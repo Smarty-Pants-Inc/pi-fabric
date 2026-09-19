@@ -29,8 +29,12 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
-    if (this.mainAgent.matches(id)) {
-      if (this.mainAgent.local) {
+    const isMain = this.mainAgent.matches(id);
+    const remoteRoot = isMain ? undefined : this.participants.get(id);
+    // Project members include peer roots, not just this host's Main and actors.
+    // Resolve their current owner through the same capability/control path.
+    if (isMain || remoteRoot?.kind === "root") {
+      if (isMain && this.mainAgent.local) {
         context?.activity?.({
           type: "entity",
           id: this.mainAgent.id,
@@ -47,13 +51,13 @@ export class AgentMessageRouter {
           ...(data === undefined ? {} : { data }),
         });
       }
-      const participant = this.participants.get(this.mainAgent.id);
+      const participant = remoteRoot ?? this.participants.get(this.mainAgent.id);
       if (!participant) throw new Error(`Unknown Fabric Main participant: ${this.mainAgent.id}`);
       if (!participant.capabilities.includes(kind)) {
         throw new Error(`Fabric participant ${participant.id} does not support ${kind}`);
       }
       if (!this.control || participant.controlProtocol === "legacy") {
-        return this.actorManager.steerRemote(this.mainAgent.id, message, kind, data);
+        return this.actorManager.steerRemote(participant.id, message, kind, data);
       }
       return this.control.request(
         participant.ownerHostId,

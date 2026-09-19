@@ -129,6 +129,35 @@ describe("agents provider message routing service boundaries", () => {
     expect(actors.steerRemote).not.toHaveBeenCalled();
   });
 
+  it("routes listed busy peer roots through their current owner, without treating them as actors", async () => {
+    const { router, participants, control, actors, main } = routing();
+    const peer = { ...participant(), id: "session:peer", rootId: "session:peer" };
+    participants.get.mockImplementation(id => id === peer.id ? peer : undefined);
+    control.request.mockResolvedValue({ queued: true, messageId: "accepted", routed: "mesh", acknowledged: true });
+    await expect(router.routeMessage(peer.id, "new authorized observation", { original: "fresh" }, "followUp",
+      undefined, { triggerTurn: false })).resolves.toMatchObject({ messageId: "accepted" });
+    expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp",
+      { message: "new authorized observation", data: { original: "fresh" }, triggerTurn: false }, "owner");
+    expect(actors.status).not.toHaveBeenCalled();
+    expect(main.deliverAgent).not.toHaveBeenCalled();
+    peer.ownerHostId = "replacement-host";
+    peer.ownerIdentityId = "replacement-owner";
+    await router.routeMessage(peer.id, "later observation", undefined, "followUp");
+    expect(control.request).toHaveBeenLastCalledWith("replacement-host", peer.id, "followUp",
+      { message: "later observation", data: undefined }, "replacement-owner");
+    peer.capabilities = [];
+    await expect(router.routeMessage(peer.id, "withdrawn", undefined, "followUp")).rejects.toThrow("does not support followUp");
+    expect(control.request).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses the existing legacy relay for a listed peer root without a control protocol", async () => {
+    const { router, participants, actors, control } = routing();
+    participants.get.mockReturnValue({ ...participant(), id: "session:legacy", controlProtocol: "legacy" });
+    await router.routeMessage("session:legacy", "observation", undefined, "followUp");
+    expect(actors.steerRemote).toHaveBeenCalledWith("session:legacy", "observation", "followUp", undefined);
+    expect(control.request).not.toHaveBeenCalled();
+  });
+
   it("does not hide local agent failures by falling through to actors", async () => {
     const { router, agents, actors } = routing();
     const failure = new Error("worker unavailable");

@@ -1,0 +1,115 @@
+# Proposal only. Do not add to Smarty Dev or pi-fabric until fork owner + CI owner review.
+# Fixed-source, single Linux x86-64 job. No matrix, inputs, arbitrary refs or Jev key.
+name: Fabric runtime artifact (fixed source)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  artifact:
+    if: github.repository == 'Smarty-Pants-Inc/pi-fabric' && github.repository_id == '1376784717' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Assert native target
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+
+      - name: Checkout reviewed capture helper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: _builder
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Checkout immutable Fabric source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 2e5fcdd94cc364445b115756edefcaab24f68928
+          fetch-depth: 1
+          persist-credentials: false
+          repository: Smarty-Pants-Inc/pi-fabric
+          path: fork
+
+      - name: Install fixed Node and Bun
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Verify tools and source
+        working-directory: fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v24.18.0
+          test "$(bun --version)" = 1.4.0
+          test "$(git rev-parse HEAD)" = 2e5fcdd94cc364445b115756edefcaab24f68928
+          test "$(git rev-parse HEAD^{tree})" = 0f4ac4e6dc248778f495554f5a43327098ad0148
+
+      - name: Install and build exact fork
+        working-directory: fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 300 bun install --frozen-lockfile
+          timeout 240 bun run build
+          timeout 60 node scripts/smoke-jev.mjs
+          node -e 'const p=require("./node_modules/@earendil-works/pi-coding-agent/package.json"); if(p.version!=="0.85.1") process.exit(1)'
+          git diff --exit-code HEAD --
+
+      # Public fork-only stage ends here. Private landed Smarty Dev fixture
+      # acceptance is a separate CI-admitted receiver stage on this exact
+      # artifact, without install or rebuild. No private archive, cross-repo
+      # token or adapter source enters the public job.
+      - name: Capture fork-smoke-tested closure
+        working-directory: fork
+        shell: bash
+        env:
+          EVIDENCE: ${{ runner.temp }}/fabric-runtime-evidence
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          timeout 60 npm pack --ignore-scripts --pack-destination "$EVIDENCE"
+          git archive --format=tar --prefix=pi-fabric/ --output="$EVIDENCE/fork-source.tar" HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          root = Path('node_modules').resolve()
+          for directory, dirs, files in os.walk(root, followlinks=False):
+              for name in dirs + files:
+                  path = Path(directory) / name
+                  if path.is_symlink():
+                      assert path.resolve(strict=True).is_relative_to(root), str(path)
+          PY
+          test "$(du -sb node_modules | cut -f1)" -le 2147483648
+          timeout 120 tar --hard-dereference --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -czf "$EVIDENCE/node_modules.tar.gz" node_modules
+          test "$(du -sb "$EVIDENCE" | cut -f1)" -le 2147483648
+          cp bun.lock "$EVIDENCE/bun.lock"
+          timeout 120 python3 ../_builder/.github/scripts/fabric-stage-closure.py "$EVIDENCE" "$RUNNER_TEMP/fabric-closure" "$EVIDENCE/closure-manifest.json"
+          timeout 60 node "$RUNNER_TEMP/fabric-closure/scripts/smoke-jev.mjs"
+          python3 ../_builder/.github/scripts/fabric-stage-closure.py --verify "$RUNNER_TEMP/fabric-closure" "$EVIDENCE/closure-manifest.json"
+          sha256sum "$(command -v node)" "$(command -v bun)" > "$EVIDENCE/tool-digests.txt"
+          printf '%s\n' "node=$(node --version)" "bun=$(bun --version)" > "$EVIDENCE/tool-versions.txt"
+          printf '%s\n' "fork_commit=2e5fcdd94cc364445b115756edefcaab24f68928" "fork_tree=0f4ac4e6dc248778f495554f5a43327098ad0148" "smarty_dev_fixture=private_post_receive_only" "run_id=$GITHUB_RUN_ID" "attempt=$GITHUB_RUN_ATTEMPT" "workflow_sha=$GITHUB_SHA" > "$EVIDENCE/source-identities.txt"
+          (cd "$EVIDENCE" && sha256sum ./*) > "$RUNNER_TEMP/fabric-checksums"
+          mv "$RUNNER_TEMP/fabric-checksums" "$EVIDENCE/SHA256SUMS"
+
+      - name: Upload reviewed short-retention artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fabric-runtime-2e5fcdd-public-artifact
+          path: ${{ runner.temp }}/fabric-runtime-evidence
+          if-no-files-found: error
+          retention-days: 1

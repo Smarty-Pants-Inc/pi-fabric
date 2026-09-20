@@ -93,6 +93,31 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
     await expect(new HerdrTransport({ HERDR_ENV: "1" }).available()).resolves.toBe(false);
   });
 
+  it.each([undefined, "", "/profiles/custom agent 'quoted'"])(
+    "forwards only an explicitly selected Pi profile (%j)",
+    async (profile) => {
+      const { socketPath, requests } = await startServer();
+      const transport = new HerdrTransport({
+        HERDR_ENV: "1",
+        HERDR_SOCKET_PATH: socketPath,
+        HERDR_WORKSPACE_ID: "w1",
+        ...(profile === undefined ? {} : { PI_CODING_AGENT_DIR: profile }),
+        PATH: "/parent/private/bin",
+        OPENAI_API_KEY: "must-not-forward",
+        OP_SERVICE_ACCOUNT_TOKEN: "must-not-forward",
+      });
+      await transport.launch({
+        id: "profile-probe", name: "profile probe", cwd: "/repo",
+        workerPath: "/fabric/worker.js", workerArguments: [],
+      });
+      const root = requests.find((request) => request.method === "layout.apply")
+        ?.params.root as Record<string, unknown>;
+      if (profile === undefined) expect(root).not.toHaveProperty("env");
+      else expect(root.env).toEqual({ PI_CODING_AGENT_DIR: profile });
+      expect(root.command).toEqual([process.execPath, "/fabric/worker.js"]);
+    },
+  );
+
   it("launches an argv-backed background tab and controls it by pane id", async () => {
     const { socketPath, requests } = await startServer();
     const transport = new HerdrTransport({

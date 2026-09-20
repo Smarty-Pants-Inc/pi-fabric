@@ -75,6 +75,11 @@ export class HerdrTransport implements AgentTransportAdapter {
           type: "pane",
           label: request.name,
           cwd: request.cwd,
+          // Herdr starts workers from its server environment, not this Pi host.
+          // Forward only the explicit profile selector, never credentials or PATH.
+          ...(this.environment.PI_CODING_AGENT_DIR !== undefined
+            ? { env: { PI_CODING_AGENT_DIR: this.environment.PI_CODING_AGENT_DIR } }
+            : {}),
           command: await scriptSpawnArgs(request.workerPath, request.workerArguments),
         },
       },

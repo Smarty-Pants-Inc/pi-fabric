@@ -34,7 +34,7 @@ jobs:
       - name: Checkout immutable Fabric source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: d22c736d9958bf868a35ee0cf4d60ed91a4d8bc5
+          ref: f3b7573ec962c4bdac921cd98df9ba178f744285
           fetch-depth: 1
           persist-credentials: false
           repository: Smarty-Pants-Inc/pi-fabric
@@ -55,8 +55,8 @@ jobs:
           set -euo pipefail
           test "$(node --version)" = v24.18.0
           test "$(bun --version)" = 1.4.0
-          test "$(git rev-parse HEAD)" = d22c736d9958bf868a35ee0cf4d60ed91a4d8bc5
-          test "$(git rev-parse HEAD^{tree})" = cc109d824d97c2876cc19d7daad33c0cf30e9737
+          test "$(git rev-parse HEAD)" = f3b7573ec962c4bdac921cd98df9ba178f744285
+          test "$(git rev-parse HEAD^{tree})" = 007e624d376efd0420bd95dc11a196273f8c3f73
 
       - name: Install and build exact fork
         working-directory: fork
@@ -102,14 +102,14 @@ jobs:
           python3 ../_builder/.github/scripts/fabric-stage-closure.py --verify "$RUNNER_TEMP/fabric-closure" "$EVIDENCE/closure-manifest.json"
           sha256sum "$(command -v node)" "$(command -v bun)" > "$EVIDENCE/tool-digests.txt"
           printf '%s\n' "node=$(node --version)" "bun=$(bun --version)" > "$EVIDENCE/tool-versions.txt"
-          printf '%s\n' "fork_commit=d22c736d9958bf868a35ee0cf4d60ed91a4d8bc5" "fork_tree=cc109d824d97c2876cc19d7daad33c0cf30e9737" "smarty_dev_fixture=private_post_receive_only" "run_id=$GITHUB_RUN_ID" "attempt=$GITHUB_RUN_ATTEMPT" "workflow_sha=$GITHUB_SHA" > "$EVIDENCE/source-identities.txt"
+          printf '%s\n' "fork_commit=f3b7573ec962c4bdac921cd98df9ba178f744285" "fork_tree=007e624d376efd0420bd95dc11a196273f8c3f73" "smarty_dev_fixture=private_post_receive_only" "run_id=$GITHUB_RUN_ID" "attempt=$GITHUB_RUN_ATTEMPT" "workflow_sha=$GITHUB_SHA" > "$EVIDENCE/source-identities.txt"
           (cd "$EVIDENCE" && sha256sum ./*) > "$RUNNER_TEMP/fabric-checksums"
           mv "$RUNNER_TEMP/fabric-checksums" "$EVIDENCE/SHA256SUMS"
 
       - name: Upload reviewed short-retention artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: fabric-runtime-d22c736-public-artifact
+          name: fabric-runtime-f3b7573-public-artifact
           path: ${{ runner.temp }}/fabric-runtime-evidence
           if-no-files-found: error
           retention-days: 1

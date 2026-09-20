@@ -1292,8 +1292,8 @@ export class ActorManager {
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
         try {
-          if (actor.requirements.length > 0) {
-            capabilityLease = await this.#acquireCapabilityView!(
+          if (actor.requirements.length > 0 && this.#acquireCapabilityView) {
+            capabilityLease = await this.#acquireCapabilityView(
               actor.requirements,
               abortController.signal,
             );
@@ -1309,6 +1309,13 @@ export class ActorManager {
             delete actor.missingCapabilities;
             committedRefs = Object.keys(capabilityLease.view.bindings).sort();
             actor.capabilityDigest = capabilityLease.view.semanticDigest;
+          } else if (actor.requirements.length > 0) {
+            // A durable resident host has no interactive action registry. Pass
+            // the declared refs to the child, whose Fabric runtime acquires
+            // and pins the same capability view before loading the actor.
+            delete actor.missingCapabilities;
+            committedRefs = actor.requirements.map(({ ref }) => ref).sort();
+            delete actor.capabilityDigest;
           } else {
             delete actor.capabilityDigest;
           }

@@ -364,6 +364,65 @@ describe("ActorManager", () => {
     });
   });
 
+  it("forwards durable actor follow-up capability requirements from a resident host", async () => {
+    const acquire = vi.fn(async (
+      _requirements: readonly FabricCapabilityRequirement[],
+      _signal: AbortSignal,
+    ): Promise<FabricCapabilityViewLease> => ({
+      satisfied: true,
+      missing: [],
+      optionalMissing: [],
+      view: {
+        id: "view-durable",
+        digest: "local-durable",
+        semanticDigest: "semantic-durable",
+        bindings: {
+          "agents.followUp": {
+            ref: "agents.followUp",
+            provider: "agents",
+            providerBindingId: "agents",
+            generation: 1,
+            descriptorHash: "follow-up",
+          },
+        },
+      },
+      release: async () => {},
+    }));
+    const opened = setup(true, undefined, acquire);
+    const actor = await opened.actors.create({
+      name: "durable follow-up",
+      instructions: "Follow up with the remote participant.",
+      requires: ["agents.followUp"],
+    });
+    await opened.actors.close();
+    await opened.agents.close();
+
+    const residentAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: path.join(opened.root, "resident-runs"),
+    });
+    agentManagers.push(residentAgents);
+    const resident = new ActorManager(
+      "test",
+      opened.identity,
+      opened.mesh,
+      opened.meshConfig,
+      residentAgents,
+      () => {},
+      { actorRoot: path.join(opened.root, "actors"), persistent: true },
+    );
+    actorManagers.push(resident);
+    const run = vi.spyOn(residentAgents, "run");
+
+    await expect(resident.ask(actor.id, "Send the remote follow-up.")).resolves.toMatchObject({
+      text: "fake worker complete",
+    });
+    expect(run).toHaveBeenCalledWith(
+      expect.objectContaining({ capabilityRequirements: ["agents.followUp"] }),
+      expect.any(AbortSignal),
+    );
+  });
+
   it("keeps mailbox work queued until required capabilities become available", async () => {
     let available = false;
     const release = vi.fn(async () => {});

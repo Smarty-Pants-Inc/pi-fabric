@@ -1095,25 +1095,35 @@ return { created, listed, removed };
     ]);
   });
 
-  it("routes agents.setEvents and agents.setInstructions to the actors provider", async () => {
-    const calls: string[] = [];
+  it("routes the documented ambient supervisor reuse controls to the actors provider", async () => {
+    const calls: Array<{ ref: string; args: Record<string, unknown> }> = [];
     const result = await new QuickJsRuntime().execute(
       `
-await agents.setEvents({ id: "a1", events: ["turn_end"] });
+await agents.setEvents({ id: "a1", events: ["agent_settled", "tool_error"] });
 await agents.setInstructions({ id: "a1", instructions: "Be brief." });
+await agents.setTools({ id: "a1", tools: ["read", "grep", "find", "ls"], scope: "project" });
+await agents.setDeliveryPolicy({ id: "a1", delivery: "steer", triggerTurn: true });
+await agents.setDeliveryPolicy({ id: "a1", delivery: "mailbox", triggerTurn: false });
 return { done: true };
 `,
       async (ref, args) => {
-        calls.push(ref);
-        if (ref === "agents.setEvents") return { id: args.id, status: "idle", name: "x" };
-        if (ref === "agents.setInstructions") return { id: args.id, status: "idle", name: "x" };
+        calls.push({ ref, args });
+        if (["agents.setEvents", "agents.setInstructions", "agents.setTools", "agents.setDeliveryPolicy"].includes(ref)) {
+          return { id: args.id, status: "idle", name: "x" };
+        }
         throw new Error(`Unexpected call: ${ref}`);
       },
       options,
     );
     expect(result.error).toBeUndefined();
     expect(result.value).toEqual({ done: true });
-    expect(calls).toEqual(["agents.setEvents", "agents.setInstructions"]);
+    expect(calls).toEqual([
+      { ref: "agents.setEvents", args: { id: "a1", events: ["agent_settled", "tool_error"] } },
+      { ref: "agents.setInstructions", args: { id: "a1", instructions: "Be brief." } },
+      { ref: "agents.setTools", args: { id: "a1", tools: ["read", "grep", "find", "ls"], scope: "project" } },
+      { ref: "agents.setDeliveryPolicy", args: { id: "a1", delivery: "steer", triggerTurn: true } },
+      { ref: "agents.setDeliveryPolicy", args: { id: "a1", delivery: "mailbox", triggerTurn: false } },
+    ]);
   });
 });
 

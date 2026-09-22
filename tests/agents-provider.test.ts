@@ -1930,6 +1930,24 @@ describe("AgentsProvider global actors", () => {
     expect(actors.status(actor.id).sessionFile).toBe(sessionFile);
   });
 
+  it("exposes inference context create/update/readback and history-free export/import", async () => {
+    const { provider, actors } = setup();
+    const descriptor = await provider.describe("setInferenceContext", context);
+    expect(descriptor?.inputSchema).toMatchObject({ required: ["id", "inferenceContext"], properties: { inferenceContext: { enum: ["full-history", "activation"] } } });
+    const actor = await provider.invoke("create", { ...createRequest, inferenceContext: "activation", extensions: false, tools: [] }, context) as { id: string; sessionFile: string };
+    expect(actors.status(actor.id)).toMatchObject({ inferenceContext: "activation", extensions: false, tools: [] });
+    await provider.invoke("setInferenceContext", { id: actor.id, inferenceContext: "full-history" }, context);
+    expect(await provider.invoke("actorStatus", { id: actor.id }, context)).toMatchObject({ id: actor.id, sessionFile: actor.sessionFile, inferenceContext: "full-history" });
+    const template = await provider.invoke("export", { id: actor.id }, context) as { id: string };
+    await provider.invoke("setInferenceContext", { id: template.id, inferenceContext: "activation", scope: "global" }, context);
+    const imported = await provider.invoke("import", { id: template.id, as: "window-copy" }, context) as { id: string; sessionFile: string; messages: number; inferenceContext: string };
+    expect(imported).toMatchObject({ inferenceContext: "activation", messages: 0 });
+    expect(imported.id).not.toBe(actor.id);
+    expect(imported.sessionFile).not.toBe(actor.sessionFile);
+    await expect(provider.invoke("setInferenceContext", { id: actor.id, inferenceContext: "invalid" }, context)).rejects.toThrow();
+    await expect(provider.invoke("create", { ...createRequest, name: "bad-window", inferenceContext: "invalid" }, context)).rejects.toThrow();
+  });
+
   it("updates tool allowlists for project actors and global templates", async () => {
     const { provider, actors, globalActors } = setup();
     const actor = (await provider.invoke("create", createRequest, context)) as { id: string };

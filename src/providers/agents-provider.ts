@@ -1,6 +1,6 @@
 import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent } from "../actors/types.js";
+import { isFabricActorHostEvent, validateActorInferenceContext } from "../actors/types.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
@@ -252,6 +252,7 @@ const actorRequest = (
       'The Veda runner does not support persistent actors: Veda executes one headless prompt per invocation. Use a Pi or Claude actor, or agents.run({ runner: "veda" }).',
     );
   }
+  validateActorInferenceContext(args.inferenceContext, runner);
   const requestedKernel = checkedKernel(args.kernel);
   const kernelRequest = {
     runner,
@@ -304,6 +305,7 @@ const actorRequest = (
       : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(typeof args.extensions === "boolean" ? { extensions: args.extensions } : {}),
+    ...(args.inferenceContext !== undefined ? { inferenceContext: args.inferenceContext } : {}),
     ...(requires ? { requires } : {}),
     ...(validWhile ? { validWhile } : {}),
   };
@@ -995,6 +997,14 @@ export class AgentsProvider implements FabricProvider {
           return this.globalActors.update(String(args.id), { tools });
         }
         return this.actorManager.setTools(String(args.id), tools);
+      }
+      case "setInferenceContext": {
+        validateActorInferenceContext(args.inferenceContext);
+        if (args.inferenceContext === undefined) throw new Error("inferenceContext is required");
+        if (args.scope === "global") {
+          return this.globalActors.update(String(args.id), { inferenceContext: args.inferenceContext });
+        }
+        return this.actorManager.setInferenceContext(String(args.id), args.inferenceContext);
       }
       case "setEvents": {
         const events = Array.isArray(args.events)

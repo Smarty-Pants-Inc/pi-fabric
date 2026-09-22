@@ -85,6 +85,17 @@ const FABRIC_ACTOR_HOST_EVENT_SET: ReadonlySet<string> = new Set(FABRIC_ACTOR_HO
 export const isFabricActorHostEvent = (value: unknown): value is FabricActorHostEvent =>
   typeof value === "string" && FABRIC_ACTOR_HOST_EVENT_SET.has(value);
 
+export type FabricActorInferenceContext = "full-history" | "activation";
+
+export function validateActorInferenceContext(value: unknown, runner?: string): asserts value is FabricActorInferenceContext | undefined {
+  if (value !== undefined && value !== "full-history" && value !== "activation") {
+    throw new Error(`Invalid actor inference context: ${String(value)}`);
+  }
+  if (value === "activation" && runner !== undefined && runner !== "pi") {
+    throw new Error("Activation inference context requires the Pi runner");
+  }
+}
+
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 export type FabricActorStatus = "idle" | "queued" | "running" | "stopped";
@@ -191,6 +202,8 @@ export interface FabricActorRequest {
    * actor's ordinary tool allowlist. Fixed at creation.
    */
   extensions?: boolean;
+  /** Inference only; journals remain complete. Omitted means full-history. */
+  inferenceContext?: FabricActorInferenceContext;
   /** Exact Fabric actions committed before every actor run. Optional entries do not block a run. */
   requires?: readonly (string | FabricCapabilityRequirement)[];
   /** Serialized guest predicate evaluated before work and before delivery. */
@@ -222,6 +235,7 @@ export interface FabricActorInfo {
   tools?: string[];
   timeoutMs?: number;
   extensions?: boolean;
+  inferenceContext?: FabricActorInferenceContext;
   requirements?: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];

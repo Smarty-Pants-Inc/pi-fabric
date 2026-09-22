@@ -29,6 +29,7 @@ export class PiModelControl {
   private readonly runId: string;
   private readonly requested: string | undefined;
   private readonly thinking: string | undefined;
+  private readonly activationWindow: boolean;
   private readonly io: {
     send(frame: Record<string, unknown>): void;
     admitted(model?: string, thinking?: string): void;
@@ -41,6 +42,7 @@ export class PiModelControl {
     requested: string | undefined,
     thinking: string | undefined,
     io: PiModelControl["io"],
+    activationWindow = false,
   ) {
     // Keep this module executable through Node's native type stripping too;
     // source workers must not rely on transform-only parameter properties.
@@ -48,10 +50,11 @@ export class PiModelControl {
     this.requested = requested;
     this.thinking = thinking;
     this.io = io;
+    this.activationWindow = activationWindow;
   }
 
   start(): void {
-    if (!this.requested) {
+    if (!this.requested && !this.activationWindow) {
       this.ready = true;
       this.io.admitted();
       return;
@@ -103,9 +106,21 @@ export class PiModelControl {
       this.fail(`${command}: ${typeof event.error === "string" ? event.error : "invalid or rejected RPC response"}`);
       return true;
     }
+    if (this.activationWindow && command === "get_state") {
+      const state = object(event.data);
+      if (state?.autoCompactionDisabledForProcess !== true || state?.autoCompactionEnabled !== false ||
+          state?.isStreaming !== false || state?.isCompacting !== false) {
+        this.fail("activation window requires native --no-auto-compaction support and an idle child; task was not sent");
+        return true;
+      }
+    }
     if (this.#awaitingStartup) {
       this.#awaitingStartup = false;
-      this.#resolveModel();
+      if (this.requested) this.#resolveModel();
+      else {
+        this.ready = true;
+        this.io.admitted();
+      }
     } else if (command === "get_available_models") {
       const models = object(event.data)?.models;
       const matches = Array.isArray(models)

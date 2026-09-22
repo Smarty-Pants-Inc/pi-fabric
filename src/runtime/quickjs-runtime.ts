@@ -508,6 +508,7 @@ globalThis.agents = Object.freeze({
   switchModel: (args) => __call("agents.switchModel", args),
   setThinking: (args) => __call("agents.setThinking", args),
   setTools: (args) => __call("agents.setTools", args),
+  setInferenceContext: (args) => __call("agents.setInferenceContext", args),
   setEvents: (args) => __call("agents.setEvents", args),
   setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
   clearMessages: (args) => __call("agents.clearMessages", args),

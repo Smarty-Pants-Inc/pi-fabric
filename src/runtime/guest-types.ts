@@ -626,6 +626,7 @@ interface FabricActorRequestBase {
   timeout_ms?: number;
   extensions?: boolean;
   requires?: Array<string | { ref: string; optional?: boolean }>;
+  inferenceContext?: "full-history" | "activation";
   validWhile?: FabricActorValidWhile;
   residency?: FabricParticipantResidency;
 }
@@ -658,6 +659,7 @@ interface FabricActorInfo {
   requirements?: Array<{ ref: string; optional?: boolean }>;
   capabilityDigest?: string;
   missingCapabilities?: string[];
+  inferenceContext?: "full-history" | "activation";
   validWhile?: { version: 1; source: string };
   residency: FabricParticipantResidency;
   queued: number;
@@ -739,6 +741,7 @@ interface FabricAgentsApi {
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;
   setDeliveryPolicy(args: {
     id: string;

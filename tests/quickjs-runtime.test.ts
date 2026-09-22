@@ -1121,12 +1121,14 @@ return { created, listed, removed };
     const calls: string[] = [];
     const result = await new QuickJsRuntime().execute(
       `
+await agents.setInferenceContext({ id: "a1", inferenceContext: "activation" });
 await agents.setEvents({ id: "a1", events: ["turn_end"] });
 await agents.setInstructions({ id: "a1", instructions: "Be brief." });
 return { done: true };
 `,
       async (ref, args) => {
         calls.push(ref);
+        if (ref === "agents.setInferenceContext") return { id: args.id, status: "idle", name: "x" };
         if (ref === "agents.setEvents") return { id: args.id, status: "idle", name: "x" };
         if (ref === "agents.setInstructions") return { id: args.id, status: "idle", name: "x" };
         throw new Error(`Unexpected call: ${ref}`);
@@ -1135,7 +1137,7 @@ return { done: true };
     );
     expect(result.error).toBeUndefined();
     expect(result.value).toEqual({ done: true });
-    expect(calls).toEqual(["agents.setEvents", "agents.setInstructions"]);
+    expect(calls).toEqual(["agents.setInferenceContext", "agents.setEvents", "agents.setInstructions"]);
   });
 });
 

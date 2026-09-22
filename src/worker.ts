@@ -2,6 +2,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { StringDecoder } from "node:string_decoder";
@@ -283,6 +285,20 @@ const main = async (): Promise<void> => {
   if (options.sessionFile) piArguments.push("--session", options.sessionFile);
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
+  const activationWindow = options.inferenceContext === "activation";
+  const activationNonce = activationWindow ? randomUUID() : undefined;
+  let activationHookPath: string | undefined;
+  if (activationWindow) {
+    const hookPath = fileURLToPath(new URL(
+      import.meta.url.endsWith(".ts") ? "./worker/activation-window.ts" : "./worker/activation-window.js",
+      import.meta.url,
+    ));
+    if (!fs.existsSync(hookPath)) throw new Error("Activation window hook is missing");
+    activationHookPath = fs.realpathSync(hookPath);
+    // CLI extensions precede discovered extensions. Install the compaction
+    // guard before any other hook can start summarization work.
+    piArguments.push("-e", hookPath, "--no-auto-compaction");
+  }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
   if (options.tools.length > 0) piArguments.push("--tools", options.tools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
@@ -339,6 +355,9 @@ const main = async (): Promise<void> => {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
           }
         : {}),
+      PI_FABRIC_ACTIVATION_WORKER_PID: activationWindow ? String(process.pid) : "",
+      PI_FABRIC_ACTIVATION_NONCE: activationNonce ?? "",
+      PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
       PI_FABRIC_AGENT_NAME: options.name,
@@ -389,6 +408,7 @@ const main = async (): Promise<void> => {
 
   // Auth checks and model_select hooks can be slow under concurrent launches.
   // Startup and admission share the overall run timeout below, not a shorter cap.
+  let activationWindowReady = false;
   const modelControl = new PiModelControl(options.id, options.model, thinking, {
     send(frame) {
       if (terminalStatus) return;
@@ -401,6 +421,10 @@ const main = async (): Promise<void> => {
     },
     admitted(model, effectiveThinking) {
       if (terminalStatus) return;
+      if (activationWindow && !activationWindowReady) {
+        modelControl.fail("activation window hook did not acknowledge readiness; task was not sent");
+        return;
+      }
       if (model) record.model = model;
       if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effectiveThinking ?? "")) {
         record.thinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
@@ -419,7 +443,7 @@ const main = async (): Promise<void> => {
       setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS).unref();
       child.stdin?.end();
     },
-  });
+  }, activationWindow);
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.
@@ -814,6 +838,13 @@ const main = async (): Promise<void> => {
       return;
     }
     compactControl.observe(event);
+    if (activationWindow && event.type === "fabric_activation_window_ready") {
+      if (event.runId === options.id && event.nonce === activationNonce &&
+          event.policy === "activation" && event.protocol === 1 && event.hook === activationHookPath && !activationWindowReady) {
+        activationWindowReady = true;
+      } else modelControl.fail("activation window readiness does not match the selected run/policy/hook");
+      return;
+    }
     if (modelControl.observe(event)) return;
     if (event.type === "message_start" || event.type === "message_update") {
       const message = event.message;

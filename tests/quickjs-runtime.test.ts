@@ -1099,6 +1099,7 @@ return { created, listed, removed };
     const calls: Array<{ ref: string; args: Record<string, unknown> }> = [];
     const result = await new QuickJsRuntime().execute(
       `
+await agents.setInferenceContext({ id: "a1", inferenceContext: "activation" });
 await agents.setEvents({ id: "a1", events: ["agent_settled", "tool_error"] });
 await agents.setInstructions({ id: "a1", instructions: "Be brief." });
 await agents.setTools({ id: "a1", tools: ["read", "grep", "find", "ls"], scope: "project" });
@@ -1108,7 +1109,7 @@ return { done: true };
 `,
       async (ref, args) => {
         calls.push({ ref, args });
-        if (["agents.setEvents", "agents.setInstructions", "agents.setTools", "agents.setDeliveryPolicy"].includes(ref)) {
+        if (["agents.setInferenceContext", "agents.setEvents", "agents.setInstructions", "agents.setTools", "agents.setDeliveryPolicy"].includes(ref)) {
           return { id: args.id, status: "idle", name: "x" };
         }
         throw new Error(`Unexpected call: ${ref}`);
@@ -1118,6 +1119,7 @@ return { done: true };
     expect(result.error).toBeUndefined();
     expect(result.value).toEqual({ done: true });
     expect(calls).toEqual([
+      { ref: "agents.setInferenceContext", args: { id: "a1", inferenceContext: "activation" } },
       { ref: "agents.setEvents", args: { id: "a1", events: ["agent_settled", "tool_error"] } },
       { ref: "agents.setInstructions", args: { id: "a1", instructions: "Be brief." } },
       { ref: "agents.setTools", args: { id: "a1", tools: ["read", "grep", "find", "ls"], scope: "project" } },

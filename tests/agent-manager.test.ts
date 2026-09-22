@@ -283,6 +283,23 @@ describe("AgentManager", () => {
     await manager.stop(handle.id);
   });
 
+  it("rejects unsupported activation windows before model preparation or transport launch", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-window-manager-"));
+    roots.push(root);
+    const preparePiModel = vi.fn();
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel,
+    });
+    managers.push(manager);
+    const request = { task: "must not infer", inferenceContext: "activation" as const, actorId: "actor", sessionFile: path.join(root, "actor.jsonl") };
+    await expect(manager.spawn({ ...request, runner: "claude" })).rejects.toThrow(/persistent Pi actor/);
+    await expect(manager.spawn({ ...request, runner: "veda" })).rejects.toThrow(/persistent Pi actor/);
+    await expect(manager.spawn({ task: "missing actor", inferenceContext: "activation" })).rejects.toThrow(/persistent Pi actor/);
+    await expect(manager.spawn({ ...request, inferenceContext: "invalid" as "activation" })).rejects.toThrow(/inference context/);
+    expect(preparePiModel).not.toHaveBeenCalled();
+    expect(manager.list()).toEqual([]);
+  });
+
   it("rejects trajectory seeds for the Claude runner and conflicting session files", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

@@ -30,6 +30,20 @@ const baseRequest: FabricActorRequest = {
 };
 
 describe("GlobalActorRegistry", () => {
+  it("round-trips inference policy without history and keeps same-ID updates", () => {
+    const { registry, agentDir } = setup();
+    const original = registry.create({ ...baseRequest, inferenceContext: "activation", extensions: false });
+    expect(registry.update(original.id, { instructions: "Updated" })).toMatchObject({ id: original.id, inferenceContext: "activation" });
+    const restored = new GlobalActorRegistry(agentDir, 64 * 1024);
+    expect(restored.toRequest(restored.resolve(original.id)!)).toMatchObject({ inferenceContext: "activation", extensions: false });
+    expect(restored.toRequest(original)).not.toHaveProperty("sessionFile");
+    expect(restored.toRequest(original)).not.toHaveProperty("messages");
+    expect(restored.update(original.id, { inferenceContext: "full-history" })).toMatchObject({ id: original.id, inferenceContext: "full-history" });
+    expect(() => restored.update(original.id, { inferenceContext: "invalid" as "activation" })).toThrow(/inference context/);
+    expect(() => restored.update(original.id, { inferenceContext: null as unknown as "activation" })).toThrow(/inference context/);
+    expect(() => restored.create({ ...baseRequest, name: "claude", runner: "claude", inferenceContext: "activation" })).toThrow(/Pi runner/);
+  });
+
   it("creates, lists, and resolves templates by id, prefix, and name", () => {
     const { registry } = setup();
     expect(registry.list()).toEqual([]);

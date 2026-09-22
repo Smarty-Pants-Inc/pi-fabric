@@ -23,11 +23,19 @@ afterEach(async () => {
 });
 
 describe("shell hang helpers", () => {
-  it("wraps bash so the child writes its pid without extra stdout", () => {
-    const wrapped = wrapShellCommandForPid("echo hi", "/tmp/job.pid", "bash");
-    expect(wrapped).toContain("/tmp/job.pid");
-    expect(wrapped.endsWith("echo hi")).toBe(true);
-    expect(wrapped.startsWith("printf ")).toBe(true);
+  it.each(["linux", "darwin"] as const)("writes the native bash pid on %s without extra stdout", (platform) => {
+    expect(wrapShellCommandForPid("echo hi", "/tmp/job.pid", "bash", platform))
+      .toBe(`printf '%s\\n' "$$" > '/tmp/job.pid'\necho hi`);
+  });
+
+  it("maps Git Bash's MSYS pid to the Windows pid used by Node", () => {
+    expect(wrapShellCommandForPid("echo hi", "C:/a b/job's.pid", "bash", "win32"))
+      .toBe(`printf '%s\\n' "$(</proc/$$/winpid)" > 'C:/a b/job'\\''s.pid'\necho hi`);
+  });
+
+  it("keeps PowerShell's already-native pid on Windows", () => {
+    expect(wrapShellCommandForPid("echo hi", "C:/a b/job's.pid", "powershell", "win32"))
+      .toBe("Set-Content -LiteralPath 'C:/a b/job''s.pid' -Value $PID\necho hi");
   });
 
   it("formats a still-running notice with pid and live path", () => {

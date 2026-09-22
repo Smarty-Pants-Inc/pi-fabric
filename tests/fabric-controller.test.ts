@@ -459,10 +459,15 @@ describe("FabricUiController dashboard wiring", () => {
       const first = widget!.render(80).join("\n");
       expect(first).toContain("T06 slice A");
       expect(first).toContain("6/6 calls");
-      expect(first).toMatch(/0s/);
+      // Shared UI formatting deliberately omits sub-second durations.
+      expect(first).not.toMatch(/\b\d+s\b/);
       expect(controller.snapshot().runs[0]?.status).toBe("running");
       requestRender.mockClear();
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(widget!.render(80).join("\n")).toMatch(/\b1s\b/);
+      expect(requestRender).toHaveBeenCalled();
+      requestRender.mockClear();
+      await vi.advanceTimersByTimeAsync(4_000);
       const elapsedMs =
         controller.snapshot().now - controller.snapshot().runs[0]!.startedAt;
       const second = widget!.render(80).join("\n");

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
@@ -19,6 +19,7 @@ const invokeBash = async (
   hangMs: number,
   signal?: AbortSignal,
   extra: Record<string, unknown> = {},
+  update: (message: string) => void = () => {},
 ) => {
   const jobs = new FabricShellJobStore();
   stores.push(jobs);
@@ -45,7 +46,7 @@ const invokeBash = async (
           getSessionFile: () => undefined,
         },
       } as unknown as ExtensionContext,
-      update: () => undefined,
+      update,
       approve: async () => {},
       audits: [],
       maxResultChars: 100_000,
@@ -65,28 +66,49 @@ const invokeBash = async (
 
 describe("pi.bash auto-spill", () => {
   it("lets a short command pass through unchanged", async () => {
-    const { result } = await invokeBash('printf "hi\\n"', 80);
-    expect(result.ok).toBe(true);
-    expect(result.output).toBe("hi\n");
-    expect(result.details).not.toMatchObject({ running: true });
+    // ponytail: shell startup is real I/O, not an 80ms platform benchmark.
+    // Control JS timers while retaining real shell I/O; shell-jobs tests exercise the deadline.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { result } = await invokeBash('printf "hi\\n"', 80);
+      expect(result.ok).toBe(true);
+      expect(result.output).toBe("hi\n");
+      expect(result.details).not.toMatchObject({ running: true });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("spills a hung command as ok:true with a live log and pid", async () => {
-    const { result, jobs } = await invokeBash("printf start; sleep 8; printf done", 120);
-    expect(result.ok).toBe(true);
-    expect(result.output).toContain("[Still running after ");
-    expect(result.output).toContain("Bounded live output (may be truncated):");
-    expect(result.details?.running).toBe(true);
-    expect(result.details?.logPath).toBeTruthy();
-    const logPath = result.details!.logPath!;
-    expect(fs.existsSync(logPath)).toBe(true);
-    const pid = result.details?.pid;
-    expect(pid).toEqual(expect.any(Number));
-    if (typeof pid === "number") {
-      expect(() => process.kill(pid, 0)).not.toThrow();
-      try { process.kill(-pid, "SIGKILL"); } catch { process.kill(pid, "SIGKILL"); }
+    // Start the hang clock only after real output proves the shell wrote its PID.
+    // Otherwise this fixture also tests whether platform startup fits the PID read window.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => { started = resolve; });
+      const pending = invokeBash("printf start; sleep 8; printf done", 120, undefined, {},
+        (message) => { if (message === "bash: start") started(); });
+      await ready;
+      await vi.advanceTimersByTimeAsync(120);
+      const { result, jobs } = await pending;
+      expect(result.ok).toBe(true);
+      expect(result.output).toContain("start");
+      expect(result.output).toContain("[Still running after ");
+      expect(result.output).toContain("Bounded live output (may be truncated):");
+      expect(result.details?.running).toBe(true);
+      expect(result.details?.logPath).toBeTruthy();
+      const logPath = result.details!.logPath!;
+      expect(fs.existsSync(logPath)).toBe(true);
+      const pid = result.details?.pid;
+      expect(pid).toEqual(expect.any(Number));
+      if (typeof pid === "number") {
+        expect(() => process.kill(pid, 0)).not.toThrow();
+        try { process.kill(-pid, "SIGKILL"); } catch { process.kill(pid, "SIGKILL"); }
+      }
+      expect(jobs.list().some((job) => job.status === "spilled")).toBe(true);
+    } finally {
+      vi.useRealTimers();
     }
-    expect(jobs.list().some((job) => job.status === "spilled")).toBe(true);
   });
 
   it("does not auto-spill when hangMs is 0", async () => {

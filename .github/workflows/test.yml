@@ -35,6 +35,12 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Type check
         run: bun run typecheck
+      # Compiled-worker integration tests import dist/ during collection.
+      # Build this checkout before tests; never rely on retained artifacts.
+      - name: Build
+        run: bun run build
+      - name: Lazy startup graph
+        run: bun run assert:lazy-graph
       - name: Test Windows type-checker regression
         if: runner.os == 'Windows'
         run: bunx vitest run tests/type-checker.test.ts
@@ -48,6 +54,5 @@ jobs:
         # Curated cross-platform surface (path and executable resolution, native
         # binaries, spawn, process and watcher fallbacks) so a Linux or Windows
         # break surfaces even when the affected selection is empty.
+        # Includes optional-preview-startup: cold import/idle and first use.
         run: bun run test:smoke
-      - name: Build
-        run: bun run build

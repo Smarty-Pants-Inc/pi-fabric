@@ -123,6 +123,13 @@ export const parseWorkerOptions = (
   if (runner !== "pi" && runner !== "claude" && runner !== "veda") {
     throw new Error(`Unsupported Fabric agent runner: ${runner}`);
   }
+  const inferenceContext = optional(args, "inference-context");
+  if (inferenceContext !== undefined && inferenceContext !== "full-history" && inferenceContext !== "activation") {
+    throw new Error("Invalid worker inference context");
+  }
+  if (inferenceContext === "activation" && (runner !== "pi" || !sessionFile || !actorId)) {
+    throw new Error("Activation inference context requires a persistent Pi actor session");
+  }
   const extensions = required(args, "extensions") === "true";
   const selectedKernel = args.get("kernel");
   const pythonRuntime = args.get("python-runtime") ?? "monty";
@@ -168,6 +175,7 @@ export const parseWorkerOptions = (
     ...(thinking ? { thinking } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),
     ...(sessionFile ? { sessionFile } : {}),
+    ...(inferenceContext ? { inferenceContext } : {}),
     ...(sessionExportFile ? { sessionExportFile } : {}),
     ...(actorId ? { actorId } : {}),
     ...(actorName ? { actorName } : {}),

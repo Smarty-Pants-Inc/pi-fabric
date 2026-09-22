@@ -10,6 +10,8 @@ const stores: FabricShellJobStore[] = [];
 const registries: ActionRegistry[] = [];
 
 afterEach(async () => {
+  // A runner timeout does not unwind an async test's finally block.
+  vi.useRealTimers();
   await Promise.all(registries.splice(0).map((registry) => registry.close()));
   await Promise.all(stores.splice(0).map((jobs) => jobs.close()));
 });
@@ -64,6 +66,11 @@ const invokeBash = async (
   return { result, jobs };
 };
 
+const waitForStart = (ready: Promise<void>, pending: ReturnType<typeof invokeBash>) =>
+  Promise.race([ready, pending.then(({ result }) => {
+    throw new Error(`Shell exited before exact startup marker: ${JSON.stringify(result)}`);
+  })]);
+
 describe("pi.bash auto-spill", () => {
   it("lets a short command pass through unchanged", async () => {
     // ponytail: shell startup is real I/O, not an 80ms platform benchmark.
@@ -88,7 +95,7 @@ describe("pi.bash auto-spill", () => {
       const ready = new Promise<void>((resolve) => { started = resolve; });
       const pending = invokeBash("printf start; sleep 8; printf done", 120, undefined, {},
         (message) => { if (message === "bash: start") started(); });
-      await ready;
+      await waitForStart(ready, pending);
       await vi.advanceTimersByTimeAsync(120);
       const { result, jobs } = await pending;
       expect(result.ok).toBe(true);
@@ -106,6 +113,23 @@ describe("pi.bash auto-spill", () => {
         try { process.kill(-pid, "SIGKILL"); } catch { process.kill(pid, "SIGKILL"); }
       }
       expect(jobs.list().some((job) => job.status === "spilled")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['printf unexpected', 'unexpected'],
+    ['printf "bash.exe: warning: could not find /tmp, please create!\\nstart"', 'could not find /tmp'],
+  ])("rejects a completed command without the exact startup marker: %s", async (command, output) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => { started = resolve; });
+      const pending = invokeBash(command, 120, undefined, {},
+        (message) => { if (message === "bash: start") started(); });
+      await expect(waitForStart(ready, pending)).rejects.toThrow("Shell exited before exact startup marker");
+      expect((await pending).result.output).toContain(output);
     } finally {
       vi.useRealTimers();
     }

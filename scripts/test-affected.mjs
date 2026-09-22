@@ -9,6 +9,7 @@
 // (bun run test:smoke) so a Linux or Windows break still surfaces quickly.
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import { testTempEnvironment } from "./test-temp.mjs";
 import { beginDriverCapture, captureBoundary, captureEnabled } from "./test-temp-capture.mjs";
 
 const argv = process.argv.slice(2);
@@ -94,6 +95,8 @@ if (argv.includes("--dry-run")) {
   console.log("dry run: selection printed, nothing executed");
   process.exit(0);
 }
+// Local affected runs own a batch root; CI runs borrow their enclosing batch root.
+Object.assign(process.env, testTempEnvironment());
 const endCapture = beginDriverCapture();
 const previousPhase = process.env.PI_TEST_TEMP_PHASE;
 let failed = false;

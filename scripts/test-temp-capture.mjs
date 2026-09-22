@@ -28,8 +28,9 @@ export function captureRecord(phase, data = {}) {
       source: text(process.env.GITHUB_SHA), run: text(process.env.GITHUB_RUN_ID),
       attempt: text(process.env.GITHUB_RUN_ATTEMPT), image: text(process.env.ImageOS),
       imageVersion: text(process.env.ImageVersion), ...data };
-    if (phase === "allocated" && process.env.PI_TEST_TEMP_LEDGER)
-      record.ledgerAppend = appendLedger({pid: process.pid, selection: record.selection, root: data.root});
+    if ((phase === "allocated" || phase === "borrowed") && process.env.PI_TEST_TEMP_LEDGER)
+      record.ledgerAppend = appendLedger({pid: process.pid, selection: record.selection, root: data.root,
+        ownership:phase === "allocated" ? "owner" : "borrower"});
     let truncated = 0;
     let line = JSON.stringify(record, (_key, value) => {
       if (typeof value !== "string") return value;
@@ -45,9 +46,9 @@ export function captureRecord(phase, data = {}) {
     fs.writeSync(process.stdout.fd, framed);
   } catch { /* Diagnostics must never change test or cleanup outcomes. */ }
 }
-export function captureAllocation(root) {
+export function captureAllocation(root, borrowed = false) {
   if (!captureEnabled()) return;
-  captureRecord("allocated", { root, inherited: Object.fromEntries(
+  captureRecord(borrowed ? "borrowed" : "allocated", { root, inherited: Object.fromEntries(
     ["TMP", "TEMP", "TMPDIR"].map(key => [key, text(process.env[key])])), state: rootState(root) });
 }
 export function captureCleanup(phase, root, error) {

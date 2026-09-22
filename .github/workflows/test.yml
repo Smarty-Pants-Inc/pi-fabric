@@ -44,18 +44,11 @@ jobs:
         run: bun run build
       - name: Lazy startup graph
         run: bun run assert:lazy-graph
-      - name: Test Windows type-checker regression
-        if: runner.os == 'Windows'
-        run: bunx vitest run tests/type-checker.test.ts
-      - name: Affected tests
+      - name: Test suites
         env:
           # Pull requests compare against the target branch; pushes compare
           # against the tip they replaced. An unusable base selects nothing.
           PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: bun run test:affected
-      - name: Platform smoke floor
-        # Curated cross-platform surface (path and executable resolution, native
-        # binaries, spawn, process and watcher fallbacks) so a Linux or Windows
-        # break surfaces even when the affected selection is empty.
-        # Includes optional-preview-startup: cold import/idle and first use.
-        run: bun run test:smoke
+        # Same Windows regression, affected selection and mandatory smoke floor,
+        # in order, with one temp owner through every runner (including no-change PRs).
+        run: node scripts/test-ci.mjs

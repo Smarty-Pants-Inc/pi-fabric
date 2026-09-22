@@ -124,6 +124,19 @@ describe("activation worker admission (offline transport fixture)", () => {
 const selectedNativeBinary = process.env.PI_FABRIC_ACTIVATION_TEST_PI_BINARY;
 const nativeBinary = selectedNativeBinary ?? path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
 describe("native activation window (offline; opted-in success needs exact native artifact)", () => {
+  const readJournal = (journal: string) => {
+    const bytes = fs.readFileSync(journal);
+    const entries = bytes.toString("utf8").split("\n").filter(line => line.length > 0)
+      .map(line => JSON.parse(line) as { type: string });
+    return { bytes, entries };
+  };
+  const expectJournalAppended = (journal: string, before: ReturnType<typeof readJournal>) => {
+    const after = readJournal(journal);
+    expect(after.bytes.subarray(0, before.bytes.length)).toEqual(before.bytes);
+    expect(after.entries.slice(0, before.entries.length)).toEqual(before.entries);
+    expect(after.entries.some(entry => entry.type === "compaction")).toBe(false);
+    return after;
+  };
   const setup = async () => {
     const dir = root();
     const requests: Array<Record<string, any>> = [];
@@ -206,15 +219,15 @@ describe("native activation window (offline; opted-in success needs exact native
     session.appendMessage(mode === "overflow"
       ? { ...assistant("", 90_000), stopReason: "error", errorMessage: "maximum context length exceeded" }
       : assistant("old reply", 90_000));
-    const before = fs.readFileSync(journal, "utf8");
+    const before = readJournal(journal);
     const result = await s.manager.run({ task: "CURRENT_ACTIVATION", model: "window-test/offline", actorId: "same-actor", sessionFile: journal, inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
     expect(result, JSON.stringify(result)).toMatchObject({ status: "completed", text: "useful current result" });
     expect(s.requests).toHaveLength(1);
     expect(JSON.stringify(s.requests)).not.toContain("OLD_PRIVATE_ACTIVATION");
     expect(JSON.stringify(s.requests)).toContain("CURRENT_ACTIVATION");
     expect(s.requests[0]!.tools ?? []).toHaveLength(0);
-    expect(fs.readFileSync(journal, "utf8")).toContain(before.trim());
-    expect(fs.readFileSync(journal, "utf8")).toContain("CURRENT_ACTIVATION");
+    const after = expectJournalAppended(journal, before);
+    expect(after.bytes.toString("utf8")).toContain("CURRENT_ACTIVATION");
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, 25_000);
 
@@ -224,7 +237,7 @@ describe("native activation window (offline; opted-in success needs exact native
     const session = SessionManager.open(journal);
     session.appendMessage(user("OLD_MANUAL_HISTORY " + "x".repeat(160_000)));
     session.appendMessage(assistant("old reply", 90_000));
-    const before = fs.readFileSync(journal, "utf8");
+    const before = readJournal(journal);
     const hook = fs.realpathSync(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER
       ? path.join(path.dirname(path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER)), "worker/activation-window.js")
       : path.resolve("src/worker/activation-window.ts"));
@@ -263,7 +276,7 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(exit, stderr).toBe(78);
     expect(stderr).toContain("Compaction is unsupported");
     expect(s.requests).toHaveLength(0);
-    expect(fs.readFileSync(journal, "utf8")).toContain(before.trim());
+    expectJournalAppended(journal, before);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
   }, 20_000);
 
@@ -271,19 +284,45 @@ describe("native activation window (offline; opted-in success needs exact native
     const s = await setup();
     const journal = path.join(s.dir, "actor.jsonl");
     const request = { model: "window-test/offline", actorId: "same-actor", sessionFile: journal, inferenceContext: "activation" as const, tools: ["read"], extensions: false, transport: "process" as const };
-    const first = await s.manager.run({ ...request, task: "FIRST_ACTIVATION" });
-    expect(first, JSON.stringify(first)).toMatchObject({ status: "completed" });
-    const before = fs.readFileSync(journal, "utf8");
-    const firstCount = s.requests.length;
-    const second = await s.manager.run({ ...request, task: "SECOND_ACTIVATION" });
-    expect(second, JSON.stringify(second)).toMatchObject({ status: "completed" });
-    const inputs = s.requests.slice(firstCount);
-    expect(inputs).toHaveLength(2);
-    expect(JSON.stringify(inputs)).not.toContain("FIRST_ACTIVATION");
-    expect(inputs[1]!.messages.map((m: {role: string}) => m.role)).toEqual(expect.arrayContaining(["user", "assistant", "tool"]));
-    expect(inputs[1]!.tools.map((t: {function: {name: string}}) => t.function.name)).toEqual(["read"]);
-    expect(fs.readFileSync(journal, "utf8")).toContain(before.trim());
-    expect(fs.readFileSync(journal, "utf8")).toContain("SECOND_ACTIVATION");
-    expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
+    const session = SessionManager.open(journal);
+    session.appendMessage(user("PRIOR_ACTIVATION"));
+    session.appendMessage(assistant("prior reply"));
+    let before = readJournal(journal);
+    for (const [task, excluded] of [
+      ["FIRST_ACTIVATION", "PRIOR_ACTIVATION"],
+      ["SECOND_ACTIVATION", "FIRST_ACTIVATION"],
+    ] as const) {
+      const requestStart = s.requests.length;
+      const result = await s.manager.run({ ...request, task });
+      expect(result, JSON.stringify(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      const inputs = s.requests.slice(requestStart);
+      expect(inputs).toHaveLength(2);
+      expect(JSON.stringify(inputs)).not.toContain(excluded);
+      expect(JSON.stringify(inputs)).not.toContain("PRIOR_ACTIVATION");
+      for (const input of inputs) {
+        expect(input.tools.map((tool: {function: {name: string}}) => tool.function.name)).toEqual(["read"]);
+      }
+      const conversation = (input: Record<string, any>) => input.messages.filter(
+        (message: {role: string}) => message.role !== "system" && message.role !== "developer",
+      );
+      const initial = conversation(inputs[0]!);
+      const continuation = conversation(inputs[1]!);
+      expect(initial.map((message: {role: string}) => message.role)).toEqual(["user"]);
+      expect(continuation.map((message: {role: string}) => message.role)).toEqual(["user", "assistant", "tool"]);
+      expect(continuation[0]).toEqual(initial[0]);
+      const text = (content: string | Array<{type: string; text?: string}>) => typeof content === "string"
+        ? content : content.map(part => part.type === "text" ? part.text : "").join("");
+      expect(text(initial[0].content)).toBe(task);
+      expect(continuation[1].tool_calls).toHaveLength(1);
+      const call = continuation[1].tool_calls[0];
+      expect(call).toMatchObject({ id: "read-current", type: "function", function: { name: "read" } });
+      expect(JSON.parse(call.function.arguments)).toEqual({ path: path.join(s.dir, "task.txt") });
+      expect(continuation[2].tool_call_id).toBe(call.id);
+      expect(text(continuation[2].content)).toBe("current tool result");
+      // OpenAI tool results identify their tool by the matching call ID, not a name field.
+      before = expectJournalAppended(journal, before);
+      expect(before.bytes.toString("utf8")).toContain(task);
+      expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
+    }
   }, 40_000);
 });

@@ -20,7 +20,7 @@ import { AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readJsonlPage } from "../log-tail.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
-import { FABRIC_ACTOR_HOST_EVENTS } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import type {
   FabricActorBindingScope,
   FabricActorDelivery,
@@ -93,6 +93,7 @@ interface ManagedActor {
   transport?: FabricAgentTransport;
   timeoutMs?: number;
   extensions?: boolean;
+  inferenceContext?: FabricActorInferenceContext;
   requirements: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
@@ -378,6 +379,7 @@ export class ActorManager {
     if (runner !== "pi" && runner !== "claude") {
       throw new Error(`Invalid Fabric actor runner: ${String(request.runner)}`);
     }
+    validateActorInferenceContext(request.inferenceContext, runner);
     const kernel = this.agents.resolveKernel({
       ...(request.kernel !== undefined ? { kernel: request.kernel } : {}),
       runner,
@@ -415,6 +417,7 @@ export class ActorManager {
       ...(request.transport ? { transport: request.transport } : {}),
       ...(request.timeoutMs ? { timeoutMs: request.timeoutMs } : {}),
       ...(typeof request.extensions === "boolean" ? { extensions: request.extensions } : {}),
+      ...(request.inferenceContext !== undefined ? { inferenceContext: request.inferenceContext } : {}),
       requirements,
       ...(request.validWhile ? { validWhile: structuredClone(request.validWhile) } : {}),
       latestActivationSequence: 0,
@@ -575,6 +578,17 @@ export class ActorManager {
   async setTools(id: string, tools: string[]): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     actor.tools = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
+    actor.updatedAt = Date.now();
+    await this.#publishPresence(actor);
+    return this.#publicInfo(actor);
+  }
+
+  /** Select future activation input without replacing the actor or its journal. */
+  async setInferenceContext(id: string, inferenceContext: FabricActorInferenceContext): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    validateActorInferenceContext(inferenceContext, actor.runner);
+    if (inferenceContext === undefined) throw new Error("inferenceContext is required");
+    actor.inferenceContext = inferenceContext;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -806,6 +820,7 @@ export class ActorManager {
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
+      ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.requirements.length > 0
         ? { requires: actor.requirements.map((requirement) => ({ ...requirement })) }
         : {}),
@@ -1271,6 +1286,7 @@ export class ActorManager {
       ) {
         const item = actor.queue.shift();
         if (!item) break;
+        const inferenceContext = actor.inferenceContext;
         actor.status = "running";
         actor.updatedAt = Date.now();
         delete actor.lastError;
@@ -1320,7 +1336,7 @@ export class ActorManager {
             delete actor.capabilityDigest;
           }
           const result = await this.agents.run(
-            this.#runRequest(actor, item, committedRefs, actor.capabilityDigest),
+            this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
           );
           runId = result.id;
@@ -1456,6 +1472,7 @@ export class ActorManager {
   #runRequest(
     actor: ManagedActor,
     item: ActorQueueItem,
+    inferenceContext: FabricActorInferenceContext | undefined,
     capabilityRequirements?: string[],
     capabilityDigest?: string,
   ): AgentRunRequest {
@@ -1471,6 +1488,7 @@ export class ActorManager {
       recursive: (actor.extensions ?? true) && actor.runner === "pi",
       extensions: actor.extensions ?? true,
       sessionFile: actor.sessionFile,
+      ...(inferenceContext !== undefined ? { inferenceContext } : {}),
       systemPrompt: this.#systemPrompt(actor),
       actorId: actor.id,
       actorName: actor.name,
@@ -1776,6 +1794,7 @@ export class ActorManager {
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
+      ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       requirements: actor.requirements,
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
@@ -1891,6 +1910,7 @@ export class ActorManager {
         (delivery === "steer" || delivery === "followUp") && record.triggerTurn === true;
       let requirements: FabricCapabilityRequirement[];
       try {
+        validateActorInferenceContext(record.inferenceContext, record.runner ?? "pi");
         requirements = normalizeCapabilityRequirements(
           Array.isArray(record.requirements) ? record.requirements : [],
         );
@@ -1944,6 +1964,7 @@ export class ActorManager {
           : {}),
         ...(typeof record.timeoutMs === "number" ? { timeoutMs: record.timeoutMs } : {}),
         ...(typeof record.extensions === "boolean" ? { extensions: record.extensions } : {}),
+        ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         requirements,
         ...(typeof record.capabilityDigest === "string"
           ? { capabilityDigest: record.capabilityDigest }
@@ -2057,6 +2078,7 @@ export class ActorManager {
       ...(actor.tools ? { tools: [...actor.tools] } : {}),
       timeoutMs: actor.timeoutMs ?? this.agents.config.timeoutMs,
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
+      ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       requirements: actor.requirements.map((requirement) => ({ ...requirement })),
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.missingCapabilities

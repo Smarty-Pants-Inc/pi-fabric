@@ -662,6 +662,12 @@ export class AgentManager {
     if (runner !== "pi" && runner !== "claude" && runner !== "veda") {
       throw new Error(`Unsupported Fabric agent runner: ${String(runner)}`);
     }
+    if (request.inferenceContext !== undefined && request.inferenceContext !== "full-history" && request.inferenceContext !== "activation") {
+      throw new Error("Invalid actor inference context");
+    }
+    if (request.inferenceContext === "activation" && (runner !== "pi" || !request.sessionFile || !request.actorId || request.sessionSeed)) {
+      throw new Error("Activation inference context requires a persistent Pi actor session");
+    }
     if (request.persona && runner !== "veda") {
       throw new Error(`The persona option is only supported by the Veda runner, not ${runner}`);
     }
@@ -853,6 +859,7 @@ export class AgentManager {
         ...(thinking ? ["--thinking", thinking] : []),
         ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
         ...(sessionFile ? ["--session-file", sessionFile] : []),
+        ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
         ...(sessionExportFile ? ["--session-export-file", sessionExportFile] : []),
         ...(inheritedSessionPins && inheritedSessionPins.length > 0
           ? ["--inherited-session-pins", serializeInheritedSessionPins(inheritedSessionPins)]

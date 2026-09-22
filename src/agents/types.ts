@@ -65,6 +65,8 @@ export interface AgentRunRequest {
   schema?: Record<string, unknown>;
   systemPrompt?: string;
   sessionFile?: string;
+  /** Host-owned actor activation policy, not a one-shot provider argument. */
+  inferenceContext?: "full-history" | "activation";
   actorId?: string;
   actorName?: string;
   capabilityRequirements?: string[];
@@ -212,6 +214,7 @@ export interface AgentWorkerOptions {
   thinking?: string;
   systemPrompt?: string;
   sessionFile?: string;
+  inferenceContext?: "full-history" | "activation";
   sessionExportFile?: string;
   actorId?: string;
   actorName?: string;

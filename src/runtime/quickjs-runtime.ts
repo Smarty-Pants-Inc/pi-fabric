@@ -506,6 +506,7 @@ globalThis.agents = Object.freeze({
   setThinking: (args) => __call("agents.setThinking", args),
   setTools: (args) => __call("agents.setTools", args),
   setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
+  setInferenceContext: (args) => __call("agents.setInferenceContext", args),
   setEvents: (args) => __call("agents.setEvents", args),
   setInstructions: (args) => __call("agents.setInstructions", args),
   actors: () => __call("agents.actors", {}),

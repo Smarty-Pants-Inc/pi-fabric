@@ -85,6 +85,48 @@ afterEach(async () => {
 });
 
 describe("ActorManager", () => {
+  it("updates inference context on the same identity, preserves policy/history, and restores it", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({
+      name: "window", instructions: "Keep quiet on hold; retain task refs.",
+      events: ["agent_settled"], topics: ["task.result"], tools: [], extensions: false,
+      thinking: "medium", responseMode: "directive", coalesce: false,
+    });
+    expect(actor.inferenceContext).toBeUndefined();
+    const before = s.actors.definition(actor.id);
+    const messages = s.actors.messages(actor.id);
+    const selected = await s.actors.setInferenceContext(actor.id, "activation");
+    expect(selected).toEqual({ ...actor, inferenceContext: "activation", updatedAt: selected.updatedAt });
+    expect(s.actors.definition(actor.id)).toEqual({ ...before, inferenceContext: "activation" });
+    expect(s.actors.messages(actor.id)).toEqual(messages);
+    await s.actors.close();
+    const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    expect(restored.status(actor.id)).toMatchObject({ id: actor.id, inferenceContext: "activation", extensions: false, tools: [] });
+    expect((await restored.setInferenceContext(actor.id, "full-history")).inferenceContext).toBe("full-history");
+    await expect(restored.setInferenceContext(actor.id, "invalid" as "activation")).rejects.toThrow(/inference context/);
+    await expect(restored.create({ name: "unsupported", instructions: "test", runner: "claude", inferenceContext: "activation" })).rejects.toThrow(/Pi runner/);
+  });
+
+  it("snapshots the policy per activation without enabling Fabric or changing its task", async () => {
+    const { actors, agents } = setup();
+    const run = vi.spyOn(agents, "run");
+    const actor = await actors.create({ name: "window", instructions: "Keep quiet", extensions: false, tools: [], inferenceContext: "activation" });
+    const pending = actors.ask(actor.id, "LIVE_WITH_PROGRESS");
+    expect(actors.status(actor.id).status).toBe("running");
+    // Change policy during the pre-launch await, not just after spawn.
+    await actors.setInferenceContext(actor.id, "full-history");
+    await waitFor(() => run.mock.calls.length === 1);
+    const first = run.mock.calls[0]![0];
+    expect(first).toMatchObject({ inferenceContext: "activation", extensions: false, recursive: false, tools: [], sessionFile: actor.sessionFile, actorId: actor.id });
+    await pending;
+    await actors.ask(actor.id, "next activation");
+    expect(run.mock.calls[1]![0].inferenceContext).toBe("full-history");
+    expect(run.mock.calls[1]![0].sessionFile).toBe(first.sessionFile);
+  });
+
   it("uses event monitoring where supported and polling fallback on Windows", async () => {
     const { mesh } = setup();
     const tail = vi.spyOn(mesh, "tail");

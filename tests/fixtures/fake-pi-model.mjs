@@ -11,6 +11,18 @@ let thinkingLevel = "low";
 let behavior = "success";
 const taskFile = process.env.FAKE_MODEL_SCENARIO;
 if (taskFile) behavior = fs.readFileSync(taskFile, "utf8");
+const activation = behavior.startsWith("activation:") ? behavior.slice("activation:".length) : undefined;
+if (activation) {
+  emit({ type: "fake_argv", argv: process.argv.slice(2) });
+  if (activation === "exit") process.exit(0);
+  if (activation !== "missing-hook" && activation !== "timeout") emit({
+    type: "fabric_activation_window_ready", runId: activation === "wrong-run" ? "wrong" : process.env.PI_FABRIC_PARENT_RUN,
+    nonce: activation === "wrong-nonce" ? "wrong" : process.env.PI_FABRIC_ACTIVATION_NONCE,
+    policy: activation === "wrong-policy" ? "full-history" : "activation",
+    hook: activation === "wrong-hook" ? "/wrong/hook" : process.env.PI_FABRIC_ACTIVATION_HOOK,
+    protocol: activation === "wrong-protocol" ? 2 : 1,
+  });
+}
 const decoder = new StringDecoder("utf8");
 let buffer = "";
 process.stdin.on("data", chunk => {
@@ -20,7 +32,7 @@ process.stdin.on("data", chunk => {
     const frame = JSON.parse(buffer.slice(0, index));
     buffer = buffer.slice(index + 1);
     emit({ type: "fake_received", frame });
-    if (behavior === "startup-timeout") continue;
+    if (behavior === "startup-timeout" || activation === "timeout") continue;
     const reply = (data, success = true) => emit({ type: "response", id: frame.id, command: frame.type, success, data, ...(success ? {} : { error: "model unavailable" }) });
     if (frame.type === "get_available_models") {
       reply({ models: [requested, wrong] });
@@ -36,7 +48,13 @@ process.stdin.on("data", chunk => {
       thinkingLevel = frame.level;
       reply();
     } else if (frame.type === "get_state") {
-      reply(behavior === "malformed" ? {} : { model, thinkingLevel, isStreaming: false });
+      reply(behavior === "malformed" ? {} : {
+        model, thinkingLevel, isStreaming: false, isCompacting: false,
+        ...(activation ? {
+          autoCompactionEnabled: activation === "still-enabled",
+          ...(activation === "ignored-flag" ? {} : { autoCompactionDisabledForProcess: true }),
+        } : {}),
+      });
     } else if (frame.type === "prompt") {
       emit({ type: "agent_start" });
       const actual = behavior === "drift" ? wrong : model;

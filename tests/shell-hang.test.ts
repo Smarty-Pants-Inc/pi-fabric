@@ -19,6 +19,7 @@ const invokeBash = async (
   hangMs: number,
   signal?: AbortSignal,
   extra: Record<string, unknown> = {},
+  update: (message: string) => void = () => {},
 ) => {
   const jobs = new FabricShellJobStore();
   stores.push(jobs);
@@ -45,7 +46,7 @@ const invokeBash = async (
           getSessionFile: () => undefined,
         },
       } as unknown as ExtensionContext,
-      update: () => undefined,
+      update,
       approve: async () => {},
       audits: [],
       maxResultChars: 100_000,
@@ -79,21 +80,35 @@ describe("pi.bash auto-spill", () => {
   });
 
   it("spills a hung command as ok:true with a live log and pid", async () => {
-    const { result, jobs } = await invokeBash("printf start; sleep 8; printf done", 120);
-    expect(result.ok).toBe(true);
-    expect(result.output).toContain("[Still running after ");
-    expect(result.output).toContain("Bounded live output (may be truncated):");
-    expect(result.details?.running).toBe(true);
-    expect(result.details?.logPath).toBeTruthy();
-    const logPath = result.details!.logPath!;
-    expect(fs.existsSync(logPath)).toBe(true);
-    const pid = result.details?.pid;
-    expect(pid).toEqual(expect.any(Number));
-    if (typeof pid === "number") {
-      expect(() => process.kill(pid, 0)).not.toThrow();
-      try { process.kill(-pid, "SIGKILL"); } catch { process.kill(pid, "SIGKILL"); }
+    // Start the hang clock only after real output proves the shell wrote its PID.
+    // Otherwise this fixture also tests whether platform startup fits the PID read window.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => { started = resolve; });
+      const pending = invokeBash("printf start; sleep 8; printf done", 120, undefined, {},
+        (message) => { if (message === "bash: start") started(); });
+      await ready;
+      await vi.advanceTimersByTimeAsync(120);
+      const { result, jobs } = await pending;
+      expect(result.ok).toBe(true);
+      expect(result.output).toContain("start");
+      expect(result.output).toContain("[Still running after ");
+      expect(result.output).toContain("Bounded live output (may be truncated):");
+      expect(result.details?.running).toBe(true);
+      expect(result.details?.logPath).toBeTruthy();
+      const logPath = result.details!.logPath!;
+      expect(fs.existsSync(logPath)).toBe(true);
+      const pid = result.details?.pid;
+      expect(pid).toEqual(expect.any(Number));
+      if (typeof pid === "number") {
+        expect(() => process.kill(pid, 0)).not.toThrow();
+        try { process.kill(-pid, "SIGKILL"); } catch { process.kill(pid, "SIGKILL"); }
+      }
+      expect(jobs.list().some((job) => job.status === "spilled")).toBe(true);
+    } finally {
+      vi.useRealTimers();
     }
-    expect(jobs.list().some((job) => job.status === "spilled")).toBe(true);
   });
 
   it("does not auto-spill when hangMs is 0", async () => {

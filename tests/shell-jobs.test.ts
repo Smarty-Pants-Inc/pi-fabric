@@ -134,8 +134,8 @@ describe("bounded shell lifecycle", () => {
 describe("raceShellHang", () => {
   it.each([79, 81])("resolves completion at %ims against the 80ms spill deadline", async (finishMs) => {
     vi.useFakeTimers();
-    const job = store().begin("bash", "echo");
     try {
+      const job = store().begin("bash", "echo");
       const pending = raceShellHang({
         hangMs: 80,
         parentSignal: undefined,

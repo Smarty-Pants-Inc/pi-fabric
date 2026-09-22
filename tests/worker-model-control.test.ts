@@ -23,6 +23,33 @@ const admit = (h: ReturnType<typeof setup>) => {
 };
 
 describe("Pi model admission", () => {
+  it.each([
+    { autoCompactionEnabled: true },
+    {},
+    { autoCompactionEnabled: false },
+    { autoCompactionEnabled: false, autoCompactionDisabledForProcess: false },
+    { autoCompactionEnabled: true, autoCompactionDisabledForProcess: true },
+    { autoCompactionEnabled: "false", autoCompactionDisabledForProcess: true },
+  ])("rejects unsupported activation compaction state %j before admission", data => {
+    const io = { send: vi.fn(), admitted: vi.fn(), observed: vi.fn(), fail: vi.fn() };
+    const control = new PiModelControl("activation", undefined, undefined, io, true);
+    control.start();
+    const frame = io.send.mock.calls[0]![0];
+    control.observe({ type: "response", id: frame.id, command: "get_state", success: true, data });
+    expect(io.admitted).not.toHaveBeenCalled();
+    expect(io.fail).toHaveBeenCalledWith(expect.stringContaining("--no-auto-compaction"));
+  });
+
+  it("requires native startup/ephemeral compaction readback even without a selected model", () => {
+    const io = { send: vi.fn(), admitted: vi.fn(), observed: vi.fn(), fail: vi.fn() };
+    const control = new PiModelControl("activation", undefined, undefined, io, true);
+    control.start();
+    expect(io.admitted).not.toHaveBeenCalled();
+    const frame = io.send.mock.calls[0]![0];
+    control.observe({ type: "response", id: frame.id, command: "get_state", success: true, data: { autoCompactionEnabled: false, autoCompactionDisabledForProcess: true, isStreaming: false, isCompacting: false } });
+    expect(io.admitted).toHaveBeenCalledOnce();
+  });
+
   it("waits for correlated RPC readiness without admitting the startup model", () => {
     const h = setup(requested, "high", false);
     expect(h.io.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ type: "get_state" }));

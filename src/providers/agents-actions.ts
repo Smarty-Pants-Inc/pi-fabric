@@ -362,6 +362,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         transport: runProperties.transport,
         timeoutMs: runProperties.timeoutMs,
         extensions: runProperties.extensions,
+        inferenceContext: { type: "string", enum: ["full-history", "activation"], description: "Inference-only activation window (Pi only); journals remain complete. Default full-history." },
         requires: {
           type: "array",
           maxItems: 128,
@@ -583,6 +584,21 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         scope: { type: "string", enum: ["project", "global"] },
       },
       required: ["id", "tools"],
+      additionalProperties: false,
+    },
+    risk: "agent",
+  },
+  {
+    name: "setInferenceContext",
+    description: "Select a same-ID actor inference policy for future activations. Running work keeps its snapshot; journals remain complete.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        inferenceContext: { type: "string", enum: ["full-history", "activation"] },
+        scope: { type: "string", enum: ["project", "global"] },
+      },
+      required: ["id", "inferenceContext"],
       additionalProperties: false,
     },
     risk: "agent",

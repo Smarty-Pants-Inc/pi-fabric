@@ -6,7 +6,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
-import { FABRIC_ACTOR_HOST_EVENTS } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, validateActorInferenceContext } from "./types.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
@@ -188,6 +188,11 @@ export class GlobalActorRegistry {
         : typeof existing.extensions === "boolean"
           ? { extensions: existing.extensions }
           : {}),
+      ...(patch.inferenceContext !== undefined
+        ? { inferenceContext: patch.inferenceContext }
+        : existing.inferenceContext !== undefined
+          ? { inferenceContext: existing.inferenceContext }
+          : {}),
       ...(patch.validWhile !== undefined
         ? { validWhile: patch.validWhile }
         : existing.validWhile
@@ -247,6 +252,7 @@ export class GlobalActorRegistry {
       ...(def.transport ? { transport: def.transport } : {}),
       ...(def.timeoutMs ? { timeoutMs: def.timeoutMs } : {}),
       ...(typeof def.extensions === "boolean" ? { extensions: def.extensions } : {}),
+      ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(def.validWhile ? { validWhile: clone(def.validWhile) } : {}),
     };
     return request;
@@ -298,6 +304,7 @@ export class GlobalActorRegistry {
       def.transport !== undefined && TRANSPORTS.has(def.transport) ? def.transport : undefined;
     const timeoutMs = typeof def.timeoutMs === "number" ? def.timeoutMs : undefined;
     const extensions = typeof def.extensions === "boolean" ? def.extensions : undefined;
+    validateActorInferenceContext(def.inferenceContext, runner);
     const requires = normalizeRequirements(def.requires);
     const validWhile = def.validWhile?.version === 1 &&
       typeof def.validWhile.source === "string" &&
@@ -325,6 +332,7 @@ export class GlobalActorRegistry {
       ...(timeoutMs ? { timeoutMs } : {}),
       ...(extensions !== undefined ? { extensions } : {}),
       ...(requires && requires.length > 0 ? { requires } : {}),
+      ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(validWhile ? { validWhile } : {}),
     };
   }
@@ -387,6 +395,7 @@ export class GlobalActorRegistry {
       const extensions = typeof record.extensions === "boolean" ? record.extensions : undefined;
       let requires: FabricCapabilityRequirement[] | undefined;
       try {
+        validateActorInferenceContext(record.inferenceContext, runner);
         requires = normalizeRequirements(record.requires);
       } catch {
         continue;
@@ -418,6 +427,7 @@ export class GlobalActorRegistry {
         ...(timeoutMs ? { timeoutMs } : {}),
         ...(extensions !== undefined ? { extensions } : {}),
         ...(requires && requires.length > 0 ? { requires } : {}),
+        ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         ...(validWhile ? { validWhile } : {}),
       };
       this.#actors.set(def.id, def);

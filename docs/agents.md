@@ -505,6 +505,23 @@ Choose one of these response modes:
 
 Delivery can stay in `mailbox` or enter the main session through `steer`, `followUp`, or `nextTurn`. For `steer` and `followUp`, explicitly set `triggerTurn: true | false`. A value of `true` starts Main when it is idle. A value of `false` is passive, and Fabric labels it as unable to start Main. The `mailbox` and `nextTurn` modes never start Main, so they reject `triggerTurn: true`. This policy keeps a delivered actor message from looking like a stalled continuation. Fabric applies no extra 8,000-character truncation to local actor or agent messages sent to Main. Standard limits for model context, providers, and cross-mesh event size still apply.
 
+### Inference history per activation
+
+Pi actors use full inference history by default. To exclude **prior activations** from model input without removing their journals, select `inferenceContext: "activation"` at creation or change the existing actor:
+
+```ts
+await agents.setInferenceContext({ id: actor.id, inferenceContext: "activation" });
+const selected = await agents.actorStatus({ id: actor.id });
+// Restore the default policy explicitly:
+await agents.setInferenceContext({ id: actor.id, inferenceContext: "full-history" });
+```
+
+Only the owner can change a live actor. The setting persists on the same ID and applies when the next activation starts; running work keeps its snapshot. `scope: "global"` changes a template. Export/import retains the policy but never imports history. The setting does not change instructions, model, effort, tools, subscriptions, checkpoints, delivery, quiet/hold rules, or retained task references.
+
+The native context hook removes the startup history prefix from inference input. The full session journal remains available, and all messages from the current activation—including complete tool calls and results across multiple model calls—remain in model input. This bounds accumulation from prior activations, **not total tokens in one activation**. `extensions: false` still excludes Fabric and project extensions; the worker adds only the projection hook, with no tools or trust expansion.
+
+Activation mode requires a Pi CLI with the process-local `--no-auto-compaction` option and its explicit `get_state` readback: `autoCompactionDisabledForProcess: true` and `autoCompactionEnabled: false`. This avoids old-history preflight compaction even with a large retained journal. Fabric never uses the persistent `set_auto_compaction` RPC setter. Unsupported runners/binaries, missing or mismatched hook readiness, and projection failure reject before inference. Manual compaction, unexpected threshold/overflow compaction, and session replacement are not supported during this mode. Compaction cannot bypass the projection to send historical context to a summarizer. A fatal projection/compaction error exits only the bound disposable child; the owner and retained journals remain intact. Oversized current activations must fail rather than compact or silently fall back to full history.
+
 The actor cannot change delivery from its response. The owner can update a live actor or global template and keep its history:
 
 ```ts

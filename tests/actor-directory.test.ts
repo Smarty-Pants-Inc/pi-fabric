@@ -86,6 +86,11 @@ describe("ActorDirectory", () => {
     expect(fs.existsSync(path.join(alpha.actorRoots.project, "actors.json"))).toBe(true);
     expect(fs.existsSync(path.join(alpha.actorRoots.session, "actors.json"))).toBe(true);
 
+    await alpha.directory.setInferenceContext(shared.id, "activation");
+    await alpha.directory.setInferenceContext(privateActor.id, "full-history");
+    expect(alpha.directory.status(shared.id).inferenceContext).toBe("activation");
+    expect(alpha.directory.status(privateActor.id).inferenceContext).toBe("full-history");
+
     const beta = open(root, "beta");
     expect(beta.directory.list()).toEqual([
       expect.objectContaining({ id: shared.id, scope: "project" }),

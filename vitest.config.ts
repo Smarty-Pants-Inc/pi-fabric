@@ -4,7 +4,7 @@ import { isolatedTestTemp } from "./scripts/test-temp.js";
 export default defineConfig({
   test: {
     environment: "node",
-    env: isolatedTestTemp("pi-fabric-vitest-"),
+    env: isolatedTestTemp("pi-fabric-vitest-", true),
     include: ["tests/**/*.test.ts"],
     maxWorkers: 2,
     // Real worker processes and cold TypeScript compilers share this suite.

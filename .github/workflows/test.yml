@@ -12,6 +12,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # Diagnostic successor only: no MSYS process is started before a real test shell.
+      PI_TEST_TEMP_CAPTURE: ${{ matrix.os == 'windows-latest' && '1' || '0' }}
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4

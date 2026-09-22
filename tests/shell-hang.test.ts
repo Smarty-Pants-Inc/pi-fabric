@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getShellConfig, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { captureAfterShell, captureEnabled, captureRecord } from "../scripts/test-temp-capture.mjs";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
@@ -8,10 +9,15 @@ import { normalizeFabricConfig } from "../src/config.js";
 
 const stores: FabricShellJobStore[] = [];
 const registries: ActionRegistry[] = [];
+let completedShell: { shell: string; output: string } | undefined;
 
 afterEach(async () => {
   // A runner timeout does not unwind an async test's finally block.
   vi.useRealTimers();
+  if (completedShell) {
+    captureAfterShell(completedShell.shell, completedShell.output);
+    completedShell = undefined;
+  }
   await Promise.all(registries.splice(0).map((registry) => registry.close()));
   await Promise.all(stores.splice(0).map((jobs) => jobs.close()));
 });
@@ -63,6 +69,10 @@ const invokeBash = async (
       elapsedMs?: number;
     } | null;
   };
+  if (captureEnabled()) {
+    try { completedShell = { shell: getShellConfig().shell, output: result.output }; }
+    catch (error) { captureRecord("shell-resolver-error", { error: String(error).slice(0, 2048) }); }
+  }
   return { result, jobs };
 };
 

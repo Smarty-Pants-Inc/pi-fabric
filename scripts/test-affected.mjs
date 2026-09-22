@@ -9,6 +9,7 @@
 // (bun run test:smoke) so a Linux or Windows break still surfaces quickly.
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import { beginDriverCapture, captureBoundary, captureEnabled } from "./test-temp-capture.mjs";
 
 const argv = process.argv.slice(2);
 const baseIndex = argv.indexOf("--base");
@@ -93,8 +94,21 @@ if (argv.includes("--dry-run")) {
   console.log("dry run: selection printed, nothing executed");
   process.exit(0);
 }
+const endCapture = beginDriverCapture();
+const previousPhase = process.env.PI_TEST_TEMP_PHASE;
+let failed = false;
 try {
-  for (const args of runs) execFileSync("bunx", args, { stdio: "inherit" });
+  for (const args of runs) {
+    if (captureEnabled()) process.env.PI_TEST_TEMP_PHASE = args[1] === "related" ? "related" : "direct";
+    captureBoundary("driver-before-child");
+    try { execFileSync("bunx", args, { stdio: "inherit" }); }
+    finally { captureBoundary("driver-after-child"); }
+  }
 } catch {
-  process.exit(1);
+  failed = true;
+} finally {
+  endCapture();
+  if (previousPhase === undefined) delete process.env.PI_TEST_TEMP_PHASE;
+  else process.env.PI_TEST_TEMP_PHASE = previousPhase;
 }
+if (failed) process.exit(1);

@@ -27,10 +27,15 @@ export const wrapShellCommandForPid = (
   command: string,
   pidPath: string,
   tool: PiShellToolName,
-): string =>
-  tool === "powershell"
-    ? `Set-Content -LiteralPath ${powershellQuote(pidPath)} -Value $PID\n${command}`
-    : `printf '%s\\n' "$$" > ${posixQuote(pidPath)}\n${command}`;
+  platform: NodeJS.Platform = process.platform,
+): string => {
+  if (tool === "powershell") {
+    return `Set-Content -LiteralPath ${powershellQuote(pidPath)} -Value $PID\n${command}`;
+  }
+  // Git Bash's $$ is an MSYS PID, not necessarily the Windows PID used by Node.
+  const pid = platform === "win32" ? "$(</proc/$$/winpid)" : "$$";
+  return `printf '%s\\n' "${pid}" > ${posixQuote(pidPath)}\n${command}`;
+};
 
 export const formatShellHangNotice = (input: {
   elapsedMs: number;

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
@@ -65,10 +65,17 @@ const invokeBash = async (
 
 describe("pi.bash auto-spill", () => {
   it("lets a short command pass through unchanged", async () => {
-    const { result } = await invokeBash('printf "hi\\n"', 80);
-    expect(result.ok).toBe(true);
-    expect(result.output).toBe("hi\n");
-    expect(result.details).not.toMatchObject({ running: true });
+    // ponytail: shell startup is real I/O, not an 80ms platform benchmark.
+    // Control JS timers while retaining real shell I/O; shell-jobs tests exercise the deadline.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { result } = await invokeBash('printf "hi\\n"', 80);
+      expect(result.ok).toBe(true);
+      expect(result.output).toBe("hi\n");
+      expect(result.details).not.toMatchObject({ running: true });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("spills a hung command as ok:true with a live log and pid", async () => {

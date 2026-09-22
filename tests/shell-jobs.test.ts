@@ -132,17 +132,28 @@ describe("bounded shell lifecycle", () => {
 });
 
 describe("raceShellHang", () => {
-  it("returns the execute result when the command finishes first", async () => {
-    const jobs = store();
-    const job = jobs.begin("bash", "echo");
-    const result = await raceShellHang({
-      hangMs: 200,
-      parentSignal: undefined,
-      job,
-      execute: async () => "ok",
-    });
-    expect(result).toEqual({ status: "done", value: "ok" });
-    await job.finish(0);
+  it.each([79, 81])("resolves completion at %ims against the 80ms spill deadline", async (finishMs) => {
+    vi.useFakeTimers();
+    const job = store().begin("bash", "echo");
+    try {
+      const pending = raceShellHang({
+        hangMs: 80,
+        parentSignal: undefined,
+        job,
+        execute: () => new Promise<string>((resolve) => setTimeout(() => resolve("ok"), finishMs)),
+      });
+      await vi.advanceTimersByTimeAsync(79);
+      expect(job.spilled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await pending).toEqual(finishMs < 80
+        ? { status: "done", value: "ok" }
+        : { status: "spilled" });
+      expect(job.spilled).toBe(finishMs > 80);
+      await vi.advanceTimersByTimeAsync(1);
+      await job.finish(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("spills when the hang budget elapses first", async () => {

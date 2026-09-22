@@ -23,18 +23,26 @@ class FixedEntryTests(unittest.TestCase):
     def report(self):
         cases = [{'title': n, 'status': 'passed'} for n in entry.REQUIRED]
         cases += [{'title': f'other source case {i}', 'status': 'passed'} for i in range(20)]
-        cases += [{'title': 'rejects an old native CLI that ignores the flag even when global compaction is already false', 'status': 'pending'}]
+        cases += [{'title': 'rejects an old native CLI that ignores the flag even when global compaction is already false', 'status': 'skipped'}]
         return {'success': True, 'numPassedTests': 25, 'numPendingTests': 1,
                 'testResults': [{'assertionResults': cases}]}
 
     def test_exact_five_and_only_expected_skip(self):
         entry.check_report(self.report())
 
+    def test_other_nonpassed_status_is_not_the_allowed_skip(self):
+        for status in ('pending', 'todo', 'failed'):
+            with self.subTest(status=status):
+                data = self.report()
+                data['testResults'][0]['assertionResults'][-1]['status'] = status
+                with self.assertRaises(AssertionError):
+                    entry.check_report(data)
+
     def test_each_required_case_cannot_skip(self):
         for i in range(5):
             with self.subTest(case=i):
                 data = self.report()
-                data['testResults'][0]['assertionResults'][i]['status'] = 'pending'
+                data['testResults'][0]['assertionResults'][i]['status'] = 'skipped'
                 data['testResults'][0]['assertionResults'][-1]['status'] = 'passed'
                 with self.assertRaises(AssertionError):
                     entry.check_report(data)

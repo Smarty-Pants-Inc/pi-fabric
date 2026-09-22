@@ -1,0 +1,67 @@
+name: Fabric fixed-artifact native qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fabric10718135458-native
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'Smarty-Pants-Inc/pi-fabric' && github.repository_id == '1376784717' && github.ref == 'refs/heads/main' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout reviewed qualification helpers only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Place reviewed fixed Node tool
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        timeout-minutes: 2
+        with:
+          node-version: 24.18.0
+      - name: Place reviewed fixed Bun tool
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        timeout-minutes: 2
+        with:
+          bun-version: 1.4.0
+
+      # REQUIRED INTERFACE, currently UNBOUND: credential administrator supplies
+      # a short-lived Actions-read token scoped to the two fixed repositories.
+      # Signing key stays off-runner; this is not permission to create a secret.
+      - name: Place two fixed artifacts under new destination intent
+        env:
+          GH_TOKEN: ${{ secrets.FABRIC_QUALIFICATION_ARTIFACT_READ_TOKEN }}
+        run: timeout --kill-after=5s 120s python3 -I -B .github/scripts/fabric-fixed-native.py receive
+
+      - name: Verify and stage complete fixed closures as DATA
+        run: timeout --kill-after=5s 240s python3 -I -B .github/scripts/fabric-fixed-native.py stage
+
+      # No artifact dependency install or rebuild. Setup above reuses the exact
+      # reviewed tool route; the helper verifies actual paths/bytes/versions.
+      - name: Run native four and omitted-history case once
+        run: timeout --kill-after=5s 210s python3 -I -B .github/scripts/fabric-fixed-native.py qualify
+
+      - name: Retain bounded qualification evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fabric10718135458-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/fabric10718135458-native/*-INTENT.json
+            ${{ runner.temp }}/fabric10718135458-native/BODY-*.json
+            ${{ runner.temp }}/fabric10718135458-native/*VERIFIED.json
+            ${{ runner.temp }}/fabric10718135458-native/NATIVE-RESULT.json
+            ${{ runner.temp }}/fabric10718135458-native/native.stdout
+            ${{ runner.temp }}/fabric10718135458-native/native.stderr
+            ${{ runner.temp }}/fabric10718135458-native/state/output/vitest.json
+          if-no-files-found: error
+          retention-days: 1

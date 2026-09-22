@@ -34,12 +34,9 @@ jobs:
         with:
           bun-version: 1.4.0
 
-      # REQUIRED INTERFACE, currently UNBOUND: credential administrator supplies
-      # a short-lived Actions-read token scoped to the two fixed repositories.
-      # Signing key stays off-runner; this is not permission to create a secret.
-      - name: Place two fixed artifacts under new destination intent
-        env:
-          GH_TOKEN: ${{ secrets.FABRIC_QUALIFICATION_ARTIFACT_READ_TOKEN }}
+      # Anonymous native GitHub release transport. Exact release/asset identities
+      # and accepted hashes are source-pinned; mutable release drift must fail.
+      - name: Place fixed Fabric ZIP and Pi inner archive under new destination intent
         run: timeout --kill-after=5s 120s python3 -I -B .github/scripts/fabric-fixed-native.py receive
 
       - name: Verify and stage complete fixed closures as DATA

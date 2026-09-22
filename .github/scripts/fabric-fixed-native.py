@@ -26,11 +26,16 @@ FABRIC_MANIFEST = '3876be84809fe45f50b14de1b5466871f8fe2a830aaa1eb264c8a00efe5bc
 PI_MANIFEST = '7610f9e84405e672158ff874f317ccad1435c211d875e1a98a6b6325611ede4d'
 PI_ARCHIVE = '4702a03ec015a0134d2a5b57e983be3a9d4fbb8a8adfba9609ca6c8268803a03'
 CLI = 'node/node_modules/@earendil-works/pi-coding-agent/dist/cli.js'
-ARTIFACTS = (
-    ('pi-fabric', 10718135458, 35780469006, '999936a251b97a6c057cf28f2665ed471941e85b', 119276501,
-     '2501a67279b6675d68bf983e9952e7980e04a9f5109171a0b46cf17c6883ebb0'),
-    ('pi', 10682730383, 35699431258, '6b4b7d4217253f890eead284c0fcebff9a0192c2', 38631527,
-     'e5691a43f8ff35700a99249a154f3828411a07145316564e81c36a091bb7f9d5'),
+RELEASE_API = 'https://api.github.com/repos/Smarty-Pants-Inc/pi-fabric'
+RELEASE_TAG = 'qualification-inputs-10718135458-10682730383'
+RELEASE_COMMIT = '999936a251b97a6c057cf28f2665ed471941e85b'
+# Bound to the sole publisher's authenticated published/tag/asset readback.
+# Repository immutability is not required; every selected identity must match.
+RELEASE_ID = 394152047
+RELEASE_ASSET_IDS = {'artifact-10718135458.zip': 582338616, 'node-stage.tar.gz': 582338748}
+ASSETS = (
+    ('artifact-10718135458.zip', 119276501, '2501a67279b6675d68bf983e9952e7980e04a9f5109171a0b46cf17c6883ebb0'),
+    ('node-stage.tar.gz', 38603868, PI_ARCHIVE),
 )
 TOOLS = {'node': '41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c',
          'bun': '33d56b070be6a9e3da0ab013038b43d1645d0534ca811ecdba4472599117eb4b'}
@@ -71,49 +76,59 @@ def deadline(*args):
 
 
 def receive(d):
-    # Preflight BOTH repositories before either body effect. Repository-scoped
-    # GITHUB_TOKEN must not be assumed to authorize the sibling Pi artifact.
-    token = os.environ['GH_TOKEN']
-    assert token
-    opener = urllib.request.build_opener(NoRedirect)
-    headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
-               'X-GitHub-Api-Version': '2022-11-28'}
-    metadata = []
-    for repo, aid, run, commit, size, digest in ARTIFACTS:
-        url = f'https://api.github.com/repos/Smarty-Pants-Inc/{repo}/actions/artifacts/{aid}'
-        with opener.open(urllib.request.Request(url, headers=headers), timeout=10) as response:
+    assert type(RELEASE_ID) is int and RELEASE_ID > 0, 'Release identity unbound'
+    assert set(RELEASE_ASSET_IDS) == {row[0] for row in ASSETS}
+    assert all(type(aid) is int and aid > 0 for aid in RELEASE_ASSET_IDS.values()), 'Asset identities unbound'
+    assert len(set(RELEASE_ASSET_IDS.values())) == len(ASSETS)
+    # Anonymous native GitHub transport only: no token, netrc or ambient proxy.
+    opener = urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))
+    headers = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+    def metadata(path):
+        with opener.open(urllib.request.Request(RELEASE_API + path, headers=headers), timeout=10) as response:
             raw = response.read(1024**2 + 1)
         assert len(raw) <= 1024**2
-        item = json.loads(raw)
-        assert item['id'] == aid and not item['expired'] and item['size_in_bytes'] == size
-        assert item['digest'] == 'sha256:' + digest
-        assert item['workflow_run']['id'] == run and item['workflow_run']['head_sha'] == commit
-        metadata.append(item)
+        return json.loads(raw)
+    release = metadata(f'/releases/{RELEASE_ID}')
+    ref = metadata('/git/ref/tags/' + RELEASE_TAG)
+    assert release['id'] == RELEASE_ID and release['tag_name'] == RELEASE_TAG
+    assert release['target_commitish'] == RELEASE_COMMIT and not release['draft'] and release['prerelease']
+    assert ref['ref'] == 'refs/tags/' + RELEASE_TAG
+    assert ref['object']['type'] == 'commit' and ref['object']['sha'] == RELEASE_COMMIT
+    declared = {asset['name']: asset for asset in release['assets']}
+    assert len(declared) == len(release['assets']) == len(ASSETS) and set(declared) == set(RELEASE_ASSET_IDS)
+    for name, size, digest in ASSETS:
+        asset = declared[name]
+        assert asset['id'] == RELEASE_ASSET_IDS[name] and asset['state'] == 'uploaded'
+        assert asset['size'] == size and asset['digest'] == 'sha256:' + digest
+        assert asset['url'] == RELEASE_API + '/releases/assets/' + str(asset['id'])
+        assert asset['browser_download_url'] == 'https://github.com/Smarty-Pants-Inc/pi-fabric/releases/download/' + RELEASE_TAG + '/' + name
     save(d / 'DESTINATION-PLACEMENT-INTENT.json', {
-        'operation': 'NEW_DESTINATION_PLACEMENT_NOT_DEV1_RETRY', 'run': os.environ['GITHUB_RUN_ID'],
-        'attempt': 1, 'artifacts': metadata, 'bodyGetsPerArtifact': 1, 'retry': False,
+        'operation': 'NEW_DESTINATION_RELEASE_PLACEMENT_NOT_DEV1_RETRY', 'run': os.environ['GITHUB_RUN_ID'],
+        'attempt': 1, 'releaseId': RELEASE_ID, 'tag': RELEASE_TAG, 'target': RELEASE_COMMIT,
+        'assets': list(declared.values()), 'bodyGetsPerAsset': 1, 'retry': False,
+        'sourceArtifactIds': [10718135458, 10682730383], 'piOperand': 'accepted inner node-stage.tar.gz, not outer diagnostic ZIP',
         'destination': str(d), 'closureEntryCap': 200000, 'expandedLayerBytesCap': 2 * 1024**3,
         'perBodyWallSeconds': 45, 'perBodyWireCap': CAP,
     })
-    for repo, aid, run, commit, size, digest in ARTIFACTS:
+    for name, size, digest in ASSETS:
         signal.alarm(45)
         started = time.monotonic()
-        url = f'https://api.github.com/repos/Smarty-Pants-Inc/{repo}/actions/artifacts/{aid}/zip'
+        aid = RELEASE_ASSET_IDS[name]
+        request = urllib.request.Request(RELEASE_API + f'/releases/assets/{aid}', headers={'Accept': 'application/octet-stream'})
         try:
-            response = opener.open(urllib.request.Request(url, headers=headers), timeout=10)
-            response.close()
-            raise ValueError('Expected exactly one signed storage redirect')
+            response = opener.open(request, timeout=10)
         except urllib.error.HTTPError as error:
             assert error.code == 302
             location = error.headers['Location']
-        target = urllib.parse.urlsplit(location)
-        assert target.scheme == 'https' and target.hostname and target.port in (None, 443)
-        assert not target.username and not target.password
-        assert target.hostname.endswith(('.blob.core.windows.net', '.actions.githubusercontent.com'))
+            target = urllib.parse.urlsplit(location)
+            assert target.scheme == 'https' and target.port in (None, 443)
+            assert not target.username and not target.password
+            assert target.hostname in ('release-assets.githubusercontent.com', 'objects.githubusercontent.com')
+            # At most this one redirect; fresh credential-free storage request.
+            response = opener.open(urllib.request.Request(location), timeout=10)
         count = 0
-        body = d / f'artifact-{aid}.zip'
-        # A separate request has NO token/header inheritance; no redirects/retry.
-        with opener.open(urllib.request.Request(location), timeout=10) as response, body.open('xb') as output:
+        body = d / name
+        with response, body.open('xb') as output:
             assert response.status == 200
             while chunk := response.read(1024**2):
                 count += len(chunk)
@@ -123,21 +138,13 @@ def receive(d):
             os.fsync(output.fileno())
         assert count == size and sha(body) == digest
         signal.alarm(0)
-        save(d / f'BODY-{aid}.json', {'bytes': count, 'sha256': digest,
+        save(d / f'BODY-{aid}.json', {'asset': name, 'bytes': count, 'sha256': digest,
                                     'elapsedSeconds': time.monotonic() - started})
 
 
 def stage_pi(d):
-    with zipfile.ZipFile(d / 'artifact-10682730383.zip') as z:
-        names = z.namelist()
-        assert len(names) == len(set(names)) <= 200000
-        assert sum(i.file_size for i in z.infolist()) <= 2 * 1024**3
-        item = z.getinfo('node-stage.tar.gz')
-        assert item.file_size <= CAP and not item.flag_bits & 1
-        archive = d / 'node-stage.tar.gz'
-        with z.open(item) as source, archive.open('xb') as out:
-            shutil.copyfileobj(source, out, 1024**2)
-    assert sha(archive) == PI_ARCHIVE
+    archive = d / 'node-stage.tar.gz'
+    assert archive.stat().st_size == 38603868 and sha(archive) == PI_ARCHIVE
     target = d / 'pi'
     with tarfile.open(archive, 'r:gz') as t:
         members = t.getmembers()

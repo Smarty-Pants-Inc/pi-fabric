@@ -67,6 +67,9 @@ describe("activation projection", () => {
       process.env.PI_FABRIC_ACTIVATION_NONCE = 'test-only-nonce';
       process.env.PI_FABRIC_PARENT_RUN = 'test-run';
       process.env.PI_FABRIC_ACTIVATION_HOOK = ${JSON.stringify(fs.realpathSync(hook))};
+      // Match native RPC's output guard, rather than allowing a logging write
+      // to masquerade as the protocol readiness ACK.
+      process.stdout.write = process.stderr.write.bind(process.stderr);
       const handlers = new Map();
       try { hook({on(name, fn) { if (${JSON.stringify(mode)} === 'registration') throw new Error('registration failed'); handlers.set(name, fn); }}); }
       catch {} // The real loader also catches registration errors.
@@ -85,6 +88,14 @@ describe("activation projection", () => {
     const result = spawnSync(process.execPath, [child], { encoding: "utf8" });
     expect(result.status, result.stderr).toBe(78);
     expect(result.stderr).toContain("Fabric activation window failed");
+    if (mode === "boundary") {
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        type: "fabric_activation_window_ready", runId: "test-run",
+        nonce: "test-only-nonce", policy: "activation", protocol: 1,
+        hook: fs.realpathSync(hook),
+      });
+      expect(result.stderr).not.toContain("fabric_activation_window_ready");
+    }
     expect(fs.existsSync(requestCounter)).toBe(false);
   });
 
@@ -236,7 +247,9 @@ describe("native activation window (offline; opted-in success needs exact native
     const journal = path.join(s.dir, "actor.jsonl");
     const session = SessionManager.open(journal);
     session.appendMessage(user("OLD_MANUAL_HISTORY " + "x".repeat(160_000)));
-    session.appendMessage(assistant("old reply", 90_000));
+    // Exceed the native 20k keep-recent budget in the reply too, so native
+    // preparation has a real split-turn summary and reaches the blocking hook.
+    session.appendMessage(assistant("old reply " + "y".repeat(100_000), 90_000));
     const before = readJournal(journal);
     const hook = fs.realpathSync(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER
       ? path.join(path.dirname(path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER)), "worker/activation-window.js")

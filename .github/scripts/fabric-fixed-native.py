@@ -240,7 +240,8 @@ def check_report(data):
     cases = [case for suite in data['testResults'] for case in suite['assertionResults']]
     assert len(cases) == 26 and sum(c['status'] == 'passed' for c in cases) == 25
     skipped = [c for c in cases if c['status'] != 'passed']
-    assert len(skipped) == 1 and skipped[0]['status'] == 'pending'
+    # Vitest 4 reports a skipped assertion as "skipped" (numPendingTests is 1).
+    assert len(skipped) == 1 and skipped[0]['status'] == 'skipped'
     assert skipped[0]['title'] == 'rejects an old native CLI that ignores the flag even when global compaction is already false'
     for name in REQUIRED:
         matches = [c for c in cases if c['title'] == name]

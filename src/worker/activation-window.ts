@@ -59,7 +59,9 @@ export default function activationWindow(pi: ExtensionAPI): void {
           throw new Error("Activation window requires a fresh Fabric RPC worker");
         }
         window = new ActivationWindow(buildSessionContext(ctx.sessionManager.getBranch()).messages);
-        process.stdout.write(`${JSON.stringify({
+        // Pi redirects ordinary stdout writes to stderr in RPC mode. This bound
+        // protocol ACK must use stdout itself, not the redirected logging stream.
+        fs.writeSync(1, `${JSON.stringify({
           type: "fabric_activation_window_ready",
           runId: process.env.PI_FABRIC_PARENT_RUN,
           nonce: process.env.PI_FABRIC_ACTIVATION_NONCE,

@@ -56,3 +56,13 @@ jobs:
         # break surfaces even when the affected selection is empty.
         # Includes optional-preview-startup: cold import/idle and first use.
         run: bun run test:smoke
+
+  smarty-ci:
+    name: smarty-ci
+    if: ${{ always() }}
+    needs: [check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every matrix check to succeed
+        run: test '${{ needs.check.result }}' = success

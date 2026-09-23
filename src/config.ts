@@ -246,6 +246,8 @@ export interface FabricRetentionConfig {
 export interface FabricMeshConfig {
   enabled: boolean;
   root?: string;
+  /** Publish the Main participant at session start instead of on first Fabric use. */
+  announce: boolean;
   actorScope: FabricActorScope;
   maxEventBytes: number;
   maxReadEvents: number;
@@ -470,6 +472,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   mesh: {
     enabled: true,
+    announce: false,
     actorScope: "project",
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
@@ -1106,6 +1109,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     mesh: {
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
+      announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
       actorScope: actorScopeValue(mesh.actorScope, DEFAULT_FABRIC_CONFIG.mesh.actorScope),
       maxEventBytes: boundedInteger(
         mesh.maxEventBytes,

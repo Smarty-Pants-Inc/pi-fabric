@@ -213,6 +213,9 @@ export class FabricState {
     }
     const sessionId = context.sessionManager.getSessionId();
     if (resolveFabricIdentity(sessionId).identity.kind !== "main") return false;
+    // Publish this Main in the shared participant directory at startup, so
+    // peers can find and steer an idle session before it first uses Fabric.
+    if (this.config.mesh.announce) return true;
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
     const meshRoot = process.env.PI_FABRIC_MESH_ROOT ??
       (this.config.mesh.root

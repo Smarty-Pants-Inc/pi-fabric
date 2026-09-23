@@ -245,6 +245,32 @@ describe("FabricState lazy bootstrap", () => {
     vi.unstubAllEnvs();
   });
 
+  it("announces a trusted Main at startup only when mesh.announce is set", async () => {
+    const quiet = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true } });
+    const quietState = createState(runtimeHarness().loader);
+    const quietContext = contextAt(quiet);
+    await quietState.bootstrap(quietContext);
+    // Isolate from a Fabric child environment that runs this suite.
+    for (const name of ["PI_FABRIC_ACTOR_ID", "PI_FABRIC_PARENT_RUN", "PI_FABRIC_CAPABILITY_REQUIREMENTS", "PI_FABRIC_CAPABILITY_DIGEST", "PI_FABRIC_PROJECT_ROOT"]) {
+      vi.stubEnv(name, undefined);
+    }
+    vi.stubEnv("PI_FABRIC_MESH_ROOT", path.join(quiet, ".pi", "fabric", "mesh"));
+    expect(quietState.shouldEagerlyActivate(quietContext)).toBe(false);
+
+    const shared = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true, announce: true } });
+    const sharedState = createState(runtimeHarness().loader);
+    const sharedContext = contextAt(shared);
+    await sharedState.bootstrap(sharedContext);
+    expect(sharedState.shouldEagerlyActivate(sharedContext)).toBe(true);
+    // Nested agents and actors never announce themselves as roots.
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "agent-child");
+    expect(sharedState.shouldEagerlyActivate(sharedContext)).toBe(false);
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", undefined);
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "actor-child");
+    expect(sharedState.shouldEagerlyActivate(sharedContext)).toBe(false);
+    vi.unstubAllEnvs();
+  });
+
   it("eagerly activates configured components before the first turn", async () => {
     const cwd = project({
       components: [{ id: "model-guidance", component: "model-guidance" }],

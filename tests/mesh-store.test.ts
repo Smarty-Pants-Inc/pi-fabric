@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -286,15 +287,67 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it("never sweeps a lock owned by a live process and times out instead", async () => {
+  it("respects a live owner inside its lease and times out instead", async () => {
     const store = createStore({ lockTimeoutMs: 300 });
-    const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now() - 60_000}\n`);
+    const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now()}\n`);
 
     await expect(
       store.publish({ topic: "team.auth", from: identity, text: "blocked" }),
     ).rejects.toThrow("Timed out waiting for the Fabric mesh lock");
     expect(fs.existsSync(lockPath)).toBe(true);
     expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`${process.pid}\n`);
+  });
+
+  // A live but signal-stopped or wedged holder must not freeze every mesh participant.
+  it("takes over an expired lease even while its owner process is still alive", async () => {
+    const store = createStore({ lockTimeoutMs: 1_000 });
+    const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now() - 60_000}\n`);
+
+    const event = await store.publish({ topic: "team.auth", from: identity, text: "recovered" });
+
+    expect(event.sequence).toBe(1);
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "takes over from a SIGSTOPped holder once its lease expires",
+    async () => {
+      const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      try {
+        await new Promise((resolve) => holder.once("spawn", resolve));
+        process.kill(holder.pid!, "SIGSTOP");
+        const store = createStore({ lockTimeoutMs: 3_000, staleLockMs: 200 });
+        holdLock(store, `stopped\n${holder.pid}\n${Date.now()}\n`);
+
+        const started = Date.now();
+        const event = await store.publish({ topic: "team.auth", from: identity, text: "recovered" });
+
+        expect(event.sequence).toBe(1);
+        expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+      } finally {
+        try { process.kill(holder.pid!, "SIGCONT"); } catch {}
+        holder.kill("SIGKILL");
+      }
+    },
+  );
+
+  it("refuses to commit once its lease was taken over, leaving the new holder's lock", async () => {
+    const store = createStore();
+    const lockPath = path.join(store.root, ".lock");
+    // jsonClone(identity) runs inside the critical section: simulate a takeover there.
+    const takenOver = {
+      ...identity,
+      toJSON() {
+        fs.writeFileSync(path.join(lockPath, "owner"), `newer\n${process.pid}\n${Date.now()}\n`);
+        return identity;
+      },
+    } as unknown as MeshIdentity;
+
+    await expect(
+      store.put({ key: "state/a", value: { ready: true }, identity: takenOver }),
+    ).rejects.toThrow("Fabric mesh lock lease expired before commit");
+    expect(store.get("state/a")).toBeUndefined();
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toMatch(/^newer\n/);
   });
 
   it("waits out a fresh ownerless lock instead of sweeping an in-flight acquisition", async () => {

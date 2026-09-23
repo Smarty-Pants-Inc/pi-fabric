@@ -56,7 +56,11 @@ export interface MeshStoreOptions {
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 const LOCK_TIMEOUT_MS = 10_000;
-const STALE_LOCK_MS = 30_000;
+// Lock lease. Every critical section is one synchronous file operation, so a running
+// holder releases within milliseconds; an older lock belongs to a dead, signal-stopped
+// or wedged holder and is taken over. Kept below LOCK_TIMEOUT_MS so waiters recover
+// before they time out.
+const STALE_LOCK_MS = 5_000;
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
@@ -72,16 +76,6 @@ const errorCode = (error: unknown): string | undefined =>
   error instanceof Error && "code" in error && typeof error.code === "string"
     ? error.code
     : undefined;
-
-const processAlive = (pid: number): boolean => {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-};
 
 const jsonClone = <T>(value: T): T => {
   const serialized = JSON.stringify(value);
@@ -215,6 +209,7 @@ export class MeshStore {
   readonly #maxStateTombstones: number;
   readonly #lockTimeoutMs: number;
   readonly #staleLockMs: number;
+  #heldLockToken: string | undefined;
   #stateCache:
     | { device: number; inode: number; size: number; modifiedAt: number; state: MeshStateFile }
     | undefined;
@@ -283,6 +278,7 @@ export class MeshStore {
       if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
         throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
       }
+      this.#assertLockHeld();
       fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
       atomicWrite(this.#counterPath, sequence);
       this.#compactEventLog();
@@ -559,6 +555,7 @@ export class MeshStore {
       state.versions[input.key] = entry.version;
       state.tombstoneOrder = (state.tombstoneOrder ?? []).filter((key) => key !== input.key);
       compactStateTombstones(state, this.#maxStateTombstones);
+      this.#assertLockHeld();
       atomicWrite(this.#statePath, state, this.#maxStateBytes);
       this.#cacheState(state);
       return jsonClone(entry);
@@ -601,6 +598,7 @@ export class MeshStore {
         input.key,
       ];
       compactStateTombstones(state, this.#maxStateTombstones);
+      this.#assertLockHeld();
       atomicWrite(this.#statePath, state, this.#maxStateBytes);
       this.#cacheState(state);
       return { deleted: true, version: existing.version };
@@ -665,9 +663,11 @@ export class MeshStore {
         await delay(10);
       }
     }
+    this.#heldLockToken = token;
     try {
       return operation();
     } finally {
+      this.#heldLockToken = undefined;
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");
         if (owner.startsWith(`${token}\n`)) {
@@ -679,13 +679,32 @@ export class MeshStore {
     }
   }
 
+  // Fence for the lease: a holder that was stopped past its lease and then resumed must
+  // not commit over the holder that took the lock over. Called right before each write.
+  // ponytail: check-then-write is not atomic; a holder stopped exactly between the check
+  // and its write can still land that one write. Closing it needs OS-level lock fencing.
+  #assertLockHeld(): void {
+    const token = this.#heldLockToken;
+    let owner = "";
+    try {
+      owner = fs.readFileSync(path.join(this.#lockPath, "owner"), "utf8");
+    } catch {
+      // Missing owner: the lock was taken over and released.
+    }
+    if (token === undefined || !owner.startsWith(`${token}\n`)) {
+      throw new Error("Fabric mesh lock lease expired before commit; the operation was not applied");
+    }
+  }
+
   // Returns true when a stale lock was removed and acquisition should retry.
-  // A lock is stale when it outlived the stale window without a live owner:
-  // either the owner file names a dead process, or the owner file is missing
-  // or corrupt — the owner crashed between creating the lock directory and
-  // writing the owner file — and the untouched lock directory itself is
-  // stale. Removal re-reads the state it judged stale so a freshly rotated
-  // owner is never deleted mid-check.
+  // A lock is stale when it outlived its lease (staleLockMs), whether or not its
+  // owner process still exists: a live but signal-stopped or wedged holder would
+  // otherwise freeze every mesh participant. The owner file may also be missing
+  // or corrupt (a crash between creating the lock directory and writing the
+  // owner file); then the untouched lock directory's age decides. Removal
+  // re-reads the state it judged stale so a freshly rotated owner is never
+  // deleted mid-check. A holder that resumes after takeover fails its commit
+  // through #assertLockHeld.
   #clearStaleLock(ownerPath: string): boolean {
     let lockModifiedAt: number | undefined;
     let owner: string | undefined;
@@ -699,10 +718,9 @@ export class MeshStore {
       }
     }
     if (owner !== undefined) {
-      const [, pidText, createdText] = owner.trim().split("\n");
+      const [, , createdText] = owner.trim().split("\n");
       const createdAt = Number(createdText);
       if (Number.isFinite(createdAt) && Date.now() - createdAt <= this.#staleLockMs) return false;
-      if (processAlive(Number(pidText))) return false;
       try {
         if (fs.readFileSync(ownerPath, "utf8") !== owner) return false;
         fs.rmSync(this.#lockPath, { recursive: true, force: true });
@@ -771,6 +789,7 @@ export class MeshStore {
         this.#eventsPath + "." + process.pid + "." + randomUUID() + ".tmp";
       try {
         fs.writeFileSync(temporaryPath, retained, { mode: 0o600 });
+        this.#assertLockHeld();
         fs.renameSync(temporaryPath, this.#eventsPath);
       } finally {
         try { fs.rmSync(temporaryPath, { force: true }); } catch {}
@@ -796,6 +815,7 @@ export class MeshStore {
       const tail = Buffer.allocUnsafe(readBytes);
       fs.readSync(descriptor, tail, 0, readBytes, size - readBytes);
       const newline = tail.lastIndexOf(0x0a);
+      this.#assertLockHeld();
       fs.ftruncateSync(descriptor, newline >= 0 ? size - readBytes + newline + 1 : 0);
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;

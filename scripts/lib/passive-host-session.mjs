@@ -23,6 +23,9 @@ export function createPassiveHostSession(agent, sessionManager) {
   session.agent = agent;
   session.sessionManager = sessionManager;
   session._pendingCustomMessages = [];
+  // Pi 0.87 refreshes finalized transcript projections when it flushes a
+  // passive message. Match the constructor's message-to-entry identity map.
+  session._entryIdsByMessage = new WeakMap();
   session._isAgentRunActive = true;
   session._emit = () => {};
   const unsubscribe = agent.subscribe((event) => {

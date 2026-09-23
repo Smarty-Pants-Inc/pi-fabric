@@ -1556,6 +1556,9 @@ describe("outer-boundary Prewalk", () => {
     }
     await agent.continue();
 
+    // Surface host-shim failures instead of misdiagnosing an aborted loop as
+    // changed steering semantics after a Pi upgrade.
+    expect(agent.state.error).toBeUndefined();
     // Three legitimate steering turns, with no late Fabric-only continuation.
     expect(requests).toHaveLength(3);
     // The executor's first request already carries task, plan and digest.

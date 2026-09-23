@@ -147,9 +147,11 @@ describe("cooperative bash middleware", () => {
 
   it("keeps the explicit hard cap after handoff", async () => {
     const h = harness();
-    const result = await h.invoke({ command: "sleep 8", timeout: 0.1, background: true });
+    // Exercise the cap after handoff, not Git Bash startup under Windows CI.
+    const timeout = process.platform === "win32" ? 2 : 0.1;
+    const result = await h.invoke({ command: "sleep 8", timeout, background: true });
     expect(result.details?.running).toBe(true);
-    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toEqual(expect.any(Number)));
+    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toEqual(expect.any(Number)), { timeout: 4_000 });
     expect(fs.readFileSync(result.details!.logPath!, "utf8")).toContain("timed out");
   });
 

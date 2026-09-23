@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { FabricActorRunBinding } from "../actors/types.js";
-import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
+import { MeshPutGuardError, MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -9,6 +9,7 @@ const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
+const CONTROL_SEEN_GRACE_MS = 10 * 60 * 1_000;
 
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
 
@@ -89,6 +90,9 @@ interface FabricControlSeenRecord {
   commandId: string;
   targetId: string;
   expiresAt: number;
+  /** The command carried its own deadlineAt; false or absent (older records) means the
+   *  effective deadline depended on the receiver's acknowledgement timeout. */
+  explicitDeadline?: boolean;
   acceptance?: FabricControlAcceptance;
 }
 
@@ -110,6 +114,8 @@ export interface FabricControlPlaneOptions {
   hostId: string;
   pollMs?: number;
   acknowledgementTimeoutMs?: number;
+  /** Clock for admission and cleanup (tests); defaults to Date.now. */
+  now?: () => number;
 }
 
 export interface FabricControlInput {
@@ -153,6 +159,10 @@ export class FabricControlPlane {
   #closed = false;
   #handler: FabricControlHandler | undefined;
   #seenCleanupAt = 0;
+
+  #now(): number {
+    return this.options.now?.() ?? Date.now();
+  }
 
   constructor(
     readonly mesh: MeshStore,
@@ -423,12 +433,14 @@ export class FabricControlPlane {
       this.#acceptCancellation(command, event.from);
       return;
     }
-    const now = Date.now();
-    await this.#cleanupSeen(now);
+    await this.#cleanupSeen(this.#now());
     const deadlineAt = Math.min(
       command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs,
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
     );
+    const explicitDeadline = command.deadlineAt !== undefined;
+    // Admit on a clock read after the await, never on a timestamp taken before it.
+    const now = this.#now();
     if (now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) {
       await this.#publishAcknowledgement(command, {
         accepted: false,
@@ -466,11 +478,21 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           expiresAt: deadlineAt + this.#ackTimeoutMs,
+          explicitDeadline,
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
         ifVersion: 0,
+        // The claim waits for the mesh lock: recheck the deadline with the clock at write time.
+        guard: () => this.#now() <= deadlineAt,
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof MeshPutGuardError) {
+        await this.#publishAcknowledgement(command, {
+          accepted: false,
+          error: "Fabric control command expired",
+        });
+        return;
+      }
       const raced = controlSeenRecord(this.mesh.get(key)?.value);
       if (
         raced?.hostId === this.options.hostId &&
@@ -494,6 +516,7 @@ export class FabricControlPlane {
       key,
       claim.version,
       deadlineAt,
+      explicitDeadline,
     );
     if (command.operation === "ask") {
       this.#activeHandlers.add(execution);
@@ -521,6 +544,7 @@ export class FabricControlPlane {
     key: string,
     claimVersion: number,
     deadlineAt: number,
+    explicitDeadline: boolean,
   ): Promise<void> {
     const controller = new AbortController();
     this.#activeCommands.set(command.commandId, {
@@ -555,6 +579,7 @@ export class FabricControlPlane {
             commandId: command.commandId,
             targetId: command.targetId,
             expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
+            explicitDeadline,
             acceptance,
           } satisfies FabricControlSeenRecord,
           identity: this.identity,
@@ -585,36 +610,35 @@ export class FabricControlPlane {
     };
   }
 
+  // A seen record keeps a command from running twice before its deadline. Records used to
+  // stay until their command event left the log (64 MiB), so they grew without bound in
+  // the shared state file (smarty-dev#266). Each plane now prunes its OWN records once they
+  // cannot matter, in one locked write, and keeps their version tombstones: a pruned key
+  // cannot be claimed again from version 0, so a paused receiver cannot re-run the command.
+  // - With the command's own deadlineAt, a record is dead weight once expiresAt (deadline +
+  //   acknowledgement timeout) plus the grace has passed: admission rejects the command.
+  // - Without it (or for older records), the effective deadline depended on the receiver's
+  //   acknowledgement timeout, which a restart can change. Such records wait until
+  //   expiresAt + MAX_CONTROL_TIMEOUT_MS + grace, beyond any configurable deadline.
+  // Only the owner prunes, on its own clock, so mixed-version fleets keep the old behaviour
+  // for owners that have not upgraded, and no foreign clock retires a record.
+  // ponytail: tombstones are capped by maxStateTombstones; after eviction, safety rests on
+  // the deadline check with a wall clock stepped back by less than the grace.
   async #cleanupSeen(now: number): Promise<void> {
     if (now - this.#seenCleanupAt < this.#ackTimeoutMs) return;
     this.#seenCleanupAt = now;
-    const candidates = this.mesh.listAll(CONTROL_SEEN_PREFIX).flatMap((entry) => {
+    const stale = this.mesh.listAll(CONTROL_SEEN_PREFIX).filter((entry) => {
       const record = controlSeenRecord(entry.value);
-      return !record || record.expiresAt < now ? [{ entry, record }] : [];
+      if (!record || record.hostId !== this.options.hostId) return false;
+      const settledAt = record.explicitDeadline === true
+        ? record.expiresAt
+        : record.expiresAt + MAX_CONTROL_TIMEOUT_MS;
+      return settledAt + CONTROL_SEEN_GRACE_MS < now;
     });
-    if (candidates.length === 0) return;
-
-    const sought = new Set(
-      candidates.flatMap(({ record }) => record ? [record.commandId] : []),
-    );
-    const retained = new Set<string>();
-    let offset = 0;
-    while (sought.size > retained.size) {
-      const page = this.mesh.tail(offset, this.mesh.maxReadEvents);
-      for (const event of page.events) {
-        if (event.topic !== CONTROL_TOPIC || !isObject(event.data)) continue;
-        const commandId = event.data.commandId;
-        if (typeof commandId === "string" && sought.has(commandId)) retained.add(commandId);
-      }
-      if (page.events.length < this.mesh.maxReadEvents || page.nextOffset === offset) break;
-      offset = page.nextOffset;
-    }
-
-    await Promise.allSettled(
-      candidates
-        .filter(({ record }) => !record || !retained.has(record.commandId))
-        .map(({ entry }) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })),
-    );
+    if (stale.length === 0) return;
+    await this.mesh
+      .deleteMany(stale.map((entry) => ({ key: entry.key, ifVersion: entry.version })))
+      .catch(() => undefined);
   }
 
   async #publishAcknowledgement(

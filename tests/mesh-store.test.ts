@@ -2,8 +2,9 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  MeshPutGuardError,
   MeshStore,
   type MeshIdentity,
   type MeshStateEntry,
@@ -244,6 +245,64 @@ describe("MeshStore", () => {
     expect(state.tombstoneOrder).toEqual(["state/b", "state/c"]);
     expect(state.versions["state/a"]).toBeUndefined();
     expect(recreated.version).toBe(1);
+  });
+});
+
+describe("MeshStore.deleteMany", () => {
+  it("deletes matching versions in one write and keeps their tombstones", async () => {
+    const store = createStore();
+    const a = await store.put({ key: "seen/a", value: 1, identity });
+    const b = await store.put({ key: "seen/b", value: 2, identity });
+    await store.put({ key: "keep/c", value: 3, identity });
+    const renames = vi.spyOn(fs, "renameSync");
+
+    const result = await store.deleteMany([
+      { key: "seen/a", ifVersion: a.version }, { key: "seen/b", ifVersion: b.version + 1 }, { key: "seen/missing" },
+    ]);
+    const stateRenames = renames.mock.calls.filter(([, target]) => String(target).endsWith("state.json"));
+    renames.mockRestore();
+    expect(result.deleted).toEqual(["seen/a"]);
+    expect(stateRenames).toHaveLength(1);
+    expect(store.get("seen/b")?.value).toBe(2);             // version mismatch: left alone
+    expect(store.get("keep/c")?.value).toBe(3);
+    const state = JSON.parse(fs.readFileSync(path.join(store.root, "state.json"), "utf8"));
+    expect(state.versions["seen/a"]).toBe(a.version);       // tombstone kept
+    expect(state.tombstoneOrder).toContain("seen/a");
+    await expect(store.put({ key: "seen/a", value: "again", identity, ifVersion: 0 }))
+      .rejects.toThrow("compare-and-swap failed");
+  });
+
+  it("keeps a record that another writer renewed after the snapshot", async () => {
+    const store = createStore();
+    const other = new MeshStore(store.root, 64 * 1024, 100);
+    await store.put({ key: "seen/a", value: "old", identity });
+    const snapshot = store.listAll("seen/");
+    await other.put({ key: "seen/a", value: "renewed", identity });
+
+    expect(await store.deleteMany(snapshot.map((e) => ({ key: e.key, ifVersion: e.version })))).toEqual({ deleted: [] });
+    expect(store.get("seen/a")?.value).toBe("renewed");
+  });
+
+  it("writes nothing for an empty or all-missing batch", async () => {
+    const store = createStore();
+    await store.put({ key: "seen/a", value: 1, identity });
+    const statePath = path.join(store.root, "state.json");
+    const before = fs.statSync(statePath);
+    expect(await store.deleteMany([])).toEqual({ deleted: [] });
+    expect(await store.deleteMany([{ key: "seen/missing" }, { key: "seen/a", ifVersion: 99 }])).toEqual({ deleted: [] });
+    const after = fs.statSync(statePath);
+    expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+  });
+});
+
+describe("MeshStore.put guard", () => {
+  it("evaluates the guard under the lock and writes nothing when it fails", async () => {
+    const store = createStore();
+    await expect(store.put({ key: "seen/a", value: 1, identity, ifVersion: 0, guard: () => false }))
+      .rejects.toBeInstanceOf(MeshPutGuardError);
+    expect(store.get("seen/a")).toBeUndefined();
+    const written = await store.put({ key: "seen/a", value: 1, identity, ifVersion: 0, guard: () => true });
+    expect(written.version).toBe(1);
   });
 });
 

@@ -24,7 +24,7 @@ const plane = (
   meshRoot: string,
   id: string,
   storeOptions: MeshStoreOptions = {},
-  controlOptions: { pollMs?: number; acknowledgementTimeoutMs?: number } = {},
+  controlOptions: { pollMs?: number; acknowledgementTimeoutMs?: number; now?: () => number } = {},
 ): FabricControlPlane => {
   const value = new FabricControlPlane(
     new MeshStore(meshRoot, 64 * 1024, 1_000, storeOptions),
@@ -531,6 +531,154 @@ describe("FabricControlPlane", () => {
     await new Promise((resolve) => setTimeout(resolve, 180));
 
     expect(receive).toHaveBeenCalledTimes(1);
+  });
+
+  // smarty-dev#266: seen records stayed until their command left the log, so they grew
+  // without bound in the shared state file.
+  const MINUTE = 60 * 1_000;
+  const seenKey = (hostId: string, commandId: string) =>
+    "topology/control-seen/" + createHash("sha256").update(`${hostId}\0${commandId}`).digest("hex");
+  const seed = async (
+    store: MeshStore,
+    commandId: string,
+    expiresAt: number,
+    options: { hostId?: string; explicitDeadline?: boolean } = {},
+  ) => {
+    const hostId = options.hostId ?? "host:receiver";
+    const explicit = options.explicitDeadline ?? true;
+    const event = await store.publish({
+      topic: "fabric.control.command", kind: "steer", from: identity("host:sender"), to: hostId,
+      data: { version: 1, commandId, targetId: "agent:target", operation: "steer", replyTo: "host:sender",
+        message: "old", requestedAt: expiresAt - 2_000, ...(explicit ? { deadlineAt: expiresAt - 1_000 } : {}) },
+    });
+    await store.put({
+      key: seenKey(hostId, commandId),
+      value: { format: 1, hostId, commandId, targetId: "agent:target", expiresAt,
+        ...(options.explicitDeadline === undefined ? { explicitDeadline: true } : options.explicitDeadline ? { explicitDeadline: true } : {}),
+        acceptance: { accepted: true } },
+      identity: identity(hostId), ifVersion: 0,
+    });
+    return event;
+  };
+  const ackAfter = (store: MeshStore, commandId: string, sequence: number, error?: string) =>
+    store.read({ topic: "fabric.control.ack", limit: 1_000 }).some((event) =>
+      event.sequence > sequence &&
+      (event.data as { commandId?: string }).commandId === commandId &&
+      (error === undefined || (event.data as { error?: string }).error === error));
+  const republish = (store: MeshStore, event: { topic: string; kind: string; from: MeshIdentity; to?: string; data?: unknown }) =>
+    store.publish({ topic: event.topic, kind: event.kind, from: event.from, to: event.to!, data: event.data });
+  const trigger = async (meshRoot: string, target: string) => {
+    const sender = plane(meshRoot, "host:sender");
+    sender.start(() => ({ accepted: false }));
+    await sender.request(target, "agent:target", "steer", { message: "trigger cleanup" });
+  };
+
+  it("prunes its own long-expired records in one write and keeps their tombstones", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const now = Date.now();
+    for (let index = 0; index < 20; index++) await seed(store, `command:old-${index}`, now - 11 * MINUTE);
+    await seed(store, "command:grace", now - 10 * MINUTE);              // equality: inside the grace
+    await seed(store, "command:live", now + MINUTE);
+    await seed(store, "command:other-host", now - 11 * MINUTE, { hostId: "host:other" });
+    await store.put({ key: "topology/control-seen-archive/x", identity: identity("host:x"),
+      value: { format: 1, hostId: "host:receiver", commandId: "x", targetId: "t", expiresAt: 1, explicitDeadline: true } });
+    const writes = vi.spyOn(MeshStore.prototype, "deleteMany");
+    const receiver = plane(meshRoot, "host:receiver", {}, { now: () => now });
+    const receive = vi.fn(() => ({ accepted: true }));
+    receiver.start(receive);
+    await trigger(meshRoot, "host:receiver");
+    await expect.poll(() => store.get(seenKey("host:receiver", "command:old-0"))).toBeUndefined();
+
+    expect(writes).toHaveBeenCalledTimes(1);
+    writes.mockRestore();
+    for (const kept of ["command:grace", "command:live"]) expect(store.get(seenKey("host:receiver", kept))).toBeDefined();
+    expect(store.get(seenKey("host:other", "command:other-host"))).toBeDefined();   // never another host's
+    expect(store.get("topology/control-seen-archive/x")).toBeDefined();             // never another prefix
+    const state = JSON.parse(fs.readFileSync(path.join(meshRoot, "state.json"), "utf8"));
+    expect(state.versions[seenKey("host:receiver", "command:old-0")]).toBe(1);      // tombstone kept
+
+    // A pruned command replayed from the log is rejected as expired, never re-executed.
+    const replay = store.read({ topic: "fabric.control.command", limit: 100 })
+      .find((event) => (event.data as { commandId?: string }).commandId === "command:old-0")!;
+    const republished = await republish(store, replay);
+    await expect.poll(() => ackAfter(store, "command:old-0", republished.sequence, "Fabric control command expired")).toBe(true);
+    expect(receive).toHaveBeenCalledTimes(1);                                          // only the trigger
+  });
+
+  // Review D1: a command without deadlineAt has a deadline that depends on the receiver's
+  // acknowledgement timeout, which a restart can raise.
+  it("keeps no-deadline records until no configurable deadline can reach them", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const now = Date.now();
+    const legacy = await seed(store, "command:legacy", now - 11 * MINUTE, { explicitDeadline: false });
+    await seed(store, "command:ancient", now - 25 * 60 * MINUTE, { explicitDeadline: false });
+    const receiver = plane(meshRoot, "host:receiver", {}, { now: () => now, acknowledgementTimeoutMs: 20 * MINUTE });
+    const receive = vi.fn(() => ({ accepted: true }));
+    receiver.start(receive);
+    await trigger(meshRoot, "host:receiver");
+    await expect.poll(() => store.get(seenKey("host:receiver", "command:ancient"))).toBeUndefined();
+    expect(store.get(seenKey("host:receiver", "command:legacy"))).toBeDefined();
+
+    // The same owner restarted with a larger timeout sees the legacy command as live again,
+    // but its record is still there: the outcome is re-acknowledged, not re-executed.
+    const republished = await republish(store, legacy);
+    await expect.poll(() => ackAfter(store, "command:legacy", republished.sequence)).toBe(true);
+    expect(receive).toHaveBeenCalledTimes(1);
+  });
+
+  // Review D3/D4: the clock must be read after cleanup and again under the claim's lock.
+  it("rejects a command whose deadline passes while cleanup runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    let clock = Date.now();
+    const receiver = plane(meshRoot, "host:receiver", {}, { now: () => clock });
+    const receive = vi.fn(() => ({ accepted: true }));
+    const listAll = receiver.mesh.listAll.bind(receiver.mesh);
+    vi.spyOn(receiver.mesh, "listAll").mockImplementation((prefix) => {
+      if (prefix === "topology/control-seen/") clock += 10 * MINUTE;   // cleanup takes "10 minutes"
+      return listAll(prefix);
+    });
+    const claims = vi.spyOn(receiver.mesh, "put");
+    receiver.start(receive);
+    const sender = plane(meshRoot, "host:sender");
+    sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "late" }))
+      .rejects.toThrow("Fabric control command expired");
+    expect(receive).not.toHaveBeenCalled();
+    // Rejected at admission on the fresh clock, before any claim is attempted.
+    expect(claims.mock.calls.filter(([input]) => input.key.startsWith("topology/control-seen/"))).toHaveLength(0);
+  });
+
+  it("rejects a command whose deadline passes while its claim waits for the lock, without committing it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    let clock = Date.now();
+    const receiver = plane(meshRoot, "host:receiver", {}, { now: () => clock });
+    const receive = vi.fn(() => ({ accepted: true }));
+    const put = receiver.mesh.put.bind(receiver.mesh);
+    let claimedKey: string | undefined;
+    vi.spyOn(receiver.mesh, "put").mockImplementation(async (input) => {
+      if (input.key.startsWith("topology/control-seen/") && input.ifVersion === 0) {
+        claimedKey = input.key;
+        clock += 10 * MINUTE;                                           // the lock wait "takes 10 minutes"
+      }
+      return put(input);
+    });
+    receiver.start(receive);
+    const sender = plane(meshRoot, "host:sender");
+    sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "late" }))
+      .rejects.toThrow("Fabric control command expired");
+    expect(receive).not.toHaveBeenCalled();
+    expect(claimedKey && receiver.mesh.get(claimedKey)).toBeUndefined();   // nothing committed
   });
 
   it("surfaces owner rejection instead of reporting an unverified queue", async () => {

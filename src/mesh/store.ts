@@ -236,6 +236,12 @@ const compactStateTombstones = (state: MeshStateFile, maxTombstones: number): vo
   state.tombstoneOrder = retainedKeys;
 };
 
+export class MeshPutGuardError extends Error {
+  constructor(readonly key: string) {
+    super(`Mesh put guard rejected ${key}`);
+  }
+}
+
 export class MeshStore {
   readonly #eventsPath: string;
   readonly #statePath: string;
@@ -558,6 +564,8 @@ export class MeshStore {
     value: unknown;
     identity: MeshIdentity;
     ifVersion?: number;
+    /** Checked under the lock, right before the write; false rejects with MeshPutGuardError. */
+    guard?: () => boolean;
   }): Promise<MeshStateEntry> {
     this.#validateKey(input.key);
     const value = jsonClone(input.value);
@@ -580,6 +588,7 @@ export class MeshStore {
           );
         }
       }
+      if (input.guard && !input.guard()) throw new MeshPutGuardError(input.key);
       const entry: MeshStateEntry = {
         key: input.key,
         value,
@@ -637,6 +646,40 @@ export class MeshStore {
       atomicWrite(this.#statePath, state, this.#maxStateBytes);
       this.#cacheState(state);
       return { deleted: true, version: existing.version };
+    });
+  }
+
+  // Removes many entries in ONE locked read-modify-write: the state file is rewritten once
+  // instead of once per key, and not at all when nothing matches. Each deleted key keeps
+  // its version tombstone, exactly like delete(), so a later put(ifVersion: 0) still fails
+  // compare-and-swap. An entry whose version no longer matches ifVersion is left alone
+  // (best-effort compare-and-swap, no throw).
+  async deleteMany(entries: Array<{ key: string; ifVersion?: number }>): Promise<{ deleted: string[] }> {
+    for (const entry of entries) this.#validateKey(entry.key);
+    if (entries.length === 0) return { deleted: [] };
+    return this.#withLock(() => {
+      const state = readState(this.#statePath, this.#maxStateBytes);
+      const deleted: string[] = [];
+      state.versions ??= {};
+      const tombstones = new Set(state.tombstoneOrder ?? []);
+      for (const { key, ifVersion } of entries) {
+        const existing = state.entries[key];
+        if (!existing || (ifVersion !== undefined && existing.version !== ifVersion)) continue;
+        delete state.entries[key];
+        state.versions[key] = existing.version;
+        tombstones.delete(key);
+        tombstones.add(key);
+        deleted.push(key);
+      }
+      if (deleted.length === 0) {
+        this.#cacheState(state);
+        return { deleted };
+      }
+      state.tombstoneOrder = [...tombstones];
+      compactStateTombstones(state, this.#maxStateTombstones);
+      atomicWrite(this.#statePath, state, this.#maxStateBytes);
+      this.#cacheState(state);
+      return { deleted };
     });
   }
 

@@ -9,6 +9,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import resource
+import re
 import signal
 import stat
 import subprocess
@@ -22,19 +23,20 @@ import zipfile
 
 HERE = Path(__file__).resolve().parent
 CAP = 128 * 1024**2
-FABRIC_MANIFEST = '3876be84809fe45f50b14de1b5466871f8fe2a830aaa1eb264c8a00efe5bc12d'
+# Bind only after the original CI producer's actual artifact receiving.
+FABRIC_MANIFEST = '3fc771349abd6a27b42f48989920b5e49817bad8bcbc23c0659b1db10db9987c'
 PI_MANIFEST = '7610f9e84405e672158ff874f317ccad1435c211d875e1a98a6b6325611ede4d'
 PI_ARCHIVE = '4702a03ec015a0134d2a5b57e983be3a9d4fbb8a8adfba9609ca6c8268803a03'
 CLI = 'node/node_modules/@earendil-works/pi-coding-agent/dist/cli.js'
 RELEASE_API = 'https://api.github.com/repos/Smarty-Pants-Inc/pi-fabric'
-RELEASE_TAG = 'qualification-inputs-10718135458-10682730383'
-RELEASE_COMMIT = '999936a251b97a6c057cf28f2665ed471941e85b'
+RELEASE_TAG = 'qualification-inputs-10724188374-10682730383'
+RELEASE_COMMIT = 'a8503f8c4fdc7c33357947708cb3da4c94899fac'
 # Bound to the sole publisher's authenticated published/tag/asset readback.
 # Repository immutability is not required; every selected identity must match.
-RELEASE_ID = 394152047
-RELEASE_ASSET_IDS = {'artifact-10718135458.zip': 582338616, 'node-stage.tar.gz': 582338748}
+RELEASE_ID = 394198399
+RELEASE_ASSET_IDS = {'artifact-10724188374.zip': 582514636, 'node-stage.tar.gz': 582514739}
 ASSETS = (
-    ('artifact-10718135458.zip', 119276501, '2501a67279b6675d68bf983e9952e7980e04a9f5109171a0b46cf17c6883ebb0'),
+    ('artifact-10724188374.zip', 119294607, '017c98565b3f5df7c40cfcaf460a1e43b1897e005cc316ad9b57610358cdf7e0'),
     ('node-stage.tar.gz', 38603868, PI_ARCHIVE),
 )
 TOOLS = {'node': '41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c',
@@ -106,7 +108,7 @@ def receive(d):
         'operation': 'NEW_DESTINATION_RELEASE_PLACEMENT_NOT_DEV1_RETRY', 'run': os.environ['GITHUB_RUN_ID'],
         'attempt': 1, 'releaseId': RELEASE_ID, 'tag': RELEASE_TAG, 'target': RELEASE_COMMIT,
         'assets': list(declared.values()), 'bodyGetsPerAsset': 1, 'retry': False,
-        'sourceArtifactIds': [10718135458, 10682730383], 'piOperand': 'accepted inner node-stage.tar.gz, not outer diagnostic ZIP',
+        'sourceArtifactIds': [10724188374, 10682730383], 'piOperand': 'accepted inner node-stage.tar.gz, not outer diagnostic ZIP',
         'destination': str(d), 'closureEntryCap': 200000, 'expandedLayerBytesCap': 2 * 1024**3,
         'perBodyWallSeconds': 45, 'perBodyWireCap': CAP,
     })
@@ -200,7 +202,7 @@ def stage(d):
                    check=True, timeout=120)
     inputs = d / 'inputs'
     inputs.mkdir(mode=0o700)
-    with zipfile.ZipFile(d / 'artifact-10718135458.zip') as z:
+    with zipfile.ZipFile(d / 'artifact-10724188374.zip') as z:
         # The unchanged receiver has already verified the exact outer allowlist,
         # all checksums, bounded layers and complete confined closure manifest.
         for item in z.infolist():
@@ -248,13 +250,80 @@ def check_report(data):
         assert len(matches) == 1 and matches[0]['status'] == 'passed'
 
 
+TARGETED_NAMES = [
+    'activation projection exits the disposable child before a request despite native-style swallowed exceptions: boundary',
+    'native activation window (offline; opted-in success needs exact native artifact) ' + REQUIRED[3],
+]
+TARGETED_PATTERN = '^(?:' + '|'.join(re.escape('tests/worker-activation-window.test.ts ' + name)
+                                  for name in TARGETED_NAMES) + ')$'
+
+
+def check_targeted_report(data):
+    assert data['success'] and data['numPassedTests'] == 2 and data['numPendingTests'] == 24
+    cases = [case for suite in data['testResults'] for case in suite['assertionResults']]
+    assert len(cases) == 26
+    passed = [case for case in cases if case['status'] == 'passed']
+    assert len(passed) == 2 and {case['fullName'] for case in passed} == set(TARGETED_NAMES)
+    assert all(case['status'] in ('passed', 'skipped') for case in cases)
+
+
 def child_limits():
     # Bound each output/journal/cache file, including stdout/stderr, without a
     # monitor or extra runtime. CI still owns total disk/memory/CPU admission.
     resource.setrlimit(resource.RLIMIT_FSIZE, (8 * 1024**2, 8 * 1024**2))
 
 
+def run_phase(argv, cwd, env, out, err, remaining, result):
+    # One shared invocation deadline supplies remaining, not a new per-phase budget.
+    child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                             stdout=out, stderr=err, start_new_session=True, preexec_fn=child_limits)
+    result['pid'] = child.pid
+    try:
+        result['exit'] = child.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        time.sleep(5)
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        result.update(status='TIMEOUT_NO_RETRY', exit=child.returncode)
+        # As before, outer/job cleanup is not adopted-child-drain proof.
+        raise TimeoutError('Cumulative qualification deadline')
+    try:
+        os.killpg(child.pid, 0)
+    except ProcessLookupError:
+        group_gone = True
+    else:
+        group_gone = False
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+            time.sleep(5)
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    while True:
+        try:
+            if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                break
+        except ChildProcessError:
+            break
+    adopted = [int(pid) for pid in Path(f'/proc/self/task/{os.getpid()}/children').read_text().split()]
+    for pid in adopted:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    result.update(originalProcessGroupGone=group_gone, residualAdoptedChildren=adopted)
+    assert result['exit'] == 0 and group_gone and not adopted
+
+
 def qualify(d):
+    assert isinstance(FABRIC_MANIFEST, str) and len(FABRIC_MANIFEST) == 64, 'New artifact binding pending'
     assert json.loads((d / 'PLACEMENT-VERIFIED.json').read_text())['fabricManifest'] == FABRIC_MANIFEST
     tools = {}
     for name, digest in TOOLS.items():
@@ -282,10 +351,15 @@ def qualify(d):
     report = state / 'output/vitest.json'
     argv = [tools['bun'], 'run', 'node_modules/.bin/vitest', 'run', 'tests/worker-activation-window.test.ts',
             '--cache=false', '--reporter=verbose', '--reporter=json', '--outputFile=' + str(report)]
-    save(d / 'NATIVE-INTENT.json', {'argv': argv, 'cwd': str(d / 'fabric'), 'environment': env,
-         'fabricArtifact': 10718135458, 'piArtifact': 10682730383,
+    targeted_report = state / 'output/targeted.json'
+    targeted_argv = argv[:-1] + ['--outputFile=' + str(targeted_report), '-t', TARGETED_PATTERN]
+    helper_argv = [sys.executable, '-I', '-S', '-B', str(HERE / 'test_fabric_fixed_native.py'), '-v']
+    phase_commands = [('helper', helper_argv), ('targeted', targeted_argv), ('full', argv)]
+    save(d / 'NATIVE-INTENT.json', {'argv': argv, 'phases': phase_commands,
+         'cumulativePhaseWallSeconds': 180, 'cwd': str(d / 'fabric'), 'environment': env,
+         'fabricArtifact': 10724188374, 'piArtifact': 10682730383,
          'fabricManifest': FABRIC_MANIFEST, 'piManifest': PI_MANIFEST,
-         'runtime': 'f7d71b57bfc9ec7ec76fc2e02f13642ec87033e3',
+         'runtime': '27abed787abb3836da19ab8c2cd6d491701cacbb',
          'operands': {name: sha(d / 'fabric' / name) for name in ('tests/worker-activation-window.test.ts', 'dist/worker.js', 'dist/worker/activation-window.js')},
          'piCliSha256': sha(d / 'pi' / CLI),
          'toolPaths': tools, 'toolSha256': TOOLS, 'toolVersions': versions,
@@ -296,74 +370,54 @@ def qualify(d):
     # not sufficient. GitHub's existing tracking tag remains for job cleanup.
     assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
     started = time.monotonic()
-    with (d / 'native.stdout').open('xb') as out, (d / 'native.stderr').open('xb') as err:
-        child = subprocess.Popen(argv, cwd=d / 'fabric', env=env, stdin=subprocess.DEVNULL,
-                                 stdout=out, stderr=err, start_new_session=True, preexec_fn=child_limits)
-        try:
-            code = child.wait(timeout=180)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            time.sleep(5)
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait()
-            save(d / 'NATIVE-RESULT.json', {'status': 'TIMEOUT_NO_RETRY', 'pid': child.pid, 'exit': child.returncode})
-            raise TimeoutError('Native qualification deadline')
-    # Exited leader alone does not prove child cleanup. Residual group members
-    # force failure, even if all assertions passed; terminate only our own group.
+    expires = started + 180
+    result = {'status': 'FAILED_OR_UNVERIFIED', 'phases': [
+        {'name': name, 'status': 'NOT_STARTED'} for name, _ in phase_commands]}
     try:
-        os.killpg(child.pid, 0)
-    except ProcessLookupError:
-        group_gone = True
-    else:
-        group_gone = False
-        try:
-            os.killpg(child.pid, signal.SIGTERM)
-            time.sleep(5)
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    # Reap exited adopted workers, and refuse success for any surviving child.
-    while True:
-        try:
-            if os.waitpid(-1, os.WNOHANG)[0] == 0:
-                break
-        except ChildProcessError:
-            break
-    children_file = Path(f'/proc/self/task/{os.getpid()}/children')
-    adopted = [int(pid) for pid in children_file.read_text().split()]
-    for pid in adopted:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    result = {'status': 'FAILED_OR_UNVERIFIED', 'pid': child.pid, 'exit': code,
-              'originalProcessGroupGone': group_gone, 'residualAdoptedChildren': adopted,
-              'elapsedSeconds': time.monotonic() - started}
-    try:
-        assert code == 0 and group_gone and not adopted
-        assert not list((state / 'tmp').iterdir()), 'Fixture temp cleanup incomplete'
-        verify_after(d)
-        result['bothFullClosuresUnchangedAfter'] = True
-        data = json.loads(report.read_text())
-        check_report(data)
+        with (d / 'native.stdout').open('xb') as out, (d / 'native.stderr').open('xb') as err:
+            for phase, (_, command) in zip(result['phases'], phase_commands):
+                remaining = expires - time.monotonic()
+                assert remaining > 0, 'Cumulative qualification deadline'
+                phase['status'] = 'FAILED_OR_UNVERIFIED'
+                label = ('\n=== ' + phase['name'] + ' ===\n').encode()
+                out.write(label); out.flush()
+                err.write(label); err.flush()
+                stderr_start = err.tell()
+                run_phase(command, d / 'fabric', env, out, err, remaining, phase)
+                assert not list((state / 'tmp').iterdir()), 'Fixture temp cleanup incomplete'
+                verify_after(d)
+                phase['bothFullClosuresUnchangedAfter'] = True
+                assert all((d / name).stat().st_size <= 8 * 1024**2
+                           for name in ('native.stdout', 'native.stderr'))
+                if phase['name'] == 'helper':
+                    with (d / 'native.stderr').open('rb') as stream:
+                        stream.seek(stderr_start)
+                        helper_log = stream.read().decode('utf8')
+                    assert len(re.findall(r'^test_.* \.\.\. ok$', helper_log, re.M)) == 13
+                    assert re.search(r'^Ran 13 tests in [0-9.]+s\n\nOK\n$', helper_log, re.M)
+                    phase['passed'] = 13
+                elif phase['name'] == 'targeted':
+                    check_targeted_report(json.loads(targeted_report.read_text()))
+                    phase['passed'] = 2
+                else:
+                    check_report(json.loads(report.read_text()))
+                    phase.update(passed=25, intentionalOldCliSkip=1)
+                assert time.monotonic() <= expires, 'Cumulative qualification deadline'
+                phase['status'] = 'PASSED'
         result.update(status='NATIVE_FOUR_AND_DEFAULT_PASSED', requiredCases=REQUIRED,
-                      passed=25, intentionalOldCliSkip=1)
+                      passed=25, intentionalOldCliSkip=1, bothFullClosuresUnchangedAfter=True)
     finally:
+        result['elapsedSeconds'] = time.monotonic() - started
         save(d / 'NATIVE-RESULT.json', result)
 
 
 def main():
+    assert isinstance(FABRIC_MANIFEST, str) and len(FABRIC_MANIFEST) == 64, 'New artifact binding pending'
     assert sys.platform == 'linux' and os.uname().machine == 'x86_64'
     assert os.environ['GITHUB_REPOSITORY'] == 'Smarty-Pants-Inc/pi-fabric'
     assert os.environ['GITHUB_REF'] == 'refs/heads/main' and os.environ['GITHUB_RUN_ATTEMPT'] == '1'
     os.umask(0o077)
-    d = Path(os.environ['RUNNER_TEMP']) / 'fabric10718135458-native'
+    d = Path(os.environ['RUNNER_TEMP']) / 'fabric10724188374-native'
     action = sys.argv[1]
     assert action in ('receive', 'stage', 'qualify')
     if action == 'receive':

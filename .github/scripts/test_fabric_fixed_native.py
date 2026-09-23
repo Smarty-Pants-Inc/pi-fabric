@@ -27,8 +27,19 @@ class FixedEntryTests(unittest.TestCase):
         return {'success': True, 'numPassedTests': 25, 'numPendingTests': 1,
                 'testResults': [{'assertionResults': cases}]}
 
+    def targeted_report(self):
+        cases = [{'fullName': name, 'status': 'passed'} for name in entry.TARGETED_NAMES]
+        cases += [{'fullName': f'filtered {i}', 'status': 'skipped'} for i in range(24)]
+        return {'success': True, 'numPassedTests': 2, 'numPendingTests': 24,
+                'testResults': [{'assertionResults': cases}]}
+
     def test_exact_five_and_only_expected_skip(self):
         entry.check_report(self.report())
+        entry.check_targeted_report(self.targeted_report())
+        import re
+        for name in entry.TARGETED_NAMES:
+            self.assertIsNotNone(re.fullmatch(entry.TARGETED_PATTERN, 'tests/worker-activation-window.test.ts ' + name))
+            self.assertIsNone(re.fullmatch(entry.TARGETED_PATTERN, name))
 
     def test_other_nonpassed_status_is_not_the_allowed_skip(self):
         for status in ('pending', 'todo', 'failed'):
@@ -52,11 +63,23 @@ class FixedEntryTests(unittest.TestCase):
         data['testResults'][0]['assertionResults'][5]['title'] = entry.REQUIRED[0]
         with self.assertRaises(AssertionError):
             entry.check_report(data)
+        data = self.targeted_report()
+        data['testResults'][0]['assertionResults'][1]['fullName'] = entry.TARGETED_NAMES[0]
+        with self.assertRaises(AssertionError):
+            entry.check_targeted_report(data)
 
     def test_failed_report_rejected(self):
         data = self.report(); data['success'] = False
         with self.assertRaises(AssertionError):
             entry.check_report(data)
+        for status in ('failed', 'skipped', 'pending', 'todo'):
+            data = self.targeted_report()
+            data['testResults'][0]['assertionResults'][0]['status'] = status
+            with self.assertRaises(AssertionError):
+                entry.check_targeted_report(data)
+        data = self.targeted_report(); data['success'] = False
+        with self.assertRaises(AssertionError):
+            entry.check_targeted_report(data)
 
     def test_intent_is_exclusive(self):
         with tempfile.TemporaryDirectory() as root:

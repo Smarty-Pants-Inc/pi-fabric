@@ -41,7 +41,8 @@ describe("resolvePiBinary", () => {
   });
 
   it("resolves the PATH launcher to an absolute path before a transport changes PATH", () => {
-    const expected = path.resolve("/opt/second", "pi");
+    // Windows launches only PATHEXT names, such as npm's pi.cmd shim.
+    const expected = path.resolve("/opt/second", process.platform === "win32" ? "pi.cmd" : "pi");
     const isExecutable = (candidate: string) => candidate === expected;
     expect(resolvePiBinary(undefined, {
       env: { PATH: ["/opt/first", "/opt/second"].join(path.delimiter) },

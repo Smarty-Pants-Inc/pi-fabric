@@ -50,9 +50,9 @@ const unquotePathEntry = (entry: string): string => {
     : trimmed;
 };
 
-const isExecutableFile = async (candidate: string): Promise<boolean> => {
+const isExecutableFile = (candidate: string): boolean => {
   try {
-    const stats = await fs.promises.stat(candidate);
+    const stats = fs.statSync(candidate);
     if (!stats.isFile()) return false;
     // Windows has no execute bit; PATHEXT already narrowed the candidate name.
     return process.platform === "win32" || (stats.mode & 0o111) !== 0;
@@ -64,21 +64,30 @@ const isExecutableFile = async (candidate: string): Promise<boolean> => {
 /**
  * PATH lookup that never shells out: Windows runners reach this code with no
  * `sh` on PATH, and a login shell may rewrite PATH behind the caller's back.
+ * Returns an absolute path, so a transport with another environment (Herdr's
+ * server, for example) launches the executable the caller selected.
  */
-export const commandAvailable = async (
+export const findExecutable = (
   command: string,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<boolean> => {
+  isExecutable: (candidate: string) => boolean = isExecutableFile,
+): string | undefined => {
   const names = executableNames(command, env);
   for (const entry of (env.PATH ?? "").split(path.delimiter)) {
     const directory = unquotePathEntry(entry);
     if (directory === "") continue;
     for (const name of names) {
-      if (await isExecutableFile(path.join(directory, name))) return true;
+      const candidate = path.resolve(directory, name);
+      if (isExecutable(candidate)) return candidate;
     }
   }
-  return false;
+  return undefined;
 };
+
+export const commandAvailable = async (
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<boolean> => findExecutable(command, env) !== undefined;
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", `'"'"'`)}'`;
 
@@ -146,7 +155,8 @@ const resolveScriptRuntimeUncached = async (options: ScriptRuntimeOptions = {}):
   const override = runtimeOverride(env);
   if (override) return override;
   for (const candidate of requireNode ? ["node"] : requireBun ? ["bun"] : ["node", "bun"]) {
-    if (await commandAvailable(candidate)) return candidate;
+    const found = findExecutable(candidate);
+    if (found) return found;
   }
   throw missingRuntimeError(execPath, requireNode, requireBun);
 };

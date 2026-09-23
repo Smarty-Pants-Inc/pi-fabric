@@ -111,6 +111,34 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     }
   });
 
+  it.skipIf(process.platform === "win32")("runs an extensionless node-shebang launcher without node on the child PATH", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-shebang-launcher-"));
+    roots.push(root);
+    const launcher = path.join(root, "pi");
+    fs.writeFileSync(launcher, [
+      "#!/usr/bin/env node",
+      'process.env.FAKE_PI_BEHAVIOR = "fabric-session-env";',
+      'process.env.PI_FABRIC_SESSION_ID = "shebang-launcher-ran";',
+      `import(${JSON.stringify(pathToFileURL(piBinary).href)}).catch((error) => { console.error(error); process.exit(1); });`,
+    ].join("\n"), { mode: 0o755 });
+    const emptyBin = path.join(root, "bin");
+    fs.mkdirSync(emptyBin);
+    const before = process.env.PATH;
+    // Herdr-like child environment: the server PATH has neither pi nor node.
+    process.env.PATH = emptyBin;
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath, piBinary: launcher, runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "report launcher", transport: "process" });
+      expect(result.status).toBe("completed");
+      expect(result.text).toBe("shebang-launcher-ran");
+    } finally {
+      process.env.PATH = before;
+    }
+  });
+
   it("propagates the root Fabric session identity through the worker", async () => {
     process.env.FAKE_PI_BEHAVIOR = "fabric-session-env";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));

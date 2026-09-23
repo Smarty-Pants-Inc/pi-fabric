@@ -47,7 +47,7 @@ jobs:
         if: runner.os == 'Windows'
         run: bunx vitest run tests/type-checker.test.ts
       - name: Launcher and Pi host regressions
-        run: bunx vitest run tests/worker-e2e.test.ts tests/prewalk-handoff.test.ts tests/shell-middleware.test.ts
+        run: bunx vitest run tests/worker-e2e.test.ts tests/pi-binary.test.ts tests/script-runtime.test.ts tests/herdr-transport.test.ts tests/prewalk-handoff.test.ts tests/shell-middleware.test.ts
       - name: Affected tests
         env:
           # Pull requests compare against the target branch; pushes compare

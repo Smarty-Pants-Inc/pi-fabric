@@ -58,6 +58,8 @@ describe("script runtime resolution", () => {
     if (!node && !bun) return; // neither runtime discoverable in this environment
     const runtime = await resolveScriptRuntime({ execPath: "/usr/local/bin/pi", env: {} });
     expect(["node", "bun"]).toContain(path.basename(runtime).replace(/\.exe$/, ""));
+    // Absolute, so a Herdr pane with the server's PATH starts the same runtime.
+    expect(path.isAbsolute(runtime)).toBe(true);
   });
 
   // A shell-based lookup silently finds nothing on Windows runners (no `sh`),

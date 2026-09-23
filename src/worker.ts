@@ -15,11 +15,29 @@ import type {
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
+// Extensionless launchers such as ~/.local/bin/pi start with
+// `#!/usr/bin/env node`; a Herdr child's server PATH need not contain node.
+// ponytail: shebang flags are not replayed; revisit if a launcher needs them.
+const nodeShebang = (command: string): boolean => {
+  if (!path.isAbsolute(command)) return false;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(command, "r");
+    const head = Buffer.alloc(128);
+    const line = head.subarray(0, fs.readSync(fd, head, 0, head.length, 0)).toString("utf8").split(/\r?\n/, 1)[0] ?? "";
+    return /^#!.*[/\s]node(?:\s|$)/.test(line);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
+
 const spawnCli = (
   command: string,
   args: readonly string[],
   options: SpawnOptions,
-): ChildProcess => NODE_SCRIPT_EXTENSIONS.has(path.extname(command).toLowerCase())
+): ChildProcess => NODE_SCRIPT_EXTENSIONS.has(path.extname(command).toLowerCase()) || nodeShebang(command)
   ? crossSpawn(process.execPath, [command, ...args], options)
   : crossSpawn(command, [...args], options);
 

@@ -40,6 +40,15 @@ describe("resolvePiBinary", () => {
     })).toBe("pi");
   });
 
+  it("resolves the PATH launcher to an absolute path before a transport changes PATH", () => {
+    const expected = path.resolve("/opt/second", "pi");
+    const isExecutable = (candidate: string) => candidate === expected;
+    expect(resolvePiBinary(undefined, {
+      env: { PATH: ["/opt/first", "/opt/second"].join(path.delimiter) },
+      isExecutable,
+    })).toBe(expected);
+  });
+
   it("uses PATH lookup outside LocalTerm", () => {
     const isExecutable = vi.fn(() => true);
     expect(resolvePiBinary(undefined, { env: {}, isExecutable })).toBe("pi");

@@ -73,6 +73,39 @@ const errorCode = (error: unknown): string | undefined =>
     ? error.code
     : undefined;
 
+const PROCESS_STATES: Record<string, string> = {
+  R: "running", S: "sleeping", D: "uninterruptible I/O wait", T: "stopped", t: "stopped by tracer",
+  Z: "zombie", X: "dead", I: "idle",
+};
+
+// Names the holder in a lock timeout. A live holder is never taken over (a resumed
+// holder could commit stale state), so a stuck one must be found and restarted from
+// outside; tonight's stopped holder (smarty-dev#266) only showed up as expired sessions.
+// ponytail: the process state comes from Linux /proc; other platforms report the PID only.
+const describeLockHolder = (ownerPath: string): string => {
+  let owner: string;
+  try {
+    owner = fs.readFileSync(ownerPath, "utf8");
+  } catch {
+    return " (lock directory has no owner record)";
+  }
+  const [, pidText, createdText] = owner.trim().split("\n");
+  const pid = Number(pidText);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return " (lock owner record is unreadable)";
+  const createdAt = Number(createdText);
+  const held = Number.isFinite(createdAt) ? ` for ${Math.max(0, Math.round((Date.now() - createdAt) / 1000))} s` : "";
+  if (!processAlive(pid)) return ` held by pid ${pid} (not running)${held}`;
+  let state = "";
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const code = stat.slice(stat.lastIndexOf(")") + 2).charAt(0);
+    if (code) state = `, state ${code}${PROCESS_STATES[code] ? ` ${PROCESS_STATES[code]}` : ""}`;
+  } catch {
+    // No /proc: report the PID only.
+  }
+  return ` held by pid ${pid} (alive${state})${held}`;
+};
+
 const processAlive = (pid: number): boolean => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -661,7 +694,9 @@ export class MeshStore {
       } catch (error) {
         if (errorCode(error) !== "EEXIST") throw error;
         if (this.#clearStaleLock(ownerPath)) continue;
-        if (Date.now() >= deadline) throw new Error("Timed out waiting for the Fabric mesh lock");
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out waiting for the Fabric mesh lock${describeLockHolder(ownerPath)}`);
+        }
         await delay(10);
       }
     }

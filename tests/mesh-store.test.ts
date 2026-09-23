@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -292,10 +293,34 @@ describe("MeshStore lock recovery", () => {
 
     await expect(
       store.publish({ topic: "team.auth", from: identity, text: "blocked" }),
-    ).rejects.toThrow("Timed out waiting for the Fabric mesh lock");
+    ).rejects.toThrow(`Timed out waiting for the Fabric mesh lock held by pid ${process.pid} (alive`);
     expect(fs.existsSync(lockPath)).toBe(true);
     expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`${process.pid}\n`);
   });
+
+  // A stopped holder keeps the lock (taking it over could let the holder commit stale
+  // state on resume); the timeout must name it so it can be restarted (smarty-dev#266).
+  it.skipIf(process.platform !== "linux")(
+    "names a signal-stopped holder in the timeout and does not take its lock",
+    async () => {
+      const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      try {
+        await new Promise((resolve) => holder.once("spawn", resolve));
+        process.kill(holder.pid!, "SIGSTOP");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const store = createStore({ lockTimeoutMs: 300 });
+        const lockPath = holdLock(store, `stopped\n${holder.pid}\n${Date.now() - 60_000}\n`);
+
+        await expect(
+          store.publish({ topic: "team.auth", from: identity, text: "blocked" }),
+        ).rejects.toThrow(new RegExp(`held by pid ${holder.pid} \\(alive, state T stopped\\) for \\d+ s`));
+        expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`${holder.pid}\n`);
+      } finally {
+        try { process.kill(holder.pid!, "SIGCONT"); } catch {}
+        holder.kill("SIGKILL");
+      }
+    },
+  );
 
   it("waits out a fresh ownerless lock instead of sweeping an in-flight acquisition", async () => {
     const store = createStore({ lockTimeoutMs: 300 });
@@ -303,7 +328,7 @@ describe("MeshStore lock recovery", () => {
 
     await expect(
       store.publish({ topic: "team.auth", from: identity, text: "blocked" }),
-    ).rejects.toThrow("Timed out waiting for the Fabric mesh lock");
+    ).rejects.toThrow("Timed out waiting for the Fabric mesh lock (lock directory has no owner record)");
     expect(fs.existsSync(lockPath)).toBe(true);
   });
 });

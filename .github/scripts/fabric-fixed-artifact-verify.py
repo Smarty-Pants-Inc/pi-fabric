@@ -4,13 +4,13 @@ New explicit artifact/source/run bindings; original105835 artifacts untouched.
 """
 import hashlib,json,posixpath,stat,tarfile,zipfile,gzip,re,time,signal,sys
 from pathlib import Path,PurePosixPath
-D=Path(sys.argv[1]).resolve();archive=D/'artifact-10718135458.zip';CAP=2*1024**3;MAX=200000
+D=Path(sys.argv[1]).resolve();archive=D/'artifact-10724188374.zip';CAP=2*1024**3;MAX=200000
 start=time.monotonic()
 def deadline(*a):raise TimeoutError('Data verification deadline')
 signal.signal(signal.SIGALRM,deadline);signal.alarm(120)
 def sha(data):return hashlib.sha256(data).hexdigest()
-with archive.open('rb') as f:assert hashlib.file_digest(f,'sha256').hexdigest()=='2501a67279b6675d68bf983e9952e7980e04a9f5109171a0b46cf17c6883ebb0'
-assert archive.stat().st_size==119276501
+with archive.open('rb') as f:assert hashlib.file_digest(f,'sha256').hexdigest()=='017c98565b3f5df7c40cfcaf460a1e43b1897e005cc316ad9b57610358cdf7e0'
+assert archive.stat().st_size==119294607
 class Bounded:
  def __init__(self,stream):self.stream=stream;self.count=0
  def read(self,n=-1):
@@ -27,7 +27,7 @@ with zipfile.ZipFile(archive) as z:
   with z.open(name) as f:assert hashlib.file_digest(f,'sha256').hexdigest()==digest
  assert set(sums)==expected-{'SHA256SUMS'}
  for name in ['source-identities.txt','tool-digests.txt','tool-versions.txt']:assert z.getinfo(name).file_size<=65536
- ids=dict(line.split('=',1) for line in z.read('source-identities.txt').decode().splitlines());assert ids=={'fork_commit':'f7d71b57bfc9ec7ec76fc2e02f13642ec87033e3','fork_tree':'73a4de6f00eb4dc55207b679b46eb866deb43872','smarty_dev_fixture':'private_post_receive_only','run_id':'35780469006','attempt':'1','workflow_sha':'999936a251b97a6c057cf28f2665ed471941e85b'}
+ ids=dict(line.split('=',1) for line in z.read('source-identities.txt').decode().splitlines());assert ids=={'fork_commit':'27abed787abb3836da19ab8c2cd6d491701cacbb','fork_tree':'7bb0c177c2d1414ee9dd499f410fdd729b69cdcc','smarty_dev_fixture':'private_post_receive_only','run_id':'35798378805','attempt':'1','workflow_sha':'a8503f8c4fdc7c33357947708cb3da4c94899fac'}
  versions=z.read('tool-versions.txt');assert versions==b'node=v24.18.0\nbun=1.4.0\n'
  tools={}
  for line in z.read('tool-digests.txt').decode().splitlines():
@@ -85,6 +85,6 @@ with zipfile.ZipFile(archive) as z:
      candidate=posixpath.normpath(posixpath.join(posixpath.dirname(part),item['target'],*parts[i:]));assert not candidate.startswith('/') and candidate!='..' and not candidate.startswith('../');changed=True;break
    if not changed:break
   else:raise ValueError('Symlink depth bound')
- result={'verified':True,'scope':'BODY_DATA_CLOSURE_ONLY','run':35780469006,'attempt':1,'job':106924410079,'artifact':10718135458,'archiveBytes':archive.stat().st_size,'archiveSHA256':'2501a67279b6675d68bf983e9952e7980e04a9f5109171a0b46cf17c6883ebb0','outerMembers':len(names),'outerLogicalBytes':outerLogical,'outerCRCAndAllSHA256SUMSVerified':True,'sourceIdentities':ids,'toolVersions':versions.decode(),'toolDigests':tools,'closureManifestSHA256':sums['closure-manifest.json'],'closureMembers':len(plan),'layerFileBytes':total,'tarMembersIncludingLayerDuplicates':memberCount,'layers':layers,'symlinksConfined':symlinks,'manifestExactEquality':True,'memberSHA256':sums,'checksumFileSHA256':sha(checksumBytes),'elapsedSeconds':time.monotonic()-start,'limits':'Each uncompressed tar/outer logical size and aggregate layer file bytes <=2GiB; <=200000 manifest and traversed entries. This is NOT a global disk-use quota.','privateFixtureRun':False,'extracted':False,'runtimeActivated':False,'old105835Untouched':True}
+ result={'verified':True,'scope':'BODY_DATA_CLOSURE_ONLY','run':35798378805,'attempt':1,'job':106982860108,'artifact':10724188374,'archiveBytes':archive.stat().st_size,'archiveSHA256':'017c98565b3f5df7c40cfcaf460a1e43b1897e005cc316ad9b57610358cdf7e0','outerMembers':len(names),'outerLogicalBytes':outerLogical,'outerCRCAndAllSHA256SUMSVerified':True,'sourceIdentities':ids,'toolVersions':versions.decode(),'toolDigests':tools,'closureManifestSHA256':sums['closure-manifest.json'],'closureMembers':len(plan),'layerFileBytes':total,'tarMembersIncludingLayerDuplicates':memberCount,'layers':layers,'symlinksConfined':symlinks,'manifestExactEquality':True,'memberSHA256':sums,'checksumFileSHA256':sha(checksumBytes),'elapsedSeconds':time.monotonic()-start,'limits':'Each uncompressed tar/outer logical size and aggregate layer file bytes <=2GiB; <=200000 manifest and traversed entries. This is NOT a global disk-use quota.','privateFixtureRun':False,'extracted':False,'runtimeActivated':False,'old105835Untouched':True}
  (D/'ARTIFACT-VERIFIED.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2))
 signal.alarm(0)

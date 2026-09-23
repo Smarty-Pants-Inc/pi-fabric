@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: fabric10718135458-native
+  group: fabric10724188374-native
   cancel-in-progress: false
 
 jobs:
@@ -44,21 +44,22 @@ jobs:
 
       # No artifact dependency install or rebuild. Setup above reuses the exact
       # reviewed tool route; the helper verifies actual paths/bytes/versions.
-      - name: Run native four and omitted-history case once
+      - name: Run helper mocks then targeted seams then native four and default once
         run: timeout --kill-after=5s 210s python3 -I -B .github/scripts/fabric-fixed-native.py qualify
 
       - name: Retain bounded qualification evidence only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: fabric10718135458-native-${{ github.run_id }}-${{ github.run_attempt }}
+          name: fabric10724188374-native-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/fabric10718135458-native/*-INTENT.json
-            ${{ runner.temp }}/fabric10718135458-native/BODY-*.json
-            ${{ runner.temp }}/fabric10718135458-native/*VERIFIED.json
-            ${{ runner.temp }}/fabric10718135458-native/NATIVE-RESULT.json
-            ${{ runner.temp }}/fabric10718135458-native/native.stdout
-            ${{ runner.temp }}/fabric10718135458-native/native.stderr
-            ${{ runner.temp }}/fabric10718135458-native/state/output/vitest.json
+            ${{ runner.temp }}/fabric10724188374-native/*-INTENT.json
+            ${{ runner.temp }}/fabric10724188374-native/BODY-*.json
+            ${{ runner.temp }}/fabric10724188374-native/*VERIFIED.json
+            ${{ runner.temp }}/fabric10724188374-native/NATIVE-RESULT.json
+            ${{ runner.temp }}/fabric10724188374-native/native.stdout
+            ${{ runner.temp }}/fabric10724188374-native/native.stderr
+            ${{ runner.temp }}/fabric10724188374-native/state/output/targeted.json
+            ${{ runner.temp }}/fabric10724188374-native/state/output/vitest.json
           if-no-files-found: error
           retention-days: 1

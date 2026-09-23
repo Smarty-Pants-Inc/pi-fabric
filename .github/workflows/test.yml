@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   check:
     strategy:
@@ -54,3 +57,26 @@ jobs:
         # binaries, spawn, process and watcher fallbacks) so a Linux or Windows
         # break surfaces even when the affected selection is empty.
         run: bun run test:smoke
+      - name: Package tested Linux runtime
+        if: runner.os == 'Linux' && github.event_name == 'push'
+        shell: bash
+        run: |
+          stage="$RUNNER_TEMP/fabric-runtime"
+          output="$RUNNER_TEMP/fabric-artifact"
+          mkdir -p "$stage" "$output"
+          git archive HEAD | tar -x -C "$stage"
+          cp -a dist node_modules "$stage/"
+          git rev-parse HEAD > "$output/COMMIT"
+          git rev-parse HEAD^{tree} > "$output/TREE"
+          node --version > "$output/NODE-VERSION"
+          bun --version > "$output/BUN-VERSION"
+          tar -czf "$output/fabric-runtime.tar.gz" -C "$stage" .
+          (cd "$output" && sha256sum fabric-runtime.tar.gz > SHA256SUMS)
+      - name: Upload tested Linux runtime
+        if: runner.os == 'Linux' && github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fabric-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/fabric-artifact/
+          if-no-files-found: error
+          retention-days: 7

@@ -355,6 +355,9 @@ const main = async (): Promise<void> => {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
           }
         : {}),
+      // Preserve the selected launcher for Fabric loaded inside this child.
+      // Herdr's server environment need not contain the owner's binary pin.
+      ...(options.runner === "pi" ? { PI_FABRIC_PI_BINARY: options.piBinary } : {}),
       PI_FABRIC_ACTIVATION_WORKER_PID: activationWindow ? String(process.pid) : "",
       PI_FABRIC_ACTIVATION_NONCE: activationNonce ?? "",
       PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",

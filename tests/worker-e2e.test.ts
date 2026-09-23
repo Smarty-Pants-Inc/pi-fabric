@@ -84,6 +84,33 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(process.env[key]).toBe(before);
   });
 
+  it("preserves the selected Pi launcher for nested Fabric instead of an ambient pin", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-nested-launcher-"));
+    roots.push(root);
+    const shim = path.join(root, "selected-pi.mjs");
+    fs.writeFileSync(shim, [
+      `if (process.env.PI_FABRIC_PI_BINARY !== ${JSON.stringify(shim)}) process.exit(79);`,
+      'process.env.FAKE_PI_BEHAVIOR = "fabric-session-env";',
+      'process.env.PI_FABRIC_SESSION_ID = "selected-launcher-retained";',
+      `await import(${JSON.stringify(pathToFileURL(piBinary).href)});`,
+    ].join("\n"));
+    const before = process.env.PI_FABRIC_PI_BINARY;
+    process.env.PI_FABRIC_PI_BINARY = path.join(root, "missing-ambient-pi");
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath, piBinary: shim, runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "report selected launcher", transport: "process" });
+      expect(result.status).toBe("completed");
+      expect(result.text).toBe("selected-launcher-retained");
+      expect(process.env.PI_FABRIC_PI_BINARY).toBe(path.join(root, "missing-ambient-pi"));
+    } finally {
+      if (before === undefined) delete process.env.PI_FABRIC_PI_BINARY;
+      else process.env.PI_FABRIC_PI_BINARY = before;
+    }
+  });
+
   it("propagates the root Fabric session identity through the worker", async () => {
     process.env.FAKE_PI_BEHAVIOR = "fabric-session-env";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));

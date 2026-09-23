@@ -33,14 +33,17 @@ export const executeFile = (
     );
   });
 
-/** Windows resolves bare names through PATHEXT; POSIX needs the execute bit. */
+/**
+ * Windows resolves bare names through PATHEXT only: an extensionless file (an
+ * npm `sh` shim, for example) is not launchable there. POSIX needs the execute bit.
+ */
 const executableNames = (command: string, env: NodeJS.ProcessEnv): string[] => {
   if (process.platform !== "win32" || path.extname(command) !== "") return [command];
   const extensions = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
     .split(";")
     .map((extension) => extension.trim().toLowerCase())
     .filter((extension) => extension !== "");
-  return [command, ...extensions.map((extension) => command + extension)];
+  return extensions.map((extension) => command + extension);
 };
 
 const unquotePathEntry = (entry: string): string => {

@@ -49,7 +49,7 @@ describe("resolvePiBinary", () => {
     })).toBe(expected);
   });
 
-  it("uses PATH lookup outside LocalTerm", () => {
+  it("falls back to the literal name when PATH has no launcher", () => {
     const isExecutable = vi.fn(() => true);
     expect(resolvePiBinary(undefined, { env: {}, isExecutable })).toBe("pi");
     expect(isExecutable).not.toHaveBeenCalled();

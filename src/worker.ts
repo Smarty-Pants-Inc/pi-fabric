@@ -17,15 +17,17 @@ const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".
 
 // Extensionless launchers such as ~/.local/bin/pi start with
 // `#!/usr/bin/env node`; a Herdr child's server PATH need not contain node.
-// ponytail: shebang flags are not replayed; revisit if a launcher needs them.
+// Only the PATH-dependent `env` form is rewritten; an absolute interpreter
+// already works. ponytail: `env -S` flags are not replayed; revisit if a
+// launcher needs them.
 const nodeShebang = (command: string): boolean => {
   if (!path.isAbsolute(command)) return false;
   let fd: number | undefined;
   try {
     fd = fs.openSync(command, "r");
-    const head = Buffer.alloc(128);
+    const head = Buffer.alloc(256);
     const line = head.subarray(0, fs.readSync(fd, head, 0, head.length, 0)).toString("utf8").split(/\r?\n/, 1)[0] ?? "";
-    return /^#!.*[/\s]node(?:\s|$)/.test(line);
+    return /^#!\s*\S*\/env\s+(?:-S\s+)?node(?:\s|$)/.test(line);
   } catch {
     return false;
   } finally {

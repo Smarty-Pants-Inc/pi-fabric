@@ -17,6 +17,8 @@ import {
   parseFormattedNumericValue,
   populateClaudeModelSource,
 } from "../src/ui/settings.js";
+import { buildMcpSection } from "../src/ui/settings-sections-execution.js";
+import { SectionSubmenu } from "../src/ui/settings-submenus.js";
 
 const theme = {
   fg: (_color: string, text: string) => text,
@@ -59,6 +61,32 @@ describe("FabricSettingsComponent", () => {
     await loading;
     expect(source.models).toEqual([
       { provider: "claude", id: "haiku", name: "Haiku" },
+    ]);
+  });
+
+  it("nests Jev semantic search and a cached MCP block list under MCP", () => {
+    const item = buildMcpSection({
+      config: DEFAULT_FABRIC_CONFIG,
+      theme,
+      persist: () => {},
+      apply: () => {},
+      options: {
+        keepVisibleCandidates: ["fabric_exec"],
+        modelSource: fakeModelSource,
+        cachedMcpServers: ["github", "slack"],
+      },
+    });
+    const submenu = item.submenu!("", () => {}) as SectionSubmenu;
+    const ids = submenu.items.map((row) => row.id);
+    expect(ids).toContain("mcp.jev.semanticSearch");
+    expect(ids).toContain("mcp.jev.blockedServers");
+    expect(submenu.items.find((row) => row.id === "mcp.jev.semanticSearch")?.currentValue).toBe("false");
+    expect(submenu.items.find((row) => row.id === "mcp.jev.blockedServers")?.currentValue).toBe("0 blocked");
+    const blocked = submenu.items.find((row) => row.id === "mcp.jev.blockedServers")!;
+    const servers = blocked.submenu!("", () => {}) as SectionSubmenu;
+    expect(servers.items.map((row) => row.id)).toEqual([
+      "mcp.jev.blockedServers.github",
+      "mcp.jev.blockedServers.slack",
     ]);
   });
 
@@ -592,7 +620,7 @@ describe("FabricSettingsComponent", () => {
     list.activateItem();
     list.submenuComponent.handleInput("jev");
     list.submenuComponent.handleInput("\r");
-    expect(applied.at(-1)).toEqual({ id: "approvals.model", value: "pi-fabric/typesafe/jev-1.13" });
+    expect(applied.at(-1)).toEqual({ id: "approvals.model", value: "pi-fabric/openrouter/jev-1.13" });
     expect(source.models.some(model => model.provider === "jev")).toBe(false);
   });
 
@@ -605,7 +633,7 @@ describe("FabricSettingsComponent", () => {
       { keepVisibleCandidates: ["fabric_exec"], modelSource: fakeModelSource },
     );
     const prewalk = items.find((item) => item.id === "prewalk")!;
-    expect(prewalk.currentValue).toBe("in-place · Ask each time");
+    expect(prewalk.currentValue).toBe("in-place · Ask each time · plan");
     const section = prewalk.submenu!("", () => {}) as any;
     const list = section.settingsList as any;
     list.selectedIndex = list.items.findIndex(
@@ -663,7 +691,7 @@ describe("FabricSettingsComponent", () => {
       { keepVisibleCandidates: ["fabric_exec"], modelSource: fakeModelSource },
     );
     const prewalk = items.find((item) => item.id === "prewalk")!;
-    expect(prewalk.currentValue).toBe("in-place · Ask each time");
+    expect(prewalk.currentValue).toBe("in-place · Ask each time · plan");
     const section = prewalk.submenu!("", () => {}) as any;
     const list = section.settingsList as any;
     const row = list.items.find((item: { id: string }) => item.id === "prewalk.thinking");
@@ -691,7 +719,7 @@ describe("FabricSettingsComponent", () => {
   it("exposes a dedicated prewalk executor model picker", () => {
     const config = {
       ...DEFAULT_FABRIC_CONFIG,
-      prewalk: { mode: "in-place" as const, model: "anthropic/claude-sonnet-4-5", alwaysRearm: false, compactOnReturn: true, detectShellWrites: true },
+      prewalk: { mode: "in-place" as const, model: "anthropic/claude-sonnet-4-5", alwaysRearm: false, compactOnReturn: true, detectShellWrites: true, requirePlan: true },
     };
     const items = buildFabricSettingsItems(theme, config, () => {}, {
       keepVisibleCandidates: ["fabric_exec"],
@@ -1208,7 +1236,7 @@ describe("FabricSettingsComponent", () => {
       expect(config.prewalk.thinking).toBe("xhigh");
       expect(
         rootList.items.find((item: { id: string }) => item.id === "prewalk").currentValue,
-      ).toBe("in-place · Ask each time · XHigh");
+      ).toBe("in-place · Ask each time · XHigh · plan");
       expect(applyFabricMode).toHaveBeenCalledOnce();
       expect(notify).toHaveBeenCalledWith("Fabric settings saved.", "info");
     } finally {
@@ -1234,13 +1262,14 @@ describe("FabricSettingsComponent", () => {
         reloadConfig: vi.fn(() => {
           const saved = JSON.parse(
             fs.readFileSync(path.join(cwd, ".pi", "fabric.json"), "utf8"),
-          ) as { prewalk?: { mode?: "in-place" | "trajectory"; model?: string; alwaysRearm?: boolean; compactOnReturn?: boolean; detectShellWrites?: boolean } };
+          ) as { prewalk?: { mode?: "in-place" | "trajectory"; model?: string; alwaysRearm?: boolean; compactOnReturn?: boolean; detectShellWrites?: boolean; requirePlan?: boolean } };
           config.prewalk = {
             mode: saved.prewalk?.mode ?? "in-place",
             ...(saved.prewalk?.model ? { model: saved.prewalk.model } : {}),
             alwaysRearm: saved.prewalk?.alwaysRearm === true,
             compactOnReturn: saved.prewalk?.compactOnReturn !== false,
             detectShellWrites: saved.prewalk?.detectShellWrites !== false,
+            requirePlan: saved.prewalk?.requirePlan !== false,
           };
         }),
         agents: { claudeModels: vi.fn().mockResolvedValue([]) },
@@ -1287,7 +1316,7 @@ describe("FabricSettingsComponent", () => {
       expect(config.prewalk.model).toBe("anthropic/claude-sonnet-4-5");
       expect(
         rootList.items.find((item: { id: string }) => item.id === "prewalk").currentValue,
-      ).toBe("in-place · anthropic/claude-sonnet-4-5");
+      ).toBe("in-place · anthropic/claude-sonnet-4-5 · plan");
       expect(nestedList.items[nestedList.selectedIndex].currentValue).toBe(
         "anthropic/claude-sonnet-4-5",
       );

@@ -18,6 +18,19 @@ Project settings override global settings; untrusted project config is not loade
 
 Alternatively, open `/fabric settings` → **Executor**, select **Kernel** → `python`, and keep **Runtime (Python)** → `monty`. **Runtime (TS)** controls only the TypeScript backend (`quickjs`, `node-process`, or `bun-process`); Python ignores that setting. Set **Kernel** back to `typescript` to restore TypeScript programs.
 
+Process runtimes can import native modules from guest code: Node guests use `await import("pkg")` (resolved from the session cwd; `--experimental-vm-modules` is set at spawn), while Bun's vm lacks the dynamic-import callback, so Bun guests call `await __fabricImport("pkg")`, which bridges the child's real ESM context (bun auto-install applies).
+
+### The Bun namespace in Bun guests
+
+When **Runtime (TS)** is `bun-process`, guest programs receive the child's real Bun module namespace as the `__bun` global — no import needed:
+
+```ts
+const config = await __bun.file("/tmp/config.json").json();
+const files = [...new __bun.Glob("**/*.ts").scanSync({ cwd: "src" })];
+```
+
+`__bun` is `undefined` under `node-process` and `quickjs`; the child resolves the Bun specifier only when it actually runs under Bun. Namespace objects come from the child's module realm, so prefer structural checks over `instanceof` across the sandbox boundary.
+
 See [configuration](configuration.md) for save scopes, timeout ceilings, result formatting, and the full reference.
 
 ### Explicit CPython escape hatch

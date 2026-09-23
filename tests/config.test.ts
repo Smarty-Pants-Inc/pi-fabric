@@ -44,14 +44,16 @@ describe("Fabric configuration", () => {
           aliases: {
             cheap: "google/gemini-2.5-flash",
             budget: ["openai/gpt-5-mini", "google/gemini-2.5-flash"],
+            shallow: { model: "google/gemini-2.5-flash", thinking: "low" },
             broken: "not-a-model",
             empty: [],
           },
         },
       }).models.aliases,
     ).toEqual({
-      cheap: ["google/gemini-2.5-flash"],
-      budget: ["openai/gpt-5-mini", "google/gemini-2.5-flash"],
+      cheap: { targets: ["google/gemini-2.5-flash"] },
+      budget: { targets: ["openai/gpt-5-mini", "google/gemini-2.5-flash"] },
+      shallow: { targets: ["google/gemini-2.5-flash"], thinking: "low" },
     });
   });
 
@@ -152,6 +154,14 @@ describe("Fabric configuration", () => {
     });
     expect(floored.executor.hostCallTimeouts).toEqual({ "extensions.subagent": 300_000 });
   });
+  it("floors fractional integers instead of resetting them to defaults", () => {
+    const normalized = normalizeFabricConfig({
+      executor: { timeoutMs: 1500.9, maxOutputChars: 2500.5 },
+    });
+    expect(normalized.executor.timeoutMs).toBe(1500);
+    expect(normalized.executor.maxOutputChars).toBe(2500);
+  });
+
 
   it("normalizes executor runtimes and their memory ceilings", () => {
     const native = normalizeFabricConfig({
@@ -173,18 +183,21 @@ describe("Fabric configuration", () => {
       alwaysRearm: false,
       compactOnReturn: true,
       detectShellWrites: true,
+      requirePlan: true,
     });
     expect(normalizeFabricConfig({ prewalk: { model: "   " } }).prewalk).toEqual({
       mode: "in-place",
       alwaysRearm: false,
       compactOnReturn: true,
       detectShellWrites: true,
+      requirePlan: true,
     });
     expect(normalizeFabricConfig({ prewalk: { alwaysRearm: true } }).prewalk).toEqual({
       mode: "in-place",
       alwaysRearm: true,
       compactOnReturn: true,
       detectShellWrites: true,
+      requirePlan: true,
     });
     expect(normalizeFabricConfig({ prewalk: { mode: "trajectory" } }).prewalk.mode).toBe(
       "trajectory",
@@ -775,6 +788,7 @@ describe("Fabric configuration", () => {
       alwaysRearm: false,
       compactOnReturn: true,
       detectShellWrites: true,
+      requirePlan: true,
     });
   });
 
@@ -875,5 +889,34 @@ describe("MCP descriptor cache configuration", () => {
     });
     expect(config.mcp.cache.revalidate).toBe("changed");
     expect(config.mcp.cache.revalidateBudgetMs).toBe(1_000);
+  });
+});
+
+describe("MCP Jev semantic search configuration", () => {
+  it("defaults to opt-in search with every MCP server eligible", () => {
+    const config = normalizeFabricConfig({});
+    expect(config.mcp.jev).toEqual({
+      semanticSearch: false,
+      blockedServers: [],
+      semanticCandidateLimit: 127,
+      semanticMinProbability: 0.2,
+    });
+  });
+
+  it("parses a block list and clamps candidate bounds", () => {
+    const config = normalizeFabricConfig({
+      mcp: {
+        jev: {
+          semanticSearch: true,
+          blockedServers: [" github ", "github", "", "x".repeat(200), 3],
+          semanticCandidateLimit: 400,
+          semanticMinProbability: 0.75,
+        },
+      },
+    });
+    expect(config.mcp.jev.semanticSearch).toBe(true);
+    expect(config.mcp.jev.blockedServers).toEqual(["github"]);
+    expect(config.mcp.jev.semanticCandidateLimit).toBe(127);
+    expect(config.mcp.jev.semanticMinProbability).toBe(0.75);
   });
 });

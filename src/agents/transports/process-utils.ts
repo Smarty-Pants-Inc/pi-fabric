@@ -33,14 +33,17 @@ export const executeFile = (
     );
   });
 
-/** Windows resolves bare names through PATHEXT; POSIX needs the execute bit. */
+/**
+ * Windows resolves bare names through PATHEXT only: an extensionless file (an
+ * npm `sh` shim, for example) is not launchable there. POSIX needs the execute bit.
+ */
 const executableNames = (command: string, env: NodeJS.ProcessEnv): string[] => {
   if (process.platform !== "win32" || path.extname(command) !== "") return [command];
   const extensions = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
     .split(";")
     .map((extension) => extension.trim().toLowerCase())
     .filter((extension) => extension !== "");
-  return [command, ...extensions.map((extension) => command + extension)];
+  return extensions.map((extension) => command + extension);
 };
 
 const unquotePathEntry = (entry: string): string => {
@@ -50,9 +53,9 @@ const unquotePathEntry = (entry: string): string => {
     : trimmed;
 };
 
-const isExecutableFile = async (candidate: string): Promise<boolean> => {
+const isExecutableFile = (candidate: string): boolean => {
   try {
-    const stats = await fs.promises.stat(candidate);
+    const stats = fs.statSync(candidate);
     if (!stats.isFile()) return false;
     // Windows has no execute bit; PATHEXT already narrowed the candidate name.
     return process.platform === "win32" || (stats.mode & 0o111) !== 0;
@@ -64,21 +67,30 @@ const isExecutableFile = async (candidate: string): Promise<boolean> => {
 /**
  * PATH lookup that never shells out: Windows runners reach this code with no
  * `sh` on PATH, and a login shell may rewrite PATH behind the caller's back.
+ * Returns an absolute path, so a transport with another environment (Herdr's
+ * server, for example) launches the executable the caller selected.
  */
-export const commandAvailable = async (
+export const findExecutable = (
   command: string,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<boolean> => {
+  isExecutable: (candidate: string) => boolean = isExecutableFile,
+): string | undefined => {
   const names = executableNames(command, env);
   for (const entry of (env.PATH ?? "").split(path.delimiter)) {
     const directory = unquotePathEntry(entry);
     if (directory === "") continue;
     for (const name of names) {
-      if (await isExecutableFile(path.join(directory, name))) return true;
+      const candidate = path.resolve(directory, name);
+      if (isExecutable(candidate)) return candidate;
     }
   }
-  return false;
+  return undefined;
 };
+
+export const commandAvailable = async (
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<boolean> => findExecutable(command, env) !== undefined;
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", `'"'"'`)}'`;
 
@@ -146,7 +158,8 @@ const resolveScriptRuntimeUncached = async (options: ScriptRuntimeOptions = {}):
   const override = runtimeOverride(env);
   if (override) return override;
   for (const candidate of requireNode ? ["node"] : requireBun ? ["bun"] : ["node", "bun"]) {
-    if (await commandAvailable(candidate)) return candidate;
+    const found = findExecutable(candidate);
+    if (found) return found;
   }
   throw missingRuntimeError(execPath, requireNode, requireBun);
 };
@@ -182,12 +195,23 @@ export const resolveScriptRuntimeSync = (options: ScriptRuntimeOptions = {}): st
   throw missingRuntimeError(execPath, requireNode, requireBun);
 };
 
+const typescriptWorker = (workerPath: string): boolean =>
+  /.[cm]?tsx?$/i.test(path.extname(workerPath));
+
+const runtimeOptionsForWorker = (
+  workerPath: string,
+  options?: ScriptRuntimeOptions,
+): ScriptRuntimeOptions | undefined => {
+  if (!typescriptWorker(workerPath) || options?.requireNode || options?.requireBun) return options;
+  return { ...options, requireBun: true };
+};
+
 export const scriptSpawnArgs = async (
   workerPath: string,
   workerArguments: readonly string[],
   options?: ScriptRuntimeOptions,
 ): Promise<string[]> => {
-  const runtime = await resolveScriptRuntime(options);
+  const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath, options));
   return [runtime, workerPath, ...workerArguments];
 };
 
@@ -202,7 +226,7 @@ export const spawnDetached = async (
   workerArguments: string[],
   cwd: string,
 ): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean> }> => {
-  const runtime = await resolveScriptRuntime();
+  const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   const child = spawn(runtime, [workerPath, ...workerArguments], {
     cwd,
     detached: process.platform !== "win32",

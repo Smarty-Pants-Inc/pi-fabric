@@ -11,6 +11,7 @@ import {
 } from "../src/ui/conversation-render.js";
 import type { NativeAgentMessage, NativeToolExecution } from "../src/ui/conversation-native-reader.js";
 import { defaultCodePreviewSettings } from "../src/ui/code-preview.js";
+import type { JsonObject } from "@earendil-works/pi-ai";
 import { assistantMessage, nativeTranscript, userMessage } from "./fixtures/native-conversation.js";
 
 const highlighting = vi.hoisted(() => ({ ready: false, invalidate: undefined as (() => void) | undefined }));
@@ -44,7 +45,9 @@ const setup = (settings: FabricConversationTranscriptRendererOptions = {}) => {
 };
 const text = (lines: string[]) => lines.map(stripTerminalSequences).join("\n");
 const call = (id: string, args: Record<string, unknown> = { command: "echo fixture" }) => ({
-  type: "toolCall" as const, id, name: "fixture", arguments: args,
+  type: "toolCall" as const, id, name: "fixture",
+  // Serialization probe: a non-JSON `toJSON` value is supplied on purpose.
+  arguments: args as JsonObject,
 });
 const result = (id: string, output: string): Extract<NativeAgentMessage, { role: "toolResult" }> => ({
   role: "toolResult", toolCallId: id, toolName: "fixture", timestamp: 1,

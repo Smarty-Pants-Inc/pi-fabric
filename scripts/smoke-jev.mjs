@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
 import { ActionRegistry } from "../dist/core/action-registry.js";
 import { AgentService, createAgentServiceClient, createAgentServiceHandler, createAgentsProvider } from "../dist/agents.js";
-import { BrowserHarnessProvider, DEFAULT_JEV_CONFIG, JevProvider, JevObservationHost, createJevAuthProvider } from "../dist/jev.js";
+import { DEFAULT_JEV_CONFIG, JevProvider, JevObservationHost, createJevAuthProvider } from "../dist/jev.js";
 
 const registry = new ActionRegistry();
 // Minimal runtime fixture: no environment-key resolution or external network.
@@ -16,32 +15,38 @@ const context = {
   cwd: process.cwd(), signal: undefined, parentToolCallId: "jev-dist-smoke", nestedToolCallId: "jev-dist-smoke",
   extensionContext: { cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => "compiled-observer" } }, update() {},
 };
-let connected = false;
-const browser = new BrowserHarnessProvider({
-  modulePath: fileURLToPath(new URL("./fixture-session.ts", import.meta.url)),
-  wsUrl: "ws://127.0.0.1:9222/devtools/browser/fixture",
-  allowedMethods: ["Target.getTargets"],
-}, async () => ({
-  async connect() { connected = true; }, isConnected: () => connected,
-  async _call() { return { targetInfos: [{ targetId: "fixture" }] }; },
-  close() { connected = false; },
-}));
+const fixtureAction = { name: "items", description: "Read synthetic items", risk: "read", inputSchema: { type: "object", properties: {}, additionalProperties: false } };
+let fixtureCalls = 0;
+let fixtureClosed = false;
+const fixture = {
+  name: "fixture", description: "Connector-neutral offline capability fixture",
+  async list() { return [fixtureAction]; },
+  async describe(name) { return name === fixtureAction.name ? fixtureAction : undefined; },
+  async invoke(name, args) {
+    assert.equal(fixtureClosed, false);
+    assert.equal(name, "items");
+    assert.deepEqual(args, {});
+    fixtureCalls++;
+    return { items: [{ id: "fixture" }] };
+  },
+  async close() { fixtureClosed = true; },
+};
 const advice = [];
 const observationHost = new JevObservationHost("compiled-observer", message => advice.push(message));
 const provider = new JevProvider({ registry, config, observationHost });
 const agentService = new AgentService({rootId: "compiled-smoke", port: {execute: async () => ({status: "completed", text: "fixture"})}});
 registry.register(provider);
-registry.register(browser);
+registry.register(fixture);
 try {
   const foreground = await provider.invoke("run", { input: null, program: {
-    name: "compiled-cdp-probe", inputSchema: {}, outputSchema: { type: "integer", minimum: 1 },
-    requires: ["browser.connect", "browser.cdp"],
-    code: `await tools.call({ref: "browser.connect"});
-      const targets = await tools.call({ref: "browser.cdp", args: {method: "Target.getTargets"}}) as {targetInfos:unknown[]};
-      return targets.targetInfos.length;`,
+    name: "compiled-capability-probe", inputSchema: {}, outputSchema: { type: "integer", minimum: 1 },
+    requires: ["fixture.items"],
+    code: `const result = await tools.call({ref: "fixture.items"}) as {items:unknown[]};
+      return result.items.length;`,
   } }, context);
   assert.equal(foreground.state, "completed", foreground.error);
   assert.equal(foreground.result, 1);
+  assert.equal(fixtureCalls, 1);
   const background = await provider.invoke("spawn", { input: null, program: {
     name: "compiled-loop-probe", inputSchema: {}, outputSchema: {}, requires: [],
     code: "while (true) await program.sleep(10);",
@@ -84,9 +89,12 @@ try {
       const body = JSON.parse(options.body);
       assert.equal(body.model, "jev-latest");
       assert.equal(body.questions.safe_to_auto_approve.type, "noul");
+      assert.equal(body.questions.touches_secrets.type, "noul");
+      assert.equal(body.questions.destructive.type, "noul");
+      assert.equal(body.questions.targets_agent_artifacts.type, "noul");
       assert.equal(body.state.action.ref, "jev.spawn");
       classifications++;
-      return Response.json({ model: "jev-latest", answers: { safe_to_auto_approve: { type: "noul", noul: probability } }, usage: { input_tokens: 20, output_tokens: 3 } });
+      return Response.json({ model: "jev-latest", answers: { safe_to_auto_approve: { type: "noul", noul: probability }, touches_secrets: { type: "noul", noul: 0 }, destructive: { type: "noul", noul: 0 }, targets_agent_artifacts: { type: "noul", noul: 0 } }, usage: { input_tokens: 20, output_tokens: 3 } });
     };
     config.approvals.read = "auto";
     config.approvals.model = "pi-fabric/typesafe/jev-latest";
@@ -107,10 +115,11 @@ try {
     assert.equal(classifications, 2);
     assert.equal(observationHost.size, 0);
   } finally { globalThis.fetch = originalFetch; }
-  console.log("Compiled Jev smoke passed: auth-only provider, typed foreground CDP program, background stop/wait, agent/Jev join aliases, event-driven Main advice, and Jev auto-mode approval; no external calls.");
+  console.log("Compiled Jev smoke passed: auth-only provider, typed foreground capability dispatch, background stop/wait, agent/Jev join aliases, event-driven Main advice, and Jev auto-mode approval; no external calls.");
 } finally {
   observationHost.close();
   await provider.close();
-  await browser.close();
+  await fixture.close();
+  assert.equal(fixtureClosed, true);
   await agentService.close();
 }

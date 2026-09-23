@@ -242,6 +242,7 @@ class ResidentHost {
           "followUp",
           true,
           result,
+          result.id,
         ).catch(() => undefined);
       },
     });
@@ -494,6 +495,7 @@ class ResidentHost {
     delivery: "steer" | "followUp",
     triggerTurn: boolean,
     data?: unknown,
+    agentCompletionId?: string,
   ): Promise<void> {
     const id = randomUUID();
     const record: ResidentDeliveryRecord = {
@@ -505,6 +507,7 @@ class ResidentHost {
       triggerTurn,
       message,
       ...(data === undefined ? {} : { data }),
+      ...(agentCompletionId ? { agentCompletionId } : {}),
       createdAt: Date.now(),
     };
     try {
@@ -600,7 +603,6 @@ class ResidentHost {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
         const handle = await this.agents.spawn({ ...command.request, residency: "durable" });
-        this.agents.detachSignal(handle.id);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) throw new Error(`Resident agent ${handle.id} has no run directory`);
         const worktreeGitRoot = this.agents.worktreeGitRoot(handle.id);
@@ -615,6 +617,8 @@ class ResidentHost {
           updatedAt: Date.now(),
         };
         atomicWrite(path.join(this.#agentsPath, `${handle.id}.json`), metadata);
+        // Publish ownership before a fast, already-settled spawn can notify Main.
+        this.agents.detachSignal(handle.id);
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,

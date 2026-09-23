@@ -13,7 +13,7 @@ describe("removeTree", () => {
     expect(fs.existsSync(dir)).toBe(false);
   });
 
-  it("retries on transient ENOTEMPTY and then succeeds", async () => {
+  it.each(["ENOTEMPTY", "EBUSY"])("retries on transient %s and then succeeds", async (code) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-rm-"));
     fs.mkdirSync(path.join(dir, "nested"), { recursive: true });
     fs.writeFileSync(path.join(dir, "nested", "file.txt"), "x");
@@ -21,8 +21,8 @@ describe("removeTree", () => {
     await removeTree(dir, async (target, options) => {
       calls++;
       if (calls < 3) {
-        const err = new Error("directory not empty") as NodeJS.ErrnoException;
-        err.code = "ENOTEMPTY";
+        const err = new Error(`transient removal failure: ${code}`) as NodeJS.ErrnoException;
+        err.code = code;
         throw err;
       }
       return fs.promises.rm(target, options);

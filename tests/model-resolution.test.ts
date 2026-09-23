@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  aliasThinking,
   normalizeModelAliases,
   resolveAvailablePiModel,
   resolveFabricModel,
@@ -28,9 +29,45 @@ describe("normalizeModelAliases", () => {
         budget: ["openai/gpt-5-mini", "google/gemini-2.5-flash"],
       }),
     ).toEqual({
-      cheap: ["google/gemini-2.5-flash"],
-      budget: ["openai/gpt-5-mini", "google/gemini-2.5-flash"],
+      cheap: { targets: ["google/gemini-2.5-flash"] },
+      budget: { targets: ["openai/gpt-5-mini", "google/gemini-2.5-flash"] },
     });
+  });
+
+  it("accepts an object entry with a fallback chain and a default thinking level", () => {
+    expect(
+      normalizeModelAliases({
+        cheap: { model: "google/gemini-2.5-flash", thinking: "low" },
+        bulk: { model: ["openai/gpt-5-mini", "google/gemini-2.5-flash"], thinking: "minimal" },
+      }),
+    ).toEqual({
+      cheap: { targets: ["google/gemini-2.5-flash"], thinking: "low" },
+      bulk: { targets: ["openai/gpt-5-mini", "google/gemini-2.5-flash"], thinking: "minimal" },
+    });
+  });
+
+  it("re-normalizes its own output so config round trips are idempotent", () => {
+    const normalized = normalizeModelAliases({
+      cheap: { model: "google/gemini-2.5-flash", thinking: "low" },
+    });
+    expect(normalizeModelAliases(normalized)).toEqual(normalized);
+  });
+
+  it("keeps the alias but ignores an invalid thinking level", () => {
+    expect(normalizeModelAliases({ cheap: { model: "google/gemini-2.5-flash", thinking: 3 } })).toEqual({
+      cheap: { targets: ["google/gemini-2.5-flash"] },
+    });
+    expect(
+      normalizeModelAliases({ cheap: { model: "google/gemini-2.5-flash", thinking: "extreme" } }),
+    ).toEqual({ cheap: { targets: ["google/gemini-2.5-flash"] } });
+  });
+
+  it("reports the thinking level of a selector that names an alias", () => {
+    const aliases = normalizeModelAliases({ Cheap: { model: "google/gemini-2.5-flash", thinking: "low" } });
+    expect(aliasThinking(aliases, "cheap")).toBe("low");
+    expect(aliasThinking(aliases, "  CHEAP ")).toBe("low");
+    expect(aliasThinking(aliases, "google/gemini-2.5-flash")).toBeUndefined();
+    expect(aliasThinking(undefined, "cheap")).toBeUndefined();
   });
 
   it("drops malformed names and targets", () => {
@@ -52,7 +89,7 @@ describe("normalizeModelAliases", () => {
       normalizeModelAliases({
         chain: ["google/gemini-2.5-flash", "google/gemini-2.5-flash", "openai/gpt-5-mini"],
       }),
-    ).toEqual({ chain: ["google/gemini-2.5-flash", "openai/gpt-5-mini"] });
+    ).toEqual({ chain: { targets: ["google/gemini-2.5-flash", "openai/gpt-5-mini"] } });
   });
 
   it("treats non-object input as empty", () => {
@@ -63,6 +100,77 @@ describe("normalizeModelAliases", () => {
 });
 
 describe("resolveAvailablePiModel", () => {
+  const codexModels = [
+    { provider: "openai-codex", id: "gpt-6-astra", name: "GPT-6 Astra" },
+    { provider: "openai-codex", id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+  ];
+
+  it("resolves a mistaken generation to the closest visible same-provider model", () => {
+    const state = { aliases: {}, available: codexModels };
+    expect(resolveAvailablePiModel("openai-codex/gpt-5.6-sol", state)).toBe(codexModels[1]);
+    expect(resolveAvailablePiModel("openai-codex/gpt-6-sol", state)).toBe(codexModels[1]);
+    expect(resolveAvailablePiModel(" OPENAI-CODEX/GPT-6-SOL ", state)).toBe(codexModels[1]);
+    expect(resolveAvailablePiModel("Sol", state)).toBe(codexModels[1]);
+    expect(resolveAvailablePiModel("openai-codex/gpt-6-astra", state)).toBe(codexModels[0]);
+  });
+
+  it("prefers exact IDs and never crosses providers for a closer match", () => {
+    const exact = { provider: "openai-codex", id: "gpt-6-sol" };
+    const state = {
+      aliases: {},
+      available: [...codexModels, exact, { provider: "other", id: "gpt-6-sol" }],
+      lastUsed: { "openai-codex/gpt-5.6-sol": 999 },
+    };
+    expect(resolveAvailablePiModel("openai-codex/gpt-6-sol", state)).toBe(exact);
+    expect(resolveAvailablePiModel("openai-codex/gpt-6-sol", {
+      ...state, available: state.available.filter(model => model !== exact),
+    })).toBe(codexModels[1]);
+  });
+
+  it("uses recency then canonical key order to break same-provider similarity ties", () => {
+    const available = [
+      { provider: "test", id: "alpha-one" },
+      { provider: "test", id: "alpha-two" },
+    ];
+    expect(resolveAvailablePiModel("test/alpha", { aliases: {}, available })).toBe(available[1]);
+    expect(resolveAvailablePiModel("test/alpha", {
+      aliases: {}, available, lastUsed: { "test/alpha-one": 100 },
+    })).toBe(available[0]);
+  });
+
+  it.each([
+    { available: [] },
+    { available: [{ provider: "other", id: "gpt-5.6-sol" }] },
+    { available: [{ provider: "openai-codex", id: "unrelated" }] },
+  ])("rejects hidden, cross-provider, or unrelated candidates from $available", ({ available }) => {
+    expect(() => resolveAvailablePiModel("openai-codex/gpt-6-sol", {
+      aliases: {}, available,
+    })).toThrow('Use agents.models({ runner: "pi" })');
+  });
+
+  it("keeps provider-qualified aliases authoritative", () => {
+    expect(resolveAvailablePiModel("openai-codex/gpt-6-sol", {
+      aliases: normalizeModelAliases({ "openai-codex/gpt-6-sol": "openai-codex/gpt-5.6-sol" }),
+      available: codexModels,
+    })).toBe(codexModels[1]);
+  });
+
+  it("keeps slash-containing model IDs provider-scoped, including alias targets", () => {
+    const model = { provider: "fireworks", id: "accounts/team/models/sol" };
+    const aliases = normalizeModelAliases({ sol: "fireworks/accounts/team/models/sol" });
+    expect(aliases.sol?.targets).toEqual(["fireworks/accounts/team/models/sol"]);
+    expect(resolveAvailablePiModel("fireworks/accounts/team/models/sol", {
+      aliases, available: [model],
+    })).toBe(model);
+    expect(resolveAvailablePiModel("sol", { aliases, available: [model] })).toBe(model);
+    expect(resolveAvailablePiModel("fireworks/accounts/team/models/slo", {
+      aliases: {}, available: [model],
+    })).toBe(model);
+    expect(() => resolveAvailablePiModel("fireworks/accounts/team/models/sol", {
+      aliases: {}, available: [{ provider: "other", id: "fireworks/accounts/team/models/sol" }],
+    })).toThrow(/not available to this Pi session/);
+  });
+
   it("accepts visible exact, fuzzy, and alias selectors", () => {
     const aliases = normalizeModelAliases({ fast: "google/gemini-2.5-flash" });
     expect(resolveAvailablePiModel("google/gemini-2.5-pro", {
@@ -79,7 +187,7 @@ describe("resolveAvailablePiModel", () => {
     })).toMatchObject({ provider: "google", id: "gemini-2.5-flash" });
   });
 
-  it("rejects hidden exact IDs and exhausted aliases with a session error", () => {
+  it("rejects unrelated IDs and exhausted aliases with a session error", () => {
     expect(() => resolveAvailablePiModel("google/private-gemini", {
       aliases: {},
       available: AVAILABLE,

@@ -6,7 +6,7 @@ import type { FabricState } from "../fabric-state.js";
 import { resolveAgentDir } from "../core/agent-dir.js";
 import { saveFabricConfig } from "../config.js";
 import { armFabricPrewalkSession } from "../prewalk/arm.js";
-import { restoreBorrowedInPlaceMain } from "../prewalk/handoff.js";
+import { restoreBorrowedInPlaceMain } from "../prewalk/return.js";
 import { truncateMiddle } from "../util.js";
 import type { FabricUiController } from "../ui/controller.js";
 import { FABRIC_CONVERSATION_SHORTCUT } from "../ui/conversation-shortcut.js";

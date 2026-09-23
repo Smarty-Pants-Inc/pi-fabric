@@ -14,8 +14,12 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { messageEntry, sessionHeader, userMessage, writeSessionFile } from "./fixtures/memory.js";
 
 // The worker is a published build entry. Exercise its real default URL, not a test-only loader.
-const workerModule = pathToFileURL(path.resolve("dist/memory/worker-provider.js")).href;
-const { WorkerMemoryProvider } = await import(workerModule) as typeof import("../src/memory/worker-provider.js");
+// CI runs affected tests before `bun run build`, so skip when dist/ is absent.
+const workerFile = path.resolve("dist/memory/worker-provider.js");
+const hasDistWorker = fs.existsSync(workerFile);
+const WorkerMemoryProvider = hasDistWorker
+  ? (await import(pathToFileURL(workerFile).href) as typeof import("../src/memory/worker-provider.js")).WorkerMemoryProvider
+  : undefined;
 const exec = promisify(execFile);
 interface Page {
   total: number;
@@ -27,12 +31,13 @@ interface Page {
 
 let root: string;
 let context: MemoryProviderContext;
-const providers: InstanceType<typeof WorkerMemoryProvider>[] = [];
+const providers: Array<InstanceType<NonNullable<typeof WorkerMemoryProvider>>> = [];
 const invocation = (): FabricInvocationContext => ({
   cwd: context.cwd, signal: undefined, parentToolCallId: "memory-integration", nestedToolCallId: "recall",
   extensionContext: {} as FabricInvocationContext["extensionContext"], update: vi.fn(),
 });
 const makeProvider = (overrides: Partial<MemoryProviderContext> = {}) => {
+  if (!WorkerMemoryProvider) throw new Error("dist/memory/worker-provider.js is required");
   const provider = new WorkerMemoryProvider({ ...context, ...overrides });
   providers.push(provider);
   return provider;
@@ -56,7 +61,7 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe("compiled file memory worker", () => {
+describe.skipIf(!hasDistWorker)("compiled file memory worker", () => {
   it("keeps the host event loop available during thirteen cold-session recalls", async () => {
     const files = Array.from({ length: 13 }, (_, index) => seed(`session-${index}`,
       Array.from({ length: 50 }, () => "brand name thương hiệu Xuân Anh ".repeat(40))));
@@ -183,7 +188,7 @@ describe("compiled file memory worker", () => {
 
   it("does not keep a Node host alive after the last request, even without explicit close", async () => {
     const workerFixture = new URL("./fixtures/memory-worker.mjs", import.meta.url).href;
-    const program = `import { WorkerMemoryProvider } from ${JSON.stringify(workerModule)};
+    const program = `import { WorkerMemoryProvider } from ${JSON.stringify(pathToFileURL(workerFile).href)};
       const provider = new WorkerMemoryProvider(${JSON.stringify(context)}, new URL(${JSON.stringify(workerFixture)}));
       await provider.invoke("recall", {}, { cwd: ${JSON.stringify(context.cwd)}, update() {} });
       console.log("idle worker released the host");`;

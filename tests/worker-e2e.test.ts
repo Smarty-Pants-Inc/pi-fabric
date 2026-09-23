@@ -84,6 +84,61 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(process.env[key]).toBe(before);
   });
 
+  it("preserves the selected Pi launcher for nested Fabric instead of an ambient pin", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-nested-launcher-"));
+    roots.push(root);
+    const shim = path.join(root, "selected-pi.mjs");
+    fs.writeFileSync(shim, [
+      `if (process.env.PI_FABRIC_PI_BINARY !== ${JSON.stringify(shim)}) process.exit(79);`,
+      'process.env.FAKE_PI_BEHAVIOR = "fabric-session-env";',
+      'process.env.PI_FABRIC_SESSION_ID = "selected-launcher-retained";',
+      `await import(${JSON.stringify(pathToFileURL(piBinary).href)});`,
+    ].join("\n"));
+    const before = process.env.PI_FABRIC_PI_BINARY;
+    process.env.PI_FABRIC_PI_BINARY = path.join(root, "missing-ambient-pi");
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath, piBinary: shim, runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "report selected launcher", transport: "process" });
+      expect(result.status).toBe("completed");
+      expect(result.text).toBe("selected-launcher-retained");
+      expect(process.env.PI_FABRIC_PI_BINARY).toBe(path.join(root, "missing-ambient-pi"));
+    } finally {
+      if (before === undefined) delete process.env.PI_FABRIC_PI_BINARY;
+      else process.env.PI_FABRIC_PI_BINARY = before;
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("runs an extensionless node-shebang launcher without node on the child PATH", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-shebang-launcher-"));
+    roots.push(root);
+    const launcher = path.join(root, "pi");
+    fs.writeFileSync(launcher, [
+      "#!/usr/bin/env node",
+      'process.env.FAKE_PI_BEHAVIOR = "fabric-session-env";',
+      'process.env.PI_FABRIC_SESSION_ID = "shebang-launcher-ran";',
+      `import(${JSON.stringify(pathToFileURL(piBinary).href)}).catch((error) => { console.error(error); process.exit(1); });`,
+    ].join("\n"), { mode: 0o755 });
+    const emptyBin = path.join(root, "bin");
+    fs.mkdirSync(emptyBin);
+    const before = process.env.PATH;
+    // Herdr-like child environment: the server PATH has neither pi nor node.
+    process.env.PATH = emptyBin;
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath, piBinary: launcher, runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "report launcher", transport: "process" });
+      expect(result.status).toBe("completed");
+      expect(result.text).toBe("shebang-launcher-ran");
+    } finally {
+      process.env.PATH = before;
+    }
+  });
+
   it("propagates the root Fabric session identity through the worker", async () => {
     process.env.FAKE_PI_BEHAVIOR = "fabric-session-env";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
@@ -195,6 +250,44 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
         `${behavior}: ${(error as Error).message} (status=${result.status} error=${result.error ?? ""})`,
       );
     }
+  }, 30_000);
+
+  it.each(["large-lifecycle", "large-lifecycle-retry"])(
+    "preserves progress through oversized lifecycle history (%s)", async (behavior) => {
+      process.env.FAKE_PI_BEHAVIOR = behavior;
+      const result = await run("finish the image-heavy task", 10_000);
+      expect(result.status).toBe("completed");
+      expect(result.error).toBeUndefined();
+      const retried = behavior.endsWith("retry");
+      expect(result.text).toBe(retried ? "retry completed" : "progress preserved");
+      expect(result.usage.input).toBe(retried ? 300 : 100);
+      expect(result.usage.output).toBe(retried ? 125 : 50);
+      expect(result.toolCalls).toBe(1);
+      expect(result.turns).toBe(1);
+      const log = fs.readFileSync(result.logFile!, "utf8");
+      expect(log.length).toBeLessThan(10_000);
+      const events = log.trim().split("\n").map((line) => JSON.parse(line));
+      expect(events.find((event) => event.type === "turn_end")).toMatchObject({ toolResults: [], turnIndex: 1 });
+      expect(events.filter((event) => event.type === "agent_end")).toEqual(retried ? [
+        { type: "agent_end", messages: [], willRetry: true },
+        { type: "agent_end", messages: [], willRetry: false },
+      ] : [{ type: "agent_end", messages: [], willRetry: false }]);
+      expect(events.some((event) => event.type === "message_end" && event.message.content === result.text)).toBe(true);
+      expect(fs.existsSync(path.join(path.dirname(result.logFile!), "oversized-event-prefix.txt"))).toBe(false);
+    }, 30_000,
+  );
+
+  it("loads the history projector from a native source worker too", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "large-lifecycle";
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-source-worker-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000 }, {
+      workerPath: path.resolve("src/worker.ts"), piBinary, runRoot: root,
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "preserve source-worker progress", transport: "process" });
+    expect(result.status).toBe("completed");
+    expect(result.text).toBe("progress preserved");
   }, 30_000);
 
   it("preserves a bounded prefix when an agent event exceeds the line limit", async () => {

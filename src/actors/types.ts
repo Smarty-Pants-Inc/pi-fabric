@@ -6,7 +6,28 @@ import type { FabricCapabilityRequirement } from "../components/types.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 
-export type FabricActorPiHostEvent = Exclude<ExtensionEvent["type"], "project_trust">;
+// Pi's extension event union is closed; every member we want the actor host
+// to observe must appear in FABRIC_ACTOR_PI_HOST_EVENTS below. `project_trust`
+// uses pi's dedicated trust handler, and pi 0.86's `cache_warming_decision` is
+// a host-internal prompt-cache maintenance control event, so neither is an
+// actor observation and both are excluded here.
+//
+// pi 0.87 added two events, and neither is an actor observation yet:
+//   - `agent_before_settle` is an actionable boundary that exists so a handler
+//     can draft session entries and force one continuation. Fabric observes
+//     lifecycle boundaries (`turn_end`, `agent_end`, `agent_settled`) and
+//     republishes the ones it cares about through FABRIC_LIFECYCLE_EVENTS, which
+//     has no `agent_before_settle` topic.
+//   - `context_with_system` runs on the full transcript including system
+//     messages and its result is sent verbatim. Exposing it to actors would let
+//     them rewrite the system prompt per request, which Fabric deliberately
+//     avoids to keep the cached system prefix byte-stable.
+// To observe either one as an actor event, add it to
+// FABRIC_ACTOR_PI_HOST_EVENTS below and give it a FABRIC_LIFECYCLE_EVENTS topic.
+export type FabricActorPiHostEvent = Exclude<
+  ExtensionEvent["type"],
+  "project_trust" | "cache_warming_decision" | "agent_before_settle" | "context_with_system"
+>;
 
 const defineFabricActorPiHostEvents = <
   const Events extends readonly FabricActorPiHostEvent[],

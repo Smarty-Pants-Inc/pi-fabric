@@ -9,7 +9,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { CPYTHON_CHILD_SOURCE } from "../src/runtime/cpython-child-source.js";
-import { CPythonRuntime } from "../src/runtime/cpython-runtime.js";
+import { CPythonRuntime, LINUX_BWRAP_ISOLATION_ARGS } from "../src/runtime/cpython-runtime.js";
 import type { FabricHostCall, FabricSandboxOptions } from "../src/runtime/kernel.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -300,7 +300,28 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
 const supportedSandbox = process.platform === "darwin" || process.platform === "linux";
 const installedSandbox = process.platform === "darwin" ? fs.existsSync("/usr/bin/sandbox-exec") : fs.existsSync("/usr/bin/bwrap") || fs.existsSync("/bin/bwrap");
 
+// An installed bwrap can still be unusable: a kernel that forbids the sandbox's
+// namespaces exits it before the child connects, and the runtime fails closed
+// there instead of running unsandboxed. The boundary tests therefore assert the
+// real sandbox only where the runtime's own isolation flags actually start.
+const linuxSandboxStarts = (() => {
+  if (process.platform !== "linux" || !installedSandbox) return false;
+  const bwrap = fs.existsSync("/usr/bin/bwrap") ? "/usr/bin/bwrap" : "/bin/bwrap";
+  try {
+    return childProcess.spawnSync(bwrap, [...LINUX_BWRAP_ISOLATION_ARGS, "--", "/bin/true"], { stdio: "ignore", timeout: 10_000 }).status === 0;
+  } catch {
+    return false;
+  }
+})();
+const usableSandbox = installedSandbox && (process.platform !== "linux" || linuxSandboxStarts);
+
 describe.skipIf(!hasPython || !supportedSandbox)("CPython OS sandbox", () => {
+  it.skipIf(process.platform !== "linux" || !usableSandbox)("starts the real Linux sandbox and carries the result over inherited IPC", async () => {
+    const result = await new CPythonRuntime(binary, true).execute("return 6 * 7", echo, options);
+    expect(result.terminationReason, `${result.error}\n${result.logs.join("\n")}`).toBe("completed");
+    expect(result.value).toBe(42);
+  });
+
   it("fails closed when the OS sandbox binary is missing", async () => {
     const { access } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
     vi.mocked(fsPromises.access).mockImplementation(async (name, mode) => {
@@ -315,7 +336,7 @@ describe.skipIf(!hasPython || !supportedSandbox)("CPython OS sandbox", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it.skipIf(!installedSandbox)("denies native and subprocess writes/network while host schema calls still execute", async () => {
+  it.skipIf(!usableSandbox)("denies native and subprocess writes/network while host schema calls still execute", async () => {
     const cwd = temp();
     let connections = 0;
     const server = net.createServer((socket) => { connections++; socket.destroy(); });
@@ -378,7 +399,7 @@ return {"signalDenied": denied_signal, "ptraceResult": attached, "errno": ctypes
     } finally { target.kill("SIGKILL"); }
   });
 
-  it.skipIf(process.platform !== "linux" || !installedSandbox)("denies pathname Unix sockets, including a socketpair/sendto bypass", async () => {
+  it.skipIf(process.platform !== "linux" || !usableSandbox)("denies pathname Unix sockets, including a socketpair/sendto bypass", async () => {
     const cwd = temp();
     const address = path.join(cwd, "host.sock");
     let connections = 0;

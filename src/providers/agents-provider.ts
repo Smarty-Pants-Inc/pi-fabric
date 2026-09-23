@@ -78,6 +78,7 @@ import { ResidentActorClient } from "../residency/actor-client.js";
 import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
 import { AgentMessageRouter } from "./agents-message-router.js";
+import { terminalAgentStatuses } from "../agents/lifecycle.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
 
@@ -169,9 +170,9 @@ const handoffTask = (args: Record<string, unknown>): string => {
   const task = typeof args.task === "string" ? args.task.trim() : "";
   const lines = [
     "Continue and complete the current user task from the inherited conversation trajectory and current workspace.",
-    "The caller has handed implementation to you and is blocked awaiting this run. Do the remaining work; do not merely advise the caller or restate the plan.",
+    "The caller is blocked awaiting this run. Finish what the user actually requested. If the request is read-only — a plan, review, or investigation — deliver the answer without changing files. For implementation requests, complete the remaining changes and verification; do not merely restate the plan.",
     "Treat the inherited conversation, completed outer Fabric result, and current workspace as grounded context. Inspect again only where the workspace or a failed check makes it necessary.",
-    "Keep the change scoped, run the relevant full test module or equivalent verification, and report the implementation plus checks honestly.",
+    "Keep the work scoped, run the relevant test module or equivalent verification, and report the result plus checks honestly.",
     "End with a concise conclusion for the caller: what you completed, which checks passed or failed, and any unfinished or blocked work. Include links, PR and issue numbers, commit hashes, and artifact paths verbatim.",
   ];
   if (task) lines.push("Additional continuation task:", task);
@@ -633,11 +634,18 @@ export class AgentsProvider implements FabricProvider {
           return root;
         }
         try {
-          return this.manager.status(id);
+          const result = this.manager.status(id);
+          // Model-facing terminal status returns the result; UI polling must not acknowledge it.
+          if (terminalAgentStatuses.has(result.status)) this.manager.markForeground(id);
+          return result;
         } catch (error) {
           if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
         }
-        if (this.residency?.hasAgent(id)) return this.residency.statusAgent(id);
+        if (this.residency?.hasAgent(id)) {
+          const result = this.residency.statusAgent(id);
+          if (terminalAgentStatuses.has(result.status)) this.residency.acknowledgeCompletion(id);
+          return result;
+        }
         const known = this.participants.get(id);
         if (known && !known.local) return known;
         try {
@@ -1267,13 +1275,15 @@ export class AgentsProvider implements FabricProvider {
       throw new Error(`Fabric participant ${id} cannot be stopped`);
     }
     if (!this.control) throw new Error("Fabric control plane is unavailable");
-    return this.control.request(
+    const result = await this.control.request(
       participant.ownerHostId,
       participant.id,
       "stop",
       {},
       participant.ownerIdentityId,
     );
+    if (this.residency?.hasAgent(id)) this.residency.acknowledgeCompletion(id);
+    return result;
   }
 
   #steeringMode(mode: unknown): "all" | "one-at-a-time" {

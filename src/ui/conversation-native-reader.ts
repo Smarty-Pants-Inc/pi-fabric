@@ -3,7 +3,7 @@ import { NativeReaderEventReplay } from "./conversation-native-reader-replay.js"
 import { NativeReaderCheckpoint } from "./conversation-native-reader-checkpoint.js";
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
 import { getConversationHost } from "./conversation-host.js";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 
 // Native Pi conversation transcript reader.
 //
@@ -139,11 +139,13 @@ const emptyUsage = (): AssistantMessage["usage"] => ({
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 });
 
-const parseRecord = (raw: string): Record<string, unknown> | undefined => {
+// JSON.parse output is a JsonValue; the object guard narrows it to JsonObject so
+// callers can feed parsed tool-call arguments straight into Pi's JsonObject fields.
+const parseRecord = (raw: string): JsonObject | undefined => {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-    return parsed as Record<string, unknown>;
+    return parsed as JsonObject;
   } catch {
     return undefined;
   }
@@ -847,7 +849,7 @@ export class NativeConversationReader {
   }
 
   #applyRecords(kind: FileKind, records: string[], updateLeaf: boolean): void {
-    const parsed = records.map(parseRecord).filter((record): record is Record<string, unknown> => record !== undefined);
+    const parsed = records.map(parseRecord).filter((record): record is JsonObject => record !== undefined);
     if (kind === "session") {
       for (const record of parsed) this.#applySessionRecord(record, updateLeaf);
       return;

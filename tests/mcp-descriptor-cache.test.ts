@@ -5,6 +5,7 @@ import type { ServerDefinition } from "mcporter";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   hashServerDefinition,
+  listCachedMcpServerNames,
   McpDescriptorCacheStore,
   mcpConfigLayerPaths,
   parseCachedServer,
@@ -179,6 +180,37 @@ describe("McpDescriptorCacheStore", () => {
     expect(await store.load()).toBeUndefined();
     fs.writeFileSync(store.filePath, JSON.stringify({ version: 2, layers: [], servers: {} }));
     expect(await store.load()).toBeUndefined();
+  });
+
+  it("lists cached server names for settings without connecting", async () => {
+    const directory = temporaryDirectory();
+    const filePath = path.join(directory, "mcp-cache.json");
+    expect(listCachedMcpServerNames(filePath)).toEqual([]);
+    const store = new McpDescriptorCacheStore(filePath);
+    await store.save({
+      version: 1,
+      layers: [],
+      updatedAt: "",
+      servers: {
+        slack: {
+          definitionHash: "a",
+          transport: "stdio",
+          description: null,
+          fetchedAt: "",
+          stale: false,
+          tools: [],
+        },
+        github: {
+          definitionHash: "b",
+          transport: "stdio",
+          description: null,
+          fetchedAt: "",
+          stale: false,
+          tools: [],
+        },
+      },
+    });
+    expect(listCachedMcpServerNames(filePath)).toEqual(["github", "slack"]);
   });
 });
 

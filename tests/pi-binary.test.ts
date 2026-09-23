@@ -40,7 +40,17 @@ describe("resolvePiBinary", () => {
     })).toBe("pi");
   });
 
-  it("uses PATH lookup outside LocalTerm", () => {
+  it("resolves the PATH launcher to an absolute path before a transport changes PATH", () => {
+    // Windows launches only PATHEXT names, such as npm's pi.cmd shim.
+    const expected = path.resolve("/opt/second", process.platform === "win32" ? "pi.cmd" : "pi");
+    const isExecutable = (candidate: string) => candidate === expected;
+    expect(resolvePiBinary(undefined, {
+      env: { PATH: ["/opt/first", "/opt/second"].join(path.delimiter) },
+      isExecutable,
+    })).toBe(expected);
+  });
+
+  it("falls back to the literal name when PATH has no launcher", () => {
     const isExecutable = vi.fn(() => true);
     expect(resolvePiBinary(undefined, { env: {}, isExecutable })).toBe("pi");
     expect(isExecutable).not.toHaveBeenCalled();

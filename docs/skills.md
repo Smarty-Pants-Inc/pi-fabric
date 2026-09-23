@@ -8,7 +8,7 @@ Pi Fabric uses a core-first, user-opt-in skill hierarchy.
 - The user invokes every advanced workflow. Each one declares `disable-model-invocation: true` and stays out of the model catalog. Agent policy forbids reading one autonomously or delegating from one user-only skill to another. The policy governs agent behavior. It is not a filesystem authorization boundary.
 - `/skill:fabric-guide` is the user-only router. It names one exact advanced command and stops there. The router never invokes the recommendation.
 - Each user-facing description summarizes its command. Only the selected execution reference spends always-on model context.
-- Both `skillsets/typescript/` and `skillsets/python/` contain the same thirteen canonical skill names, each with its own reference files. Fabric contributes only the selected tree through Pi resource discovery. Changing the kernel reloads Pi resources; see [kernel-specific skills](kernels.md#kernel-specific-skills-and-guidance). Third-party skills remain under Pi's normal discovery rules.
+- Both `skillsets/typescript/` and `skillsets/python/` contain the same fourteen canonical skill names, each with its own reference files. Fabric contributes only the selected tree through Pi resource discovery. Changing the kernel reloads Pi resources; see [kernel-specific skills](kernels.md#kernel-specific-skills-and-guidance). Third-party skills remain under Pi's normal discovery rules.
 
 The parent agent behaves like regular Pi until the user explicitly opts into orchestration, recursion, Schema, Jev programs, ambient actors, or swarm coordination.
 
@@ -43,6 +43,7 @@ A mandatory pointer serves legibility and single-source maintenance. Per-run tok
 - `/skill:fabric-rlm`: decompose context recursively.
 - `/skill:fabric-schema`: gate mutation behind evidence.
 - `/skill:fabric-jev`: compose typed System One judgments, bounded foreground/background loops, and event-driven Main-turn advisors; see [Jev](jev.md).
+- `/skill:fabric-foreman`: supervise Main’s coding work with batched Jev judgments and deterministic policy, per turn or at settlement; see [Foreman](foreman.md).
 - `/skill:fabric-advisor`: get persistent peer advice.
 - `/skill:fabric-supervisor`: supervise a persistent goal.
 - `/skill:fabric-spec`: supervise spec compliance persistently.

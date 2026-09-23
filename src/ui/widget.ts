@@ -111,33 +111,67 @@ export const shouldShowFabricWidget = (
   return finishedAt > (snapshot.widgetDismissedAt ?? 0);
 };
 
+/**
+ * Share of the terminal height the animated box may claim. pi's main-screen
+ * renderer scrolls the pane once the rendered content is taller than the
+ * terminal, so a box that fills the viewport keeps that scroll region moving on
+ * every animation frame — which reads as flicker inside tmux. Half the pane
+ * keeps the transcript and editor visible and bounds the box on short panes.
+ */
+export const WIDGET_TERMINAL_ROW_SHARE = 0.5;
+
+/** Effective row budget: the configured maximum, bounded by the live pane. */
+export const widgetRowLimit = (maxRows: number, terminalRows?: number): number => {
+  const configured = Math.max(1, maxRows);
+  if (terminalRows === undefined || !Number.isFinite(terminalRows) || terminalRows <= 0) {
+    return configured;
+  }
+  const paneShare = Math.floor(terminalRows * WIDGET_TERMINAL_ROW_SHARE);
+  return Math.max(1, Math.min(configured, paneShare));
+};
+
 export class FabricWidget implements Component {
   constructor(
     readonly theme: Theme,
     readonly snapshot: () => FabricDashboardSnapshot,
     readonly maxRows: number,
+    // Live terminal height. pi re-renders the widget on resize, so reading the
+    // pane per render bounds the box without a resize subscription.
+    readonly terminalRows?: () => number | undefined,
   ) {}
 
+  #rowLimit(): number {
+    return widgetRowLimit(this.maxRows, this.terminalRows?.());
+  }
+
   #lastWidth: number | undefined;
+  #lastLimit: number | undefined;
   #lastSnapshot: FabricDashboardSnapshot | undefined;
   #lastLines: string[] | undefined;
   #pending:
-    | { width: number; snapshot: FabricDashboardSnapshot; lines: string[] }
+    | { width: number; limit: number; snapshot: FabricDashboardSnapshot; lines: string[] }
     | undefined;
 
   render(width: number): string[] {
     if (width <= 0) return [];
     const snapshot = this.snapshot();
+    // The pane can shrink between renders, so the row budget is part of the
+    // cache key: a box measured against a taller terminal must not be reused.
+    const limit = this.#rowLimit();
     const lines =
-      this.#pending?.width === width && this.#pending.snapshot === snapshot
+      this.#pending?.width === width &&
+      this.#pending.limit === limit &&
+      this.#pending.snapshot === snapshot
         ? this.#pending.lines
         : this.#lastWidth === width &&
+            this.#lastLimit === limit &&
             this.#lastSnapshot === snapshot &&
             this.#lastLines
           ? this.#lastLines
-          : this.#renderLines(snapshot, width);
+          : this.#renderLines(snapshot, width, limit);
     this.#pending = undefined;
     this.#lastWidth = width;
+    this.#lastLimit = limit;
     this.#lastSnapshot = snapshot;
     this.#lastLines = lines;
     return lines;
@@ -146,8 +180,9 @@ export class FabricWidget implements Component {
   hasChanged(): boolean {
     if (this.#lastWidth === undefined || this.#lastLines === undefined) return true;
     const snapshot = this.snapshot();
-    const lines = this.#renderLines(snapshot, this.#lastWidth);
-    this.#pending = { width: this.#lastWidth, snapshot, lines };
+    const limit = this.#rowLimit();
+    const lines = this.#renderLines(snapshot, this.#lastWidth, limit);
+    this.#pending = { width: this.#lastWidth, limit, snapshot, lines };
     return (
       lines.length !== this.#lastLines.length ||
       lines.some((line, index) => line !== this.#lastLines?.[index])
@@ -157,12 +192,13 @@ export class FabricWidget implements Component {
   invalidate(): void {
     this.#pending = undefined;
     this.#lastWidth = undefined;
+    this.#lastLimit = undefined;
     this.#lastSnapshot = undefined;
     this.#lastLines = undefined;
   }
 
-  #renderLines(snapshot: FabricDashboardSnapshot, width: number): string[] {
-    return this.#boundContent(this.#buildContent(snapshot), width);
+  #renderLines(snapshot: FabricDashboardSnapshot, width: number, limit: number): string[] {
+    return this.#boundContent(this.#buildContent(snapshot), width, limit);
   }
 
   #buildContent(snapshot: FabricDashboardSnapshot): string[] {
@@ -250,8 +286,8 @@ export class FabricWidget implements Component {
     return lines;
   }
 
-  #boundContent(content: string[], width: number): string[] {
-    const bounded = content.slice(0, Math.max(1, this.maxRows));
+  #boundContent(content: string[], width: number, limit: number): string[] {
+    const bounded = content.slice(0, limit);
     if (content.length > bounded.length && bounded.length > 0) {
       const marker = this.theme.fg("dim", `+${content.length - bounded.length}`);
       const available = Math.max(0, width - visibleWidth(marker) - 1);

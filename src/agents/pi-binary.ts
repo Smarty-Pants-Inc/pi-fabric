@@ -1,6 +1,7 @@
 import { accessSync, constants } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { findExecutable } from "./transports/process-utils.js";
 
 export interface PiBinaryResolutionOptions {
   env?: NodeJS.ProcessEnv;
@@ -30,5 +31,7 @@ export const resolvePiBinary = (
     if ((options.isExecutable ?? executable)(shim)) return shim;
   }
 
-  return "pi";
+  // Resolve with the host's PATH now: Herdr workers inherit the server's
+  // environment, whose PATH need not contain the owner's Pi launcher.
+  return findExecutable("pi", env, options.isExecutable) ?? "pi";
 };

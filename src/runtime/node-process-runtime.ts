@@ -61,6 +61,14 @@ export class NodeProcessRuntime {
         error: "Process memory limit must be a positive safe integer",
       };
     }
+    if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 1) {
+      return {
+        value: undefined,
+        logs: [],
+        terminationReason: "runtime_error",
+        error: "Process timeout must be positive",
+      };
+    }
 
     // Bun evaluates --eval input as ESM and ignores V8 heap flags, so the
     // Bun child gets the guest source bare; Node needs the module + heap flags.
@@ -75,6 +83,9 @@ export class NodeProcessRuntime {
       this.#interpreter === "bun"
         ? ["--eval", NODE_PROCESS_CHILD_SOURCE]
         : [
+            // Guest import() through importModuleDynamically needs the vm
+            // modules flag; Bun's vm ignores the option (see __fabricImport).
+            "--experimental-vm-modules",
             `--max-old-space-size=${Math.max(16, Math.floor(options.memoryLimitBytes / (1024 * 1024)))}`,
             "--input-type=module",
             "--eval",
@@ -122,11 +133,11 @@ export class NodeProcessRuntime {
         resolve(result);
       };
       const scheduleDeadline = (): void => {
-        if (deadline) clearTimeout(deadline);
+        clearTimeout(deadline);
         deadline = setTimeout(() => {
           const error = `Execution timed out after ${effectiveTimeoutMs}ms`;
           finish({ value: undefined, logs: [], terminationReason: "timed_out", error });
-        }, Math.max(0, deadlineAt - Date.now()));
+        }, Math.min(2_147_483_647, Math.max(0, deadlineAt - Date.now())));
         deadline.unref?.();
       };
       const extendDeadline = (ref: string, args: Record<string, unknown>): void => {
@@ -179,6 +190,25 @@ export class NodeProcessRuntime {
         }
         if (message.type !== "call") return;
         extendDeadline(message.ref, message.args);
+        if (message.ref === "fabric.$timer") {
+          const ms = Math.max(0, Number(message.args?.ms ?? 0));
+          let timer: NodeJS.Timeout | undefined;
+          const timerTask = new Promise<void>((resolveTask) => {
+            timer = setTimeout(() => {
+              if (!settled && !finishing) {
+                send(child, { type: "response", id: message.id, ok: true, value: undefined });
+              }
+              resolveTask();
+            }, ms);
+            timer!.unref?.();
+          });
+          hostTasks.add(timerTask);
+          void timerTask.finally(() => {
+            hostTasks.delete(timerTask);
+            if (timer) clearTimeout(timer);
+          });
+          return;
+        }
         const task = runAbortable(hostAbortController.signal, () =>
           hostCall(message.ref, message.args, hostAbortController.signal),
         ).then(

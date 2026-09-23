@@ -266,8 +266,8 @@ describe("trajectory handoff sessions", () => {
     roots.push(root);
     const source = SessionManager.create(root, path.join(root, "source"));
     source.appendMessage({ role: "user", content: "Implement the guard", timestamp: 1 });
-    const activeEntryId = source.appendMessage(
-      assistant([
+    const activeEntryId = source.appendMessage({
+      ...assistant([
         {
           type: "thinking",
           thinking: "**Plan the token guard**\n\nsteps",
@@ -281,7 +281,13 @@ describe("trajectory handoff sessions", () => {
           arguments: { code: "await pi.edit(...);" },
         },
       ]),
-    );
+      // The transfer below declares openai-codex/gpt-5.6-sol as the thinking
+      // source, and the rs_blob signature is a Codex Responses item: keep the
+      // message metadata honest so the source-scoped digest can attribute it.
+      api: "openai-responses",
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+    } as Parameters<SessionManager["appendMessage"]>[0]);
 
     const seed = snapshotHandoffSession(
       source,

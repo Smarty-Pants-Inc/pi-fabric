@@ -27,7 +27,7 @@ const runProperties = {
   model: {
     type: "string",
     description:
-      "Pi provider/id, a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties); Claude runtime value or Veda backend model/alias are forwarded verbatim.",
+      "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Claude runtime value or Veda backend model/alias are forwarded verbatim.",
   },
   persona: {
     type: "string",
@@ -51,6 +51,10 @@ const runProperties = {
   },
   worktree: { type: "boolean" },
   schema: { type: "object", description: "Optional JSON Schema for validated structured output" },
+  systemPrompt: {
+    type: "string",
+    description: "Optional extra system prompt body for this child run. Pi runners merge it below component guidance and forward it via --system-prompt; Claude runners receive it via --append-system-prompt. Useful for reliability-focused prompt rules on models with weak behavioral defaults.",
+  },
 };
 
 const runSchema = {
@@ -168,25 +172,28 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "spawn",
     description:
-      "Start a child agent through Pi or Claude Code and return a handle immediately. Detached runs send Main a follow-up on terminal completion when agents.notifyOnComplete is enabled; use wait when this Fabric program needs the result and status only for progress inspection.",
+      "Start a child agent through Pi or Claude Code and return a handle immediately. For independent launches, await Promise.allSettled and inspect every result so one rejection does not abort pending sibling calls at program exit. Unread detached results are batched at the next safe turn boundary (or wake idle Main) when agents.notifyOnComplete is enabled. wait/join and terminal status acknowledge results and retract pending notifications. Use wait when this program needs the result; do not poll status in a loop.",
     inputSchema: spawnSchema,
     risk: "agent",
   },
   {
     name: "wait",
-    description: "Wait for a previously spawned child agent",
+    description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification",
+    effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
     inputSchema: idSchema,
     risk: "read",
   },
   {
     name: "join",
     description: "Alias for agents.wait: wait for a previously spawned child agent with the same progress and completion-notification behavior",
+    effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
     inputSchema: idSchema,
     risk: "read",
   },
   {
     name: "status",
-    description: "Get the latest status of any known project participant",
+    description: "Get the latest status of any known project participant. A terminal child-agent result acknowledges its pending completion notification; running status does not.",
+    effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
     inputSchema: idSchema,
     risk: "read",
   },

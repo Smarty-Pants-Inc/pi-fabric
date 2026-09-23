@@ -7,6 +7,7 @@ import {
   loadFabricConfigForScope,
   saveFabricConfig,
 } from "../config.js";
+import { listCachedMcpServerNames, mcpDescriptorCachePath } from "../providers/mcp-descriptor-cache.js";
 import { FabricSettingsComponent } from "./settings-component.js";
 import {
   modelKey,
@@ -141,6 +142,7 @@ export async function openFabricSettings(
       keepVisibleCandidates,
       modelSource,
       claudeModelSource,
+      cachedMcpServers: listCachedMcpServerNames(mcpDescriptorCachePath(context.cwd)),
       ...(activeModelKey ? { activeModelKey } : {}),
     });
   };

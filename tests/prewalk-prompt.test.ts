@@ -100,6 +100,12 @@ describe("prewalk prompt isolation", () => {
 
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
-    expect(source.slice(start, end)).toContain("restoreBorrowedInPlaceMain");
+    const handler = source.slice(start, end);
+    expect(handler).toContain("restoreBorrowedInPlaceMain");
+    // Recovery must precede the eager activation that may auto-arm: a restarted
+    // process otherwise arms on the executor before Main can snap back.
+    expect(handler.indexOf("restoreBorrowedInPlaceMain")).toBeLessThan(
+      handler.indexOf("state.ensure(context)"),
+    );
   });
 });

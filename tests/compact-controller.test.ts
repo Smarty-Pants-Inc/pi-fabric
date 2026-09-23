@@ -192,6 +192,53 @@ describe("CompactController", () => {
     });
   });
 
+  it("records a too-small session as cancelled once and clears its intent", async () => {
+    const onCommit = vi.fn();
+    const controller = new CompactController({ onCommit });
+    const capture: CompactCapture = { current: undefined };
+    const ctx = fakeContext(capture);
+    const compact = vi.spyOn(ctx, "compact");
+    controller.request({ requestedBy: "prewalk" });
+    const first = controller.maybeCommit(ctx);
+    capture.current!.onError(new Error("Nothing to compact (session too small)"));
+    // Duplicate callbacks and subsequent settled boundaries cannot retry it.
+    capture.current!.onError(new Error("late provider error"));
+    await first;
+    await controller.maybeCommit(ctx);
+    expect(compact).toHaveBeenCalledTimes(1);
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    expect(controller.status()).toEqual({ last: expect.objectContaining({
+      requestedBy: "prewalk", status: "cancelled", error: "Nothing to compact (session too small)",
+    }) });
+  });
+
+  it("preserves a newer intent when the in-flight session is too small", async () => {
+    const controller = new CompactController();
+    const capture: CompactCapture = { current: undefined };
+    controller.request({ requestedBy: "prewalk" });
+    const first = controller.maybeCommit(fakeContext(capture));
+    const newer = controller.request({ requestedBy: "model", instructions: "Keep this request" });
+    capture.current!.onError(new Error("Nothing to compact (session too small)"));
+    await first;
+    expect(controller.status().pending).toEqual(newer);
+    const second = controller.maybeCommit(fakeContext(capture));
+    capture.current!.onComplete(committed());
+    await second;
+    expect(controller.status().pending).toBeUndefined();
+    expect(controller.status().last).toMatchObject({ requestedBy: "model", status: "committed" });
+  });
+
+  it("does not hide errors merely containing the too-small phrase", async () => {
+    const controller = new CompactController();
+    const capture: CompactCapture = { current: undefined };
+    controller.request({});
+    const commit = controller.maybeCommit(fakeContext(capture));
+    const error = "Provider error: Nothing to compact (session too small)";
+    capture.current!.onError(new Error(error));
+    await commit;
+    expect(controller.status().last).toMatchObject({ status: "failed", error });
+  });
+
   it("records a failure and clears intent on other errors", () => {
     const capture: CompactCapture = { current: undefined };
     const controller = new CompactController();

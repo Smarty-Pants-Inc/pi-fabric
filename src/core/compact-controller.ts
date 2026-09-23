@@ -55,12 +55,26 @@ export interface CompactControllerHooks {
   onRequest?: (intent: CompactPendingIntent) => void;
   // Fired when the host settles a recorded intent: "committed" when pi
   // applied the compaction, "cancelled" when pi reports "Compaction
-  // cancelled" / "Already compacted" (the intent is still cleared; the raw pi
-  // message is kept in `error`), and "failed" for any other error.
+  // cancelled" / "Already compacted" / "Nothing to compact (session too
+  // small)" (the intent is still cleared; the raw pi message is kept in
+  // `error`), and "failed" for any other error.
   onCommit?: (info: CompactLastCommit) => void;
 }
 
 const DEFAULT_REQUESTED_BY = "model";
+
+// Pi rejects a manual compaction with these exact messages when there is
+// nothing to do: the user cancelled it, the session is already compacted, or
+// the session is below keepRecentTokens so every message would be kept
+// anyway. Nothing was compacted, so the commit settles as a quiet
+// "cancelled" instead of a failure. Exact matches only — a message merely
+// containing one of these phrases (for example a provider error quoting it)
+// stays a failure.
+const BENIGN_COMPACT_MESSAGES = new Set([
+  "Compaction cancelled",
+  "Already compacted",
+  "Nothing to compact (session too small)",
+]);
 
 const isString = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0;
@@ -187,8 +201,7 @@ export class CompactController {
           onError: (error) => finish(() => {
             const message = error?.message ?? "Compaction error";
             clearCommittedIntent();
-            const cancelled =
-              message === "Compaction cancelled" || message === "Already compacted";
+            const cancelled = BENIGN_COMPACT_MESSAGES.has(message);
             this.#last = {
               at: Date.now(),
               requestedBy,

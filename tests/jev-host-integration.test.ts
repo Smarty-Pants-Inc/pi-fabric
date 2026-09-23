@@ -21,6 +21,9 @@ describe("Main lifecycle to Jev observer integration", () => {
       events: { emit: vi.fn() }, getThinkingLevel: () => "off", sendMessage,
       on(event: string, handler: (event: unknown, context: ExtensionContext) => void) {
         handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+        return () => {
+          handlers.set(event, (handlers.get(event) ?? []).filter((entry) => entry !== handler));
+        };
       },
     } as unknown as ExtensionAPI;
     const context = {

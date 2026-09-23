@@ -18,6 +18,7 @@ import { buildActorContext } from "./actors/context.js";
 import { actorDeliveryNotice } from "./actors/delivery-policy.js";
 import { prepareFabricActorHostPayload } from "./actors/host-event-payload.js";
 import type { JevObservationHost } from "./jev/observation.js";
+import { resolveJevModelRoute } from "./jev/routes.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
 import { CapturedToolCatalog, type CapturedToolEntry } from "./capture/catalog.js";
 import { FabricComponentCatalog } from "./components/catalog.js";
@@ -79,8 +80,14 @@ import type {
   FabricPeerInfo,
 } from "./topology/types.js";
 import { actorParticipantRecord, agentParticipantRecords } from "./topology/records.js";
-import { PrewalkController } from "./prewalk/controller.js";
+import {
+  PrewalkController,
+  type FabricPrewalkPlanCheckpoint,
+} from "./prewalk/controller.js";
 import { PrewalkDriftTracker } from "./prewalk/fs-drift.js";
+import {
+  deliverPrewalkPlanCheckpoint,
+} from "./prewalk/messages.js";
 import {
   claimFabricFsDriftHandoff,
   claimFabricHandoff,
@@ -97,6 +104,7 @@ import {
 } from "./main-agent.js";
 import { AgentsProvider } from "./providers/agents-provider.js";
 import { CompactProvider } from "./providers/compact-provider.js";
+import { PrewalkProvider } from "./providers/prewalk-provider.js";
 import { ComponentsProvider } from "./providers/components-provider.js";
 import type { McpProviderHooks } from "./providers/mcp-provider.js";
 import { RuntimeStateBuiltins } from "./runtime-state-builtins.js";
@@ -112,12 +120,12 @@ import {
   type FabricProviderDiscovery,
 } from "./protocol.js";
 import { AgentManager } from "./agents/manager.js";
+import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
 import { ResidencyClient } from "./residency/client.js";
 import { RESIDENT_HOST_FORMAT, residentRoot } from "./residency/protocol.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
 
-const BACKGROUND_COMPLETION_MAX_CHARS = 8_000;
 const inheritedCapabilityRequirements = (): string[] => {
   const source = process.env.PI_FABRIC_CAPABILITY_REQUIREMENTS;
   if (!source) return [];
@@ -137,6 +145,13 @@ const escapeXmlText = (value: string): string =>
 
 
 import type { FabricManagedHost } from "./managed-host.js";
+import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./build-identity.js";
+
+// Loaded-code identity of this lazy runtime module. Stable-path lazy imports
+// keep their first evaluation for the life of the host process, so a hash
+// captured at activation is the ground truth a reload-freshness check compares
+// the current disk file against.
+const FABRIC_RUNTIME_MODULE_IDENTITY = captureLoadedFileIdentity(import.meta.url);
 
 export interface FabricRuntimeStateOptions {
   managedHost?: FabricManagedHost;
@@ -145,6 +160,7 @@ export interface FabricRuntimeStateOptions {
   prewalkDrift?: PrewalkDriftTracker;
   sessionApprovals?: FabricSessionApprovals;
   paths?: FabricRuntimePaths;
+  entryIdentity?: FabricLoadedFileIdentity;
 }
 
 export class FabricRuntimeState {
@@ -154,6 +170,7 @@ export class FabricRuntimeState {
   #repairs: RepairCompiler | undefined;
   #speculation: RuntimeStateSpeculation | undefined;
   #agents: AgentManager | undefined;
+  #completionInbox: AgentCompletionInbox | undefined;
   #actors: ActorDirectory | undefined;
   #jevObservationHost: JevObservationHost | undefined;
   #globalActors: GlobalActorRegistry | undefined;
@@ -187,6 +204,7 @@ export class FabricRuntimeState {
   readonly sessionApprovals: FabricSessionApprovals;
   readonly #paths: FabricRuntimePaths | undefined;
   readonly #managedHost: FabricManagedHost | undefined;
+  readonly #entryIdentity: FabricLoadedFileIdentity | undefined;
   #widgetDismissedAt = 0;
   #suppressResidentGuidanceSync = false;
 
@@ -201,6 +219,7 @@ export class FabricRuntimeState {
     this.sessionApprovals = options.sessionApprovals ?? new FabricSessionApprovals();
     this.#paths = options.paths;
     this.#managedHost = options.managedHost;
+    this.#entryIdentity = options.entryIdentity;
   }
 
   get initialized(): boolean {
@@ -410,14 +429,22 @@ export class FabricRuntimeState {
       this.#managedHost,
     );
     const enforceSchema = this.#config.schema.mode === "enforce";
-    if (!this.#managedHost && !enforceSchema) {
-      const { browserHarnessComponent } = await import("./jev/browser.js");
-      this.componentCatalog.register(browserHarnessComponent, { overwrite: true });
-    }
     await builtins.tools(context.cwd, this.#config, this.capturedTools, {
       jobs: this.shellJobs,
       getHangMs: () => this.#config?.executor.shellHangMs ?? DEFAULT_SHELL_HANG_MS,
     });
+    // One definition for both host modes: the controller belongs to this
+    // runtime state, so managed and normal sessions share a single wiring site.
+    await builtins.install(createProviderComponent({
+      provider: "prewalk",
+      description: "Frontier-first handoff readiness and plan record",
+      create: () => new PrewalkProvider(this.prewalk, {
+        buildIdentity: () => ({
+          entry: this.#entryIdentity ?? null,
+          lazyRuntime: FABRIC_RUNTIME_MODULE_IDENTITY,
+        }),
+      }),
+    }));
     if (this.#managedHost) {
       this.#registry.markUnavailable("jev", "Jev programs are unavailable in managed hosts");
       // Closed-world hosts must never construct unused native managers, stores or model history.
@@ -550,6 +577,8 @@ export class FabricRuntimeState {
       }
       return { key: `${resolved.provider}/${resolved.id}`, model };
     };
+    const completionInbox = new AgentCompletionInbox(this.pi, context);
+    this.#completionInbox = completionInbox;
     this.#agents = new AgentManager(context.cwd, agentConfig, {
       fullCodeMode: this.#config.fullCodeMode,
       kernel: () => this.#config?.executor.kernel ?? "typescript",
@@ -590,27 +619,8 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publish(event).catch(() => undefined);
       },
-      onBackgroundComplete: (result) => {
-        const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
-        const duration =
-          durationMs < 60_000
-            ? `${Math.round(durationMs / 1_000)}s`
-            : `${(durationMs / 60_000).toFixed(1)}m`;
-        const summary = result.text || result.error || "no result";
-        const clippedSummary =
-          summary.length > BACKGROUND_COMPLETION_MAX_CHARS
-            ? `${summary.slice(0, BACKGROUND_COMPLETION_MAX_CHARS)}\n[completion truncated]`
-            : summary;
-        this.pi.sendMessage(
-          {
-            customType: "pi-fabric-agent-complete",
-            content: `Fabric agent ${result.id.slice(0, 8)} ${result.status} after ${duration}: ${clippedSummary}`,
-            display: true,
-            details: result,
-          },
-          { deliverAs: "followUp", triggerTurn: true },
-        );
-      },
+      onBackgroundComplete: (result) => completionInbox.enqueue(result),
+      onResultConsumed: (id) => completionInbox.acknowledge(id),
     });
     const canManageActor = (actorId: string): boolean | undefined => {
       const participant = this.#participants?.get(actorId);
@@ -736,6 +746,8 @@ export class FabricRuntimeState {
           mesh: this.#mesh,
           participants: this.#participants,
           mainAgent,
+          onBackgroundComplete: (result, delivered) => completionInbox.enqueue(result, delivered),
+          onResultConsumed: (id) => completionInbox.acknowledge(id),
           piModelState,
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
@@ -809,7 +821,7 @@ export class FabricRuntimeState {
         create: (component) => {
           component.guide({
             label: "jev-programs", models: ["*/*"], targets: ["main", "participant"],
-            content: "Jev supplies typed Choice, Noul, and Score judgments, not generated text. Use jev.evaluate for batched questions; jev.run/spawn for isolated TypeScript programs that may loop using input, program.sleep, program.emit, and exact requires capabilities. run/wait return terminal envelopes (join aliases wait for both agents and Jev); inspect state and result/error. Background programs are session-owned; jev.status and jev.stop inspect/cancel them. For Main-turn advisors, spawn with observe, await program.nextEvent without polling, and opt into bounded context fields. program.advise requires jev.advise and explicit delivery; default is record-only. Return the observer ID without waiting in Main; Escape/Main abort cancels observers. Use /login jev, TYPESAFE_API_KEY, or a trusted credentialCommand. Credentials stay host-side; status never retrieves a key. See docs/jev.md for schemas, budgets, and browser integration.",
+            content: "Jev supplies typed Choice, Noul, and Score judgments, not generated text. Use jev.evaluate for batched questions; jev.run/spawn for isolated TypeScript programs that may loop using input, program.sleep, program.emit, and exact requires capabilities. run/wait return terminal envelopes (join aliases wait for both agents and Jev); inspect state and result/error. Background programs are session-owned; jev.status and jev.stop inspect/cancel them. For Main-turn advisors, spawn with observe, await program.nextEvent without polling, and opt into bounded context fields. program.advise requires jev.advise and explicit delivery; default is record-only. Return the observer ID without waiting in Main; Escape/Main abort cancels observers. Use /login jev, TYPESAFE_API_KEY, /login openrouter, OPENROUTER_API_KEY, /login vercel-ai-gateway, AI_GATEWAY_API_KEY, or a trusted credentialCommand. Credentials stay host-side; status never retrieves a key. See docs/jev.md for schemas, budgets, and browser integration.",
           });
           const observationHost = identity.kind === "main" ? new JevObservationHost(context.sessionManager.getSessionId(), advice => {
             this.pi.sendMessage({
@@ -820,13 +832,15 @@ export class FabricRuntimeState {
             }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn });
           }) : undefined;
           this.#jevObservationHost = observationHost;
+          // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.
+          const jevRoute = resolveJevModelRoute(this.#config!.jev.model).route;
           const provider = new JevProvider({
             registry: this.#registry!, config: this.#config!, observationHost,
             credentialSource: {
-              configured: () => context.modelRegistry.getProviderAuthStatus?.("jev")?.configured ?? false,
+              configured: () => context.modelRegistry.getProviderAuthStatus?.(jevRoute.providerId)?.configured ?? false,
               resolve: async (signal) => {
                 signal.throwIfAborted();
-                return context.modelRegistry.getApiKeyForProvider?.("jev");
+                return context.modelRegistry.getApiKeyForProvider?.(jevRoute.providerId);
               },
             },
             authorize: (ref, parentToolCallId) => this.#schema!.authorize(ref, parentToolCallId),
@@ -1018,8 +1032,22 @@ export class FabricRuntimeState {
     // config edit must never claim once the master switch is off.
     if (this.#config?.prewalk.enabled === false) return undefined;
     let pending = claimFabricHandoff(this.prewalk, execution, sessionId, resultFormat);
+    if (pending && pending.kind !== "explicit" && this.#config?.prewalk.detectShellWrites && this.#cwd) {
+      // This audited outer boundary consumed all mutations in its window, even
+      // when the plan gate withholds the handoff. Do not rediscover those edits
+      // as shell drift on a later read. The fs-only path advances in evaluate().
+      await this.prewalkDrift.captureBaseline(sessionId, this.#cwd);
+    }
     if (!pending && this.#config?.prewalk.detectShellWrites) {
       pending = await this.#claimShellWriteHandoff(execution, sessionId, resultFormat);
+    }
+    if (pending?.kind === "prewalk-plan") {
+      // Nothing hands off yet: the frontier model owes a plan checkpoint at this
+      // boundary, and the arm stays armed for the mutation that follows it.
+      if (!deliverPrewalkPlanCheckpoint(this.pi, pending)) {
+        this.prewalk.reopenPlanCheckpoint();
+      }
+      return undefined;
     }
     if (pending) {
       this.activity.resume(outerToolCallId);
@@ -1041,7 +1069,7 @@ export class FabricRuntimeState {
     execution: FabricExecutionResult,
     sessionId: string,
     resultFormat: FabricResultFormat,
-  ): Promise<PendingFabricHandoff | undefined> {
+  ): Promise<PendingFabricHandoff | FabricPrewalkPlanCheckpoint | undefined> {
     if (!this.prewalk.isArmed(sessionId) || !this.#cwd) return undefined;
     if (!execution.audits.some((audit) => isPiShellRef(audit.ref) && audit.success === true)) {
       return undefined;
@@ -1249,6 +1277,8 @@ export class FabricRuntimeState {
   }
 
   async shutdown(): Promise<void> {
+    this.#completionInbox?.close();
+    this.#completionInbox = undefined;
     this.#suppressResidentGuidanceSync = true;
     await this.#deactivateRepairs();
     clearActiveCompiledSurface();
@@ -1346,6 +1376,8 @@ export class FabricRuntimeState {
   }
 
   async #closeInternal(): Promise<void> {
+    this.#completionInbox?.close();
+    this.#completionInbox = undefined;
     await this.#deactivateRepairs();
     if (!this.#registry) return;
     await this.#participants?.quiesce().catch(() => undefined);

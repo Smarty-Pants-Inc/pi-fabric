@@ -167,21 +167,34 @@ const clipUtf8 = (text: string, maxBytes: number): string => {
 };
 
 // Bounded continuity bridge for executors whose reasoning channel cannot
-// accept prior thinking: the newest few first-lines, cited by stable entry id,
-// explicitly labeled as deliberation so they read as context, not style. The
-// full scratchpad remains addressable in the source session.
+// accept prior thinking: the current task's newest few first-lines, cited by
+// stable entry id. Custom checkpoint/continuation messages are not new tasks.
+// Only the boundary model's reasoning may be attributed to it; if no real user
+// boundary survives, omit the digest rather than borrowing unrelated history.
+// The full scratchpad remains addressable in the source session.
 export const buildThinkingDigest = (
   entries: SessionEntry[],
   input: ThinkingTransferInput,
 ): ThinkingDigest | undefined => {
   const blocks: Array<{ entryId: string; line: string }> = [];
+  let hasTask = false;
   for (const entry of entries) {
     if (entry.type !== "message") continue;
     const message = (entry as SessionMessageEntry).message as {
       role?: unknown;
       content?: unknown;
+      provider?: unknown;
+      model?: unknown;
     };
-    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    if (message.role === "user") {
+      hasTask = true;
+      blocks.length = 0;
+      continue;
+    }
+    if (!hasTask || message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    if (input.source && (
+      message.provider !== input.source.provider || message.model !== input.source.modelId
+    )) continue;
     for (const part of message.content as unknown[]) {
       if (!isThinkingPart(part)) continue;
       const text = typeof part.thinking === "string" ? part.thinking : "";

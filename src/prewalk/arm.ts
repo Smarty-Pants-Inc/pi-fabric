@@ -5,7 +5,7 @@ import {
   PREWALK_ARMED_MESSAGE_TYPE,
   hasPrewalkArmedPrompt,
   prewalkArmedPrompt,
-} from "./handoff.js";
+} from "./messages.js";
 
 // The single arm path shared by `/fabric prewalk` and alwaysRearm session
 // auto-arm, so drift baseline, hidden armed advisory, and status chip never
@@ -25,6 +25,7 @@ export const armFabricPrewalkSession = async (
     ...(input.task ? { task: input.task } : {}),
     ...(prewalk.thinking ? { thinking: prewalk.thinking } : {}),
     alwaysRearm: prewalk.alwaysRearm,
+    requirePlan: prewalk.requirePlan,
   });
   // Anchor the shell-write drift window at arm time so the first
   // bash-running boundary diffs against the pre-task tree state; only
@@ -35,7 +36,7 @@ export const armFabricPrewalkSession = async (
   // Hidden advisory framing, queued for the next prompt (rules before the
   // task when the caller submits one). nextTurn never triggers a turn;
   // custom messages never fire `input`, so observeTask ignores it.
-  const armedPrompt = prewalkArmedPrompt(prewalk.mode, input.model);
+  const armedPrompt = prewalkArmedPrompt(prewalk.mode, input.model, prewalk.requirePlan);
   if (!hasPrewalkArmedPrompt(context.sessionManager.getBranch(), armedPrompt)) {
     pi.sendMessage(
       {
@@ -73,6 +74,19 @@ export const autoArmFabricPrewalk = async (
   // initialize() cancels any prior arm at session start; a non-idle status
   // means another path armed first — never clobber it.
   if (state.prewalk.status().state !== "idle") return undefined;
+  // A failed in-place return left Main on the executor: auto-arming now would
+  // hand the next mutation back to the same executor and capture it as the
+  // new boundary model, losing the original Main. restoreBorrowedInPlaceMain
+  // runs first at session start and reload, so this only triggers when that
+  // recovery also failed; an explicit /fabric prewalk arm still overrides.
+  const borrowed = state.prewalk.borrowedReturn();
+  if (
+    borrowed &&
+    context.model &&
+    `${context.model.provider}/${context.model.id}` === borrowed.executorModel
+  ) {
+    return "Fabric prewalk auto-arm skipped: Main is still on the executor after a failed in-place return. Restart the session or run /fabric reload to retry the return, or arm prewalk explicitly.";
+  }
   if (!state.config.fullCodeMode || state.config.schema.mode === "enforce") {
     return "Fabric prewalk auto-arm skipped: requires full code mode with Schema enforce mode disabled.";
   }

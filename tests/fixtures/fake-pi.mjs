@@ -114,6 +114,49 @@ switch (behavior) {
     }, 10);
     break;
   }
+  case "large-lifecycle":
+  case "large-lifecycle-retry": {
+    // Each message is below the worker cap; aggregate history is well above it.
+    // Include both images and ordinary text so this cannot pass via base64 regex
+    // redaction. Write fragmented records with backpressure, including metadata
+    // after the large field and a following event in the same write.
+    const retry = behavior === "large-lifecycle-retry";
+    const history = Array.from({ length: 8 }, (_, index) => ({
+      role: "toolResult",
+      content: [
+        { type: "image", data: "a".repeat(512 * 1024), mimeType: "image/png" },
+        { type: "text", text: `image ${index}: 界 🚀 \\ \" { }\n` + "ordinary text ".repeat(8192) },
+      ],
+    }));
+    const write = (text) => new Promise((resolve, reject) => {
+      process.stdout.write(text, (error) => error ? reject(error) : resolve());
+    });
+    const fragmented = async (event, following = "") => {
+      const line = JSON.stringify(event) + "\r\n" + following;
+      for (let i = 0; i < line.length; i += 8191) await write(line.slice(i, i + 8191));
+    };
+    emit({ type: "agent_start" });
+    emit({ type: "tool_execution_start", toolName: "fabric_exec", toolCallId: "image-1" });
+    emit({ type: "tool_execution_end", toolName: "fabric_exec", toolCallId: "image-1", result: { content: "saved screenshot" }, isError: false });
+    const message = { role: "assistant", content: "progress preserved", usage: { input: 100, output: 50 } };
+    emit({ type: "message_end", message });
+    await fragmented({ type: "turn_end", message, toolResults: history, turnIndex: 1 });
+    await fragmented({ type: "agent_end", messages: history, willRetry: retry }, '{"type":"agent_settled"}\n');
+    if (retry) {
+      // If willRetry after history was lost, the premature settled event closes
+      // stdin and ends the run before the authoritative final response arrives.
+      let ended = false;
+      process.stdin.on("end", () => { ended = true; });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (!ended) {
+        emit({ type: "agent_start" });
+        emit({ type: "message_end", message: { role: "assistant", content: "retry completed", usage: { input: 200, output: 75 } } });
+        await fragmented({ messages: history, type: "agent_end", willRetry: false }, '{"type":"agent_settled"}\n');
+      }
+    }
+    process.stdin.pause();
+    break;
+  }
   case "oversized-event": {
     const event = {
       type: "message_end",

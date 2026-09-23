@@ -32,10 +32,13 @@ import {
 import { setActiveCompiledSurface } from "./entropy/active.js";
 import {
   filterPrewalkContinuationMessages,
+  filterPrewalkPlanningDirectives,
+  withTrajectoryRearmDirective,
+} from "./prewalk/messages.js";
+import {
   restoreBorrowedInPlaceMain,
   settleInPlacePrewalk,
-  withTrajectoryRearmDirective,
-} from "./prewalk/handoff.js";
+} from "./prewalk/return.js";
 import type { PendingFabricHandoff } from "./prewalk/handoff.js";
 import { autoArmFabricPrewalk } from "./prewalk/arm.js";
 import {
@@ -102,6 +105,7 @@ import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { captureLoadedFileIdentity } from "./build-identity.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -118,6 +122,11 @@ const FABRIC_RUNTIME_PATHS = {
   skills: path.resolve(FABRIC_ENTRY_DIR, "..", "skillsets"),
 };
 const FABRIC_SKILLS_DIR = FABRIC_RUNTIME_PATHS.skills;
+
+// Loaded-code identity of this extension entry, captured while the module bytes
+// on disk are still the bytes this process evaluated. prewalk.status compares
+// it against the current file to expose stale-runtime reloads.
+const FABRIC_ENTRY_IDENTITY = captureLoadedFileIdentity(import.meta.url);
 
 const componentRegistrationFrom = (
   value: unknown,
@@ -173,7 +182,11 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   );
   const capturedTools = new CapturedToolCatalog();
   const proxyContract = new ProxyContractLedger();
-  const state = new FabricState(pi, capturedTools, { paths: FABRIC_RUNTIME_PATHS, ...(options.managedHost ? {managedHost: options.managedHost} : {}) });
+  const state = new FabricState(pi, capturedTools, {
+    paths: FABRIC_RUNTIME_PATHS,
+    ...(FABRIC_ENTRY_IDENTITY ? { entryIdentity: FABRIC_ENTRY_IDENTITY } : {}),
+    ...(options.managedHost ? {managedHost: options.managedHost} : {}),
+  });
   const directToolApproval = new FabricDirectToolApproval(
     pi,
     () => state.config,
@@ -690,12 +703,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       "success" in event.message.details
         ? { ...event.message.details, success: boundarySucceeded }
         : event.message.details;
+    // `details` is optional on ToolResultMessage; under exactOptionalPropertyTypes
+    // an explicitly `undefined` property is rejected, so omit the key instead.
     return {
       message: {
         ...event.message,
         content: [{ type: "text", text }],
-        details,
         isError: !boundarySucceeded,
+        ...(details === undefined ? {} : { details }),
       },
     };
   });
@@ -751,13 +766,24 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   pi.on("context", (event, context) => {
     const sessionId = context.sessionManager.getSessionId();
+    const pendingContinuation = state.initialized
+      ? state.prewalk.pendingContinuationMessage(sessionId)
+      : undefined;
     const continuation = filterPrewalkContinuationMessages(
       event.messages,
       (continuationId) => state.initialized &&
         state.prewalk.acceptContinuation(sessionId, continuationId),
+      pendingContinuation,
     );
-    let changed = continuation.changed;
-    const messages = continuation.messages.map((message) => {
+    // Planning directives are phase-scoped: visible only while this session's
+    // arm is live (Main still owes its plan). A claimed handoff or an off arm
+    // must not project stale planning instructions into later requests.
+    const planning = filterPrewalkPlanningDirectives(
+      continuation.messages,
+      state.initialized && state.prewalk.isArmed(sessionId),
+    );
+    let changed = continuation.changed || planning.changed;
+    const messages = planning.messages.map((message) => {
       if (message.role !== "user") return message;
       if (typeof message.content === "string") {
         const content = expandSkillDirMarkersInSkillBlock(message.content);

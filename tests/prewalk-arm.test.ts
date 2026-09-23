@@ -4,7 +4,7 @@ import type { FabricPrewalkMode } from "../src/config.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { armFabricPrewalkSession, autoArmFabricPrewalk } from "../src/prewalk/arm.js";
 import { PrewalkController } from "../src/prewalk/controller.js";
-import { PREWALK_ARMED_MESSAGE_TYPE, prewalkArmedPrompt } from "../src/prewalk/handoff.js";
+import { PREWALK_ARMED_MESSAGE_TYPE, prewalkArmedPrompt } from "../src/prewalk/messages.js";
 import type { FabricThinking } from "../src/thinking.js";
 
 const CWD = "/tmp/fabric-prewalk-arm-test";
@@ -33,6 +33,7 @@ const makeHarness = (
     model?: string;
     thinking?: FabricThinking;
     detectShellWrites?: boolean;
+    requirePlan?: boolean;
     enabled?: boolean;
     fullCodeMode?: boolean;
     schemaMode?: string;
@@ -57,6 +58,7 @@ const makeHarness = (
         ...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
         alwaysRearm: input.alwaysRearm ?? true,
         detectShellWrites: input.detectShellWrites ?? true,
+        requirePlan: input.requirePlan ?? true,
       },
     },
     prewalk,
@@ -76,6 +78,15 @@ const makeHarness = (
 };
 
 describe("armFabricPrewalkSession", () => {
+  it.each(["manual", "auto"] as const)("does not demand a rejected plan when the gate is disabled (%s)", async (entry) => {
+    const h = makeHarness({ model: "anthropic/executor", requirePlan: false });
+    if (entry === "auto") await autoArmFabricPrewalk(h.state, h.context, h.pi);
+    else await armFabricPrewalkSession(h.state, h.context, h.pi, { model: "anthropic/executor" });
+    expect(h.prewalk.planRequired("session-1")).toBe(false);
+    expect(h.sendMessage.mock.calls[0]?.[0].content).not.toContain("prewalk.plan(");
+    expect(h.sendMessage.mock.calls[0]?.[0].content).toContain("first successful");
+  });
+
   it("arms from the live config and mirrors arm-time side effects", async () => {
     const h = makeHarness({ model: "anthropic/executor", thinking: "high" });
 
@@ -218,6 +229,46 @@ describe("autoArmFabricPrewalk", () => {
 
     expect(h.prewalk.status().state).toBe("idle");
     expect(h.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("skips auto-arm while Main is still on the executor after a failed return, and arms once Main is restored", async () => {
+    const h = makeHarness({ model: "anthropic/executor" });
+    h.prewalk.arm({ model: "anthropic/executor", sessionId: "session-1", alwaysRearm: true });
+    h.prewalk.claim([
+      { ref: "pi.edit", nestedToolCallId: "edit-1", startedAt: 1, success: true },
+    ], "session-1");
+    h.prewalk.beginContinuation("cont-1", "anthropic/frontier");
+    h.prewalk.acceptContinuation("session-1", "cont-1");
+    // The return to Main failed: the arm is cancelled, the borrowed record survives.
+    h.prewalk.cancel();
+    expect(h.prewalk.status().state).toBe("idle");
+    expect(h.prewalk.borrowedReturn()).toEqual({
+      returnModel: "anthropic/frontier",
+      executorModel: "anthropic/executor",
+    });
+
+    const onExecutor = {
+      ...h.context,
+      model: { provider: "anthropic", id: "executor" },
+    } as unknown as ExtensionContext;
+    const skip = await autoArmFabricPrewalk(h.state, onExecutor, h.pi);
+
+    expect(skip).toContain("failed in-place return");
+    expect(h.prewalk.status().state).toBe("idle");
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.captureBaseline).not.toHaveBeenCalled();
+
+    // Once restoreBorrowedInPlaceMain has put Main back, auto-arm resumes.
+    const restored = {
+      ...h.context,
+      model: { provider: "anthropic", id: "frontier" },
+    } as unknown as ExtensionContext;
+    expect(await autoArmFabricPrewalk(h.state, restored, h.pi)).toBeUndefined();
+    expect(h.prewalk.status()).toMatchObject({
+      state: "armed",
+      model: "anthropic/executor",
+      sessionId: "session-1",
+    });
   });
 
   it("stays silent when always re-arm is off", async () => {

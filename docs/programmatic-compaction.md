@@ -119,10 +119,14 @@ never become typed protocol input.
   waits for the next settled boundary.
 - On pi's `onComplete`, Fabric clears the intent and `last` records
   `status: "committed"` with the summary and token counts.
-- On pi's `onError` with `"Compaction cancelled"` or `"Already compacted"`,
-  Fabric clears the intent and `last` records `status: "cancelled"` with the
-  raw pi message in `error`. No compaction happened, and the outcome stays
-  observable without being silently dropped.
+- On pi's `onError` with `"Compaction cancelled"`, `"Already compacted"`,
+  or `"Nothing to compact (session too small)"`, Fabric clears the intent
+  and `last` records `status: "cancelled"` with the raw pi message in
+  `error`. No compaction happened — the too-small message is Pi rejecting a
+  manual compaction whose session sits below `keepRecentTokens`, so every
+  message would be kept anyway — and the outcome stays observable without
+  being silently dropped. Only exact messages are benign: an error merely
+  containing one of the phrases stays `failed`.
 - On any other error, Fabric clears the intent and `last` records
   `status: "failed"` with the message. A synchronous throw from `compact()`
   itself follows the same failure path.
@@ -173,8 +177,9 @@ return await agents.wait({ id: handle.id });
   best-effort events to the durable `fabric.compact` topic on each transition.
   Recorded intents publish `kind: "requested"`, and settled intents publish
   `kind: "committed" | "cancelled" | "failed"`. Pi's benign
-  `"Compaction cancelled"` and `"Already compacted"` outcomes publish with
-  `kind: "cancelled"`. Other Fabric participants, such as persistent actors
+  `"Compaction cancelled"`, `"Already compacted"`, and `"Nothing to
+  compact (session too small)"` outcomes publish with `kind: "cancelled"`.
+  Other Fabric participants, such as persistent actors
   and peer sessions, can subscribe to observe compaction transitions.
   Activity-only sessions with the mesh disabled silently skip this step.
 - **Status query**: `compact.status()` gives the context-independent,
@@ -194,7 +199,7 @@ safety needs no configuration.
 
 | File | Role |
 | --- | --- |
-| `src/core/compact-controller.ts` | Pending-intent controller with `request`, `cancel`, `status`, and `maybeCommit`. Uses a single replaceable slot, typed preserve encoding, an in-flight guard, and a quiet clear on cancelled or already-compacted outcomes. |
+| `src/core/compact-controller.ts` | Pending-intent controller with `request`, `cancel`, `status`, and `maybeCommit`. Uses a single replaceable slot, typed preserve encoding, an in-flight guard, and a quiet clear on benign no-op outcomes (cancelled, already compacted, or session too small). |
 | `src/providers/compact-provider.ts` | Fabric provider that exposes a bounded TypeBox-validated `request` (write, including optional `preserve: string[]`), `status` (read), and `cancel` (read). Registered always, with activity audit. |
 | `src/fabric-state.ts` | Constructs the controller with mesh-publish hooks, registers the provider, and resets on re-init or shutdown. |
 | `src/index.ts` | Invokes `state.compact.maybeCommit(context)` in the existing `agent_settled` handler. |

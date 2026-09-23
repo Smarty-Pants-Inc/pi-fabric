@@ -435,6 +435,7 @@ globalThis.state = __providerProxy("state");
 globalThis.schema = __providerProxy("schema");
 globalThis.components = __providerProxy("components");
 globalThis.compact = __providerProxy("compact");
+globalThis.prewalk = __providerProxy("prewalk");
 globalThis.jev = __providerProxy("jev");
 const __createActor = async (args = {}) => {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
@@ -486,6 +487,7 @@ globalThis.agents = Object.freeze({
   members: (args = {}) => __call("agents.members", args),
   self: () => __call("agents.self", {}),
   main: () => __call("agents.main", {}),
+  sessions: () => __call("agents.sessions", {}),
   peers: () => __call("agents.peers", {}),
   subscribe: (args) => __call("agents.subscribe", args),
   subscriptions: (args = {}) => __call("agents.subscriptions", args),
@@ -500,18 +502,24 @@ globalThis.agents = Object.freeze({
   followUp: (args) => __call("agents.followUp", args),
   setSteeringMode: (args) => __call("agents.setSteeringMode", args),
   setFollowUpMode: (args) => __call("agents.setFollowUpMode", args),
+  compact: (args) => __call("agents.compact", args),
   actorStatus: (args) => __call("agents.actorStatus", args),
   setModel: (args) => __call("agents.setModel", args),
   switchModel: (args) => __call("agents.switchModel", args),
   setThinking: (args) => __call("agents.setThinking", args),
   setTools: (args) => __call("agents.setTools", args),
-  setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
   setInferenceContext: (args) => __call("agents.setInferenceContext", args),
   setEvents: (args) => __call("agents.setEvents", args),
+  setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
+  clearMessages: (args) => __call("agents.clearMessages", args),
   setInstructions: (args) => __call("agents.setInstructions", args),
   actors: () => __call("agents.actors", {}),
   messages: (args) => __call("agents.messages", args),
   remove: (args) => __call("agents.remove", args),
+  // Keyword keys for the actor-template routes, spelled as the provider,
+  // audit projection, and docs already spell them.
+  "import": (args) => __call("agents.import", args),
+  "export": (args) => __call("agents.export", args),
   log: (args) => __call("agents.log", args),
 });
 globalThis.mesh = Object.freeze({
@@ -829,6 +837,22 @@ export class QuickJsRuntime {
           + " For large or quote-heavy content, keep it in top-level payloads and reference π.<key> instead of escaping it inside code.",
       };
     }
+    if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 1) {
+      return {
+        value: undefined,
+        logs: [],
+        terminationReason: "runtime_error",
+        error: "QuickJS timeout must be positive",
+      };
+    }
+    if (options.maxLogChars !== undefined && (!Number.isSafeInteger(options.maxLogChars) || options.maxLogChars < 0)) {
+      return {
+        value: undefined,
+        logs: [],
+        terminationReason: "runtime_error",
+        error: "QuickJS log limit must be a nonnegative safe integer",
+      };
+    }
     if (
       !Number.isSafeInteger(options.memoryLimitBytes) ||
       options.memoryLimitBytes < 1 ||
@@ -913,8 +937,8 @@ export class QuickJsRuntime {
     };
     const scheduleDeadline = (): void => {
       if (!rejectDeadline || closing || cancelled || timedOut) return;
-      if (timeout) clearTimeout(timeout);
-      timeout = setTimeout(expireDeadline, Math.max(0, executionDeadlineAt - Date.now()));
+      clearTimeout(timeout);
+      timeout = setTimeout(expireDeadline, Math.min(2_147_483_647, Math.max(0, executionDeadlineAt - Date.now())));
     };
     const extendExecutionTimeout = (
       ref: string,

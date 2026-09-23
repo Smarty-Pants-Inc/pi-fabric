@@ -9,7 +9,7 @@ import { FABRIC_PREWALK_REQUEST_EVENT } from "../src/protocol.js";
 import {
   PREWALK_ARMED_MESSAGE_TYPE,
   prewalkArmedPrompt,
-} from "../src/prewalk/handoff.js";
+} from "../src/prewalk/messages.js";
 import type { FabricState } from "../src/fabric-state.js";
 import type { FabricUiController } from "../src/ui/controller.js";
 

@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
+import type { FabricExecutionResult } from "../src/execution-service.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { getActiveRepairCompiler } from "../src/repairs/active.js";
 import { catalogDigestFromSurface } from "../src/repairs/catalog-digest.js";
@@ -87,7 +88,7 @@ describe("Fabric runtime provider components", () => {
     const config = normalizeFabricConfig({
       fullCodeMode: true,
       capture: { enabled: true },
-      components: [{ id: "guidance-only", component: "guidance-only" }],
+      components: [{ id: "guidance-only", component: "guidance-only" }, { id: "optional-device", component: "third-party-device", config: { label: "fixture" } }],
       mcp: { enabled: false, cache: { enabled: false } },
       mesh: { enabled: true },
       memory: { enabled: true },
@@ -110,6 +111,11 @@ describe("Fabric runtime provider components", () => {
       await runtime.initialize(context, config);
 
       expect(getActiveRepairCompiler()).toBe(runtime.repairs);
+      // Concrete connector definitions belong to external packages, not Fabric.
+      expect(runtime.componentCatalog.get("browser-harness")).toBeUndefined();
+      expect(runtime.componentCatalog.get("macos-harness")).toBeUndefined();
+      expect(runtime.registry.providers().map(provider => provider.name)).not.toContain("browser");
+      expect(runtime.registry.providers().map(provider => provider.name)).not.toContain("macos");
       expect(runtime.repairs.catalogDigest).toBe(catalogDigestFromSurface({
         providers: runtime.registry.providers().map((provider) => provider.name),
         capturedTools: [],
@@ -126,6 +132,7 @@ describe("Fabric runtime provider components", () => {
           "fabric.provider.memory",
           "fabric.provider.mesh",
           "fabric.provider.pi",
+          "fabric.provider.prewalk",
           "fabric.provider.schema",
           "fabric.provider.state",
         ],
@@ -151,6 +158,7 @@ describe("Fabric runtime provider components", () => {
             "state",
             "schema",
             "compact",
+            "prewalk",
             "agents",
             "memory",
             "jev",
@@ -185,6 +193,29 @@ describe("Fabric runtime provider components", () => {
         cwd, signal: undefined, parentToolCallId: "jev-reload-test", nestedToolCallId: "jev-reload-test",
         extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 32_768,
       };
+      // Configuration can precede extension discovery. The host knows no device API.
+      expect(runtime.components.status("optional-device").state).toBe("waiting");
+      expect(runtime.registry.has("devicefixture")).toBe(false);
+      let deviceInvocations = 0;
+      let deviceClosed = 0;
+      runtime.registerExternalComponent({
+        name: "third-party-device", provides: ["devicefixture"], guarantee: "managed",
+        configSchema: { type: "object", properties: { label: { type: "string" } }, required: ["label"], additionalProperties: false },
+        activate(component, config) {
+          const descriptor = { name: "sample", description: "Third-party device fixture", inputSchema: { type: "object", additionalProperties: false }, risk: "read" as const };
+          component.provide({
+            name: "devicefixture", description: "An arbitrary external connector",
+            async list() { return [descriptor]; }, async describe() { return descriptor; },
+            async invoke() { deviceInvocations++; return { label: (config as { label: string }).label }; },
+            async close() { deviceClosed++; },
+          });
+        },
+      });
+      await runtime.settleComponents();
+      expect(runtime.components.status("optional-device").state).toBe("active");
+      expect(deviceInvocations).toBe(0);
+      expect(await runtime.registry.invoke("devicefixture.sample", {}, invocation)).toEqual({ label: "fixture" });
+      expect(deviceInvocations).toBe(1);
       const spawned = await runtime.registry.invoke("jev.spawn", {
         program: { name: "self-pinned-loop", code: "while (true) await program.sleep(10);", requires: ["jev.evaluate"], inputSchema: {}, outputSchema: {} }, input: null,
       }, invocation) as { id: string };
@@ -223,6 +254,7 @@ describe("Fabric runtime provider components", () => {
       fs.writeFileSync(componentFile, JSON.stringify({ components: [] }));
       await vi.waitFor(() => expect(registry.has("livefixture")).toBe(false), { timeout: 3000 });
       expect(runtime.registry).toBe(registry);
+      expect(deviceClosed).toBe(1);
       expect(runtime.components.status("fabric.provider.jev").revision).toBe(jevRevision);
       expect(await registry.invoke("jev.status", { id: spawned.id }, invocation)).toMatchObject({ state: "running" });
       await runtime.registry.invoke("components.reload", { id: "fabric.provider.jev" }, invocation);
@@ -389,6 +421,114 @@ describe("Fabric runtime provider components", () => {
     } finally {
       await runtime.shutdown();
       expect(getActiveRepairCompiler()).toBeUndefined();
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// The runtime is the component that decides, so the checkpoint contract is
+// pinned here as well as at the claim helpers: a gated boundary delivers the
+// plan message, starts no handoff, and leaves the arm armed for the next one.
+describe("Fabric runtime prewalk plan checkpoint", () => {
+  it.each([false, true])("consumes the audited checkpoint window (shell read before plan=%s)", async (readBeforePlan) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prewalk-gate-"));
+    fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
+    vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
+
+    const pi = {
+      events: { emit: vi.fn() },
+      getThinkingLevel: vi.fn(() => "off"),
+      sendMessage: vi.fn(),
+    } as unknown as ExtensionAPI;
+    const context = {
+      cwd,
+      hasUI: false,
+      isProjectTrusted: () => true,
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn() },
+      sessionManager: {
+        getSessionId: () => "runtime-prewalk-gate",
+        getSessionFile: () => undefined,
+        getBranch: () => [],
+        getLeafId: () => undefined,
+      },
+      ui: { setStatus: vi.fn(), notify: vi.fn() },
+    } as unknown as ExtensionContext;
+    const config = normalizeFabricConfig({
+      fullCodeMode: true,
+      capture: { enabled: false },
+      mcp: { enabled: false, cache: { enabled: false } },
+      mesh: { enabled: false },
+      memory: { enabled: false },
+      agents: { enabled: false },
+      residency: { enabled: false },
+      prewalk: { enabled: true, mode: "in-place", model: "anthropic/executor", requirePlan: true },
+    });
+    const fixture = path.join(cwd, "unused.mjs");
+    fs.writeFileSync(fixture, "export default {};");
+    const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), {
+      paths: { extension: fixture, worker: fixture, residentHost: fixture, skills: cwd },
+    });
+    try {
+    await runtime.initialize(context, config);
+    runtime.prewalk.arm({
+      model: "anthropic/executor",
+      sessionId: "session-1",
+      requirePlan: true,
+    });
+    const file = path.join(cwd, "app.ts");
+    fs.writeFileSync(file, "before");
+    await runtime.prewalkDrift.captureBaseline("session-1", cwd);
+    fs.writeFileSync(file, "after: audited edit");
+    const execution = {
+      success: true,
+      value: "outer result",
+      logs: [],
+      audits: [
+        { ref: "pi.edit", nestedToolCallId: "edit-1", startedAt: 1, endedAt: 2, success: true },
+      ],
+      phases: [],
+    } as unknown as FabricExecutionResult;
+
+    const pending = await runtime.claimHandoff(execution, "session-1", "auto", "call-1");
+
+    expect(pending).toBeUndefined();
+    expect(runtime.prewalk.status()).toMatchObject({ state: "armed" });
+    expect(pi.sendMessage).toHaveBeenCalledOnce();
+    const [message, options] = (pi.sendMessage as unknown as { mock: { calls: unknown[][] } }).mock.calls[0]!;
+    expect(message).toMatchObject({ customType: "pi-fabric-prewalk-plan", display: false });
+    expect(options).toEqual({ deliverAs: "steer", triggerTurn: true });
+
+    // Delivery is not readiness: the arm still owes a recorded plan, so the
+    // boundary keeps withholding until prewalk.plan supplies one (the claim
+    // itself is covered in tests/prewalk-handoff.test.ts).
+    expect(runtime.prewalk.planCheckpointRequired("session-1")).toBe(true);
+    const shell = (): FabricExecutionResult => ({
+      ...execution, audits: [{ ref: "pi.bash", nestedToolCallId: "shell", startedAt: 3, endedAt: 4, success: true }],
+    });
+    runtime.activity.start("shell-read");
+    if (readBeforePlan) {
+      expect(await runtime.claimHandoff(shell(), "session-1", "auto", "shell-read")).toBeUndefined();
+      expect(runtime.prewalk.planState("session-1").prompts).toBe(1);
+    }
+    runtime.prewalk.submitPlan("session-1", {
+      outcome: "Finish the task", steps: ["Check app.ts"], verification: ["Read app.ts"], risks: "None",
+    });
+    expect(await runtime.claimHandoff(shell(), "session-1", "auto", "shell-read")).toBeUndefined();
+    fs.writeFileSync(file, "after: genuine new shell write");
+    runtime.activity.start("shell-write");
+    expect(await runtime.claimHandoff(shell(), "session-1", "auto", "shell-write")).toMatchObject({
+      kind: "prewalk-in-place", triggerRef: "fs.drift", triggerFiles: ["app.ts"],
+    });
+    await runtime.initialize(context, config);
+    expect(runtime.prewalk.status().state).toBe("idle");
+    runtime.prewalk.arm({ model: "anthropic/executor", sessionId: "session-1", requirePlan: true });
+    expect(runtime.prewalk.planState("session-1")).toEqual({ required: true, ready: false, prompts: 0 });
+    } finally {
+      await runtime.shutdown();
       vi.unstubAllEnvs();
       fs.rmSync(cwd, { recursive: true, force: true });
     }

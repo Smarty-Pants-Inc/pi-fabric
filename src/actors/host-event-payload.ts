@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+// Base64 and image-block heuristics are shared with the fabric_exec media
+// sanitizer so both channels agree on what counts as a payload.
+import { isImageContent, looksLikeBase64 } from "../core/media-sanitize.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 
 interface FabricActorHostMediaDescriptor {
@@ -46,19 +49,6 @@ const redactInlineSecrets = (value: string): string =>
     )
     .replace(/(https?:\/\/)[^\s/:@]+:[^\s/@]+@/gi, "$1[redacted]@");
 
-const looksLikeBase64 = (value: string): boolean => {
-  if (value.startsWith("data:") && value.includes(";base64,")) return true;
-  if (value.length < 1_024 || value.length % 4 !== 0) return false;
-  return /^[A-Za-z0-9+/=_\r\n-]+$/.test(value);
-};
-
-const isImageContent = (value: unknown): value is ImageContent =>
-  typeof value === "object" &&
-  value !== null &&
-  !Array.isArray(value) &&
-  (value as { type?: unknown }).type === "image" &&
-  typeof (value as { data?: unknown }).data === "string" &&
-  typeof (value as { mimeType?: unknown }).mimeType === "string";
 
 export const prepareFabricActorHostPayload = (
   value: unknown,

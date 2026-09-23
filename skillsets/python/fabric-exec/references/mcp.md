@@ -20,4 +20,4 @@ return await mcp.call(server="my-server", tool="weird-tool-name", args={"q": "x"
 return await tools.describe(ref="mcp.context7.resolve_library_id")
 ```
 
-Inspect inputSchema first and outputSchema when supplied. `tools.search` discovers current refs; `tools.call(ref=..., args=...)` invokes a computed one. `mcp.disableOAuth` permits cached credentials but prevents new interactive OAuth; calls respect mcp.callTimeoutMs. mcp.enabled=False disables this surface. Never expose credentials in model results.
+Inspect inputSchema first and outputSchema when supplied. `tools.search` discovers current refs; `tools.search(query=..., searchMode="semantic")` is opt-in Jev ranking (enable under /fabric settings → MCP; block individual cached servers there). `tools.call(ref=..., args=...)` invokes a computed one. `mcp.disableOAuth` permits cached credentials but prevents new interactive OAuth; calls respect mcp.callTimeoutMs. mcp.enabled=False disables this surface. Never expose credentials in model results.

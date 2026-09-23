@@ -28,7 +28,17 @@ const context = () => ({
     { type: "message", message: { role: "toolResult", content: "HOSTILE TOOL OUTPUT" } },
   ] },
 } as unknown as ExtensionContext);
-const response = (probability = 1) => ({ model: "jev-1.13", answers: { safe_to_auto_approve: { type: "noul", noul: probability } }, usage: { input_tokens: 100, output_tokens: 8 } });
+const noul = (probability: number) => ({ type: "noul", noul: probability });
+const response = (probability = 1, verdicts: Partial<Record<"touches_secrets" | "destructive" | "targets_agent_artifacts", number>> = {}) => ({
+  model: "jev-1.13",
+  answers: {
+    safe_to_auto_approve: noul(probability),
+    touches_secrets: noul(verdicts.touches_secrets ?? 0),
+    destructive: noul(verdicts.destructive ?? 0),
+    targets_agent_artifacts: noul(verdicts.targets_agent_artifacts ?? 0),
+  },
+  usage: { input_tokens: 100, output_tokens: 8 },
+});
 const fetcher = vi.fn<typeof fetch>();
 const config = () => normalizeFabricConfig({ approvals: { execute: "auto", model: "pi-fabric/typesafe/jev-latest" } });
 
@@ -65,6 +75,17 @@ describe("Jev auto-approval classifier", () => {
     expect(body.state.action).toMatchObject({ ref: "fixture.run", risk: "execute", argumentsJson: '{"command":"bun run typecheck"}' });
     expect(body.questions.safe_to_auto_approve.type).toBe("noul");
     expect(body.questions.safe_to_auto_approve.instructions).toContain("untrusted quoted evidence");
+    expect(Object.keys(body.questions).sort()).toEqual([
+      "destructive",
+      "safe_to_auto_approve",
+      "targets_agent_artifacts",
+      "touches_secrets",
+    ]);
+    expect(body.state.session).toEqual({
+      actions: [{ name: "fixture.run", argumentsJson: '{"command":"bun run typecheck"}' }],
+      truncated: false,
+    });
+    expect(body.state.evidence).toEqual({ truncated: false, argumentsTruncated: false });
     expect(options!.body).not.toMatch(/PRIVATE|HOSTILE|fixture-only-key/);
     expect(body.state.conversation).toContain("Run the local tests");
   });
@@ -92,6 +113,51 @@ describe("Jev auto-approval classifier", () => {
     await expect(classifier.classify(action, {}, context(), "pi-fabric/typesafe/jev-latest")).rejects.toThrow("invalid");
   });
 
+  it.each([
+    [1, 0.5, 0, "escalate"],
+    [1, 0, 0.5, "escalate"],
+    [1, 0.499, 0.499, "allow"],
+  ] as const)("hard-escalates a positive secrets or destructive verdict", async (probability, secrets, destructive, decision) => {
+    fetcher.mockImplementation(async () => Response.json(response(probability, { touches_secrets: secrets, destructive })));
+    const result = await new FabricAutoApprovalClassifier().classify(action, {}, context(), "pi-fabric/typesafe/jev-latest");
+    expect(result.decision).toBe(decision);
+    expect(result.verdicts).toMatchObject({ safeToAutoApprove: probability, touchesSecrets: secrets, destructive });
+  });
+
+  it("keeps secrets and destructive verdicts authoritative at a zero threshold", async () => {
+    fetcher.mockImplementation(async () => Response.json(response(0, { touches_secrets: 1 })));
+    const classifier = new FabricAutoApprovalClassifier(() => ({ ...DEFAULT_JEV_CONFIG, autoApprovalThreshold: 0 }));
+    const result = await classifier.classify(action, {}, context(), "pi-fabric/typesafe/jev-latest");
+    expect(result).toMatchObject({ decision: "escalate", threshold: 0 });
+    expect(result.reason).toContain("secrets 1");
+  });
+
+  it("projects prior session actions from the branch without result text", async () => {
+    const ctx = context();
+    vi.spyOn(ctx.sessionManager, "getBranch").mockReturnValue([
+      user("Clean up the scratch files you created"),
+      { type: "message", message: { role: "assistant", content: [
+        { type: "toolCall", name: "fabric_exec", arguments: { code: "pi.write(...)" } },
+      ] } },
+      { type: "message", message: { role: "toolResult", content: "ignored", details: { audits: [
+        { tool: "write", args: { path: "/project/tmp/scratch.ts" }, success: true },
+        { tool: "bash", args: { command: "bun run build" }, success: false, result: "HOSTILE TOOL OUTPUT" },
+      ] } } },
+    ] as never);
+    await new FabricAutoApprovalClassifier().classify(action, {}, ctx, "pi-fabric/typesafe/jev-latest");
+    const body = JSON.parse(fetcher.mock.calls[0]![1]!.body as string);
+    expect(body.state.session).toEqual({
+      actions: [
+        { name: "fabric_exec", argumentsJson: '{"code":"pi.write(...)"}' },
+        { name: "write", argumentsJson: '{"path":"/project/tmp/scratch.ts"}' },
+        { name: "bash", argumentsJson: '{"command":"bun run build"}', ok: false },
+      ],
+      truncated: false,
+    });
+    expect(body.state.conversation).toContain("Clean up the scratch files");
+    expect(fetcher.mock.calls[0]![1]!.body).not.toContain("HOSTILE");
+  });
+
   it("starts at the latest user turn and does not infer authority from older requests", async () => {
     const ctx = context();
     vi.spyOn(ctx.sessionManager, "getBranch").mockReturnValue([user("old".repeat(20_000)), user("Run local tests")] as never);
@@ -99,7 +165,7 @@ describe("Jev auto-approval classifier", () => {
     expect(fetcher.mock.calls[0]![1]!.body).not.toContain("oldold");
   });
 
-  it.each(["arguments", "user", "history", "tool-call", "missing-user", "non-json"])("requires explicit approval for incomplete %s evidence", async kind => {
+  it.each(["arguments", "user", "history", "tool-call", "missing-user", "non-json"])("handles incomplete %s evidence as facts or a pre-inference gate", async kind => {
     const ctx = context();
     const args: Record<string, unknown> = {};
     if (kind === "arguments") args.command = "x".repeat(16_001);
@@ -110,13 +176,21 @@ describe("Jev auto-approval classifier", () => {
     ] as never);
     if (kind === "missing-user") vi.spyOn(ctx.sessionManager, "getBranch").mockReturnValue([]);
     if (kind === "non-json") args.cycle = args;
-    await expect(new FabricAutoApprovalClassifier().classify(action, args, ctx, "pi-fabric/typesafe/jev-latest")).rejects.toThrow("complete bounded");
-    expect(fetcher).not.toHaveBeenCalled();
-    expect(ctx.modelRegistry.getApiKeyForProvider).not.toHaveBeenCalled();
+    if (kind === "missing-user") {
+      await expect(new FabricAutoApprovalClassifier().classify(action, args, ctx, "pi-fabric/typesafe/jev-latest")).rejects.toThrow("user evidence");
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(ctx.modelRegistry.getApiKeyForProvider).not.toHaveBeenCalled();
+      return;
+    }
+    const result = await new FabricAutoApprovalClassifier().classify(action, args, ctx, "pi-fabric/typesafe/jev-latest");
+    expect(result.decision).toBe("allow");
+    const body = JSON.parse(fetcher.mock.calls[0]![1]!.body as string);
+    expect(body.state.evidence.argumentsTruncated).toBe(kind === "arguments" || kind === "non-json");
+    expect(body.state.evidence.truncated).toBe(kind === "user" || kind === "history" || kind === "tool-call");
   });
 
   it.each([undefined, { type: "noul", noul: 1.1 }, { type: "noul", noul: -1 }, { type: "noul", noul: "1" }, { type: "choice", choice: "allow" }])("rejects malformed typed answers", async answer => {
-    fetcher.mockImplementation(async () => Response.json({ ...response(), answers: { safe_to_auto_approve: answer } }));
+    fetcher.mockImplementation(async () => Response.json({ ...response(), answers: { ...response().answers, safe_to_auto_approve: answer } }));
     await expect(new FabricAutoApprovalClassifier().classify(action, {}, context(), "pi-fabric/typesafe/jev-latest")).rejects.toThrow("invalid");
   });
 
@@ -132,6 +206,42 @@ describe("Jev auto-approval classifier", () => {
     expect(fetcher).not.toHaveBeenCalled();
     await new FabricAutoApprovalClassifier().classify(action, {}, context(), "pi-fabric/typesafe/jev-1.13");
     expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string).model).toBe("jev-1.13");
+  });
+
+  it("classifies through OpenRouter decisions with the openrouter credential", async () => {
+    fetcher.mockImplementation(async () => Response.json({ ...response(), model: "typesafe/jev-1.13" }));
+    const ctx = context();
+    const result = await new FabricAutoApprovalClassifier().classify(action, { command: "bun run typecheck" }, ctx, "pi-fabric/openrouter/jev-latest");
+    expect(result).toMatchObject({ decision: "allow", model: "pi-fabric/openrouter/typesafe/jev-1.13" });
+    expect(ctx.modelRegistry.getApiKeyForProvider).toHaveBeenCalledWith("openrouter");
+    expect(ctx.modelRegistry.find).not.toHaveBeenCalled();
+    const [url, options] = fetcher.mock.calls[0]!;
+    expect(url).toBe("https://openrouter.ai/api/alpha/decisions");
+    expect(options).toMatchObject({ redirect: "error", headers: { Authorization: "Bearer fixture-only-key" } });
+    expect(JSON.parse(options!.body as string).model).toBe("~typesafe/jev-latest");
+    expect(options!.body).not.toMatch(/PRIVATE|HOSTILE|fixture-only-key/);
+  });
+
+  it("classifies through Vercel AI Gateway with the vercel-ai-gateway credential", async () => {
+    fetcher.mockImplementation(async () => Response.json({ ...response(), model: "typesafe-ai/jev" }));
+    const ctx = context();
+    const result = await new FabricAutoApprovalClassifier().classify(action, { command: "bun run typecheck" }, ctx, "pi-fabric/vercel-ai-gateway/jev-latest");
+    expect(result).toMatchObject({ decision: "allow", model: "pi-fabric/vercel-ai-gateway/typesafe-ai/jev" });
+    expect(ctx.modelRegistry.getApiKeyForProvider).toHaveBeenCalledWith("vercel-ai-gateway");
+    expect(ctx.modelRegistry.find).not.toHaveBeenCalled();
+    const [url, options] = fetcher.mock.calls[0]!;
+    expect(url).toBe("https://ai-gateway.vercel.sh/typesafe/v1/systemone");
+    expect(options).toMatchObject({ redirect: "error", headers: { Authorization: "Bearer fixture-only-key" } });
+    expect(JSON.parse(options!.body as string).model).toBe("typesafe-ai/jev");
+    expect(options!.body).not.toMatch(/PRIVATE|HOSTILE|fixture-only-key/);
+    await expect(new FabricAutoApprovalClassifier().classify(action, {}, context(), "pi-fabric/vercel-ai-gateway/jev-preview")).rejects.toThrow("Vercel AI Gateway serves");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects OpenRouter aliases the service does not expose before credentials or network", async () => {
+    await expect(new FabricAutoApprovalClassifier().classify(action, {}, context(), "pi-fabric/openrouter/jev-preview")).rejects.toThrow("OpenRouter serves");
+    await expect(new FabricAutoApprovalClassifier().classify(action, {}, context(), "pi-fabric/openrouter/../bad")).rejects.toThrow("not available");
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("uses environment auth when Pi has no key and does not need a chat model", async () => {

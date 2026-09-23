@@ -3,6 +3,7 @@ import { validationMessage } from "../core/action-arguments.js";
 import type { FabricActionDescriptor, FabricInvocationContext, FabricProvider, FabricProviderListRequest } from "../protocol.js";
 import { JevClient, JevCredentials, type JevCredentialSource } from "../jev/client.js";
 import { JevProgramManager, type JevManagerOptions } from "../jev/manager.js";
+import { resolveJevModelRoute, type JevRoute } from "../jev/routes.js";
 import type { JevLaunch, JevRequest } from "../jev/types.js";
 import { jevObserveSchema } from "../jev/observation.js";
 
@@ -60,9 +61,12 @@ export class JevProvider implements FabricProvider {
   readonly description = "TypeSafe System One judgments and foreground/background reactive TypeScript programs";
   readonly manager: JevProgramManager;
   readonly client: JevClient;
+  readonly route: JevRoute;
   constructor(options: JevManagerOptions & { credentialSource?: JevCredentialSource }, client?: JevClient) {
     this.manager = new JevProgramManager(options);
-    this.client = client ?? new JevClient(options.config.jev, undefined, new JevCredentials(options.config.jev.credentialCommand, process.env, options.credentialSource));
+    this.route = resolveJevModelRoute(options.config.jev.model).route;
+    this.client = client ?? new JevClient(options.config.jev, undefined,
+      new JevCredentials(options.config.jev.credentialCommand, process.env, options.credentialSource, this.route.envKeys), this.route);
   }
   async list(request: FabricProviderListRequest): Promise<FabricActionDescriptor[]> {
     const query = request.query?.toLowerCase();
@@ -79,7 +83,7 @@ export class JevProvider implements FabricProvider {
       case "run": return this.manager.launch(args as unknown as JevLaunch, context, false);
       case "spawn": return this.manager.launch(args as unknown as JevLaunch, context, true);
       case "status": return typeof args.id === "string" ? this.manager.status(args.id, args.after as number | undefined) : {
-        credentials: this.client.credentials.status(), model: this.client.config.model, runs: this.manager.list(),
+        credentials: this.client.credentials.status(), model: this.client.config.model, route: this.route.id, runs: this.manager.list(),
       };
       case "join":
       case "wait": return this.manager.wait(args.id as string, context.signal);

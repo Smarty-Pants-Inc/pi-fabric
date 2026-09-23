@@ -1,4 +1,6 @@
-const PROVIDER_MODEL_RE = /^[^\s/]+\/[^\s/]+$/;
+import { isFabricThinking, type FabricThinking } from "../thinking.js";
+
+const PROVIDER_MODEL_RE = /^[^\s/]+\/[^\s]+$/;
 
 /** Minimal model view needed for resolution; satisfied by pi Model entries. */
 export interface FabricModelCandidate {
@@ -12,6 +14,19 @@ export type FabricModelResolution =
   | { kind: "already-active"; model: FabricModelCandidate }
   | { kind: "ambiguous"; query: string; candidates: FabricModelCandidate[] }
   | { kind: "not-found"; query: string; tried?: string[] };
+
+/**
+ * One configured alias: an ordered fallback chain plus an optional default
+ * thinking level. The thinking level is a Fabric default for runs that select
+ * the alias, below an explicit call/actor value and above the global
+ * `agents.thinking` default.
+ */
+export interface FabricModelAlias {
+  targets: string[];
+  thinking?: FabricThinking;
+}
+
+export type FabricModelAliases = Record<string, FabricModelAlias>;
 
 /** Markers reported in `via` when an inexact selector is fuzzy-resolved. */
 export const FUZZY_RESOLUTION_MARKERS = ["closest", "recent", "latest"] as const;
@@ -33,13 +48,20 @@ const sameModel = (
  * dropped entirely, matching the lenient fallback style of the other config
  * normalizers (no partial alias survives with a silently missing target).
  */
-export const normalizeModelAliases = (input: unknown): Record<string, string[]> => {
+export const normalizeModelAliases = (input: unknown): FabricModelAliases => {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return {};
-  const aliases: Record<string, string[]> = {};
+  const aliases: FabricModelAliases = {};
   for (const [rawName, rawValue] of Object.entries(input as Record<string, unknown>)) {
     const name = rawName.trim();
     if (!name) continue;
-    const values = typeof rawValue === "string" ? [rawValue] : rawValue;
+    // Object entries carry {model, thinking?}; re-normalizing them keeps a
+    // config round trip through persisted state or a resident owner idempotent.
+    const entry =
+      typeof rawValue === "object" && rawValue !== null && !Array.isArray(rawValue)
+        ? (rawValue as { model?: unknown; targets?: unknown; thinking?: unknown })
+        : undefined;
+    const rawTargets = entry ? entry.model ?? entry.targets : rawValue;
+    const values = typeof rawTargets === "string" ? [rawTargets] : rawTargets;
     if (!Array.isArray(values) || values.length === 0) continue;
     const targets: string[] = [];
     let valid = true;
@@ -55,9 +77,29 @@ export const normalizeModelAliases = (input: unknown): Record<string, string[]> 
       }
       if (!targets.includes(target)) targets.push(target);
     }
-    if (valid && targets.length > 0) aliases[name] = targets;
+    if (valid && targets.length > 0) {
+      aliases[name] = {
+        targets,
+        ...(entry && isFabricThinking(entry.thinking) ? { thinking: entry.thinking } : {}),
+      };
+    }
   }
   return aliases;
+};
+
+/**
+ * Default thinking level configured for a selector that names an alias, or
+ * undefined when the selector is not an alias or carries no level.
+ */
+export const aliasThinking = (
+  aliases: FabricModelAliases | undefined,
+  selector: string,
+): FabricThinking | undefined => {
+  if (!aliases) return undefined;
+  const query = selector.trim().toLowerCase();
+  if (!query) return undefined;
+  const key = Object.keys(aliases).find((name) => name.toLowerCase() === query);
+  return key === undefined ? undefined : aliases[key]?.thinking;
 };
 
 const FUZZY_MIN_QUERY_LENGTH = 4;
@@ -202,7 +244,7 @@ const pickClosestCandidate = (
 export const resolveFabricModel = (
   query: string,
   options: {
-    aliases: Record<string, string[]>;
+    aliases: FabricModelAliases;
     available: readonly FabricModelCandidate[];
     current?: FabricModelCandidate;
     provider?: string;
@@ -222,7 +264,7 @@ export const resolveFabricModel = (
   );
   const tried: string[] = [];
   if (aliasKey !== undefined) {
-    const chain = options.aliases[aliasKey] ?? [];
+    const chain = options.aliases[aliasKey]?.targets ?? [];
     for (const target of chain) {
       tried.push(target);
       const separator = target.indexOf("/");
@@ -291,13 +333,14 @@ const unavailablePiModelError = (
 
 /**
  * Resolve a Pi participant selector strictly within the execution owner's
- * visible registry. Exact provider/id keys never fall back to fuzzy matching;
- * aliases and inexact selectors retain the normal Fabric resolution policy.
+ * visible registry. Provider-qualified selectors prefer exact IDs, then the
+ * closest visible ID/name on that same provider. Aliases retain their ordered
+ * exact-target policy; bare selectors retain normal Fabric fuzzy resolution.
  */
 export const resolveAvailablePiModel = (
   selector: string,
   options: {
-    aliases: Record<string, string[]>;
+    aliases: FabricModelAliases;
     available: readonly FabricModelCandidate[];
     lastUsed?: FabricModelUsage;
   },
@@ -311,6 +354,15 @@ export const resolveAvailablePiModel = (
       (model) => modelKey(model).toLowerCase() === query.toLowerCase(),
     );
     if (exact) return exact;
+    // Recover near-miss IDs without crossing provider/auth boundaries.
+    const separator = query.indexOf("/");
+    const provider = query.slice(0, separator).toLowerCase();
+    const closest = pickClosestCandidate(
+      query.slice(separator + 1).toLowerCase(),
+      options.available.filter((model) => model.provider.toLowerCase() === provider),
+      options.lastUsed,
+    )?.model;
+    if (closest) return closest;
     throw unavailablePiModelError(query);
   }
 

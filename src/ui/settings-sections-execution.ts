@@ -1,5 +1,6 @@
 import type { SettingItem } from "@earendil-works/pi-tui";
 import { isJevApprovalModel } from "../jev/model-key.js";
+import { jevClassifierModels } from "../jev/routes.js";
 import type { SettingsSectionContext } from "./settings-section-context.js";
 import {
   setting,
@@ -8,10 +9,12 @@ import {
   probabilitySubmenu,
   stringInputSubmenu,
   modelPickerSubmenu,
+  listSubmenu,
 } from "./settings-submenus.js";
 import {
   BOOLEANS,
   summaryFor,
+  formatBlockedCount,
   EXECUTOR_KERNELS,
   PYTHON_RUNTIMES,
   EXECUTOR_RUNTIMES,
@@ -246,31 +249,28 @@ export const buildApprovalsSection = (
       () => [
         setting("approvals.model", "Auto model", config.approvals.model || INHERIT_VALUE, {
           description:
-            "Pi or Jev model used as the auto-mode safety classifier. Inherit uses the active session model. Jev requires /login jev or TYPESAFE_API_KEY and the configured minimum safety probability (default 0.50); lower scores and errors require explicit approval. No executable classifier tools.",
+            "Pi or Jev model used as the auto-mode safety classifier. Inherit uses the active session model. Jev requires /login jev (TypeSafe), the existing openrouter credential (OpenRouter), or the existing vercel-ai-gateway credential (Vercel AI Gateway) and the configured minimum safety probability (default 0.50); lower scores and errors require explicit approval. No executable classifier tools.",
           submenu: modelPickerSubmenu(
             theme,
             {
               ...options.modelSource,
               models: [
                 ...options.modelSource.models.filter(model => !isJevApprovalModel(`${model.provider}/${model.id}`)),
-                ...[...new Set([config.jev.model, "jev-latest", "jev-1.13"])].map(model => ({
-                  provider: "pi-fabric", id: `typesafe/${model}`,
-                  name: `Jev (TypeSafe safety classifier · ${model})`,
-                })),
+                ...jevClassifierModels(config.jev.model),
               ],
             },
             {
               headerText:
-                "Safety classifier for auto approval policies. Inherit uses the active Pi model. Jev uses typed judgments, not chat; authenticate with /login jev.",
+                "Safety classifier for auto approval policies. Inherit uses the active Pi model. Jev uses typed judgments, not chat; authenticate with /login jev for TypeSafe, /login openrouter for OpenRouter, or /login vercel-ai-gateway for Vercel AI Gateway.",
               inheritName: "Use the active Pi session model",
             },
           ),
         }),
         ...(isJevApprovalModel(config.approvals.model) ? [
           setting("jev.autoApprovalThreshold", "Jev minimum probability", String(config.jev.autoApprovalThreshold), {
-            description: "Minimum safety probability for automatic approval (0–1, default 0.50). Lower values allow more actions; 0 allows every valid judgment. Errors still require approval.",
+            description: "Minimum safety probability for automatic approval (0–1, default 0.50). Lower values allow more actions; secrets and destructive verdicts still escalate. Errors still require approval.",
             submenu: probabilitySubmenu(theme, "Jev minimum probability",
-              "Enter a probability from 0 to 1 (default 0.50). Higher values are more conservative. 0 allows every valid judgment; 1 requires a probability of 1. Errors and incomplete evidence still require approval."),
+              "Enter a probability from 0 to 1 (default 0.50). Higher values are more conservative. 0 allows every judgment whose secrets and destructive verdicts are clean; 1 requires a probability of 1. Errors and missing user text still require approval."),
           }),
         ] : []),
         setting("approvals.read", "Read", config.approvals.read, {
@@ -300,8 +300,33 @@ export const buildApprovalsSection = (
 };
 
 export const buildMcpSection = (
-  { config, theme, persist }: Pick<SettingsSectionContext, "config" | "theme" | "persist">,
+  { config, theme, persist, apply, options }: Pick<
+    SettingsSectionContext,
+    "config" | "theme" | "persist" | "apply" | "options"
+  >,
 ): SettingItem => {
+  const blockedItem = setting(
+    "mcp.jev.blockedServers",
+    "Block from Jev",
+    formatBlockedCount(config.mcp.jev.blockedServers.length),
+    {
+      description:
+        "Cached MCP servers. Toggle to block sending that server's tool metadata to Jev. Unlisted and future servers stay allowed.",
+    },
+  );
+  blockedItem.submenu = listSubmenu(
+    theme,
+    "mcp.jev.blockedServers",
+    "Block from Jev",
+    "Cached MCP servers. Toggle to block sending that server's tool metadata to Jev. Unlisted and future servers stay allowed.",
+    options.cachedMcpServers ?? [],
+    config.mcp.jev.blockedServers,
+    (selected) => {
+      apply("mcp.jev.blockedServers", selected);
+      blockedItem.currentValue = formatBlockedCount(selected.length);
+    },
+  );
+
   return setting("mcp", "MCP", summaryFor("mcp", config), {
     description: "Model Context Protocol provider discovery and invocation.",
     submenu: sectionSubmenu(
@@ -349,6 +374,12 @@ export const buildMcpSection = (
             "Wall-clock budget for the session-start background MCP revalidation.",
           ),
         }),
+        setting("mcp.jev.semanticSearch", "Jev semantic search", config.mcp.jev.semanticSearch ? "true" : "false", {
+          description:
+            'Opt-in: tools.search({ query, searchMode: "semantic" }) ranks actions with Jev. Default search stays lexical. Cached and future MCP servers are eligible unless blocked below.',
+          values: BOOLEANS,
+        }),
+        blockedItem,
       ],
       persist,
     ),

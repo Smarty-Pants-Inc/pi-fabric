@@ -1,3 +1,5 @@
+import { isJevModelId } from "./routes.js";
+
 export interface FabricJevConfig {
   enabled: boolean;
   model: string;
@@ -39,7 +41,8 @@ export function normalizeJevConfig(value: unknown): FabricJevConfig {
   const command = input.credentialCommand;
   return {
     enabled: typeof input.enabled === "boolean" ? input.enabled : true,
-    model: typeof input.model === "string" && /^[a-zA-Z0-9._-]{1,128}$/.test(input.model)
+    // Bare aliases use the direct route; `~typesafe/...` and `typesafe/...` select OpenRouter decisions.
+    model: typeof input.model === "string" && isJevModelId(input.model)
       ? input.model : DEFAULT_JEV_CONFIG.model,
     autoApprovalThreshold: typeof input.autoApprovalThreshold === "number" &&
       Number.isFinite(input.autoApprovalThreshold) && input.autoApprovalThreshold >= 0 && input.autoApprovalThreshold <= 1

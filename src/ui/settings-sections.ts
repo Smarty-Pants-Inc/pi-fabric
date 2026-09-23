@@ -41,6 +41,7 @@ export const buildFabricSettingsItems = (
     modelSource: ModelSource;
     claudeModelSource?: ModelSource;
     activeModelKey?: string;
+    cachedMcpServers?: readonly string[];
   },
 ): SettingItem[] => {
   const persist = (id: string, newValue: string): void =>

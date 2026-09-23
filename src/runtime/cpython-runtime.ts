@@ -49,6 +49,13 @@ const executable = async (binary: string, cwd: string): Promise<string> => {
   throw new Error(`CPython executable not found: ${binary}. Install Python 3 or set executor.cpython.binary to a trusted executable's absolute path.`);
 };
 
+// The isolation flags are exported so the sandbox tests can probe whether this
+// kernel can actually start the same sandbox, instead of treating an installed
+// bwrap as a usable one. The seccomp filter rides in on fd 4, so a probe can
+// leave the seccomp arguments off.
+export const LINUX_BWRAP_ISOLATION_ARGS = ["--ro-bind", "/", "/", "--unshare-all", "--die-with-parent", "--new-session", "--proc", "/proc", "--dev", "/dev"] as const;
+export const LINUX_BWRAP_SECCOMP_ARGS = ["--seccomp", "4"] as const;
+
 const launch = async (binary: string, enforce: boolean, cwd: string): Promise<{ command: string; args: string[]; seccomp?: Buffer }> => {
   const python = await executable(binary, cwd);
   const args = ["-I", "-B", "-u", "-c", CPYTHON_CHILD_SOURCE];
@@ -68,7 +75,7 @@ const launch = async (binary: string, enforce: boolean, cwd: string): Promise<{ 
     if (!bwrap) throw new Error("Schema enforce CPython requires bubblewrap (/usr/bin/bwrap). Install bubblewrap and enable unprivileged user namespaces; no unsandboxed fallback is permitted.");
     return {
       command: bwrap,
-      args: ["--ro-bind", "/", "/", "--unshare-all", "--die-with-parent", "--new-session", "--proc", "/proc", "--dev", "/dev", "--preserve-fds", "1", "--seccomp", "4", "--chdir", cwd, "--", python, ...args],
+      args: [...LINUX_BWRAP_ISOLATION_ARGS, ...LINUX_BWRAP_SECCOMP_ARGS, "--chdir", cwd, "--", python, ...args],
       seccomp: linuxCPythonNetworkFilter(process.arch),
     };
   }

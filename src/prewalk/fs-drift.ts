@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { isFabricStateRelativePath } from "../core/fabric-state-paths.js";
 
 // Prewalk's audit claim never sees writes made through opaque Pi shell calls
 // heredocs, sed -i, formatter binaries — because audits record tool refs, not
@@ -21,6 +22,9 @@ import { promisify } from "node:util";
 // ignored directories never registers as drift. Git-less trees fall back to
 // an in-process walk skipping only .git and node_modules, where artifact
 // writes do count as drift — the honest but noisier signal.
+//
+// Fabric's own state directory is excluded outright: those writes are runtime
+// bookkeeping, and counting them claimed a handoff on a cache refresh.
 
 const execFileAsync = promisify(execFile);
 
@@ -77,7 +81,7 @@ const listGitFiles = async (
       ["-C", root, "ls-files", "-co", "--exclude-standard", "-z"],
       { timeout: GIT_TIMEOUT_MS, maxBuffer: 64 << 20 },
     );
-    return { root, files: listed.stdout.split("\0").filter((file) => file.length > 0) };
+    return { root, files: listed.stdout.split("\0").filter((file) => file.length > 0 && !isFabricStateRelativePath(file)) };
   } catch {
     return undefined;
   }
@@ -106,6 +110,11 @@ const listWalkFiles = async (
     }
     for (const entry of entries) {
       const absolute = path.join(dir, entry.name);
+      // The git listing reports "/" while a walk on Windows reports "\"; both
+      // feed one baseline manifest, so report one canonical separator.
+      const relative = path.relative(root, absolute).split(path.sep).join("/");
+      // Prune runtime state before walking, counting or statting its contents.
+      if (isFabricStateRelativePath(relative)) continue;
       if (entry.isDirectory()) {
         if (!WALK_SKIP_DIRS.has(entry.name)) pendingDirs.push(absolute);
         continue;
@@ -114,7 +123,7 @@ const listWalkFiles = async (
       // special-file stats. Symlinked file edits surface through the target
       // only when the target itself is inside the listing root.
       if (!entry.isFile()) continue;
-      files.push(path.relative(root, absolute));
+      files.push(relative);
       if (files.length > maxTrackedFiles) return { files, overflow: true };
     }
   }
@@ -210,6 +219,23 @@ export class PrewalkDriftTracker {
     }
     const verified = await this.#verifyModified(current.root, candidates);
     files.push(...verified.changed);
+    // Carry each file's learned content hash into the advancing baseline when
+    // its stat is unchanged this window: an intervening unchanged scan must not
+    // forget hashes, or a later content-identical touch re-claims and breaks the
+    // one-misfire-per-content-state promise. Stat-modified files get fresh
+    // hashes from #verifyModified; files without a learned hash carry nothing.
+    for (const [file, before] of baseline.files) {
+      const now = current.files.get(file);
+      if (
+        now &&
+        now.sha1 === undefined &&
+        before.sha1 !== undefined &&
+        before.size === now.size &&
+        Math.abs(before.mtimeMs - now.mtimeMs) <= 1e-6
+      ) {
+        now.sha1 = before.sha1;
+      }
+    }
     this.#baselines.set(sessionId, current);
     if (files.length === 0) return undefined;
     const shown = files.slice(0, MAX_REPORT_FILES);

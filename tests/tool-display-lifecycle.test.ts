@@ -100,6 +100,9 @@ const createHarness = (): Harness => {
     }),
     registerCommand: vi.fn(),
     registerMessageRenderer: vi.fn(),
+    // Auto-arm can run when the ambient agent dir enables prewalk; the arm path
+    // sends a hidden armed advisory, so the stub must accept it.
+    sendMessage: vi.fn(),
     registerTool: vi.fn((tool: unknown) => {
       registeredTools.push(tool);
     }),

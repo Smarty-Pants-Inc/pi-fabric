@@ -30,6 +30,13 @@ import {
   resolveFabricExecPayloads,
 } from "./fabric-exec-arguments.js";
 import { repairFabricGuestCode } from "./runtime/guest-code-repair.js";
+import {
+  FABRIC_REPEAT_BLOCK,
+  FABRIC_REPEAT_WARN,
+  FabricRepeatGuard,
+  fabricRepeatBlockText,
+  fabricRepeatWarnText,
+} from "./repeat-guard.js";
 import { typeErrorRecoveryHint } from "./type-error-guidance.js";
 import { normalizeRunDisplay } from "./run-display.js";
 import type { PendingFabricHandoff } from "./prewalk/handoff.js";
@@ -76,7 +83,7 @@ import {
   observeResultRows,
   type ResultRowBalance,
 } from "./ui/row-balance.js";
-import { type SpinnerTimerState, updateSpinner } from "./ui/spinner.js";
+import { observeAnimationRows, type SpinnerTimerState, updateSpinner } from "./ui/spinner.js";
 import type { FabricToolDisplayController } from "./ui/tool-display.js";
 import { boundModelOutput, modelOutputBudget } from "./output-budget.js";
 import { formatFabricValue } from "./ui/structured.js";
@@ -139,6 +146,7 @@ export const createFabricExecTool = (
 ): ToolDefinition<any, any, any> => {
   const python = toolKernel(state) === "python";
   const monty = python && state.config.executor.pythonRuntime === "monty";
+  const repeatGuard = new FabricRepeatGuard(FABRIC_REPEAT_WARN, FABRIC_REPEAT_BLOCK);
   return decorateShell(
   defineTool({
     name: "fabric_exec",
@@ -305,7 +313,7 @@ export const createFabricExecTool = (
         composite.addChild(header);
         composite.addChild(new Text("\n", 0, 0));
         composite.addChild(writePreview);
-        return composite;
+        return observeAnimationRows(composite, rendererState.fabricSpinner ??= {});
       }
 
       const lines = safeTerminalText(code).split("\n");
@@ -354,7 +362,7 @@ export const createFabricExecTool = (
       composite.addChild(codePreview);
       composite.addChild(new Text("\n", 0, 0));
       composite.addChild(writePreview);
-      return composite;
+      return observeAnimationRows(composite, rendererState.fabricSpinner ??= {});
     },
     renderResult(result, { expanded, isPartial }, theme, context) {
       observePiTheme(theme);
@@ -380,7 +388,7 @@ export const createFabricExecTool = (
       const rowBalance = rendererState.fabricResultRowBalance ??= {};
       const trackRows = (component: Component): Component =>
         observeResultRows(
-          inheritComponentBackground(component),
+          observeAnimationRows(inheritComponentBackground(component), rendererState.fabricSpinner ??= {}),
           rowBalance,
           { expanded, isPartial },
         );
@@ -825,6 +833,14 @@ export const createFabricExecTool = (
       // keep the same coercion here for direct internal invocations.
       const joined = Array.isArray(params.code) ? params.code.join("\n") : params.code;
       const code = state.config.executor.kernel === "python" ? joined : repairFabricGuestCode(joined);
+      const repeat = repeatGuard.observe(code);
+      if (repeat.blocked) {
+        return {
+          content: [{ type: "text", text: fabricRepeatBlockText(repeat.count) }],
+          isError: true,
+          details: undefined,
+        };
+      }
       const runDisplay = normalizeRunDisplay(params.display);
       const strings = resolveFabricExecPayloads(params);
       const tokenBudget = "tokenBudget" in params && typeof params.tokenBudget === "number"
@@ -860,9 +876,10 @@ export const createFabricExecTool = (
 
       const selectedResultFormat =
         params.resultFormat ?? state.config.executor.resultFormat;
+      const boundarySessionId = context.sessionManager.getSessionId();
       const pendingHandoff = await state.claimHandoff(
         result,
-        context.sessionManager.getSessionId(),
+        boundarySessionId,
         selectedResultFormat,
         toolCallId,
       );
@@ -872,6 +889,22 @@ export const createFabricExecTool = (
           "fabric-prewalk",
           `waiting for fabric_exec boundary → ${String(pendingHandoff.args.model ?? "executor")}`,
         );
+        // The nudge budget is spent and the arm still has no plan: the handoff
+        // proceeds rather than stalling the session, and that is worth saying.
+        if (pendingHandoff.readiness?.kind === "unplanned") {
+          context.ui.notify(
+            `Prewalk: handing off without a recorded plan after ${pendingHandoff.readiness.prompts} reminders.`,
+            "warning",
+          );
+        }
+      } else if (state.prewalk.planRequired(boundarySessionId)) {
+        // This boundary was withheld because the plan is still owed. Reflect the
+        // planning phase instead of leaving the footer reading "armed".
+        const prewalkStatus = state.prewalk.status();
+        context.ui.setStatus(
+          "fabric-prewalk",
+          prewalkStatus.state === "armed" ? `plan awaited → ${prewalkStatus.model}` : undefined,
+        );
       }
       const fullFormattedValue = formatFabricValue(result.value, selectedResultFormat);
       const failureProgress = formatFailureProgress(result.trace);
@@ -879,6 +912,7 @@ export const createFabricExecTool = (
       if (fullFormattedValue.text) fullSections.push(fullFormattedValue.text);
       if (result.error) fullSections.push(`Runtime error: ${result.error}`);
       if (failureProgress) fullSections.push(failureProgress);
+      if (repeat.warn) fullSections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const fullRawOutput = fullSections.join("\n\n");
       const outputBudget = modelOutputBudget(
         state.config.executor.maxOutputChars,
@@ -897,6 +931,7 @@ export const createFabricExecTool = (
       if (formattedValue.text) sections.push(formattedValue.text);
       if (result.error) sections.push(`Runtime error: ${result.error}`);
       if (failureProgress) sections.push(failureProgress);
+      if (repeat.warn) sections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const rawOutput = sections.join("\n\n");
       const outputFormat =
         formattedValue.language &&
@@ -949,13 +984,19 @@ export const createFabricExecTool = (
         outputBudget,
         fullRawOutput || "(no output)",
       )).text;
+      // In-place prewalk continuation arrives as an in-band context message on
+      // this boundary turn, so the loop must keep running: the executor's first
+      // request follows naturally. Terminating here would strand the
+      // continuation — no queued turn remains to carry it.
+      const inPlaceContinuation = pendingHandoff?.kind === "prewalk-in-place";
       const terminate =
-        pendingHandoff !== undefined ||
-        (result.success &&
-          typeof result.value === "object" &&
-          result.value !== null &&
-          "terminate" in result.value &&
-          result.value.terminate === true);
+        !inPlaceContinuation &&
+        (pendingHandoff !== undefined ||
+          (result.success &&
+            typeof result.value === "object" &&
+            result.value !== null &&
+            "terminate" in result.value &&
+            result.value.terminate === true));
       // A nested `pi.read` of an image returns image content blocks that
       // normalizeResult stripped (the sandbox holds text only). The provider
       // handed them out-of-band to each call audit; re-attach them here so
@@ -965,6 +1006,9 @@ export const createFabricExecTool = (
       // (its `context` hook swaps image→description on the LLM-bound
       // fabric_exec clone), so every read audit carries its image here.
       const mediaBlocks: FabricMediaBlock[] = [];
+      // Images the guest returned directly, hoisted out of the text channels by
+      // the media sanitizer; their descriptors remain in the text.
+      for (const block of result.media ?? []) mediaBlocks.push(block);
       for (const audit of result.audits) {
         if (audit.media) mediaBlocks.push(...audit.media);
       }

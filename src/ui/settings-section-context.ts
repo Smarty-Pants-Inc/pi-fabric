@@ -7,6 +7,7 @@ interface SettingsSectionOptions {
   modelSource: ModelSource;
   claudeModelSource?: ModelSource;
   activeModelKey?: string;
+  cachedMcpServers?: readonly string[];
 }
 
 // Section builders receive editor data and callbacks, never the runtime state.

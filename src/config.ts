@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { renameAtomic } from "./core/atomic-write.js";
 import { quarantineDamagedFile } from "./core/damaged-file.js";
-import { normalizeModelAliases } from "./core/model-resolution.js";
+import { normalizeModelAliases, type FabricModelAliases } from "./core/model-resolution.js";
 import { PI_CORE_TOOL_NAME_SET } from "./core/pi-tools.js";
 import { DEFAULT_SHELL_HANG_MS, SHELL_HANG_MAX_MS } from "./core/shell-jobs.js";
 import {
@@ -90,6 +90,15 @@ interface FabricMcpCacheConfig {
   revalidateBudgetMs: number;
 }
 
+export interface FabricMcpJevConfig {
+  /** Opt-in Jev ranking for tools.search({ searchMode: "semantic" }). */
+  semanticSearch: boolean;
+  /** MCP servers whose tool metadata must not be sent to Jev. Empty allows every server, including ones not yet cached. */
+  blockedServers: string[];
+  semanticCandidateLimit: number;
+  semanticMinProbability: number;
+}
+
 export interface FabricMcpConfig {
   enabled: boolean;
   configPath?: string;
@@ -97,6 +106,7 @@ export interface FabricMcpConfig {
   allowDynamicServers: boolean;
   callTimeoutMs: number;
   cache: FabricMcpCacheConfig;
+  jev: FabricMcpJevConfig;
 }
 
 interface FabricClaudeRunnerConfig {
@@ -129,6 +139,11 @@ interface FabricPrewalkConfig {
   // Compact with the configured engine just before restoring Main's boundary
   // model after an in-place continuation settles.
   compactOnReturn: boolean;
+  // Frontier-first planning: the mutation boundary that would hand off instead
+  // asks Main to record its plan, and the handoff fires at the next mutation with
+  // that plan in the transcript. Upstream prewalk nudges the plan on turn one,
+  // before any discovery; this lands on the boundary, after it.
+  requirePlan: boolean;
   // Filesystem fallback trigger: when an armed boundary ran a successful
   // pi.bash or pi.powershell without an audited mutation, claim on stat-manifest drift so
   // shell heredocs / sed -i / formatter writes also hand off.
@@ -290,8 +305,8 @@ export interface FabricSpeculationConfig {
 
 
 export interface FabricModelsConfig {
-  /** Alias name → ordered provider/model fallback chain, first available wins. */
-  aliases: Record<string, string[]>;
+  /** Alias name → ordered provider/model fallback chain plus an optional default thinking level. */
+  aliases: FabricModelAliases;
 }
 
 export interface FabricConfig {
@@ -376,12 +391,19 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
       revalidate: "changed",
       revalidateBudgetMs: 60_000,
     },
+    jev: {
+      semanticSearch: false,
+      blockedServers: [],
+      semanticCandidateLimit: 127,
+      semanticMinProbability: 0.2,
+    },
   },
   prewalk: {
     mode: "in-place",
     alwaysRearm: false,
     compactOnReturn: true,
     detectShellWrites: true,
+    requirePlan: true,
   },
   agents: {
     enabled: true,
@@ -567,8 +589,8 @@ const booleanValue = (value: unknown, fallback: boolean): boolean =>
   typeof value === "boolean" ? value : fallback;
 
 const boundedInteger = (value: unknown, fallback: number, min: number, max: number): number =>
-  typeof value === "number" && Number.isInteger(value)
-    ? Math.max(min, Math.min(max, value))
+  typeof value === "number" && Number.isFinite(value)
+    ? Math.max(min, Math.min(max, Math.floor(value)))
     : fallback;
 
 const boundedFloat = (value: unknown, fallback: number, min: number, max: number): number =>
@@ -674,6 +696,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const approvals = objectValue(input.approvals);
   const mcp = objectValue(input.mcp);
   const mcpCache = objectValue(mcp.cache);
+  const mcpJev = objectValue(mcp.jev);
   const prewalk = objectValue(input.prewalk);
   const agents = objectValue(input.agents);
   const claude = objectValue(agents.claude);
@@ -887,6 +910,34 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           600_000,
         ),
       },
+      jev: {
+        semanticSearch: booleanValue(
+          mcpJev.semanticSearch,
+          DEFAULT_FABRIC_CONFIG.mcp.jev.semanticSearch,
+        ),
+        blockedServers: Array.isArray(mcpJev.blockedServers)
+          ? [...new Set(
+              mcpJev.blockedServers.flatMap((name) => {
+                if (typeof name !== "string") return [];
+                const trimmed = name.trim();
+                return trimmed.length > 0 && trimmed.length <= 128 ? [trimmed] : [];
+              }),
+            )].slice(0, 256)
+          : [...DEFAULT_FABRIC_CONFIG.mcp.jev.blockedServers],
+        semanticCandidateLimit: boundedInteger(
+          mcpJev.semanticCandidateLimit,
+          DEFAULT_FABRIC_CONFIG.mcp.jev.semanticCandidateLimit,
+          2,
+          127,
+        ),
+        semanticMinProbability:
+          typeof mcpJev.semanticMinProbability === "number" &&
+          Number.isFinite(mcpJev.semanticMinProbability) &&
+          mcpJev.semanticMinProbability >= 0 &&
+          mcpJev.semanticMinProbability <= 1
+            ? mcpJev.semanticMinProbability
+            : DEFAULT_FABRIC_CONFIG.mcp.jev.semanticMinProbability,
+      },
     },
     prewalk: {
       ...(prewalk.enabled === false ? { enabled: false } : {}),
@@ -904,6 +955,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       detectShellWrites: booleanValue(
         prewalk.detectShellWrites,
         DEFAULT_FABRIC_CONFIG.prewalk.detectShellWrites,
+      ),
+      requirePlan: booleanValue(
+        prewalk.requirePlan,
+        DEFAULT_FABRIC_CONFIG.prewalk.requirePlan,
       ),
     },
     agents: {

@@ -1,5 +1,4 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import path from "node:path";
 import type { CapturedToolCatalog } from "./capture/catalog.js";
 import { createProviderComponent, type FabricProviderComponent, type FabricProviderComponentManifest } from "./components/provider-component.js";
 import type { FabricConfig } from "./config.js";
@@ -8,7 +7,7 @@ import { resolveAgentDir } from "./core/agent-dir.js";
 import type { MeshStore, MeshIdentity } from "./mesh/store.js";
 import type { ParticipantDirectory } from "./topology/participant-directory.js";
 import { CapturedToolsProvider } from "./providers/captured-tools-provider.js";
-import { McpDescriptorCacheStore } from "./providers/mcp-descriptor-cache.js";
+import { McpDescriptorCacheStore, mcpDescriptorCachePath } from "./providers/mcp-descriptor-cache.js";
 import { McpProvider } from "./providers/mcp-provider.js";
 import type { MemoryProviderContext } from "./providers/memory-provider.js";
 import { WorkerMemoryProvider } from "./memory/worker-provider.js";
@@ -76,14 +75,7 @@ export class RuntimeStateBuiltins {
       create: () => new McpProvider(cwd, config.mcp, {
         ...(config.mcp.cache.enabled
           ? {
-              cache: new McpDescriptorCacheStore(
-                path.join(
-                  process.env.PI_FABRIC_PROJECT_ROOT ?? cwd,
-                  ".pi",
-                  "fabric",
-                  "mcp-cache.json",
-                ),
-              ),
+              cache: new McpDescriptorCacheStore(mcpDescriptorCachePath(cwd)),
             }
           : {}),
         hooks: {
@@ -170,6 +162,7 @@ export class RuntimeStateBuiltins {
       ...(config.mesh.enabled ? ["mesh", "state"] : ["mesh", "state"].filter((name) => this.managedHost?.has(name))),
       "schema",
       "compact",
+      "prewalk",
       "agents",
       ...(!this.managedHost && config.jev.enabled && config.schema.mode !== "enforce" ? ["jev"] : []),
       ...(config.memory.enabled || this.managedHost?.has("memory") ? ["memory"] : []),

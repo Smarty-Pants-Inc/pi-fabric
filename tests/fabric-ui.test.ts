@@ -21,7 +21,7 @@ import { formatToolCallDuration } from "../src/ui/tool-call-timing.js";
 import type { ModelSource } from "../src/ui/model-picker.js";
 import type { FabricThinking } from "../src/thinking.js";
 import type { FabricDashboardSnapshot } from "../src/ui/types.js";
-import { FabricWidget, shouldShowFabricWidget } from "../src/ui/widget.js";
+import { FabricWidget, shouldShowFabricWidget, widgetRowLimit } from "../src/ui/widget.js";
 
 const actorModelSource: ModelSource = {
   models: [
@@ -381,6 +381,37 @@ describe("Fabric dynamic UI", () => {
     const ansiLines = new FabricWidget(ansiTheme, () => current, 5).render(48);
     expect(ansiLines.every((line) => visibleWidth(line) <= 48)).toBe(true);
     expect(shouldShowFabricWidget(current, "auto")).toBe(true);
+  });
+
+  it("caps the animated box to a share of the pane so it cannot overflow", () => {
+    const current = snapshot();
+    const base = current.agents[0]!;
+    current.agents = Array.from({ length: 14 }, (_, index) => ({
+      ...base,
+      id: `agent-${index + 2}`,
+      name: `worker-${index + 2}`,
+      status: index % 2 === 0 ? "running" : "queued",
+    }));
+    const natural = new FabricWidget(theme, () => current, 40).render(72);
+    expect(natural.length).toBeGreaterThan(12);
+
+    expect(widgetRowLimit(40, 60)).toBe(30);
+    expect(widgetRowLimit(6, 12)).toBe(6);
+    expect(widgetRowLimit(40, 8)).toBe(4);
+    expect(widgetRowLimit(40, 1)).toBe(1);
+    expect(widgetRowLimit(40, undefined)).toBe(40);
+    expect(widgetRowLimit(0, 60)).toBe(1);
+
+    // No pane reading keeps the configured budget; a short pane clamps it.
+    expect(new FabricWidget(theme, () => current, 40, () => undefined).render(72).length).toBe(natural.length);
+    expect(new FabricWidget(theme, () => current, 40, () => 8).render(72).length).toBeLessThanOrEqual(4);
+
+    // The accessor is read per render, so a live resize tightens the same widget.
+    let rows = 60;
+    const widget = new FabricWidget(theme, () => current, 40, () => rows);
+    expect(widget.render(72).length).toBe(Math.min(natural.length, 30));
+    rows = 10;
+    expect(widget.render(72).length).toBeLessThanOrEqual(5);
   });
 
   it("discloses the chat shortcut only while a child is active", () => {

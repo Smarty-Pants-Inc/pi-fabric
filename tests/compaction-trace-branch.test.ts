@@ -6,6 +6,7 @@ import type {
   SessionEntry,
   SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
+import type { JsonValue } from "@earendil-works/pi-ai";
 import {
   compileFabricBranchSummary,
 } from "../src/compaction/branch-summary.js";
@@ -101,7 +102,8 @@ const fabricResult = (
   toolCallId: callId,
   toolName: "fabric_exec",
   content: [{ type: "text", text }],
-  details,
+  // Trace fixtures are opaque test data; Pi types toolResult.details as JsonValue.
+  details: details as JsonValue,
   isError: false,
   timestamp: 3,
 }, parentId);

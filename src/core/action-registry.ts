@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+
+/** Effective page size for registry list(): caller default 100, hard cap 1000.
+ *  Exported so guest discovery surfaces slice identically to the registry. */
+export const fabricActionListLimit = (limit?: number): number =>
+  Math.max(1, Math.min(limit ?? 100, 1_000));
 import { repairCatalogInput, validateCatalogArgs, validationMessage } from "./action-arguments.js";
 import {
   MAX_AUDIT_VALUE_CHARS,
@@ -184,6 +189,62 @@ const actionDescriptorHash = (action: ResolvedFabricAction): string =>
 const discoveryTerms = (value: string): string[] =>
   [...value.normalize("NFKC").matchAll(/[\p{L}\p{N}_]+/gu)]
     .map((match) => match[0].toLowerCase());
+
+export const scoreActionSearch = (
+  query: string,
+  action: {
+    ref: string;
+    name: string;
+    description: string;
+    provider: string;
+    namespace?: string;
+    inputSchema: unknown;
+  },
+  providerDescription = "",
+): number => {
+  const normalizedQuery = query.normalize("NFKC").trim().toLowerCase();
+  if (!normalizedQuery) return 0;
+  const queryTerms = [...new Set(discoveryTerms(normalizedQuery))];
+  const ref = action.ref.normalize("NFKC").toLowerCase();
+  const name = action.name.normalize("NFKC").toLowerCase();
+  const description = action.description.normalize("NFKC").toLowerCase();
+  const provider = action.provider.normalize("NFKC").toLowerCase();
+  const providerBody = providerDescription.normalize("NFKC").toLowerCase();
+  const namespace = (action.namespace ?? "").normalize("NFKC").toLowerCase();
+  const schema = JSON.stringify(action.inputSchema ?? {}).normalize("NFKC").toLowerCase();
+  const tokenSets = {
+    ref: new Set(discoveryTerms(ref)),
+    name: new Set(discoveryTerms(name)),
+    description: new Set(discoveryTerms(description)),
+    provider: new Set(discoveryTerms(provider)),
+    providerBody: new Set(discoveryTerms(providerBody)),
+    namespace: new Set(discoveryTerms(namespace)),
+    schema: new Set(discoveryTerms(schema)),
+  };
+  const fields = Object.values(tokenSets);
+  let score = 0;
+  if (ref === normalizedQuery) score += 1_000;
+  if (name === normalizedQuery) score += 800;
+  if (ref.startsWith(normalizedQuery)) score += 300;
+  else if (ref.includes(normalizedQuery)) score += 120;
+  if (description.includes(normalizedQuery)) score += 40;
+  if (providerBody.includes(normalizedQuery)) score += 20;
+  if (schema.includes(normalizedQuery)) score += 10;
+  let matchedTerms = 0;
+  for (const term of queryTerms) {
+    const matched = fields.some((field) => field.has(term));
+    if (!matched) continue;
+    matchedTerms += 1;
+    if (tokenSets.ref.has(term) || tokenSets.name.has(term)) score += 30;
+    if (tokenSets.provider.has(term)) score += 20;
+    if (tokenSets.description.has(term)) score += 8;
+    if (tokenSets.providerBody.has(term)) score += 4;
+    if (tokenSets.namespace.has(term)) score += 6;
+    if (tokenSets.schema.has(term)) score += 2;
+  }
+  if (queryTerms.length > 0 && matchedTerms === queryTerms.length) score += 15;
+  return score;
+};
 
 const conflictBetween = (
   left: FabricActionEffect,
@@ -412,10 +473,10 @@ export class ActionRegistry {
   // carry-forward read the live contract. Capability-view paths stay
   // declared everywhere (see describe): committed views pin declared
   // digests, and a surface activation must never invalidate them.
-  async list(
+  async listDetailed(
     request: FabricProviderListRequest & { provider?: string; declared?: boolean },
     context: FabricInvocationContext,
-  ): Promise<ResolvedFabricAction[]> {
+  ): Promise<{ actions: ResolvedFabricAction[]; total: number; truncated: boolean }> {
     if (context.capabilityView) {
       const refs = Object.keys(context.capabilityView.bindings)
         .filter((ref) => !request.provider || ref.startsWith(`${request.provider}.`))
@@ -423,12 +484,13 @@ export class ActionRegistry {
         .sort();
       const actions = await Promise.all(refs.map((ref) => this.describe(ref, context)));
       const query = request.query?.normalize("NFKC").trim().toLowerCase();
-      return actions
+      const filtered = actions
         .filter((action) => !request.namespace || action.namespace === request.namespace)
         .filter((action) =>
           !query || `${action.ref} ${action.description}`.toLowerCase().includes(query),
-        )
-        .slice(0, Math.max(1, Math.min(request.limit ?? 100, 1_000)));
+        );
+      const page = filtered.slice(0, fabricActionListLimit(request.limit));
+      return { actions: page, total: filtered.length, truncated: filtered.length > page.length };
     }
     const providers = request.provider
       ? [this.#requireProvider(request.provider)]
@@ -458,8 +520,16 @@ export class ActionRegistry {
           });
       }),
     );
-    const limit = Math.max(1, Math.min(request.limit ?? 100, 1_000));
-    return lists.flat().slice(0, limit);
+    const all = lists.flat();
+    const page = all.slice(0, fabricActionListLimit(request.limit));
+    return { actions: page, total: all.length, truncated: all.length > page.length };
+  }
+  async list(
+    request: FabricProviderListRequest & { provider?: string; declared?: boolean },
+    context: FabricInvocationContext,
+  ): Promise<ResolvedFabricAction[]> {
+    const { actions } = await this.listDetailed(request, context);
+    return actions;
   }
 
   async catalog(
@@ -556,52 +626,16 @@ export class ActionRegistry {
   ): Promise<ResolvedFabricAction[]> {
     const normalizedQuery = query.normalize("NFKC").trim().toLowerCase();
     if (!normalizedQuery) return [];
-    const queryTerms = [...new Set(discoveryTerms(normalizedQuery))];
     const listed = await this.list({ limit: 1_000 }, context);
     return listed
-      .map((action) => {
-        const providerDescription =
-          this.#providerBindings.current(action.provider)?.provider.description ?? "";
-        const ref = action.ref.normalize("NFKC").toLowerCase();
-        const name = action.name.normalize("NFKC").toLowerCase();
-        const description = action.description.normalize("NFKC").toLowerCase();
-        const provider = action.provider.normalize("NFKC").toLowerCase();
-        const providerBody = providerDescription.normalize("NFKC").toLowerCase();
-        const namespace = (action.namespace ?? "").normalize("NFKC").toLowerCase();
-        const schema = JSON.stringify(action.inputSchema).normalize("NFKC").toLowerCase();
-        const tokenSets = {
-          ref: new Set(discoveryTerms(ref)),
-          name: new Set(discoveryTerms(name)),
-          description: new Set(discoveryTerms(description)),
-          provider: new Set(discoveryTerms(provider)),
-          providerBody: new Set(discoveryTerms(providerBody)),
-          namespace: new Set(discoveryTerms(namespace)),
-          schema: new Set(discoveryTerms(schema)),
-        };
-        const fields = Object.values(tokenSets);
-        let score = 0;
-        if (ref === normalizedQuery) score += 1_000;
-        if (name === normalizedQuery) score += 800;
-        if (ref.startsWith(normalizedQuery)) score += 300;
-        else if (ref.includes(normalizedQuery)) score += 120;
-        if (description.includes(normalizedQuery)) score += 40;
-        if (providerBody.includes(normalizedQuery)) score += 20;
-        if (schema.includes(normalizedQuery)) score += 10;
-        let matchedTerms = 0;
-        for (const term of queryTerms) {
-          const matched = fields.some((field) => field.has(term));
-          if (!matched) continue;
-          matchedTerms += 1;
-          if (tokenSets.ref.has(term) || tokenSets.name.has(term)) score += 30;
-          if (tokenSets.provider.has(term)) score += 20;
-          if (tokenSets.description.has(term)) score += 8;
-          if (tokenSets.providerBody.has(term)) score += 4;
-          if (tokenSets.namespace.has(term)) score += 6;
-          if (tokenSets.schema.has(term)) score += 2;
-        }
-        if (queryTerms.length > 0 && matchedTerms === queryTerms.length) score += 15;
-        return { action, score };
-      })
+      .map((action) => ({
+        action,
+        score: scoreActionSearch(
+          normalizedQuery,
+          action,
+          this.#providerBindings.current(action.provider)?.provider.description ?? "",
+        ),
+      }))
       .filter((entry) => entry.score > 0)
       .sort(
         (left, right) =>

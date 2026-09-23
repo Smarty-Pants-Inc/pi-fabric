@@ -56,9 +56,23 @@ const run = async (message) => {
     logs.push(line);
     logChars += line.length;
   };
+
+  // Bun module namespace for the guest. The child resolves the specifier in
+  // its own module context; under the node runtime it fails and the binding
+  // stays undefined. Namespace objects come from this realm, so instanceof
+  // against guest-realm classes fails (same caveat as other sandbox bridges).
+  const __bun = await import("bun").catch(() => undefined);
   const sandbox = {
     __fabricHostCall: hostCall,
     __fabricTokenBudget: message.tokenBudget ?? Number.POSITIVE_INFINITY,
+    // Native-module bridge for guests whose vm lacks the dynamic-import
+    // callback. Bun >= 1.4 honors importModuleDynamically on runInContext
+    // (natural import() works there), so this is mostly a fallback and an
+    // explicit escape hatch. Cross-realm caveat: namespaces come from this
+    // realm, so instanceof against guest-realm classes fails.
+    __fabricImport: (specifier) => import(specifier),
+    // Resolved above; undefined under the node runtime.
+    __bun,
     print,
     π: jsonCompatible(message.strings),
   };
@@ -71,6 +85,10 @@ const run = async (message) => {
     vm.runInContext(message.setup, context, { filename: "pi-fabric-setup.js" });
     const promise = vm.runInContext(message.code + "\n__piFabricMain()", context, {
       filename: "pi-fabric-guest.js",
+      // Node requires --experimental-vm-modules (set at spawn). Bun >= 1.4
+      // honors this option on runInContext (unlike on createContext), so
+      // natural guest import() works there; __fabricImport is a fallback.
+      importModuleDynamically: (specifier) => import(specifier),
     });
     const value = jsonCompatible(await promise);
     send({ type: "result", result: { value, logs, terminationReason: "completed" } });

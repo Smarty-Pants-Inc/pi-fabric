@@ -15,11 +15,31 @@ import type {
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
+// Extensionless launchers such as ~/.local/bin/pi start with
+// `#!/usr/bin/env node`; a Herdr child's server PATH need not contain node.
+// Only the PATH-dependent `env` form is rewritten; an absolute interpreter
+// already works. ponytail: `env -S` flags are not replayed; revisit if a
+// launcher needs them.
+const nodeShebang = (command: string): boolean => {
+  if (!path.isAbsolute(command)) return false;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(command, "r");
+    const head = Buffer.alloc(256);
+    const line = head.subarray(0, fs.readSync(fd, head, 0, head.length, 0)).toString("utf8").split(/\r?\n/, 1)[0] ?? "";
+    return /^#!\s*\S*\/env\s+(?:-S\s+)?node(?:\s|$)/.test(line);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
+
 const spawnCli = (
   command: string,
   args: readonly string[],
   options: SpawnOptions,
-): ChildProcess => NODE_SCRIPT_EXTENSIONS.has(path.extname(command).toLowerCase())
+): ChildProcess => NODE_SCRIPT_EXTENSIONS.has(path.extname(command).toLowerCase()) || nodeShebang(command)
   ? crossSpawn(process.execPath, [command, ...args], options)
   : crossSpawn(command, [...args], options);
 
@@ -29,6 +49,13 @@ type CompactControlModule = typeof import("./agents/compact-control.js");
 type WorkerOptionsModule = typeof import("./worker/options.js");
 type WorkerRunRecordModule = typeof import("./worker/run-record.js");
 type WorkerSessionExportModule = typeof import("./worker/session-export.js");
+type WorkerEventProjectionModule = typeof import("./worker/event-projection.js");
+const loadWorkerEventProjection = async (): Promise<WorkerEventProjectionModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/event-projection.js");
+  const sourceModulePath = "./worker/event-projection.ts";
+  return import(sourceModulePath) as Promise<WorkerEventProjectionModule>;
+};
+
 type WorkerModelControlModule = typeof import("./worker/model-control.js");
 
 const loadWorkerModelControl = async (): Promise<WorkerModelControlModule> => {
@@ -196,12 +223,13 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
     loadAgentResult(),
     loadWorkerModelControl(),
+    loadWorkerEventProjection(),
   ]);
   runRecordHelpers = loadedRunRecordHelpers;
   const {
@@ -347,6 +375,9 @@ const main = async (): Promise<void> => {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
           }
         : {}),
+      // Preserve the selected launcher for Fabric loaded inside this child.
+      // Herdr's server environment need not contain the owner's binary pin.
+      ...(options.runner === "pi" ? { PI_FABRIC_PI_BINARY: options.piBinary } : {}),
       PI_FABRIC_ACTIVATION_WORKER_PID: activationWindow ? String(process.pid) : "",
       PI_FABRIC_ACTIVATION_NONCE: activationNonce ?? "",
       PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",
@@ -388,6 +419,7 @@ const main = async (): Promise<void> => {
   // once the child closes instead of treating stdout as NDJSON lines.
   let vedaOutput = "";
   let vedaParsed: Record<string, unknown> | undefined;
+  const eventProjection = options.runner === "pi" ? new PiEventProjection() : undefined;
   const outputDecoder = new StringDecoder("utf8");
   const stderrDecoder = new StringDecoder("utf8");
   let terminalStatus: AgentRunStatus | undefined;
@@ -1131,16 +1163,19 @@ const main = async (): Promise<void> => {
       vedaOutput += decoded;
       return;
     }
-    outputBuffer += decoded;
+    outputBuffer += eventProjection ? eventProjection.write(decoded) : decoded;
     while (true) {
       const newline = outputBuffer.indexOf("\n");
       if (newline < 0) {
-        if (outputBuffer.length > MAX_EVENT_LINE_CHARS) {
-          failOversizedEvent(outputBuffer);
-        }
+        // Redundant Pi lifecycle history has already been elided while streaming.
+        // Keep the cap on authoritative messages and all other event fields;
+        // broad base64/text redaction must not bypass this safety boundary.
+        if (outputBuffer.length > MAX_EVENT_LINE_CHARS) failOversizedEvent(outputBuffer);
         break;
       }
       if (newline > MAX_EVENT_LINE_CHARS) {
+        // The retained record still exceeds the cap. Preserve bounded evidence;
+        // do not use broad text redaction to keep an anomalous run alive.
         failOversizedEvent(outputBuffer.slice(0, newline));
         return;
       }
@@ -1203,7 +1238,8 @@ const main = async (): Promise<void> => {
   if (options.runner === "veda") {
     vedaOutput += outputDecoder.end();
   } else {
-    outputBuffer += outputDecoder.end();
+    const tail = outputDecoder.end();
+    outputBuffer += eventProjection ? eventProjection.write(tail) + eventProjection.end() : tail;
   }
   recordStderr(stderrDecoder.end());
   if (options.runner === "veda") {

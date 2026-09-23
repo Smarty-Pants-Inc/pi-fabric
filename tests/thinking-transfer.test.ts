@@ -188,6 +188,39 @@ describe("thinking transfer translation", () => {
 });
 
 describe("thinking continuity digest", () => {
+  it("scopes the digest to the current user task without treating checkpoints as tasks", () => {
+    const entries = [
+      user("old-task", "Old task"),
+      assistant("old-thinking", [{ type: "thinking", thinking: "OLD_TASK_FINDING" }]),
+      user("current-task", "Current task"),
+      assistant("current-thinking", [{ type: "thinking", thinking: "CURRENT_TASK_PLAN" }]),
+      { type: "custom_message", id: "checkpoint", customType: "pi-fabric-prewalk-plan", content: "Record a plan", display: false, parentId: null, timestamp: "2024-01-01T00:00:00.000Z" } as SessionEntry,
+    ];
+    const digest = buildThinkingDigest(entries, kimi);
+    expect(digest?.content).toContain("[entry current-thinking] CURRENT_TASK_PLAN");
+    expect(digest?.content).not.toContain("OLD_TASK_FINDING");
+    expect(digest?.citedBlocks).toBe(1);
+  });
+
+  it("does not attribute a different model's reasoning to the boundary model", () => {
+    const foreign = assistant("foreign-thinking", [{ type: "thinking", thinking: "FOREIGN_MODEL_FINDING" }]) as SessionMessageEntry;
+    foreign.message = { ...foreign.message, provider: "other", model: "executor" } as typeof foreign.message;
+    const digest = buildThinkingDigest([
+      user("task", "Current task"),
+      foreign,
+      assistant("main-thinking", [{ type: "thinking", thinking: "MAIN_PLAN" }]),
+    ], kimi);
+    expect(digest?.content).toContain("MAIN_PLAN");
+    expect(digest?.content).not.toContain("FOREIGN_MODEL_FINDING");
+    expect(digest?.citedBlocks).toBe(1);
+  });
+
+  it("omits a digest when no task boundary can be established", () => {
+    expect(buildThinkingDigest([
+      assistant("orphan", [{ type: "thinking", thinking: "UNSCOPED_THINKING" }]),
+    ], kimi)).toBeUndefined();
+  });
+
   it("returns undefined without thinking blocks", () => {
     expect(buildThinkingDigest([user("u1", "goal")], kimi)).toBeUndefined();
   });

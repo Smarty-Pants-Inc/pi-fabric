@@ -5,6 +5,9 @@ regressions against plain Pi, built to mirror the methodology and metrics of
 github.com/Whamp/pi-fabric-deepswe-trajectories (issue: "DeepSWE Performance
 Trajectories with GPT-5.6-sol:low").
 
+In-place Prewalk canary/SWE evidence lives in [`prewalk/`](prewalk/README.md).
+It is the same kind of opt-in harness: not Vitest CI, not `src/` unit tests.
+
 ## What it measures
 
 Per (task, config, rep) cell:

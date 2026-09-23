@@ -44,6 +44,7 @@ import type {
 } from "./protocol.js";
 import type { FabricRuntimeState } from "./fabric-runtime-state.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
+import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
 import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host.js";
 
@@ -51,6 +52,7 @@ export interface FabricStateOptions {
   managedHost?: FabricManagedHostOptions;
   paths?: FabricRuntimePaths;
   runtimeLoader?: () => Promise<typeof import("./fabric-runtime-state.js")>;
+  entryIdentity?: FabricLoadedFileIdentity;
 }
 
 type ActivationHook = (context: ExtensionContext) => void | Promise<void>;
@@ -73,6 +75,7 @@ export class FabricState {
   readonly #externalComponents = new Map<string, FabricComponentDefinition>();
   readonly #options: FabricStateOptions;
   readonly #managedHost: FabricManagedHost | undefined;
+  readonly #entryIdentity: FabricLoadedFileIdentity | undefined;
   readonly activity = new FabricActivityStore();
   readonly prewalk = new PrewalkController();
   readonly prewalkDrift = new PrewalkDriftTracker();
@@ -86,6 +89,7 @@ export class FabricState {
   ) {
     this.#options = options;
     this.#managedHost = options.managedHost ? new FabricManagedHost(options.managedHost) : undefined;
+    this.#entryIdentity = options.entryIdentity;
   }
 
   get kernelReloadRequired(): boolean {
@@ -492,6 +496,7 @@ export class FabricState {
         prewalkDrift: this.prewalkDrift,
         sessionApprovals: this.sessionApprovals,
         ...(this.#options.paths ? { paths: this.#options.paths } : {}),
+        ...(this.#entryIdentity ? { entryIdentity: this.#entryIdentity } : {}),
       },
     );
   }

@@ -36,6 +36,28 @@ return { models, process: typeof process, require: typeof require };
       require: "undefined",
     });
   });
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -100])("rejects non-positive timeout %s without spawning", async (timeoutMs) => {
+    const result = await new NodeProcessRuntime().execute(
+      "return 1;",
+      async () => undefined,
+      { ...options, timeoutMs },
+    );
+
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toBe("Process timeout must be positive");
+  });
+
+
+  it("leaves __bun undefined on the node runtime", async () => {
+    const result = await new NodeProcessRuntime().execute(
+      "return typeof __bun;",
+      async () => undefined,
+      options,
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.value).toBe("undefined");
+  });
 
   it("normalizes the string shorthand for tools.search", async () => {
     const result = await new NodeProcessRuntime().execute(
@@ -257,6 +279,17 @@ return { models, process: typeof process };
     });
   });
 
+  it("exposes the Bun module namespace as __bun", async () => {
+    const result = await new BunProcessRuntime().execute(
+      'return { file: typeof __bun.file, glob: typeof __bun.Glob };',
+      async () => undefined,
+      options,
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ file: "function", glob: "function" });
+  });
+
   it("preserves named string payloads", async () => {
     const content = [
       "multiline",
@@ -322,5 +355,59 @@ return { models, process: typeof process };
 
     expect(result.terminationReason).toBe("runtime_error");
     expect(result.error).toContain("bun boom");
+  });
+});
+
+describe("process runtime dynamic imports", () => {
+  it("resolves guest import() on the node vm", async () => {
+    const result = await new NodeProcessRuntime().execute(
+      'const diff = await import("diff"); return { diffChars: typeof diff.diffChars };',
+      async () => undefined,
+      options,
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ diffChars: "function" });
+  });
+
+  it.skipIf(!hasBun)("bridges __fabricImport for bun guests", async () => {
+    const result = await new BunProcessRuntime().execute(
+      'const diff = await __fabricImport("diff"); return { diffChars: typeof diff.diffChars };',
+      async () => undefined,
+      options,
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ diffChars: "function" });
+  });
+});
+
+describe("process runtime guest timers", () => {
+  it("resolves guest setTimeout via fabric.$timer intercept (node)", async () => {
+    const result = await new NodeProcessRuntime().execute(
+      'await new Promise((r) => setTimeout(r, 50)); return "timer-ok";',
+      async (ref) => {
+        if (ref === "fabric.$timer") throw new Error("should not reach hostCall");
+        return undefined;
+      },
+      options,
+    );
+
+    expect(result.terminationReason).toBe("completed");
+    expect(result.value).toBe("timer-ok");
+  });
+
+  it.skipIf(!hasBun)("resolves guest setTimeout via fabric.$timer intercept (bun)", async () => {
+    const result = await new BunProcessRuntime().execute(
+      'await new Promise((r) => setTimeout(r, 50)); return "timer-ok";',
+      async (ref) => {
+        if (ref === "fabric.$timer") throw new Error("should not reach hostCall");
+        return undefined;
+      },
+      options,
+    );
+
+    expect(result.terminationReason).toBe("completed");
+    expect(result.value).toBe("timer-ok");
   });
 });

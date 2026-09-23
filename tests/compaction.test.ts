@@ -32,6 +32,7 @@ import type {
   SessionEntry,
   SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
+import type { JsonObject } from "@earendil-works/pi-ai";
 
 // Fixture builders. Ids are deterministic so the golden-determinism test can
 // build a fixture once and recompile it for byte-identical comparison.
@@ -56,16 +57,16 @@ const user = (text: string): SessionMessageEntry => ({
 });
 
 const textPart = (text: string): { type: "text"; text: string } => ({ type: "text", text });
-const toolCallPart = (id: string, name: string, args: Record<string, unknown>): {
+const toolCallPart = (id: string, name: string, args: JsonObject): {
   type: "toolCall";
   id: string;
   name: string;
-  arguments: Record<string, unknown>;
+  arguments: JsonObject;
 } => ({ type: "toolCall", id, name, arguments: args });
 
 const thinkingPart = (thinking: string): { type: "thinking"; thinking: string } => ({ type: "thinking", thinking });
 
-const assistant = (...parts: ({ type: "text"; text: string } | { type: "thinking"; thinking: string } | { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> })[]): SessionMessageEntry => ({
+const assistant = (...parts: ({ type: "text"; text: string } | { type: "thinking"; thinking: string } | { type: "toolCall"; id: string; name: string; arguments: JsonObject })[]): SessionMessageEntry => ({
   type: "message",
   id: nextId(),
   parentId: null,

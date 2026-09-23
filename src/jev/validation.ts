@@ -1,4 +1,5 @@
 import { Value } from "typebox/value";
+import { isJevModelId } from "./routes.js";
 import type { JevJson, JevRequest, JevResponse, JevAnswer } from "./types.js";
 
 export function jsonText(value: unknown, maxBytes: number, label: string): string {
@@ -28,7 +29,7 @@ export function checkRequest(value: unknown, maxBytes: number): asserts value is
   jsonText(value, maxBytes, "Jev request");
   if (!object(value) || !keysOnly(value, ["state", "questions", "model"]) || !description(value.state) ||
       !object(value.questions) || Object.keys(value.questions).length < 1 || Object.keys(value.questions).length > 128 ||
-      (value.model !== undefined && (typeof value.model !== "string" || !/^[a-zA-Z0-9._-]{1,128}$/.test(value.model)))) {
+      (value.model !== undefined && (typeof value.model !== "string" || !isJevModelId(value.model)))) {
     throw new Error("Invalid Jev request: provide state, 1–128 questions, and an optional model ID");
   }
   for (const [id, q] of Object.entries(value.questions)) {

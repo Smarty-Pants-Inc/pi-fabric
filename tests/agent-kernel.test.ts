@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { removeTree } from "../src/agents/rm.js";
 import type { AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG, type FabricPythonRuntime } from "../src/config.js";
@@ -40,7 +41,7 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  await Promise.all(roots.splice(0).map((root) => removeTree(root)));
 });
 
 const argv = (overrides: Record<string, string> = {}) => [

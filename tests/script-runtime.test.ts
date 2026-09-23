@@ -58,6 +58,8 @@ describe("script runtime resolution", () => {
     if (!node && !bun) return; // neither runtime discoverable in this environment
     const runtime = await resolveScriptRuntime({ execPath: "/usr/local/bin/pi", env: {} });
     expect(["node", "bun"]).toContain(path.basename(runtime).replace(/\.exe$/, ""));
+    // Absolute, so a Herdr pane with the server's PATH starts the same runtime.
+    expect(path.isAbsolute(runtime)).toBe(true);
   });
 
   // A shell-based lookup silently finds nothing on Windows runners (no `sh`),
@@ -89,5 +91,12 @@ describe("script runtime resolution", () => {
     expect(() =>
       resolveScriptRuntimeSync({ execPath: "/usr/local/bin/bun", requireNode: true }),
     ).toThrow();
+  });
+
+  it("launches TypeScript workers with bun so Node test hosts can boot src/worker.ts", async () => {
+    if (!await commandAvailable("bun")) return;
+    const args = await scriptSpawnArgs("src/worker.ts", ["--id", "x"]);
+    expect(path.basename(args[0]!).replace(/\.exe$/i, "")).toBe("bun");
+    expect(args[1]).toBe("src/worker.ts");
   });
 });

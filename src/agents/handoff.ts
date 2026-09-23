@@ -7,6 +7,7 @@ import {
   type SessionEntry,
   type SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
+import type { JsonObject } from "@earendil-works/pi-ai";
 import { compileFabricSummary, rawContextTokens } from "../compaction/hook.js";
 import {
   compactionRequestBoundsError,
@@ -97,7 +98,7 @@ const isToolCall = (value: unknown): value is {
   type: "toolCall";
   id: string;
   name: string;
-  arguments: Record<string, unknown>;
+  arguments: JsonObject;
 } =>
   isRecord(value) &&
   value.type === "toolCall" &&

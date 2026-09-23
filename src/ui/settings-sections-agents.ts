@@ -60,6 +60,16 @@ export const buildPrewalkSection = (
           },
         ),
         setting(
+          "prewalk.requirePlan",
+          "Plan checkpoint first",
+          config.prewalk.requirePlan ? "true" : "false",
+          {
+            description:
+              "Frontier-first planning: on the mutation boundary that would hand off, ask Main to write the plan (outcome, remaining steps, exact files, verification) and keep working on the frontier model. The handoff then fires at the next successful mutation, and Fabric delivers the recorded plan directly in the executor continuation or task. After two reminders without a plan it hands off unplanned with a warning. Disable to hand off on the first mutation, as before.",
+            values: BOOLEANS,
+          },
+        ),
+        setting(
           "prewalk.detectShellWrites",
           "Detect shell writes",
           config.prewalk.detectShellWrites ? "true" : "false",
@@ -317,7 +327,7 @@ export const buildAgentsSection = (
           values: BOOLEANS,
         }),
         setting("agents.notifyOnComplete", "Notify on complete", config.agents.notifyOnComplete ? "true" : "false", {
-          description: "Post a message when a background agent completes.",
+          description: "Show background completion notices and deliver unread results to Main at a safe boundary. Results already received through wait or terminal status do not wake Main again.",
           values: BOOLEANS,
         }),
       ],

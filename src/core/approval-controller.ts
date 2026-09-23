@@ -28,6 +28,7 @@ import type { ResolvedFabricAction } from "./action-registry.js";
 import {
   FabricAutoApprovalClassifier,
   type FabricAutoApprovalDecision,
+  type FabricAutoApprovalVerdicts,
 } from "./auto-approval-classifier.js";
 
 const inheritedRisks = (): FabricRisk[] => {
@@ -70,6 +71,10 @@ export interface FabricAutoApprovalAudit {
   model?: string;
   error?: string;
   at: number;
+  /** Jev path only: per-question probabilities behind the decision. */
+  verdicts?: FabricAutoApprovalVerdicts;
+  /** Jev path only: effective auto-approval threshold. */
+  threshold?: number;
 }
 
 export class ApprovalController {
@@ -143,6 +148,8 @@ export class ApprovalController {
         reason: decision.reason,
         model: decision.model,
         at: Date.now(),
+        ...(decision.verdicts ? { verdicts: decision.verdicts } : {}),
+        ...(decision.threshold !== undefined ? { threshold: decision.threshold } : {}),
       }, decision);
       if (decision.decision === "allow") return;
       await this.#requestApproval(

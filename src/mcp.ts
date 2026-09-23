@@ -15,5 +15,11 @@ export function createMcpProvider(options: {
     allowDynamicServers: false,
     callTimeoutMs: options.callTimeoutMs ?? 120_000,
     cache: { enabled: false, revalidate: "off", revalidateBudgetMs: 0 },
+    jev: {
+      semanticSearch: false,
+      blockedServers: [],
+      semanticCandidateLimit: 127,
+      semanticMinProbability: 0.2,
+    },
   }, { source: options.source });
 }

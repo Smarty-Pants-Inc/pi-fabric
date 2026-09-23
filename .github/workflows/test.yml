@@ -6,15 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   check:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      # Diagnostic successor only: no MSYS process is started before a real test shell.
-      PI_TEST_TEMP_CAPTURE: ${{ matrix.os == 'windows-latest' && '1' || '0' }}
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
@@ -23,7 +24,7 @@ jobs:
           # base, so that base commit has to be present in history.
           fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
-      - name: Install ripgrep
+      - name: Install runtime prerequisites
         # pi's grep tool downloads rg on first use when it is absent; on shared
         # runners that ad-hoc GitHub Releases download is rate-limited, so
         # provision rg on PATH up front to keep nested-grep tests hermetic.
@@ -32,23 +33,52 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             choco install ripgrep -y --no-progress
           else
-            sudo apt-get install -y ripgrep
+            sudo apt-get update
+            sudo apt-get install -y ripgrep bubblewrap python3
           fi
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Type check
         run: bun run typecheck
-      # Compiled-worker integration tests import dist/ during collection.
-      # Build this checkout before tests; never rely on retained artifacts.
+      # Some integration tests execute the published worker entrypoints in dist.
       - name: Build
         run: bun run build
-      - name: Lazy startup graph
-        run: bun run assert:lazy-graph
-      - name: Test suites
+      - name: Test Windows type-checker regression
+        if: runner.os == 'Windows'
+        run: bunx vitest run tests/type-checker.test.ts
+      - name: Launcher and Pi host regressions
+        run: bunx vitest run tests/worker-e2e.test.ts tests/pi-binary.test.ts tests/script-runtime.test.ts tests/herdr-transport.test.ts tests/prewalk-handoff.test.ts tests/shell-middleware.test.ts
+      - name: Affected tests
         env:
           # Pull requests compare against the target branch; pushes compare
           # against the tip they replaced. An unusable base selects nothing.
           PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        # Same Windows regression, affected selection and mandatory smoke floor,
-        # in order, with one temp owner through every runner (including no-change PRs).
-        run: node scripts/test-ci.mjs
+        run: bun run test:affected
+      - name: Platform smoke floor
+        # Curated cross-platform surface (path and executable resolution, native
+        # binaries, spawn, process and watcher fallbacks) so a Linux or Windows
+        # break surfaces even when the affected selection is empty.
+        run: bun run test:smoke
+      - name: Package tested Linux runtime
+        if: runner.os == 'Linux' && github.event_name == 'push'
+        shell: bash
+        run: |
+          stage="$RUNNER_TEMP/fabric-runtime"
+          output="$RUNNER_TEMP/fabric-artifact"
+          mkdir -p "$stage" "$output"
+          git archive HEAD | tar -x -C "$stage"
+          cp -a dist node_modules "$stage/"
+          git rev-parse HEAD > "$output/COMMIT"
+          git rev-parse HEAD^{tree} > "$output/TREE"
+          node --version > "$output/NODE-VERSION"
+          bun --version > "$output/BUN-VERSION"
+          tar -czf "$output/fabric-runtime.tar.gz" -C "$stage" .
+          (cd "$output" && sha256sum fabric-runtime.tar.gz > SHA256SUMS)
+      - name: Upload tested Linux runtime
+        if: runner.os == 'Linux' && github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fabric-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/fabric-artifact/
+          if-no-files-found: error
+          retention-days: 7

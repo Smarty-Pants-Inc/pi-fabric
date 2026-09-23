@@ -23,7 +23,7 @@ Request fields include task, name, runner, kernel, transport, model, persona, th
 - `worktree=True` creates a retained dedicated Git worktree in the selected repository. Verify canonical repository identity, never infer it from directory naming. Abort with zero changes on mismatch. Partition concurrent edit ownership; never edit shared files concurrently. Inspect and stop active work before cleanup; leave unrelated worktrees alone.
 - `schema` requests validated structured output. `thinking` is configured/clamped reasoning effort.
 
-`agents.spawn` returns a handle; `wait`, `status`, `stop`, and `cleanup` take its id. Detached runs notify Main on terminal completion by default; `wait` makes the run foreground and suppresses that notification. `residency="durable"` is a spawn-only opt-in to outlive Main, requiring trusted mesh and no Schema enforce.
+`agents.spawn` returns a handle; `wait`, `status`, `stop`, and `cleanup` take its id. Unread detached results are batched after the current tool turn, or wake idle Main once; concise UI notices appear immediately. `wait`/`join` and terminal `status` acknowledge results and retract pending notifications, even after completion. Running status and UI/list polling do not acknowledge them. Return the relevant outcome to Main from your program; prefer `wait` over status polling. Escape/error parks results until new input. `residency="durable"` is a spawn-only opt-in to outlive Main, requiring trusted mesh and no Schema enforce; unread deliveries and acknowledgments survive reconnects.
 
 ```python
 handle = await agents.spawn(task="Map the persistence layer.", tools=["read", "grep", "find", "ls"])

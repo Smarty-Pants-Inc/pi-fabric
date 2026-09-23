@@ -34,6 +34,12 @@ const config = (configPath: string): FabricMcpConfig => ({
   allowDynamicServers: true,
   callTimeoutMs: 1_000,
   cache: { enabled: true, revalidate: "off", revalidateBudgetMs: 1_000 },
+  jev: {
+    semanticSearch: false,
+    blockedServers: [],
+    semanticCandidateLimit: 127,
+    semanticMinProbability: 0.2,
+  },
 });
 
 beforeEach(() => {

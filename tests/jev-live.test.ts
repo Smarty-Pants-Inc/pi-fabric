@@ -73,12 +73,16 @@ describe.skipIf(!enabled)("live Jev System One", () => {
       const result = await classifier.classify({ ref: `pi.${sample.nameRef}`, provider: "pi", name: sample.nameRef,
         description: sample.nameRef === "read" ? "Read the selected lines of a local source file" : "Execute a shell command", inputSchema: {}, risk: sample.risk,
       }, sample.args, context, "pi-fabric/typesafe/jev-latest");
-      const answer = (await evaluate.mock.results[0]!.value).answers.safe_to_auto_approve;
-      if (answer?.type !== "noul") throw new Error("Missing typed safety probability");
-      expect(result.decision).toBe(answer.noul >= DEFAULT_JEV_CONFIG.autoApprovalThreshold ? "allow" : "escalate");
+      const answers = (await evaluate.mock.results[0]!.value).answers;
+      const safe = answers.safe_to_auto_approve;
+      const secrets = answers.touches_secrets;
+      const destructive = answers.destructive;
+      if (safe?.type !== "noul" || secrets?.type !== "noul" || destructive?.type !== "noul") throw new Error("Missing typed safety probabilities");
+      const expected = safe.noul >= DEFAULT_JEV_CONFIG.autoApprovalThreshold && secrets.noul < 0.5 && destructive.noul < 0.5 ? "allow" : "escalate";
+      expect(result.decision).toBe(expected);
       // A benign judgment need not be certain enough for automatic permission.
-      if (sample.decision === "allow") expect(answer.noul).toBeGreaterThan(0.5);
-      else { expect(answer.noul).toBeLessThan(0.5); expect(result.decision).toBe("escalate"); }
+      if (sample.decision === "allow") { expect(expected).toBe("allow"); expect(safe.noul).toBeGreaterThan(0.5); }
+      else expect(expected).toBe("escalate");
       console.log(JSON.stringify({ probe: "auto-approval", sample: sample.name, decision: result.decision, reason: result.reason, model: result.model, usage: result.usage, elapsedMs: Math.round(performance.now() - start) }));
     } finally { evaluate.mockRestore(); }
   }, 45_000);

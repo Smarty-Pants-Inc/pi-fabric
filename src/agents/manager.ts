@@ -192,6 +192,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   latestRecord?: AgentRunRecord;
   latestUiRecord?: AgentRunRecord;
   background: boolean;
+  completionNotified?: boolean;
   lastLivenessCheckAt: number;
   /** Sum of tokens.usage deltas drained from the worker so far. Settle closes
    *  the gap against the status file's cumulative snapshot so the ledger total
@@ -439,6 +440,7 @@ export class AgentManager {
   readonly #identityId: string | undefined;
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
+  readonly #onResultConsumed: ((id: string) => void) | undefined;
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #preparePiModel:
     | ((model: string | undefined) => Promise<string | void>)
@@ -485,6 +487,7 @@ export class AgentManager {
       identityId?: string;
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
+      onResultConsumed?: (id: string) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       preparePiModel?: (model: string | undefined) => Promise<string | void>;
       resolveParticipantGuidance?: AgentParticipantGuidanceResolver;
@@ -506,6 +509,7 @@ export class AgentManager {
     this.#vedaBinary =
       options.vedaBinary ?? process.env.PI_FABRIC_VEDA_BINARY ?? config.veda.binary;
     this.#onBackgroundComplete = options.onBackgroundComplete;
+    this.#onResultConsumed = options.onResultConsumed;
     this.#onLifecycle = options.onLifecycle;
     this.#preparePiModel = options.preparePiModel;
     this.#resolveParticipantGuidance = options.resolveParticipantGuidance;
@@ -975,17 +979,21 @@ export class AgentManager {
     managed.background = false;
     if (!managed.settled) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
-      return managed.result;
+      const result = await managed.result;
+      this.#onResultConsumed?.(id);
+      return result;
     }
     const record = readRecord(managed.statusFile) ?? managed.latestRecord;
     if (!record || !terminalStatuses.has(record.status)) {
       throw new Error(`Agent ${id} settled without a result`);
     }
+    this.#onResultConsumed?.(id);
     return this.#withTransportMetadata(record, managed) as AgentRunResult;
   }
 
   markForeground(id: string): void {
     this.#requireRun(id).background = false;
+    this.#onResultConsumed?.(id);
   }
 
   detachSignal(id: string): void {
@@ -1018,6 +1026,13 @@ export class AgentManager {
     managed.abortHandler = undefined;
     if (managed.background) return;
     managed.background = true;
+    // A fast worker may settle before agents.spawn returns and detaches it.
+    if (managed.settled) {
+      const record = readRecord(managed.statusFile) ?? managed.latestRecord;
+      if (record && terminalStatuses.has(record.status)) {
+        this.#notifyBackgroundComplete(managed, this.#withTransportMetadata(record, managed) as AgentRunResult);
+      }
+    }
     if (attached) {
       this.#emitLifecycle(managed, "run.detached", Date.now(), { data: { reason } });
     }
@@ -1140,6 +1155,7 @@ export class AgentManager {
   async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
+    this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
       await removeTree(managed.runDirectory);
@@ -1608,12 +1624,18 @@ export class AgentManager {
     this.#invalidateUiList();
     finishAgentSettlement(managed, result);
     managed.task = "";
+    this.#notifyBackgroundComplete(managed, result);
+  }
+
+  #notifyBackgroundComplete(managed: ManagedAgent, result: AgentRunResult): void {
     if (
       managed.background &&
+      !managed.completionNotified &&
       !this.#closing &&
       this.config.notifyOnComplete &&
       this.#onBackgroundComplete
     ) {
+      managed.completionNotified = true;
       try {
         this.#onBackgroundComplete(result);
       } catch { /* completion callback must not break the manager */ }

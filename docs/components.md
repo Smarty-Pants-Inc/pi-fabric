@@ -140,6 +140,10 @@ Declare instances at the root of `fabric.json`:
 
 A definition may arrive after the configuration that references it. The unresolved instance stays `waiting` and lists `component:<name>` in `missing`. Component discovery activates the instance later. Once the runtime is active, trusted configuration edits reconcile automatically; `/fabric reload` is not required. When a later activation fails during a multi-entry reconciliation, Fabric rolls back the additions and replacements from that pass. Two live component records may never declare the same provider name. Fabric rejects the insertion or replacement before it disturbs either fiber.
 
+### External connectors
+
+Connector packages own their component definitions, provider schemas, transports, credentials, and model-facing guidance. Fabric has no connector-specific registration table or required UI action vocabulary. Install the connector's ordinary Pi extension: it registers through `FABRIC_COMPONENT_REGISTER_EVENT` and answers `FABRIC_COMPONENT_DISCOVER_EVENT`. Configure it with the same generic `components.describe` / `plan` / `apply` surface used by every other component. A configured but undiscovered definition remains `waiting`; configuration never imports arbitrary modules on its own. See [the external harness example and migration](harnesses.md).
+
 ### Live configuration control
 
 Components are generic host primitives. Connector packages own browser, desktop, application, and transport behavior; neither component management nor Jev needs a built-in tool for each integration. Register the definition through the ordinary extension protocol, then configure instances through the same live control plane.

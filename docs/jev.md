@@ -8,11 +8,17 @@ For guided authoring, invoke `/skill:fabric-jev <task>`. It is user-opt-in and a
 
 On Pi 0.85.1 or newer, `/login jev` prompts privately for a TypeSafe API key and stores an ordinary API-key credential under `jev` in Pi's `auth.json`. `/logout` removes it. Jev registers an **auth-only provider with no chat models**; it does not appear as a selectable text-generating model.
 
-Resolution order:
+Jev has three upstream routes. Bare aliases (`jev-latest`, `jev-1.13`, `jev-1.13.0`, `jev-preview`) post to TypeSafe's `/v1/systemone`. OpenRouter decisions IDs (`typesafe/jev-1.13`, `~typesafe/jev-latest`) post to OpenRouter's `/api/alpha/decisions` and reuse the **existing `openrouter` credential** — the same `auth.json` entry as your chat models, so `/login openrouter` covers both. OpenRouter serves Jev on its Decisions API, not `/chat/completions`, and has no `jev-preview` alias. Vercel AI Gateway model IDs (`typesafe-ai/jev`, or the `jev-latest` alias) post to its TypeSafe-compatible `/typesafe/v1/systemone` endpoint and reuse the **existing `vercel-ai-gateway` credential** (`/login vercel-ai-gateway`, `AI_GATEWAY_API_KEY`); the request and response shapes stay TypeSafe's own, so only the base URL and key change. No second provider is registered.
+
+TypeSafe route resolution order:
 
 1. Pi's provider authentication (`auth.json`, then `TYPESAFE_API_KEY`, including supported Pi runtime overrides).
 2. `TYPESAFE_API_KEY` directly when running without Pi's auth service.
 3. An explicitly configured host-side command, if neither is available.
+
+The Vercel AI Gateway route resolves Pi's `vercel-ai-gateway` provider authentication first (`auth.json`, then `AI_GATEWAY_API_KEY`), then `AI_GATEWAY_API_KEY`, then the same trusted `jev.credentialCommand`.
+
+The OpenRouter route resolves Pi's `openrouter` provider authentication first (`auth.json`, then `OPENROUTER_API_KEY`), then `OPENROUTER_API_KEY` or `TYPESAFE_OPENROUTER_API_KEY`, then the same trusted `jev.credentialCommand`.
 
 For Localterm, set this in your trusted `fabric.json` (never put the resolved secret into model-visible code):
 
@@ -30,9 +36,9 @@ The command uses argv, not a shell. It runs only when inference needs a key, wit
 
 ## Auto-mode tool safety
 
-Jev can also serve as the host's auto-approval classifier, independently of programs and observers. Choose **Approvals → Auto model → Jev (TypeSafe safety classifier)** in `/fabric settings`, or set `approvals.model` to `"pi-fabric/typesafe/jev-latest"` (or pin `"pi-fabric/typesafe/jev-1.13"`) and the relevant risk policies to `"auto"`. Authenticate with `/login jev`, `TYPESAFE_API_KEY`, or the trusted credential command above.
+Jev can also serve as the host's auto-approval classifier, independently of programs and observers. Choose **Approvals → Auto model** in `/fabric settings`, or set `approvals.model` to `"pi-fabric/typesafe/jev-latest"` and the relevant risk policies to `"auto"`. The picker also offers the pinned `pi-fabric/typesafe/jev-1.13`, `pi-fabric/typesafe/jev-1.13.0`, and `pi-fabric/typesafe/jev-preview` aliases (all resolve to the same build today), plus OpenRouter-served `pi-fabric/openrouter/jev-latest` and `pi-fabric/openrouter/jev-1.13`, and Vercel AI Gateway-served `pi-fabric/vercel-ai-gateway/jev-latest`. Authenticate with `/login jev` and `TYPESAFE_API_KEY` on the TypeSafe route, `/login openrouter` and `OPENROUTER_API_KEY` on the OpenRouter route, or `/login vercel-ai-gateway` and `AI_GATEWAY_API_KEY` on the Vercel AI Gateway route.
 
-The host uses a typed Noul safety judgment, not generated text or a chat-model adapter. Probabilities at or above `jev.autoApprovalThreshold` auto-allow (default **0.50**); lower scores and errors require explicit approval. When a Jev model is selected, **Approvals → Jev minimum probability** lets you enter any finite value from 0 to 1. Higher values are more conservative; 0 allows every valid judgment. This is a probabilistic advisor, not a hard security boundary or a correctness guarantee. Read [auto approval configuration](configuration.md#jev-as-the-auto-mode-classifier) for the bounded current-turn evidence, outbound data disclosure, credential behavior, timeout and usage rules. Jev remains absent from ordinary chat-model pickers.
+The host asks four typed Noul questions in one request - safety, secrets exposure, destructive effect, and whether the action targets only artifacts this session created - and never uses generated text or a chat-model adapter. Auto-allow requires the safety probability at or above `jev.autoApprovalThreshold` (default **0.50**) **and** the secrets and destructive probabilities below 0.5; lower scores, a positive secrets or destructive judgment, missing user text, and errors require explicit approval. When a Jev model is selected, **Approvals → Jev minimum probability** lets you enter any finite value from 0 to 1. Higher values are more conservative; 0 allows every judgment whose secrets and destructive verdicts are clean. This is a probabilistic advisor, not a hard security boundary or a correctness guarantee. Read [auto approval configuration](configuration.md#jev-as-the-auto-mode-classifier) for the current-turn evidence, session-action projection, outbound data disclosure, credential behavior, timeout and usage rules. Jev remains absent from ordinary chat-model pickers.
 
 ## Direct judgments
 
@@ -135,7 +141,74 @@ Foreground cancellation cancels the run. Cancelling a `wait` only cancels that w
 
 Status retains the latest 64 events (4 KiB each); use `sequence` and `nextSequence` to detect gaps. Logs are capped at 4 KiB; program input and final JSON output are each capped at 32 KiB. Terminal runs are retained in a bounded in-memory history; old IDs eventually expire. There is no unlimited hidden transcript or per-tick reasoning agent.
 
+## Realtime loops
+
+A realtime controller is one program: observe, judge, act, pace, repeat. Two decision shapes cover the published realtime examples: [Jev Ultrafast](https://github.com/browser-use/jev-ultrafast) and [jev-doom-agent](https://github.com/lukaske/jev-doom-agent).
+
+- **Operation plus speculative targets.** One request asks which operation to run and, separately, which target each operation would use. Code applies only the target head matching the chosen operation. This is the browser-agent shape: a dynamic element table, one network round trip, one executed action.
+- **Factorized control axes.** One request asks several independent questions whose answers execute together, for example movement / view / trigger / interaction. This is the shape of the browser-native Doom example.
+
+Both are ordinary `jev.evaluate` batches: keep independent questions in one request, and keep the mapping from answers to effects in code. A counterfactual head that is not executed is still a judgment; never let unused heads write state.
+
+### Observation stays structured state
+
+Read the application's own state — a page bridge through `browser.cdp` and `Runtime.evaluate`, or a small application-specific provider — and project it into a compact object with a revision. Include the facts the judgment needs and nothing else: player/entity/environment fields, the previous action, and bounded history are usually enough. Screenshots are not part of the typed request contract; keep pixels out of `state`, and never send secrets.
+
+### Code owns the motor layer
+
+Jev selects a tactic; code decides how to execute it. A timed pulse with an epoch guard is what survives a realtime loop: apply an input mask, hold it for a bounded interval, release it only while it is still the newest pulse, then re-observe.
+
+```ts
+let epoch = 0;
+async function pulse(mask: string, durationMs: number) {
+  const mine = ++epoch;
+  await tools.call({ ref: "app.control", args: { mask, epoch: mine } });
+  await program.sleep(durationMs);
+  if (mine === epoch) await tools.call({ ref: "app.release", args: { epoch: mine } });
+}
+```
+
+Revalidate the revision you decided from before applying anything. A rejected or stale action means re-observe and re-decide, not retry blindly.
+
+### Degraded mode must be labeled
+
+A realtime loop needs a deterministic fallback for every degraded decision: a failed request, an invalid response, or confidence below your threshold. Compute the fallback in code, replace the judgment, and record it, so the UI and telemetry never present it as a model decision.
+
+```ts
+let degraded = false;
+try {
+  const decision = await jev.evaluate({ state, questions });
+  if (decision.answers.action.confidence < 0.5) degraded = true;
+  else frame = decision.answers.action.choice;
+} catch { degraded = true; }
+if (degraded) { frame = deterministicFallback(state); await program.emit({ fallback: true, frame }); }
+```
+
+Confidence is neither truth nor authorization; a low-confidence answer is a reason to fall back, not a reason to act. Fabric validates the response before it returns it — an invalid choice, probability set, or confidence rejects the evaluation instead of surfacing a partial answer, so `catch` is part of the loop.
+
+### Budget arithmetic for sustained loops
+
+Default per-run limits are 60 seconds, 100 evaluations, 1,000 host calls, and 100,000 reported tokens. `program.sleep` and `program.emit` are host calls and count against `maxToolCalls`, so a paced loop spends budget even when it is not touching the world. At 10 Hz with observe, evaluate, control, release, and sleep, that is five host calls per tick: the default 1,000 host calls last about 20 seconds, and the default 100 evaluations about 10 seconds. A sustained run needs explicit limits and a raised host ceiling:
+
+```json
+{
+  "jev": { "maxDurationMs": 3600000, "maxEvaluations": 100000, "maxToolCalls": 1000000, "maxTokens": 100000000 }
+}
+```
+
+Per-program `limits` are clamped to these ceilings (24 hours, 100,000 evaluations, 1,000,000 host calls). Duration and evaluation count are the real liveness bounds; the wall-clock deadline and terminal state are always reported in the run envelope.
+
+### Telemetry and shutdown
+
+Spawn the loop with `jev.spawn` so Main stays responsive and can inspect it. The event ring holds the latest 64 events (4 KiB each) — roughly six seconds at 10 Hz — so drain it with `jev.status({ id, after })` from the supervising turn or persist it host-side; terminal runs live only in a bounded history. At most one evaluation may be in flight per program, so batch independent questions instead of hedging decisions, and run two engines as two programs (`jev.maxConcurrentRuns`).
+
+Stop a loop with `jev.stop({ id })`, provider reload/unload, or a code-owned terminal rule such as death, goal reached, or a no-match judgment. Cancellation aborts in-flight inference and host calls, but it is not rollback of effects already issued.
+
+`tests/jev-realtime-loop.test.ts` is the deterministic reference for both shapes, the pulse/epoch pattern, labeled degraded mode, a death stop, and status/stop on a paced run.
+
 ## Main-turn advisors and supervisors
+
+For a ready-to-use coding-supervision policy, invoke `/skill:fabric-foreman <goal>`. It uses these same primitives with per-turn or settlement cadence, ten batched judgments, and bounded deterministic interventions. See [the Foreman capability comparison](foreman.md).
 
 `jev.spawn({program,input,observe})` can subscribe to the owning Main session. This is an **event-driven sidecar**, not another reasoning agent or a polling loop. It works with mesh disabled. It is not a mesh participant, a cross-session subscription, or restart-durable storage; do not pass its run ID to `agents.subscribe`.
 
@@ -235,7 +308,9 @@ Every external action keeps Fabric argument validation, approvals, Schema policy
 
 ## Browser Harness JS
 
-The optional `browser-harness` component imports your trusted Browser Harness SDK and maintains one connection. It is separate from Jev and usable through ordinary Fabric calls. Nothing scans or connects to your browser merely because Jev is enabled.
+For the default guarded workflow, see [external connector components](harnesses.md). First load the harness-owned Pi extension; Fabric does not auto-register connector definitions. Then configure `interactionModulePath` and `allowedOrigins` to expose `browser.observe`, `browser.act`, and `browser.waitForChange`; the optional `macos-harness` component exposes the same concepts over native AX. These connectors do not depend on Jev. Prefer observed candidates over arbitrary evaluators for unknown UI decisions; retain exact deterministic routes and explicitly granted raw APIs for supported tasks and escape hatches. `act` validates inside the host operation, and an `executed` receipt is not verification of the goal.
+
+The following raw-CDP path remains available through the independently installed Browser Harness component. That connector imports your trusted Browser Harness SDK and maintains one connection. It is separate from Jev and usable through ordinary Fabric calls. Nothing scans or connects to your browser merely because Jev is enabled.
 
 ```json
 {
@@ -284,6 +359,6 @@ PI_FABRIC_JEV_LIVE=1 PI_FABRIC_JEV_LOCALTERM=1 bunx vitest run tests/jev-live.te
 
 After `bun run build`, `bun run test:jev:dist` checks the compiled public entry point, auth-only registration, foreground CDP composition with a simulated session, and background stop/wait, agent/Jev join aliases, and event-driven Main advice.
 
-No real browser state or secrets are printed by these probes. Live tests exercise all three primitives, foreground/background inference loops, and a feedback controller using changing synthetic screen observations and source control IDs. Unit tests exercise the Browser Harness adapter with an injected session; they do not attach to a personal browser.
+No real browser state or secrets are printed by these probes. Live tests exercise all three primitives, foreground/background inference loops, and a feedback controller using changing synthetic screen observations and source control IDs. `tests/jev-realtime-loop.test.ts` replays both realtime shapes offline: batched target heads with one request per tick, factorized control axes with pulse/epoch motor control, labeled degraded decisions, a death stop, and status/stop on a paced loop. Unit tests exercise the Browser Harness adapter with an injected session; they do not attach to a personal browser.
 
-Public host APIs and types are exported from `pi-fabric/jev`. Fabric lifecycle and trust semantics are detailed in [components.md](components.md). Current TypeSafe contracts: [API](https://docs.typesafe.ai/api), [Choice](https://docs.typesafe.ai/primitives/choice), [Noul](https://docs.typesafe.ai/primitives/noul), [Score](https://docs.typesafe.ai/primitives/score), and [confidence](https://docs.typesafe.ai/confidence).
+Jev host APIs and types are exported from `pi-fabric/jev`. Connector implementations live in their own packages and register through `pi-fabric/protocol`. Browser adapter exports have been removed from `pi-fabric/jev`; load the Browser Harness-owned extension instead. Fabric lifecycle and trust semantics are detailed in [components.md](components.md). Current TypeSafe contracts: [API](https://docs.typesafe.ai/api), [Choice](https://docs.typesafe.ai/primitives/choice), [Noul](https://docs.typesafe.ai/primitives/noul), [Score](https://docs.typesafe.ai/primitives/score), and [confidence](https://docs.typesafe.ai/confidence).

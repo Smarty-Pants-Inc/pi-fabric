@@ -27,9 +27,12 @@ import {
 } from "./config.js";
 import {
   ActionRegistry,
+  fabricActionListLimit,
   type FabricCallAudit,
   type FabricRegistryActivityEvent,
 } from "./core/action-registry.js";
+import { semanticSearchActions } from "./core/semantic-search.js";
+import { resolveJevModelRoute } from "./jev/routes.js";
 import {
   ApprovalController,
   FabricSessionApprovals,
@@ -40,7 +43,11 @@ import {
   codeUsesOrchestration,
   isBlockingOrchestrationRef,
 } from "./runtime/orchestration.js";
-import type { FabricCommittedCapabilityView } from "./protocol.js";
+import type { FabricCommittedCapabilityView, FabricMediaBlock } from "./protocol.js";
+import {
+  sanitizeFabricMediaText,
+  sanitizeFabricMediaValue,
+} from "./core/media-sanitize.js";
 import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import type {
   FabricKernel,
@@ -92,6 +99,8 @@ export interface FabricExecutionResult {
   kernel?: FabricKernel;
   value: unknown;
   logs: string[];
+  /** Images hoisted out of `value` by the media sanitizer, indexed by descriptor. */
+  media?: FabricMediaBlock[];
   audits: FabricCallAudit[];
   phases: string[];
   trace: FabricExecutionTraceV1;
@@ -587,15 +596,40 @@ export class FabricExecutionService {
                       ? "resolve"
                       : "invoke",
                   );
-                  const actions = await this.registry.list(
-                    {
-                      ...(typeof args.provider === "string" ? { provider: args.provider } : {}),
-                      ...(typeof args.namespace === "string" ? { namespace: args.namespace } : {}),
-                      ...(typeof args.query === "string" ? { query: args.query } : {}),
-                      ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
-                    },
-                    callContext,
-                  );
+                  const request = {
+                    ...(typeof args.provider === "string" ? { provider: args.provider } : {}),
+                    ...(typeof args.namespace === "string" ? { namespace: args.namespace } : {}),
+                    ...(typeof args.query === "string" ? { query: args.query } : {}),
+                    ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+                  };
+                  // Silent page caps make guests conclude actions are absent
+                  // (tools.list is the trap: servers sorted past the cap look
+                  // missing). envelope: true returns an honest page with totals;
+                  // the bare-array default stays byte-for-byte unchanged.
+                  if (args.envelope === true) {
+                    const limit = fabricActionListLimit(
+                      typeof args.limit === "number" ? args.limit : undefined,
+                    );
+                    // Enumerate past the caller's page (hard ceiling 1000, the
+                    // registry's own) so totals reflect post-permission counts.
+                    const { actions: capped } = await this.registry.listDetailed(
+                      { ...request, limit: 1_000 },
+                      callContext,
+                    );
+                    const visible = capped.filter(
+                      (action) => effectiveFullCodeMode || !fullCodeProvider(action.provider),
+                    );
+                    const page = visible.slice(0, limit);
+                    return {
+                      kind: "pi-fabric.action-list",
+                      version: 1,
+                      actions: page,
+                      total: visible.length,
+                      truncated: visible.length > page.length,
+                      limit,
+                    };
+                  }
+                  const actions = await this.registry.list(request, callContext);
                   return actions.filter(
                     (action) => effectiveFullCodeMode || !fullCodeProvider(action.provider),
                   );
@@ -607,14 +641,74 @@ export class FabricExecutionService {
                 args,
                 runtimeSignal,
                 async () => {
-                  const actions = await this.registry.search(
-                    String(args.query ?? ""),
-                    callContext,
-                    typeof args.limit === "number" ? args.limit : undefined,
-                  );
-                  return actions.filter(
-                    (action) => effectiveFullCodeMode || !fullCodeProvider(action.provider),
-                  );
+                  const query = String(args.query ?? "");
+                  const limit = typeof args.limit === "number" ? args.limit : undefined;
+                  const searchMode = args.searchMode;
+                  if (
+                    searchMode !== undefined &&
+                    searchMode !== "lexical" &&
+                    searchMode !== "semantic"
+                  ) {
+                    throw new Error("invalid_search_mode");
+                  }
+                  const visible = (actions: Awaited<ReturnType<ActionRegistry["search"]>>) =>
+                    actions.filter(
+                      (action) => effectiveFullCodeMode || !fullCodeProvider(action.provider),
+                    );
+                  if (searchMode === "semantic") {
+                    if (!this.config.mcp.jev.semanticSearch) {
+                      throw new Error(
+                        "Jev semantic search is disabled. Enable it in /fabric settings → MCP.",
+                      );
+                    }
+                    const listed = visible(await this.registry.list({ limit: 1_000 }, callContext));
+                    const result = await semanticSearchActions({
+                      query,
+                      actions: listed,
+                      blockedServers: this.config.mcp.jev.blockedServers,
+                      candidateLimit: this.config.mcp.jev.semanticCandidateLimit,
+                      minProbability: this.config.mcp.jev.semanticMinProbability,
+                      signal: runtimeSignal ?? new AbortController().signal,
+                      evaluate: async (request, signal) => {
+                        const { JevClient, JevCredentials } = await import("./jev/client.js");
+                        const route = resolveJevModelRoute(this.config.jev.model).route;
+                        const extensionContext = callContext.extensionContext;
+                        const client = new JevClient(
+                          this.config.jev,
+                          fetch,
+                          new JevCredentials(
+                            this.config.jev.credentialCommand,
+                            process.env,
+                            {
+                              configured: () =>
+                                extensionContext.modelRegistry.getProviderAuthStatus?.(route.providerId)
+                                  ?.configured ?? false,
+                              resolve: async (abort) => {
+                                abort.throwIfAborted();
+                                return extensionContext.modelRegistry.getApiKeyForProvider?.(
+                                  route.providerId,
+                                );
+                              },
+                            },
+                            route.envKeys,
+                          ),
+                          route,
+                        );
+                        return client.evaluate(request, signal);
+                      },
+                    });
+                    if (!result.ok) throw new Error(result.error.message);
+                    return {
+                      kind: "pi-fabric.action-search",
+                      version: 1,
+                      actions: result.actions.slice(
+                        0,
+                        Math.max(1, Math.min(limit ?? 30, 100)),
+                      ),
+                      backend: result.backend,
+                    };
+                  }
+                  return visible(await this.registry.search(query, callContext, limit));
                 },
               );
             case "fabric.$describe":
@@ -783,18 +877,23 @@ export class FabricExecutionService {
     const runOutcome = executionOutcomeFromTermination(sandboxResult.terminationReason);
     const succeeded = runOutcome === "succeeded";
     this.activity?.finish(options.parentToolCallId, succeeded, sandboxResult.error);
+    // Logs, results, and error text reach the model, the event stream, and
+    // persisted traces. Raw media must not: images are hoisted out of band and
+    // base64 payloads collapse to a descriptor (see core/media-sanitize.ts).
+    const sanitizedValue = sanitizeFabricMediaValue(sandboxResult.value);
     return {
       success: succeeded,
       kernel: python ? "python" : "typescript",
-      value: sandboxResult.value,
-      logs: sandboxResult.logs,
+      value: sanitizedValue.value,
+      logs: sandboxResult.logs.map(sanitizeFabricMediaText),
+      ...(sanitizedValue.images.length > 0 ? { media: sanitizedValue.images } : {}),
       audits,
       phases,
       // Guest and provider error text may embed tool output or source
       // literals, so the durable trace records only safe causes.
       trace: traceRecorder.seal(runOutcome, phases),
       elapsedMs: performance.now() - startedAt,
-      ...(sandboxResult.error ? { error: sandboxResult.error } : {}),
+      ...(sandboxResult.error ? { error: sanitizeFabricMediaText(sandboxResult.error) } : {}),
       ...(handoffRequest ? { handoffRequest } : {}),
       ...(classifierUsages.length > 0
         ? { usage: aggregateUsage(classifierUsages) }

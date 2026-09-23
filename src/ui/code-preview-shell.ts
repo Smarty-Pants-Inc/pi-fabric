@@ -8,6 +8,7 @@ import {
   type Component,
 } from "@earendil-works/pi-tui";
 import { continueArcGroup } from "./arc-group.js";
+import { animationFitsViewport, type AnimationViewportState } from "./spinner.js";
 
 type ToolCallBackgroundMode = "on" | "border" | "off";
 type AnyTool = ToolDefinition<any, any, any>;
@@ -43,6 +44,8 @@ type TimingState = Record<string, unknown> & {
   codePreviewTimingOnlyRenderToken?: number;
   codePreviewTimingCallComponent?: Component;
   codePreviewTimingResultComponent?: Component;
+  codePreviewTimingViewport?: AnimationViewportState;
+  codePreviewTimingLabel?: string;
 };
 
 type BorderState = TimingState & {
@@ -72,6 +75,7 @@ const clearTimingInterval = (state: TimingState): void => {
 
 const ensureTimingInterval = (state: TimingState, invalidate: () => void): void => {
   state.codePreviewTimingInterval ??= setInterval(() => {
+    if (!animationFitsViewport(state.codePreviewTimingViewport)) return;
     const token = (state.codePreviewTimingOnlyRenderToken ?? 0) + 1;
     state.codePreviewTimingOnlyRenderToken = token;
     try {
@@ -126,10 +130,15 @@ const updateTiming = (
   }
   if (options.formatLabel === false) return undefined;
   const running = context.isPartial;
+  if (running && !animationFitsViewport(state.codePreviewTimingViewport)) {
+    return state.codePreviewTimingLabel;
+  }
   const endedAt = running ? Date.now() : (state.codePreviewTimingEndedAt ?? Date.now());
   const durationMs = endedAt - startedAt;
   if (!Number.isFinite(durationMs) || Math.round(durationMs) <= 0) return undefined;
-  return `${running ? "Elapsed" : "Took"} ${formatDuration(durationMs)}`;
+  const label = `${running ? "Elapsed" : "Took"} ${formatDuration(durationMs)}`;
+  state.codePreviewTimingLabel = label;
+  return label;
 };
 
 class TimingPreservedComponent implements Component {
@@ -238,6 +247,7 @@ class BorderedToolCall implements Component {
       ...(this.callComponent?.render(Math.max(1, width - 4)) ?? []),
       ...(this.resultComponent?.render(Math.max(1, width - 4)) ?? []),
     ];
+    (this.state.codePreviewTimingViewport ??= {}).renderedRows = body.length + (width < 4 ? 0 : 2);
     if (width < 4) return body;
     const innerWidth = width - 4;
     const border = (value: string) => this.theme.fg(this.color, value);

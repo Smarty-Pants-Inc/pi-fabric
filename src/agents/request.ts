@@ -1,5 +1,6 @@
 import type { AgentRunRequest } from "./types.js";
 import { isFabricThinking } from "../thinking.js";
+import { aliasThinking, type FabricModelAliases } from "../core/model-resolution.js";
 
 const stringArray = (value: unknown): string[] | undefined => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
 const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
@@ -9,7 +10,7 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
 
 export const normalizeAgentRunRequest = (
   args: Record<string, unknown>,
-  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; timeoutMs: number; inheritedModel?: {provider: string; id: string}},
+  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; timeoutMs: number; inheritedModel?: {provider: string; id: string}; models?: {aliases?: FabricModelAliases}},
   options: {allowCwd?: boolean} = {},
 ): AgentRunRequest => {
   const transport =
@@ -21,7 +22,19 @@ export const normalizeAgentRunRequest = (
     args.transport === "herdr"
       ? args.transport
       : undefined;
-  const thinking = isFabricThinking(args.thinking) ? args.thinking : undefined;
+  // An explicit call or actor level always wins; otherwise an alias can carry
+  // the intended effort for the model it selects (e.g. a "cheap" alias that is
+  // both cheaper and shallower), and the global agents.thinking default applies
+  // last, inside the manager.
+  const requestedModel =
+    typeof args.model === "string"
+      ? args.model
+      : typeof defaults.model === "string"
+        ? defaults.model
+        : undefined;
+  const thinking = isFabricThinking(args.thinking)
+    ? args.thinking
+    : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
   const tools = stringArray(args.tools);
   const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
   const runner =
@@ -64,6 +77,9 @@ export const normalizeAgentRunRequest = (
       : {}),
     ...(typeof args.schema === "object" && args.schema !== null && !Array.isArray(args.schema)
       ? { schema: args.schema as Record<string, unknown> }
+      : {}),
+    ...(typeof args.systemPrompt === "string" && args.systemPrompt.trim()
+      ? { systemPrompt: args.systemPrompt }
       : {}),
   };
 };

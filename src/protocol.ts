@@ -1,4 +1,15 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BashOperations, BashToolOptions, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+/** Host-local opt-in on a bash ToolDefinition; never serialized into guest schemas. */
+export const FABRIC_BASH_MIDDLEWARE = Symbol.for("pi-fabric:bash-middleware:v1");
+
+/** The extension keeps standalone execution; Fabric owns local process/job lifetime. */
+export interface FabricBashMiddlewareV1 {
+  version: 1;
+  options?: Omit<BashToolOptions, "operations">;
+  /** Filter output before Fabric retains it in previews, results, or background logs. */
+  wrapOperations: (operations: BashOperations) => BashOperations;
+}
 
 export const FABRIC_PROVIDER_REGISTER_EVENT = "pi-fabric:provider:register:v1";
 export const FABRIC_PROVIDER_DISCOVER_EVENT = "pi-fabric:provider:discover:v1";

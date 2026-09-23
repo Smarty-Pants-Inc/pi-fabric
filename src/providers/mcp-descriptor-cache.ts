@@ -188,6 +188,18 @@ const parseCacheFile = (value: unknown): McpDescriptorCacheFile | undefined => {
 
 let tempCounter = 0;
 
+export const mcpDescriptorCachePath = (cwd: string): string =>
+  path.join(process.env.PI_FABRIC_PROJECT_ROOT ?? cwd, ".pi", "fabric", "mcp-cache.json");
+
+export const listCachedMcpServerNames = (filePath: string): string[] => {
+  try {
+    const parsed = parseCacheFile(JSON.parse(fsSync.readFileSync(filePath, "utf8")));
+    return parsed ? Object.keys(parsed.servers).sort((left, right) => left.localeCompare(right)) : [];
+  } catch {
+    return [];
+  }
+};
+
 export class McpDescriptorCacheStore {
   constructor(readonly filePath: string) {}
 

@@ -243,6 +243,127 @@ describe("durable cwd validation", () => {
 // node_modules shims hangs before the child starts, so the launcher never
 // reaches its spawn trace. Durable residency E2E stays POSIX-only until that
 // spawn path is resolved; the launcher logic tests below run everywhere.
+describe("durable completion receipts", () => {
+  const seedCompletion = async (state: RootHarness, status = "completed") => {
+    const id = "a".repeat(32);
+    const runDirectory = path.join(state.config.residencyRoot, "runs", id);
+    const agentsPath = path.join(state.config.residencyRoot, "agents");
+    fs.mkdirSync(runDirectory, { recursive: true });
+    fs.mkdirSync(agentsPath, { recursive: true });
+    const result = {
+      id, name: "durable worker", status, text: "authoritative full result", task: "work",
+      runner: "pi", transport: "process", cwd: state.root, startedAt: 1, updatedAt: 2, finishedAt: 2,
+      turns: 1, toolCalls: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    };
+    fs.writeFileSync(path.join(runDirectory, "status.json"), JSON.stringify(result));
+    const metadataPath = path.join(agentsPath, `${id}.json`);
+    fs.writeFileSync(metadataPath, JSON.stringify({
+      format: RESIDENT_HOST_FORMAT, rootId: state.identity.id, id, runDirectory, handle: result, createdAt: 1, updatedAt: 2,
+    }));
+    const key = `${residentDeliveryPrefix(state.identity.id)}receipt-test`;
+    await state.mesh.put({
+      key, identity: { id: residentHostId(state.identity.id), name: "resident", kind: "main" }, ifVersion: 0,
+      value: {
+        format: RESIDENT_HOST_FORMAT, id: "receipt-test", rootId: state.identity.id,
+        agentCompletionId: id, from: { id, name: result.name, kind: "agent" },
+        delivery: "followUp", triggerTurn: true, message: "truncated legacy summary",
+        data: { fabricTruncated: true }, createdAt: 2,
+      },
+    });
+    return { id, result, runDirectory, metadataPath, key };
+  };
+
+  it("retracts an already queued completion on late wait and persists the receipt across reconnects", async () => {
+    const state = await rootHarness("late-completion-wait");
+    const seeded = await seedCompletion(state);
+    const onBackgroundComplete = vi.fn();
+    const onResultConsumed = vi.fn();
+    const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete, onResultConsumed };
+    const client = new ResidencyClient(options);
+    const reconnect = new ResidencyClient(options);
+    try {
+      client.start();
+      await waitFor(() => onBackgroundComplete.mock.calls.length > 0);
+      expect(onBackgroundComplete.mock.calls[0]![0].text).toBe("authoritative full result");
+      expect(state.deliveries).toHaveLength(0);
+      expect(state.mesh.listAll(residentDeliveryPrefix(state.identity.id))).toHaveLength(1);
+      expect((await client.waitAgent(seeded.id)).status).toBe("completed");
+      expect(onResultConsumed).toHaveBeenCalledWith(seeded.id);
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeGreaterThan(0);
+      await client.close();
+      onBackgroundComplete.mockClear();
+      reconnect.start();
+      await waitFor(() => state.mesh.listAll(residentDeliveryPrefix(state.identity.id)).length === 0);
+      expect(onBackgroundComplete).not.toHaveBeenCalled();
+      expect(state.deliveries).toHaveLength(0);
+    } finally {
+      await client.close();
+      await reconnect.close();
+      await state.participants.close();
+    }
+  });
+
+  it("retains an unread envelope across disconnect and acknowledges only actual inbox delivery", async () => {
+    const state = await rootHarness("unread-completion-resume");
+    const seeded = await seedCompletion(state);
+    const onBackgroundComplete = vi.fn();
+    const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete };
+    const client = new ResidencyClient(options);
+    const reconnect = new ResidencyClient(options);
+    try {
+      client.start();
+      await waitFor(() => onBackgroundComplete.mock.calls.length > 0);
+      await client.close();
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeUndefined();
+      onBackgroundComplete.mockClear();
+      reconnect.start();
+      await waitFor(() => onBackgroundComplete.mock.calls.length > 0);
+      onBackgroundComplete.mock.calls[0]![1]();
+      await waitFor(() => state.mesh.listAll(residentDeliveryPrefix(state.identity.id)).length === 0);
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeGreaterThan(0);
+    } finally {
+      await client.close();
+      await reconnect.close();
+      await state.participants.close();
+    }
+  });
+
+  it("honors disabled completion notifications for envelopes from an older resident host", async () => {
+    const state = await rootHarness("disabled-completion-resume");
+    await seedCompletion(state);
+    state.config.agents.notifyOnComplete = false;
+    const onBackgroundComplete = vi.fn();
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete });
+    try {
+      client.start();
+      await waitFor(() => state.mesh.listAll(residentDeliveryPrefix(state.identity.id)).length === 0);
+      expect(onBackgroundComplete).not.toHaveBeenCalled();
+      expect(state.deliveries).toHaveLength(0);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("does not consume a result when a durable wait is aborted", async () => {
+    const state = await rootHarness("aborted-completion-wait");
+    const seeded = await seedCompletion(state, "running");
+    const onBackgroundComplete = vi.fn();
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete });
+    try {
+      await expect(client.waitAgent(seeded.id, AbortSignal.abort())).rejects.toThrow("aborted");
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeUndefined();
+      fs.writeFileSync(path.join(seeded.runDirectory, "status.json"), JSON.stringify({ ...seeded.result, status: "completed" }));
+      client.start();
+      await waitFor(() => onBackgroundComplete.mock.calls.length > 0);
+      expect(state.deliveries).toHaveLength(0);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+});
+
 describe.skipIf(!hasResidentHost || process.platform === "win32")("durable participant residency", () => {
   it("keeps a durable actor responsive after its originating Main closes", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-actor");

@@ -245,6 +245,26 @@ describe("FabricState lazy bootstrap", () => {
     vi.unstubAllEnvs();
   });
 
+  it("announces a trusted Main at startup only when mesh.announce is set", async () => {
+    const quiet = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true } });
+    const quietState = createState(runtimeHarness().loader);
+    const quietContext = contextAt(quiet);
+    await quietState.bootstrap(quietContext);
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    expect(quietState.shouldEagerlyActivate(quietContext)).toBe(false);
+
+    const shared = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true, announce: true } });
+    const sharedState = createState(runtimeHarness().loader);
+    const sharedContext = contextAt(shared);
+    await sharedState.bootstrap(sharedContext);
+    expect(sharedState.shouldEagerlyActivate(sharedContext)).toBe(true);
+    // Nested agents and actors never announce themselves as roots.
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "agent-child");
+    expect(sharedState.shouldEagerlyActivate(sharedContext)).toBe(false);
+    vi.unstubAllEnvs();
+  });
+
   it("eagerly activates configured components before the first turn", async () => {
     const cwd = project({
       components: [{ id: "model-guidance", component: "model-guidance" }],

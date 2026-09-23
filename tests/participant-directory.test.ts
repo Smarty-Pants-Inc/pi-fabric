@@ -505,4 +505,57 @@ describe("ParticipantDirectory", () => {
     again.mockRestore();
     expect(steady).toBe(1);
   });
+
+  // smarty-dev#266: a stopped mesh lock holder expired every lease; sessions() said [].
+  const stallDirectory = (name: string, source: () => FabricParticipantRecord[]) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: "main", sessionId: name };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 150 });
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 300,
+    });
+    directory.registerSource(source);
+    directories.push(directory);
+    return { directory, mesh, identity };
+  };
+
+  it("reports a write-stalled mesh without throwing from its own reads, then recovers", async () => {
+    const { directory, mesh, identity } = stallDirectory("stall", () => [rootRecord("session:stall", "session:stall", "stall")]);
+    await directory.start();
+    expect(directory.sessions().map((session) => session.id)).toEqual([identity.id]);
+    expect(directory.writeStalled()).toBeUndefined();
+
+    // A live holder that never releases: the store must not take its lock over.
+    const lockPath = path.join(mesh.root, ".lock");
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+    await expect.poll(() => directory.writeStalled()?.message ?? "", { timeout: 5_000, interval: 50 })
+      .toMatch(/^Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock/);
+    // Timers, the dashboard and ownership checks read these: they must never throw.
+    expect(() => directory.sessions()).not.toThrow();
+    expect(() => directory.peers()).not.toThrow();
+    expect(directory.get("session:departed")).toBeUndefined();
+
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    await expect.poll(() => directory.writeStalled(), { timeout: 5_000, interval: 50 }).toBeUndefined();
+    expect(directory.sessions().map((session) => session.id)).toEqual([identity.id]);
+  });
+
+  it("returns an empty directory without a stall report when the mesh is healthy", async () => {
+    const { directory } = stallDirectory("empty", () => []);
+    await directory.start();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(directory.sessions()).toEqual([]);
+    expect(directory.writeStalled()).toBeUndefined();
+  });
+
+  it("does not report a stall for a heartbeat failure that is not a lock timeout", async () => {
+    const { directory, mesh } = stallDirectory("disk", () => [rootRecord("session:disk", "session:disk", "disk")]);
+    await directory.start();
+    vi.spyOn(mesh, "writeBatch").mockRejectedValue(new Error("ENOSPC: no space left on device"));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(directory.writeStalled()).toBeUndefined();
+    expect(() => directory.sessions()).not.toThrow();
+  });
 });

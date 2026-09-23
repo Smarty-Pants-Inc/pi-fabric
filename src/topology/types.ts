@@ -97,6 +97,8 @@ export interface FabricParticipantSource {
   /** All live root Pi session agents, including the current lineage root. */
   sessions?(now?: number): FabricParticipantInfo[];
   peers(now?: number): FabricPeerInfo[];
+  /** The reason peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
+  writeStalled?(now?: number): Error | undefined;
   refresh(): Promise<void>;
   scheduleRefresh(): void;
 }

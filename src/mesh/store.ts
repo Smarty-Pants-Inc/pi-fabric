@@ -795,7 +795,9 @@ export class MeshStore {
         if (errorCode(error) !== "EEXIST") throw error;
         if (this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
-          throw new Error(`Timed out waiting for the Fabric mesh lock${describeLockHolder(ownerPath)}`);
+          throw Object.assign(new Error(`Timed out waiting for the Fabric mesh lock${describeLockHolder(ownerPath)}`), {
+            code: "FABRIC_MESH_LOCK_TIMEOUT",
+          });
         }
         await delay(10);
       }

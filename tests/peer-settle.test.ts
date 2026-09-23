@@ -175,3 +175,40 @@ describe("awaitPeerSettle", () => {
     ).resolves.toEqual({ ok: false, error: "cancelled" });
   });
 });
+
+// smarty-dev#266: during a mesh write stall every peer looks departed ("settled").
+describe("awaitPeerSettle during a mesh write stall", () => {
+  const stalled = new Error("Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock held by pid 7");
+
+  it("refuses to arm while the mesh is stalled", async () => {
+    await expect(awaitPeerSettle({ poll: () => [], stalled: () => stalled }))
+      .resolves.toEqual({ ok: false, error: stalled.message });
+  });
+
+  it("reports a stall that starts while waiting instead of settling", async () => {
+    let stall: Error | undefined;
+    const waiting = awaitPeerSettle({
+      poll: () => (stall ? [] : [peer("session:busy", { status: "running" })]),
+      stalled: () => stall,
+      pollMs: 20,
+      settledForMs: 10_000,
+    });
+    await sleep(50);
+    stall = stalled;
+    await expect(waiting).resolves.toEqual({ ok: false, error: stalled.message });
+  });
+
+  it("finishes with ok:false when a later poll throws, instead of escaping its timer", async () => {
+    let calls = 0;
+    const waiting = awaitPeerSettle({
+      poll: () => {
+        calls += 1;
+        if (calls > 2) throw new Error("directory read failed");
+        return [peer("session:busy", { status: "running" })];
+      },
+      pollMs: 20,
+      settledForMs: 10_000,
+    });
+    await expect(waiting).resolves.toEqual({ ok: false, error: "directory read failed" });
+  });
+});

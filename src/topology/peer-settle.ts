@@ -64,6 +64,8 @@ export interface AwaitPeerSettleOptions {
 	now?: () => number;
 	signal?: AbortSignal;
 	onUpdate?: (progress: PeerSettleProgress) => void;
+	/** A stalled mesh makes peers look departed; report it instead of "settled". */
+	stalled?: () => Error | undefined;
 }
 
 const matchesSelector = (peer: FabricPeerInfo, selector: string): boolean => {
@@ -96,6 +98,8 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 	const settledFor = Math.max(0, options.settledForMs ?? DEFAULT_PEER_SETTLED_FOR_MS);
 	const pollMs = Math.max(10, options.pollMs ?? PEER_SETTLE_POLL_MS);
 	const armedAt = now();
+	const stalledAtArm = options.stalled?.();
+	if (stalledAtArm) return Promise.resolve({ ok: false, error: stalledAtArm.message });
 	const initial = options.poll();
 	const targets =
 		options.selector !== undefined
@@ -132,6 +136,19 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 		};
 		const onAbort = (): void => finish({ ok: false, error: "cancelled" });
 		const tick = (): void => {
+			// A timer callback must never throw: an uncaught error exits interactive Pi.
+			try {
+				poll();
+			} catch (error) {
+				finish({ ok: false, error: error instanceof Error ? error.message : String(error) });
+			}
+		};
+		const poll = (): void => {
+			const stalled = options.stalled?.();
+			if (stalled) {
+				finish({ ok: false, error: stalled.message });
+				return;
+			}
 			const snapshot = options.poll();
 			const byId = new Map(snapshot.map((peer) => [peer.id, peer] as const));
 			const current = now();

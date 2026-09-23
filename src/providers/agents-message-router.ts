@@ -13,7 +13,7 @@ export class AgentMessageRouter {
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding">,
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh">,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled">,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding,
   ) {}
@@ -52,7 +52,7 @@ export class AgentMessageRouter {
         });
       }
       const participant = remoteRoot ?? this.participants.get(this.mainAgent.id);
-      if (!participant) throw new Error(`Unknown Fabric Main participant: ${this.mainAgent.id}`);
+      if (!participant) throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric Main participant: ${this.mainAgent.id}`);
       if (!participant.capabilities.includes(kind)) {
         throw new Error(`Fabric participant ${participant.id} does not support ${kind}`);
       }
@@ -95,7 +95,7 @@ export class AgentMessageRouter {
       target = this.resolveActorTarget(id);
     } catch (error) {
       if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) {
-        throw new Error(`Unknown Fabric participant: ${id}`);
+        throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric participant: ${id}`);
       }
       throw error;
     }

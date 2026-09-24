@@ -1375,7 +1375,7 @@ export class ActorManager {
               };
               this.#recordMessage(actor, silent);
               item.resolve?.(structuredClone(silent));
-              this.#noteFailedActivation(actor, reason, result.id);
+              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || result.status === "stopped");
               continue;
             }
             throw new Error(result.error || `Actor run ${result.status}`);
@@ -1445,7 +1445,7 @@ export class ActorManager {
           };
           this.#recordMessage(actor, failed);
           item.reject?.(new Error(message));
-          this.#noteFailedActivation(actor, message, runId);
+          this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted);
         } finally {
           await capabilityLease?.release().catch(() => undefined);
           // Retain a durable copy of the run's event log + status in the
@@ -1480,7 +1480,10 @@ export class ActorManager {
 
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean): void {
+    // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
+    // starts a turn must never cut through the stop-the-world halt.
+    if (interrupted || this.#halted || this.#closing) return;
     const streak = this.#failureStreaks.get(actor.id) ?? { count: 0, notified: false };
     streak.count += 1;
     this.#failureStreaks.set(actor.id, streak);

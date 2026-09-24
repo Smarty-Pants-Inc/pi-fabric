@@ -1353,7 +1353,6 @@ export class ActorManager {
             await this.#saveActors();
           }
           runCompleted = result.status === "completed";
-          if (runCompleted) this.#failureStreaks.delete(actor.id);
           if (result.status !== "completed") {
             if (actor.responseMode === "directive") {
               // A failed directive run is non-fatal: stay silent and keep the
@@ -1382,6 +1381,9 @@ export class ActorManager {
             throw new Error(result.error || `Actor run ${result.status}`);
           }
           const message = this.#outgoingMessage(actor, item, result);
+          // Only a completed run whose output is a valid message ends a failure streak: a
+          // run that keeps returning an invalid directive is failing too.
+          this.#failureStreaks.delete(actor.id);
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
             throw new Error(`Fabric actor ownership moved before delivery: ${actor.id}`);

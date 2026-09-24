@@ -8,7 +8,6 @@ const primaryEntryPoints = [
   "src/agents.ts",
   "src/jev.ts",
   "src/protocol.ts",
-  "src/worker.ts",
   "src/residency/host.ts",
   "src/residency/launcher.ts",
   "src/residency/pi-entry.ts",
@@ -20,7 +19,6 @@ const primaryEntryPoints = [
   "src/memory/search.ts",
   "src/memory/discovery.ts",
   "src/memory/normalize.ts",
-  "src/memory/file-worker.ts",
   "src/memory/worker-provider.ts",
   "src/providers/memory-provider.ts",
 ];
@@ -82,9 +80,43 @@ const result = await build({
   logLevel: "info",
 });
 
-const bundledPackages = Object.keys(result.metafile.inputs).filter((input) =>
-  input.includes("node_modules/"),
-);
+// Pi supplies these packages to extensions through its module aliases, so
+// they are peers and must never be bundled into code that Pi loads.
+const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozechner)\/pi-[a-z-]+)(?:\/|$)/;
+
+// Fabric starts these as their own Node process or worker thread. Pi's aliases
+// do not reach them, and Pi installs packages without peers, so each one is a
+// self-contained file that carries its own copy of the host packages it uses.
+// ponytail: typebox (agent-result schema checks) is their only host import
+// today; scripts/smoke-package-install.mjs fails if one gains another.
+const standalone = await build({
+  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts"],
+  outdir: "dist",
+  outbase: "src",
+  entryNames: "[dir]/[name]",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  metafile: true,
+  logLevel: "info",
+  plugins: [{
+    name: "external-except-host-provided",
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /^[^./]/ }, (args) =>
+        args.kind === "entry-point" || hostProvided.test(args.path)
+          ? undefined
+          : { path: args.path, external: true });
+    },
+  }],
+});
+
+const bundledPackages = [
+  ...Object.keys(result.metafile.inputs).filter((input) => input.includes("node_modules/")),
+  ...Object.keys(standalone.metafile.inputs).filter((input) =>
+    input.includes("node_modules/") && !input.includes("node_modules/typebox/")),
+];
 if (bundledPackages.length > 0) {
   throw new Error(`Package code was bundled unexpectedly:\n${bundledPackages.join("\n")}`);
 }

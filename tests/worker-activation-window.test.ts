@@ -5,7 +5,8 @@ import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
+import { SessionManager, buildSessionContext, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ActivationWindow } from "../src/worker/activation-window.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -47,6 +48,47 @@ describe("activation projection", () => {
     expect(extended.slice(0, old.length)).toEqual(old);
     expect(() => window.project([...old, current, result])).toThrow(/lost current/);
     expect(() => window.project([current])).toThrow(/boundary/);
+  });
+
+  // smarty-dev#390: Pi journals system-prompt changes as role "system" entries that the
+  // model context omits; a snapshot that kept them failed every activation after the first.
+  it("ignores the system-prompt entries Pi journals but leaves out of the model context", () => {
+    const system = (text: string) => ({ role: "system", content: "", sections: { preamble: text }, timestamp: 1 });
+    const session = SessionManager.inMemory("/repo");
+    session.appendMessage(system("first prompt") as never);
+    session.appendMessage(user("old activation"));
+    session.appendMessage(assistant("old reply"));
+    session.appendMessage(system("changed prompt") as never);
+    const journal = buildSessionContext(session.getBranch()).messages;
+    expect(journal.map(message => message.role)).toContain("system");
+    const window = new ActivationWindow(journal);
+    const current = user("current envelope");
+    const context = [...journal.filter(message => message.role !== "system"), current];
+    expect(window.project(context)).toEqual([current]);
+    expect(() => window.project([user("rewritten history"), assistant("old reply"), current])).toThrow(/boundary/);
+  });
+
+  // Astra P1 on pi-fabric#33: the conversation check cannot see system records, because
+  // Pi strips them before the context hook and restores their replayed head after it.
+  it("fails closed when an earlier system record is rewritten, and allows only appended ones", () => {
+    // Each record patches its own section, as Pi's section diffs do, so a rewrite shows in the head.
+    const system = (text: string, section = "preamble") => ({ role: "system", content: "", sections: { [section]: text }, timestamp: 1 }) as never;
+    const journal = [system("first prompt"), user("old activation"), assistant("old reply"), system("changed rules", "rules")];
+    const head = (records: unknown[]) => getCurrentSystemMessage(records as never) as never;
+    const window = new ActivationWindow(journal);
+    const current = user("current envelope");
+    const appended = system("this activation's tools", "tools");
+    const now = [...journal, appended, current];
+    const running = [head([journal[0], journal[3], appended]), current];
+    expect(() => window.verifySystem(now, running)).not.toThrow();
+    // A rewritten old record in what reaches the model.
+    const rewritten = [head([system("REWRITTEN"), journal[3], appended]), current];
+    expect(() => window.verifySystem(now, rewritten)).toThrow(/system prompt/);
+    // A rewritten old record in the journal.
+    const forged = [system("REWRITTEN"), ...now.slice(1)];
+    expect(() => new ActivationWindow(journal).verifySystem(forged, [head([forged[0], journal[3], appended]), current])).toThrow(/system records/);
+    // Records appended in this activation may not disappear on a later model call.
+    expect(() => window.verifySystem(journal, [head([journal[0], journal[3]]), current])).toThrow(/system records/);
   });
 
   it("projects a large prior activation without a token ceiling on the current activation", () => {

@@ -157,6 +157,26 @@ describe("MeshStore", () => {
     }
   });
 
+  it("keeps at most 1,000 tombstones by default, and an evicted key still conflicts on a stale version", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-tombstones-"));
+    const store = new MeshStore(root, 64 * 1024, 100);
+    try {
+      const first = await store.put({ key: "gone/0", value: 0, identity });
+      await store.delete({ key: "gone/0" });
+      for (let index = 1; index <= 1_050; index++) {
+        await store.writeBatch({ identity, ops: [{ kind: "put", key: `gone/${index}`, value: index }, { kind: "delete", key: `gone/${index}` }] });
+      }
+      const state = JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"));
+      expect(state.tombstoneOrder).toHaveLength(1_000);
+      expect(Object.keys(state.versions)).toHaveLength(1_000);
+      expect(state.versions["gone/0"]).toBeUndefined();                  // evicted
+      await expect(store.put({ key: "gone/0", value: 1, identity, ifVersion: first.version })).rejects.toThrow("compare-and-swap failed");
+      const again = await store.put({ key: "gone/0", value: 2, identity, ifVersion: 0 });
+      expect(again.version).toBeGreaterThan(first.version + 1);          // above every earlier revision
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   it("keeps unreadable state as a write barrier while serving an empty table", async () => {
     const store = createStore();

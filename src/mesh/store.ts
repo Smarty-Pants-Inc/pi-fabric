@@ -70,7 +70,13 @@ const STALE_LOCK_MS = 30_000;
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
-const DEFAULT_MAX_STATE_TOMBSTONES = 10_000;
+// ponytail: every tombstone is rewritten with the whole shared state on every write, and read
+// by every process (smarty-dev#251, dev1 load P0: 4,787 tombstones were 40% of a 2.3 MB file).
+// The persistent revision clock makes eviction safe: an evicted key is recreated above every
+// earlier revision, and a stale compare-and-swap still conflicts. A key re-claimed with
+// ifVersion 0 after eviction needs its id replayed; live claimers use fresh ids, and control
+// commands are rejected once past their deadline.
+const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
 /**
  * Read-cache age for the stores a Fabric runtime and its resident host use: at most one parse
  * of the shared state per process per this interval (smarty-dev#251, dev1 load P0: ~50

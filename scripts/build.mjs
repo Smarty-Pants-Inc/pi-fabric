@@ -5,6 +5,7 @@ import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
 const primaryEntryPoints = [
   "src/index.ts",
   "src/memory.ts",
+  "src/mesh.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/jev.ts",

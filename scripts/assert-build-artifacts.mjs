@@ -10,6 +10,7 @@ const dist = join(root, "dist");
 const stable = [
   "index.js",
   "memory.js",
+  "mesh.js",
   "mcp.js",
   "agents.js",
   "jev.js",

@@ -671,3 +671,5 @@ return { event, claimed };
 ```
 
 Topics provide durable channels and direct messages with sequence cursors. `mesh.members({ scope?, kinds? })` returns the same combined directory of roots, agents, and actors as `agents.members()`. Versioned `get`, `put`, and `delete` operations provide compare-and-swap state for task claims, leases, reservations, and decisions. You can combine these operations with persistent actors to implement messenger-style swarms in Fabric code. Messenger-style swarms need no fixed planner and worker roles or user-managed daemon. When guest code requests durable residency, Fabric starts the hidden resident host described earlier. See [`/skill:fabric-swarm`](../skillsets/typescript/fabric-swarm/SKILL.md) for the pattern and [`references/mesh.md`](../skillsets/typescript/fabric-exec/references/mesh.md) for the complete API.
+
+Host scripts that run outside Pi, such as schedulers and maintenance tools, import `MeshStore` from `pi-fabric/mesh`. It uses the same lock, revision clock and event log as Fabric, and it loads no extension or agent runtime. Point it at the same mesh root as the Fabric sessions it works with.

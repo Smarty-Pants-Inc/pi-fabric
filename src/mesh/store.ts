@@ -47,6 +47,11 @@ interface MeshStateFile {
   highWater?: number;
 }
 
+export interface MeshReadOptions {
+  /** Read the current file (re-parsing only if it changed), not a recent parse. */
+  fresh?: boolean;
+}
+
 export interface MeshStoreOptions {
   maxEventLogBytes?: number;
   retainedEventLogBytes?: number;
@@ -632,9 +637,11 @@ export class MeshStore {
     return true;
   }
 
-  get(key: string): MeshStateEntry | undefined {
+  // fresh: skip the read cache's recent-parse reuse (readCacheMs), for a read that decides a
+  // protocol step rather than a listing. The file is still read only when it changed.
+  get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
-    const entries = this.#readCachedState().entries;
+    const entries = this.#readCachedState(options.fresh === true).entries;
     return Object.hasOwn(entries, key) ? jsonClone(entries[key]) : undefined;
   }
 
@@ -644,9 +651,9 @@ export class MeshStore {
   }
 
   /** Internal project-state scan for host-managed indexes that must reconcile every key. */
-  listAll(prefix = ""): MeshStateEntry[] {
+  listAll(prefix = "", options: MeshReadOptions = {}): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
-    return Object.values(this.#readCachedState().entries)
+    return Object.values(this.#readCachedState(options.fresh === true).entries)
       .filter((entry) => !prefix || entry.key.startsWith(prefix))
       .sort((left, right) => left.key.localeCompare(right.key))
       .map((entry) => jsonClone(entry));
@@ -804,9 +811,9 @@ export class MeshStore {
     });
   }
 
-  #readCachedState(): MeshStateFile {
+  #readCachedState(fresh = false): MeshStateFile {
     const recent = this.#stateCache;
-    if (recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {
+    if (!fresh && recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {
       return recent.state;
     }
     try {

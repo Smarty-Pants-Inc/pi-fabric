@@ -176,6 +176,37 @@ describe("LifecycleBroker", () => {
     await waitFor(() => target.list().length === 0);
   });
 
+  // review/astra on #49: with the runtime read cache, a publisher's cached listing must not
+  // hide a subscription another host created a moment ago; the event would be lost for good.
+  it("delivers an event emitted right after another host subscribes, despite the read cache", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    // Two hosts: separate stores on one mesh root; the publisher's store caches reads for 60 s.
+    const targetMesh = new MeshStore(meshRoot, 64 * 1024, 100);
+    const publisherMesh = new MeshStore(meshRoot, 64 * 1024, 100, { readCacheMs: 60_000 });
+    const deliveries: FabricLifecycleEvent[] = [];
+    const target = new LifecycleBroker(targetMesh, targetIdentity, participants(targetIdentity.id),
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, (_subscription, event) => { deliveries.push(event); });
+    // A long poll interval: nothing but the fresh read can refresh the publisher's cached view.
+    const publisher = new LifecycleBroker(publisherMesh, sourceIdentity, participants(sourceIdentity.id),
+      { enabled: true, pollMs: 60_000, maxReadEvents: 100 }, () => {});
+    brokers.push(target, publisher);
+    target.start();
+    await targetMesh.put({ key: "unrelated/key", value: 1, identity: targetIdentity });   // the state file exists
+    // The publisher reads (and caches) the state while nobody subscribes.
+    await publisher.publish({ source, event: "pi.agent_settled", occurredAt: 1 });
+    expect(publisherMesh.listAll("topology/subscriptions/")).toEqual([]);
+    await target.subscribe({
+      from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once: false,
+    });
+    expect(publisherMesh.listAll("topology/subscriptions/")).toEqual([]);   // its cached view is stale
+    await publisher.publish({ source, event: "pi.agent_settled", occurredAt: 2 });
+    await waitFor(() => deliveries.length === 1);
+    expect(deliveries[0]).toMatchObject({ event: "pi.agent_settled", occurredAt: 2 });
+  });
+
   it("delivers attributed component state transitions", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
     roots.push(root);

@@ -246,7 +246,8 @@ export class MeshProvider implements FabricProvider {
       case "get": {
         const key = String(args.key);
         assertReadableStateKey(key);
-        return this.store.get(key) ?? null;
+        // Guest code pairs get with compare-and-swap writes: read the current file.
+        return this.store.get(key, { fresh: true }) ?? null;
       }
       case "list": {
         const prefix = typeof args.prefix === "string" ? args.prefix : "";
@@ -259,7 +260,7 @@ export class MeshProvider implements FabricProvider {
           ),
         );
         return this.store
-          .listAll(prefix)
+          .listAll(prefix, { fresh: true })
           .filter(
             (entry) =>
               !PRIVATE_STATE_PREFIXES.some((privatePrefix) =>

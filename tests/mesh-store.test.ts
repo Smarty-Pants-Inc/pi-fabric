@@ -133,6 +133,8 @@ describe("MeshStore", () => {
       expect(parses.mock.calls.filter(([file]) => String(file).endsWith("state.json"))).toHaveLength(0);
       parses.mockRestore();
       expect(reader.get("cache/theirs")).toBeUndefined();               // within the window: the recent parse
+      expect(reader.get("cache/theirs", { fresh: true })?.version).toBe(theirs.version);   // fresh: the file
+      expect(reader.listAll("cache/", { fresh: true }).map((entry) => entry.key)).toEqual(["cache/own", "cache/theirs"]);
       // A write still reads the file under the lock: a stale view cannot pass a version check.
       await expect(reader.put({ key: "cache/theirs", value: 2, identity, ifVersion: 0 })).rejects.toThrow("compare-and-swap failed");
       expect(reader.get("cache/theirs")?.version).toBe(theirs.version);  // a failed write drops the cache

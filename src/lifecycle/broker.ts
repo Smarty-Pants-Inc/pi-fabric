@@ -155,7 +155,7 @@ export class LifecycleBroker {
 
   async unsubscribe(id: string): Promise<{ removed: boolean }> {
     const key = subscriptionKey(id.trim());
-    const entry = this.mesh.get(key);
+    const entry = this.mesh.get(key, { fresh: true });
     if (!entry || !lifecycleSubscriptionFromValue(entry.value)) return { removed: false };
     const result = await this.mesh.delete({ key, ifVersion: entry.version });
     return { removed: result.deleted };
@@ -300,9 +300,11 @@ export class LifecycleBroker {
     );
   }
 
+  // Fresh: this decides whether the event is published at all, so a subscription another host
+  // created a moment ago must count (a cached listing would drop the event for good).
   #isObserved(sourceId: string, event: FabricLifecyclePublishRequest["event"]): boolean {
     return this.mesh
-      .listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX)
+      .listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX, { fresh: true })
       .some((entry) => {
         const subscription = lifecycleSubscriptionFromValue(entry.value);
         return (

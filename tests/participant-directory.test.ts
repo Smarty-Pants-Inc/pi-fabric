@@ -594,12 +594,23 @@ describe("ParticipantDirectory", () => {
     // it, but peer-settle does not take the absence as a departure.
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(false), { timeout: 3_000, interval: 10 });
     expect(reader.writeStalled()).toBeUndefined();
+    // review/astra on a85b2c4: a settle armed now sees no peer at all; it must not succeed either.
+    let late: PeerSettleResult | undefined;
+    void awaitPeerSettle({
+      poll: () => reader.peers(),
+      stalled: () => reader.writeStalled(),
+      confirmedAt: () => reader.confirmedAt(),
+      settledForMs: 60_000,
+      pollMs: 20,
+    }).then((settled) => { late = settled; });
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(result).toBeUndefined();
+    expect(late).toBeUndefined();
     // Two heartbeat intervals without a commit: the lapse now reads as unknown visibility.
     await vi.waitFor(() => expect(result).toBeDefined(), { timeout: 5_000, interval: 20 });
     expect(result).toEqual({ ok: false, error: expect.stringMatching(/1 peer lease lapsed while this host's heartbeat has not committed/) });
     expect(reader.writeStalled()?.message).toMatch(/^Fabric mesh is write-stalled: 1 peer lease lapsed/);
+    await vi.waitFor(() => expect(late).toEqual({ ok: false, error: expect.stringMatching(/peer lease lapsed/) }), { timeout: 2_000, interval: 20 });
     expect(Date.now() - started).toBeLessThan(5_000);          // long before the 10 s lock timeout
     release();
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });

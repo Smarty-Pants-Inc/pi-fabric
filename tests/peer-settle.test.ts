@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   awaitPeerSettle,
   buildPeerCards,
@@ -204,6 +204,23 @@ describe("awaitPeerSettle during a mesh write stall", () => {
     confirmed = Date.now();
     await sleep(40);
     expect(result).toEqual({ ok: true });
+  });
+
+  it("waits for a commit after arming before an empty or partial snapshot counts as settled", async () => {
+    let live: FabricPeerInfo[] = [];
+    let confirmed = Date.now() - 1_000;
+    let result: PeerSettleResult | undefined;
+    void awaitPeerSettle({ poll: () => live, confirmedAt: () => confirmed, settledForMs: 30, pollMs: 5 })
+      .then((settled) => { result = settled; });
+    await sleep(40);
+    expect(result).toBeUndefined();                            // empty, but not confirmed
+    live = [peer("session:late", { status: "running" })];      // the arming snapshot missed it
+    await sleep(20);
+    confirmed = Date.now();
+    await sleep(60);
+    expect(result).toBeUndefined();                            // now watched, and still running
+    live = [peer("session:late", { status: "idle" })];
+    await vi.waitFor(() => expect(result).toEqual({ ok: true }), { timeout: 2_000, interval: 10 });
   });
 
   it("reports a stall that starts while waiting instead of settling", async () => {

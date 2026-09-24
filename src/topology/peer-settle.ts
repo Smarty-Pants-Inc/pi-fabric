@@ -118,18 +118,25 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 			error: `No Fabric peer matches "${options.selector}" on this project mesh`,
 		});
 	}
-	if (targets.length === 0) return Promise.resolve({ ok: true });
+	// With confirmedAt, a snapshot is complete only once this host has committed a heartbeat
+	// after arming: before that it can already omit a peer that lapsed behind a stalled lock.
+	const confirmedSinceArm = (): boolean => {
+		const confirmed = options.confirmedAt?.();
+		return confirmed === undefined || confirmed > armedAt;
+	};
+	if (targets.length === 0 && confirmedSinceArm()) return Promise.resolve({ ok: true });
 
 	const watched = new Map<string, WatchedPeer>();
-	for (const peer of targets) {
+	const watch = (peer: FabricPeerInfo, at: number): void => {
 		watched.set(peer.id, {
 			id: peer.id,
 			label: peer.label ?? peer.name,
 			running: peer.status === "running",
-			lastRunningAt: peer.status === "running" ? armedAt : undefined,
+			lastRunningAt: peer.status === "running" ? at : undefined,
 			settled: false,
 		});
-	}
+	};
+	for (const peer of targets) watch(peer, armedAt);
 
 	return new Promise<PeerSettleResult>((resolve) => {
 		let timer: ReturnType<typeof setInterval> | undefined;
@@ -156,9 +163,18 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 				finish({ ok: false, error: stalled.message });
 				return;
 			}
+			const confirmed = confirmedSinceArm();
 			const snapshot = options.poll();
 			const byId = new Map(snapshot.map((peer) => [peer.id, peer] as const));
 			const current = now();
+			if (!confirmed) {
+				// Peers the arming snapshot missed, seen before the first confirming commit.
+				for (const peer of snapshot) {
+					if (watched.has(peer.id)) continue;
+					if (options.selector !== undefined && !matchesSelector(peer, options.selector)) continue;
+					watch(peer, current);
+				}
+			}
 			for (const entry of watched.values()) {
 				if (entry.settled) continue;
 				const peer = byId.get(entry.id);
@@ -183,7 +199,7 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 			const waiting = [...watched.values()]
 				.filter((entry) => !entry.settled)
 				.map((entry) => ({ label: entry.label, status: entry.running ? "running" : "idle" }) as const);
-			if (waiting.length === 0) {
+			if (waiting.length === 0 && confirmed) {
 				options.onUpdate?.({ waiting });
 				finish({ ok: true });
 				return;

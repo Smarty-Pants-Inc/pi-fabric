@@ -207,8 +207,8 @@ export class ActorManager {
   readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
   readonly #parked = new Map<string, ActorQueueItem[]>();
-  /** Actor ids with a drain in flight, possibly on an object a registry reload replaced. */
-  readonly #drainingIds = new Set<string>();
+  /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
+  readonly #draining = new Map<string, ManagedActor>();
   readonly #actorRoot: string;
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
@@ -1092,11 +1092,13 @@ export class ActorManager {
     // own settle events.
     this.#halted = true;
     // An explicit cancel beats an ownership retry: a run that an ownership loss already
-    // aborted must not be parked and run again after the interrupt.
-    for (const actor of this.#actors.values()) {
+    // aborted must not be parked and run again after the interrupt. Drains are found by
+    // actor id, because a reload may have replaced the object an older drain still runs on.
+    for (const actor of new Set([...this.#actors.values(), ...this.#draining.values()])) {
       if (!actor.abortController) continue;
       actor.cancelAbort = actor.abortController;
       delete actor.ownershipAbort;
+      if (this.#actors.get(actor.id) !== actor) actor.abortController.abort();
     }
     // Parked events are queued work too: an interrupt cancels them (recorded).
     for (const [id, items] of [...this.#parked]) {
@@ -1276,7 +1278,7 @@ export class ActorManager {
       actor.draining ||
       // One activation at a time per actor session, even across a registry reload that
       // replaced the object an older drain still runs on (smarty-dev#442).
-      this.#drainingIds.has(actor.id) ||
+      this.#draining.has(actor.id) ||
       actor.status === "stopped" ||
       this.#closing ||
       !this.#canManage(actor.id)
@@ -1284,7 +1286,7 @@ export class ActorManager {
       return;
     }
     actor.draining = true;
-    this.#drainingIds.add(actor.id);
+    this.#draining.set(actor.id, actor);
     const drain = this.#drain(actor);
     actor.drain = drain;
     const release = (): void => {
@@ -1521,7 +1523,7 @@ export class ActorManager {
       // concurrent #ensureDrain observes `draining === false` and starts a
       // fresh drain instead of stranding a just-enqueued item.
       actor.draining = false;
-      this.#drainingIds.delete(actor.id);
+      if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
       // A reload may have moved this actor's queue to a new object while this drain ran.
       const live = this.#actors.get(actor.id);
       if (live && live !== actor && live.queue.length > 0) queueMicrotask(() => this.#ensureDrain(live));
@@ -2426,7 +2428,8 @@ export class ActorManager {
   }
 
   #recordDropped(actor: ManagedActor, item: ActorQueueItem, reason: string): void {
-    this.#recordMessage(actor, {
+    // A late result may drop an event on an object a reload has replaced: record it on the live one.
+    this.#recordMessage(this.#actors.get(actor.id) ?? actor, {
       id: randomUUID(),
       actorId: actor.id,
       actorName: actor.name,

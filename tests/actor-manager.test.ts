@@ -1505,13 +1505,18 @@ describe("ActorManager", () => {
   }, 30_000);
 
   // Records every actor activation (the manager cleans completed runs out of agents.list()).
-  const recordRuns = (agents: AgentManager) => {
+  // hold, when given, delays each run's result until it resolves (a deferred result).
+  const recordRuns = (agents: AgentManager, hold?: () => Promise<void>) => {
     const runs: Array<{ task: string; startedAt: number; finishedAt?: number }> = [];
     const run = agents.run.bind(agents);
     vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
       const entry: { task: string; startedAt: number; finishedAt?: number } = { task: request.task, startedAt: Date.now() };
       runs.push(entry);
-      try { return await run(request, signal); } finally { entry.finishedAt = Date.now(); }
+      try {
+        const result = await run(request, signal);
+        await hold?.();
+        return result;
+      } finally { entry.finishedAt = Date.now(); }
     });
     return runs;
   };
@@ -1544,7 +1549,8 @@ describe("ActorManager", () => {
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
     actors.listOwned();
     const from = { id: "peer", name: "peer", kind: "actor" as const };
-    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    // HANG has no progress, so the ownership loss always aborts it (a progressing run detaches).
+    await mesh.publish({ topic: "team.pulls", from, text: "HANG first" });
     await waitFor(() => actors.status(actor.id).status === "running");
     await mesh.publish({ topic: "team.pulls", from, text: "held-2" });
     await mesh.publish({ topic: "team.pulls", from, text: "held-3" });
@@ -1579,6 +1585,30 @@ describe("ActorManager", () => {
     actors.dispatchHostEvent("input", {});                     // the user resumes
     await new Promise((resolve) => setTimeout(resolve, 2_000));
     expect(runs.filter((run) => run.task.includes("cancel-me"))).toHaveLength(1);
+  }, 30_000);
+
+  // review/astra on 7b47958, R2 and R4 across a persistent reload: the old drain's deferred
+  // result arrives after ownership returned (a new actor object) and after ESC.
+  it("cancels, and records on the live actor, a deferred in-flight event across a persistent reload", async () => {
+    let owned = true;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const { actors, mesh, agents } = setup(true, () => owned);
+    const runs = recordRuns(agents, () => held);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "HANG deferred" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    owned = false;
+    actors.listOwned();                                        // aborts the run; its result is held back
+    owned = true;
+    actors.listOwned();                                        // persistent reload: a new actor object
+    actors.haltAll();                                          // ESC while the old drain still waits
+    release();
+    await waitFor(() => actors.messages(actor.id).some((message) => message.error?.includes("halted by user interrupt")), 10_000);
+    actors.dispatchHostEvent("input", {});                     // the user resumes
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    expect(runs.filter((run) => run.task.includes("HANG deferred"))).toHaveLength(1);
   }, 30_000);
 
   // Astra review of #36, R4: a drop recorded while unowned survives the ownership-return reload.

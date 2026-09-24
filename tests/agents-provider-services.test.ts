@@ -124,6 +124,35 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage("gone", "hi", undefined, "steer")).rejects.toThrow(stalled.message);
   });
 
+  // smarty-dev#447: a sender whose lease just lapsed may still be live; its owner host gets
+  // the reply. A long lapse or no record at all fails with the reason.
+  it("replies to a peer root whose lease lapsed moments ago through its owner host", async () => {
+    const { router, participants, control } = routing();
+    const peer = { ...participant(), id: "session:peer", rootId: "session:peer", stale: true };
+    participants.get.mockReturnValue(undefined);
+    Object.assign(participants, { lastKnown: vi.fn((id: string) => id === peer.id ? { participant: peer, lapsedMs: 20_000 } : undefined) });
+    control.request.mockResolvedValue({ queued: true, messageId: "delivered", routed: "mesh", acknowledged: true });
+    await expect(router.routeMessage(peer.id, "reply", undefined, "followUp")).resolves.toMatchObject({ acknowledged: true, messageId: "delivered" });
+    expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp", { message: "reply", data: undefined }, "owner");
+  });
+
+  it("names why a target cannot be resolved", async () => {
+    const { router, participants, control } = routing();
+    const peer = { ...participant(), id: "session:gone", rootId: "session:gone", stale: true };
+    participants.get.mockReturnValue(undefined);
+    const lastKnown = vi.fn<(id: string) => { participant: FabricParticipantInfo; lapsedMs: number } | undefined>();
+    Object.assign(participants, { lastKnown });
+    lastKnown.mockReturnValue({ participant: peer, lapsedMs: 600_000 });
+    await expect(router.routeMessage(peer.id, "reply", undefined, "followUp"))
+      .rejects.toThrow("Unknown Fabric participant: session:gone (its lease lapsed 600 s ago, so the session has probably ended)");
+    lastKnown.mockReturnValue({ participant: peer, lapsedMs: Number.POSITIVE_INFINITY });
+    await expect(router.routeMessage(peer.id, "reply", undefined, "followUp")).rejects.toThrow("its host is gone or was replaced");
+    lastKnown.mockReturnValue(undefined);
+    await expect(router.routeMessage("session:never", "reply", undefined, "followUp"))
+      .rejects.toThrow("Unknown Fabric participant: session:never (no record on this mesh root");
+    expect(control.request).not.toHaveBeenCalled();
+  });
+
   it("preserves passive Main delivery and caller identity without actor validation", async () => {
     const { router, main, actors } = routing();
     const from = { id: "source", name: "Source", kind: "main" as const };

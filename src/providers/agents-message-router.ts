@@ -7,16 +7,43 @@ import type { FabricInvocationContext } from "../protocol.js";
 import type { FabricControlPlane, FabricControlCommand, FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { FabricAgentRunner } from "../config.js";
+
+// A root whose lease lapsed this recently may still be live: its heartbeat can be late
+// under mesh lock contention or a busy event loop (smarty-dev#447). A reply still goes to
+// its owner host, which acknowledges it when alive; a gone host leaves the outcome unknown.
+// ponytail: 5 min covers every lease flap seen in the fleet; a longer lapse reads as ended.
+const LAPSED_ROOT_REPLY_WINDOW_MS = 5 * 60_000;
 // Route messages using only the ownership, delivery, and binding ports needed here.
 export class AgentMessageRouter {
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding">,
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled">,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown">,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding,
   ) {}
+  #recentlyLapsedRoot(id: string): FabricParticipantInfo | undefined {
+    const known = this.participants.lastKnown?.(id);
+    if (!known || known.participant.kind !== "root" || known.lapsedMs > LAPSED_ROOT_REPLY_WINDOW_MS) return undefined;
+    return known.participant;
+  }
+
+  // Says why a target cannot be resolved; the prefix stays "Unknown Fabric participant: <id>".
+  #unknownParticipant(id: string): Error {
+    const known = this.participants.lastKnown?.(id);
+    if (!known) {
+      return new Error(
+        `Unknown Fabric participant: ${id} (no record on this mesh root: the session has ended, ` +
+          "has not joined yet, or uses another mesh root)",
+      );
+    }
+    const when = Number.isFinite(known.lapsedMs)
+      ? `its lease lapsed ${Math.round(known.lapsedMs / 1000)} s ago`
+      : "its host is gone or was replaced";
+    return new Error(`Unknown Fabric participant: ${id} (${when}, so the session has probably ended)`);
+  }
+
   async routeMessage(
     id: string,
     message: string,
@@ -30,7 +57,7 @@ export class AgentMessageRouter {
     } = {},
   ): Promise<FabricAgentMessageResult> {
     const isMain = this.mainAgent.matches(id);
-    const remoteRoot = isMain ? undefined : this.participants.get(id);
+    const remoteRoot = isMain ? undefined : this.participants.get(id) ?? this.#recentlyLapsedRoot(id);
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.
     if (isMain || remoteRoot?.kind === "root") {
@@ -95,7 +122,7 @@ export class AgentMessageRouter {
       target = this.resolveActorTarget(id);
     } catch (error) {
       if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) {
-        throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric participant: ${id}`);
+        throw this.participants.writeStalled?.() ?? this.#unknownParticipant(id);
       }
       throw error;
     }

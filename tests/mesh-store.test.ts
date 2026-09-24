@@ -118,6 +118,68 @@ describe("MeshStore", () => {
     expect(fs.readFileSync(statePath, "utf8")).toBe("");
   });
 
+  // smarty-dev#251 (dev1 load P0): runtime stores reuse a recent parse instead of re-reading
+  // the shared state on every change by another process.
+  it("reuses a recent parse for reads, sees its own writes at once, and writes against the file", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-cache-"));
+    const reader = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 400 });
+    const other = new MeshStore(root, 64 * 1024, 100);
+    try {
+      await reader.put({ key: "cache/own", value: 1, identity });
+      expect(reader.get("cache/own")?.value).toBe(1);                   // its own write, at once
+      const theirs = await other.put({ key: "cache/theirs", value: 1, identity });
+      const parses = vi.spyOn(fs, "readFileSync");
+      for (let index = 0; index < 20; index++) reader.listAll("cache/");
+      expect(parses.mock.calls.filter(([file]) => String(file).endsWith("state.json"))).toHaveLength(0);
+      parses.mockRestore();
+      expect(reader.get("cache/theirs")).toBeUndefined();               // within the window: the recent parse
+      expect(reader.get("cache/theirs", { fresh: true })?.version).toBe(theirs.version);   // fresh: the file
+      expect(reader.listAll("cache/", { fresh: true }).map((entry) => entry.key)).toEqual(["cache/own", "cache/theirs"]);
+      // A write still reads the file under the lock: a stale view cannot pass a version check.
+      await expect(reader.put({ key: "cache/theirs", value: 2, identity, ifVersion: 0 })).rejects.toThrow("compare-and-swap failed");
+      expect(reader.get("cache/theirs")?.version).toBe(theirs.version);  // a failed write drops the cache
+      await other.put({ key: "cache/later", value: 1, identity });
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      expect(reader.get("cache/later")?.value).toBe(1);                 // after the window: re-read
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps re-reading on every change by default", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-cache-"));
+    const reader = new MeshStore(root, 64 * 1024, 100);
+    const other = new MeshStore(root, 64 * 1024, 100);
+    try {
+      reader.listAll();
+      await other.put({ key: "cache/now", value: 1, identity });
+      expect(reader.get("cache/now")?.value).toBe(1);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps at most 1,000 tombstones by default, and an evicted key still conflicts on a stale version", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-tombstones-"));
+    const store = new MeshStore(root, 64 * 1024, 100);
+    try {
+      const first = await store.put({ key: "gone/0", value: 0, identity });
+      await store.delete({ key: "gone/0" });
+      for (let index = 1; index <= 1_050; index++) {
+        await store.writeBatch({ identity, ops: [{ kind: "put", key: `gone/${index}`, value: index }, { kind: "delete", key: `gone/${index}` }] });
+      }
+      const state = JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"));
+      expect(state.tombstoneOrder).toHaveLength(1_000);
+      expect(Object.keys(state.versions)).toHaveLength(1_000);
+      expect(state.versions["gone/0"]).toBeUndefined();                  // evicted
+      await expect(store.put({ key: "gone/0", value: 1, identity, ifVersion: first.version })).rejects.toThrow("compare-and-swap failed");
+      const again = await store.put({ key: "gone/0", value: 2, identity, ifVersion: 0 });
+      expect(again.version).toBeGreaterThan(first.version + 1);          // above every earlier revision
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it("keeps unreadable state as a write barrier while serving an empty table", async () => {
     const store = createStore();
     const statePath = path.join(store.root, "state.json");

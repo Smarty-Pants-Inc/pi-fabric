@@ -21,7 +21,7 @@ import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
-import { MeshStore, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mesh/store.js";
 import { FabricControlPlane, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
@@ -157,7 +157,8 @@ class ResidentHost {
     this.#responsesPath = path.join(config.residencyRoot, "responses");
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
-    this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
+      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS });
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       hostId: this.hostId,

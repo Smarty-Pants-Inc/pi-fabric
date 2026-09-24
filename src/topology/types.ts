@@ -69,6 +69,8 @@ export interface FabricParticipantListOptions {
   scope?: FabricParticipantScope;
   kinds?: FabricParticipantKind[];
   includeStale?: boolean;
+  /** Read the current mesh state, not a recent cached parse (for protocol decisions). */
+  fresh?: boolean;
 }
 
 export interface FabricPeerInfo {
@@ -92,7 +94,7 @@ export interface FabricPeerInfo {
 
 export interface FabricParticipantSource {
   list(options?: FabricParticipantListOptions, now?: number): FabricParticipantInfo[];
-  get(id: string, now?: number): FabricParticipantInfo | undefined;
+  get(id: string, now?: number, options?: { fresh?: boolean }): FabricParticipantInfo | undefined;
   self(now?: number): FabricParticipantInfo;
   /** All live root Pi session agents, including the current lineage root. */
   sessions?(now?: number): FabricParticipantInfo[];

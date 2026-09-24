@@ -69,7 +69,7 @@ import {
 import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
-import { MeshStore, type MeshIdentity } from "./mesh/store.js";
+import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "./mesh/store.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
@@ -497,6 +497,7 @@ export class FabricRuntimeState {
       meshRoot,
       this.#config.mesh.maxEventBytes,
       this.#config.mesh.maxReadEvents,
+      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS },
     );
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     this.#participants = new ParticipantDirectory(this.#mesh, {

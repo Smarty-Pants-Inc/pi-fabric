@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
-import type { FabricParticipantSource } from "../topology/types.js";
+import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import {
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX,
   FABRIC_PARTICIPANT_LIFECYCLE_TOPIC,
@@ -155,7 +155,7 @@ export class LifecycleBroker {
 
   async unsubscribe(id: string): Promise<{ removed: boolean }> {
     const key = subscriptionKey(id.trim());
-    const entry = this.mesh.get(key);
+    const entry = this.mesh.get(key, { fresh: true });
     if (!entry || !lifecycleSubscriptionFromValue(entry.value)) return { removed: false };
     const result = await this.mesh.delete({ key, ifVersion: entry.version });
     return { removed: result.deleted };
@@ -285,8 +285,15 @@ export class LifecycleBroker {
     }
   }
 
+  // Both answers are final: a skipped event is skipped for good (the cursor moves past it), and
+  // a delivered one can end a once subscription. So ownership is read from the current mesh
+  // state, not a recent cached parse. This runs only for events that already match a
+  // subscription's source and event type, so it costs about one check per delivery.
   #sourceIsCurrentOwner(event: FabricLifecycleEvent): boolean {
-    const participant = this.participants.get(event.source.id);
+    return this.#ownsSource(event, this.participants.get(event.source.id, undefined, { fresh: true }));
+  }
+
+  #ownsSource(event: FabricLifecycleEvent, participant: FabricParticipantInfo | undefined): boolean {
     return Boolean(
       participant &&
       !participant.stale &&
@@ -300,9 +307,11 @@ export class LifecycleBroker {
     );
   }
 
+  // Fresh: this decides whether the event is published at all, so a subscription another host
+  // created a moment ago must count (a cached listing would drop the event for good).
   #isObserved(sourceId: string, event: FabricLifecyclePublishRequest["event"]): boolean {
     return this.mesh
-      .listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX)
+      .listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX, { fresh: true })
       .some((entry) => {
         const subscription = lifecycleSubscriptionFromValue(entry.value);
         return (

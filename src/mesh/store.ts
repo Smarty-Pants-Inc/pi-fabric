@@ -54,6 +54,13 @@ export interface MeshStoreOptions {
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
   staleLockMs?: number;
+  /**
+   * Reads (get, list, listAll) reuse the last parsed state for up to this long, even when
+   * another process has rewritten the file since. Every write still reads the file fresh
+   * under the lock and checks versions, and a store sees its own writes at once. 0 (the
+   * default) re-reads whenever the file changed.
+   */
+  readCacheMs?: number;
 }
 
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
@@ -64,6 +71,13 @@ const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_STATE_TOMBSTONES = 10_000;
+/**
+ * Read-cache age for the stores a Fabric runtime and its resident host use: at most one parse
+ * of the shared state per process per this interval (smarty-dev#251, dev1 load P0: ~50
+ * processes each re-parsed the whole file on every change, about 10 times a second).
+ * ponytail: listings may lag other hosts by up to 2 s; leases are 15 s and heartbeats 5 s.
+ */
+export const RUNTIME_MESH_READ_CACHE_MS = 2_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 const CURSOR_OFFSET_BASE = 2 ** 32;
@@ -325,8 +339,9 @@ export class MeshStore {
   readonly #maxStateTombstones: number;
   readonly #lockTimeoutMs: number;
   readonly #staleLockMs: number;
+  readonly #readCacheMs: number;
   #stateCache:
-    | { device: number; inode: number; size: number; modifiedAt: number; state: MeshStateFile }
+    | { device: number; inode: number; size: number; modifiedAt: number; parsedAt: number; state: MeshStateFile }
     | undefined;
 
   constructor(
@@ -361,6 +376,7 @@ export class MeshStore {
     );
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
+    this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
@@ -783,6 +799,10 @@ export class MeshStore {
   }
 
   #readCachedState(): MeshStateFile {
+    const recent = this.#stateCache;
+    if (recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {
+      return recent.state;
+    }
     try {
       const stat = fs.statSync(this.#statePath);
       const cached = this.#stateCache;
@@ -813,6 +833,7 @@ export class MeshStore {
         inode: stat.ino,
         size: stat.size,
         modifiedAt: stat.mtimeMs,
+        parsedAt: Date.now(),
         state,
       };
     } catch {
@@ -846,6 +867,11 @@ export class MeshStore {
     }
     try {
       return operation();
+    } catch (error) {
+      // A failed write (a version conflict above all) means this store's view is behind: the
+      // next read parses the file again instead of reusing a recent parse.
+      this.#stateCache = undefined;
+      throw error;
     } finally {
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");

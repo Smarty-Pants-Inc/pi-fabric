@@ -22,11 +22,18 @@ import type { FabricParticipantResidency } from "../topology/types.js";
 //     messages and its result is sent verbatim. Exposing it to actors would let
 //     them rewrite the system prompt per request, which Fabric deliberately
 //     avoids to keep the cached system prefix byte-stable.
-// To observe either one as an actor event, add it to
+//   - `provider_stream_event` (newer Pi) fires for every raw provider stream chunk: far
+//     too frequent for an actor mailbox. Excluding it is a no-op on Pi versions that
+//     do not define it.
+// To observe one of these as an actor event, add it to
 // FABRIC_ACTOR_PI_HOST_EVENTS below and give it a FABRIC_LIFECYCLE_EVENTS topic.
 export type FabricActorPiHostEvent = Exclude<
   ExtensionEvent["type"],
-  "project_trust" | "cache_warming_decision" | "agent_before_settle" | "context_with_system"
+  | "project_trust"
+  | "cache_warming_decision"
+  | "agent_before_settle"
+  | "context_with_system"
+  | "provider_stream_event"
 >;
 
 const defineFabricActorPiHostEvents = <

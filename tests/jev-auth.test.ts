@@ -10,6 +10,18 @@ describe("Jev native login", () => {
     expect(provider.id).toBe("jev"); expect(provider.getModels()).toEqual([]);
     expect(provider.auth.apiKey.login).toBeTypeOf("function");
   });
+  // Newer Pi's createProvider rejects a provider without any api/images/classifiers
+  // implementation, so the login-only provider carries a stream that only ever errors.
+  it("carries a concrete stream implementation that ends with an error", async () => {
+    const provider = createJevAuthProvider();
+    const model = { id: "none", name: "none", api: "openai-completions", provider: "jev" } as unknown as Parameters<typeof provider.stream>[0];
+    for (const stream of [provider.stream(model, { messages: [] } as never), provider.streamSimple(model, { messages: [] } as never)]) {
+      const events = [];
+      for await (const event of stream) events.push(event);
+      expect(events.map((event) => event.type)).toEqual(["error"]);
+      await expect(stream.result()).resolves.toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("login-only") });
+    }
+  });
   it("persists api_key credentials through Pi storage and resolves login/logout", async () => {
     const storage = new InMemoryCredentialStore();
     const models = createModels({ credentials: storage }); models.setProvider(createJevAuthProvider());

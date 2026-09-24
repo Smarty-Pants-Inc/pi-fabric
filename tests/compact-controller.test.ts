@@ -354,7 +354,9 @@ describe("CompactController", () => {
       errorListeners: new Set(),
     });
 
-    const emitted = runner.emit({ type: "agent_settled" }).then(() => {
+    // Newer Pi adds a required `outcome`; the assertion keeps this compiling on both.
+    const settled = { type: "agent_settled", outcome: "completed" } as Parameters<typeof runner.emit>[0];
+    const emitted = runner.emit(settled).then(() => {
       timeline.push("public:agent_settled");
     });
     await Promise.resolve();

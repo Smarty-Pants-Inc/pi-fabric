@@ -17,6 +17,8 @@ export class ActorMeshMonitor {
   #started = false;
   /** Events created before this are not delivered when resuming from a saved cursor. */
   #replayFloor: number | undefined;
+  /** Resumed from a saved cursor and not yet at the end of the log. */
+  #catchingUp = false;
 
   constructor(
     readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail">,
@@ -29,13 +31,15 @@ export class ActorMeshMonitor {
        */
       maxReplayAgeMs?: number | undefined;
       beforePoll(): boolean;
-      onEvent(event: MeshEvent): void;
+      /** false: a receiver is full; while catching up, the event is offered again later. */
+      onEvent(event: MeshEvent): boolean | void;
     },
   ) {
     const saved = this.#readCursor();
     this.#offset = saved ?? mesh.latestOffset();
     if (saved !== undefined && callbacks.maxReplayAgeMs !== undefined) {
       this.#replayFloor = Date.now() - callbacks.maxReplayAgeMs;
+      this.#catchingUp = true;
     }
   }
 
@@ -98,13 +102,22 @@ export class ActorMeshMonitor {
     if (!this.callbacks.beforePoll()) return;
     this.#polling = true;
     try {
-      const tail = this.mesh.tail(this.#offset, this.config.maxReadEvents);
-      this.#offset = tail.nextOffset;
+      // Catch-up reads one event at a time, so an event a full actor queue rejects keeps the
+      // cursor on it and is offered again, instead of overflowing silently (smarty-dev#472).
+      // Live reads keep whole pages and the queue's own overflow policy.
+      const tail = this.mesh.tail(this.#offset, this.#catchingUp ? 1 : this.config.maxReadEvents);
+      if (this.#catchingUp && tail.events.length === 0) this.#catchingUp = false;
+      const catchingUp = this.#catchingUp;
+      // Live: advance first, so a failing dispatch never blocks the stream (the cursor file is
+      // committed only after a complete dispatch).
+      if (!catchingUp) this.#offset = tail.nextOffset;
       for (const event of tail.events) {
         if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor) continue;
-        this.callbacks.onEvent(event);
+        if (this.callbacks.onEvent(event) === false && catchingUp) return;
       }
+      if (catchingUp) this.#offset = tail.nextOffset;
       this.#writeCursor();
+      if (catchingUp) this.schedule();
     } finally {
       this.#polling = false;
     }

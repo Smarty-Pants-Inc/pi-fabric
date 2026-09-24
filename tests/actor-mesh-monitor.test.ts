@@ -80,15 +80,44 @@ describe("ActorMeshMonitor", () => {
     vi.spyOn(fs, "watch").mockReturnValue(Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as FSWatcher);
     const old = { topic: "t", createdAt: 1_000_000 - 60_001 } as MeshEvent;
     const recent = { topic: "t", createdAt: 1_000_000 - 30_000 } as MeshEvent;
-    const mesh = { root, latestOffset: vi.fn(() => 99), tail: vi.fn(() => ({ events: [old, recent], nextOffset: 9 })) };
+    const log = [old, recent];                               // offsets 5 and 6; 7 is the end
+    const mesh = { root, latestOffset: vi.fn(() => 99), tail: vi.fn((offset: number) =>
+      offset - 5 < log.length ? { events: [log[offset - 5]!], nextOffset: offset + 1 } : { events: [], nextOffset: offset }) };
     const onEvent = vi.fn();
     const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 7 },
       { cursorPath, maxReplayAgeMs: 60_000, beforePoll: () => true, onEvent });
     monitors.push(monitor);
     monitor.start();
     await vi.advanceTimersByTimeAsync(0);
-    expect(mesh.tail).toHaveBeenCalledWith(5, 7);            // resumed from the saved cursor
+    expect(mesh.tail).toHaveBeenCalledWith(5, 1);            // resumed from the saved cursor, one event at a time
     expect(onEvent.mock.calls.map(([event]) => event)).toEqual([recent]);
+    expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).cursor).toBe(7);
+  });
+
+  it("keeps a catch-up event that a full receiver rejected, and offers it again", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-"));
+    roots.push(root);
+    const cursorPath = path.join(root, "cursor.json");
+    fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, cursor: 0 }));
+    vi.spyOn(fs, "watch").mockReturnValue(Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as FSWatcher);
+    const log = [{ topic: "t", createdAt: 999_000 }, { topic: "t", createdAt: 999_500 }] as MeshEvent[];
+    const mesh = { root, latestOffset: vi.fn(() => 99), tail: vi.fn((offset: number) =>
+      offset < log.length ? { events: [log[offset]!], nextOffset: offset + 1 } : { events: [], nextOffset: offset }) };
+    let full = true;
+    const onEvent = vi.fn((_event: MeshEvent) => !full);
+    const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 7 },
+      { cursorPath, maxReplayAgeMs: 60_000, beforePoll: () => true, onEvent });
+    monitors.push(monitor);
+    monitor.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onEvent).toHaveBeenCalledTimes(1);                 // rejected: the cursor stays on it
+    expect(fs.existsSync(cursorPath) && JSON.parse(fs.readFileSync(cursorPath, "utf8")).cursor).toBe(0);
+    full = false;
+    monitor.schedule();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual([log[0], log[0], log[1]]);
+    expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).cursor).toBe(2);
   });
 
   it("uses polling when watch creation fails and ignores malformed cursors", async () => {

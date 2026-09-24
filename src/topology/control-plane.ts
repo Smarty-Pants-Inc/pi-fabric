@@ -441,10 +441,16 @@ export class FabricControlPlane {
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
     );
     if (now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) {
-      await this.#publishAcknowledgement(command, {
-        accepted: false,
-        error: "Fabric control command expired",
-      });
+      // A sender waits at most MAX_CONTROL_ACK_GRACE_MS past the deadline. An older command
+      // is history: a restarting owner replays the retained log from its start, and
+      // answering every past command added one locked publish each, thousands per
+      // relaunch wave (smarty-dev#367). Only a sender that may still wait gets an answer.
+      if (now <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) {
+        await this.#publishAcknowledgement(command, {
+          accepted: false,
+          error: "Fabric control command expired",
+        });
+      }
       return;
     }
 

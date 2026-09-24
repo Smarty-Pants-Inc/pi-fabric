@@ -326,6 +326,37 @@ describe("FabricControlPlane", () => {
     );
   });
 
+  // smarty-dev#367: every restarting owner replays the retained log from its start; it
+  // answered each long-expired command again, 21,479 acks nobody waited for.
+  it("does not answer a command whose sender stopped waiting long ago", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    await store.publish({
+      topic: "fabric.control.command",
+      kind: "steer",
+      from: identity("host:sender"),
+      to: "host:receiver",
+      data: {
+        version: 1,
+        commandId: "command:history",
+        targetId: "agent:target",
+        operation: "steer",
+        replyTo: "host:sender",
+        message: "old",
+        requestedAt: Date.now() - 10 * 60_000,
+      },
+    });
+    const receiver = plane(meshRoot, "host:receiver");
+    const receive = vi.fn(() => ({ accepted: true }));
+    receiver.start(receive);                                     // a restart replays the log
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(receive).not.toHaveBeenCalled();
+    expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toEqual([]);
+  });
+
   it("final-drains a command published immediately before close", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);

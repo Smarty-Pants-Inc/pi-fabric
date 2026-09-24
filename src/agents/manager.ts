@@ -1516,7 +1516,9 @@ export class AgentManager {
       // Relaunch only when the previous worker is gone for certain. A worker that did
       // not stop, or whose transport cannot say, fails the run instead of running twice.
       if (await managed.transport.isAlive().catch(() => true)) {
-        throw new Error(`the previous worker ${previousSession ? `(${previousSession}) ` : ""}did not stop, so it was not relaunched`);
+        const reason = `the previous worker ${previousSession ? `(${previousSession}) ` : ""}did not stop, so it was not relaunched`;
+        this.#markLost(managed, reason);                       // it may still use its files
+        throw new Error(reason);
       }
       // Keep an append-only record of every relaunch; the status and lifecycle
       // files below are replaced by the new attempt.

@@ -6,6 +6,7 @@ import {
   FABRIC_RUN_ROOT_PREFIX,
   markRunRootActive,
   markRunRootClosed,
+  hasUnresolvedWorker,
   markUnresolvedWorker,
   pruneActorRunArchives,
   sweepTempRunRoots,
@@ -124,6 +125,26 @@ describe("temporal retention", () => {
     const unmarked = sweep(tempRoot);
     expect(unmarked.removedRoots).toContain(orphaned);         // the closed root goes too once empty
     expect(unmarked.removedRuns).toEqual([path.join(closed, "lost")]);
+  });
+
+  it("never removes a completed parent run whose nested child is marked unresolved", () => {
+    const tempRoot = temporaryDirectory();
+    const orphaned = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphaned-parent");
+    const closed = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed-parent");
+    for (const runRoot of [orphaned, closed]) {
+      const parent = path.join(runRoot, "parent");
+      writeStatus(parent, { status: "completed", transport: "process", finishedAt: 1, updatedAt: 1 });
+      fs.writeFileSync(path.join(parent, "task.txt"), "work");
+      const child = path.join(parent, "nested", "child");
+      writeStatus(child, { status: "failed", transport: "herdr", sessionId: "pane-1", finishedAt: 1, updatedAt: 1 });
+      fs.writeFileSync(path.join(child, "task.txt"), "work");
+      markUnresolvedWorker(child, "the Herdr server has been unreachable for 300 s");
+    }
+    fs.writeFileSync(path.join(orphaned, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    fs.writeFileSync(path.join(closed, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
+    const result = sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
+    expect(result).toEqual({ removedRoots: [], removedRuns: [] });
+    expect(hasUnresolvedWorker(path.join(orphaned, "parent"))).toBe(true);
   });
 
   it("removes dead temporary run roots after six hours", () => {

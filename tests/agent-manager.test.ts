@@ -11,6 +11,7 @@ import {
   effectiveAgentTimeoutMs,
   AgentManager,
 } from "../src/agents/manager.js";
+import { markUnresolvedWorker } from "../src/storage/retention.js";
 import {
   clearOwnedBudgetEnv,
   readBudgetLedgerDetailed,
@@ -675,11 +676,33 @@ describe("AgentManager", () => {
       const relaunches = fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"), "utf8")
         .trim().split("\n").map((line) => JSON.parse(line));
       expect(relaunches).toEqual([expect.objectContaining({ kind: "relaunch-failed" })]);
+      // review/astra on e170d9e: the worker that did not stop may still use its files.
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+      expect(fs.existsSync(manager.runDirectory(handle.id)!)).toBe(true);
     } finally {
       spy.mockRestore();
       await first?.stop();
     }
   }, 45_000);
+
+  // review/astra on e170d9e: a marked nested child keeps its completed parent's files too.
+  it("keeps a completed parent run whose nested child is marked unresolved", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const runRoot = path.join(root, "runs");                   // a custom (not managed temp) root
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot,
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "complete quickly", transport: "process" });
+    expect(result.status).toBe("completed");
+    const runDirectory = manager.runDirectory(result.id)!;
+    markUnresolvedWorker(path.join(runDirectory, "nested", "child"), "the Herdr server has been unreachable for 300 s");
+    await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
+    await manager.close();
+    expect(fs.existsSync(path.join(runDirectory, "nested", "child"))).toBe(true);
+  }, 30_000);
 
   it("gives up retrying a child whose transport always exits before producing a result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));

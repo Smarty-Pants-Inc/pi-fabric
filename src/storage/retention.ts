@@ -63,8 +63,18 @@ export const markRunRootClosed = (root: string, now = Date.now(), childrenStoppe
  * this file in its run directory. Every cleanup path refuses such a run, across restarts.
  */
 export const UNRESOLVED_WORKER_FILE = "unresolved-worker.json";
-export const hasUnresolvedWorker = (runDirectory: string): boolean =>
-  fs.existsSync(path.join(runDirectory, UNRESOLVED_WORKER_FILE));
+/** True when this run, or any nested child run below it, is marked. */
+export const hasUnresolvedWorker = (runDirectory: string, depth = 0): boolean => {
+  if (fs.existsSync(path.join(runDirectory, UNRESOLVED_WORKER_FILE))) return true;
+  if (depth >= 32) return false;
+  const nested = path.join(runDirectory, "nested");
+  try {
+    return fs.readdirSync(nested, { withFileTypes: true })
+      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(nested, entry.name), depth + 1));
+  } catch {
+    return false;
+  }
+};
 export const markUnresolvedWorker = (runDirectory: string, reason: string, details: Record<string, unknown> = {}): void => {
   fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
   writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });

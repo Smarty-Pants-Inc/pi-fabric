@@ -290,6 +290,20 @@ describe("durable completion receipts", () => {
     }
   });
 
+  it("refuses the fallback cleanup of a completed durable run whose nested child is marked", async () => {
+    const state = await rootHarness("unresolved-nested-cleanup");
+    const seeded = await seedCompletion(state, "completed");
+    markUnresolvedWorker(path.join(seeded.runDirectory, "nested", "child"), "the Herdr server has been unreachable for 300 s");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(fs.existsSync(path.join(seeded.runDirectory, "nested", "child"))).toBe(true);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
   it("retracts an already queued completion on late wait and persists the receipt across reconnects", async () => {
     const state = await rootHarness("late-completion-wait");
     const seeded = await seedCompletion(state);

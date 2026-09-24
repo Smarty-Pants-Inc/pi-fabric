@@ -150,6 +150,26 @@ describe("agents provider message routing service boundaries", () => {
     expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined }, "owner");
   });
 
+  it("names why a remote Main cannot be resolved", async () => {
+    const { router, participants, control, main } = routing();
+    main.local = false;
+    main.id = "session:main-root";
+    const root = { ...participant(), id: "session:main-root", rootId: "session:main-root", stale: true };
+    participants.get.mockReturnValue(undefined);
+    const lastKnown = vi.fn<(id: string) => { participant: FabricParticipantInfo; lapsedMs: number } | undefined>();
+    Object.assign(participants, { lastKnown });
+    lastKnown.mockReturnValue({ participant: root, lapsedMs: 600_000 });
+    await expect(router.routeMessage("main", "result", undefined, "followUp"))
+      .rejects.toThrow("Unknown Fabric Main participant: session:main-root (its lease lapsed 600 s ago, so the session has probably ended)");
+    lastKnown.mockReturnValue({ participant: root, lapsedMs: Number.POSITIVE_INFINITY });
+    await expect(router.routeMessage("main", "result", undefined, "followUp"))
+      .rejects.toThrow("Unknown Fabric Main participant: session:main-root (its host is gone or was replaced");
+    lastKnown.mockReturnValue(undefined);
+    await expect(router.routeMessage("main", "result", undefined, "followUp"))
+      .rejects.toThrow("Unknown Fabric Main participant: session:main-root (no record on this mesh root");
+    expect(control.request).not.toHaveBeenCalled();
+  });
+
   it("reports a write-stalled mesh before trying a recently lapsed root", async () => {
     const { router, participants, control, main } = routing();
     const stalled = new Error("Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock");

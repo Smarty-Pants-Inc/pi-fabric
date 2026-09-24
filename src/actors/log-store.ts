@@ -85,7 +85,7 @@ export class ActorLogStore {
     if (!runDirectory || !fs.existsSync(runDirectory)) return;
     const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
     fs.mkdirSync(dest, { recursive: true, mode: 0o700 });
-    for (const file of ["events.jsonl", "status.json", "task.txt"]) {
+    for (const file of ["events.jsonl", "status.json", "task.txt", "relaunches.jsonl"]) {
       const src = path.join(runDirectory, file);
       if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dest, file));
     }

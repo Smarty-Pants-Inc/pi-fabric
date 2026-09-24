@@ -178,6 +178,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   // The dead-transport failure we are retrying past; preferred over a bare
   // timed_out verdict if the run deadline lands mid-retry.
   lastRetriedTransportFailure?: AgentRunResult;
+  /** Set when a relaunch failed; the run settles with it, not the attempt it replaced. */
+  relaunchFailure?: AgentRunRecord;
   model?: string;
   thinking?: AgentRunRequest["thinking"];
   actorId?: string;
@@ -1449,10 +1451,18 @@ export class AgentManager {
       // transport and wait for it to exit before starting the next. After a real
       // exit this is a no-op; if liveness was misjudged (a dropped transport call),
       // it ends the old worker instead of racing it on the same task.
+      // ponytail: the stop is unconditional because a misjudged liveness check is the
+      // case it exists for. For a process worker that really exited, it signals a
+      // process group whose id Linux does not reuse within the retry delay.
       const previousSession = managed.transport.sessionId;
       await managed.transport.stop().catch(() => undefined);
       await this.#waitForTransportExit(managed);
       if (managed.settled || this.#closing || managed.stopRequested) return false;
+      // Relaunch only when the previous worker is gone for certain. A worker that did
+      // not stop, or whose transport cannot say, fails the run instead of running twice.
+      if (await managed.transport.isAlive().catch(() => true)) {
+        throw new Error(`the previous worker ${previousSession ? `(${previousSession}) ` : ""}did not stop, so it was not relaunched`);
+      }
       // Keep an append-only record of every relaunch; the status and lifecycle
       // files below are replaced by the new attempt.
       fs.appendFileSync(
@@ -1505,6 +1515,15 @@ export class AgentManager {
       return true;
     } catch (error) {
       const retryError = error instanceof Error ? error.message : String(error);
+      try {
+        fs.appendFileSync(
+          path.join(managed.runDirectory, "relaunches.jsonl"),
+          `${JSON.stringify({ at: Date.now(), kind: "relaunch-failed", error: retryError.slice(0, 500) })}\n`,
+          { encoding: "utf8", mode: 0o600 },
+        );
+      } catch {
+        // The status record below still carries the failure.
+      }
       const failed = {
         ...record,
         // Keep the run's real progress: the relaunch failed, not the attempt.
@@ -1514,6 +1533,7 @@ export class AgentManager {
       };
       writeRecord(managed.statusFile, failed);
       managed.latestRecord = failed;
+      managed.relaunchFailure = failed;
       return false;
     }
   }
@@ -1545,7 +1565,7 @@ export class AgentManager {
       if (record && terminalStatuses.has(record.status)) {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         if (await this.#retryStartup(managed, record, deadline)) continue;
-        this.#settle(managed, this.#withTransportMetadata(record, managed) as AgentRunResult);
+        this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;
       }
       if (Date.now() >= deadline) {
@@ -1606,8 +1626,9 @@ export class AgentManager {
               managed.lastRetriedTransportFailure = failed;
               continue;
             }
-            writeRecord(managed.statusFile, failed);
-            this.#settle(managed, failed);
+            const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
+            writeRecord(managed.statusFile, settled);
+            this.#settle(managed, settled);
             return;
           }
         } else {

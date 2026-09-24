@@ -482,6 +482,45 @@ describe("AgentManager", () => {
     }
   }, 30_000);
 
+  // dev-lead review F2: a stop that does not take effect must never lead to a second worker.
+  it("fails the run instead of relaunching while the previous worker is still alive after its stop", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    let first: Awaited<ReturnType<typeof launch>> | undefined;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      if (++launches > 1) return handle;
+      first = handle;
+      let stopRequested = false;
+      return {
+        ...handle,
+        // Misjudged as dead until a stop is requested; the stop is then lost, so it stays alive.
+        isAlive: async () => (stopRequested ? handle.isAlive() : false),
+        stop: async () => { stopRequested = true; },
+      };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      const result = await manager.wait(handle.id);
+      expect(launches).toBe(1);
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("did not stop, so it was not relaunched");
+      const relaunches = fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      expect(relaunches).toEqual([expect.objectContaining({ kind: "relaunch-failed" })]);
+    } finally {
+      spy.mockRestore();
+      await first?.stop();
+    }
+  }, 45_000);
+
   it("gives up retrying a child whose transport always exits before producing a result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

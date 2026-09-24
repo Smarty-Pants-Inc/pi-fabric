@@ -1205,6 +1205,30 @@ describe("ActorManager", () => {
     expect(deliveries.filter((text) => text.startsWith("Fabric host notice:"))).toEqual([]);
   }, 60_000);
 
+  // review/astra on 810b557: in text mode (the default) a stopped run throws into the catch path.
+  it("does not count a text actor's run stopped through agents.stop() as the third failure", async () => {
+    const { actors, agents, deliveries } = setup();
+    const actor = await actors.create({
+      name: "watcher",
+      instructions: "Answer briefly.",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    for (let run = 1; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+      await expect(actors.ask(actor.id, "FAIL_DIRECTIVE")).rejects.toThrow();
+    }
+    const asked = actors.ask(actor.id, "HANG").catch((error: unknown) => error);
+    const hanging = () => agents.list().find((run) => run.status === "running" && String((run as { task?: string }).task).includes("HANG"));
+    await waitFor(() => hanging() !== undefined);
+    const hung = hanging()!;
+    await agents.stop(hung.id);
+    expect(String(await asked)).toMatch(/stopped/i);
+    await waitFor(() => actors.status(actor.id).status === "idle");
+    expect(deliveries.filter((text) => text.startsWith("Fabric host notice:"))).toEqual([]);
+    await expect(actors.ask(actor.id, "FAIL_DIRECTIVE")).rejects.toThrow(); // a real third failure still alarms
+    await waitFor(() => deliveries.some((text) => text.startsWith("Fabric host notice:")));
+  }, 60_000);
+
   it.each(["stop", "close"] as const)("does not count an activation cut off by %s as the third failure", async (how) => {
     const { actors, deliveries } = setup();
     const actor = await actors.create({

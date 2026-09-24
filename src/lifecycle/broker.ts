@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
-import type { FabricParticipantSource } from "../topology/types.js";
+import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import {
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX,
   FABRIC_PARTICIPANT_LIFECYCLE_TOPIC,
@@ -285,8 +285,14 @@ export class LifecycleBroker {
     }
   }
 
+  // A skipped event is skipped for good (the cursor moves past it), so a "not the owner"
+  // answer from a cached view is checked again against the current mesh state.
   #sourceIsCurrentOwner(event: FabricLifecycleEvent): boolean {
-    const participant = this.participants.get(event.source.id);
+    return this.#ownsSource(event, this.participants.get(event.source.id)) ||
+      this.#ownsSource(event, this.participants.get(event.source.id, undefined, { fresh: true }));
+  }
+
+  #ownsSource(event: FabricLifecycleEvent, participant: FabricParticipantInfo | undefined): boolean {
     return Boolean(
       participant &&
       !participant.stale &&

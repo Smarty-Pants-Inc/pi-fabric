@@ -9,6 +9,7 @@ import {
   type FabricLifecycleSubscription,
 } from "../src/lifecycle/types.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantSource,
@@ -205,6 +206,51 @@ describe("LifecycleBroker", () => {
     await publisher.publish({ source, event: "pi.agent_settled", occurredAt: 2 });
     await waitFor(() => deliveries.length === 1);
     expect(deliveries[0]).toMatchObject({ event: "pi.agent_settled", occurredAt: 2 });
+  });
+
+  // review/astra on #49: the receiving side skips an event whose source is not the current
+  // owner, for good. A cached view where the source's lease had lapsed must not decide that.
+  it("delivers an event from a source whose lease was renewed after the receiver's cached read", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const targetMesh = new MeshStore(meshRoot, 64 * 1024, 100, { readCacheMs: 60_000 });
+    const sourceMesh = new MeshStore(meshRoot, 64 * 1024, 100);
+    const directory = (mesh: MeshStore, identity: MeshIdentity, leaseMs: number) => {
+      const value = new ParticipantDirectory(mesh, {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity: { ...identity, kind: "actor" },
+        heartbeatMs: 100, leaseMs,
+      });
+      value.registerSource(() => [{
+        format: 1, id: identity.id, kind: "root", rootId: identity.id, ownerHostId: identity.id,
+        ownerIdentityId: identity.id, name: identity.name, status: "idle", runner: "pi", transport: "host",
+        capabilities: ["steer", "followUp", "fabric"], startedAt: 1, updatedAt: 2, pendingMessages: false,
+        controlProtocol: "v1",
+      }]);
+      return value;
+    };
+    const sourceDirectory = directory(sourceMesh, sourceIdentity, 300);
+    const targetDirectory = directory(targetMesh, targetIdentity, 60_000);   // the receiver stays live
+    await sourceDirectory.refresh();                           // the source's lease: 300 ms
+    await targetDirectory.refresh();
+    const deliveries: FabricLifecycleEvent[] = [];
+    const target = new LifecycleBroker(targetMesh, targetIdentity, targetDirectory,
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, (_subscription, event) => { deliveries.push(event); });
+    const publisher = new LifecycleBroker(sourceMesh, sourceIdentity, sourceDirectory,
+      { enabled: true, pollMs: 60_000, maxReadEvents: 100 }, () => {});
+    brokers.push(target, publisher);
+    await target.subscribe({
+      from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 400));  // the cached lease has lapsed
+    expect(targetDirectory.get(source.id)).toBeUndefined();   // the receiver's cached view
+    await sourceDirectory.refresh();                           // the source renews ...
+    await publisher.publish({ source, event: "pi.agent_settled", occurredAt: 7 });   // ... and publishes
+    expect(targetDirectory.get(source.id)).toBeUndefined();   // still the stale cached view
+    target.start();
+    await waitFor(() => deliveries.length === 1);
+    expect(deliveries[0]).toMatchObject({ event: "pi.agent_settled", occurredAt: 7 });
   });
 
   it("delivers attributed component state transitions", async () => {

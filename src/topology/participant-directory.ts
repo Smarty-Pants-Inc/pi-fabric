@@ -348,16 +348,17 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!options.kinds || options.kinds.includes(self.kind)) byId.set(self.id, self);
       return [...byId.values()];
     }
+    const read = { fresh: options.fresh === true };
     const hosts = new Map(
       this.mesh
-        .listAll(HOST_PREFIX)
+        .listAll(HOST_PREFIX, read)
         .flatMap((entry) => {
           const host = hostFromEntry(entry);
           return host ? [[host.id, host] as const] : [];
         }),
     );
     const byId = new Map<string, FabricParticipantInfo>();
-    for (const entry of this.mesh.listAll(PARTICIPANT_PREFIX)) {
+    for (const entry of this.mesh.listAll(PARTICIPANT_PREFIX, read)) {
       const participant = participantFromEntry(entry);
       if (!participant) continue;
       const owner = hosts.get(participant.ownerHostId);
@@ -378,7 +379,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     const legacyRoots = new Map(
       this.mesh
-        .listAll(LEGACY_SESSION_PREFIX)
+        .listAll(LEGACY_SESSION_PREFIX, read)
         .flatMap((entry) => {
           const root = legacyRootFromEntry(entry, this.options.rootId, now);
           return root ? [[root.id, root] as const] : [];
@@ -391,7 +392,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }
       if (!options.kinds || options.kinds.includes("actor")) {
-        for (const entry of this.mesh.listAll(LEGACY_ACTOR_PREFIX)) {
+        for (const entry of this.mesh.listAll(LEGACY_ACTOR_PREFIX, read)) {
           const actor = legacyActorFromEntry(entry, legacyRoots);
           if (actor && !byId.has(actor.id)) byId.set(actor.id, actor);
         }
@@ -411,9 +412,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     );
   }
 
-  get(id: string, now = Date.now()): FabricParticipantInfo | undefined {
+  get(id: string, now = Date.now(), options: { fresh?: boolean } = {}): FabricParticipantInfo | undefined {
     const target = id === "main" ? this.options.rootId : id;
-    return this.list({ scope: "project" }, now).find((participant) => participant.id === target);
+    return this.list({ scope: "project", ...(options.fresh ? { fresh: true } : {}) }, now)
+      .find((participant) => participant.id === target);
   }
 
   // A stalled mesh writer (for example a signal-stopped lock holder, smarty-dev#266)

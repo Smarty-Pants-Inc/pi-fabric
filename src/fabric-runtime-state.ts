@@ -163,6 +163,9 @@ export interface FabricRuntimeStateOptions {
   entryIdentity?: FabricLoadedFileIdentity;
 }
 
+// ponytail: 10 min covers a reload wave's gap; a longer downtime is future-only by design.
+const MAIN_ACTOR_MESH_REPLAY_MS = 10 * 60_000;
+
 export class FabricRuntimeState {
   #registry: ActionRegistry | undefined;
   #config: FabricConfig | undefined;
@@ -709,6 +712,11 @@ export class FabricRuntimeState {
             retention: this.#config.retention,
             resolvePiModel: (model) => resolveParticipantPiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
+            // A /reload or restart of this session resumes its actors' mesh stream where the
+            // last runtime stopped, so events published in between still reach them
+            // (smarty-dev#472). A longer downtime replays only its last minutes.
+            meshCursorPath: path.join(actorRoots.session, "mesh-cursor.json"),
+            meshReplayAgeMs: MAIN_ACTOR_MESH_REPLAY_MS,
           }
         : {
             persistent: false,

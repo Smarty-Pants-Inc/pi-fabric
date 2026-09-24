@@ -15,17 +15,28 @@ export class ActorMeshMonitor {
   #polling = false;
   #closed = false;
   #started = false;
+  /** Events created before this are not delivered when resuming from a saved cursor. */
+  #replayFloor: number | undefined;
 
   constructor(
     readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail">,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
+      /**
+       * On resume from a saved cursor, deliver only events newer than this many ms, so a
+       * restart replays the gap it missed and not a long downtime (#37's replay storm).
+       */
+      maxReplayAgeMs?: number | undefined;
       beforePoll(): boolean;
       onEvent(event: MeshEvent): void;
     },
   ) {
-    this.#offset = this.#readCursor() ?? mesh.latestOffset();
+    const saved = this.#readCursor();
+    this.#offset = saved ?? mesh.latestOffset();
+    if (saved !== undefined && callbacks.maxReplayAgeMs !== undefined) {
+      this.#replayFloor = Date.now() - callbacks.maxReplayAgeMs;
+    }
   }
 
   start(): void {
@@ -89,7 +100,10 @@ export class ActorMeshMonitor {
     try {
       const tail = this.mesh.tail(this.#offset, this.config.maxReadEvents);
       this.#offset = tail.nextOffset;
-      for (const event of tail.events) this.callbacks.onEvent(event);
+      for (const event of tail.events) {
+        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor) continue;
+        this.callbacks.onEvent(event);
+      }
       this.#writeCursor();
     } finally {
       this.#polling = false;

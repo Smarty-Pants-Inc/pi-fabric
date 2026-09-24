@@ -286,6 +286,8 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
+      /** With meshCursorPath: on resume, replay only events newer than this (ms). */
+      meshReplayAgeMs?: number;
       relayParticipantSteering?: boolean;
       retention?: FabricRetentionConfig;
       acquireCapabilityView?(
@@ -327,6 +329,7 @@ export class ActorManager {
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
+      maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();

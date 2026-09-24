@@ -228,6 +228,61 @@ describe("ActorManager presence under a stalled mesh lock", () => {
   }, 20_000);
 });
 
+// smarty-dev#472: a Main-hosted actor lost every event published while its session reloaded,
+// because each runtime started its mesh stream at the tail.
+describe("ActorManager across a session reload", () => {
+  const reloadable = (root: string, mesh: MeshStore, agents: AgentManager, replayAgeMs = 10 * 60_000) => {
+    const manager = new ActorManager(
+      "reload", { id: "session:reload", name: "main", kind: "main", sessionId: "reload" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+      {
+        actorRoot: path.join(root, "actors"), persistent: true,
+        meshCursorPath: path.join(root, "actors", "mesh-cursor.json"), meshReplayAgeMs: replayAgeMs,
+      },
+    );
+    actorManagers.push(manager);
+    return manager;
+  };
+
+  it("delivers an event published while the session reloaded, after the reload", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const before = reloadable(root, mesh, agents);
+    const actor = await before.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    await mesh.publish({ topic: "team.pulls", from, text: "before the reload" });
+    await waitFor(() => before.messages(actor.id).some((message) => message.direction === "out" && !message.error));
+    await before.close();                                    // the old runtime is gone ...
+    await mesh.publish({ topic: "team.pulls", from, text: "during the reload" });
+    const after = reloadable(root, mesh, agents);            // ... and the new one starts
+    await waitFor(() => after.messages(actor.id).filter((message) => message.direction === "out" && !message.error).length === 2, 15_000);
+  }, 30_000);
+
+  it("does not replay events older than the replay window after a long downtime", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const before = reloadable(root, mesh, agents);
+    const actor = await before.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    await before.close();
+    await mesh.publish({ topic: "team.pulls", from, text: "long ago" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const after = reloadable(root, mesh, agents, 100);      // the event is older than the window
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(after.messages(actor.id).filter((message) => message.direction === "out")).toEqual([]);
+  }, 30_000);
+});
+
 describe("ActorManager", () => {
   it("updates inference context on the same identity, preserves policy/history, and restores it", async () => {
     const s = setup(true);

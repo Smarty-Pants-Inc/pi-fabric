@@ -157,6 +157,8 @@ await agents.tell({ id: supervisor.id, message: "Own the remaining migration." }
 return { audit, supervisor };
 ```
 
+A Main session's actors keep a mesh cursor in the session's actor directory. After `/reload` or a restart of that session, they receive the topic events that were published while no runtime was reading them. A longer downtime replays only its last 10 minutes, and a new session starts at the current end of the log.
+
 The first durable request starts one hidden resident host for the current root when needed. Fabric transfers actor ownership to this host or starts the one-shot run there. It publishes the owner in the standard participant directory. Fabric routes `steer`, `followUp`, `tell`, blocking `ask`, and `stop` through the acknowledged mesh control plane. The process uses the captured agent, mesh, timeout, recursion, and cost-ceiling configuration. It also uses the runner, model, and tool capabilities that the originating call explicitly authorized. Users do not configure a daemon profile or workflow policy.
 
 The original TUI can shut down after the transfer. Durable agents continue until they reach a terminal status. A resumed copy of the same root can call `agents.status`, `agents.wait`, `agents.log`, and `agents.cleanup`. The mesh stores terminal notifications and active actor deliveries until Main resumes. Durable actors keep their registry definition, mailbox history, runner session, mesh subscriptions, and replay cursor. Main relays session-bound host events while it is available. The cross-process relay can omit oversized raw image blocks. The relay keeps their redacted media descriptors.

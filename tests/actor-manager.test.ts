@@ -1504,6 +1504,86 @@ describe("ActorManager", () => {
     expect(actors.messages(actor.id).filter((message) => message.error?.startsWith("Dropped a queued event"))).toEqual([]);
   }, 30_000);
 
+  // Records every actor activation (the manager cleans completed runs out of agents.list()).
+  const recordRuns = (agents: AgentManager) => {
+    const runs: Array<{ task: string; startedAt: number; finishedAt?: number }> = [];
+    const run = agents.run.bind(agents);
+    vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+      const entry: { task: string; startedAt: number; finishedAt?: number } = { task: request.task, startedAt: Date.now() };
+      runs.push(entry);
+      try { return await run(request, signal); } finally { entry.finishedAt = Date.now(); }
+    });
+    return runs;
+  };
+
+  // Astra review of #36, R1: a run that completes while ownership is elsewhere is recorded,
+  // never parked and run a second time.
+  it("records, and does not rerun, an event whose run completed while ownership was away", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(false, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "LIVE_WITH_PROGRESS once" });
+    // The manager has seen the run's progress, so an abort detaches it and it completes.
+    await waitFor(() => agents.list().some((run) => ((run as { turns?: number }).turns ?? 0) > 0));
+    owned = false;
+    actors.listOwned();                                        // the caller aborts; the progressing run is detached
+    await waitFor(() => actors.messages(actor.id).some((message) => message.error?.startsWith("Dropped a queued event")), 10_000);
+    owned = true;
+    actors.listOwned();
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(runs.filter((run) => run.task.includes("LIVE_WITH_PROGRESS once"))).toHaveLength(1);
+  }, 30_000);
+
+  // Astra review of #36, R2: ESC cancels parked events too, even with their restore already scheduled.
+  it("cancels parked events on an interrupt that arrives before their restore runs", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(false, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "team.pulls", from, text: "held-2" });
+    await mesh.publish({ topic: "team.pulls", from, text: "held-3" });
+    await waitFor(() => actors.status(actor.id).queued === 2);
+    owned = false;
+    actors.listOwned();                                        // held-2 and held-3 park
+    owned = true;
+    actors.listOwned();                                        // their restore is scheduled ...
+    actors.haltAll();                                          // ... and ESC arrives first
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(runs.filter((run) => run.task.includes("held-"))).toEqual([]);
+    expect(actors.messages(actor.id).filter((message) => message.error?.includes("halted by user interrupt"))).toHaveLength(2);
+  }, 30_000);
+
+  // Astra review of #36, R3: after a reload, restored work waits for the old drain's run.
+  it("runs restored events only after the reloaded actor's previous run settles", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(true, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS serial-1" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "team.pulls", from, text: "serial-2" });
+    await waitFor(() => actors.status(actor.id).queued === 1);
+    await waitFor(() => agents.list().some((run) => ((run as { turns?: number }).turns ?? 0) > 0));
+    owned = false;
+    actors.listOwned();
+    owned = true;
+    actors.listOwned();                                        // reload: new actor object, serial-2 restored
+    await waitFor(() => runs.some((run) => run.task.includes("serial-2") && run.finishedAt !== undefined), 15_000);
+    const first = runs.filter((run) => run.task.includes("serial-1"));
+    const second = runs.filter((run) => run.task.includes("serial-2"));
+    expect(first).toHaveLength(1);                             // the detached run was not restarted
+    expect(second).toHaveLength(1);
+    expect(second[0]!.startedAt).toBeGreaterThanOrEqual(first[0]!.finishedAt!);
+  }, 30_000);
+
   it("routes host events and durable topic events to subscriptions", async () => {
     const { actors, mesh } = setup();
     const actor = await actors.create({

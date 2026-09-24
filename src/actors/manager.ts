@@ -205,6 +205,8 @@ export class ActorManager {
   readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
   readonly #parked = new Map<string, ActorQueueItem[]>();
+  /** Actor ids with a drain in flight, possibly on an object a registry reload replaced. */
+  readonly #drainingIds = new Set<string>();
   readonly #actorRoot: string;
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
@@ -1029,6 +1031,7 @@ export class ActorManager {
     if (event === "input" && this.#halted) {
       this.#halted = false;
       this.#meshMonitor.schedule();
+      this.#scheduleRestoreParked();
     }
     if (this.#halted) return false;
     if (MAIN_REVISION_EVENTS.has(event)) this.#mainRevision++;
@@ -1086,6 +1089,12 @@ export class ActorManager {
     // work) so an idle-but-subscribed actor is not re-armed by the interrupt's
     // own settle events.
     this.#halted = true;
+    // Parked events are queued work too: an interrupt cancels them (recorded).
+    for (const [id, items] of [...this.#parked]) {
+      this.#parked.delete(id);
+      const owner = this.#actors.get(id);
+      if (owner) this.#drop(owner, items, `Fabric actor ${owner.name} (${owner.id}) halted by user interrupt`);
+    }
     for (const actor of this.#actors.values()) {
       if (!this.#canManage(actor.id) || actor.status === "stopped") continue;
       const inFlight = actor.abortController !== undefined;
@@ -1256,6 +1265,9 @@ export class ActorManager {
   #ensureDrain(actor: ManagedActor): void {
     if (
       actor.draining ||
+      // One activation at a time per actor session, even across a registry reload that
+      // replaced the object an older drain still runs on (smarty-dev#442).
+      this.#drainingIds.has(actor.id) ||
       actor.status === "stopped" ||
       this.#closing ||
       !this.#canManage(actor.id)
@@ -1263,6 +1275,7 @@ export class ActorManager {
       return;
     }
     actor.draining = true;
+    this.#drainingIds.add(actor.id);
     const drain = this.#drain(actor);
     actor.drain = drain;
     const release = (): void => {
@@ -1337,6 +1350,10 @@ export class ActorManager {
             abortController.signal,
           );
           runId = result.id;
+          // Captured before any check that can throw: a completed run is never parked and
+          // rerun, whatever happens to ownership afterwards.
+          runCompleted = result.status === "completed";
+          runStopped = result.status === "stopped";
           if (actor.ownershipAbort === abortController && result.status !== "completed") {
             // An ownership change stopped this run; the event runs again under its owner.
             delete actor.ownershipAbort;
@@ -1352,8 +1369,6 @@ export class ActorManager {
             actor.runnerSessionId = result.runnerSessionId;
             await this.#saveActors();
           }
-          runCompleted = result.status === "completed";
-          runStopped = result.status === "stopped";
           if (result.status !== "completed") {
             if (actor.responseMode === "directive") {
               // A failed directive run is non-fatal: stay silent and keep the
@@ -1483,6 +1498,10 @@ export class ActorManager {
       // concurrent #ensureDrain observes `draining === false` and starts a
       // fresh drain instead of stranding a just-enqueued item.
       actor.draining = false;
+      this.#drainingIds.delete(actor.id);
+      // A reload may have moved this actor's queue to a new object while this drain ran.
+      const live = this.#actors.get(actor.id);
+      if (live && live !== actor && live.queue.length > 0) queueMicrotask(() => this.#ensureDrain(live));
     }
   }
 
@@ -2379,6 +2398,8 @@ export class ActorManager {
   #scheduleRestoreParked(): void {
     if (this.#parked.size === 0 || this.#closing) return;
     queueMicrotask(() => {
+      // An interrupt holds parked work until the user resumes (the halt gate).
+      if (this.#halted || this.#closing) return;
       for (const [id, items] of [...this.#parked]) {
         const actor = this.#actors.get(id);
         if (!actor || actor.status === "stopped" || !this.#canManageCached(id)) continue;

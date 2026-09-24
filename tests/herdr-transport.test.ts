@@ -3,7 +3,7 @@ import net, { type Server } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { HerdrTransport, abortableSleep, type HerdrTransportOptions } from "../src/agents/transports/herdr-transport.js";
+import { HerdrTransport, abortableSleep, canonicalSocket, type HerdrTransportOptions } from "../src/agents/transports/herdr-transport.js";
 
 const servers: Server[] = [];
 const roots: string[] = [];
@@ -229,8 +229,18 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
     await expect(handle.isAlive()).resolves.toBe(true);           // gone at t=0: unknown
     monotonic = 4 * 60_000;
     await expect(handle.isAlive()).resolves.toBe(true);
+    expect(handle.lostContact?.()).toBeUndefined();
     monotonic = 5 * 60_000;
-    await expect(handle.isAlive()).resolves.toBe(false);          // gone for the whole bound: dead
+    await expect(handle.isAlive()).resolves.toBe(false);          // gone for the whole bound: lost, not proven dead
+    expect(handle.lostContact?.()).toMatch(/Herdr server has been unreachable for 300 s; pane .* may still run/);
+  });
+
+  it("does not report lost contact for a pane that a reachable server says is gone", async () => {
+    const { socketPath } = await startServer();
+    const handle = await herdr(socketPath).launch(launchRequest);
+    await handle.stop();
+    await expect(handle.isAlive()).resolves.toBe(false);
+    expect(handle.lostContact?.()).toBeUndefined();
   });
 
   // dev-lead review F3/F5: adoption and cleanup match this run's id, never a shared name.
@@ -238,15 +248,19 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
   describe("layout.apply budget", () => {
     const applies = (requests: Array<{ method: string }>) =>
       requests.filter((request) => request.method === "layout.apply").length;
-    const clock = (start: number) => {
-      const state = { now: start, sleeps: [] as number[] };
+    // A sleep advances the monotonic clock by ms and the wall clock by ms + wallDrift (a
+    // negative drift is a wall clock that steps back during each wait).
+    const clock = (start: number, wallDrift = 0) => {
+      const state = { now: start, monotonic: 0, sleeps: [] as number[] };
       return {
         state,
         now: () => state.now,
+        monotonicNow: () => state.monotonic,
         sleep: async (ms: number, signal?: AbortSignal) => {
           if (signal?.aborted) throw signal.reason;
           state.sleeps.push(ms);
-          state.now += ms;
+          state.now += ms + wallDrift;
+          state.monotonic += ms;
         },
       };
     };
@@ -264,7 +278,7 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
       const time = clock(1_000 * 60_000 + 5_000);
       // A transport per launch stands in for separate Fabric processes: only the ledger is shared.
       const launch = (id: string) =>
-        herdr(socketPath, { spawnsPerMinute: 2, now: time.now, sleep: time.sleep }).launch({ ...launchRequest, id });
+        herdr(socketPath, { spawnsPerMinute: 2, now: time.now, monotonicNow: time.monotonicNow, sleep: time.sleep }).launch({ ...launchRequest, id });
       await launch("run-a");
       await launch("run-b");
       expect(time.state.sleeps).toEqual([]);
@@ -280,9 +294,33 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
       const time = clock(2_000 * 60_000);
       fs.mkdirSync(ledger(socketPath), { recursive: true, mode: 0o700 });
       for (let minute = 2_000; minute <= 2_003; minute++) fs.writeFileSync(path.join(ledger(socketPath), `${minute}-0`), "");
-      const transport = herdr(socketPath, { spawnsPerMinute: 1, now: time.now, sleep: time.sleep });
+      const transport = herdr(socketPath, { spawnsPerMinute: 1, now: time.now, monotonicNow: time.monotonicNow, sleep: time.sleep });
       await expect(transport.launch(launchRequest)).rejects.toThrow("Herdr launch budget exhausted");
       expect(applies(requests)).toBe(0);
+    });
+
+    // dev-lead review D6: the two-minute bound is monotonic, jitter included.
+    it("fails at the monotonic deadline instead of applying late, even with maximum jitter", async () => {
+      const { socketPath, requests } = await startServer();
+      const time = clock(2_100 * 60_000);                        // a full minute boundary
+      fs.mkdirSync(ledger(socketPath), { recursive: true, mode: 0o700 });
+      for (const minute of [2_100, 2_101]) fs.writeFileSync(path.join(ledger(socketPath), `${minute}-0`), "");
+      // Minute 2_102 is free: the old two-rollover wait reached it at 134 s and applied late.
+      const transport = herdr(socketPath, { spawnsPerMinute: 1, now: time.now, monotonicNow: time.monotonicNow, sleep: time.sleep, random: () => 0.999 });
+      await expect(transport.launch(launchRequest)).rejects.toThrow("Herdr launch budget exhausted");
+      expect(applies(requests)).toBe(0);
+      expect(time.state.monotonic).toBeLessThanOrEqual(120_000);
+    });
+
+    it("keeps the monotonic bound when the wall clock steps back during each wait", async () => {
+      const { socketPath, requests } = await startServer();
+      const time = clock(2_200 * 60_000, -50_000);
+      fs.mkdirSync(ledger(socketPath), { recursive: true, mode: 0o700 });
+      for (let minute = 2_195; minute <= 2_205; minute++) fs.writeFileSync(path.join(ledger(socketPath), `${minute}-0`), "");
+      const transport = herdr(socketPath, { spawnsPerMinute: 1, now: time.now, monotonicNow: time.monotonicNow, sleep: time.sleep, random: () => 0.999 });
+      await expect(transport.launch(launchRequest)).rejects.toThrow("Herdr launch budget exhausted");
+      expect(applies(requests)).toBe(0);
+      expect(time.state.monotonic).toBeLessThanOrEqual(120_000);
     });
 
     it("stops waiting when the manager closes", async () => {
@@ -294,6 +332,7 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
       const transport = herdr(socketPath, {
         spawnsPerMinute: 1,
         now: time.now,
+        monotonicNow: time.monotonicNow,
         sleep: async (ms, signal) => { closing.abort(new Error("Fabric agent manager is closing")); await time.sleep(ms, signal); },
       });
       await expect(transport.launch({ ...launchRequest, signal: closing.signal })).rejects.toThrow("closing");
@@ -350,6 +389,62 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
       await new HerdrTransport(env(socketPath)).launch(launchRequest);
       expect(applies(requests)).toBe(1);
       expect(fs.readdirSync(shared)).toEqual([]);
+    });
+
+    // dev-lead review D4: a private parent is not enough when a higher ancestor can replace it.
+    it.skipIf(process.platform === "win32")("does not use a ledger below an ancestor that others can replace", async () => {
+      const { socketPath, requests } = await startServer();
+      const shared = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-herdr-shared-"));
+      roots.push(shared);
+      const session = path.join(shared, "session");
+      fs.mkdirSync(session, { mode: 0o700 });
+      fs.chmodSync(shared, 0o777);                               // other-writable, not sticky
+      await herdr(socketPath, { spawnLedgerDir: path.join(session, "spawns") }).launch(launchRequest);
+      expect(applies(requests)).toBe(1);
+      expect(fs.existsSync(path.join(session, "spawns"))).toBe(false);
+    });
+
+    it.skipIf(process.platform === "win32")("accepts a ledger below a sticky shared ancestor", async () => {
+      const { socketPath } = await startServer();
+      const shared = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-herdr-sticky-"));
+      roots.push(shared);
+      const session = path.join(shared, "session");
+      fs.mkdirSync(session, { mode: 0o700 });
+      fs.chmodSync(shared, 0o1777);                              // as /tmp
+      await herdr(socketPath, { spawnLedgerDir: path.join(session, "spawns") }).launch(launchRequest);
+      expect(fs.readdirSync(path.join(session, "spawns"))).toHaveLength(1);
+    });
+
+    // dev-lead review D5: an alias whose target a live handoff removed keeps the server's identity.
+    it.skipIf(process.platform === "win32")("gives an alias the same identity while its target is gone and after it returns", () => {
+      const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-herdr-alias-")));
+      roots.push(dir);
+      const target = path.join(dir, "herdr.sock");
+      const alias = path.join(dir, "alias.sock");
+      const chained = path.join(dir, "chained.sock");
+      fs.symlinkSync(target, alias);
+      fs.symlinkSync(alias, chained);
+      expect(canonicalSocket(alias)).toBe(target);               // target missing
+      expect(canonicalSocket(chained)).toBe(target);
+      fs.writeFileSync(target, "");
+      expect(canonicalSocket(alias)).toBe(target);               // target back
+      expect(canonicalSocket(chained)).toBe(target);
+      fs.rmSync(target);
+      expect(canonicalSocket(target)).toBe(target);
+    });
+
+    it.skipIf(process.platform === "win32")("joins launches of one run through an alias and its target", async () => {
+      const { socketPath, requests } = await startServer();
+      const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-herdr-link-"));
+      roots.push(linkDir);
+      const linked = path.join(linkDir, "herdr.sock");
+      fs.symlinkSync(socketPath, linked);
+      const [first, second] = await Promise.all([
+        new HerdrTransport(env(socketPath)).launch(launchRequest),
+        new HerdrTransport(env(linked)).launch(launchRequest),
+      ]);
+      expect(second).toBe(first);
+      expect(applies(requests)).toBe(1);
     });
 
     it.skipIf(process.platform === "win32")("does not use a ledger whose parent directory others can write", async () => {

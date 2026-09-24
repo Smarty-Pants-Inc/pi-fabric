@@ -75,7 +75,8 @@ const runLabel = (request: AgentTransportLaunch): string => `${request.name} · 
 // actor fan-out drove 260 of them in five minutes and froze Herdr (smarty-dev#266).
 const SPAWNS_PER_MINUTE = 20;
 // A launch waits for at most this many minute rollovers, then fails.
-const SPAWN_WAIT_MINUTES = 2;
+/** The longest a launch waits for a budget slot, on the monotonic clock. */
+const SPAWN_WAIT_MS = 120_000;
 // Waiting launches wake across the next minute's first 15 s, not in one burst.
 const SPAWN_JITTER_MS = 15_000;
 
@@ -88,6 +89,8 @@ export interface HerdrTransportOptions {
   /** Monotonic clock for local bounds. */
   monotonicNow?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Source of the wait jitter, in [0, 1). */
+  random?: () => number;
 }
 
 export const abortableSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
@@ -98,33 +101,62 @@ export const abortableSleep = (ms: number, signal?: AbortSignal): Promise<void> 
     signal?.addEventListener("abort", abort, { once: true });
   });
 
-// The ledger sits beside the Herdr socket: one per server (the socket's real path), in
-// the directory of the user who owns that server, and the same for every process
-// whatever its TMPDIR. Windows sockets are pipe names, so they hash into the temp directory.
+// The server's stable identity: the socket's real path, following symlinks by hand when a
+// live handoff has removed the final target, so an alias and its target always agree.
+export const canonicalSocket = (socketPath: string): string => {
+  let current = path.resolve(socketPath);
+  for (let hops = 0; hops < 40; hops++) {
+    try {
+      return fs.realpathSync(current);
+    } catch {
+      try {
+        if (!fs.lstatSync(current).isSymbolicLink()) break;
+        current = path.resolve(path.dirname(current), fs.readlinkSync(current));
+        continue;
+      } catch {
+        break; // the final target is gone
+      }
+    }
+  }
+  try {
+    return path.join(fs.realpathSync(path.dirname(current)), path.basename(current));
+  } catch {
+    return current;
+  }
+};
+
+// The ledger sits beside the Herdr socket: one per server (its canonical path), in the
+// directory of the user who owns that server, and the same for every process whatever
+// its TMPDIR. Windows sockets are pipe names, so they hash into the temp directory.
 const spawnLedgerFor = (socketPath: string): string => {
   if (process.platform === "win32") {
     const server = createHash("sha256").update(socketPath).digest("hex").slice(0, 16);
     return path.join(os.tmpdir(), "pi-fabric-herdr-spawns", server);
   }
-  let real: string;
-  try {
-    real = fs.realpathSync(socketPath);
-  } catch {
-    real = path.resolve(socketPath); // gone during a live handoff
+  return `${canonicalSocket(socketPath)}.pi-fabric-spawns`;
+};
+
+// Every ancestor must be one that no other account can rename or replace: owned by this
+// user or root, and not writable by others unless sticky (as /tmp). Then no pathname used
+// below can be redirected after the check.
+const unsafeAncestor = (directory: string): string | undefined => {
+  const uid = process.getuid?.();
+  for (let current = path.dirname(directory); ; current = path.dirname(current)) {
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return `${current} is not a real directory`;
+    if (stat.uid !== uid && stat.uid !== 0) return `${current} is owned by another user`;
+    if ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) return `${current} is writable by other users`;
+    if (path.dirname(current) === current) return undefined;
   }
-  return `${real}.pi-fabric-spawns`;
 };
 
 // Creates the ledger directory, or accepts an existing one, only when it is a real
-// directory owned by this user and writable by nobody else: a slot must not be
-// forgeable or redirected by another account.
+// directory owned by this user and writable by nobody else, below ancestors that nobody
+// else can replace: a slot must not be forgeable or redirected by another account.
 const privateLedger = (directory: string): string | undefined => {
   if (process.platform !== "win32") {
-    // The parent is where another account could swap the ledger for its own directory.
-    const parent = fs.lstatSync(path.dirname(directory));
-    if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o022) !== 0) {
-      return "its parent directory is not private to this user";
-    }
+    const unsafe = unsafeAncestor(directory);
+    if (unsafe) return unsafe;
   }
   try {
     fs.mkdirSync(directory, { mode: 0o700, recursive: process.platform === "win32" });
@@ -177,7 +209,9 @@ export class HerdrTransport implements AgentTransportAdapter {
   }
 
   launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
-    const key = `${this.environment.HERDR_SOCKET_PATH ?? ""}\0${request.id}`;
+    const socket = this.environment.HERDR_SOCKET_PATH ?? "";
+    const server = process.platform === "win32" ? socket : canonicalSocket(socket);
+    const key = `${server}\0${request.id}`;
     const pending = launching.get(key);
     if (pending) return pending;
     const launched = this.#launch(request).finally(() => {
@@ -220,6 +254,7 @@ export class HerdrTransport implements AgentTransportAdapter {
     const livePane = paneId;
     const monotonicNow = this.options.monotonicNow ?? (() => performance.now());
     let serverGoneSince: number | undefined;
+    let lost: string | undefined;
     return {
       kind: this.kind,
       livenessPollIntervalMs: EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS,
@@ -228,21 +263,28 @@ export class HerdrTransport implements AgentTransportAdapter {
       // so a lost run is never relaunched beside it.
       relaunchable: false,
       ...(terminalId ? { attachCommand: `herdr terminal attach ${terminalId}` } : {}),
+      lostContact: () => lost,
       isAlive: async () => {
         try {
           await this.#request({ method: "pane.get", params: { pane_id: livePane } });
           serverGoneSince = undefined;
+          lost = undefined;
           return true;
         } catch (error) {
           // Only a reachable server's pane_not_found ends the run at once. A dropped call is
           // re-polled, and a gone server (a live handoff keeps the panes running) ends it
           // only after SERVER_GONE_LIMIT_MS; the run then fails, because Herdr handles are
-          // never relaunched. ponytail: a Herdr API that stays hung keeps the run alive
-          // until its deadline.
-          if (error instanceof HerdrApiError && error.herdrCode === "pane_not_found") return false;
+          // never relaunched, and as lost contact, not an exit (lostContact). ponytail: a
+          // Herdr API that stays hung keeps the run alive until its deadline.
+          if (error instanceof HerdrApiError && error.herdrCode === "pane_not_found") {
+            lost = undefined;
+            return false;
+          }
           if (!serverGone(error)) return true;
           serverGoneSince ??= monotonicNow();
-          return monotonicNow() - serverGoneSince < SERVER_GONE_LIMIT_MS;
+          if (monotonicNow() - serverGoneSince < SERVER_GONE_LIMIT_MS) return true;
+          lost = `the Herdr server has been unreachable for ${Math.round(SERVER_GONE_LIMIT_MS / 1000)} s; pane ${livePane} may still run`;
+          return false;
         }
       },
       stop: async () => {
@@ -293,9 +335,18 @@ export class HerdrTransport implements AgentTransportAdapter {
     const limit = this.options.spawnsPerMinute ?? SPAWNS_PER_MINUTE;
     const now = this.options.now ?? Date.now;
     const sleep = this.options.sleep ?? abortableSleep;
+    const monotonicNow = this.options.monotonicNow ?? (() => performance.now());
+    const random = this.options.random ?? Math.random;
     const directory = this.options.spawnLedgerDir ?? spawnLedgerFor(this.environment.HERDR_SOCKET_PATH ?? "");
-    for (let waited = 0; ; waited++) {
+    // Wall time only names the shared minute slots; the wait itself is bounded monotonically.
+    const deadline = monotonicNow() + SPAWN_WAIT_MS;
+    const exhausted = (): Error => new Error(
+      `Herdr launch budget exhausted: ${limit} launches per minute into this Herdr server, ` +
+      `with none free for ${SPAWN_WAIT_MS / 60_000} minutes. Use transport "process" for actors and background agents.`,
+    );
+    for (;;) {
       if (signal?.aborted) throw signal.reason;
+      if (monotonicNow() >= deadline) throw exhausted();
       const minute = Math.floor(now() / 60_000);
       try {
         const unusable = privateLedger(directory);
@@ -318,15 +369,12 @@ export class HerdrTransport implements AgentTransportAdapter {
         ledgerUnusable(directory, (error as Error).message);
         return;
       }
-      if (waited >= SPAWN_WAIT_MINUTES) {
-        throw new Error(
-          `Herdr launch budget exhausted: ${limit} launches per minute into this Herdr server, ` +
-          `with none free for ${SPAWN_WAIT_MINUTES} minutes. Use transport "process" for actors and background agents.`,
-        );
-      }
-      // Clamped, so a wall clock that steps back cannot stretch the wait.
+      const remaining = deadline - monotonicNow();
+      if (remaining <= 0) throw exhausted();
+      // Clamped, so a wall clock that steps back cannot stretch the wait, and the whole
+      // sleep, jitter included, ends by the deadline.
       const untilNextMinute = Math.min(60_000, Math.max(0, (minute + 1) * 60_000 - now()));
-      await sleep(untilNextMinute + Math.floor(Math.random() * SPAWN_JITTER_MS), signal);
+      await sleep(Math.min(remaining, untilNextMinute + Math.floor(random() * SPAWN_JITTER_MS)), signal);
     }
   }
 

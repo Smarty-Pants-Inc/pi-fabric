@@ -513,6 +513,44 @@ describe("AgentManager", () => {
     }
   }, 30_000);
 
+  // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
+  // neither cleanup nor shutdown deletes files that the still-running worker may use.
+  it("fails a run whose transport lost contact as lost, and keeps its worker's files", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launches++;
+      handles.push(handle);
+      // As a Herdr handle past its bound: the worker keeps running, contact is lost.
+      return { ...handle, relaunchable: false, isAlive: async () => false, lostContact: () => "the Herdr server has been unreachable for 300 s" };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      expect(launches).toBe(1);
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      expect(result.error).not.toContain("exited without a result");
+      const runDirectory = manager.runDirectory(result.id)!;
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
+      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(await handles[0]!.isAlive()).toBe(true);           // the real worker still runs
+      await manager.close();
+      expect(fs.existsSync(runDirectory)).toBe(true);           // shutdown kept its files
+    } finally {
+      spy.mockRestore();
+      for (const handle of handles) await handle.stop();
+    }
+  }, 30_000);
+
   // dev-lead review F2: a stop that does not take effect must never lead to a second worker.
   it("fails the run instead of relaunching while the previous worker is still alive after its stop", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));

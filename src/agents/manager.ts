@@ -180,6 +180,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   lastRetriedTransportFailure?: AgentRunResult;
   /** Set when a relaunch failed; the run settles with it, not the attempt it replaced. */
   relaunchFailure?: AgentRunRecord;
+  /** Set when the run failed because its transport lost contact: its worker may still run. */
+  lostContact?: string;
   model?: string;
   thinking?: AgentRunRequest["thinking"];
   actorId?: string;
@@ -1157,6 +1159,12 @@ export class AgentManager {
   async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
+    if (managed.lostContact) {
+      throw new Error(
+        `Cannot clean up agent ${id}: Fabric lost track of its worker (${managed.lostContact}), which may still ` +
+        `use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
+      );
+    }
     this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
@@ -1267,7 +1275,9 @@ export class AgentManager {
     const all = [...this.#runs.values()];
     await Promise.allSettled(all.map((managed) => this.#waitForTransportExit(managed)));
     const transports = [...all.map((managed) => managed.transport), ...this.#unregisteredTransports];
-    const alive = await Promise.all(transports.map((transport) => transport.isAlive().catch(() => true)));
+    // Lost contact is not an exit: such a worker may still use its files.
+    const alive = await Promise.all(transports.map((transport) =>
+      transport.isAlive().then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean)) {
       this.#unregisteredTransports.clear();
@@ -1318,7 +1328,7 @@ export class AgentManager {
       });
     }
     const expired = [...this.#runs.values()].filter((managed) => {
-      if (!managed.settled || managed.actorId) return false;
+      if (!managed.settled || managed.actorId || managed.lostContact) return false;
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       const finishedAt = record?.finishedAt ?? record?.updatedAt;
       return typeof finishedAt === "number" && now - finishedAt >= this.#retention.oneShotRunMs;
@@ -1454,8 +1464,8 @@ export class AgentManager {
       // exit this is a no-op; if liveness was misjudged (a dropped transport call),
       // it ends the old worker instead of racing it on the same task.
       // ponytail: the stop is unconditional because a misjudged liveness check is the
-      // case it exists for. For a process worker that really exited, it signals a
-      // process group whose id Linux does not reuse within the retry delay.
+      // case it exists for. A process worker that really exited is not signalled: its
+      // transport saw the exit and never signals a numeric id that may be reused.
       const previousSession = managed.transport.sessionId;
       await managed.transport.stop().catch(() => undefined);
       await this.#waitForTransportExit(managed);
@@ -1618,6 +1628,19 @@ export class AgentManager {
         if (!alive) {
           firstObservedDeadAt ??= livenessCheckedAt;
           if (livenessCheckedAt - firstObservedDeadAt >= TRANSPORT_EXIT_GRACE_MS) {
+            const lost = managed.transport.lostContact?.();
+            if (lost) {
+              // Not an exit: never relaunched, retried or cleaned up automatically.
+              managed.lostContact = lost;
+              const failed = failedRecord(
+                managed,
+                "failed",
+                `Lost track of the worker: ${lost}. Fabric does not relaunch it or delete its files.`,
+              );
+              writeRecord(managed.statusFile, failed);
+              this.#settle(managed, failed);
+              return;
+            }
             const logSummary = summarizeRunLog(managed.runDirectory, 8);
             const failed = failedRecord(
               managed,

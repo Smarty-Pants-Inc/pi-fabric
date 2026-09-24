@@ -1470,6 +1470,40 @@ describe("ActorManager", () => {
     });
   });
 
+  // smarty-dev#442: an ownership flicker dropped about 20 queued PR events of a busy review
+  // actor. Queued mesh events (no caller) must survive it and run once ownership returns.
+  it.each([false, true])("keeps queued mesh events across an ownership flicker (persistent %s)", async (persistent) => {
+    let owned = true;
+    const { actors, mesh } = setup(persistent, () => owned);
+    const actor = await actors.create({
+      name: "reviewer",
+      instructions: "Review each event.",
+      topics: ["team.pulls"],
+      responseMode: "text",
+    });
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS event-1" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "team.pulls", from, text: "event-2" });
+    await mesh.publish({ topic: "team.pulls", from, text: "event-3" });
+    await waitFor(() => actors.status(actor.id).queued === 2);
+    actors.listOwned();                                            // ownership observed as true
+
+    owned = false;
+    actors.listOwned();                                            // observe the loss: park, abort the run
+    expect(actors.status(actor.id).queued).toBe(0);
+    owned = true;
+    actors.listOwned();                                            // observe the return: queued events come back
+
+    const ran = () => actors.messages(actor.id)
+      .filter((message) => message.direction === "out" && message.runId)
+      .map((message) => String((message as { text?: string }).text ?? "") + " " + message.source);
+    await waitFor(() => ran().length >= 3, 20_000);
+    const inbound = actors.messages(actor.id).filter((message) => message.direction === "in").length;
+    expect(inbound).toBe(3);
+    expect(actors.messages(actor.id).filter((message) => message.error?.startsWith("Dropped a queued event"))).toEqual([]);
+  }, 30_000);
+
   it("routes host events and durable topic events to subscriptions", async () => {
     const { actors, mesh } = setup();
     const actor = await actors.create({

@@ -1183,6 +1183,28 @@ describe("ActorManager", () => {
     expect(notices()).toHaveLength(2);
   }, 60_000);
 
+  // dev-lead review of #34: interrupted activations (ESC) are not failures, and no notice
+  // may start a turn while the halt holds.
+  it("does not count interrupted activations toward the owner notice", async () => {
+    const { actors, deliveries } = setup();
+    const actor = await actors.create({
+      name: "supervisor",
+      instructions: "Watch and steer only when needed.",
+      responseMode: "directive",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER + 1; run++) {
+      const asked = actors.ask(actor.id, "HANG").catch(() => undefined);
+      await waitFor(() => actors.status(actor.id).status === "running");
+      actors.haltAll();
+      await asked;
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      actors.dispatchHostEvent("input", {});                   // the user resumes
+    }
+    expect(deliveries.filter((text) => text.startsWith("Fabric host notice:"))).toEqual([]);
+  }, 60_000);
+
   // review/astra on #34: a completed run with an invalid directive is a failure too.
   it("counts completed runs whose directive is invalid toward the owner notice", async () => {
     const { actors, deliveries } = setup();

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FabricMainAgentInfo } from "../main-agent.js";
-import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type {
   FabricHostRecord,
   FabricParticipantInfo,
@@ -527,16 +527,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const root = [...desired.values()].find(
       (participant) => participant.kind === "root" && participant.id === this.options.rootId,
     );
+    // Every write of this heartbeat goes into ONE locked state write (smarty-dev#367):
+    // each separate put rewrote the whole shared state file under the mesh lock.
+    const ops: MeshBatchOperation[] = [];
     const legacySessionKey = this.#legacySessionKey();
     if (legacySessionKey && this.#quiescing) {
       const legacy = this.mesh.get(legacySessionKey);
       if (legacy?.updatedBy.id === this.options.identity.id) {
-        await this.mesh
-          .delete({ key: legacy.key, ifVersion: legacy.version })
-          .catch(() => undefined);
+        ops.push({ kind: "delete", key: legacy.key, ifVersion: legacy.version, onConflict: "skip" });
       }
     } else if (root && legacySessionKey && root.cwd && root.sessionId) {
-      await this.mesh.put({
+      ops.push({
+        kind: "put",
         key: legacySessionKey,
         value: {
           id: root.id,
@@ -555,7 +557,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
           pendingMessages: root.pendingMessages === true,
           local: false,
         },
-        identity: this.options.identity,
       });
     }
 
@@ -603,42 +604,42 @@ export class ParticipantDirectory implements FabricParticipantSource {
           continue;
         }
       }
-      await this.mesh.put({
+      ops.push({
+        kind: "put",
         key,
         value: record,
-        identity: this.options.identity,
         ...(occupied ? { ifVersion: occupied.version } : {}),
-      }).catch((error: unknown) => {
-        const latest = this.mesh.get(key);
-        const latestParticipant = latest && participantFromEntry(latest);
-        if (latestParticipant && latestParticipant.ownerHostId !== this.options.hostId) return;
-        throw error;
+        // Another host took the key meanwhile: leave it. Any other conflict fails the
+        // whole heartbeat (nothing written) so the next one retries.
+        onConflict: (latest) => {
+          const latestParticipant = latest && participantFromEntry(latest);
+          return latestParticipant && latestParticipant.ownerHostId !== this.options.hostId ? "skip" : "abort";
+        },
       });
     }
     for (const { entry, participant } of existing) {
       if (desired.has(participant.id)) continue;
-      await this.mesh.delete({ key: entry.key, ifVersion: entry.version }).catch(() => undefined);
+      ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
     }
 
-    // Stamp this host's lease last, once every slower write above is done: a
-    // refresh that outruns its own lease must not publish an already-expired
-    // lease, which would make peers — and this host's own list() — read the
-    // records it just wrote as stale.
-    const leaseAt = Date.now();
-    const host: FabricHostRecord = {
-      format: 1,
-      id: this.options.hostId,
-      rootId: this.options.rootId,
-      identity: this.options.identity,
-      startedAt: this.#startedAt,
-      updatedAt: leaseAt,
-      expiresAt: leaseAt + this.#leaseMs,
-    };
-    await this.mesh.put({
+    // Stamp this host's lease at commit time, under the lock: a refresh that
+    // outruns its own lease must not publish an already-expired lease, which
+    // would make peers — and this host's own list() — read the records it just
+    // wrote as stale.
+    ops.push({
+      kind: "put",
       key: keyFor(HOST_PREFIX, this.options.hostId),
-      value: host,
-      identity: this.options.identity,
+      value: (leaseAt: number): FabricHostRecord => ({
+        format: 1,
+        id: this.options.hostId,
+        rootId: this.options.rootId,
+        identity: this.options.identity,
+        startedAt: this.#startedAt,
+        updatedAt: leaseAt,
+        expiresAt: leaseAt + this.#leaseMs,
+      }),
     });
+    await this.mesh.writeBatch({ identity: this.options.identity, ops });
   }
 
   /**

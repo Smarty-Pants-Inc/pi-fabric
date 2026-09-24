@@ -2,8 +2,9 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  MeshBatchConflictError,
   MeshStore,
   type MeshIdentity,
   type MeshStateEntry,
@@ -247,7 +248,71 @@ describe("MeshStore", () => {
   });
 });
 
+describe("MeshStore.writeBatch", () => {
+  it("applies puts and deletes in one write, with per-operation compare-and-swap", async () => {
+    const store = createStore();
+    const a = await store.put({ key: "k/a", value: 1, identity });
+    const b = await store.put({ key: "k/b", value: 2, identity });
+    const renames = vi.spyOn(fs, "renameSync");
+    const results = await store.writeBatch({ identity, ops: [
+      { kind: "put", key: "k/a", value: 10, ifVersion: a.version },
+      { kind: "put", key: "k/b", value: 20, ifVersion: b.version + 5, onConflict: "skip" },
+      { kind: "delete", key: "k/missing" },
+      { kind: "put", key: "k/lease", value: (now: number) => ({ stampedAt: now }) },
+    ] });
+    const stateWrites = renames.mock.calls.filter(([, target]) => String(target).endsWith("state.json")).length;
+    renames.mockRestore();
+    expect(stateWrites).toBe(1);
+    expect(results.map((r) => r.applied)).toEqual([true, false, false, true]);
+    expect(store.get("k/a")?.value).toBe(10);
+    expect(store.get("k/b")?.value).toBe(2);                              // skipped
+    expect(typeof (store.get("k/lease")?.value as { stampedAt: number }).stampedAt).toBe("number");
+  });
+
+  it("deletes in a batch, keeps the tombstone version, and recreates only on the current version", async () => {
+    const store = createStore();
+    const put = await store.put({ identity, key: "batch/k", value: 1 });
+    const [deleted] = await store.writeBatch({ identity, ops: [{ kind: "delete", key: "batch/k", ifVersion: put.version }] });
+    expect(deleted).toEqual({ key: "batch/k", applied: true, version: put.version });
+    expect(store.get("batch/k")).toBeUndefined();
+    // A stale compare-and-swap against the deleted key conflicts; the tombstone version wins.
+    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "batch/k", value: 2, ifVersion: put.version - 1 }] }))
+      .rejects.toThrow(/expected version/);
+    const [recreated] = await store.writeBatch({ identity, ops: [{ kind: "put", key: "batch/k", value: 3, ifVersion: put.version }] });
+    expect(recreated).toEqual({ key: "batch/k", applied: true, version: put.version + 1 });
+    expect(store.get("batch/k")?.value).toBe(3);
+  });
+
+  it("keeps state that another writer wrote between two batches", async () => {
+    const a = createStore();
+    const dir = a.root;
+    const b = new MeshStore(dir, 64 * 1024, 100);
+    await a.writeBatch({ identity, ops: [{ kind: "put", key: "batch/a", value: "a1" }] });
+    await b.put({ identity, key: "batch/b", value: "b1" });
+    await a.writeBatch({ identity, ops: [{ kind: "put", key: "batch/a", value: "a2" }, { kind: "delete", key: "batch/none" }] });
+    const fresh = new MeshStore(dir, 64 * 1024, 100);
+    expect(fresh.get("batch/a")?.value).toBe("a2");
+    expect(fresh.get("batch/b")?.value).toBe("b1");
+  });
+
+  it("writes nothing when an operation aborts on conflict, or when nothing applies", async () => {
+    const store = createStore();
+    const a = await store.put({ key: "k/a", value: 1, identity });
+    await expect(store.writeBatch({ identity, ops: [
+      { kind: "put", key: "k/new", value: 1 },
+      { kind: "put", key: "k/a", value: 2, ifVersion: a.version + 1, onConflict: (current) => (current ? "abort" : "skip") },
+    ] })).rejects.toBeInstanceOf(MeshBatchConflictError);
+    expect(store.get("k/new")).toBeUndefined();                          // all or nothing
+    const statePath = path.join(store.root, "state.json");
+    const before = fs.statSync(statePath);
+    await store.writeBatch({ identity, ops: [{ kind: "delete", key: "k/missing" }] });
+    const after = fs.statSync(statePath);
+    expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+  });
+});
+
 describe("MeshStore lock recovery", () => {
+
   const holdLock = (store: MeshStore, owner?: string): string => {
     const lockPath = path.join(store.root, ".lock");
     fs.mkdirSync(lockPath, { mode: 0o700 });

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { ACTOR_FAILURE_NOTICE_AFTER, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -1159,6 +1159,29 @@ describe("ActorManager", () => {
     const passive = await actors.setDeliveryPolicy(actor.id, "steer", false);
     expect(passive).toMatchObject({ delivery: "steer", triggerTurn: false, messages });
   });
+
+  // smarty-dev#390: activation-context supervisors failed every activation silently for an hour.
+  it("tells the owner's Main once when an actor keeps failing, and again after it recovers and fails", async () => {
+    const { actors, deliveries } = setup();
+    const actor = await actors.create({
+      name: "supervisor",
+      instructions: "Watch and steer only when needed.",
+      responseMode: "directive",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    const notices = () => deliveries.filter((text) => text.startsWith("Fabric host notice:"));
+    for (let run = 1; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    expect(notices()).toEqual([]);
+    await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    expect(notices()).toEqual([expect.stringContaining(`actor supervisor failed its last ${ACTOR_FAILURE_NOTICE_AFTER} activations`)]);
+    expect(notices()[0]).toContain("Structured agent output was invalid");
+    await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    expect(notices()).toHaveLength(1);                       // once per streak
+    await actors.ask(actor.id, "all good");                  // a completed run ends the streak
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    expect(notices()).toHaveLength(2);
+  }, 60_000);
 
   it("stays ambient and retains the failed run when a directive run fails", async () => {
     const { actors, agents } = setup();

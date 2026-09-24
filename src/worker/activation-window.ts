@@ -9,7 +9,12 @@ export class ActivationWindow {
   private current: string[] = [];
 
   constructor(messages: readonly AgentMessage[]) {
-    this.prior = messages.map(message => JSON.stringify(message));
+    // Pi records system-prompt changes in the transcript as role "system" entries,
+    // but the context it sends to the model (and to this hook) leaves them out; a
+    // snapshot that kept them was never a prefix of that context (smarty-dev#390).
+    this.prior = messages
+      .filter(message => (message as { role?: string }).role !== "system")
+      .map(message => JSON.stringify(message));
   }
 
   project(messages: AgentMessage[]): AgentMessage[] {

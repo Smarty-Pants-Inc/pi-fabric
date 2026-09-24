@@ -827,11 +827,14 @@ describe("AgentsProvider runner support", () => {
 
     for (const [action, args] of [
       ["sessions", {}], ["peers", {}], ["members", { scope: "project" }], ["list", { scope: "project" }],
+      // lineage also reads the shared directory: descendants in other runtimes.
+      ["members", { scope: "lineage", kinds: ["agent"] }], ["list", { scope: "lineage" }],
     ] as const) {
       await expect(provider.invoke(action, args, context), action).rejects.toThrow(stalled.message);
     }
     await expect(provider.invoke("members", { scope: "local" }, context)).resolves.toBeInstanceOf(Array);
     await expect(provider.invoke("members", { scope: "project", includeStale: true }, context)).resolves.toBeInstanceOf(Array);
+    await expect(provider.invoke("members", { scope: "lineage", includeStale: true }, context)).resolves.toBeInstanceOf(Array);
     await expect(provider.invoke("list", {}, context)).resolves.toBeInstanceOf(Array);
   });
 

@@ -542,6 +542,59 @@ describe("ParticipantDirectory", () => {
     expect(directory.sessions().map((session) => session.id)).toEqual([identity.id]);
   });
 
+  // Review F1: peers' leases can expire before this host's lock wait times out; visibility
+  // must read as unknown during that wait, not as departed.
+  it("reports a stall while a heartbeat waits longer than one beat, before any lock timeout", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:waiting", name: "main", kind: "main", sessionId: "waiting" };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 10_000 });
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 200, leaseMs: 600,
+    });
+    directory.registerSource(() => [rootRecord(identity.id, identity.id, "waiting")]);
+    directories.push(directory);
+    await directory.start();
+    const lockPath = path.join(mesh.root, ".lock");
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+    const started = Date.now();
+    await expect.poll(() => directory.writeStalled()?.message ?? "", { timeout: 3_000, interval: 25 })
+      .toMatch(/heartbeat has waited [0-9.]+ s for the mesh lock/);
+    expect(Date.now() - started).toBeLessThan(2_000);          // long before the 10 s lock timeout
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    await expect.poll(() => directory.writeStalled(), { timeout: 3_000, interval: 25 }).toBeUndefined();
+  });
+
+  it("does not report a stall for lock waits shorter than one heartbeat", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:brief", name: "main", kind: "main", sessionId: "brief" };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 10_000 });
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 400, leaseMs: 1_200,
+    });
+    directory.registerSource(() => [rootRecord(identity.id, identity.id, "brief")]);
+    directories.push(directory);
+    await directory.start();
+    const lockPath = path.join(mesh.root, ".lock");
+    let flagged = false;
+    for (let round = 0; round < 6; round++) {
+      // Ordinary contention: another writer holds the lock for 60 ms at a time.
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, "owner"), `brief\n${process.pid}\n${Date.now()}\n`);
+      const until = Date.now() + 60;
+      while (Date.now() < until) {
+        if (directory.writeStalled()) flagged = true;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      fs.rmSync(lockPath, { recursive: true, force: true });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      if (directory.writeStalled()) flagged = true;
+    }
+    expect(flagged).toBe(false);
+  });
+
   it("returns an empty directory without a stall report when the mesh is healthy", async () => {
     const { directory } = stallDirectory("empty", () => []);
     await directory.start();

@@ -667,7 +667,9 @@ export class AgentsProvider implements FabricProvider {
             )
           : undefined;
         const scope = this.#participantScope(args.scope, "project");
-        const stalled = scope === "project" && args.includeStale !== true
+        // Every scope but local reads the shared directory (lineage includes descendants
+        // in other runtimes), so each is unknown, not short, during a write stall.
+        const stalled = scope !== "local" && args.includeStale !== true
           ? this.participants.writeStalled?.()
           : undefined;
         if (stalled) throw stalled;
@@ -1230,8 +1232,9 @@ export class AgentsProvider implements FabricProvider {
   #listAgents(scopeValue: unknown): Array<AgentRunRecord | AgentHandleInfo | ReturnType<FabricParticipantSource["self"]>> {
     const scope = this.#participantScope(scopeValue, "local");
     if (scope === "local") return this.manager.list();
-    // Like agents.members: a project listing during a mesh write stall is unknown, not short.
-    const stalled = scope === "project" ? this.participants.writeStalled?.() : undefined;
+    // Like agents.members: a mesh-dependent listing (project or lineage) during a write
+    // stall is unknown, not short.
+    const stalled = this.participants.writeStalled?.();
     if (stalled) throw stalled;
     const local = new Map<string, AgentRunRecord | AgentHandleInfo>();
     const append = (record: AgentRunRecord | AgentHandleInfo): void => {

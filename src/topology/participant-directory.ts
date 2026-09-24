@@ -251,6 +251,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshScheduled = false;
   #refreshAgain = false;
   #refreshedAt = Date.now();
+  #refreshStartedAt: number | undefined;
   #refreshError: unknown;
   #quiescing = false;
 
@@ -310,6 +311,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async refresh(): Promise<void> {
     if (this.#closed) return;
     if (this.#refreshing) return this.#refreshing;
+    this.#refreshStartedAt = Date.now();
     const operation = this.#refresh();
     this.#refreshing = operation;
     try {
@@ -320,7 +322,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshError = error;
       throw error;
     } finally {
-      if (this.#refreshing === operation) this.#refreshing = undefined;
+      if (this.#refreshing === operation) {
+        this.#refreshing = undefined;
+        this.#refreshStartedAt = undefined;
+      }
       if (this.#refreshAgain) {
         this.#refreshAgain = false;
         this.scheduleRefresh();
@@ -416,17 +421,29 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // the directory's own reads (get, list, sessions, peers) never throw, because timers,
   // the dashboard and local ownership checks consume them. User-facing listings and
   // "unknown participant" answers turn it into an error instead of an empty answer.
-  // ponytail: the signal is this host's heartbeat failing on a mesh-lock timeout, so a
-  // stall is reported from its first timeout (about 10 s in) until the next successful
-  // heartbeat; peers that expire before then are not flagged.
+  // Two signals: this host's heartbeat failed on a mesh-lock timeout, or a heartbeat has
+  // been waiting longer than one heartbeat interval. The second covers the seconds before
+  // the lock timeout, while peers' leases already expire; a heartbeat normally commits in
+  // milliseconds, so ordinary contention does not trip it.
+  // ponytail: a refresh that is slow for another reason also reads as a stall; reporting
+  // "unknown" then is still more honest than an empty directory.
   writeStalled(now = Date.now()): Error | undefined {
     if (!this.options.enabled || this.#closed) return undefined;
     const error = this.#refreshError;
-    if (!isMeshLockTimeout(error)) return undefined;
-    return new Error(
-      `Fabric mesh is write-stalled: ${error.message}. Participant leases have not renewed for ` +
-        `${Math.round((now - this.#refreshedAt) / 1000)} s, so peer visibility is unknown, not empty.`,
-    );
+    if (isMeshLockTimeout(error)) {
+      return new Error(
+        `Fabric mesh is write-stalled: ${error.message}. Participant leases have not renewed for ` +
+          `${Math.round((now - this.#refreshedAt) / 1000)} s, so peer visibility is unknown, not empty.`,
+      );
+    }
+    const started = this.#refreshStartedAt;
+    if (this.#refreshing && started !== undefined && now - started > this.#heartbeatMs) {
+      return new Error(
+        `Fabric mesh is write-stalled: this host's heartbeat has waited ${((now - started) / 1000).toFixed(1)} s ` +
+          "for the mesh lock, so peer visibility is unknown, not empty.",
+      );
+    }
+    return undefined;
   }
 
   self(now = Date.now()): FabricParticipantInfo {

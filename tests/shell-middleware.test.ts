@@ -128,7 +128,10 @@ describe("cooperative bash middleware", () => {
     const h = harness({ hangMs: immediate ? 120_000 : 30 });
     fs.writeFileSync(path.join(h.cwd, "fixture"), `${SECRET}\n`);
     const result = await h.invoke({ command: "cat fixture; sleep 0.2; cat fixture", ...(immediate ? { run_in_background: true } : {}) });
-    expect(result).toMatchObject({ ok: true, details: { running: true, pid: expect.any(Number), logPath: expect.any(String) } });
+    expect(result).toMatchObject({ ok: true, details: { running: true, logPath: expect.any(String) } });
+    // A handoff after 30 ms can come before a slow Git Bash (Windows CI) writes its pid file;
+    // readPid() then reports none. shell-hang.test.ts covers the pid itself.
+    if (immediate || result.details?.pid !== undefined) expect(result.details?.pid).toEqual(expect.any(Number));
     expect(result.output).not.toContain(SECRET);
     await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toEqual(expect.any(Number)));
     const log = fs.readFileSync(result.details!.logPath!, "utf8");

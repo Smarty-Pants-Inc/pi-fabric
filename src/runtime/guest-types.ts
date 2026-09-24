@@ -756,8 +756,8 @@ interface FabricAgentsApi {
   }): Promise<FabricActorInfo>;
   ask(args: { id: string; message: string; data?: unknown; model?: string; thinking?: FabricThinking }): Promise<FabricActorMessage>;
   tell(args: { id: string; message: string; data?: unknown; model?: string; thinking?: FabricThinking }): Promise<{ queued: true; messageId: string }>;
-  steer(args: { id: string; message: string; data?: unknown }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
-  followUp(args: { id: string; message: string; data?: unknown }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
+  steer(args: { id: string; message: string; data?: unknown; messageId?: string }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
+  followUp(args: { id: string; message: string; data?: unknown; messageId?: string }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
   setSteeringMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */

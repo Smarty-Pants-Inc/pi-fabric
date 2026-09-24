@@ -934,6 +934,7 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "steer",
           context,
+          typeof args.messageId === "string" ? { messageId: args.messageId } : {},
         );
       case "followUp":
         return this.routeMessage(
@@ -942,6 +943,7 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "followUp",
           context,
+          typeof args.messageId === "string" ? { messageId: args.messageId } : {},
         );
       case "setSteeringMode":
         return this.manager.setSteeringMode(String(args.id), this.#steeringMode(args.mode));
@@ -1121,6 +1123,7 @@ export class AgentsProvider implements FabricProvider {
       from?: MeshIdentity;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
+      messageId?: string;
     } = {},
   ): Promise<FabricAgentMessageResult> {
     return this.#router.routeMessage(id, message, data, kind, context, options);

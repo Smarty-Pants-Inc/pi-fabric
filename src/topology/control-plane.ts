@@ -9,6 +9,19 @@ const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
+// The sender keeps waiting this long past the command deadline. The owner admits a
+// command only before its deadline, but its acknowledgement can queue for the mesh lock:
+// without this grace a delivered command was reported as timed out and then retried
+// (smarty-dev#367). A command not admitted by the deadline is acknowledged as expired.
+const MAX_CONTROL_ACK_GRACE_MS = 15_000;
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:@/-]{1,200}$/;
+
+/** Validates a caller-chosen message id used for at-most-once control delivery. */
+export const assertFabricIdempotencyKey = (key: string): void => {
+  if (!IDEMPOTENCY_KEY.test(key)) {
+    throw new Error("messageId must be 1-200 characters of letters, digits and . _ : @ / -");
+  }
+};
 
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
 
@@ -122,6 +135,8 @@ export interface FabricControlInput {
 export interface FabricControlRequestOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Caller-chosen id: repeating it after a timeout re-acknowledges instead of delivering twice. */
+  idempotencyKey?: string;
 }
 
 interface PendingControlRequest {
@@ -181,6 +196,7 @@ export class FabricControlPlane {
     operation: FabricControlOperation,
     input: FabricControlInput = {},
     ownerIdentityId = ownerHostId,
+    options: Pick<FabricControlRequestOptions, "idempotencyKey"> = {},
   ): Promise<FabricControlResult> {
     const { commandId, acceptance } = await this.#requestAcceptance(
       ownerHostId,
@@ -188,7 +204,7 @@ export class FabricControlPlane {
       operation,
       input,
       ownerIdentityId,
-      { timeoutMs: this.#ackTimeoutMs },
+      { timeoutMs: this.#ackTimeoutMs, ...options },
     );
     return {
       queued: true,
@@ -237,15 +253,29 @@ export class FabricControlPlane {
       this.#pollMs * 4,
       Math.min(MAX_CONTROL_TIMEOUT_MS, Math.floor(options.timeoutMs ?? this.#ackTimeoutMs)),
     );
-    const commandId = randomUUID();
+    if (options.idempotencyKey !== undefined) assertFabricIdempotencyKey(options.idempotencyKey);
+    // A caller-chosen key gives a stable command id, namespaced by this sender: the
+    // owner's existing dedupe then re-acknowledges a retry instead of delivering twice.
+    const commandId = options.idempotencyKey === undefined
+      ? randomUUID()
+      : "idem:" + createHash("sha256").update(`${this.identity.id}\0${options.idempotencyKey}`).digest("hex").slice(0, 40);
+    if (this.#pending.has(commandId)) {
+      throw new Error(`A Fabric request with this messageId is already waiting for ${targetId}`);
+    }
     const requestedAt = Date.now();
+    const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
     let pendingRequest: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
       const timer = setTimeout(() => {
         const timedOut = this.#clearPending(commandId);
         if (timedOut) void this.#publishCancellation(commandId, timedOut);
-        reject(new Error("Timed out waiting for the remote Fabric owner to acknowledge " + targetId));
-      }, timeoutMs);
+        reject(new Error(
+          `Timed out waiting for the remote Fabric owner to acknowledge ${targetId}; ` +
+            (options.idempotencyKey === undefined
+              ? "it may still be delivered. Pass a messageId to retry without delivering twice."
+              : `it may still be delivered. Retrying with messageId "${options.idempotencyKey}" delivers it at most once.`),
+        ));
+      }, timeoutMs + ackGraceMs);
       timer.unref();
       const pending: PendingControlRequest = {
         resolve,
@@ -449,7 +479,9 @@ export class FabricControlPlane {
           command,
           duplicate.acceptance ?? {
             accepted: false,
-            error: "Fabric control outcome is indeterminate after owner restart",
+            error: this.#activeCommands.has(command.commandId)
+              ? "Fabric control command is still running; retry later with the same messageId"
+              : "Fabric control outcome is indeterminate after owner restart",
           },
         );
       }

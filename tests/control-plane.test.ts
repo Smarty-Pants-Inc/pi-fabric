@@ -533,6 +533,45 @@ describe("FabricControlPlane", () => {
     expect(receive).toHaveBeenCalledTimes(1);
   });
 
+  // smarty-dev#367: a retry after an acknowledgement timeout delivered the message twice.
+  it("delivers a retried request with the same idempotency key once", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const sender = plane(meshRoot, "host:sender");
+    const receiver = plane(meshRoot, "host:receiver");
+    const receive = vi.fn((command: { commandId: string }) => ({ accepted: true, messageId: "delivered:" + command.commandId }));
+    sender.start(() => ({ accepted: false }));
+    receiver.start(receive);
+
+    const first = await sender.request("host:receiver", "agent:target", "steer", { message: "once" }, "host:receiver", { idempotencyKey: "retry-1" });
+    const retry = await sender.request("host:receiver", "agent:target", "steer", { message: "once" }, "host:receiver", { idempotencyKey: "retry-1" });
+    const other = await sender.request("host:receiver", "agent:target", "steer", { message: "twice" }, "host:receiver", { idempotencyKey: "retry-2" });
+
+    expect(receive).toHaveBeenCalledTimes(2);                 // retry-1 once, retry-2 once
+    expect(retry.messageId).toBe(first.messageId);
+    expect(other.messageId).not.toBe(first.messageId);
+    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "x" }, "host:receiver", { idempotencyKey: "bad key!" }))
+      .rejects.toThrow("messageId must be");
+  });
+
+  it("waits past the deadline for the acknowledgement of a command the owner admitted in time", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const sender = plane(meshRoot, "host:sender", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    const receiver = plane(meshRoot, "host:receiver", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    // Admitted within the 100 ms deadline, acknowledged after it (a slow handler or a
+    // contended mesh lock): the sender must report the delivery, not a timeout.
+    receiver.start(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return { accepted: true, messageId: "late-but-delivered" };
+    });
+    sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "slow ack" }))
+      .resolves.toMatchObject({ acknowledged: true, messageId: "late-but-delivered" });
+  });
+
   it("surfaces owner rejection instead of reporting an unverified queue", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);

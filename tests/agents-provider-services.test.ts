@@ -108,6 +108,31 @@ const command = (operation: FabricControlCommand["operation"]): FabricControlCom
 });
 
 describe("agents provider message routing service boundaries", () => {
+  it("delivers a local steer with the same messageId at most once, and retries a failed one", async () => {
+    const { router, agents } = routing();
+    agents.status.mockImplementation((id) => {
+      if (id === "child") return { id: "child", name: "Child" } as ReturnType<Ports[0]["status"]>;
+      throw new Error("Unknown Fabric agent");
+    });
+    let calls = 0;
+    agents.steer.mockImplementation(() => {
+      calls += 1;
+      if (calls === 1) throw new Error("child busy");
+      return { messageId: `local-${calls}` } as ReturnType<Ports[0]["steer"]>;
+    });
+
+    await expect(router.routeMessage("child", "hi", undefined, "steer", undefined, { messageId: "m-1" })).rejects.toThrow("child busy");
+    const [a, b] = await Promise.all([
+      router.routeMessage("child", "hi", undefined, "steer", undefined, { messageId: "m-1" }),
+      router.routeMessage("child", "hi", undefined, "steer", undefined, { messageId: "m-1" }),
+    ]);
+    const c = await router.routeMessage("child", "hi", undefined, "steer", undefined, { messageId: "m-1" });
+    expect(agents.steer).toHaveBeenCalledTimes(2);            // the failed try + one delivery
+    expect([a.messageId, b.messageId, c.messageId]).toEqual(["local-2", "local-2", "local-2"]);
+    await router.routeMessage("child", "hi", undefined, "steer", undefined, { messageId: "m-2" });
+    expect(agents.steer).toHaveBeenCalledTimes(3);
+  });
+
   it("preserves passive Main delivery and caller identity without actor validation", async () => {
     const { router, main, actors } = routing();
     const from = { id: "source", name: "Source", kind: "main" as const };

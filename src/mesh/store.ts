@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
+import { quarantineDamagedFile } from "../core/damaged-file.js";
 import { readJsonlPage } from "../log-tail.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
@@ -210,6 +211,33 @@ const readState = (filePath: string, maxBytes: number, recoverDamage = true): Me
   }
 };
 
+// Fork patch (pi-fabric#27 F2): a mutation that finds state.json empty or unparseable
+// keeps the damaged bytes aside (as the fork always did) and continues, instead of
+// blocking every mesh write on the root until someone repairs the file. The clock the
+// damage lost restarts at the wall-clock millisecond: revisions advance by one per
+// locked write, so no earlier revision can reach that floor, and no token is reissued.
+// ponytail: assumes fewer than one committed write per millisecond since the last
+// reseed; each write is a locked, fsynced rewrite of the whole file.
+const readStateForWrite = (filePath: string, maxBytes: number): MeshStateFile => {
+  try {
+    return readState(filePath, maxBytes, false);
+  } catch (error) {
+    let size: number;
+    try {
+      size = fs.statSync(filePath).size;
+    } catch {
+      throw error;
+    }
+    if (size > maxBytes) throw error;                          // oversized is not damage
+    if (quarantineDamagedFile(filePath) === undefined) throw error;
+    const reseeded: MeshStateFile = { ...emptyState(), highWater: Date.now() };
+    // Persist the floor at once: a write that fails after this point (a CAS conflict)
+    // must not leave a missing file that the next writer would read as clock 0.
+    atomicWrite(filePath, reseeded, maxBytes);
+    return reseeded;
+  }
+};
+
 const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY): void => {
   const serialized = JSON.stringify(value, null, 2);
   if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
@@ -252,9 +280,12 @@ const stateSlot = (state: MeshStateFile, key: string): {
   if ((state.format === 2 || state.revisionFormat === 2) && !Object.hasOwn(state, "highWater")) {
     throw new Error("Missing Fabric mesh high-water revision");
   }
+  // Fork patch (pi-fabric#27 F1): Fabric builds before the persistent clock still write
+  // version+1 without advancing highWater, so on a mixed fleet retained history can pass
+  // the clock. Raise it to the retained maximum (the legacy seeding rule) instead of
+  // refusing every later write on the root; retained tokens stay unique.
   const highWater = Object.hasOwn(state, "highWater")
-    ? storageRevision(state.highWater) : retainedMaximum;
-  if (highWater < retainedMaximum) throw new Error("Inconsistent Fabric mesh high-water revision");
+    ? Math.max(storageRevision(state.highWater), retainedMaximum) : retainedMaximum;
   const present = Object.hasOwn(state.entries, key);
   const version = present ? state.entries[key]!.version
     : state.versions !== undefined && Object.hasOwn(state.versions, key) ? state.versions[key]! : 0;
@@ -637,7 +668,7 @@ export class MeshStore {
     this.#validateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
     return this.#withLock(() => {
-      const state = readState(this.#statePath, this.#maxStateBytes, false);
+      const state = readStateForWrite(this.#statePath, this.#maxStateBytes);
       const slot = stateSlot(state, request.key);
       const plan = request.transition(slot.present, slot.version, slot.highWater);
       if (plan.kind !== "put") throw new Error("Invalid verified storage put plan");
@@ -672,7 +703,7 @@ export class MeshStore {
     this.#validateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
     return this.#withLock(() => {
-      const state = readState(this.#statePath, this.#maxStateBytes, false);
+      const state = readStateForWrite(this.#statePath, this.#maxStateBytes);
       const slot = stateSlot(state, request.key);
       const plan = request.transition(slot.present, slot.version, slot.highWater);
       if (plan.kind === "unchanged") {
@@ -715,51 +746,55 @@ export class MeshStore {
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0) return [];
     return this.#withLock(() => {
-      const state = readState(this.#statePath, this.#maxStateBytes);
+      // Each operation takes the same verified transition as put()/delete(), so a batch
+      // advances the persistent clock exactly as the single writes would.
+      const state = readStateForWrite(this.#statePath, this.#maxStateBytes);
       state.versions ??= {};
       const tombstones = new Set(state.tombstoneOrder ?? []);
       const results: MeshBatchResult[] = [];
       let changed = false;
       const now = Date.now();
       for (const op of input.ops) {
+        const slot = stateSlot(state, op.key);
         const existing = state.entries[op.key];
-        const stored = state.versions[op.key];
-        const actualVersion =
-          existing?.version ?? (typeof stored === "number" && Number.isSafeInteger(stored) ? stored : 0);
-        if (op.ifVersion !== undefined && op.ifVersion !== actualVersion) {
+        if (op.ifVersion !== undefined && op.ifVersion !== slot.version) {
           const policy = typeof op.onConflict === "function"
             ? op.onConflict(existing ? jsonClone(existing) : undefined)
             : op.onConflict ?? "abort";
           if (policy === "abort") {
-            throw new MeshBatchConflictError(op.key, op.ifVersion, actualVersion);
+            throw new MeshBatchConflictError(op.key, op.ifVersion, slot.version);
           }
-          results.push({ key: op.key, applied: false, version: actualVersion });
+          results.push({ key: op.key, applied: false, version: slot.version });
           continue;
         }
-        if (op.kind === "delete") {
-          if (!existing) {
-            results.push({ key: op.key, applied: false, version: actualVersion });
-            continue;
-          }
-          delete state.entries[op.key];
-          state.versions[op.key] = existing.version;
-          tombstones.delete(op.key);
-          tombstones.add(op.key);
-          results.push({ key: op.key, applied: true, version: existing.version });
-          changed = true;
+        const request = op.kind === "delete"
+          ? captureStorageDelete({ key: op.key, ifVersion: op.ifVersion })
+          : captureStoragePut({
+            key: op.key,
+            ifVersion: op.ifVersion,
+            value: typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value,
+            identity: input.identity,
+          }, this.maxEventBytes);
+        const plan = request.transition(slot.present, slot.version, slot.highWater);
+        if (plan.kind === "unchanged") {
+          results.push({ key: op.key, applied: false, version: slot.version });
           continue;
         }
-        const value = jsonClone(typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value);
-        if (Buffer.byteLength(JSON.stringify(value), "utf8") > this.maxEventBytes) {
-          throw new Error(`Mesh state value exceeds ${this.maxEventBytes} bytes`);
+        if (plan.kind === "delete") {
+          delete state.entries[plan.key];
+          tombstones.delete(plan.key);
+          tombstones.add(plan.key);
+        } else {
+          state.entries[plan.key] = {
+            key: plan.key, value: plan.value, version: plan.version, updatedAt: now, updatedBy: plan.identity,
+          };
+          tombstones.delete(plan.key);
         }
-        const entry: MeshStateEntry = {
-          key: op.key, value, version: actualVersion + 1, updatedAt: now, updatedBy: jsonClone(input.identity),
-        };
-        state.entries[op.key] = entry;
-        state.versions[op.key] = entry.version;
-        tombstones.delete(op.key);
-        results.push({ key: op.key, applied: true, version: entry.version });
+        state.versions[plan.key] = plan.version;
+        state.format = 1;
+        state.revisionFormat = 2;
+        state.highWater = plan.highWater;
+        results.push({ key: op.key, applied: true, version: plan.version });
         changed = true;
       }
       if (!changed) {

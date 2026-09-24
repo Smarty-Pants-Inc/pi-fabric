@@ -118,7 +118,9 @@ describe("MeshStore", () => {
     expect(fs.readFileSync(statePath, "utf8")).toBe("");
   });
 
-  it("keeps unreadable state as a write barrier while serving an empty table", async () => {
+  // Fork patch (pi-fabric#27 F2): unreadable state is kept aside on the next write, not a
+  // permanent write barrier; the clock restarts above every earlier revision.
+  it("serves an empty table for unreadable state, then keeps its bytes aside on the next write", async () => {
     const store = createStore();
     const statePath = path.join(store.root, "state.json");
     fs.mkdirSync(store.root, { recursive: true });
@@ -127,8 +129,12 @@ describe("MeshStore", () => {
     expect(store.listAll()).toEqual([]);
     expect(store.get("shared/value")).toBeUndefined();
     expect(fs.readFileSync(statePath, "utf8")).toBe("{");
-    await expect(store.put({ key: "shared/value", value: { revision: 1 }, identity })).rejects.toThrow("invalid state format");
-    expect(fs.readFileSync(statePath, "utf8")).toBe("{");
+    const floor = Date.now();
+    const written = await store.put({ key: "shared/value", value: { revision: 1 }, identity });
+    expect(written.version).toBeGreaterThan(floor);
+    const aside = fs.readdirSync(store.root).filter((name) => name.startsWith("state.json.damaged."));
+    expect(aside).toHaveLength(1);
+    expect(fs.readFileSync(path.join(store.root, aside[0]!), "utf8")).toBe("{");
   });
 
   it("supports complete internal prefix scans independently of public read limits", async () => {
@@ -263,17 +269,18 @@ describe("MeshStore.writeBatch", () => {
     expect(typeof (store.get("k/lease")?.value as { stampedAt: number }).stampedAt).toBe("number");
   });
 
-  it("deletes in a batch, keeps the tombstone version, and recreates only on the current version", async () => {
+  it("deletes in a batch with a tombstone successor, and recreates only on the current version", async () => {
     const store = createStore();
     const put = await store.put({ identity, key: "batch/k", value: 1 });
+    // As delete(): a batch delete consumes the key's successor revision (0.94 clock).
     const [deleted] = await store.writeBatch({ identity, ops: [{ kind: "delete", key: "batch/k", ifVersion: put.version }] });
-    expect(deleted).toEqual({ key: "batch/k", applied: true, version: put.version });
+    expect(deleted).toEqual({ key: "batch/k", applied: true, version: put.version + 1 });
     expect(store.get("batch/k")).toBeUndefined();
     // A stale compare-and-swap against the deleted key conflicts; the tombstone version wins.
-    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "batch/k", value: 2, ifVersion: put.version - 1 }] }))
+    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "batch/k", value: 2, ifVersion: put.version }] }))
       .rejects.toThrow(/expected version/);
-    const [recreated] = await store.writeBatch({ identity, ops: [{ kind: "put", key: "batch/k", value: 3, ifVersion: put.version }] });
-    expect(recreated).toEqual({ key: "batch/k", applied: true, version: put.version + 1 });
+    const [recreated] = await store.writeBatch({ identity, ops: [{ kind: "put", key: "batch/k", value: 3, ifVersion: deleted!.version }] });
+    expect(recreated).toEqual({ key: "batch/k", applied: true, version: deleted!.version + 1 });
     expect(store.get("batch/k")?.value).toBe(3);
   });
 

@@ -313,16 +313,18 @@ describe("MeshStore uses the proved transition", () => {
     expect(bytes(store)).toBe(before);
   });
 
-  it("refuses a clock below retained history instead of silently reseeding it", async () => {
+  // Fork patch (pi-fabric#27 F1): a clock below retained history (a pre-clock writer on a
+  // mixed fleet) is raised to the retained maximum, not a permanent write barrier.
+  it("raises a clock below retained history to the retained maximum", async () => {
     const store = createStore();
-    await store.put({ key: "state/other", value: 1, identity });
+    const other = await store.put({ key: "state/other", value: 1, identity });
     const state = JSON.parse(bytes(store));
     state.highWater = 0;
     fs.writeFileSync(statePath(store), JSON.stringify(state));
-    const before = bytes(store);
-    await expect(store.put({ key: "state/new", value: 2, identity })).rejects.toThrow("high-water");
-    await expect(store.delete({ key: "state/other" })).rejects.toThrow("high-water");
-    expect(bytes(store)).toBe(before);
+    const created = await store.put({ key: "state/new", value: 2, identity });
+    expect(created.version).toBe(other.version + 1);
+    expect(await store.delete({ key: "state/other" })).toEqual({ deleted: true, version: other.version + 1 });
+    expect(JSON.parse(bytes(store)).highWater).toBeGreaterThanOrEqual(created.version);
   });
 
   it("clock exhaustion refuses even a small live revision without changing unrelated state", async () => {
@@ -339,14 +341,87 @@ describe("MeshStore uses the proved transition", () => {
     expect(bytes(store)).toBe(before);
   });
 
-  it("failed writes to damaged JSON do not quarantine/reset unrelated state", async () => {
+  // pi-fabric#27 F1: a Fabric build before the persistent clock (the fork at 8198824) puts
+  // version+1 and leaves highWater and revisionFormat as they are. Simulate that writer.
+  const legacyPut = (store: MeshStore, key: string, value: unknown) => {
+    const state = JSON.parse(bytes(store));
+    const actual = state.entries[key]?.version ?? state.versions?.[key] ?? 0;
+    state.entries[key] = { key, value, version: actual + 1, updatedAt: Date.now(), updatedBy: identity };
+    state.versions = { ...(state.versions ?? {}), [key]: actual + 1 };
+    state.tombstoneOrder = (state.tombstoneOrder ?? []).filter((entry: string) => entry !== key);
+    fs.writeFileSync(statePath(store), JSON.stringify(state));
+    return actual + 1;
+  };
+
+  it("keeps every new write working after a pre-clock writer updated a key (mixed fleet)", async () => {
     const store = createStore();
-    fs.writeFileSync(statePath(store), '{"format":1,"entries":{"unrelated":');
-    const before = bytes(store);
-    await expect(store.put({ key: "state/a", value: 2, identity, ifVersion: 9 })).rejects.toThrow("invalid state format");
-    await expect(store.delete({ key: "state/a", ifVersion: 9 })).rejects.toThrow("invalid state format");
-    expect(bytes(store)).toBe(before);
-    expect(fs.readdirSync(store.root)).toEqual(["state.json"]);
+    const mine = await store.put({ key: "state/k", value: 1, identity });
+    const legacy = legacyPut(store, "state/k", 2);              // now above highWater
+    expect(legacy).toBeGreaterThan(JSON.parse(bytes(store)).highWater);
+    const updated = await store.put({ key: "state/k", value: 3, identity, ifVersion: legacy });
+    expect(updated.version).toBe(legacy + 1);
+    const other = await store.put({ key: "state/other", value: 1, identity });
+    expect(other.version).toBeGreaterThan(updated.version);
+    const [batched] = await store.writeBatch({ identity, ops: [{ kind: "put", key: "state/batched", value: 1 }] });
+    expect(batched!.version).toBeGreaterThan(other.version);
+    expect((await store.delete({ key: "state/k", ifVersion: updated.version })).deleted).toBe(true);
+    await expect(store.put({ key: "state/k", value: 4, identity, ifVersion: mine.version })).rejects.toThrow("compare-and-swap failed");
+    const final = JSON.parse(bytes(store));
+    const maxVersion = Math.max(...Object.values(final.versions as Record<string, number>));
+    expect(final.highWater).toBeGreaterThanOrEqual(maxVersion);
+  });
+
+  it("keeps every new write working after a pre-clock writer recreated a deleted key", async () => {
+    const store = createStore();
+    await store.put({ key: "state/k", value: 1, identity });
+    const deleted = await store.delete({ key: "state/k" });   // tombstone v+1, clock advanced
+    const legacy = legacyPut(store, "state/k", 2);              // recreated at tombstone+1
+    expect(legacy).toBe(deleted.version! + 1);
+    const next = await store.put({ key: "state/new", value: 1, identity });
+    expect(next.version).toBeGreaterThan(legacy);
+    expect((await store.put({ key: "state/k", value: 3, identity, ifVersion: legacy })).version).toBeGreaterThan(legacy);
+    expect((await store.delete({ key: "state/new", ifVersion: next.version })).deleted).toBe(true);
+  });
+
+  it("advances the persistent clock in a batch exactly as single writes do", async () => {
+    const batched = createStore();
+    const single = createStore();
+    for (const store of [batched, single]) {
+      await store.put({ key: "state/a", value: 1, identity });
+      await store.put({ key: "state/gone", value: 1, identity });
+    }
+    const results = await batched.writeBatch({ identity, ops: [
+      { kind: "put", key: "state/b", value: 1 },
+      { kind: "put", key: "state/a", value: 2, ifVersion: 1 },
+      { kind: "delete", key: "state/gone" },
+      { kind: "delete", key: "state/missing" },
+    ] });
+    const expected = [
+      (await single.put({ key: "state/b", value: 1, identity })).version,
+      (await single.put({ key: "state/a", value: 2, identity, ifVersion: 1 })).version,
+      (await single.delete({ key: "state/gone" })).version,
+    ];
+    expect(results.map((result) => result.applied)).toEqual([true, true, true, false]);
+    expect(results.slice(0, 3).map((result) => result.version)).toEqual(expected);
+    const [left, right] = [JSON.parse(bytes(batched)), JSON.parse(bytes(single))];
+    expect(left.highWater).toBe(right.highWater);
+    expect(left.versions).toEqual(right.versions);
+    expect(left.revisionFormat).toBe(2);
+  });
+
+  // Fork patch (pi-fabric#27 F2): damaged JSON is kept aside once, and the restarted clock
+  // is persisted even when the write that found the damage fails its compare-and-swap.
+  it("keeps damaged JSON aside and persists a restarted clock even when the write fails", async () => {
+    const store = createStore();
+    const damaged = '{"format":1,"entries":{"unrelated":';
+    fs.writeFileSync(statePath(store), damaged);
+    const floor = Date.now();
+    await expect(store.put({ key: "state/a", value: 2, identity, ifVersion: 9 })).rejects.toThrow("compare-and-swap failed");
+    const aside = fs.readdirSync(store.root).filter((name) => name.startsWith("state.json.damaged."));
+    expect(aside).toHaveLength(1);
+    expect(fs.readFileSync(path.join(store.root, aside[0]!), "utf8")).toBe(damaged);
+    expect(JSON.parse(bytes(store)).highWater).toBeGreaterThanOrEqual(floor);
+    expect((await store.put({ key: "state/a", value: 3, identity })).version).toBeGreaterThan(floor);
   });
 
   it("failed size admission leaves unrelated entries, tombstones and cache unchanged", async () => {
@@ -362,13 +437,14 @@ describe("MeshStore uses the proved transition", () => {
     expect(store.get("state/a")).toEqual(entry);
   });
 
-  it.each(["", "  ", "{"])("read recovery never turns damaged bytes %j into fresh allocation history", async damaged => {
+  it.each(["", "  ", "{"])("never reissues an earlier revision after damaged bytes %j", async damaged => {
     const store = createStore();
-    await store.put({ key: "state/a", value: 1, identity });
+    const first = await store.put({ key: "state/a", value: 1, identity });
     fs.writeFileSync(statePath(store), damaged);
     expect(store.listAll()).toEqual([]);
-    await expect(store.put({ key: "state/a", value: 2, identity })).rejects.toThrow("invalid state format");
-    expect(bytes(store)).toBe(damaged);
+    const next = await store.put({ key: "state/a", value: 2, identity });
+    expect(next.version).toBeGreaterThan(Math.max(first.version, Date.now() - 60_000));
+    await expect(store.put({ key: "state/a", value: 3, identity, ifVersion: first.version })).rejects.toThrow("compare-and-swap failed");
   });
 
   it.each(["toString", "valueOf", "hasOwnProperty"])("uses own-key presence and clock allocation for %s", async key => {

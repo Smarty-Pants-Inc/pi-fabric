@@ -244,6 +244,11 @@ export class ActorManager {
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
   readonly #pendingPresence = new Set<string>();
+  /** One presence write at a time per actor id; a queued one reads the latest state. */
+  readonly #presenceChains = new Map<string, Promise<void>>();
+  readonly #presenceQueued = new Set<string>();
+  /** Orphan deletes, fenced to the entry version seen when it was found. */
+  readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
   #closing = false;
@@ -1160,6 +1165,8 @@ export class ActorManager {
     this.#meshMonitor.close();
     if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
     this.#presenceTimer = undefined;
+    // Let presence writes already in flight finish before the runtime goes.
+    await Promise.allSettled([...this.#presenceChains.values()]);
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
     this.#listeners.clear();
@@ -1868,20 +1875,45 @@ export class ActorManager {
   // Writes an actor's presence as it is now: its record while this host manages it, or a
   // delete once it is gone. A failed write (a contended mesh lock) is retried until it lands,
   // so the mesh never keeps a stale entry or misses a new actor (smarty-dev#448).
-  async #writePresence(id: string): Promise<void> {
+  // Writes are serialized per id, and each reads the state only when it runs, so a write that
+  // waited on the lock can never land after a newer one (a removed actor put back).
+  #writePresence(id: string): Promise<void> {
+    if (this.#presenceQueued.has(id)) return this.#presenceChains.get(id)!;
+    this.#presenceQueued.add(id);
+    const previous = this.#presenceChains.get(id) ?? Promise.resolve();
+    const next = previous.then(() => {
+      this.#presenceQueued.delete(id);
+      return this.#writePresenceNow(id);
+    });
+    this.#presenceChains.set(id, next);
+    void next.finally(() => {
+      if (this.#presenceChains.get(id) === next) this.#presenceChains.delete(id);
+    });
+    return next;
+  }
+
+  async #writePresenceNow(id: string): Promise<void> {
     const actor = this.#actors.get(id);
     if (actor && !this.#canManageCached(id)) {
       this.#pendingPresence.delete(id);                        // another host owns its presence
       return;
     }
+    const fence = actor ? undefined : this.#orphanPresence.get(id);
     try {
       if (actor) {
         await this.mesh.put({ key: this.#presenceKey(id), value: this.#publicInfo(actor), identity: this.identity });
       } else {
-        await this.mesh.delete({ key: this.#presenceKey(id) });
+        await this.mesh.delete({ key: this.#presenceKey(id), ...(fence !== undefined ? { ifVersion: fence } : {}) });
       }
       this.#pendingPresence.delete(id);
-    } catch {
+      this.#orphanPresence.delete(id);
+    } catch (error) {
+      if (fence !== undefined && error instanceof Error && error.message.includes("compare-and-swap failed")) {
+        // Someone wrote this entry since it was found orphaned: it is not ours to delete.
+        this.#pendingPresence.delete(id);
+        this.#orphanPresence.delete(id);
+        return;
+      }
       this.#pendingPresence.add(id);
       this.#schedulePresenceRetry();
     }
@@ -1914,7 +1946,9 @@ export class ActorManager {
       const id = entry.key.slice(prefix.length);
       const scope = (entry.value as { scope?: unknown } | null)?.scope;
       if (id.includes("/") || scope !== this.#actorScope || entry.updatedBy.id !== this.identity.id) continue;
-      if (!this.#actors.has(id)) void this.#writePresence(id);
+      if (this.#actors.has(id)) continue;
+      this.#orphanPresence.set(id, entry.version);
+      void this.#writePresence(id);
     }
   }
 

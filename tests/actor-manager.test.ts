@@ -87,7 +87,7 @@ afterEach(async () => {
 // smarty-dev#448: presence writes lost on a contended mesh lock left the mesh without a new
 // actor, or with a removed one.
 describe("ActorManager presence under a stalled mesh lock", () => {
-  const stalledSetup = () => {
+  const stalledSetup = (presenceRetryMs = 50) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-presence-"));
     roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { lockTimeoutMs: 150 });
@@ -98,7 +98,7 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     const identity: MeshIdentity = { id: "session:presence", name: "main", kind: "main", sessionId: "presence" };
     const make = () => {
       const manager = new ActorManager("presence", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
-        { actorRoot: path.join(root, "actors"), persistent: true, presenceRetryMs: 50 });
+        { actorRoot: path.join(root, "actors"), persistent: true, presenceRetryMs });
       actorManagers.push(manager);
       return manager;
     };
@@ -132,6 +132,67 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     expect(mesh.get(`actors/presence/${actor.id}`)).toBeDefined();
     release();
     await waitFor(() => mesh.get(`actors/presence/${actor.id}`) === undefined, 5_000);
+  }, 20_000);
+
+  // review/astra on #46, F1: a presence write held on the lock must not land after a newer one.
+  it("never puts a removed actor back when an older presence write lands late", async () => {
+    const { mesh, make } = stalledSetup();
+    const actors = make();
+    const put = mesh.put.bind(mesh);
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    let held = 0;
+    vi.spyOn(mesh, "put").mockImplementation(async (input) => {
+      if (input.key.startsWith("actors/presence/") && held++ === 0) await gate;   // the create's write sleeps
+      return put(input);
+    });
+    const created = actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    await waitFor(() => held === 1);
+    const actor = actors.list().find((candidate) => candidate.name === "reviewer")!;
+    const removed = actors.remove(actor.id);                   // its delete must wait behind that write
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    open();
+    await created;
+    await removed;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(mesh.get(`actors/presence/${actor.id}`)).toBeUndefined();
+  }, 20_000);
+
+  it("lets close() wait for a presence write in flight", async () => {
+    const { mesh, make } = stalledSetup();
+    const actors = make();
+    const put = mesh.put.bind(mesh);
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    let held = 0;
+    vi.spyOn(mesh, "put").mockImplementation(async (input) => {
+      if (input.key.startsWith("actors/presence/") && held++ === 0) await gate;
+      return put(input);
+    });
+    const created = actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    await waitFor(() => held === 1);
+    let closed = false;
+    const closing = actors.close().then(() => { closed = true; });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(closed).toBe(false);
+    open();
+    await closing;
+    await created.catch(() => undefined);
+    expect(closed).toBe(true);
+  }, 20_000);
+
+  // review/astra on #46, F2: an orphan delete that failed keeps its version fence on retry.
+  it("does not delete an orphan entry that another writer replaced before the retry", async () => {
+    const { mesh, make, hold, release, identity } = stalledSetup(1_000);
+    await mesh.put({ key: "actors/presence/ghost", value: { id: "ghost", scope: "project" }, identity });
+    hold();
+    make();                                                    // the reap's delete fails on the lock (150 ms)
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    release();
+    // Before the 1 s retry, another writer replaces the entry.
+    const replaced = await mesh.put({ key: "actors/presence/ghost", value: { id: "ghost", scope: "project", again: true }, identity: { ...identity, id: "session:other" } });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(mesh.get("actors/presence/ghost")?.version).toBe(replaced.version);
   }, 20_000);
 
   it("reaps this session's orphan presence at start, and nothing of another scope or writer", async () => {

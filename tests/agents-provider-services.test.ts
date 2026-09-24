@@ -136,6 +136,35 @@ describe("agents provider message routing service boundaries", () => {
     expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp", { message: "reply", data: undefined }, "owner");
   });
 
+  // review/astra on #44: a worker replies to its own remote Main through the same lookup.
+  it.each(["main", "session:main-root"])("replies to a remote Main whose lease lapsed moments ago (%s)", async (target) => {
+    const { router, participants, control, main } = routing();
+    main.local = false;
+    main.id = "session:main-root";
+    main.matches = ((id: string) => id === "main" || id === "session:main-root") as typeof main.matches;
+    const root = { ...participant(), id: "session:main-root", rootId: "session:main-root", stale: true };
+    participants.get.mockReturnValue(undefined);
+    Object.assign(participants, { lastKnown: vi.fn((id: string) => id === root.id ? { participant: root, lapsedMs: 15_000 } : undefined) });
+    control.request.mockResolvedValue({ queued: true, messageId: "to-main", routed: "mesh", acknowledged: true });
+    await expect(router.routeMessage(target, "result", undefined, "followUp")).resolves.toMatchObject({ messageId: "to-main" });
+    expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined }, "owner");
+  });
+
+  it("reports a write-stalled mesh before trying a recently lapsed root", async () => {
+    const { router, participants, control, main } = routing();
+    const stalled = new Error("Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock");
+    const peer = { ...participant(), id: "session:peer", rootId: "session:peer", stale: true };
+    participants.get.mockReturnValue(undefined);
+    Object.assign(participants, {
+      writeStalled: vi.fn(() => stalled),
+      lastKnown: vi.fn(() => ({ participant: peer, lapsedMs: 10_000 })),
+    });
+    await expect(router.routeMessage(peer.id, "reply", undefined, "followUp")).rejects.toThrow(stalled.message);
+    main.local = false;
+    await expect(router.routeMessage("main", "reply", undefined, "followUp")).rejects.toThrow(stalled.message);
+    expect(control.request).not.toHaveBeenCalled();
+  });
+
   it("names why a target cannot be resolved", async () => {
     const { router, participants, control } = routing();
     const peer = { ...participant(), id: "session:gone", rootId: "session:gone", stale: true };

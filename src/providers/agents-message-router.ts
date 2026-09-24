@@ -24,6 +24,8 @@ export class AgentMessageRouter {
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding,
   ) {}
   #recentlyLapsedRoot(id: string): FabricParticipantInfo | undefined {
+    // A write-stalled mesh explains the lapse, and delivery needs the mesh: report the stall.
+    if (this.participants.writeStalled?.()) return undefined;
     const known = this.participants.lastKnown?.(id);
     if (!known || known.participant.kind !== "root" || known.lapsedMs > LAPSED_ROOT_REPLY_WINDOW_MS) return undefined;
     return known.participant;
@@ -78,7 +80,8 @@ export class AgentMessageRouter {
           ...(data === undefined ? {} : { data }),
         });
       }
-      const participant = remoteRoot ?? this.participants.get(this.mainAgent.id);
+      const participant = remoteRoot ?? this.participants.get(this.mainAgent.id) ??
+        this.#recentlyLapsedRoot(this.mainAgent.id);
       if (!participant) throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric Main participant: ${this.mainAgent.id}`);
       if (!participant.capabilities.includes(kind)) {
         throw new Error(`Fabric participant ${participant.id} does not support ${kind}`);

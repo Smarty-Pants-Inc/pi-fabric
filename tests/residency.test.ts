@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { markUnresolvedWorker } from "../src/storage/retention.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -272,6 +273,22 @@ describe("durable completion receipts", () => {
     });
     return { id, result, runDirectory, metadataPath, key };
   };
+
+  // review/astra on 3257dba, D1: the durable fallback cleanup keeps a possibly live worker's files.
+  it("refuses the fallback cleanup of a durable run marked with an unresolved worker", async () => {
+    const state = await rootHarness("unresolved-cleanup");
+    const seeded = await seedCompletion(state, "failed");
+    markUnresolvedWorker(seeded.runDirectory, "the Herdr server has been unreachable for 300 s");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(fs.existsSync(seeded.runDirectory)).toBe(true);
+      expect(fs.existsSync(seeded.metadataPath)).toBe(true);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
 
   it("retracts an already queued completion on late wait and persists the receipt across reconnects", async () => {
     const state = await rootHarness("late-completion-wait");

@@ -6,6 +6,7 @@ import {
   FABRIC_RUN_ROOT_PREFIX,
   markRunRootActive,
   markRunRootClosed,
+  markUnresolvedWorker,
   pruneActorRunArchives,
   sweepTempRunRoots,
 } from "../src/storage/retention.js";
@@ -100,6 +101,31 @@ describe("safe run roots", () => {
 });
 
 describe("temporal retention", () => {
+  // review/astra on 3257dba, D1: a lost worker's run survives its manager, in both sweeps.
+  it("never removes a run marked with an unresolved worker, after its owner is gone", () => {
+    const tempRoot = temporaryDirectory();
+    const orphaned = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphaned");
+    const closed = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
+    for (const runRoot of [orphaned, closed]) {
+      const run = path.join(runRoot, "lost");
+      writeStatus(run, { status: "failed", transport: "herdr", sessionId: "pane-1", finishedAt: 1, updatedAt: 1 });
+      fs.writeFileSync(path.join(run, "task.txt"), "work");
+      markUnresolvedWorker(run, "the Herdr server has been unreachable for 300 s");
+    }
+    fs.writeFileSync(path.join(orphaned, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    fs.writeFileSync(path.join(closed, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
+    const sweep = (at: string) => sweepTempRunRoots({ tempRoot: at, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
+    const result = sweep(tempRoot);
+    expect(result).toEqual({ removedRoots: [], removedRuns: [] });
+    expect(fs.existsSync(path.join(orphaned, "lost"))).toBe(true);
+    expect(fs.existsSync(path.join(closed, "lost"))).toBe(true);
+    // Without the marker the same runs are swept.
+    for (const runRoot of [orphaned, closed]) fs.rmSync(path.join(runRoot, "lost", "unresolved-worker.json"));
+    const unmarked = sweep(tempRoot);
+    expect(unmarked.removedRoots).toContain(orphaned);         // the closed root goes too once empty
+    expect(unmarked.removedRuns).toEqual([path.join(closed, "lost")]);
+  });
+
   it("removes dead temporary run roots after six hours", () => {
     const tempRoot = temporaryDirectory();
     const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "dead");

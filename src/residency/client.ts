@@ -10,6 +10,7 @@ import { resolveAgentCwd } from "../agents/manager.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, processIsAlive, spawnDetached } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
+import { hasUnresolvedWorker } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
@@ -375,6 +376,12 @@ export class ResidencyClient {
     const status = this.statusAgent(metadata.id);
     if (!("startedAt" in status) || !terminal(status.status)) {
       throw new Error(`Cannot clean up running durable Fabric agent ${metadata.id}`);
+    }
+    if (hasUnresolvedWorker(metadata.runDirectory)) {
+      throw new Error(
+        `Cannot clean up durable Fabric agent ${metadata.id}: its worker may still be running ` +
+        `(see ${metadata.runDirectory}). Check the worker, then remove its files by hand.`,
+      );
     }
     if (metadata.handle.worktree) {
       const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;

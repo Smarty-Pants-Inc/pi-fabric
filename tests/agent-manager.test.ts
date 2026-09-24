@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -548,6 +549,96 @@ describe("AgentManager", () => {
     } finally {
       spy.mockRestore();
       for (const handle of handles) await handle.stop();
+    }
+  }, 30_000);
+
+  // review/astra on 3257dba, D1: every settlement path keeps a possibly live worker's evidence.
+  const lostOnStop = (launched: Array<{ stop(): Promise<void> }>) => {
+    const launch = ProcessTransport.prototype.launch;
+    return vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launched.push(handle);
+      // As a Herdr handle whose server is gone: stop cannot reach the worker, which keeps running.
+      let stopped = false;
+      return {
+        ...handle,
+        relaunchable: false,
+        isAlive: async () => !stopped,
+        stop: async () => { stopped = true; },
+        lostContact: () => (stopped ? "the Herdr server has been unreachable for 300 s" : undefined),
+      };
+    });
+  };
+
+  it.each(["stop", "deadline"] as const)("marks a run whose worker was lost on the %s path, and refuses its cleanup", async (path_) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launched: Array<{ stop(): Promise<void> }> = [];
+    const spy = lostOnStop(launched);
+    try {
+      // A request can only extend the configured timeout, so the deadline case configures it.
+      const manager = new AgentManager(process.cwd(), {
+        ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, ...(path_ === "deadline" ? { timeoutMs: 1_500 } : {}),
+      }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      const result = path_ === "stop" ? await manager.stop(handle.id) : await manager.wait(handle.id);
+      expect(result.status).toBe(path_ === "stop" ? "stopped" : "timed_out");
+      const runDirectory = manager.runDirectory(handle.id)!;
+      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
+        .toMatch(/Herdr server has been unreachable/);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+      await manager.close();
+      expect(fs.existsSync(runDirectory)).toBe(true);
+    } finally {
+      spy.mockRestore();
+      for (const handle of launched) await handle.stop();
+    }
+  }, 30_000);
+
+  // review/astra on 3257dba, D3: an unconfirmed launch keeps its worktree and run files.
+  it("keeps the worktree and run files of a launch whose outcome is unknown", async () => {
+    const repository = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-unknown-launch-repo-"));
+    roots.push(repository);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: repository, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    git("init", "-q");
+    git("config", "user.email", "pi-fabric-tests@example.invalid");
+    git("config", "user.name", "Pi Fabric tests");
+    fs.writeFileSync(path.join(repository, "README.md"), "test\n");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    const launched: Array<{ stop(): Promise<void> }> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      launched.push(await launch.call(this, request));       // the worker starts ...
+      // ... but the reply is lost, as a dropped Herdr layout.apply reply.
+      throw Object.assign(new Error("Herdr did not confirm the launch"), { launchOutcome: "unknown" });
+    });
+    let worktree: string | undefined;
+    try {
+      const manager = new AgentManager(repository, DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      await expect(manager.spawn({ task: "HANG until stopped", transport: "process", worktree: true })).rejects.toThrow("did not confirm");
+      const marked = fs.readdirSync(root).map((name) => path.join(root, name, "unresolved-worker.json")).filter((file) => fs.existsSync(file));
+      expect(marked).toHaveLength(1);
+      worktree = JSON.parse(fs.readFileSync(marked[0]!, "utf8")).worktree as string;
+      expect(fs.existsSync(worktree)).toBe(true);
+      expect(git("worktree", "list", "--porcelain")).toContain("branch refs/heads/");
+      await manager.close();
+      expect(fs.existsSync(path.dirname(marked[0]!))).toBe(true);
+      expect(fs.existsSync(worktree)).toBe(true);
+    } finally {
+      spy.mockRestore();
+      for (const handle of launched) await handle.stop();
+      if (worktree) execFileSync("git", ["worktree", "remove", "--force", worktree], { cwd: repository, stdio: "ignore" });
     }
   }, 30_000);
 

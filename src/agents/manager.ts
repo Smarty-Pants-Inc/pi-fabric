@@ -69,6 +69,8 @@ import type { BudgetLedgerState } from "./budget-ledger.js";
 import { readJsonlPage } from "../log-tail.js";
 import {
   canRemoveManagedRunRoot,
+  hasUnresolvedWorker,
+  markUnresolvedWorker,
   heartbeatRunRoot,
   markRunRootActive,
   markRunRootClosed,
@@ -418,6 +420,15 @@ const failedRecord = (
     ...(managed.branch ? { branch: managed.branch } : {}),
     ...(managed.worktree ? { worktree: managed.worktree } : {}),
   };
+};
+
+const runRootHasUnresolvedWorker = (root: string): boolean => {
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(root, entry.name)));
+  } catch {
+    return false;
+  }
 };
 
 export class AgentManager {
@@ -968,6 +979,14 @@ export class AgentManager {
       return this.#handleInfo(managed, "running");
     } catch (error) {
       release();
+      // An unconfirmed launch may have started a worker that already uses the worktree
+      // and run files: keep both, marked, and neither retry nor adopt it.
+      if ((error as { launchOutcome?: string } | undefined)?.launchOutcome === "unknown") {
+        try {
+          markUnresolvedWorker(runDirectory, (error as Error).message, { runId: id, ...(worktree ? { worktree } : {}) });
+        } catch { /* best effort: the worktree is kept either way */ }
+        throw error;
+      }
       if (worktree) await this.#worktrees.cleanup(id, true).catch(() => false);
       throw error;
     }
@@ -1146,6 +1165,7 @@ export class AgentManager {
     }
     await managed.transport.stop();
     await this.#waitForTransportExit(managed);
+    await this.#noteUnconfirmedExit(managed);
     const terminal = readRecord(managed.statusFile);
     const record =
       terminal && terminalStatuses.has(terminal.status)
@@ -1159,10 +1179,10 @@ export class AgentManager {
   async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
-    if (managed.lostContact) {
+    if (managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) {
       throw new Error(
-        `Cannot clean up agent ${id}: Fabric lost track of its worker (${managed.lostContact}), which may still ` +
-        `use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
+        `Cannot clean up agent ${id}: Fabric lost track of its worker (${managed.lostContact ?? "see its run directory"}), ` +
+        `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
     this.markForeground(id);
@@ -1278,8 +1298,10 @@ export class AgentManager {
     // Lost contact is not an exit: such a worker may still use its files.
     const alive = await Promise.all(transports.map((transport) =>
       transport.isAlive().then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
+    const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
+      runRootHasUnresolvedWorker(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
-    if (!alive.some(Boolean)) {
+    if (!alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();
       const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
       if (!this.config.retainRuns) {
@@ -1328,7 +1350,7 @@ export class AgentManager {
       });
     }
     const expired = [...this.#runs.values()].filter((managed) => {
-      if (!managed.settled || managed.actorId || managed.lostContact) return false;
+      if (!managed.settled || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       const finishedAt = record?.finishedAt ?? record?.updatedAt;
       return typeof finishedAt === "number" && now - finishedAt >= this.#retention.oneShotRunMs;
@@ -1341,6 +1363,27 @@ export class AgentManager {
       this.#pruneRetainedUiRecords();
       this.#invalidateUiList();
     }
+  }
+
+  // After a stop: a worker whose exit is not confirmed (lost contact, or still reported
+  // alive) may keep using its files, so the run is marked unresolved (never cleaned up).
+  async #noteUnconfirmedExit(managed: ManagedAgent): Promise<void> {
+    if (managed.lostContact) return;
+    const lost = managed.transport.lostContact?.();
+    const alive = lost === undefined && await managed.transport.isAlive().catch(() => true);
+    if (lost === undefined && !alive) return;
+    this.#markLost(managed, lost ?? "the worker did not confirm its exit after it was stopped");
+  }
+
+  #markLost(managed: ManagedAgent, reason: string): void {
+    managed.lostContact = reason;
+    try {
+      markUnresolvedWorker(managed.runDirectory, reason, {
+        runId: managed.id,
+        transport: managed.transport.kind,
+        ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
+      });
+    } catch { /* the in-memory mark still guards this manager */ }
   }
 
   async #waitForTransportExit(managed: ManagedAgent): Promise<void> {
@@ -1586,6 +1629,7 @@ export class AgentManager {
       if (Date.now() >= deadline) {
         await managed.transport.stop();
         await this.#waitForTransportExit(managed);
+        await this.#noteUnconfirmedExit(managed);
         const completed = readRecord(managed.statusFile);
         if (
           completed &&
@@ -1631,7 +1675,7 @@ export class AgentManager {
             const lost = managed.transport.lostContact?.();
             if (lost) {
               // Not an exit: never relaunched, retried or cleaned up automatically.
-              managed.lostContact = lost;
+              this.#markLost(managed, lost);
               const failed = failedRecord(
                 managed,
                 "failed",

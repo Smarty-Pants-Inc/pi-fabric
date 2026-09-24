@@ -234,10 +234,11 @@ export class HerdrTransport implements AgentTransportAdapter {
       // Fail closed: layout.apply is not idempotent and a dropped reply leaves its outcome
       // unknown, so Fabric neither adopts a pane nor launches again (smarty-dev#347).
       // ponytail: a pane Herdr created anyway runs unowned; the label names it for cleanup.
-      throw new Error(
+      // launchOutcome "unknown": the manager keeps this run's worktree and files, marked.
+      throw Object.assign(new Error(
         `Herdr did not confirm the launch (${(error as Error).message}); a worker may still start in tab "${label}". ` +
-        "Fabric does not retry an unconfirmed Herdr launch.",
-      );
+        "Fabric does not retry an unconfirmed Herdr launch, and keeps its worktree and run files.",
+      ), { launchOutcome: "unknown" as const });
     }
 
     let terminalId: string | undefined;

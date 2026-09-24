@@ -223,6 +223,22 @@ describe("awaitPeerSettle during a mesh write stall", () => {
     await vi.waitFor(() => expect(result).toEqual({ ok: true }), { timeout: 2_000, interval: 10 });
   });
 
+  it("checks a peer that settled before confirmation again on the confirming snapshot", async () => {
+    let live: FabricPeerInfo[] = [peer("session:quiet", { status: "idle" })];
+    let confirmed = Date.now() - 1_000;
+    let result: PeerSettleResult | undefined;
+    void awaitPeerSettle({ poll: () => live, confirmedAt: () => confirmed, settledForMs: 30, pollMs: 5 })
+      .then((settled) => { result = settled; });
+    await sleep(60);                                           // quiet for 30 ms: provisionally settled
+    expect(result).toBeUndefined();
+    live = [peer("session:quiet", { status: "running" })];     // it resumes before the confirming poll
+    confirmed = Date.now();
+    await sleep(60);
+    expect(result).toBeUndefined();
+    live = [peer("session:quiet", { status: "idle" })];
+    await vi.waitFor(() => expect(result).toEqual({ ok: true }), { timeout: 2_000, interval: 10 });
+  });
+
   it("reports a stall that starts while waiting instead of settling", async () => {
     let stall: Error | undefined;
     const waiting = awaitPeerSettle({

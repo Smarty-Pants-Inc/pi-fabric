@@ -166,6 +166,8 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 				return;
 			}
 			const confirmed = confirmedSinceArm();
+			// Settles before the first confirmed snapshot are provisional: that snapshot checks them again.
+			const final = complete;
 			const snapshot = options.poll();
 			const byId = new Map(snapshot.map((peer) => [peer.id, peer] as const));
 			const current = now();
@@ -179,7 +181,10 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 				complete = confirmed;
 			}
 			for (const entry of watched.values()) {
-				if (entry.settled) continue;
+				if (entry.settled) {
+					if (final) continue;
+					entry.settled = false;
+				}
 				const peer = byId.get(entry.id);
 				if (!peer) {
 					entry.missingSince ??= current;

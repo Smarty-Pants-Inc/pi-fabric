@@ -1,20 +1,46 @@
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 import { buildSessionContext, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
+
+const isSystem = (message: AgentMessage): boolean => (message as { role?: string }).role === "system";
+const systemHead = (messages: readonly AgentMessage[]): string =>
+  JSON.stringify(getCurrentSystemMessage(messages as Parameters<typeof getCurrentSystemMessage>[0]) ?? null);
 
 /** A native startup snapshot, never a guessed prompt marker or a journal edit. */
 export class ActivationWindow {
   private readonly prior: string[];
+  /** The startup system records: an immutable witness (smarty-dev#390). */
+  private readonly witness: readonly string[];
+  private system: readonly string[];
   private current: string[] = [];
 
   constructor(messages: readonly AgentMessage[]) {
-    // Pi records system-prompt changes in the transcript as role "system" entries,
-    // but the context it sends to the model (and to this hook) leaves them out; a
-    // snapshot that kept them was never a prefix of that context (smarty-dev#390).
-    this.prior = messages
-      .filter(message => (message as { role?: string }).role !== "system")
-      .map(message => JSON.stringify(message));
+    // Pi journals system-prompt changes as role "system" records. It strips them
+    // before the context hook and restores their replayed head after it, so the
+    // conversation snapshot leaves them out; verifySystem checks them instead.
+    this.prior = messages.filter(message => !isSystem(message)).map(message => JSON.stringify(message));
+    this.witness = Object.freeze(messages.filter(isSystem).map(message => JSON.stringify(message)));
+    this.system = this.witness;
+  }
+
+  /**
+   * Checks the system prompt that reaches the model. The journal's system records must
+   * start with the startup witness and may only grow during the activation, and the
+   * running context's system head must be the replay of exactly those records: a
+   * rewritten earlier record, in the journal or in the running context, fails closed.
+   */
+  verifySystem(journal: readonly AgentMessage[], running: readonly AgentMessage[]): void {
+    const records = journal.filter(isSystem);
+    const encoded = records.map(message => JSON.stringify(message));
+    if (this.system.some((record, index) => encoded[index] !== record)) {
+      throw new Error("Activation window lost its native system records");
+    }
+    this.system = encoded;
+    if (systemHead(running) !== systemHead(records)) {
+      throw new Error("Activation window lost its native system prompt");
+    }
   }
 
   project(messages: AgentMessage[]): AgentMessage[] {
@@ -82,6 +108,16 @@ export default function activationWindow(pi: ExtensionAPI): void {
       try {
         if (!window) throw new Error("Activation window is not initialized");
         return { messages: window.project(event.messages) };
+      } catch (error) {
+        return failClosed(error);
+      }
+    });
+    // Runs after every context handler, on what reaches the model with its system head.
+    pi.on("context_with_system", (event, ctx) => {
+      try {
+        if (!window) throw new Error("Activation window is not initialized");
+        window.verifySystem(buildSessionContext(ctx.sessionManager.getBranch()).messages, event.messages);
+        return undefined;
       } catch (error) {
         return failClosed(error);
       }

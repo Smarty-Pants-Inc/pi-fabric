@@ -5,6 +5,7 @@ import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getCurrentSystemMessage } from "@earendil-works/pi-ai";
 import { SessionManager, buildSessionContext, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ActivationWindow } from "../src/worker/activation-window.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -65,6 +66,29 @@ describe("activation projection", () => {
     const context = [...journal.filter(message => message.role !== "system"), current];
     expect(window.project(context)).toEqual([current]);
     expect(() => window.project([user("rewritten history"), assistant("old reply"), current])).toThrow(/boundary/);
+  });
+
+  // Astra P1 on pi-fabric#33: the conversation check cannot see system records, because
+  // Pi strips them before the context hook and restores their replayed head after it.
+  it("fails closed when an earlier system record is rewritten, and allows only appended ones", () => {
+    // Each record patches its own section, as Pi's section diffs do, so a rewrite shows in the head.
+    const system = (text: string, section = "preamble") => ({ role: "system", content: "", sections: { [section]: text }, timestamp: 1 }) as never;
+    const journal = [system("first prompt"), user("old activation"), assistant("old reply"), system("changed rules", "rules")];
+    const head = (records: unknown[]) => getCurrentSystemMessage(records as never) as never;
+    const window = new ActivationWindow(journal);
+    const current = user("current envelope");
+    const appended = system("this activation's tools", "tools");
+    const now = [...journal, appended, current];
+    const running = [head([journal[0], journal[3], appended]), current];
+    expect(() => window.verifySystem(now, running)).not.toThrow();
+    // A rewritten old record in what reaches the model.
+    const rewritten = [head([system("REWRITTEN"), journal[3], appended]), current];
+    expect(() => window.verifySystem(now, rewritten)).toThrow(/system prompt/);
+    // A rewritten old record in the journal.
+    const forged = [system("REWRITTEN"), ...now.slice(1)];
+    expect(() => new ActivationWindow(journal).verifySystem(forged, [head([forged[0], journal[3], appended]), current])).toThrow(/system records/);
+    // Records appended in this activation may not disappear on a later model call.
+    expect(() => window.verifySystem(journal, [head([journal[0], journal[3]]), current])).toThrow(/system records/);
   });
 
   it("projects a large prior activation without a token ceiling on the current activation", () => {

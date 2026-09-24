@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { ACTOR_FAILURE_NOTICE_AFTER, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -1159,6 +1159,116 @@ describe("ActorManager", () => {
     const passive = await actors.setDeliveryPolicy(actor.id, "steer", false);
     expect(passive).toMatchObject({ delivery: "steer", triggerTurn: false, messages });
   });
+
+  // smarty-dev#390: activation-context supervisors failed every activation silently for an hour.
+  it("tells the owner's Main once when an actor keeps failing, and again after it recovers and fails", async () => {
+    const { actors, deliveries } = setup();
+    const actor = await actors.create({
+      name: "supervisor",
+      instructions: "Watch and steer only when needed.",
+      responseMode: "directive",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    const notices = () => deliveries.filter((text) => text.startsWith("Fabric host notice:"));
+    for (let run = 1; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    expect(notices()).toEqual([]);
+    await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    expect(notices()).toEqual([expect.stringContaining(`actor supervisor failed its last ${ACTOR_FAILURE_NOTICE_AFTER} activations`)]);
+    expect(notices()[0]).toContain("Structured agent output was invalid");
+    await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    expect(notices()).toHaveLength(1);                       // once per streak
+    await actors.ask(actor.id, "all good");                  // a completed run ends the streak
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    expect(notices()).toHaveLength(2);
+  }, 60_000);
+
+  // dev-lead review of #34: interrupted activations (ESC) are not failures, and no notice
+  // may start a turn while the halt holds.
+  it("does not count interrupted activations toward the owner notice", async () => {
+    const { actors, deliveries } = setup();
+    const actor = await actors.create({
+      name: "supervisor",
+      instructions: "Watch and steer only when needed.",
+      responseMode: "directive",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER + 1; run++) {
+      const asked = actors.ask(actor.id, "HANG").catch(() => undefined);
+      await waitFor(() => actors.status(actor.id).status === "running");
+      actors.haltAll();
+      await asked;
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      actors.dispatchHostEvent("input", {});                   // the user resumes
+    }
+    expect(deliveries.filter((text) => text.startsWith("Fabric host notice:"))).toEqual([]);
+  }, 60_000);
+
+  // review/astra on 810b557: in text mode (the default) a stopped run throws into the catch path.
+  it("does not count a text actor's run stopped through agents.stop() as the third failure", async () => {
+    const { actors, agents, deliveries } = setup();
+    const actor = await actors.create({
+      name: "watcher",
+      instructions: "Answer briefly.",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    for (let run = 1; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+      await expect(actors.ask(actor.id, "FAIL_DIRECTIVE")).rejects.toThrow();
+    }
+    const asked = actors.ask(actor.id, "HANG").catch((error: unknown) => error);
+    const hanging = () => agents.list().find((run) => run.status === "running" && String((run as { task?: string }).task).includes("HANG"));
+    await waitFor(() => hanging() !== undefined);
+    const hung = hanging()!;
+    await agents.stop(hung.id);
+    expect(String(await asked)).toMatch(/stopped/i);
+    await waitFor(() => actors.status(actor.id).status === "idle");
+    expect(deliveries.filter((text) => text.startsWith("Fabric host notice:"))).toEqual([]);
+    await expect(actors.ask(actor.id, "FAIL_DIRECTIVE")).rejects.toThrow(); // a real third failure still alarms
+    await waitFor(() => deliveries.some((text) => text.startsWith("Fabric host notice:")));
+  }, 60_000);
+
+  it.each(["stop", "close"] as const)("does not count an activation cut off by %s as the third failure", async (how) => {
+    const { actors, deliveries } = setup();
+    const actor = await actors.create({
+      name: "supervisor",
+      instructions: "Watch and steer only when needed.",
+      responseMode: "directive",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    for (let run = 1; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    const asked = actors.ask(actor.id, "HANG").catch(() => undefined);
+    await waitFor(() => actors.status(actor.id).status === "running");
+    if (how === "stop") await actors.stop(actor.id);
+    else await actors.close();
+    await asked;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(deliveries.filter((text) => text.startsWith("Fabric host notice:"))).toEqual([]);
+  }, 60_000);
+
+  // review/astra on #34: a completed run with an invalid directive is a failure too.
+  it("counts completed runs whose directive is invalid toward the owner notice", async () => {
+    const { actors, deliveries } = setup();
+    const actor = await actors.create({
+      name: "supervisor",
+      instructions: "Watch and steer only when needed.",
+      responseMode: "directive",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    const notices = () => deliveries.filter((text) => text.startsWith("Fabric host notice:"));
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+      await actors.ask(actor.id, "EMPTY_MESSAGE_DIRECTIVE").catch(() => undefined);
+    }
+    expect(notices()).toEqual([expect.stringContaining("missing message text")]);
+    await actors.ask(actor.id, "all good");                  // a valid message still ends the streak
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+      await actors.ask(actor.id, "EMPTY_MESSAGE_DIRECTIVE").catch(() => undefined);
+    }
+    expect(notices()).toHaveLength(2);
+  }, 60_000);
 
   it("stays ambient and retains the failed run when a directive run fails", async () => {
     const { actors, agents } = setup();

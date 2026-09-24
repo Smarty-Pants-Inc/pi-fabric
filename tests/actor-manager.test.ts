@@ -1556,7 +1556,45 @@ describe("ActorManager", () => {
     actors.haltAll();                                          // ... and ESC arrives first
     await new Promise((resolve) => setTimeout(resolve, 2_500));
     expect(runs.filter((run) => run.task.includes("held-"))).toEqual([]);
-    expect(actors.messages(actor.id).filter((message) => message.error?.includes("halted by user interrupt"))).toHaveLength(2);
+    // Both parked events, and the in-flight one the ownership loss aborted, are recorded dropped.
+    expect(actors.messages(actor.id).filter((message) => message.error?.includes("halted by user interrupt"))).toHaveLength(3);
+  }, 30_000);
+
+  // Astra review of #36, R2 follow-up: ESC after an ownership loss cancels the aborted in-flight
+  // event; the next input must not run it again.
+  it("drops, and never reruns, an in-flight event that an ownership loss aborted and ESC cancelled", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(false, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "HANG cancel-me" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    owned = false;
+    actors.listOwned();                                        // ownership loss aborts the run
+    actors.haltAll();                                          // ESC before the aborted run returns
+    await waitFor(() => actors.messages(actor.id).some((message) => message.error?.includes("halted by user interrupt")), 10_000);
+    owned = true;
+    actors.listOwned();
+    actors.dispatchHostEvent("input", {});                     // the user resumes
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    expect(runs.filter((run) => run.task.includes("cancel-me"))).toHaveLength(1);
+  }, 30_000);
+
+  // Astra review of #36, R4: a drop recorded while unowned survives the ownership-return reload.
+  it("keeps a drop recorded while unowned across the persistent ownership reload", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(true, () => owned);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "LIVE_WITH_PROGRESS kept" });
+    await waitFor(() => agents.list().some((run) => ((run as { turns?: number }).turns ?? 0) > 0));
+    owned = false;
+    actors.listOwned();                                        // the progressing run is detached and completes unowned
+    await waitFor(() => actors.messages(actor.id).some((message) => message.error?.startsWith("Dropped a queued event")), 10_000);
+    owned = true;
+    actors.listOwned();                                        // persistent reload rebuilds the actor from its registry
+    expect(actors.messages(actor.id).some((message) => message.error?.startsWith("Dropped a queued event"))).toBe(true);
   }, 30_000);
 
   // Astra review of #36, R3: after a reload, restored work waits for the old drain's run.

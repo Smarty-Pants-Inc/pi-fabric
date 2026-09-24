@@ -109,6 +109,8 @@ interface ManagedActor {
   abortController?: AbortController;
   /** The in-flight run an ownership change aborted: its event is parked, not failed. */
   ownershipAbort?: AbortController;
+  /** The in-flight run an explicit cancel (ESC) aborted: its event is dropped, never retried. */
+  cancelAbort?: AbortController;
   drain?: Promise<void>;
   draining: boolean;
 }
@@ -1089,6 +1091,13 @@ export class ActorManager {
     // work) so an idle-but-subscribed actor is not re-armed by the interrupt's
     // own settle events.
     this.#halted = true;
+    // An explicit cancel beats an ownership retry: a run that an ownership loss already
+    // aborted must not be parked and run again after the interrupt.
+    for (const actor of this.#actors.values()) {
+      if (!actor.abortController) continue;
+      actor.cancelAbort = actor.abortController;
+      delete actor.ownershipAbort;
+    }
     // Parked events are queued work too: an interrupt cancels them (recorded).
     for (const [id, items] of [...this.#parked]) {
       this.#parked.delete(id);
@@ -1354,6 +1363,13 @@ export class ActorManager {
           // rerun, whatever happens to ownership afterwards.
           runCompleted = result.status === "completed";
           runStopped = result.status === "stopped";
+          const cancelled = actor.cancelAbort === abortController;
+          if (cancelled) delete actor.cancelAbort;
+          // A caller hears the run's own outcome; an event without one is recorded dropped.
+          if (cancelled && !runCompleted && !item.resolve && !item.reject) {
+            this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
+            continue;
+          }
           if (actor.ownershipAbort === abortController && result.status !== "completed") {
             // An ownership change stopped this run; the event runs again under its owner.
             delete actor.ownershipAbort;
@@ -1445,6 +1461,13 @@ export class ActorManager {
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          if (actor.cancelAbort === abortController) {
+            delete actor.cancelAbort;
+            if (!runCompleted && !item.resolve && !item.reject) {
+              this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
+              continue;
+            }
+          }
           const ownershipAborted = actor.ownershipAbort === abortController;
           if (ownershipAborted) delete actor.ownershipAbort;
           if (!this.#canManage(actor.id) || ownershipAborted) {
@@ -1910,6 +1933,7 @@ export class ActorManager {
     this.#registryFingerprint = fingerprint;
     const ownsAny = [...this.#actors.keys()].some((id) => this.#ownershipDecision(id));
     if (!ownsAny) {
+      const previous = [...this.#actors.values()];
       for (const actor of this.#actors.values()) {
         actor.abortController?.abort();
         this.#park(actor, actor.queue.splice(0),
@@ -1922,10 +1946,12 @@ export class ActorManager {
       for (const actor of this.#actors.values()) {
         this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
       }
+      this.#carryMessages(previous);
       this.#scheduleRestoreParked();
       return;
     }
     const owned = new Set<string>();
+    const replaced: ManagedActor[] = [];
     for (const [id, actor] of this.#actors) {
       if (this.#ownershipDecision(id)) {
         owned.add(id);
@@ -1934,6 +1960,7 @@ export class ActorManager {
       actor.abortController?.abort();
       this.#park(actor, actor.queue.splice(0),
         `Fabric actor ${actor.name} (${actor.id}) is not owned by this host`);
+      replaced.push(actor);
       this.#actors.delete(id);
       this.#ownership.delete(id);
       this.#locallyCreated.delete(id);
@@ -1944,6 +1971,7 @@ export class ActorManager {
         this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
       }
     }
+    this.#carryMessages(replaced);
     this.#scheduleRestoreParked();
   }
 
@@ -2325,6 +2353,7 @@ export class ActorManager {
       return;
     }
     this.#reloadingOwnership = true;
+    const previous = [...this.#actors.values()];
     try {
       for (const actor of this.#actors.values()) {
         if (actor.abortController) actor.ownershipAbort = actor.abortController;
@@ -2339,6 +2368,7 @@ export class ActorManager {
       for (const actor of this.#actors.values()) {
         this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
       }
+      this.#carryMessages(previous);
     } finally {
       this.#reloadingOwnership = false;
     }
@@ -2365,6 +2395,19 @@ export class ActorManager {
   // results belong on the live object, or they vanish from the actor's messages.
   #liveActor(actor: ManagedActor): ManagedActor {
     return this.#actors.get(actor.id) ?? actor;
+  }
+
+  // A reload rebuilds actor objects from the registry. Messages recorded while this host
+  // did not own an actor (drops above all) were never saved there; keep them.
+  #carryMessages(previous: readonly ManagedActor[]): void {
+    for (const old of previous) {
+      const live = this.#actors.get(old.id);
+      if (!live || live === old) continue;
+      const known = new Set(live.messages.map((message) => message.id));
+      for (const message of old.messages) {
+        if (!known.has(message.id)) this.#recordMessage(live, message);
+      }
+    }
   }
 
   #takeParked(id: string): ActorQueueItem[] {

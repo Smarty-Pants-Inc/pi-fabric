@@ -247,6 +247,8 @@ export class ActorManager {
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   readonly #presenceQueued = new Set<string>();
+  /** Actor ids named by the last successfully parsed registry (undefined until one is). */
+  #registryIds: Set<string> | undefined;
   /** Orphan deletes, fenced to the entry version seen when it was found. */
   readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
@@ -1933,8 +1935,10 @@ export class ActorManager {
     this.#presenceTimer.unref();
   }
 
+  // Reaps only against a registry that was read and parsed: an unreadable or malformed
+  // actors.json proves nothing about which actors exist, so their presence stays.
   #reapOrphanPresence(): void {
-    if (this.#closing || !this.meshConfig.enabled) return;
+    if (this.#closing || !this.meshConfig.enabled || !this.#persistent || !this.#registryIds) return;
     const prefix = `actors/${this.sessionId}/`;
     let entries: MeshStateEntry[];
     try {
@@ -1946,7 +1950,7 @@ export class ActorManager {
       const id = entry.key.slice(prefix.length);
       const scope = (entry.value as { scope?: unknown } | null)?.scope;
       if (id.includes("/") || scope !== this.#actorScope || entry.updatedBy.id !== this.identity.id) continue;
-      if (this.#actors.has(id)) continue;
+      if (this.#actors.has(id) || this.#registryIds.has(id)) continue;
       this.#orphanPresence.set(id, entry.version);
       void this.#writePresence(id);
     }
@@ -2079,6 +2083,10 @@ export class ActorManager {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
     const records = (parsed as { actors?: unknown }).actors;
     if (!Array.isArray(records)) return;
+    // Every id the registry names, loadable or not: the orphan reaper's only evidence.
+    this.#registryIds = new Set(records.flatMap((value) =>
+      typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string"
+        ? [(value as { id: string }).id] : []));
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
       const record = value as Partial<ManagedActor>;

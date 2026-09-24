@@ -185,6 +185,9 @@ describe("ActorManager presence under a stalled mesh lock", () => {
   it("does not delete an orphan entry that another writer replaced before the retry", async () => {
     const { mesh, make, hold, release, identity } = stalledSetup(1_000);
     await mesh.put({ key: "actors/presence/ghost", value: { id: "ghost", scope: "project" }, identity });
+    const actorsDir = path.join(path.dirname(mesh.root), "actors");
+    fs.mkdirSync(actorsDir, { recursive: true });
+    fs.writeFileSync(path.join(actorsDir, "actors.json"), JSON.stringify({ actors: [] }));
     hold();
     make();                                                    // the reap's delete fails on the lock (150 ms)
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -195,12 +198,29 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     expect(mesh.get("actors/presence/ghost")?.version).toBe(replaced.version);
   }, 20_000);
 
+  // review/astra on #46, F3: a registry that cannot be read proves nothing; presence stays.
+  it.each([["malformed", "{"], ["with an unloadable record", JSON.stringify({ actors: [{ id: "kept" }] })]])(
+    "keeps presence when the registry is %s", async (_case, registry) => {
+      const { mesh, make, identity } = stalledSetup();
+      await mesh.put({ key: "actors/presence/kept", value: { id: "kept", scope: "project" }, identity });
+      const actorsDir = path.join(path.dirname(mesh.root), "actors");
+      fs.mkdirSync(actorsDir, { recursive: true });
+      fs.writeFileSync(path.join(actorsDir, "actors.json"), registry);
+      make();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(mesh.get("actors/presence/kept")).toBeDefined();
+    }, 20_000);
+
   it("reaps this session's orphan presence at start, and nothing of another scope or writer", async () => {
     const { mesh, make, identity } = stalledSetup();
     const other = { ...identity, id: "session:other" };
     await mesh.put({ key: "actors/presence/ghost", value: { id: "ghost", scope: "project" }, identity });
     await mesh.put({ key: "actors/presence/session-scoped", value: { id: "session-scoped", scope: "session" }, identity });
     await mesh.put({ key: "actors/presence/foreign", value: { id: "foreign", scope: "project" }, identity: other });
+    // The registry was read and no longer lists "ghost" (a remove whose delete never landed).
+    const actorsDir = path.join(path.dirname(mesh.root), "actors");
+    fs.mkdirSync(actorsDir, { recursive: true });
+    fs.writeFileSync(path.join(actorsDir, "actors.json"), JSON.stringify({ actors: [] }));
     make();                                                    // project scope (the mesh default)
     await waitFor(() => mesh.get("actors/presence/ghost") === undefined, 5_000);
     expect(mesh.get("actors/presence/session-scoped")).toBeDefined();

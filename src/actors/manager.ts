@@ -1937,6 +1937,7 @@ export class ActorManager {
     if (!ownsAny) {
       const previous = [...this.#actors.values()];
       for (const actor of this.#actors.values()) {
+        this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
         this.#park(actor, actor.queue.splice(0),
           `Fabric actor ${actor.name} (${actor.id}) reloaded from its registry`);
@@ -1959,6 +1960,7 @@ export class ActorManager {
         owned.add(id);
         continue;
       }
+      this.#markOwnershipAbort(actor);
       actor.abortController?.abort();
       this.#park(actor, actor.queue.splice(0),
         `Fabric actor ${actor.name} (${actor.id}) is not owned by this host`);
@@ -2340,7 +2342,7 @@ export class ActorManager {
       const next = this.#ownershipDecision(actor.id);
       this.#ownership.set(actor.id, next);
       if (previous && !next) {
-        if (actor.abortController) actor.ownershipAbort = actor.abortController;
+        this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
         this.#park(actor, actor.queue.splice(0),
           `Fabric actor ${actor.name} (${actor.id}) ownership moved to another host`);
@@ -2358,7 +2360,7 @@ export class ActorManager {
     const previous = [...this.#actors.values()];
     try {
       for (const actor of this.#actors.values()) {
-        if (actor.abortController) actor.ownershipAbort = actor.abortController;
+        this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
         this.#park(actor, actor.queue.splice(0),
           `Fabric actor ${actor.name} (${actor.id}) reloaded when its ownership returned`);
@@ -2399,12 +2401,22 @@ export class ActorManager {
     return this.#actors.get(actor.id) ?? actor;
   }
 
+  // An in-flight run that an ownership change aborts is parked and retried, not failed,
+  // unless an explicit cancel (ESC) already claimed it.
+  #markOwnershipAbort(actor: ManagedActor): void {
+    if (actor.abortController && actor.cancelAbort !== actor.abortController) {
+      actor.ownershipAbort = actor.abortController;
+    }
+  }
+
   // A reload rebuilds actor objects from the registry. Messages recorded while this host
-  // did not own an actor (drops above all) were never saved there; keep them.
+  // did not own an actor (drops above all) were never saved there; keep them. The
+  // activation counter carries over too, so restored events keep their freshness.
   #carryMessages(previous: readonly ManagedActor[]): void {
     for (const old of previous) {
       const live = this.#actors.get(old.id);
       if (!live || live === old) continue;
+      live.latestActivationSequence = Math.max(live.latestActivationSequence, old.latestActivationSequence);
       const known = new Set(live.messages.map((message) => message.id));
       for (const message of old.messages) {
         if (!known.has(message.id)) this.#recordMessage(live, message);

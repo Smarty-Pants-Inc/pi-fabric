@@ -1611,6 +1611,61 @@ describe("ActorManager", () => {
     expect(runs.filter((run) => run.task.includes("HANG deferred"))).toHaveLength(1);
   }, 30_000);
 
+  // review/astra on ffc39e8, R5: restored events keep their freshness across a persistent reload.
+  it("runs the latest restored event, and keeps older ones stale, across a persistent ownership flip", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(true, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({
+      name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text",
+      validWhile: { version: 1, source: "({ activation, current }) => activation.sequence === current.latestActivationSequence" },
+    });
+    actors.listOwned();
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS older" });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS newest" });
+    await waitFor(() => actors.status(actor.id).queued === 2);
+    owned = false;
+    actors.listOwned();                                        // both queued events park
+    owned = true;
+    actors.listOwned();                                        // persistent reload: a new actor object
+    await waitFor(() => runs.some((run) => run.task.includes("newest") && run.finishedAt !== undefined), 15_000);
+    expect(runs.filter((run) => run.task.includes("newest"))).toHaveLength(1);
+    expect(runs.filter((run) => run.task.includes("older"))).toEqual([]);
+    expect(actors.messages(actor.id).some((message) => message.stale)).toBe(true);
+  }, 30_000);
+
+  // review/astra on ffc39e8, R6: a registry resync that replaces an unowned actor parks the
+  // aborted in-flight event for retry, like an ownership refresh does.
+  it.each(["every actor", "one of two actors"] as const)("retries an in-flight event aborted by a registry resync after ownership returns (%s unowned)", async (scope) => {
+    let owned = true;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let keeper: string | undefined;
+    // "one of two": another actor stays owned, so the resync takes its partial replacement path.
+    const { actors, mesh, agents, root } = setup(true, (id) => owned || id === keeper);
+    const runs = recordRuns(agents, () => held);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    if (scope === "one of two actors") {
+      keeper = (await actors.create({ name: "keeper", instructions: "Keep.", topics: ["team.other"], responseMode: "text" })).id;
+    }
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "HANG resync" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    owned = false;
+    const registry = path.join(root, "actors", "actors.json");
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(registry, later, later);                     // another host rewrote the registry
+    actors.listOwned();                                        // the resync replaces the unowned actor
+    owned = true;
+    actors.listOwned();                                        // ownership returns before the result
+    release();
+    await waitFor(() => runs.filter((run) => run.task.includes("HANG resync")).length === 2, 15_000);
+    actors.haltAll();
+  }, 30_000);
+
   // Astra review of #36, R4: a drop recorded while unowned survives the ownership-return reload.
   it("keeps a drop recorded while unowned across the persistent ownership reload", async () => {
     let owned = true;

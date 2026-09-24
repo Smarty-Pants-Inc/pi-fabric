@@ -303,6 +303,27 @@ describe("AgentManager", () => {
     expect(manager.list()).toEqual([]);
   });
 
+  it("passes prepared destination settings only to compacted handoffs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-budget-"));
+    roots.push(root);
+    const resolveBudget = vi.fn(async () => ({ contextWindow: 50_000, targetContextRatio: 0.5, reserveTokens: 5000, keepRecentTokens: 1000 }));
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async () => "anthropic/resolved-target",
+      resolveHandoffCompactionBudget: resolveBudget,
+    });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "HANG", model: "alias", sessionSeed: handoffSeed(`Fact ${"x".repeat(60_000)}`), handoffCompact: {} });
+    expect(resolveBudget).toHaveBeenCalledExactlyOnceWith("anthropic/resolved-target", process.cwd());
+    const directory = path.join(manager.runDirectory(handle.id)!, "handoff-session");
+    const child = SessionManager.open(path.join(directory, fs.readdirSync(directory)[0]!));
+    expect(child.getBranch().find(e => e.type === "compaction")).toMatchObject({ details: { budget: { contextWindow: 50_000, keepRecentTokens: 1000 } } });
+    await manager.stop(handle.id);
+    const plain = await manager.spawn({ task: "HANG", model: "alias", sessionSeed: handoffSeed() });
+    expect(resolveBudget).toHaveBeenCalledTimes(1);
+    await manager.stop(plain.id);
+  });
+
   it("rejects trajectory seeds for the Claude runner and conflicting session files", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

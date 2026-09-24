@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { assertCertificateFacts, consume } from "../verified/policy.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -320,19 +321,20 @@ export class SchemaController {
       const certificateEntry = this.mesh.get(`${CERTIFICATE_PREFIX}${tokenHash}`);
       if (!certificateEntry) throw new Error("Unknown Schema certificate");
       const certificate = certificateEntry.value as SchemaCertificateRecord;
-      if (certificate.status !== "active") throw new Error(`Schema certificate is ${certificate.status}`);
-      if (certificate.hypothesisId !== input.hypothesisId) throw new Error("Schema certificate is bound to a different hypothesis");
-      this.#assertInvocation(certificate.parentToolCallId, context.parentToolCallId);
-      if (Date.now() > certificate.expiresAt) throw new Error("Schema certificate expired");
       const hypothesisEntry = this.#requireHypothesis(input.hypothesisId);
       const hypothesis = hypothesisEntry.value as SchemaHypothesisRecord;
-      if (hypothesis.status !== "verified") throw new Error(`Schema hypothesis is not verified: ${hypothesis.status}`);
-      if (!sameBinding(certificate.state, stateBinding(this.state?.getHead() ?? null))) {
-        throw new Error("Schema state head changed after verification");
-      }
-      if (certificate.generation !== this.#generation()) throw new Error("Schema workspace generation is stale");
       const baseline = snapshotWorkspace(this.cwd, [this.mesh.root]);
-      if (baseline.fingerprint !== certificate.fingerprint) throw new Error("Schema workspace fingerprint is stale");
+      const consumption = consume(certificate.status === "active");
+      assertCertificateFacts([
+        { valid: consumption.fst, error: `Schema certificate is ${certificate.status}` },
+        { valid: certificate.hypothesisId === input.hypothesisId, error: "Schema certificate is bound to a different hypothesis" },
+        { valid: certificate.parentToolCallId === context.parentToolCallId, error: "Schema artifact belongs to a different fabric_exec invocation" },
+        { valid: Number.isFinite(certificate.expiresAt) && Date.now() <= certificate.expiresAt, error: "Schema certificate expired" },
+        { valid: hypothesis.status === "verified", error: `Schema hypothesis is not verified: ${hypothesis.status}` },
+        { valid: sameBinding(certificate.state, stateBinding(this.state?.getHead() ?? null)), error: "Schema state head changed after verification" },
+        { valid: certificate.generation === this.#generation(), error: "Schema workspace generation is stale" },
+        { valid: baseline.fingerprint === certificate.fingerprint, error: "Schema workspace fingerprint is stale" },
+      ]);
 
       const declared = new Map<string, ReturnType<typeof resolveWorkspaceFile>>();
       let payloadBytes = 0;
@@ -370,7 +372,7 @@ export class SchemaController {
 
       await this.mesh.put({
         key: certificateEntry.key,
-        value: { ...certificate, status: "consumed", consumedAt: Date.now() },
+        value: { ...certificate, status: consumption.snd ? "active" : "consumed", consumedAt: Date.now() },
         ifVersion: certificateEntry.version,
         identity: this.identity,
       });

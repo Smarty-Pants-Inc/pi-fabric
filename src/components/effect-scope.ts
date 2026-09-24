@@ -1,3 +1,4 @@
+import { boundedEffectResources, cleanupState, consume } from "../verified/policy.js";
 import type {
   FabricComponentDisposer,
   FabricComponentEffect,
@@ -91,16 +92,14 @@ const normalizeRegistration = (
 ): { label: string; effect?: FabricComponentEffectInfo } => {
   if (typeof registration === "string") return { label: registration };
   if (!registration) return { label: fallbackLabel };
-  const resources = [...new Set((registration.resources ?? [])
-    .filter((resource): resource is string => typeof resource === "string" && resource.length > 0)
-    .map((resource) => resource.slice(0, 256)))].slice(0, 64);
+  const resources = boundedEffectResources(registration.resources);
   const label = registration.label?.trim().slice(0, 256) || fallbackLabel;
   return {
     label,
     effect: {
       label,
       kind: registration.kind ?? "transactional",
-      resources: resources.length > 0 ? resources : ["*"],
+      resources,
       ordering: registration.ordering ?? "unknown",
     },
   };
@@ -255,8 +254,9 @@ export class FabricEffectScope {
 
     let disposal: Promise<void> | undefined;
     record.dispose = async () => {
-      if (record.disposed) return disposal;
-      record.disposed = true;
+      const release = consume(!record.disposed);
+      if (!release.fst) return disposal;
+      record.disposed = !release.snd;
       record.armed = false;
       disposal = (async () => {
         await record.setup.catch(() => undefined);
@@ -327,8 +327,9 @@ export class FabricEffectScope {
     };
     let disposal: Promise<void> | undefined;
     record.dispose = async () => {
-      if (record.disposed) return disposal;
-      record.disposed = true;
+      const release = consume(!record.disposed);
+      if (!release.fst) return disposal;
+      record.disposed = !release.snd;
       record.armed = false;
       disposal = (async () => {
         const failures: unknown[] = [];
@@ -369,7 +370,7 @@ export class FabricEffectScope {
       }
       this.#state = "disposed";
       return {
-        status: failures.length > 0 ? "quarantined" : "disposed",
+        status: cleanupState(failures.length > 0, false) === 2 ? "quarantined" : "disposed",
         failures,
       };
     })();

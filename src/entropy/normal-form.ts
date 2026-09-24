@@ -2,6 +2,7 @@
 // A proof is a re-derivation from a bounded rule language, not a claim made
 // by an imported artifact. No observation can authorize a new semantic map.
 import { Value } from "typebox/value";
+import { useNormalized } from "../verified/policy.js";
 import { stableJsonHash } from "../core/stable-hash.js";
 import { shapeSignature } from "./fingerprint.js";
 
@@ -132,7 +133,9 @@ export const applyNormalFormPlan = (
   // This early identity law protects every canonical capability, including
   // rare enum members and nullable values. Successful candidates satisfy it
   // too, which establishes idempotence without a corpus-dependent gate.
-  if (!plan || plan.ref !== ref || accepts(schema, args) || !provesNormalFormPlan(plan, schema)) return unchanged;
+  const canonical = accepts(schema, args);
+  const proven = !canonical && plan !== undefined && plan.ref === ref && provesNormalFormPlan(plan, schema);
+  if (!useNormalized(canonical, proven, true, true) || !plan) return unchanged;
   const properties = (schema as { properties: Record<string, Record<string, unknown>> }).properties;
   const candidate = { ...args };
   const applied: NormalFormRule[] = [];
@@ -176,7 +179,7 @@ export const applyNormalFormPlan = (
   }
   // A partial repair is not a successful correction. Return original input
   // on every refusal so authoritative validation reports the real failure.
-  if (applied.length === 0 || !accepts(schema, candidate)) return unchanged;
+  if (!useNormalized(canonical, proven, applied.length > 0, accepts(schema, candidate))) return unchanged;
   return {
     args: candidate,
     witness: {

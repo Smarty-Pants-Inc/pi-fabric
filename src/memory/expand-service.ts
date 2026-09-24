@@ -1,3 +1,5 @@
+import { pointerCurrent } from "../verified/policy.js";
+import { acceptsExpansionPage } from "../verified/memory.js";
 import { RECALL_MAX_RESPONSE_CHARS } from "./context.js";
 import {
   expandSessionEntriesChecked,
@@ -127,7 +129,7 @@ export async function processMemoryExpand(
       snapshot.sourceHash !== expectedSourceHash;
     const lineageChanged = expectedLineageFingerprint !== undefined &&
       snapshot.lineageFingerprint !== expectedLineageFingerprint;
-    if (sourceChanged || lineageChanged) {
+    if (!pointerCurrent(!sourceChanged, !lineageChanged)) {
       return {
         session: ref.file,
         branches,
@@ -157,7 +159,7 @@ export async function processMemoryExpand(
       initialState.sourceHash !== expectedSourceHash;
     const lineageChanged = expectedLineageFingerprint !== undefined &&
       initialLineage.fingerprint !== expectedLineageFingerprint;
-    if (sourceChanged || lineageChanged) {
+    if (!pointerCurrent(!sourceChanged, !lineageChanged)) {
       return {
         session: ref.file,
         branches,
@@ -197,8 +199,7 @@ export async function processMemoryExpand(
     if (
       !finalState ||
       !finalObservation ||
-      finalState.sourceHash !== initialState.sourceHash ||
-      finalLineage.fingerprint !== initialLineage.fingerprint
+      !pointerCurrent(finalState.sourceHash === initialState.sourceHash, finalLineage.fingerprint === initialLineage.fingerprint)
     ) {
       return {
         session: ref.file,
@@ -523,6 +524,11 @@ export async function processMemoryExpand(
     }
   }
 
+  if (!acceptsExpansionPage(output, selected, entryOffset, textOffset, cursor)) {
+    cache.forgetExpansionSnapshot(snapshot);
+    return { session: ref.file, entries: [], error: { code: "invalid_expansion", message: "Expansion failed source-bound chunk verification" } };
+  }
+
   const endingObservation = access.observe(branches);
   if (!endingObservation || !sameSourceObservation(snapshot.observation, endingObservation)) {
     cache.forgetExpansionSnapshot(snapshot);
@@ -531,8 +537,7 @@ export async function processMemoryExpand(
     if (
       !actualState ||
       !endingObservation ||
-      actualState.sourceHash !== snapshot.sourceHash ||
-      actualLineage.fingerprint !== snapshot.lineageFingerprint
+      !pointerCurrent(actualState.sourceHash === snapshot.sourceHash, actualLineage.fingerprint === snapshot.lineageFingerprint)
     ) {
       return {
         session: ref.file,

@@ -49,7 +49,7 @@ schemas, guest payloads, or discovery metadata.
   backgrounded child. `executor.shellHangMs: 0` disables automatic handoff, not
   explicit `background: true`.
 - Middleware factories and hooks may close over current policy. Fabric reads the
-  active captured definition for each invocation rather than caching a prior
+  active captured definition for each invocation without caching a prior
   extension generation. The selected protection remains pinned across that
   invocation's awaited lifecycle hooks. There is no load-order handshake or need to register another `bash` tool.
 - Invalid capabilities or failing factories reject the call; Fabric never retries

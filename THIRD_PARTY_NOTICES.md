@@ -1,5 +1,14 @@
 # Third-party notices
 
+## Bend 2.0.26
+
+The generated policy kernel includes Bend's emitted JavaScript trampoline and
+compiled Base primitives from [Bend 2.0.26](https://github.com/bendlang/bend/tree/v2.0.26),
+Copyright 2026 HigherOrderCO, licensed under Apache-2.0. Pi Fabric removes the
+CLI invocation, adds library exports, and tree-shakes unused runtime code.
+The complete license is distributed at [docs/licenses/bend-apache-2.0.txt](docs/licenses/bend-apache-2.0.txt).
+
+
 Pi Fabric's QuickJS host-bridge design and TypeScript code-mode ergonomics were informed by the MIT-licensed [`boozedog/pi-codemode`](https://github.com/boozedog/pi-codemode) project.
 
 Its subagent transport design was informed by the MIT-licensed [`sigilmakes/spindle`](https://github.com/sigilmakes/spindle), Pi's bundled subagent example, and LocalTerm's tmux-parity session API.

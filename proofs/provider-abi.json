@@ -1,0 +1,4 @@
+{
+  "providerTake": [["ticket", "ProviderTicket"], ["key", "StateText"], ["observed", "StateText"], ["stopped", "boolean"], "ProviderOutcome"],
+  "providerRevoke": [["ticket", "ProviderTicket"], "ProviderTicket"]
+}

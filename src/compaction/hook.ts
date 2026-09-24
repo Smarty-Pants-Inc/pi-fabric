@@ -6,9 +6,10 @@ import {
   type SessionBeforeTreeEvent,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { acceptCompactionCut, acceptSummaryBounds } from "../verified/policy.js";
 import { calculateContextTokens, DEFAULT_COMPACTION_SETTINGS, estimateTokens } from "../core/token-math.js";
 import { buildSessionContext, sessionEntryToContextMessages } from "../core/session-context.js";
-import { clipUtf8, MAX_SUMMARY_BYTES } from "./bounds.js";
+import { clipUtf8, MAX_SUMMARY_BYTES, utf8Bytes } from "./bounds.js";
 import { modelCompactionKey } from "./threshold.js";
 import { NO_BUILTIN_ENRICHERS, runEnrichers, type CompactionEnricher } from "./enrichers.js";
 import { compileFabricBranchSummary } from "./branch-summary.js";
@@ -23,7 +24,7 @@ import {
   type ProjectionOmittedCounts,
   type Sections,
 } from "./projections.js";
-import { renderSummary } from "./render.js";
+import { renderSummaryWithMetadata, SUMMARY_SECTIONS } from "./render.js";
 
 type CompactionEngine = "pi" | "fabric";
 
@@ -48,10 +49,12 @@ interface CallResultSpan {
 }
 
 export interface FabricCompactionBudget {
-  contextWindow: number;
-  targetContextRatio: number;
+  contextWindow?: number;
+  targetContextRatio?: number;
   reserveTokens: number;
   keepRecentTokens: number;
+  /** False for a new executor: source-model usage does not calibrate its context. */
+  calibrateUsage?: boolean;
 }
 
 type FabricCompactionBindingConstraint =
@@ -331,22 +334,25 @@ const tokenCalibration = (
   return { tokenScale, fixedOverheadTokens };
 };
 
+const continuityTailLimit = (value: number | undefined): number =>
+  value !== undefined && Number.isSafeInteger(value) && value >= 0
+    ? value : DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
+
 const continuityCutPlan = (
   branchEntries: SessionEntry[],
   tokensBefore: number,
   budget: FabricCompactionBudget,
 ): ContinuityCutPlan | undefined => {
-  if (!Number.isFinite(budget.contextWindow) || budget.contextWindow <= 0) return undefined;
+  if (typeof budget.contextWindow !== "number" || !Number.isFinite(budget.contextWindow) || budget.contextWindow <= 0
+    || typeof budget.targetContextRatio !== "number" || !Number.isFinite(budget.targetContextRatio)) return undefined;
   const contextWindow = Math.floor(budget.contextWindow);
   const reserveTokens = Math.max(0, Math.floor(budget.reserveTokens));
-  const keepRecentTokens = Math.max(0, Math.floor(budget.keepRecentTokens));
+  const keepRecentTokens = continuityTailLimit(budget.keepRecentTokens);
   const targetContextRatio = Math.max(0.25, Math.min(0.85, budget.targetContextRatio));
   const rawTokensBefore = rawContextTokens(branchEntries);
-  const { tokenScale, fixedOverheadTokens } = tokenCalibration(
-    branchEntries,
-    tokensBefore,
-    rawTokensBefore,
-  );
+  const { tokenScale, fixedOverheadTokens } = budget.calibrateUsage === false
+    ? { tokenScale: 1, fixedOverheadTokens: 0 }
+    : tokenCalibration(branchEntries, tokensBefore, rawTokensBefore);
   const continuityTargetTokens = Math.max(1, Math.ceil(
     fixedOverheadTokens + (keepRecentTokens + SUMMARY_RAW_TOKEN_BUDGET) * tokenScale,
   ));
@@ -423,7 +429,8 @@ const boundary = (
 const computeContinuityCut = (
   branchEntries: SessionEntry[],
   live: LiveEntry[],
-  plan: ContinuityCutPlan,
+  plan: ContinuityCutPlan | undefined,
+  rawTailTokenBudget = plan?.rawTailTokenBudget ?? DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
 ): CutResult => {
   const suffixTokens = new Array<number>(live.length + 1).fill(0);
   for (let index = live.length - 1; index >= 0; index--) {
@@ -436,13 +443,13 @@ const computeContinuityCut = (
   for (let index = 1; index < live.length; index++) {
     const item = live[index]!;
     if (item.branchIndex <= previousCompactionIndex) continue;
-    if (!item.cutPoint || suffixTokens[index]! > plan.rawTailTokenBudget) continue;
+    if (!item.cutPoint || suffixTokens[index]! > rawTailTokenBudget) continue;
     if (!closureSafe(spans, item.branchIndex)) continue;
     cutIndex = index;
     break;
   }
   const retainedRawTokens = suffixTokens[cutIndex] ?? 0;
-  const details = {
+  const details = plan ? {
     strategy: "continuity" as const,
     contextWindow: plan.contextWindow,
     targetContextRatio: plan.targetContextRatio,
@@ -459,7 +466,7 @@ const computeContinuityCut = (
     reductionCeilingTokens: plan.reductionCeilingTokens,
     rawTailTokenBudget: plan.rawTailTokenBudget,
     bindingConstraint: plan.bindingConstraint,
-  };
+  } : undefined;
   if (cutIndex >= live.length) {
     return boundary(live.map((item) => item.entry), "", details);
   }
@@ -470,7 +477,7 @@ const computeContinuityCut = (
   );
 };
 
-export const computeCut = (
+const proposeCut = (
   branchEntries: SessionEntry[],
   options?: { tokensBefore: number; budget: FabricCompactionBudget },
 ): CutResult => {
@@ -482,9 +489,16 @@ export const computeCut = (
     if (plan) return computeContinuityCut(branchEntries, live, plan);
   }
 
+  // Without a model window, retain legacy whole-turn continuity only when
+  // it fits the raw-tail limit. Large autonomous turns use the same bounded,
+  // closure-safe suffix selector without inventing provider budget metadata.
   const lastBoundary = lastBoundaryIndex(live);
-  if (lastBoundary <= 0) return boundary(live.map((item) => item.entry), "");
-  const closed = closeCut(branchEntries, live, lastBoundary);
+  const closed = lastBoundary > 0 ? closeCut(branchEntries, live, lastBoundary) : 0;
+  const keepRecentTokens = continuityTailLimit(options?.budget.keepRecentTokens);
+  const tailTokens = live.slice(closed).reduce((sum, item) => sum + item.estimatedTokens, 0);
+  if (tailTokens > keepRecentTokens) {
+    return computeContinuityCut(branchEntries, live, undefined, keepRecentTokens);
+  }
   const previousCompactionIndex = findLastCompaction(branchEntries)?.index ?? -1;
   if (closed <= 0 || live[closed]!.branchIndex <= previousCompactionIndex) {
     return boundary(live.map((item) => item.entry), "");
@@ -494,6 +508,30 @@ export const computeCut = (
     live.slice(0, closed).map((item) => item.entry),
     live[closed]!.entry.id,
   );
+};
+
+/** Selection stays an optimized TypeScript producer. Every successful proposal,
+ * including legacy and compact-all paths, passes the compiled acceptance gate. */
+export const computeCut = (
+  branchEntries: SessionEntry[],
+  options?: { tokensBefore: number; budget: FabricCompactionBudget },
+): CutResult => {
+  const proposed = proposeCut(branchEntries, options);
+  if (!proposed.ok) return proposed;
+  const live = collectLive(branchEntries);
+  const kept = proposed.firstKeptEntryId
+    ? live.findIndex((item) => item.entry.id === proposed.firstKeptEntryId)
+    : live.length;
+  if (kept < 0) return { ok: false, reason: "empty" };
+  const boundaryIndex = live[kept]?.branchIndex ?? branchEntries.length;
+  const retained = live.slice(kept).reduce((sum, item) => sum + item.estimatedTokens, 0);
+  const budget = proposed.budget?.rawTailTokenBudget ?? continuityTailLimit(options?.budget.keepRecentTokens);
+  if (!acceptCompactionCut({
+    eligible: kept === live.length || live[kept]!.cutPoint,
+    afterPrevious: boundaryIndex > (findLastCompaction(branchEntries)?.index ?? -1),
+    retained, budget, boundary: boundaryIndex,
+  }, callResultSpans(branchEntries).values())) return { ok: false, reason: "empty" };
+  return proposed;
 };
 
 interface FabricCompactionDetailsV1 {
@@ -622,6 +660,12 @@ const isFabricV2Details = (value: Record<string, unknown>): boolean => {
       || (typeof value.omittedCounts.commits === "number" && Number.isFinite(value.omittedCounts.commits)))
     && (value.omittedCounts.thinking === undefined
       || (typeof value.omittedCounts.thinking === "number" && Number.isFinite(value.omittedCounts.thinking)))
+    && (value.omittedCounts.dialogueBytes === undefined
+      || (typeof value.omittedCounts.dialogueBytes === "number"
+        && Number.isFinite(value.omittedCounts.dialogueBytes) && value.omittedCounts.dialogueBytes >= 0))
+    && (value.instructionPolicy.renderedOmittedBytes === undefined
+      || (typeof value.instructionPolicy.renderedOmittedBytes === "number"
+        && Number.isFinite(value.instructionPolicy.renderedOmittedBytes) && value.instructionPolicy.renderedOmittedBytes >= 0))
     && typeof value.instructionPolicy.mode === "string"
     && instructionModes.has(value.instructionPolicy.mode)
     && typeof value.instructionPolicy.canonicalized === "boolean"
@@ -707,16 +751,24 @@ export const compileFabricSummary = (
 
   const source = cumulativeSource(branchEntries, cut.firstKeptEntryId);
   if (source.events.length === 0) return { cancel: true, reason: "fabric: no raw cumulative source" };
-  const projected = projectWithMetadata(source.events);
+  // Only dialogue from the already-kept tail is needed to pair a summarized
+  // proposal with its raw user reply. Never summarize the tail's tool history.
+  const retainedDialogue = cut.firstKeptEntryId
+    ? normalizeEntries(branchEntries.slice(source.prefixEntries.length).filter((entry) =>
+        entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant")))
+        .filter((event) => event.kind === "user" || event.kind === "assistantText")
+    : [];
+  const projected = projectWithMetadata(source.events, retainedDialogue);
   const sections: Sections = projected.sections;
   runEnrichers(enrichers, source.events, sections);
 
-  const summary = renderSummary(sections, {
+  const rendered = renderSummaryWithMetadata(sections, {
     firstEntryId: source.range.first,
     lastEntryId: source.range.last,
     lastTimestamp: source.timestamp,
     requestLines: instructions.requestLines,
   });
+  const { summary } = rendered;
   const projectedTokensAfter = cut.budget
     ? Math.ceil(
         cut.budget.fixedOverheadTokens
@@ -729,17 +781,22 @@ export const compileFabricSummary = (
     : undefined;
   // The maximum-summary reservation should make this unreachable unless fixed overhead alone
   // makes the target infeasible. Never persist an expanding or nominally unsafe result.
-  if (budgetDetails && budgetDetails.projectedTokensAfter > budgetDetails.targetContextTokens) {
+  if (!acceptSummaryBounds(
+    utf8Bytes(summary), MAX_SUMMARY_BYTES,
+    budgetDetails?.projectedTokensAfter ?? 0, budgetDetails?.targetContextTokens ?? 0,
+  )) {
     return {
       cancel: true,
       reason: "fabric: no deterministic summary fits the continuity context target",
     };
   }
   const versions = priorFabricVersions(branchEntries);
-  const sectionHeaders = SECTION_HEADERS
+  const sectionHeaders = SUMMARY_SECTIONS
     .filter(({ key }) => sections[key].length > 0)
     .map(({ header }) => header);
-  if (instructions.requestLines.length > 0) sectionHeaders.splice(1, 0, "[Compaction Request]");
+  if (instructions.requestLines.length > 0) {
+    sectionHeaders.splice(sections.dialogue.length > 0 ? 1 : 0, 0, "[Compaction Request]");
+  }
 
   const details: FabricCompactionDetailsV2 = {
     compactor: "fabric",
@@ -762,13 +819,18 @@ export const compileFabricSummary = (
     },
     omittedCounts: {
       ...projected.omittedCounts,
+      dialogueBytes: (projected.omittedCounts.dialogueBytes ?? 0) + rendered.dialogueOmittedBytes,
       preserve: instructions.policy.omittedPreserveCount,
       // Thinking parts never survive normalization into a rendered summary;
       // the structural count keeps that erasure auditable against the raw
       // prefix instead of letting deliberation vanish untracked.
       thinking: countErasedThinkingBlocks(source.prefixEntries),
     },
-    instructionPolicy: instructions.policy,
+    instructionPolicy: {
+      ...instructions.policy,
+      truncated: instructions.policy.truncated || rendered.requestOmittedBytes > 0,
+      renderedOmittedBytes: rendered.requestOmittedBytes,
+    },
     stableAddresses: {
       firstKeptEntryId: cut.firstKeptEntryId,
       cumulativeSourceRange: source.range,
@@ -787,15 +849,6 @@ export const compileFabricSummary = (
     },
   };
 };
-
-const SECTION_HEADERS: { key: keyof Sections; header: string }[] = [
-  { key: "goal", header: "[Session Goal]" },
-  { key: "files", header: "[Files And Changes]" },
-  { key: "activity", header: "[Fabric Activity]" },
-  { key: "outstanding", header: "[Outstanding Context]" },
-  { key: "earlierTurns", header: "[Earlier Turns]" },
-  { key: "status", header: "[Current Status]" },
-];
 
 export interface CompactionHookOptions {
   getEngine: () => CompactionEngine;
@@ -860,16 +913,12 @@ export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHook
       : advertisedWindow === undefined
         ? evidenceWindow
         : Math.min(advertisedWindow, evidenceWindow);
-    const budget = effectiveWindow !== undefined
-      && typeof targetContextRatio === "number"
-      && Number.isFinite(targetContextRatio)
-      ? {
-          contextWindow: effectiveWindow,
-          targetContextRatio,
-          reserveTokens: settings.reserveTokens,
-          keepRecentTokens: settings.keepRecentTokens,
-        }
-      : undefined;
+    const budget: FabricCompactionBudget = {
+      ...(effectiveWindow !== undefined ? { contextWindow: effectiveWindow } : {}),
+      ...(typeof targetContextRatio === "number" && Number.isFinite(targetContextRatio) ? { targetContextRatio } : {}),
+      reserveTokens: settings.reserveTokens,
+      keepRecentTokens: settings.keepRecentTokens,
+    };
     const result = compileFabricSummary(
       branchEntries ?? [],
       preparation.tokensBefore,

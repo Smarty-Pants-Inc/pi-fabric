@@ -1,11 +1,10 @@
 import { clipUtf8, sampleAddressed } from "./bounds.js";
 import { firstLine, type CompactionEvent, type ToolCallEvent } from "./normalize.js";
+import { dialogueExcerpts, recentDialogue } from "./dialogue.js";
 import {
   MAX_EARLIER_TURNS,
   MAX_FILES_PER_KIND,
   MAX_UNRESOLVED,
-  MAX_USER_GOAL_LINE,
-  MAX_USER_GOAL_LINES,
 } from "./projections.js";
 
 type ProbeClass = "content" | "address";
@@ -57,14 +56,6 @@ const essentialPathToken = (path: string): string => {
   const trimmed = path.slice(0, end);
   const separator = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
   return trimmed.slice(separator + 1) || path;
-};
-
-const goalAnswer = (text: string): string => {
-  const lines = text.split("\n").filter((line, index, all) =>
-    line.trim() !== "" || (index === 0 && all.length === 1),
-  ).map((line) => truncate(line, MAX_USER_GOAL_LINE));
-  if (lines.length <= MAX_USER_GOAL_LINES) return lines.join("\n");
-  return [...lines.slice(0, MAX_USER_GOAL_LINES), "…"].join("\n");
 };
 
 const eventWindow = (events: CompactionEvent[], cutIndex: number): CompactionEvent[] => {
@@ -126,13 +117,26 @@ export const generateProbes = (events: CompactionEvent[], cutIndex: number): Pro
     (event): event is Extract<CompactionEvent, { kind: "user" }> => event.kind === "user",
   );
 
+  // Derive complete role-labelled excerpts from source dialogue, not the
+  // rendered projection or first-line samples. Lost later paragraphs fail QA.
+  const exchanges = recentDialogue(source, events.slice(source.length));
+  for (const exchange of exchanges) {
+    for (const excerpt of dialogueExcerpts(exchange)) {
+      probes.push({
+        id: `dialogue:${exchange.user.entryId}:${excerpt.heading}`,
+        class: "content",
+        question: "Which recent user direction or preceding assistant response must remain distinguishable?",
+        answer: `${excerpt.heading}\n${excerpt.text}`,
+      });
+    }
+  }
   const firstUser = users[0];
-  if (firstUser) {
+  if (firstUser && !exchanges.some(({ user }) => user.entryId === firstUser.entryId)) {
     probes.push({
-      id: "goal",
+      id: "historical-goal",
       class: "content",
-      question: "What goal did the first user message establish?",
-      answer: goalAnswer(firstUser.text),
+      question: "What original request remains historical evidence?",
+      answer: truncate(firstLine(firstUser.text), 120),
     });
   }
 

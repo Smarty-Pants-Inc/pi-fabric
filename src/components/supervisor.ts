@@ -1,7 +1,8 @@
+import { transitionCurrent, cleanupState as verifiedCleanupState } from "../verified/policy.js";
 import { validateComponentConfig } from "./validation.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
-  ActionRegistry,
+  type ActionRegistry,
   type FabricCallAudit,
   type FabricCapabilityViewLease,
 } from "../core/action-registry.js";
@@ -964,20 +965,23 @@ export class FabricComponentSupervisor {
             this.#assertEffectCapacity(component, 1);
             this.#assertIndependent(component, [effect]);
           }
-          const acquired = this.options.acquire
-            ? await this.options.acquire(ref, args ?? {}, invocation)
-            : await this.registry.acquireScoped(ref, args ?? {}, invocation);
-          try {
-            scope!.defer(acquired.dispose, {
+          const adopt = (dispose: () => void | Promise<void>): void => {
+            scope!.defer(dispose, {
               label: `acquire:${ref}`,
               kind: effect.kind,
               resources: effect.resources,
               ordering: effect.ordering,
             });
-          } catch (error) {
-            await acquired.dispose();
-            throw error;
+          };
+          if (!this.options.acquire) {
+            // Transfer ownership before publication. Abort must not race this
+            // inverse stack and release a resource ahead of its owner cleanup.
+            const acquired = await this.registry.acquireScoped(ref, args ?? {}, invocation, adopt);
+            return acquired.value as T;
           }
+          const acquired = await this.options.acquire(ref, args ?? {}, invocation);
+          try { adopt(acquired.dispose); }
+          catch (error) { await acquired.dispose(); throw error; }
           return acquired.value as T;
         },
         call: async (ref, args) => {
@@ -1110,12 +1114,13 @@ export class FabricComponentSupervisor {
         }
       }
       let retryDelayMs = 0;
-      if (cleanupErrors.length > 0) {
+      const recovery = verifiedCleanupState(cleanupErrors.length > 0, diverted);
+      if (recovery === 2) {
         component.state = "quarantined";
         component.consecutiveDiversions = 0;
         component.error = errorMessage(error);
         component.cleanupErrors = cleanupErrors;
-      } else if (diverted) {
+      } else if (recovery === 1) {
         component.state = "waiting";
         component.consecutiveDiversions++;
         retryDelayMs = Math.min(2 ** (component.consecutiveDiversions - 1), 100);
@@ -1158,10 +1163,10 @@ export class FabricComponentSupervisor {
   }
 
   #transitionCurrent(component: ManagedComponent, epoch: number): boolean {
-    return !component.retired &&
-      component.epoch === epoch &&
-      this.#components.get(component.entry.id) === component &&
-      !this.#closed;
+    return transitionCurrent(
+      component.retired, component.epoch === epoch,
+      this.#components.get(component.entry.id) === component, this.#closed,
+    );
   }
 
   async #unload(component: ManagedComponent, visited: Set<string>): Promise<void> {

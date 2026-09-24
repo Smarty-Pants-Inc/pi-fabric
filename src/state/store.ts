@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { headReadable } from "../verified/policy.js";
 import path from "node:path";
 import {
   MeshStore,
@@ -576,17 +577,11 @@ export class StateStore {
         typeof head.transitionSequence === "number" &&
         Number.isSafeInteger(head.transitionSequence) &&
         head.transitionSequence > 0;
-      if (
-        !hasValidSequence ||
-        proof?.version !== HEAD_COMMIT_PROOF_VERSION
-      ) {
-        return null;
-      }
-      if (proof.status === "committed") return head;
-      if (proof.status !== "pending") return null;
-      return committedTransitionIds(this.stateEvents()).has(head.transitionId)
-        ? head
-        : null;
+      const validVersion = proof?.version === HEAD_COMMIT_PROOF_VERSION;
+      const pending = proof?.status === "pending";
+      const marker = hasValidSequence && validVersion && pending &&
+        committedTransitionIds(this.stateEvents()).has(head.transitionId);
+      return headReadable(hasValidSequence, validVersion, proof?.status === "committed", pending, marker) ? head : null;
     }
     const events = this.stateEvents();
     const committedIds = committedTransitionIds(events);

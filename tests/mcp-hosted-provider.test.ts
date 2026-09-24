@@ -72,7 +72,7 @@ describe("hosted native MCP", () => {
     expect(await f.provider.list({}, context)).toHaveLength(30);
     expect(await f.registry.describe("mcp.authorized.tool_29", context)).toMatchObject({ inputSchema: schema });
     await expect(f.registry.invoke("mcp.authorized.tool_29", { value: "ok" }, context)).resolves.toMatchObject({ text: "done" });
-    expect(f.callTool).toHaveBeenCalledWith("authorized", "tool-29", expect.objectContaining({ args: { value: "ok" }, signal: context.signal }));
+    expect(f.callTool).toHaveBeenCalledWith("authorized", "tool-29", expect.objectContaining({ args: { value: "ok" }, signal: expect.any(AbortSignal) }));
     await expect(f.registry.invoke("mcp.authorized.tool_29", { value: [] }, context)).rejects.toThrow();
     expect(f.callTool).toHaveBeenCalledTimes(1);
   });

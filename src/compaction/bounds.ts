@@ -1,3 +1,5 @@
+import { acceptSampleAccounting } from "../verified/policy.js";
+
 export const MAX_SUMMARY_BYTES = 32 * 1024;
 const MAX_REQUEST_SOURCE_BYTES = 8 * 1024;
 
@@ -20,6 +22,18 @@ export const clipUtf8 = (text: string, maxBytes: number, suffix = "…"): string
     used += bytes;
   }
   return `${output}${suffix}`;
+};
+
+// Preserve complete multiline text when it fits, and make byte loss explicit.
+export const boundedExcerpt = (text: string, maxBytes: number): { text: string; omittedBytes: number } => {
+  const sourceBytes = utf8Bytes(text);
+  if (sourceBytes <= maxBytes) return { text, omittedBytes: 0 };
+  const prefix = clipUtf8(text, Math.max(0, maxBytes - 64), "");
+  const omittedBytes = sourceBytes - utf8Bytes(prefix);
+  return {
+    text: clipUtf8(`${prefix}\n[omitted ${omittedBytes} UTF-8 bytes]`, maxBytes, ""),
+    omittedBytes,
+  };
 };
 
 export interface CanonicalText {
@@ -59,10 +73,12 @@ export const sampleAddressedFrom = <T extends AddressedValue>(
   const earliest: T[] = [];
   const latest: T[] = [];
   let omitted = 0;
+  let total = 0;
   let omittedFirstEntryId: string | undefined;
   let omittedLastEntryId: string | undefined;
 
   for (const value of source) {
+    total++;
     if (earliest.length < earliestLimit) {
       earliest.push(value);
       continue;
@@ -75,6 +91,9 @@ export const sampleAddressedFrom = <T extends AddressedValue>(
     omittedLastEntryId = displaced.entryId;
   }
 
+  if (!acceptSampleAccounting(total, earliest.length + latest.length, omitted, maxValues)) {
+    throw new Error("Addressed sample failed conservation/bound verification");
+  }
   return {
     values: [...earliest, ...latest],
     omitted,

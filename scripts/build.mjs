@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { build } from "esbuild";
+import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
 
 const primaryEntryPoints = [
   "src/index.ts",
@@ -27,6 +28,7 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/core/provider-operations.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
@@ -112,6 +114,18 @@ const standalone = await build({
     },
   }],
 });
+
+// tsc does not copy input .d.ts files; ship the generated kernel ABI and receipt.
+mkdirSync("dist/verified/generated", { recursive: true });
+const receiptPath = "src/verified/generated/manifest.json";
+const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+for (const source of Object.keys(receipt.outputs)) {
+  if (!/^src\/verified\/generated\/[a-z-]+\.(?:js|d\.ts)$/.test(source)) {
+    throw new Error(`Unexpected verified artifact path: ${source}`);
+  }
+  copyFileSync(source, source.replace(/^src\//, "dist/"));
+}
+copyFileSync(receiptPath, "dist/verified/generated/manifest.json");
 
 const bundledPackages = [
   ...Object.keys(result.metafile.inputs).filter((input) => input.includes("node_modules/")),

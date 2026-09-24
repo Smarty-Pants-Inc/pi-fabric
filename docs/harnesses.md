@@ -84,7 +84,7 @@ The macOS package accepts a trusted argv prefix and exact app grants:
 }
 ```
 
-That adapter owns the persistent JSON-lines child process and appends its `serve --app` arguments without a shell. It starts only on explicit `macos.connect`. Its package—not Fabric core—defines subprocess bounds, cancellation behavior, receipts, and native limitations.
+That adapter owns the persistent JSON-lines child process and appends its `serve --app` arguments without a shell. It starts only on explicit `macos.connect`. Its package, not Fabric core, defines subprocess bounds, cancellation behavior, receipts, and native limitations.
 
 Use `tools.call({ref,args})` for newly discovered actions; do not assume a static guest proxy exists. The browser package requires an explicitly attached session ID and an authorized origin. It does not borrow the separate extension-relay daemon's process-local connection. Raw CDP method grants are separate, more powerful capabilities, not origin restrictions.
 
@@ -96,7 +96,7 @@ These harness packages support:
 2. **Unknown UI decision:** observe bounded state, select an observed target and advertised operation, call guarded `act`, then inspect fresh evidence.
 3. **Unsupported mechanic:** use separately authorized raw CDP/AX/vision/script paths, then re-observe. Never use an escape hatch to bypass a denied action.
 
-The browser scope is `{sessionId}`; native scope is `{app}`. Observations carry temporary handles. Read-only context rows may have no supported operations. The packages perform freshness validation inside `act` rather than trusting an earlier model-visible validation step. Their receipts distinguish `executed`, `stale`, `blocked`, and `outcome_unknown`:
+The browser scope is `{sessionId}`; native scope is `{app}`. Observations carry temporary handles. Read-only context rows may have no supported operations. The packages perform freshness validation inside `act`; they do not trust an earlier model-visible validation step. Their receipts distinguish `executed`, `stale`, `blocked`, and `outcome_unknown`:
 
 - Executed means dispatched, not goal success.
 - Stale means re-observe and select again.
@@ -111,7 +111,7 @@ The browser controller currently uses bounded light-DOM observation and syntheti
 
 Jev programs declare only the exact installed refs they need. For these harnesses that may be `jev.evaluate`, `browser.observe`, and `browser.act`, or the corresponding native refs. Connect/attach explicitly before launching a loop; pass the authorized scope as input. Batch independent selection questions and execute only the branch selected by code. Keep the no-match/escalation path and finite budgets.
 
-Other connectors may use entirely different verbs and result shapes. Read their descriptors and guidance instead of inferring a universal UI interface. Keep deterministic rules, permission decisions, and execution outside model confidence. Send only consented, bounded, redacted state to a model; generated prose requires Main or an authorized text helper, not Jev. See [Jev](jev.md) for program/auth contracts.
+Other connectors may use entirely different verbs and result shapes. Read their descriptors and guidance. Do not infer a universal UI interface. Keep deterministic rules, permission decisions, and execution outside model confidence. Send only consented, bounded, redacted state to a model; generated prose requires Main or an authorized text helper, not Jev. See [Jev](jev.md) for program/auth contracts.
 
 ## Migration and verification
 

@@ -8,7 +8,7 @@ For guided authoring, invoke `/skill:fabric-jev <task>`. It is user-opt-in and a
 
 On Pi 0.85.1 or newer, `/login jev` prompts privately for a TypeSafe API key and stores an ordinary API-key credential under `jev` in Pi's `auth.json`. `/logout` removes it. Jev registers an **auth-only provider with no chat models**; it does not appear as a selectable text-generating model.
 
-Jev has three upstream routes. Bare aliases (`jev-latest`, `jev-1.13`, `jev-1.13.0`, `jev-preview`) post to TypeSafe's `/v1/systemone`. OpenRouter decisions IDs (`typesafe/jev-1.13`, `~typesafe/jev-latest`) post to OpenRouter's `/api/alpha/decisions` and reuse the **existing `openrouter` credential** — the same `auth.json` entry as your chat models, so `/login openrouter` covers both. OpenRouter serves Jev on its Decisions API, not `/chat/completions`, and has no `jev-preview` alias. Vercel AI Gateway model IDs (`typesafe-ai/jev`, or the `jev-latest` alias) post to its TypeSafe-compatible `/typesafe/v1/systemone` endpoint and reuse the **existing `vercel-ai-gateway` credential** (`/login vercel-ai-gateway`, `AI_GATEWAY_API_KEY`); the request and response shapes stay TypeSafe's own, so only the base URL and key change. No second provider is registered.
+Jev has three upstream routes. Bare aliases (`jev-latest`, `jev-1.13`, `jev-1.13.0`, `jev-preview`) post to TypeSafe's `/v1/systemone`. OpenRouter decisions IDs (`typesafe/jev-1.13`, `~typesafe/jev-latest`) post to OpenRouter's `/api/alpha/decisions` and reuse the **existing `openrouter` credential** (the same `auth.json` entry as your chat models), so `/login openrouter` covers both. OpenRouter serves Jev on its Decisions API, not `/chat/completions`, and has no `jev-preview` alias. Vercel AI Gateway model IDs (`typesafe-ai/jev`, or the `jev-latest` alias) post to its TypeSafe-compatible `/typesafe/v1/systemone` endpoint and reuse the **existing `vercel-ai-gateway` credential** (`/login vercel-ai-gateway`, `AI_GATEWAY_API_KEY`); the request and response shapes stay TypeSafe's own, so only the base URL and key change. No second provider is registered.
 
 TypeSafe route resolution order:
 
@@ -72,7 +72,7 @@ return { team: result.answers.route.choice, refundProbability: result.answers.re
 - Keep exact rules, arithmetic, source extraction, action execution, and permissions in code. Confidence is neither truth nor authorization.
 - State is sent to TypeSafe. Bound and minimize browser/application data; do not send secrets or unrelated private content.
 
-Fabric accepts up to 128 questions and 255 Choice options per question, subject to the configured request byte cap and upstream limits. Structured JSON instructions/rubrics are supported. Service failures are not automatically retried: a controller must decide whether a retry is affordable and its observation is still fresh. For HTTP 429/529, back off rather than spin.
+Fabric accepts up to 128 questions and 255 Choice options per question, subject to the configured request byte cap and upstream limits. Structured JSON instructions/rubrics are supported. Service failures are not automatically retried: a controller must decide whether a retry is affordable and its observation is still fresh. For HTTP 429/529, back off; do not spin.
 
 ## Foreground and background
 
@@ -152,7 +152,7 @@ Both are ordinary `jev.evaluate` batches: keep independent questions in one requ
 
 ### Observation stays structured state
 
-Read the application's own state — a page bridge through `browser.cdp` and `Runtime.evaluate`, or a small application-specific provider — and project it into a compact object with a revision. Include the facts the judgment needs and nothing else: player/entity/environment fields, the previous action, and bounded history are usually enough. Screenshots are not part of the typed request contract; keep pixels out of `state`, and never send secrets.
+Read the application's own state through a page bridge using `browser.cdp` and `Runtime.evaluate`, or through a small application-specific provider, and project it into a compact object with a revision. Include the facts the judgment needs and nothing else: player/entity/environment fields, the previous action, and bounded history are usually enough. Screenshots are not part of the typed request contract; keep pixels out of `state`, and never send secrets.
 
 ### Code owns the motor layer
 
@@ -184,7 +184,7 @@ try {
 if (degraded) { frame = deterministicFallback(state); await program.emit({ fallback: true, frame }); }
 ```
 
-Confidence is neither truth nor authorization; a low-confidence answer is a reason to fall back, not a reason to act. Fabric validates the response before it returns it — an invalid choice, probability set, or confidence rejects the evaluation instead of surfacing a partial answer, so `catch` is part of the loop.
+Confidence is neither truth nor authorization; a low-confidence answer is a reason to fall back, not a reason to act. Fabric validates the response before it returns it. An invalid choice, probability set, or confidence rejects the evaluation without surfacing a partial answer, so `catch` is part of the loop.
 
 ### Budget arithmetic for sustained loops
 
@@ -200,7 +200,7 @@ Per-program `limits` are clamped to these ceilings (24 hours, 100,000 evaluation
 
 ### Telemetry and shutdown
 
-Spawn the loop with `jev.spawn` so Main stays responsive and can inspect it. The event ring holds the latest 64 events (4 KiB each) — roughly six seconds at 10 Hz — so drain it with `jev.status({ id, after })` from the supervising turn or persist it host-side; terminal runs live only in a bounded history. At most one evaluation may be in flight per program, so batch independent questions instead of hedging decisions, and run two engines as two programs (`jev.maxConcurrentRuns`).
+Spawn the loop with `jev.spawn` so Main stays responsive and can inspect it. The event ring holds the latest 64 events (4 KiB each), roughly six seconds at 10 Hz, so drain it with `jev.status({ id, after })` from the supervising turn or persist it host-side; terminal runs live only in a bounded history. At most one evaluation may be in flight per program, so batch independent questions, avoid hedging decisions, and run two engines as two programs (`jev.maxConcurrentRuns`).
 
 Stop a loop with `jev.stop({ id })`, provider reload/unload, or a code-owned terminal rule such as death, goal reached, or a no-match judgment. Cancellation aborts in-flight inference and host calls, but it is not rollback of effects already issued.
 
@@ -265,7 +265,7 @@ return {id:observer.id, state:observer.state};
 - `events`: a nonempty subset of `input`, `turn_end`, `tool_error`, `agent_end`, `agent_settled`. These are local host-event names, not mesh `pi.*` names. No replay of events before launch.
 - `include`: defaults to `[]` (operational metadata only). `inputText` selects raw input-event text; `assistantText` selects the completed turn's visible text; `toolResults` selects bounded tool-result text and error metadata from `turn_end`/`tool_error`. Each applies only where that event carries it. Settlement events do not implicitly carry a transcript. Keep goals/history in bounded explicit input or the program's own prior observations.
 - Never automatically includes thinking, system prompts, request headers, images, tool arguments, tool-result `details`, or session history. Common credential patterns are redacted as defense in depth, **not a guarantee that opted-in free text contains no secrets**. Obtain consent before sending selected text to TypeSafe and treat it as untrusted evidence.
-- `maxChars`: 256–8,192, default 4,096, bounds the projected payload; `truncated` flags incomplete evidence. A truncated payload may be a string instead of an object. Extraction also caps content blocks and tool-result count. Do not infer success or safety from missing/truncated evidence.
+- `maxChars`: 256–8,192, default 4,096, bounds the projected payload; `truncated` flags incomplete evidence. A truncated payload may be a string in place of an object. Extraction also caps content blocks and tool-result count. Do not infer success or safety from missing/truncated evidence.
 - `queueSize`: 1–32, default 8; oldest queued events are dropped on overflow. `maxEventAgeMs`: 100–300,000, default 30,000; expired queued events are discarded. This is bounded best-effort observation, not a lossless audit stream. `nextEvent` allows only one pending consumer; consume/classify sequentially.
 - Each event has `{id,sequence,event,source:"main",sessionId,revision,at,payload,truncated}`. `status.observation` reports subscribed events, received/consumed/dropped/queued counts, and delivered/suppressed advice; progress `status.events` remains the separate 64-entry `program.emit` ring.
 
@@ -275,11 +275,11 @@ Delivery defaults to off. Opt into `"steer"` or `"followUp"`; `triggerTurn` defa
 
 There is at most **one delivery attempt across all Jev observers per external user input**. Automatic continuations and extension-injected input do not reset this feedback latch. Duplicate, stale, disabled, over-budget, feedback-gated, or failed deliveries return `{delivered:false,reason}`; failures are not replayed. This prevents an advisor from repeatedly waking/steering Main based on its own intervention. Additional turns may still be classified and recorded within budget. Broader separately granted tools retain their own authority; these safeguards specifically govern `jev.advise`.
 
-Main abort (including RPC/SDK abort), Escape when `ui.haltOnEscape` is enabled, tree navigation, and provider reload/unload/shutdown cancel observing runs and discard their inboxes. Cancellation does not resurrect them on the next input; create a replacement only when requested. Ordinary non-observing spawned programs keep their existing detachment semantics. Cancelling only a wait is still not a stop, but a separate Main abort also cancels its observers. These are asynchronous post-turn advisors, **not pre-execution safety gates** and not rollback of effects already issued.
+Main abort (including RPC/SDK abort), Escape when `ui.haltOnEscape` is enabled, tree navigation, and provider reload/unload/shutdown cancel observing runs and discard their inboxes. Cancellation does not resurrect them on the next input; create a replacement only when requested. Ordinary non-observing spawned programs keep their existing detachment semantics. Cancelling only a wait does not stop a program. A separate Main abort also cancels its observers. These are asynchronous post-turn advisors, **not pre-execution safety gates** and not rollback of effects already issued.
 
 ## Schemas and limits
 
-Input and output schemas are checked at runtime. The supported JSON Schema subset is `type` (one type), `properties`, `required`, `additionalProperties`, `items`, `enum`, `const`, `anyOf`, `oneOf`, `allOf`, numeric/string/array/object min/max bounds, `description`, and `title`. References, regexes, unknown keywords, and excessive depth/size are rejected rather than silently trusted. Use `anyOf` for unions. `{}` permits any finite JSON value. Return `null` explicitly for programs without a result; `undefined` is not JSON.
+Input and output schemas are checked at runtime. The supported JSON Schema subset is `type` (one type), `properties`, `required`, `additionalProperties`, `items`, `enum`, `const`, `anyOf`, `oneOf`, `allOf`, numeric/string/array/object min/max bounds, `description`, and `title`. References, regexes, unknown keywords, and excessive depth/size are rejected, never silently trusted. Use `anyOf` for unions. `{}` permits any finite JSON value. Return `null` explicitly for programs without a result; `undefined` is not JSON.
 
 Program TypeScript gets semantic diagnostics before execution. Runtime validation remains authoritative; TypeScript annotations are not a security boundary. The guest has at most 64 MiB memory (or the lower configured executor limit), 128 pending timers, and a 100 ms uninterrupted CPU limit. Awaiting host work or timers yields a fresh CPU slice; an infinite synchronous loop is terminated without freezing Pi for the whole run deadline.
 
@@ -302,7 +302,7 @@ Default per-run limits: **60 seconds, 100 evaluations, 1,000 host calls, 100,000
 }
 ```
 
-Duration can be configured up to 24 hours. Evaluation slots are reserved before dispatch, including failed requests. One evaluation may be in flight per program; batch independent questions rather than building an inference backlog. Other granted tool calls may run concurrently. Token usage is reported **after** inference: exceeding the token threshold stops the program before it can use that answer, but the final request can overshoot the threshold and still incurs charges. This is not a hard dollar-spend limit. Request-size and evaluation-count limits are the pre-dispatch bounds. Failed requests with no usage report may still have incurred upstream charges.
+Duration can be configured up to 24 hours. Evaluation slots are reserved before dispatch, including failed requests. One evaluation may be in flight per program; batch independent questions to avoid building an inference backlog. Other granted tool calls may run concurrently. Token usage is reported **after** inference: exceeding the token threshold stops the program before it can use that answer, but the final request can overshoot the threshold and still incurs charges. This is not a hard dollar-spend limit. Request-size and evaluation-count limits are the pre-dispatch bounds. Failed requests with no usage report may still have incurred upstream charges.
 
 Every external action keeps Fabric argument validation, approvals, Schema policy, and a pinned capability generation. A restricted caller cannot widen its own capability view by spawning a program. Recursive Jev lifecycle calls are denied inside programs. Jev is unavailable in Schema enforce and managed-host modes. Other deliberately granted capabilities can be powerful: **granting `pi.bash` or an unrestricted evaluator is not a read-only sandbox** and can defeat data-isolation assumptions. Prefer narrow application connectors.
 
@@ -345,7 +345,7 @@ const observation = await tools.call({
 
 A Jev program uses `requires: ["jev.evaluate", "browser.connect", "browser.cdp"]`. Page-scoped calls require explicit `sessionId`; there is no shared active-tab pointer to race between programs. Host `allowedMethods` are enforced and become part of the pinned action descriptor. CDP is always marked `execute`, including `Runtime.evaluate`: arbitrary page JavaScript cannot be made read-only by a label. Method grants are not origin/target restrictions. Calls have a timeout and at most 16 outstanding wire requests; cancelling a sent command cannot undo its browser effect.
 
-For tighter controls, expose a small application-specific Fabric provider instead of general CDP. Build compact records/candidate controls from observations, let Jev judge them, map selected IDs back to observed nodes in code, and verify the result. Screenshots are not part of this typed text/JSON adapter's Jev request contract.
+For tighter controls, expose a small application-specific Fabric provider in place of general CDP. Build compact records/candidate controls from observations, let Jev judge them, map selected IDs back to observed nodes in code, and verify the result. Screenshots are not part of this typed text/JSON adapter's Jev request contract.
 
 ## Verification
 

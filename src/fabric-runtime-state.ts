@@ -619,6 +619,21 @@ export class FabricRuntimeState {
           includeSlots: false,
         }).appendText || undefined;
       },
+      resolveHandoffCompactionBudget: async (modelKey, cwd) => {
+        const { model } = resolveParticipantPiModel(modelKey);
+        // Load host settings only for an actual compacted handoff. Project
+        // trust does not transfer implicitly to a different working directory.
+        const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
+        const settings = SettingsManager.create(cwd, resolveAgentDir(), {
+          projectTrusted: !this.#managedHost && cwd === context.cwd && context.isProjectTrusted(),
+        }).getCompactionSettings(model);
+        return {
+          contextWindow: model.contextWindow,
+          targetContextRatio: this.#config?.compaction.targetContextRatio ?? DEFAULT_FABRIC_CONFIG.compaction.targetContextRatio,
+          reserveTokens: settings.reserveTokens,
+          keepRecentTokens: settings.keepRecentTokens,
+        };
+      },
       preparePiModel: async (modelKey) => {
         const resolved = resolveParticipantPiModel(modelKey);
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);

@@ -15,6 +15,13 @@ describe("CI build prerequisites", () => {
     for (const index of tests) expect(build, `build must precede ${steps[index]!.name}`).toBeLessThan(index);
   });
 
+  it("installs the artifact's pinned Bend release with a checksum", () => {
+    const { bend } = JSON.parse(fs.readFileSync(fileURLToPath(new URL("../src/verified/generated/manifest.json", import.meta.url)), "utf8")) as { bend: string };
+    const install = steps.find((step) => step.name === "Install pinned Bend proof compiler")?.run ?? "";
+    expect(install).toContain(`https://github.com/bendlang/bend/releases/download/v${bend}/bend-${bend}-linux-x64.tar.gz`);
+    expect(install).toMatch(/echo "[a-f0-9]{64}  \$RUNNER_TEMP\/bend\.tar\.gz" \| sha256sum -c -/);
+  });
+
   it("refreshes apt metadata before installing Linux runtime prerequisites", () => {
     const prerequisites = steps.find((step) => step.name === "Install runtime prerequisites")?.run ?? "";
     const update = prerequisites.indexOf("sudo apt-get update");

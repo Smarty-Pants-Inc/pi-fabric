@@ -15,17 +15,8 @@ import {
 import { NO_BUILTIN_ENRICHERS, runEnrichers, type CompactionEnricher } from "./enrichers.js";
 import { decodeCompactionInstructions } from "./instructions.js";
 import { normalizeEntries, type CompactionEvent, type ToolCallEvent } from "./normalize.js";
-import { projectWithMetadata, type Sections } from "./projections.js";
-import { renderSummary } from "./render.js";
-
-const SECTION_HEADERS: { key: keyof Sections; header: string }[] = [
-  { key: "goal", header: "[Session Goal]" },
-  { key: "files", header: "[Files And Changes]" },
-  { key: "activity", header: "[Fabric Activity]" },
-  { key: "outstanding", header: "[Outstanding Context]" },
-  { key: "earlierTurns", header: "[Earlier Turns]" },
-  { key: "status", header: "[Current Status]" },
-];
+import { projectWithMetadata } from "./projections.js";
+import { renderSummaryWithMetadata, SUMMARY_SECTIONS } from "./render.js";
 
 const asJsonObject = (value: Record<string, unknown>): Record<string, FabricTraceJsonValue> | undefined => {
   try {
@@ -209,24 +200,26 @@ export const compileFabricBranchSummary = (
   if (events.length === 0) return undefined;
   const projected = projectWithMetadata(events);
   runEnrichers(enrichers, events, projected.sections);
-  const request = {
-    text: instructions.requestLines.join("\n"),
-    sourceBytes: instructions.policy.sourceBytes,
-    truncated: instructions.policy.truncated,
-  };
-  const sections = SECTION_HEADERS
+  const sections = SUMMARY_SECTIONS
     .filter(({ key }) => projected.sections[key].length > 0)
     .map(({ header }) => header);
-  if (request.text) sections.splice(1, 0, "[Compaction Request]");
-  const summary = renderSummary(projected.sections, {
+  if (instructions.requestLines.length > 0) {
+    sections.splice(projected.sections.dialogue.length > 0 ? 1 : 0, 0, "[Compaction Request]");
+  }
+  const rendered = renderSummaryWithMetadata(projected.sections, {
     firstEntryId: entriesToSummarize[0]?.id ?? "",
     lastEntryId: entriesToSummarize.at(-1)?.id ?? "",
     lastTimestamp: entriesToSummarize.at(-1)?.timestamp ?? "",
     ...(instructions.requestLines.length > 0 ? { requestLines: instructions.requestLines } : {}),
     summaryKind: "branch",
   });
+  const request = {
+    text: instructions.requestLines.join("\n"),
+    sourceBytes: instructions.policy.sourceBytes,
+    truncated: instructions.policy.truncated || rendered.requestOmittedBytes > 0,
+  };
   return {
-    summary,
+    summary: rendered.summary,
     details: boundedDetails(entriesToSummarize, factsFromEvents(events), sections, request, oldLeafId),
   };
 };

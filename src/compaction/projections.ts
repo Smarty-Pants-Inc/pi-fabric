@@ -1,4 +1,5 @@
 import { clipUtf8, omissionLine, sampleAddressed, sampleAddressedFrom } from "./bounds.js";
+import { projectDialogue, recentDialogue } from "./dialogue.js";
 import {
   firstLine,
   type CompactionEvent,
@@ -14,6 +15,8 @@ import {
 // outstanding fold's state machine — nothing is remembered, only re-derived.
 
 export interface Sections {
+  dialogue: string[];
+  // Retain the internal key for v2 details compatibility; these are historical.
   goal: string[];
   files: string[];
   activity: string[];
@@ -26,8 +29,6 @@ export interface Sections {
 const MAX_LINE = 140;
 const FILE_TOOLS = new Set(["read", "edit", "write", "grep", "find", "ls"]);
 const MODIFYING_TOOLS = new Set(["edit", "write"]);
-export const MAX_USER_GOAL_LINES = 3;
-export const MAX_USER_GOAL_LINE = 1024;
 const MAX_USER_ONELINER = 120;
 const MAX_EARLIER_USER = 80;
 const MAX_STATUS_LINE = 140;
@@ -49,6 +50,7 @@ const TRANSCRIPT_WINDOW = 40;
 
 export interface ProjectionOmittedCounts {
   goal: number;
+  dialogueBytes?: number;
   files: number;
   activity: number;
   outstanding: number;
@@ -88,11 +90,6 @@ const customMessageLine = (
 ): string => {
   const visibility = event.display ? "visible" : "hidden";
   return `custom ${quoted(event.customType, 80)} (${visibility}): ${quoted(event.text, maxText)}${customDetailsSuffix(event.details)}`;
-};
-
-const trailingEllipsis = (lines: string[], max: number): string[] => {
-  if (lines.length <= max) return lines;
-  return [...lines.slice(0, max), "…"];
 };
 
 const pathOf = (args: Record<string, unknown>): string | undefined => {
@@ -210,30 +207,15 @@ const commonRoot = (paths: string[]): string => {
 const stripRoot = (root: string, path: string): string =>
   root ? path.replace(root, "") : path;
 
-// [Session Goal] keeps up to three mechanically normalized, bounded lines
-// from the first user message. Later scope changes use bounded one-liners and
-// deterministic earliest/latest sampling with source addresses.
-const projectGoal = (events: CompactionEvent[]): ProjectedSection => {
-  const first = events.find(
-    (event): event is Extract<CompactionEvent, { kind: "user" }> => event.kind === "user",
-  );
-  if (!first) return { lines: [], omitted: 0 };
-  const firstLines = first.text.split("\n").filter((line, i, arr) =>
-    line.trim() !== "" || (i === 0 && arr.length === 1),
-  ).map((line) => truncate(line, MAX_USER_GOAL_LINE));
-  const lines: string[] = [...trailingEllipsis(firstLines, MAX_USER_GOAL_LINES)];
-  function* laterUsers(): Generator<Extract<CompactionEvent, { kind: "user" }>> {
-    let skippedFirst = false;
+// Earlier requests are historical evidence, not an inferred active mandate.
+const projectGoal = (events: CompactionEvent[], protectedUsers: ReadonlySet<string>): ProjectedSection => {
+  const lines: string[] = [];
+  function* historicalUsers(): Generator<Extract<CompactionEvent, { kind: "user" }>> {
     for (const event of events) {
-      if (event.kind !== "user") continue;
-      if (!skippedFirst) {
-        skippedFirst = true;
-        continue;
-      }
-      yield event;
+      if (event.kind === "user" && !protectedUsers.has(event.entryId)) yield event;
     }
   }
-  const sampled = sampleAddressedFrom(laterUsers(), MAX_LATER_GOALS);
+  const sampled = sampleAddressedFrom(historicalUsers(), MAX_LATER_GOALS);
   for (let index = 0; index < sampled.values.length; index++) {
     if (sampled.omitted > 0 && index === sampled.splitIndex) {
       lines.push(omissionLine(
@@ -648,8 +630,10 @@ const projectTranscript = (events: CompactionEvent[]): ProjectedSection => {
   return { lines, omitted };
 };
 
-export const projectWithMetadata = (events: CompactionEvent[]): ProjectionResult => {
-  const goal = projectGoal(events);
+export const projectWithMetadata = (events: CompactionEvent[], retainedDialogue: CompactionEvent[] = []): ProjectionResult => {
+  const exchanges = recentDialogue(events, retainedDialogue);
+  const dialogue = projectDialogue(exchanges);
+  const goal = projectGoal(events, new Set(exchanges.map(({ user }) => user.entryId)));
   const files = projectFiles(events);
   const activity = projectActivity(events);
   const outstanding = projectOutstandingWithMetadata(events);
@@ -657,6 +641,7 @@ export const projectWithMetadata = (events: CompactionEvent[]): ProjectionResult
   const transcript = projectTranscript(events);
   return {
     sections: {
+      dialogue: dialogue.lines,
       goal: goal.lines,
       files: files.lines,
       activity: activity.lines,
@@ -667,6 +652,7 @@ export const projectWithMetadata = (events: CompactionEvent[]): ProjectionResult
     },
     omittedCounts: {
       goal: goal.omitted,
+      dialogueBytes: dialogue.omittedBytes,
       files: files.omitted,
       activity: activity.omitted,
       outstanding: outstanding.omitted,

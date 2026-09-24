@@ -105,6 +105,17 @@ parsing. It checks the preserve count before iterating or canonicalizing
 items. Ordinary manual and Pi instructions remain bounded explicit text and
 never become typed protocol input.
 
+The rendered request block is separately bounded to 3 KiB. Complete items are
+kept when they fit; otherwise each item receives an excerpt with an explicit
+UTF-8 byte-loss marker. Compaction details set `instructionPolicy.truncated`
+for rendering loss too, and `renderedOmittedBytes` records its size. Input
+validation limits are not a promise that every accepted byte appears inline.
+
+`preserve` is **one-shot**, not a persistent task ledger: it applies to this
+compaction and is not automatically carried into the next one. Recent dialogue
+has its own protected projection; `state.goal` remains an executable predicate,
+not an automatically inferred conversational objective.
+
 #### Commit semantics
 
 - The host's `agent_settled` handler awaits `maybeCommit(context)`. It never
@@ -122,9 +133,9 @@ never become typed protocol input.
 - On pi's `onError` with `"Compaction cancelled"`, `"Already compacted"`,
   or `"Nothing to compact (session too small)"`, Fabric clears the intent
   and `last` records `status: "cancelled"` with the raw pi message in
-  `error`. No compaction happened — the too-small message is Pi rejecting a
+  `error`. No compaction happened. The too-small message is Pi rejecting a
   manual compaction whose session sits below `keepRecentTokens`, so every
-  message would be kept anyway — and the outcome stays observable without
+  message would be kept anyway. The outcome stays observable without
   being silently dropped. Only exact messages are benign: an error merely
   containing one of the phrases stays `failed`.
 - On any other error, Fabric clears the intent and `last` records

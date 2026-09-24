@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { settleWithin } from "../async-settlement.js";
+import { BEND_NAT_MAX } from "../verified/nat.js";
+import { consume } from "../verified/policy.js";
+import { bindingStep, type BindingLife, type BindingEvent, type BindingOutcome } from "../verified/generated/lifecycle-kernel.js";
 import type { FabricComponentProviderLease } from "../components/types.js";
 import type { FabricProvider } from "../protocol.js";
 
@@ -28,11 +32,24 @@ const snapshot = (binding: FabricProviderBinding): FabricProviderBinding => ({
   ...(binding.closeTask ? { closeTask: binding.closeTask } : {}),
 });
 
+const useOnce = (): (() => boolean) => {
+  let active = true;
+  return () => {
+    const next = consume(active);
+    active = next.snd;
+    return next.fst;
+  };
+};
+
 export class FabricProviderBindings {
+  readonly #lifecycles = new Map<string, BindingLife>();
   readonly #current = new Map<string, FabricProviderBinding>();
   readonly #staged = new Map<string, FabricProviderBinding>();
   readonly #all = new Map<string, FabricProviderBinding>();
   readonly #generations = new Map<string, number>();
+  readonly #pending = new Set<Promise<unknown>>();
+  readonly #excluded = new Set<string>();
+  readonly #signals = new Map<string, AbortController>();
   readonly #listeners = new Set<(event: FabricProviderBindingEvent) => void>();
 
   subscribe(listener: (event: FabricProviderBindingEvent) => void): () => void {
@@ -46,7 +63,8 @@ export class FabricProviderBindings {
 
   binding(id: string): FabricProviderBinding | undefined {
     const binding = this.#all.get(id);
-    return binding?.state === "closed" ? undefined : binding;
+    const life = this.#lifecycles.get(id);
+    return binding && life && bindingStep(life, { $: "Inspect" }).command.$ === "Granted" ? binding : undefined;
   }
 
   has(name: string): boolean {
@@ -65,6 +83,9 @@ export class FabricProviderBindings {
     provider: FabricProvider,
     options: { overwrite?: boolean; staged?: boolean } = {},
   ): FabricComponentProviderLease {
+    if ([...this.#all.values()].some(binding => binding.provider === provider && binding.closeTask)) {
+      throw new Error("Cannot mount a provider instance whose close has begun");
+    }
     const current = this.#current.get(provider.name);
     const staged = this.#staged.get(provider.name);
     if ((current || staged) && !options.overwrite) {
@@ -72,6 +93,7 @@ export class FabricProviderBindings {
     }
     if (staged && options.overwrite) this.retire(staged.id);
     const generation = (this.#generations.get(provider.name) ?? 0) + 1;
+    if (!Number.isSafeInteger(generation)) throw new Error("Provider generation overflow");
     this.#generations.set(provider.name, generation);
     const binding: FabricProviderBinding = {
       id: randomUUID(),
@@ -90,6 +112,8 @@ export class FabricProviderBindings {
       );
     }
     this.#all.set(binding.id, binding);
+    this.#lifecycles.set(binding.id, { $: "Life", phase: { $: options.staged ? "Staged" : "Active" }, owner: true, holds: 0n, calls: 0n, revoked: false });
+    this.#signals.set(binding.id, new AbortController());
     if (options.staged) {
       this.#staged.set(binding.name, binding);
       this.#emit({ type: "staged", binding: snapshot(binding) });
@@ -98,7 +122,7 @@ export class FabricProviderBindings {
       if (replaced && options.overwrite) void this.releaseOwner(replaced.id).catch(() => undefined);
     }
 
-    let released = false;
+    const takeRelease = useOnce();
     return {
       bindingId: binding.id,
       name: binding.name,
@@ -108,8 +132,7 @@ export class FabricProviderBindings {
       },
       retire: () => this.retire(binding.id),
       release: async () => {
-        if (released) return binding.closeTask;
-        released = true;
+        if (!takeRelease()) return binding.closeTask;
         return this.releaseOwner(binding.id);
       },
     };
@@ -118,7 +141,7 @@ export class FabricProviderBindings {
   activate(bindingIds: readonly string[]): string[] {
     const bindings = bindingIds.map((id) => {
       const binding = this.#all.get(id);
-      if (!binding || binding.state === "closed") {
+      if (!binding || binding.state === "closed" || binding.closeTask) {
         throw new Error(`Unknown Fabric provider binding: ${id}`);
       }
       if (binding.state !== "staged" && binding.state !== "active") {
@@ -158,53 +181,94 @@ export class FabricProviderBindings {
 
   retire(id: string): void {
     const binding = this.#all.get(id);
-    if (!binding || binding.state === "retiring" || binding.state === "closed") return;
+    if (!binding) return;
+    const withdrawing = this.#current.get(binding.name)?.id === id || this.#staged.get(binding.name)?.id === id;
     if (this.#current.get(binding.name)?.id === id) this.#current.delete(binding.name);
     if (this.#staged.get(binding.name)?.id === id) this.#staged.delete(binding.name);
-    binding.state = "retiring";
-    this.#emit({ type: "retiring", binding: snapshot(binding) });
+    this.#step(binding, { $: "Retire" });
+    if (withdrawing) this.#emit({ type: "retiring", binding: snapshot(binding) });
     void this.#maybeClose(binding).catch(() => undefined);
   }
 
-  retain(ids: Iterable<string>): () => Promise<void> {
+  retain(ids: Iterable<string>, cleanup = false): () => Promise<void> {
     const retained: FabricProviderBinding[] = [];
     try {
       for (const id of new Set(ids)) {
         const binding = this.#all.get(id);
-        if (!binding || binding.state === "closed") {
+        if (!binding || this.#step(binding, { $: "Retain", cleanup }) !== "Granted") {
           throw new Error(`Unknown Fabric provider binding: ${id}`);
         }
-        binding.retainers++;
         retained.push(binding);
       }
     } catch (error) {
-      for (const binding of retained) binding.retainers--;
+      for (const binding of retained) this.#step(binding, { $: "Release" });
       throw error;
     }
-    let released = false;
+    const takeRelease = useOnce();
     return async () => {
-      if (released) return;
-      released = true;
+      if (!takeRelease()) return;
       await Promise.all(retained.map(async (binding) => {
-        binding.retainers = Math.max(0, binding.retainers - 1);
+        this.#step(binding, { $: "Release" });
         await this.#maybeClose(binding);
       }));
     };
   }
 
-  beginInvocation(id: string): () => Promise<void> {
+  beginInvocation(id: string, cleanup = false): () => Promise<void> {
     const binding = this.#all.get(id);
-    if (!binding || binding.state === "closed") {
+    if (!binding || this.#step(binding, { $: "Begin", cleanup }) !== "Granted") {
       throw new Error(`Unknown Fabric provider binding: ${id}`);
     }
-    binding.inFlight++;
-    let ended = false;
+    const takeEnd = useOnce();
     return async () => {
-      if (ended) return;
-      ended = true;
-      binding.inFlight = Math.max(0, binding.inFlight - 1);
+      if (!takeEnd()) return;
+      this.#step(binding, { $: "End" });
       await this.#maybeClose(binding);
     };
+  }
+
+  signal(id: string): AbortSignal {
+    const controller = this.#signals.get(id);
+    if (!controller) throw new Error("Unknown provider authority");
+    return controller.signal;
+  }
+
+  revoke(id: string): void {
+    const binding = this.#all.get(id);
+    if (!binding) return;
+    this.#step(binding, { $: "Revoke" });
+    this.#signals.get(id)?.abort(new Error("Fabric provider authority revoked"));
+    this.retire(id);
+    void this.#maybeClose(binding).catch(() => undefined);
+  }
+
+  quarantine(id: string, error: unknown): void {
+    const binding = this.#all.get(id);
+    if (!binding) return;
+    binding.closeError = error instanceof Error ? error.message : String(error);
+    this.#step(binding, { $: "Fail" });
+    this.revoke(id);
+  }
+
+  /** Hold the real operation, not the caller's cancellation race. */
+  track<T>(id: string, operation: () => T | PromiseLike<T>, cleanup = false): Promise<T> {
+    if (!cleanup && !this.binding(id)) return Promise.reject(new Error("Fabric provider authority revoked or unavailable"));
+    let end: () => Promise<void>;
+    try { end = this.beginInvocation(id, cleanup); }
+    catch (error) { return Promise.reject(error); }
+    let actual: Promise<T>;
+    try { actual = Promise.resolve(operation()); }
+    catch (error) { actual = Promise.reject(error); }
+    this.#pending.add(actual);
+    const settled = () => { this.#pending.delete(actual); return end(); };
+    void actual.then(settled, settled).catch(() => undefined);
+    return actual;
+  }
+
+  trackProvider<T>(provider: FabricProvider, operation: () => T | PromiseLike<T>, cleanup = false): Promise<T> {
+    const binding = [...this.#all.values()].find(item => item.provider === provider && this.#canBegin(item.id, cleanup));
+    if (!binding) return Promise.reject(new Error("Fabric provider binding is unavailable"));
+    return this.track(binding.id, operation, cleanup);
   }
 
   notifyCatalogChanged(provider: string): void {
@@ -215,20 +279,13 @@ export class FabricProviderBindings {
     const tasks: Promise<void>[] = [];
     for (const binding of this.#all.values()) {
       if (binding.state === "closed") continue;
-      if (excludedProviderNames.has(binding.name)) {
-        if (this.#current.get(binding.name)?.id === binding.id) this.#current.delete(binding.name);
-        binding.unsubscribeCatalog?.();
-        delete binding.unsubscribeCatalog;
-        binding.state = "closed";
-        this.#all.delete(binding.id);
-        continue;
-      }
-      this.retire(binding.id);
-      binding.ownerRetained = false;
-      binding.retainers = 0;
+      if (excludedProviderNames.has(binding.name)) this.#excluded.add(binding.id);
+      this.revoke(binding.id);
       tasks.push(this.#maybeClose(binding));
     }
-    await Promise.allSettled(tasks);
+    const deadline = Date.now() + 1_000;
+    await settleWithin([...tasks, ...this.#pending], 1_000);
+    await settleWithin([...this.#all.values()].flatMap(binding => binding.closeTask ? [binding.closeTask] : []), Math.max(0, deadline - Date.now()));
     this.#current.clear();
     this.#staged.clear();
   }
@@ -238,7 +295,7 @@ export class FabricProviderBindings {
     if (current?.id === binding.id && binding.state === "active") return current;
     if (current && current.id !== binding.id) this.retire(current.id);
     if (this.#staged.get(binding.name)?.id === binding.id) this.#staged.delete(binding.name);
-    binding.state = "active";
+    if (this.#step(binding, { $: "Activate" }) !== "Granted") throw new Error("Provider binding cannot be activated");
     this.#current.set(binding.name, binding);
     this.#emit({ type: "activated", binding: snapshot(binding) });
     return current;
@@ -248,35 +305,58 @@ export class FabricProviderBindings {
     const binding = this.#all.get(id);
     if (!binding) return;
     this.retire(id);
-    binding.ownerRetained = false;
+    this.#step(binding, { $: "DropOwner" });
     await this.#maybeClose(binding);
   }
 
   async #maybeClose(binding: FabricProviderBinding): Promise<void> {
-    if (
-      binding.state !== "retiring" ||
-      binding.ownerRetained ||
-      binding.retainers > 0 ||
-      binding.inFlight > 0
-    ) {
-      return;
-    }
     if (binding.closeTask) return binding.closeTask;
-    binding.closeTask = (async () => {
-      binding.unsubscribeCatalog?.();
-      delete binding.unsubscribeCatalog;
+    // The reducer reserves Closing synchronously, before arbitrary callbacks.
+    if (this.#step(binding, { $: "Close" }) !== "StartClose") return;
+    binding.closeTask = Promise.resolve().then(async () => {
       try {
-        await binding.provider.close?.();
+        const unsubscribe = binding.unsubscribeCatalog;
+        delete binding.unsubscribeCatalog;
+        await unsubscribe?.();
+        const shared = [...this.#all.values()].some(other => other.id !== binding.id && other.provider === binding.provider && other.state !== "closed");
+        if (!shared && !this.#excluded.has(binding.id)) await binding.provider.close?.();
       } catch (error) {
-        binding.closeError = error instanceof Error ? error.message : String(error);
+        this.quarantine(binding.id, error);
         throw error;
-      } finally {
-        binding.state = "closed";
-        this.#all.delete(binding.id);
-        this.#emit({ type: "closed", binding: snapshot(binding) });
       }
-    })();
+      if (this.#step(binding, { $: "Complete" }) !== "Granted") {
+        throw new Error(binding.closeError ?? "Provider close completion refused");
+      }
+      this.#all.delete(binding.id);
+      this.#lifecycles.delete(binding.id);
+      this.#signals.delete(binding.id);
+      this.#excluded.delete(binding.id);
+      this.#emit({ type: "closed", binding: snapshot(binding) });
+    });
     return binding.closeTask;
+  }
+
+  #canBegin(id: string, cleanup: boolean): boolean {
+    const life = this.#lifecycles.get(id);
+    return !!life && life.calls < BigInt(BEND_NAT_MAX) && bindingStep(life, { $: "Begin", cleanup }).command.$ === "Granted";
+  }
+
+  #step(binding: FabricProviderBinding, event: BindingEvent): BindingOutcome["command"]["$"] {
+    const life = this.#lifecycles.get(binding.id);
+    if (!life) return "Denied";
+    if ((event.$ === "Begin" && life.calls >= BigInt(BEND_NAT_MAX)) || (event.$ === "Retain" && life.holds >= BigInt(BEND_NAT_MAX))) {
+      throw new Error("Provider lifecycle accounting overflow");
+    }
+    const outcome = bindingStep(life, event);
+    if (outcome.next.holds > BigInt(BEND_NAT_MAX) || outcome.next.calls > BigInt(BEND_NAT_MAX)) {
+      throw new Error("Provider lifecycle accounting overflow");
+    }
+    this.#lifecycles.set(binding.id, outcome.next);
+    binding.state = ({ Staged: "staged", Active: "active", Retiring: "retiring", Closing: "retiring", Closed: "closed", Failed: "retiring" } as const)[outcome.next.phase.$];
+    binding.ownerRetained = outcome.next.owner;
+    binding.retainers = Number(outcome.next.holds);
+    binding.inFlight = Number(outcome.next.calls);
+    return outcome.command.$;
   }
 
   #emit(event: FabricProviderBindingEvent): void {

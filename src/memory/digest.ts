@@ -1,3 +1,4 @@
+import { coverageComplete } from "../verified/policy.js";
 import type { NormalizationCoverage, NormalizedEntry } from "./normalize.js";
 import { compareLexical, tokenizeLexical } from "./tokenize.js";
 
@@ -135,7 +136,7 @@ export const foldSessionDigest = (input: DigestInput): SessionDigest => {
     vocabulary: sortedVocabulary,
     addresses,
     indexCoverage: {
-      complete: sortedReasons.length === 0,
+      complete: coverageComplete(input.normalizationCoverage?.complete ?? true, sortedReasons.length > 0),
       vocabularyBytes: vocabularyJsonBytes(sortedVocabulary),
       reasons: sortedReasons,
     },

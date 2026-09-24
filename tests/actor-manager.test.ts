@@ -1205,6 +1205,25 @@ describe("ActorManager", () => {
     expect(deliveries.filter((text) => text.startsWith("Fabric host notice:"))).toEqual([]);
   }, 60_000);
 
+  it.each(["stop", "close"] as const)("does not count an activation cut off by %s as the third failure", async (how) => {
+    const { actors, deliveries } = setup();
+    const actor = await actors.create({
+      name: "supervisor",
+      instructions: "Watch and steer only when needed.",
+      responseMode: "directive",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    for (let run = 1; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await actors.ask(actor.id, "FAIL_DIRECTIVE");
+    const asked = actors.ask(actor.id, "HANG").catch(() => undefined);
+    await waitFor(() => actors.status(actor.id).status === "running");
+    if (how === "stop") await actors.stop(actor.id);
+    else await actors.close();
+    await asked;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(deliveries.filter((text) => text.startsWith("Fabric host notice:"))).toEqual([]);
+  }, 60_000);
+
   // review/astra on #34: a completed run with an invalid directive is a failure too.
   it("counts completed runs whose directive is invalid toward the owner notice", async () => {
     const { actors, deliveries } = setup();

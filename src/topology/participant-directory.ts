@@ -676,9 +676,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       local: false,
       };
       const current = this.mesh.get(legacySessionKey)?.value;
-      const withoutTime = (value: unknown): string =>
-        JSON.stringify({ ...(isObject(value) ? value : {}), updatedAt: undefined });
-      if (withoutTime(current) !== withoutTime(legacyValue)) changed = true;
+      if (JSON.stringify({ ...(isObject(current) ? current : {}), updatedAt: undefined }) !==
+        JSON.stringify({ ...legacyValue, updatedAt: undefined })) changed = true;
       ops.push({ kind: "put", key: legacySessionKey, value: legacyValue });
     }
 
@@ -705,6 +704,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return actor ? [[actor.id, actor.ownerIdentityId] as const] : [];
         }),
     );
+    // A change-driven refresh needs a change beyond the timestamps that sources stamp on
+    // every read (Main's info() sets updatedAt to now).
+    const withoutTime = (value: unknown): string =>
+      JSON.stringify({ ...(isObject(value) ? value : {}), updatedAt: undefined });
     for (const record of desired.values()) {
       const current = existingById.get(record.id);
       if (current && JSON.stringify(current.participant) === JSON.stringify(record)) continue;
@@ -726,7 +729,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           continue;
         }
       }
-      changed = true;
+      if (!current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
       ops.push({
         kind: "put",
         key,

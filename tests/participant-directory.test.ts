@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { MainAgentController } from "../src/main-agent.js";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { awaitPeerSettle, type PeerSettleResult } from "../src/topology/peer-settle.js";
 
@@ -402,8 +404,16 @@ describe("ParticipantDirectory", () => {
       const directory = new ParticipantDirectory(mesh, {
         enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 60_000, leaseMs: 180_000,
       });
+      // The production Main source: MainAgentController.info() stamps updatedAt on every read.
       let status: "idle" | "running" = "idle";
-      directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, "busy"), status }]);
+      const main = new MainAgentController(
+        { getThinkingLevel: () => "high" } as unknown as ExtensionAPI, identity.id, true, "/tmp/project", "busy");
+      const context = {
+        model: { provider: "anthropic", id: "model" },
+        isIdle: () => status === "idle",
+        hasPendingMessages: () => false,
+      } as unknown as ExtensionContext;
+      directory.registerSource(() => [directory.root(main.info(context))]);
       directories.push(directory);
       await directory.start();
       const writes = vi.spyOn(mesh, "writeBatch");
@@ -412,8 +422,11 @@ describe("ParticipantDirectory", () => {
 
     it("writes nothing when no published record changed", async () => {
       const { directory, writes } = await changing();
-      for (let index = 0; index < 20; index++) directory.scheduleRefresh();
-      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      for (let index = 0; index < 20; index++) {
+        directory.scheduleRefresh();
+        await new Promise((resolve) => setTimeout(resolve, 100));   // each read gets a new updatedAt
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
       expect(writes).not.toHaveBeenCalled();
     });
 

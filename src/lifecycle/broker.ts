@@ -285,11 +285,12 @@ export class LifecycleBroker {
     }
   }
 
-  // A skipped event is skipped for good (the cursor moves past it), so a "not the owner"
-  // answer from a cached view is checked again against the current mesh state.
+  // Both answers are final: a skipped event is skipped for good (the cursor moves past it), and
+  // a delivered one can end a once subscription. So ownership is read from the current mesh
+  // state, not a recent cached parse. This runs only for events that already match a
+  // subscription's source and event type, so it costs about one check per delivery.
   #sourceIsCurrentOwner(event: FabricLifecycleEvent): boolean {
-    return this.#ownsSource(event, this.participants.get(event.source.id)) ||
-      this.#ownsSource(event, this.participants.get(event.source.id, undefined, { fresh: true }));
+    return this.#ownsSource(event, this.participants.get(event.source.id, undefined, { fresh: true }));
   }
 
   #ownsSource(event: FabricLifecycleEvent, participant: FabricParticipantInfo | undefined): boolean {

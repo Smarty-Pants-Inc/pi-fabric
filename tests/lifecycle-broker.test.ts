@@ -253,6 +253,44 @@ describe("LifecycleBroker", () => {
     expect(deliveries[0]).toMatchObject({ event: "pi.agent_settled", occurredAt: 7 });
   });
 
+  // review/astra on #49, F2: after a handoff inside the cache window, an event from the former
+  // owner must not be delivered (it would end a once subscription before the new owner's event).
+  it("skips an event from a former owner after a handoff, and delivers the new owner's", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const former = participant(sourceIdentity, false);
+    const current = { ...former, ownerHostId: "host:new", ownerIdentityId: "host:new" };
+    const target = participant(targetIdentity, true);
+    // The cached view still names the former owner; the current mesh state names the new one.
+    const handedOff: FabricParticipantSource = {
+      list: () => [target, current],
+      get: (id, _now, options) => id === target.id ? target : id === source.id ? (options?.fresh ? current : former) : undefined,
+      self: () => target,
+      peers: () => [],
+      async refresh() {},
+      scheduleRefresh() {},
+    };
+    const deliveries: FabricLifecycleEvent[] = [];
+    const receiver = new LifecycleBroker(mesh, targetIdentity, handedOff,
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, (_subscription, event) => { deliveries.push(event); });
+    const publisher = new LifecycleBroker(mesh, sourceIdentity, participants(sourceIdentity.id),
+      { enabled: true, pollMs: 60_000, maxReadEvents: 100 }, () => {});
+    brokers.push(receiver, publisher);
+    await receiver.subscribe({
+      from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once: true,
+    });
+    await publisher.publish({ source, event: "pi.agent_settled", occurredAt: 1 });           // former owner
+    await publisher.publish({ source: { ...source, ownerHostId: "host:new", ownerIdentityId: "host:new" },
+      event: "pi.agent_settled", occurredAt: 2 });                                            // new owner
+    receiver.start();
+    await waitFor(() => deliveries.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(deliveries.map((event) => event.occurredAt)).toEqual([2]);
+    await waitFor(() => receiver.list().length === 0);       // the once subscription ended on it
+  });
+
   it("delivers attributed component state transitions", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
     roots.push(root);

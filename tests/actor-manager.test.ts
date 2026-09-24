@@ -1183,6 +1183,28 @@ describe("ActorManager", () => {
     expect(notices()).toHaveLength(2);
   }, 60_000);
 
+  // review/astra on #34: a completed run with an invalid directive is a failure too.
+  it("counts completed runs whose directive is invalid toward the owner notice", async () => {
+    const { actors, deliveries } = setup();
+    const actor = await actors.create({
+      name: "supervisor",
+      instructions: "Watch and steer only when needed.",
+      responseMode: "directive",
+      delivery: "mailbox",
+      triggerTurn: false,
+    });
+    const notices = () => deliveries.filter((text) => text.startsWith("Fabric host notice:"));
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+      await actors.ask(actor.id, "EMPTY_MESSAGE_DIRECTIVE").catch(() => undefined);
+    }
+    expect(notices()).toEqual([expect.stringContaining("missing message text")]);
+    await actors.ask(actor.id, "all good");                  // a valid message still ends the streak
+    for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) {
+      await actors.ask(actor.id, "EMPTY_MESSAGE_DIRECTIVE").catch(() => undefined);
+    }
+    expect(notices()).toHaveLength(2);
+  }, 60_000);
+
   it("stays ambient and retains the failed run when a directive run fails", async () => {
     const { actors, agents } = setup();
     const actor = await actors.create({

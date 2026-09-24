@@ -1488,6 +1488,8 @@ export class AgentManager {
       if (managed.settled || this.#closing || managed.stopRequested) return false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
       this.#unregisteredTransports.delete(managed.transport);
+      // A later launch succeeded: an earlier relaunch failure no longer describes this run.
+      delete managed.relaunchFailure;
       if (managed.settled || this.#closing || managed.stopRequested) {
         // A stop landed while the relaunch was in flight. Release the child we
         // just started so it cannot outlive the monitor and the stop path can
@@ -1566,7 +1568,8 @@ export class AgentManager {
       }
       if (record && terminalStatuses.has(record.status)) {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
-        if (await this.#retryStartup(managed, record, deadline)) continue;
+        // A relaunch that failed is terminal: no fallback launch may run after it.
+        if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
         this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;
       }
@@ -1624,7 +1627,7 @@ export class AgentManager {
                 : "Agent transport exited without a result",
             );
             if (await this.#resumeStopped(managed, failed, deadline)) continue;
-            if (await this.#retryStartup(managed, failed, deadline)) {
+            if (!managed.relaunchFailure && await this.#retryStartup(managed, failed, deadline)) {
               managed.lastRetriedTransportFailure = failed;
               continue;
             }

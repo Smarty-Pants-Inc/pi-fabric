@@ -598,6 +598,33 @@ describe("AgentManager", () => {
   },
   30_000);
 
+  // review/astra on #26: a failed relaunch is terminal. No fallback launch runs after it, so
+  // the saved failure can never mask a later result.
+  it("makes a failed resume relaunch terminal, with no fallback launch", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      launches++;
+      if (launches === 2) throw new Error("transient launch failure");
+      return launch.call(this, request);
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "RESUME_AFTER_CRASH", transport: "process" });
+      expect(launches).toBe(2);
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("relaunch failed: transient launch failure");
+    } finally {
+      spy.mockRestore();
+    }
+  }, 45_000);
+
   it("resumes a run whose transport died after doing work", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

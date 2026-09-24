@@ -5,14 +5,8 @@ import type { FabricAgentMessageResult, FabricMainAgentTarget } from "../main-ag
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
 import type { FabricControlPlane, FabricControlCommand, FabricControlAcceptance } from "../topology/control-plane.js";
-import { assertFabricIdempotencyKey } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { FabricAgentRunner } from "../config.js";
-// Local results kept for messageId retries: long enough to cover a caller's retry
-// after an acknowledgement timeout, bounded so a chatty caller cannot grow it.
-const DELIVERED_TTL_MS = 10 * 60 * 1_000;
-const DELIVERED_MAX = 1_000;
-
 // Route messages using only the ownership, delivery, and binding ports needed here.
 export class AgentMessageRouter {
   constructor(
@@ -33,45 +27,7 @@ export class AgentMessageRouter {
       from?: MeshIdentity;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
-      messageId?: string;
     } = {},
-  ): Promise<FabricAgentMessageResult> {
-    if (options.messageId === undefined) return this.#route(id, message, data, kind, context, options);
-    assertFabricIdempotencyKey(options.messageId);
-    // At-most-once for a caller-chosen messageId: a local retry returns the first
-    // result, and remote retries reuse one control command id that the owner dedupes.
-    const now = Date.now();
-    for (const [key, entry] of this.#delivered) {
-      if (now - entry.at <= DELIVERED_TTL_MS && this.#delivered.size <= DELIVERED_MAX) break;
-      this.#delivered.delete(key);
-    }
-    const key = `${kind}\0${id}\0${options.messageId}`;
-    const previous = this.#delivered.get(key);
-    if (previous) return previous.result;
-    // Cache the in-flight delivery so a concurrent retry waits for it; forget a failed
-    // one so the caller can retry it.
-    const result = this.#route(id, message, data, kind, context, options);
-    this.#delivered.set(key, { at: now, result });
-    result.catch(() => {
-      if (this.#delivered.get(key)?.result === result) this.#delivered.delete(key);
-    });
-    return result;
-  }
-
-  readonly #delivered = new Map<string, { at: number; result: Promise<FabricAgentMessageResult> }>();
-
-  async #route(
-    id: string,
-    message: string,
-    data: unknown,
-    kind: "steer" | "followUp",
-    context: FabricInvocationContext | undefined,
-    options: {
-      from?: MeshIdentity;
-      triggerTurn?: boolean;
-      binding?: FabricActorRunBinding;
-      messageId?: string;
-    },
   ): Promise<FabricAgentMessageResult> {
     const isMain = this.mainAgent.matches(id);
     const remoteRoot = isMain ? undefined : this.participants.get(id);
@@ -115,7 +71,6 @@ export class AgentMessageRouter {
             : {}),
         },
         participant.ownerIdentityId,
-        ...(options.messageId === undefined ? [] : [{ idempotencyKey: options.messageId }]),
       );
     }
 
@@ -192,7 +147,6 @@ export class AgentMessageRouter {
         ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
       },
       participant.ownerIdentityId,
-      ...(options.messageId === undefined ? [] : [{ idempotencyKey: options.messageId }]),
     );
   }
 

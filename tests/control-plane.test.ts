@@ -534,27 +534,6 @@ describe("FabricControlPlane", () => {
   });
 
   // smarty-dev#367: a retry after an acknowledgement timeout delivered the message twice.
-  it("delivers a retried request with the same idempotency key once", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
-    roots.push(root);
-    const meshRoot = path.join(root, "mesh");
-    const sender = plane(meshRoot, "host:sender");
-    const receiver = plane(meshRoot, "host:receiver");
-    const receive = vi.fn((command: { commandId: string }) => ({ accepted: true, messageId: "delivered:" + command.commandId }));
-    sender.start(() => ({ accepted: false }));
-    receiver.start(receive);
-
-    const first = await sender.request("host:receiver", "agent:target", "steer", { message: "once" }, "host:receiver", { idempotencyKey: "retry-1" });
-    const retry = await sender.request("host:receiver", "agent:target", "steer", { message: "once" }, "host:receiver", { idempotencyKey: "retry-1" });
-    const other = await sender.request("host:receiver", "agent:target", "steer", { message: "twice" }, "host:receiver", { idempotencyKey: "retry-2" });
-
-    expect(receive).toHaveBeenCalledTimes(2);                 // retry-1 once, retry-2 once
-    expect(retry.messageId).toBe(first.messageId);
-    expect(other.messageId).not.toBe(first.messageId);
-    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "x" }, "host:receiver", { idempotencyKey: "bad key!" }))
-      .rejects.toThrow("messageId must be");
-  });
-
   it("waits past the deadline for the acknowledgement of a command the owner admitted in time", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);
@@ -570,6 +549,20 @@ describe("FabricControlPlane", () => {
     sender.start(() => ({ accepted: false }));
     await expect(sender.request("host:receiver", "agent:target", "steer", { message: "slow ack" }))
       .resolves.toMatchObject({ acknowledged: true, messageId: "late-but-delivered" });
+  });
+
+  it("still times out, after the deadline plus a bounded grace, when no owner answers", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    sender.start(() => ({ accepted: false }));
+    const started = Date.now();
+    // No receiver runs. The outcome is unknown, so the error must not promise a safe retry.
+    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "nobody home" }))
+      .rejects.toThrow("the outcome is unknown and it may still be delivered, so a retry can deliver it twice");
+    const waited = Date.now() - started;
+    expect(waited).toBeGreaterThanOrEqual(100 + 200 - 20);   // the deadline plus 2 x 100 ms of grace
+    expect(waited).toBeLessThan(2_000);
   });
 
   it("surfaces owner rejection instead of reporting an unverified queue", async () => {

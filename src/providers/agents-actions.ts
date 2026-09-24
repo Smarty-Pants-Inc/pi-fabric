@@ -453,15 +453,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       "Steer Main, a running one-shot agent between turns, or a persistent actor through its mailbox. The stable id alias main targets the root user-facing Pi session. Non-local targets route over the project mesh.",
     inputSchema: {
       type: "object",
-      properties: {
-        id: { type: "string" },
-        message: { type: "string" },
-        data: {},
-        messageId: {
-          type: "string",
-          description: "Optional caller-chosen id (1-200 of A-Z a-z 0-9 . _ : @ / -). Retrying with the same id after a timeout delivers the message at most once.",
-        },
-      },
+      properties: { id: { type: "string" }, message: { type: "string" }, data: {} },
       required: ["id", "message"],
       additionalProperties: false,
     },
@@ -473,15 +465,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       "Queue a follow-up for Main or a running one-shot agent, or enqueue a persistent actor mailbox message. The stable id alias main targets the root user-facing Pi session. Non-local targets route over the project mesh.",
     inputSchema: {
       type: "object",
-      properties: {
-        id: { type: "string" },
-        message: { type: "string" },
-        data: {},
-        messageId: {
-          type: "string",
-          description: "Optional caller-chosen id (1-200 of A-Z a-z 0-9 . _ : @ / -). Retrying with the same id after a timeout delivers the message at most once.",
-        },
-      },
+      properties: { id: { type: "string" }, message: { type: "string" }, data: {} },
       required: ["id", "message"],
       additionalProperties: false,
     },

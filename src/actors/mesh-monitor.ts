@@ -102,22 +102,28 @@ export class ActorMeshMonitor {
     if (!this.callbacks.beforePoll()) return;
     this.#polling = true;
     try {
-      // Catch-up reads one event at a time, so an event a full actor queue rejects keeps the
-      // cursor on it and is offered again, instead of overflowing silently (smarty-dev#472).
-      // Live reads keep whole pages and the queue's own overflow policy.
-      const tail = this.mesh.tail(this.#offset, this.#catchingUp ? 1 : this.config.maxReadEvents);
+      // Live and catch-up both read whole pages. Live advances first, so a failing dispatch
+      // never blocks the stream; the cursor file is committed after the page.
+      const start = this.#offset;
+      const tail = this.mesh.tail(start, this.config.maxReadEvents);
       if (this.#catchingUp && tail.events.length === 0) this.#catchingUp = false;
       const catchingUp = this.#catchingUp;
-      // Live: advance first, so a failing dispatch never blocks the stream (the cursor file is
-      // committed only after a complete dispatch).
       if (!catchingUp) this.#offset = tail.nextOffset;
-      for (const event of tail.events) {
+      for (const [index, event] of tail.events.entries()) {
         if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor) continue;
-        if (this.callbacks.onEvent(event) === false && catchingUp) return;
+        if (this.callbacks.onEvent(event) === false && catchingUp) {
+          // A full actor queue rejected this event while catching up (smarty-dev#472): keep
+          // the cursor on it and offer it again later; earlier events are already delivered.
+          this.#offset = index === 0 ? start : this.mesh.tail(start, index).nextOffset;
+          this.#writeCursor();
+          return;
+        }
       }
       if (catchingUp) this.#offset = tail.nextOffset;
       this.#writeCursor();
-      if (catchingUp) this.schedule();
+      // Yield to the event loop between catch-up pages, so timers such as the lease
+      // heartbeat keep running through a long backlog.
+      if (catchingUp) setImmediate(() => this.schedule());
     } finally {
       this.#polling = false;
     }

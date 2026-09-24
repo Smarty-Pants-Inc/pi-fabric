@@ -236,6 +236,33 @@ const compactStateTombstones = (state: MeshStateFile, maxTombstones: number): vo
   state.tombstoneOrder = retainedKeys;
 };
 
+export type MeshBatchOperation =
+  | {
+      kind: "put";
+      key: string;
+      value: unknown | ((now: number) => unknown);
+      ifVersion?: number;
+      onConflict?: "skip" | "abort" | ((current: MeshStateEntry | undefined) => "skip" | "abort");
+    }
+  | {
+      kind: "delete";
+      key: string;
+      ifVersion?: number;
+      onConflict?: "skip" | "abort" | ((current: MeshStateEntry | undefined) => "skip" | "abort");
+    };
+
+export interface MeshBatchResult {
+  key: string;
+  applied: boolean;
+  version: number;
+}
+
+export class MeshBatchConflictError extends Error {
+  constructor(readonly key: string, readonly expected: number, readonly found: number) {
+    super(`Mesh compare-and-swap failed for ${key}: expected version ${expected}, found ${found}`);
+  }
+}
+
 export class MeshStore {
   readonly #eventsPath: string;
   readonly #statePath: string;
@@ -637,6 +664,79 @@ export class MeshStore {
       atomicWrite(this.#statePath, state, this.#maxStateBytes);
       this.#cacheState(state);
       return { deleted: true, version: existing.version };
+    });
+  }
+
+  // Applies several puts and deletes in ONE locked read-modify-write, so a caller that
+  // updates many keys at once rewrites the shared state file once instead of once per
+  // key. Each operation keeps put()/delete() semantics, including an optional
+  // compare-and-swap. On a version mismatch, `onConflict` decides: "skip" leaves that
+  // key alone, "abort" writes nothing at all and rejects. A put value may be a function,
+  // evaluated under the lock at commit time (for timestamps such as lease stamps).
+  // Returns one result per operation, in order.
+  async writeBatch(input: {
+    identity: MeshIdentity;
+    ops: MeshBatchOperation[];
+  }): Promise<MeshBatchResult[]> {
+    for (const op of input.ops) this.#validateKey(op.key);
+    if (input.ops.length === 0) return [];
+    return this.#withLock(() => {
+      const state = readState(this.#statePath, this.#maxStateBytes);
+      state.versions ??= {};
+      const tombstones = new Set(state.tombstoneOrder ?? []);
+      const results: MeshBatchResult[] = [];
+      let changed = false;
+      const now = Date.now();
+      for (const op of input.ops) {
+        const existing = state.entries[op.key];
+        const stored = state.versions[op.key];
+        const actualVersion =
+          existing?.version ?? (typeof stored === "number" && Number.isSafeInteger(stored) ? stored : 0);
+        if (op.ifVersion !== undefined && op.ifVersion !== actualVersion) {
+          const policy = typeof op.onConflict === "function"
+            ? op.onConflict(existing ? jsonClone(existing) : undefined)
+            : op.onConflict ?? "abort";
+          if (policy === "abort") {
+            throw new MeshBatchConflictError(op.key, op.ifVersion, actualVersion);
+          }
+          results.push({ key: op.key, applied: false, version: actualVersion });
+          continue;
+        }
+        if (op.kind === "delete") {
+          if (!existing) {
+            results.push({ key: op.key, applied: false, version: actualVersion });
+            continue;
+          }
+          delete state.entries[op.key];
+          state.versions[op.key] = existing.version;
+          tombstones.delete(op.key);
+          tombstones.add(op.key);
+          results.push({ key: op.key, applied: true, version: existing.version });
+          changed = true;
+          continue;
+        }
+        const value = jsonClone(typeof op.value === "function" ? (op.value as (now: number) => unknown)(now) : op.value);
+        if (Buffer.byteLength(JSON.stringify(value), "utf8") > this.maxEventBytes) {
+          throw new Error(`Mesh state value exceeds ${this.maxEventBytes} bytes`);
+        }
+        const entry: MeshStateEntry = {
+          key: op.key, value, version: actualVersion + 1, updatedAt: now, updatedBy: jsonClone(input.identity),
+        };
+        state.entries[op.key] = entry;
+        state.versions[op.key] = entry.version;
+        tombstones.delete(op.key);
+        results.push({ key: op.key, applied: true, version: entry.version });
+        changed = true;
+      }
+      if (!changed) {
+        this.#cacheState(state);
+        return results;
+      }
+      state.tombstoneOrder = [...tombstones];
+      compactStateTombstones(state, this.#maxStateTombstones);
+      atomicWrite(this.#statePath, state, this.#maxStateBytes);
+      this.#cacheState(state);
+      return results;
     });
   }
 

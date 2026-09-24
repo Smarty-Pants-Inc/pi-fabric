@@ -188,14 +188,12 @@ describe("ParticipantDirectory", () => {
       rootRecord(identity.id, identity.id, "slow"),
       agentRecord("agent:slow", identity.id, identity.id, identity.id),
     ]);
-    const publish = directory.mesh.put.bind(directory.mesh);
-    // A contended Windows mesh makes each participant write outlast the 300ms
-    // lease; the host lease must still be fresh once the refresh completes.
-    vi.spyOn(directory.mesh, "put").mockImplementation(async (input) => {
-      if (input.key.startsWith("topology/participants/")) {
-        await new Promise((resolve) => setTimeout(resolve, 350));
-      }
-      return publish(input);
+    const write = directory.mesh.writeBatch.bind(directory.mesh);
+    // A contended Windows mesh makes the heartbeat write outlast the 300ms lease;
+    // the host lease is stamped at commit, so it must still be fresh afterwards.
+    vi.spyOn(directory.mesh, "writeBatch").mockImplementation(async (input) => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      return write(input);
     });
 
     await directory.start();
@@ -480,5 +478,31 @@ describe("ParticipantDirectory", () => {
     }
     expect(directory.mesh.listAll("topology/hosts/")).toHaveLength(1);
     expect(directory.mesh.listAll("topology/participants/")).toHaveLength(1);
+  });
+
+  // smarty-dev#367: each heartbeat put rewrote the whole shared state file under the lock.
+  it("writes one heartbeat as a single state-file write", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:batch", name: "main", kind: "main", sessionId: "batch" };
+    const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => [
+      rootRecord(identity.id, identity.id, "batch"),
+      agentRecord("agent:one", identity.id, identity.id, identity.id),
+      agentRecord("agent:two", identity.id, identity.id, identity.id),
+    ]);
+    const renames = vi.spyOn(fs, "renameSync");
+    await directory.refresh();
+    const stateWrites = renames.mock.calls.filter(([, target]) => String(target).endsWith("state.json")).length;
+    renames.mockRestore();
+    // Peer-label claiming may add one write on first start; the heartbeat itself is one.
+    expect(stateWrites).toBeLessThanOrEqual(2);
+    expect(directory.mesh.listAll("topology/participants/")).toHaveLength(3);
+    expect(directory.mesh.listAll("topology/hosts/")).toHaveLength(1);
+
+    const again = vi.spyOn(fs, "renameSync");
+    await directory.refresh();
+    const steady = again.mock.calls.filter(([, target]) => String(target).endsWith("state.json")).length;
+    again.mockRestore();
+    expect(steady).toBe(1);
   });
 });

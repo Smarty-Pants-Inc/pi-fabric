@@ -569,12 +569,14 @@ describe("FabricControlPlane", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
-    const sender = plane(meshRoot, "host:sender", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
-    const receiver = plane(meshRoot, "host:receiver", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
-    // Admitted within the 100 ms deadline, acknowledged after it (a slow handler or a
-    // contended mesh lock): the sender must report the delivery, not a timeout.
+    // A 400 ms deadline leaves a slow runner (windows-latest) time to admit the command;
+    // the handler then acknowledges after the deadline but inside the 2 x 400 ms grace.
+    const sender = plane(meshRoot, "host:sender", {}, { pollMs: 20, acknowledgementTimeoutMs: 400 });
+    const receiver = plane(meshRoot, "host:receiver", {}, { pollMs: 20, acknowledgementTimeoutMs: 400 });
+    // Admitted within the deadline, acknowledged after it (a slow handler or a contended
+    // mesh lock): the sender must report the delivery, not a timeout.
     receiver.start(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await new Promise((resolve) => setTimeout(resolve, 500));
       return { accepted: true, messageId: "late-but-delivered" };
     });
     sender.start(() => ({ accepted: false }));

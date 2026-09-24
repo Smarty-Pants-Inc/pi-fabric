@@ -409,19 +409,39 @@ describe("MeshStore uses the proved transition", () => {
     expect(left.revisionFormat).toBe(2);
   });
 
-  // Fork patch (pi-fabric#27 F2): damaged JSON is kept aside once, and the restarted clock
-  // is persisted even when the write that found the damage fails its compare-and-swap.
-  it("keeps damaged JSON aside and persists a restarted clock even when the write fails", async () => {
+  // pi-fabric#27: batches (the directory heartbeat) are the same barrier as put/delete.
+  it.each(["", "{"])("refuses a batch on damaged bytes %j and leaves them unchanged", async damaged => {
     const store = createStore();
-    const damaged = '{"format":1,"entries":{"unrelated":';
+    await store.put({ key: "state/a", value: 1, identity });
     fs.writeFileSync(statePath(store), damaged);
-    const floor = Date.now();
-    await expect(store.put({ key: "state/a", value: 2, identity, ifVersion: 9 })).rejects.toThrow("compare-and-swap failed");
-    const aside = fs.readdirSync(store.root).filter((name) => name.startsWith("state.json.damaged."));
-    expect(aside).toHaveLength(1);
-    expect(fs.readFileSync(path.join(store.root, aside[0]!), "utf8")).toBe(damaged);
-    expect(JSON.parse(bytes(store)).highWater).toBeGreaterThanOrEqual(floor);
-    expect((await store.put({ key: "state/a", value: 3, identity })).version).toBeGreaterThan(floor);
+    await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "state/a", value: 2 }] })).rejects.toThrow("invalid state format");
+    expect(bytes(store)).toBe(damaged);
+    expect(fs.readdirSync(store.root)).toEqual(["state.json"]);
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("refuses writes, and replaces nothing, when valid state cannot be read", async () => {
+    const store = createStore();
+    await store.put({ key: "state/a", value: 1, identity });
+    const before = bytes(store);
+    fs.chmodSync(statePath(store), 0o000);
+    try {
+      await expect(store.put({ key: "state/b", value: 1, identity })).rejects.toThrow("Failed to read Fabric mesh state");
+      await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "state/b", value: 1 }] })).rejects.toThrow("Failed to read Fabric mesh state");
+    } finally {
+      fs.chmodSync(statePath(store), 0o600);
+    }
+    expect(bytes(store)).toBe(before);
+    expect(fs.readdirSync(store.root)).toEqual(["state.json"]);
+  });
+
+  it("failed writes to damaged JSON do not quarantine/reset unrelated state", async () => {
+    const store = createStore();
+    fs.writeFileSync(statePath(store), '{"format":1,"entries":{"unrelated":');
+    const before = bytes(store);
+    await expect(store.put({ key: "state/a", value: 2, identity, ifVersion: 9 })).rejects.toThrow("invalid state format");
+    await expect(store.delete({ key: "state/a", ifVersion: 9 })).rejects.toThrow("invalid state format");
+    expect(bytes(store)).toBe(before);
+    expect(fs.readdirSync(store.root)).toEqual(["state.json"]);
   });
 
   it("failed size admission leaves unrelated entries, tombstones and cache unchanged", async () => {
@@ -437,14 +457,13 @@ describe("MeshStore uses the proved transition", () => {
     expect(store.get("state/a")).toEqual(entry);
   });
 
-  it.each(["", "  ", "{"])("never reissues an earlier revision after damaged bytes %j", async damaged => {
+  it.each(["", "  ", "{"])("read recovery never turns damaged bytes %j into fresh allocation history", async damaged => {
     const store = createStore();
-    const first = await store.put({ key: "state/a", value: 1, identity });
+    await store.put({ key: "state/a", value: 1, identity });
     fs.writeFileSync(statePath(store), damaged);
     expect(store.listAll()).toEqual([]);
-    const next = await store.put({ key: "state/a", value: 2, identity });
-    expect(next.version).toBeGreaterThan(Math.max(first.version, Date.now() - 60_000));
-    await expect(store.put({ key: "state/a", value: 3, identity, ifVersion: first.version })).rejects.toThrow("compare-and-swap failed");
+    await expect(store.put({ key: "state/a", value: 2, identity })).rejects.toThrow("invalid state format");
+    expect(bytes(store)).toBe(damaged);
   });
 
   it.each(["toString", "valueOf", "hasOwnProperty"])("uses own-key presence and clock allocation for %s", async key => {

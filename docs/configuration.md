@@ -543,6 +543,10 @@ call override → session binding → project default → Fabric default
 
 Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable.
 
+Shared state keeps a persistent revision clock (`highWater` in the mesh `state.json`). A new key takes the next clock revision, and an update takes its key's version plus one. Compare revisions only through `ifVersion`; a new key seldom starts at 1. Fabric builds from before this clock can still write to a shared root. A newer Fabric then raises its clock to the highest retained revision, so both can use one root.
+
+If `state.json` is empty or unparseable, reads return an empty table and every write fails with `invalid state format`. This barrier keeps Fabric from issuing a revision that an earlier caller still holds. To repair a root, stop every Fabric process that uses it, inspect the file, fix it or move it aside, and then start the processes again. Moving the file aside restarts revisions. That is safe only while no process runs, because each process reads fresh revisions after it starts.
+
 ## Compaction
 
 The deterministic, LLM-free compaction engine is on by default. It keeps Pi's bounded `keepRecentTokens` continuity tail. `compaction.targetContextRatio` sets a hard occupancy ceiling. Set `compaction.engine` to `"pi"` to restore pi-core compaction. When pi-vcc is also installed, Fabric takes precedence for automatic compaction. An explicit `/pi-vcc` command always uses pi-vcc's engine. See [compaction](compaction.md) for invariants, loss guarantees, sections, and limits.

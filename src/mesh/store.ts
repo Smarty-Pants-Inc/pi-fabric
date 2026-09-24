@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
-import { quarantineDamagedFile } from "../core/damaged-file.js";
 import { readJsonlPage } from "../log-tail.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
@@ -208,33 +207,6 @@ const readState = (filePath: string, maxBytes: number, recoverDamage = true): Me
     if (!recoverDamage) throw new Error("Failed to read Fabric mesh state: invalid state format");
     // Preserve the original bytes at this path as a barrier to clock reset.
     return emptyState();
-  }
-};
-
-// Fork patch (pi-fabric#27 F2): a mutation that finds state.json empty or unparseable
-// keeps the damaged bytes aside (as the fork always did) and continues, instead of
-// blocking every mesh write on the root until someone repairs the file. The clock the
-// damage lost restarts at the wall-clock millisecond: revisions advance by one per
-// locked write, so no earlier revision can reach that floor, and no token is reissued.
-// ponytail: assumes fewer than one committed write per millisecond since the last
-// reseed; each write is a locked, fsynced rewrite of the whole file.
-const readStateForWrite = (filePath: string, maxBytes: number): MeshStateFile => {
-  try {
-    return readState(filePath, maxBytes, false);
-  } catch (error) {
-    let size: number;
-    try {
-      size = fs.statSync(filePath).size;
-    } catch {
-      throw error;
-    }
-    if (size > maxBytes) throw error;                          // oversized is not damage
-    if (quarantineDamagedFile(filePath) === undefined) throw error;
-    const reseeded: MeshStateFile = { ...emptyState(), highWater: Date.now() };
-    // Persist the floor at once: a write that fails after this point (a CAS conflict)
-    // must not leave a missing file that the next writer would read as clock 0.
-    atomicWrite(filePath, reseeded, maxBytes);
-    return reseeded;
   }
 };
 
@@ -668,7 +640,7 @@ export class MeshStore {
     this.#validateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
     return this.#withLock(() => {
-      const state = readStateForWrite(this.#statePath, this.#maxStateBytes);
+      const state = readState(this.#statePath, this.#maxStateBytes, false);
       const slot = stateSlot(state, request.key);
       const plan = request.transition(slot.present, slot.version, slot.highWater);
       if (plan.kind !== "put") throw new Error("Invalid verified storage put plan");
@@ -703,7 +675,7 @@ export class MeshStore {
     this.#validateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
     return this.#withLock(() => {
-      const state = readStateForWrite(this.#statePath, this.#maxStateBytes);
+      const state = readState(this.#statePath, this.#maxStateBytes, false);
       const slot = stateSlot(state, request.key);
       const plan = request.transition(slot.present, slot.version, slot.highWater);
       if (plan.kind === "unchanged") {
@@ -747,8 +719,9 @@ export class MeshStore {
     if (input.ops.length === 0) return [];
     return this.#withLock(() => {
       // Each operation takes the same verified transition as put()/delete(), so a batch
-      // advances the persistent clock exactly as the single writes would.
-      const state = readStateForWrite(this.#statePath, this.#maxStateBytes);
+      // advances the persistent clock exactly as the single writes would, and damaged
+      // state is the same write barrier.
+      const state = readState(this.#statePath, this.#maxStateBytes, false);
       state.versions ??= {};
       const tombstones = new Set(state.tombstoneOrder ?? []);
       const results: MeshBatchResult[] = [];

@@ -118,9 +118,7 @@ describe("MeshStore", () => {
     expect(fs.readFileSync(statePath, "utf8")).toBe("");
   });
 
-  // Fork patch (pi-fabric#27 F2): unreadable state is kept aside on the next write, not a
-  // permanent write barrier; the clock restarts above every earlier revision.
-  it("serves an empty table for unreadable state, then keeps its bytes aside on the next write", async () => {
+  it("keeps unreadable state as a write barrier while serving an empty table", async () => {
     const store = createStore();
     const statePath = path.join(store.root, "state.json");
     fs.mkdirSync(store.root, { recursive: true });
@@ -129,12 +127,8 @@ describe("MeshStore", () => {
     expect(store.listAll()).toEqual([]);
     expect(store.get("shared/value")).toBeUndefined();
     expect(fs.readFileSync(statePath, "utf8")).toBe("{");
-    const floor = Date.now();
-    const written = await store.put({ key: "shared/value", value: { revision: 1 }, identity });
-    expect(written.version).toBeGreaterThan(floor);
-    const aside = fs.readdirSync(store.root).filter((name) => name.startsWith("state.json.damaged."));
-    expect(aside).toHaveLength(1);
-    expect(fs.readFileSync(path.join(store.root, aside[0]!), "utf8")).toBe("{");
+    await expect(store.put({ key: "shared/value", value: { revision: 1 }, identity })).rejects.toThrow("invalid state format");
+    expect(fs.readFileSync(statePath, "utf8")).toBe("{");
   });
 
   it("supports complete internal prefix scans independently of public read limits", async () => {

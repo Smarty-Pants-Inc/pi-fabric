@@ -58,12 +58,34 @@ export const markRunRootClosed = (root: string, now = Date.now(), childrenStoppe
   const existing = readJson<RunRootOwner>(ownerPath(root));
   writeOwner(root, { pid: process.pid, startedAt: validOwner(existing) ? existing.startedAt : now, heartbeatAt: now, closedAt: now, childrenStopped });
 };
+/**
+ * A run whose worker may still be running (lost contact, or an unconfirmed launch) keeps
+ * this file in its run directory. Every cleanup path refuses such a run, across restarts.
+ */
+export const UNRESOLVED_WORKER_FILE = "unresolved-worker.json";
+/** True when this run, or any nested child run below it, is marked. */
+export const hasUnresolvedWorker = (runDirectory: string, depth = 0): boolean => {
+  if (fs.existsSync(path.join(runDirectory, UNRESOLVED_WORKER_FILE))) return true;
+  if (depth >= 32) return false;
+  const nested = path.join(runDirectory, "nested");
+  try {
+    return fs.readdirSync(nested, { withFileTypes: true })
+      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(nested, entry.name), depth + 1));
+  } catch {
+    return false;
+  }
+};
+export const markUnresolvedWorker = (runDirectory: string, reason: string, details: Record<string, unknown> = {}): void => {
+  fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
+  writeJsonAtomic(path.join(runDirectory, UNRESOLVED_WORKER_FILE), { reason, markedAt: Date.now(), ...details });
+};
 const recordAgeReference = (record: RunRecordSummary, fallback: number): number =>
   time(record.finishedAt) ? record.finishedAt : time(record.updatedAt) ? record.updatedAt : fallback;
 const runFiles = new Set(["task.txt", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json"]);
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0): boolean => {
   if (depth > 32 || !ownedStat(root)?.isDirectory()) return false;
+  if (hasUnresolvedWorker(root)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;

@@ -254,6 +254,8 @@ export interface AgentTransportLaunch {
   cwd: string;
   workerPath: string;
   workerArguments: string[];
+  /** Aborted when the agent manager closes; a transport may stop waiting to launch. */
+  signal?: AbortSignal;
 }
 
 export interface AgentTransportHandle {
@@ -261,6 +263,17 @@ export interface AgentTransportHandle {
   sessionId?: string;
   attachCommand?: string;
   livenessPollIntervalMs?: number;
+  /**
+   * False when a lost worker must never be launched again automatically: the transport
+   * cannot prove the previous one is gone (Herdr, smarty-dev#266). Default true.
+   */
+  relaunchable?: boolean;
+  /**
+   * Why liveness gave up without proof that the worker exited (a Herdr server that stayed
+   * unreachable). The run then fails as "lost track of the worker", and Fabric neither
+   * relaunches it nor deletes its files. Undefined while contact holds or after a proven exit.
+   */
+  lostContact?(): string | undefined;
   isAlive(): Promise<boolean>;
   stop(): Promise<void>;
 }

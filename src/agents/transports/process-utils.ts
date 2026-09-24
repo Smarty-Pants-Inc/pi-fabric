@@ -234,16 +234,28 @@ export const spawnDetached = async (
   });
   if (!child.pid) throw new Error("Failed to launch Fabric worker process");
   const pid = child.pid;
+  // Once the worker exited, its numeric id is no identity: after its group empties, the id
+  // can name an unrelated process (group). So nothing is signalled or probed by number then.
+  // ponytail: descendants an exited worker left in its group are not signalled; liveness
+  // (and so relaunch) is about the worker itself.
+  let exited = false;
+  child.once("exit", () => { exited = true; });
   child.unref();
   return {
     pid,
     async stop() {
+      if (exited) return;
       try {
         process.kill(process.platform === "win32" ? pid : -pid, "SIGTERM");
       } catch { /* process group already exited */ }
     },
     async isAlive() {
-      return processIsAlive(pid);
+      if (exited) return false;
+      if (processIsAlive(pid)) return true;
+      // Gone once is gone for good: the probe can see the exit before the "exit" event
+      // (Windows), and any later answer for this number is another process.
+      exited = true;
+      return false;
     },
   };
 };

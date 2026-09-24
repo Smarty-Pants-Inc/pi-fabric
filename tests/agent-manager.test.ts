@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,11 +11,13 @@ import {
   effectiveAgentTimeoutMs,
   AgentManager,
 } from "../src/agents/manager.js";
+import { markUnresolvedWorker } from "../src/storage/retention.js";
 import {
   clearOwnedBudgetEnv,
   readBudgetLedgerDetailed,
 } from "../src/agents/budget-ledger.js";
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -441,6 +444,266 @@ describe("AgentManager", () => {
   },
   30_000);
 
+  // smarty-dev#347: a dropped transport call made a live worker look dead; the relaunch
+  // then ran the same task in a second worker while the first kept going.
+  it("stops the previous worker before relaunching one whose liveness was misjudged", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const events: string[] = [];
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      const index = ++launches;
+      events.push(`launch:${index}`);
+      if (index > 1) return handle;
+      let stopped = false;
+      return {
+        ...handle,
+        // The first worker is alive, but its liveness check is "dropped" until it is stopped.
+        isAlive: async () => (stopped ? handle.isAlive() : false),
+        stop: async () => { events.push("stop:1"); stopped = true; await handle.stop(); },
+      };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      await expect.poll(() => launches, { timeout: 15_000, interval: 50 }).toBe(2);
+
+      expect(events.slice(0, 3)).toEqual(["launch:1", "stop:1", "launch:2"]);
+      const relaunches = fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      expect(relaunches).toEqual([expect.objectContaining({ kind: "startup-retry", previousError: expect.stringContaining("exited without a result") })]);
+      await manager.stop(handle.id);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 30_000);
+
+  // smarty-dev#266 (Herdr): a transport that cannot prove a lost worker is gone never relaunches it.
+  it("fails a lost run instead of relaunching it when its transport is not relaunchable", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launches++;
+      handles.push(handle);
+      // The worker looks lost at once, as a Herdr pane whose server stayed unreachable.
+      return { ...handle, relaunchable: false, isAlive: async () => false };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      expect(launches).toBe(1);
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("Agent transport exited without a result");
+      expect(fs.existsSync(path.join(manager.runDirectory(result.id)!, "relaunches.jsonl"))).toBe(false);
+    } finally {
+      spy.mockRestore();
+      for (const handle of handles) await handle.stop();
+    }
+  }, 30_000);
+
+  // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
+  // neither cleanup nor shutdown deletes files that the still-running worker may use.
+  it("fails a run whose transport lost contact as lost, and keeps its worker's files", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launches++;
+      handles.push(handle);
+      // As a Herdr handle past its bound: the worker keeps running, contact is lost.
+      return { ...handle, relaunchable: false, isAlive: async () => false, lostContact: () => "the Herdr server has been unreachable for 300 s" };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      expect(launches).toBe(1);
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      expect(result.error).not.toContain("exited without a result");
+      const runDirectory = manager.runDirectory(result.id)!;
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
+      expect(fs.existsSync(runDirectory)).toBe(true);
+      expect(await handles[0]!.isAlive()).toBe(true);           // the real worker still runs
+      await manager.close();
+      expect(fs.existsSync(runDirectory)).toBe(true);           // shutdown kept its files
+    } finally {
+      spy.mockRestore();
+      for (const handle of handles) await handle.stop();
+    }
+  }, 30_000);
+
+  // review/astra on 3257dba, D1: every settlement path keeps a possibly live worker's evidence.
+  const lostOnStop = (launched: Array<{ stop(): Promise<void> }>) => {
+    const launch = ProcessTransport.prototype.launch;
+    return vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launched.push(handle);
+      // As a Herdr handle whose server is gone: stop cannot reach the worker, which keeps running.
+      let stopped = false;
+      return {
+        ...handle,
+        relaunchable: false,
+        isAlive: async () => !stopped,
+        stop: async () => { stopped = true; },
+        lostContact: () => (stopped ? "the Herdr server has been unreachable for 300 s" : undefined),
+      };
+    });
+  };
+
+  it.each(["stop", "deadline"] as const)("marks a run whose worker was lost on the %s path, and refuses its cleanup", async (path_) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launched: Array<{ stop(): Promise<void> }> = [];
+    const spy = lostOnStop(launched);
+    try {
+      // A request can only extend the configured timeout, so the deadline case configures it.
+      const manager = new AgentManager(process.cwd(), {
+        ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, ...(path_ === "deadline" ? { timeoutMs: 1_500 } : {}),
+      }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      const result = path_ === "stop" ? await manager.stop(handle.id) : await manager.wait(handle.id);
+      expect(result.status).toBe(path_ === "stop" ? "stopped" : "timed_out");
+      const runDirectory = manager.runDirectory(handle.id)!;
+      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
+        .toMatch(/Herdr server has been unreachable/);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+      await manager.close();
+      expect(fs.existsSync(runDirectory)).toBe(true);
+    } finally {
+      spy.mockRestore();
+      for (const handle of launched) await handle.stop();
+    }
+  }, 30_000);
+
+  // review/astra on 3257dba, D3: an unconfirmed launch keeps its worktree and run files.
+  it("keeps the worktree and run files of a launch whose outcome is unknown", async () => {
+    const repository = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-unknown-launch-repo-"));
+    roots.push(repository);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: repository, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    git("init", "-q");
+    git("config", "user.email", "pi-fabric-tests@example.invalid");
+    git("config", "user.name", "Pi Fabric tests");
+    fs.writeFileSync(path.join(repository, "README.md"), "test\n");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    const launched: Array<{ stop(): Promise<void> }> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      launched.push(await launch.call(this, request));       // the worker starts ...
+      // ... but the reply is lost, as a dropped Herdr layout.apply reply.
+      throw Object.assign(new Error("Herdr did not confirm the launch"), { launchOutcome: "unknown" });
+    });
+    let worktree: string | undefined;
+    try {
+      const manager = new AgentManager(repository, DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      await expect(manager.spawn({ task: "HANG until stopped", transport: "process", worktree: true })).rejects.toThrow("did not confirm");
+      const marked = fs.readdirSync(root).map((name) => path.join(root, name, "unresolved-worker.json")).filter((file) => fs.existsSync(file));
+      expect(marked).toHaveLength(1);
+      worktree = JSON.parse(fs.readFileSync(marked[0]!, "utf8")).worktree as string;
+      expect(fs.existsSync(worktree)).toBe(true);
+      expect(git("worktree", "list", "--porcelain")).toContain("branch refs/heads/");
+      await manager.close();
+      expect(fs.existsSync(path.dirname(marked[0]!))).toBe(true);
+      expect(fs.existsSync(worktree)).toBe(true);
+    } finally {
+      spy.mockRestore();
+      for (const handle of launched) await handle.stop();
+      if (worktree) execFileSync("git", ["worktree", "remove", "--force", worktree], { cwd: repository, stdio: "ignore" });
+    }
+  }, 30_000);
+
+  // dev-lead review F2: a stop that does not take effect must never lead to a second worker.
+  it("fails the run instead of relaunching while the previous worker is still alive after its stop", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    let first: Awaited<ReturnType<typeof launch>> | undefined;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      if (++launches > 1) return handle;
+      first = handle;
+      let stopRequested = false;
+      return {
+        ...handle,
+        // Misjudged as dead until a stop is requested; the stop is then lost, so it stays alive.
+        isAlive: async () => (stopRequested ? handle.isAlive() : false),
+        stop: async () => { stopRequested = true; },
+      };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      const result = await manager.wait(handle.id);
+      expect(launches).toBe(1);
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("did not stop, so it was not relaunched");
+      const relaunches = fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      expect(relaunches).toEqual([expect.objectContaining({ kind: "relaunch-failed" })]);
+      // review/astra on e170d9e: the worker that did not stop may still use its files.
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+      expect(fs.existsSync(manager.runDirectory(handle.id)!)).toBe(true);
+    } finally {
+      spy.mockRestore();
+      await first?.stop();
+    }
+  }, 45_000);
+
+  // review/astra on e170d9e: a marked nested child keeps its completed parent's files too.
+  it("keeps a completed parent run whose nested child is marked unresolved", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const runRoot = path.join(root, "runs");                   // a custom (not managed temp) root
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot,
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "complete quickly", transport: "process" });
+    expect(result.status).toBe("completed");
+    const runDirectory = manager.runDirectory(result.id)!;
+    markUnresolvedWorker(path.join(runDirectory, "nested", "child"), "the Herdr server has been unreachable for 300 s");
+    await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
+    await manager.close();
+    expect(fs.existsSync(path.join(runDirectory, "nested", "child"))).toBe(true);
+  }, 30_000);
+
   it("gives up retrying a child whose transport always exits before producing a result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -486,6 +749,33 @@ describe("AgentManager", () => {
     expect(fs.readFileSync(path.join(runDirectory, "resume-attempts"), "utf8")).toBe("2");
   },
   30_000);
+
+  // review/astra on #26: a failed relaunch is terminal. No fallback launch runs after it, so
+  // the saved failure can never mask a later result.
+  it("makes a failed resume relaunch terminal, with no fallback launch", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      launches++;
+      if (launches === 2) throw new Error("transient launch failure");
+      return launch.call(this, request);
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "RESUME_AFTER_CRASH", transport: "process" });
+      expect(launches).toBe(2);
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("relaunch failed: transient launch failure");
+    } finally {
+      spy.mockRestore();
+    }
+  }, 45_000);
 
   it("resumes a run whose transport died after doing work", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));

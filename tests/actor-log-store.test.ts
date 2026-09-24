@@ -76,10 +76,10 @@ describe("ActorLogStore", () => {
     expect(store.retainedRunIds(actor)).toEqual([]);
     const source = path.join(root, "source");
     fs.mkdirSync(path.join(source, "nested"), { recursive: true });
-    for (const file of ["events.jsonl", "status.json", "task.txt", "private.txt", "nested/child"]) fs.writeFileSync(path.join(source, file), file);
+    for (const file of ["events.jsonl", "status.json", "task.txt", "relaunches.jsonl", "private.txt", "nested/child"]) fs.writeFileSync(path.join(source, file), file);
     await store.retainRun(actor, "latest", source);
     const dest = path.join(root, "actor", "runs", "latest");
-    expect(fs.readdirSync(dest).sort()).toEqual(["events.jsonl", "nested", "status.json", "task.txt"]);
+    expect(fs.readdirSync(dest).sort()).toEqual(["events.jsonl", "nested", "relaunches.jsonl", "status.json", "task.txt"]);
     expect(fs.readFileSync(path.join(dest, "nested", "child"), "utf8")).toBe("nested/child");
     vi.spyOn(fs, "cpSync").mockImplementation(() => { throw new Error("nested unavailable"); });
     await expect(store.retainRun(actor, "other", source)).resolves.toBeUndefined();

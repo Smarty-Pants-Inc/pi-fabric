@@ -214,8 +214,8 @@ describe("awaitPeerSettle during a mesh write stall", () => {
       .then((settled) => { result = settled; });
     await sleep(40);
     expect(result).toBeUndefined();                            // empty, but not confirmed
-    live = [peer("session:late", { status: "running" })];      // the arming snapshot missed it
-    await sleep(20);
+    // The arming snapshot missed it; it shows up in the same poll as the confirming commit.
+    live = [peer("session:late", { status: "running" })];
     confirmed = Date.now();
     await sleep(60);
     expect(result).toBeUndefined();                            // now watched, and still running

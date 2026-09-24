@@ -137,6 +137,8 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 		});
 	};
 	for (const peer of targets) watch(peer, armedAt);
+	// True once a snapshot taken after a confirming commit has joined the watch.
+	let complete = false;
 
 	return new Promise<PeerSettleResult>((resolve) => {
 		let timer: ReturnType<typeof setInterval> | undefined;
@@ -167,13 +169,14 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 			const snapshot = options.poll();
 			const byId = new Map(snapshot.map((peer) => [peer.id, peer] as const));
 			const current = now();
-			if (!confirmed) {
-				// Peers the arming snapshot missed, seen before the first confirming commit.
+			if (!complete) {
+				// Peers the arming snapshot missed, up to and including the first confirmed snapshot.
 				for (const peer of snapshot) {
 					if (watched.has(peer.id)) continue;
 					if (options.selector !== undefined && !matchesSelector(peer, options.selector)) continue;
 					watch(peer, current);
 				}
+				complete = confirmed;
 			}
 			for (const entry of watched.values()) {
 				if (entry.settled) continue;
@@ -199,7 +202,7 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 			const waiting = [...watched.values()]
 				.filter((entry) => !entry.settled)
 				.map((entry) => ({ label: entry.label, status: entry.running ? "running" : "idle" }) as const);
-			if (waiting.length === 0 && confirmed) {
+			if (waiting.length === 0 && complete) {
 				options.onUpdate?.({ waiting });
 				finish({ ok: true });
 				return;

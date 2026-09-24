@@ -1445,6 +1445,29 @@ export class AgentManager {
           JSON.stringify(resume.carryOver),
         );
       }
+      // Never run two workers for one run (smarty-dev#347): stop the previous
+      // transport and wait for it to exit before starting the next. After a real
+      // exit this is a no-op; if liveness was misjudged (a dropped transport call),
+      // it ends the old worker instead of racing it on the same task.
+      const previousSession = managed.transport.sessionId;
+      await managed.transport.stop().catch(() => undefined);
+      await this.#waitForTransportExit(managed);
+      if (managed.settled || this.#closing || managed.stopRequested) return false;
+      // Keep an append-only record of every relaunch; the status and lifecycle
+      // files below are replaced by the new attempt.
+      fs.appendFileSync(
+        path.join(managed.runDirectory, "relaunches.jsonl"),
+        `${JSON.stringify({
+          at: Date.now(),
+          kind: resume ? "resume" : "startup-retry",
+          startupAttempts: managed.startupAttempts,
+          resumeAttempts: managed.resumeAttempts,
+          previousStatus: record.status,
+          ...(record.error ? { previousError: record.error.slice(0, 500) } : {}),
+          ...(previousSession ? { previousTransportSession: previousSession } : {}),
+        })}\n`,
+        { encoding: "utf8", mode: 0o600 },
+      );
       // The relaunched child owns a fresh status/lifecycle pair, so drain what
       // the previous attempt published (token usage above all) before discarding
       // the journal it landed in.

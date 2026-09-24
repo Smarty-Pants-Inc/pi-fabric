@@ -15,6 +15,7 @@ import {
   readBudgetLedgerDetailed,
 } from "../src/agents/budget-ledger.js";
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -440,6 +441,46 @@ describe("AgentManager", () => {
     ).toBe("2");
   },
   30_000);
+
+  // smarty-dev#347: a dropped transport call made a live worker look dead; the relaunch
+  // then ran the same task in a second worker while the first kept going.
+  it("stops the previous worker before relaunching one whose liveness was misjudged", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const events: string[] = [];
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      const index = ++launches;
+      events.push(`launch:${index}`);
+      if (index > 1) return handle;
+      let stopped = false;
+      return {
+        ...handle,
+        // The first worker is alive, but its liveness check is "dropped" until it is stopped.
+        isAlive: async () => (stopped ? handle.isAlive() : false),
+        stop: async () => { events.push("stop:1"); stopped = true; await handle.stop(); },
+      };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      await expect.poll(() => launches, { timeout: 15_000, interval: 50 }).toBe(2);
+
+      expect(events.slice(0, 3)).toEqual(["launch:1", "stop:1", "launch:2"]);
+      const relaunches = fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      expect(relaunches).toEqual([expect.objectContaining({ kind: "startup-retry", previousError: expect.stringContaining("exited without a result") })]);
+      await manager.stop(handle.id);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 30_000);
 
   it("gives up retrying a child whose transport always exits before producing a result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));

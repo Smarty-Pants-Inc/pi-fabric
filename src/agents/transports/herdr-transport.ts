@@ -35,14 +35,6 @@ interface HerdrPaneResponse extends HerdrErrorResponse {
   };
 }
 
-interface HerdrTabListResponse extends HerdrErrorResponse {
-  result?: { tabs?: Array<{ tab_id?: string; label?: string }> };
-}
-
-interface HerdrPaneListResponse extends HerdrErrorResponse {
-  result?: { panes?: Array<{ pane_id?: string; tab_id?: string }> };
-}
-
 // A Herdr error response is definitive. A socket that is missing or refused means the
 // server is gone and the request was never delivered. Anything else (timeout, close
 // without a reply, reset) is a dropped call whose outcome is unknown: Herdr may have
@@ -60,9 +52,6 @@ const serverGone = (error: unknown): boolean => {
 
 const droppedCall = (error: unknown): boolean => !(error instanceof HerdrApiError) && !serverGone(error);
 
-// After a dropped layout.apply reply, poll this long for the tab Herdr made for the run.
-const RECOVERY_ATTEMPTS = 10;
-const RECOVERY_DELAY_MS = 500;
 // A live handoff removes the API socket while the panes keep running, so a gone server
 // is unknown, not death, until it has been gone this long.
 const SERVER_GONE_LIMIT_MS = 5 * 60_000;
@@ -79,8 +68,7 @@ const responseError = (response: HerdrErrorResponse): Error | undefined => {
   );
 };
 
-// The run id makes a launch's tab its own: a label shared by two runs could adopt, and
-// later close, the other run's worker.
+// The run id tells a person which run a tab belongs to; Fabric never acts on the label.
 const runLabel = (request: AgentTransportLaunch): string => `${request.name} · ${request.id.slice(0, 12)}`;
 
 // Every layout.apply spawns a tab, a pty and a worker in the Herdr server. On dev1 an
@@ -131,6 +119,13 @@ const spawnLedgerFor = (socketPath: string): string => {
 // directory owned by this user and writable by nobody else: a slot must not be
 // forgeable or redirected by another account.
 const privateLedger = (directory: string): string | undefined => {
+  if (process.platform !== "win32") {
+    // The parent is where another account could swap the ledger for its own directory.
+    const parent = fs.lstatSync(path.dirname(directory));
+    if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o022) !== 0) {
+      return "its parent directory is not private to this user";
+    }
+  }
   try {
     fs.mkdirSync(directory, { mode: 0o700, recursive: process.platform === "win32" });
   } catch (error) {
@@ -197,18 +192,18 @@ export class HerdrTransport implements AgentTransportAdapter {
     if (!workspaceId) throw new Error("Herdr transport requires HERDR_WORKSPACE_ID");
     await this.#claimSpawnSlot(request.signal);
     const label = runLabel(request);
-    // An earlier attempt of this run may have left a pane: one whose dropped layout.apply
-    // was created after its recovery window. It must not run beside the new worker.
-    await this.#closeRunTabs(workspaceId, label);
-    let paneId: string | undefined;
+    let paneId: string;
     try {
       paneId = await this.#applyLayout(workspaceId, request, label);
     } catch (error) {
       if (!droppedCall(error)) throw error;
-      // layout.apply is not idempotent: adopt the pane Herdr made for this run instead of
-      // launching a second worker.
-      paneId = await this.#adoptLaunchedPane(workspaceId, label);
-      if (!paneId) throw error;
+      // Fail closed: layout.apply is not idempotent and a dropped reply leaves its outcome
+      // unknown, so Fabric neither adopts a pane nor launches again (smarty-dev#347).
+      // ponytail: a pane Herdr created anyway runs unowned; the label names it for cleanup.
+      throw new Error(
+        `Herdr did not confirm the launch (${(error as Error).message}); a worker may still start in tab "${label}". ` +
+        "Fabric does not retry an unconfirmed Herdr launch.",
+      );
     }
 
     let terminalId: string | undefined;
@@ -229,6 +224,9 @@ export class HerdrTransport implements AgentTransportAdapter {
       kind: this.kind,
       livenessPollIntervalMs: EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS,
       sessionId: livePane,
+      // Herdr cannot prove a lost pane's worker is gone (a live handoff keeps it running),
+      // so a lost run is never relaunched beside it.
+      relaunchable: false,
       ...(terminalId ? { attachCommand: `herdr terminal attach ${terminalId}` } : {}),
       isAlive: async () => {
         try {
@@ -236,10 +234,10 @@ export class HerdrTransport implements AgentTransportAdapter {
           serverGoneSince = undefined;
           return true;
         } catch (error) {
-          // Only a reachable server's pane_not_found ends the run. A dropped call is
-          // re-polled, and a gone server (a live handoff keeps the panes running) is
-          // death only after SERVER_GONE_LIMIT_MS, so a live worker is never relaunched
-          // beside itself. ponytail: a Herdr API that stays hung keeps the run alive
+          // Only a reachable server's pane_not_found ends the run at once. A dropped call is
+          // re-polled, and a gone server (a live handoff keeps the panes running) ends it
+          // only after SERVER_GONE_LIMIT_MS; the run then fails, because Herdr handles are
+          // never relaunched. ponytail: a Herdr API that stays hung keeps the run alive
           // until its deadline.
           if (error instanceof HerdrApiError && error.herdrCode === "pane_not_found") return false;
           if (!serverGone(error)) return true;
@@ -330,52 +328,6 @@ export class HerdrTransport implements AgentTransportAdapter {
       const untilNextMinute = Math.min(60_000, Math.max(0, (minute + 1) * 60_000 - now()));
       await sleep(untilNextMinute + Math.floor(Math.random() * SPAWN_JITTER_MS), signal);
     }
-  }
-
-  async #tabs(workspaceId: string): Promise<Array<{ tab_id?: string; label?: string }>> {
-    const response = (await this.#request({
-      method: "tab.list",
-      params: { workspace_id: workspaceId },
-    })) as HerdrTabListResponse;
-    return response.result?.tabs ?? [];
-  }
-
-  // Closes any tab this run left from an earlier attempt. Best effort: a failed listing
-  // leaves nothing known to close.
-  async #closeRunTabs(workspaceId: string, label: string): Promise<void> {
-    let tabs: Array<{ tab_id?: string; label?: string }>;
-    try {
-      tabs = await this.#tabs(workspaceId);
-    } catch {
-      return;
-    }
-    for (const tab of tabs) {
-      if (tab.label !== label || !tab.tab_id) continue;
-      await this.#request({ method: "tab.close", params: { tab_id: tab.tab_id } }).catch(() => undefined);
-    }
-  }
-
-  // Finds the one tab labelled with this run's id and returns its pane. Returns undefined
-  // when there is none within the recovery window, or it is ambiguous, so the caller fails
-  // instead of guessing or launching again.
-  async #adoptLaunchedPane(workspaceId: string, label: string): Promise<string | undefined> {
-    for (let attempt = 0; attempt < RECOVERY_ATTEMPTS; attempt++) {
-      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, RECOVERY_DELAY_MS));
-      try {
-        const created = (await this.#tabs(workspaceId)).filter((tab) => tab.label === label);
-        if (created.length > 1) return undefined;
-        if (created.length === 0) continue;
-        const panes = (await this.#request({
-          method: "pane.list",
-          params: { workspace_id: workspaceId },
-        })) as HerdrPaneListResponse;
-        const pane = (panes.result?.panes ?? []).filter((item) => item.tab_id === created[0]!.tab_id);
-        return pane.length === 1 ? pane[0]!.pane_id : undefined;
-      } catch {
-        // Keep trying within the bounded recovery window.
-      }
-    }
-    return undefined;
   }
 
   #request(request: { method: string; params: Record<string, unknown> }): Promise<unknown> {

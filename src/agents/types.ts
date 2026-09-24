@@ -263,6 +263,11 @@ export interface AgentTransportHandle {
   sessionId?: string;
   attachCommand?: string;
   livenessPollIntervalMs?: number;
+  /**
+   * False when a lost worker must never be launched again automatically: the transport
+   * cannot prove the previous one is gone (Herdr, smarty-dev#266). Default true.
+   */
+  relaunchable?: boolean;
   isAlive(): Promise<boolean>;
   stop(): Promise<void>;
 }

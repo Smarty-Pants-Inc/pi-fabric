@@ -185,29 +185,27 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
         ],
       },
     });
+    expect(handle.relaunchable).toBe(false);
     await expect(handle.isAlive()).resolves.toBe(true);
     await handle.stop();
     await expect(handle.isAlive()).resolves.toBe(false);
   });
 
   // smarty-dev#347: a dropped Herdr call must never respawn or duplicate a live worker.
-  it("adopts the pane when the layout.apply reply is dropped after Herdr created it", async () => {
-    const { socketPath, requests } = await startServer({ drop: "apply-after-create" });
-    const handle = await herdr(socketPath).launch(launchRequest);
-    expect(handle.sessionId).toBe("w1:p2");
-    expect(requests.filter((request) => request.method === "layout.apply")).toHaveLength(1);
-  });
-
-  it("fails without a second launch when the dropped layout.apply created nothing", async () => {
-    const { socketPath, requests } = await startServer({ drop: "apply-before-create" });
-    await expect(herdr(socketPath).launch(launchRequest)).rejects.toThrow("closed without a response");
-    expect(requests.filter((request) => request.method === "layout.apply")).toHaveLength(1);
+  it("fails closed, without adopting or launching again, when a layout.apply reply is dropped", async () => {
+    for (const drop of ["apply-after-create", "apply-before-create"] as const) {
+      const { socketPath, requests } = await startServer({ drop });
+      await expect(herdr(socketPath).launch(launchRequest)).rejects.toThrow(
+        'a worker may still start in tab "review worker · run-1". Fabric does not retry an unconfirmed Herdr launch',
+      );
+      expect(requests.map((request) => request.method)).toEqual(["layout.apply"]);   // no listing, adoption or retry
+    }
   });
 
   it("does not try to recover from a definitive Herdr error", async () => {
     const { socketPath, requests } = await startServer({ drop: "apply-error" });
     await expect(herdr(socketPath).launch(launchRequest)).rejects.toThrow("invalid_layout");
-    expect(requests.filter((request) => request.method === "tab.list")).toHaveLength(1); // only the pre-launch snapshot
+    expect(requests.map((request) => request.method)).toEqual(["layout.apply"]);
   });
 
   it("keeps a worker alive when a liveness call is dropped, and ends it only when Herdr says so", async () => {
@@ -236,23 +234,6 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
   });
 
   // dev-lead review F3/F5: adoption and cleanup match this run's id, never a shared name.
-  it("closes a tab left by an earlier attempt of the same run before it launches", async () => {
-    const { socketPath, requests } = await startServer({ tabs: [{ tab_id: "w1:t9", label: "review worker · run-1" }] });
-    await herdr(socketPath).launch(launchRequest);
-    const methods = requests.map((request) => request.method);
-    expect(methods.indexOf("tab.close")).toBeLessThan(methods.indexOf("layout.apply"));
-    expect(requests.find((request) => request.method === "tab.close")?.params).toEqual({ tab_id: "w1:t9" });
-  });
-
-  it("never adopts or closes another run's tab that shares the task name", async () => {
-    // Another run's tab, labelled by this build and by an older one (the bare task name).
-    const others = [{ tab_id: "w1:t8", label: "review worker · run-2" }, { tab_id: "w1:t9", label: "review worker" }];
-    const { socketPath, requests } = await startServer({ drop: "apply-before-create", tabs: others });
-    await expect(herdr(socketPath).launch(launchRequest)).rejects.toThrow("closed without a response");
-    expect(requests.filter((request) => request.method === "tab.close")).toEqual([]);
-    expect(requests.filter((request) => request.method === "layout.apply")).toHaveLength(1);
-  }, 15_000);
-
   // smarty-dev#266: 2,264 layout.apply calls from fleet actors froze dev1's Herdr.
   describe("layout.apply budget", () => {
     const applies = (requests: Array<{ method: string }>) =>
@@ -369,6 +350,16 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
       await new HerdrTransport(env(socketPath)).launch(launchRequest);
       expect(applies(requests)).toBe(1);
       expect(fs.readdirSync(shared)).toEqual([]);
+    });
+
+    it.skipIf(process.platform === "win32")("does not use a ledger whose parent directory others can write", async () => {
+      const { socketPath, requests } = await startServer();
+      const shared = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-herdr-shared-"));
+      roots.push(shared);
+      fs.chmodSync(shared, 0o777);
+      await herdr(socketPath, { spawnLedgerDir: path.join(shared, "spawns") }).launch(launchRequest);
+      expect(applies(requests)).toBe(1);
+      expect(fs.existsSync(path.join(shared, "spawns"))).toBe(false);
     });
 
     it("ends a real wait at once when the signal aborts", async () => {

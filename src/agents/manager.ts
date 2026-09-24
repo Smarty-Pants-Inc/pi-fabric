@@ -1348,6 +1348,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.transport.relaunchable === false ||
       managed.startupAttempts >= AGENT_STARTUP_MAX_ATTEMPTS ||
       managed.settled ||
       this.#closing ||
@@ -1390,6 +1391,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.transport.relaunchable === false ||
       managed.settled ||
       this.#closing ||
       managed.stopRequested ||

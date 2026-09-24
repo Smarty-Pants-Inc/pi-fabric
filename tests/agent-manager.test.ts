@@ -482,6 +482,37 @@ describe("AgentManager", () => {
     }
   }, 30_000);
 
+  // smarty-dev#266 (Herdr): a transport that cannot prove a lost worker is gone never relaunches it.
+  it("fails a lost run instead of relaunching it when its transport is not relaunchable", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const launch = ProcessTransport.prototype.launch;
+    let launches = 0;
+    const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request);
+      launches++;
+      handles.push(handle);
+      // The worker looks lost at once, as a Herdr pane whose server stayed unreachable.
+      return { ...handle, relaunchable: false, isAlive: async () => false };
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      expect(launches).toBe(1);
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("Agent transport exited without a result");
+      expect(fs.existsSync(path.join(manager.runDirectory(result.id)!, "relaunches.jsonl"))).toBe(false);
+    } finally {
+      spy.mockRestore();
+      for (const handle of handles) await handle.stop();
+    }
+  }, 30_000);
+
   // dev-lead review F2: a stop that does not take effect must never lead to a second worker.
   it("fails the run instead of relaunching while the previous worker is still alive after its stop", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));

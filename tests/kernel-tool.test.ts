@@ -7,10 +7,14 @@ import { prepareFabricExecArguments } from "../src/fabric-exec-arguments.js";
 import { defaultFabricExecutionGuidance, fabricExecutionKernelGuidance } from "../src/core/system-guidance.js";
 import { defaultCodePreviewSettings } from "../src/ui/code-preview.js";
 
-const toolFor = (kernel: "typescript" | "python", pythonRuntime: "cpython" | "monty" = "cpython") => {
+const toolFor = (kernel: "typescript" | "python", pythonRuntime: "cpython" | "monty" = "cpython", mode: { fullCodeMode?: boolean; schema?: "off" | "enforce" } = {}) => {
   const state = {
     bootstrapped: true,
-    config: normalizeFabricConfig({ executor: { kernel, pythonRuntime }, ui: { toolDisplay: "full" } }),
+    config: normalizeFabricConfig({
+      executor: { kernel, pythonRuntime }, ui: { toolDisplay: "full" },
+      ...(mode.fullCodeMode !== undefined ? { fullCodeMode: mode.fullCodeMode } : {}),
+      ...(mode.schema ? { schema: { mode: mode.schema } } : {}),
+    }),
   } as FabricState;
   return createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), (tool) => tool);
 };
@@ -32,6 +36,18 @@ describe("exclusive kernel tool surface", () => {
     expect(python.parameters.properties).not.toHaveProperty("tokenBudget");
     expect(ts.parameters.properties).toHaveProperty("tokenBudget");
     expect(python.parameters.required).toEqual(["code"]);
+  });
+
+  // smarty-dev#459: orchestration-only programs have no `pi` or `extensions`; guidance that
+  // advertised them caused 49 "Cannot find name 'pi'" failures in the fleet.
+  it.each(["typescript", "python"] as const)("advertises pi.* only where %s programs have it", (kernel) => {
+    const orchestration = toolFor(kernel, "cpython", { fullCodeMode: false }).promptGuidelines!.join("\n");
+    expect(orchestration).not.toMatch(/\bpi\.[a-z]/);
+    expect(orchestration).not.toMatch(/\bextensions\.[a-z]/);
+    expect(orchestration).toContain("`pi` and `extensions` do not exist inside `fabric_exec`");
+    expect(toolFor(kernel, "cpython", { fullCodeMode: true }).promptGuidelines!.join("\n")).toContain("pi.edit");
+    // Schema enforce routes every tool through fabric_exec, so pi.* is available there too.
+    expect(toolFor(kernel, "cpython", { fullCodeMode: false, schema: "enforce" }).promptGuidelines!.join("\n")).toContain("pi.edit");
   });
 
   it("describes Monty's subset without advertising native Python", () => {

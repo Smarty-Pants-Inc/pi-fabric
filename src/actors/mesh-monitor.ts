@@ -114,7 +114,8 @@ export class ActorMeshMonitor {
         if (this.callbacks.onEvent(event) === false && catchingUp) {
           // A full actor queue rejected this event while catching up (smarty-dev#472): keep
           // the cursor on it and offer it again later; earlier events are already delivered.
-          this.#offset = index === 0 ? start : this.mesh.tail(start, index).nextOffset;
+          // The boundary comes from this same read, so a compaction since cannot move it.
+          this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
           this.#writeCursor();
           return;
         }

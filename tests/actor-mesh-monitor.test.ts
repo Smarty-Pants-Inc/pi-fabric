@@ -106,7 +106,7 @@ describe("ActorMeshMonitor", () => {
     const log = [{ topic: "t", createdAt: 998_000 }, { topic: "t", createdAt: 999_000 }, { topic: "t", createdAt: 999_500 }] as MeshEvent[];
     const mesh = { root, latestOffset: vi.fn(() => 99), tail: vi.fn((offset: number, limit = 7) => {
       const events = log.slice(offset, offset + limit);
-      return { events, nextOffset: offset + events.length };
+      return { events, nextOffset: offset + events.length, cursors: events.map((_, index) => offset + index + 1) };
     }) };
     let full = true;
     // The first event is taken; the second is rejected mid-page while the queue is full.
@@ -159,6 +159,29 @@ describe("ActorMeshMonitor", () => {
     expect(writes.mock.calls.filter(([, target]) => String(target) === cursorPath).length).toBeLessThanOrEqual(1_500 / 100 + 3);
     expect(ticksWhenDone).toBeGreaterThan(0);                                 // timers ran during catch-up
   }, 30_000);
+
+  // review/astra on #45, F3: the retry boundary comes from the same read; a compaction
+  // between reads cannot move the saved cursor past the rejected event.
+  it("keeps the rejected event's position from the page it was read in", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-"));
+    roots.push(root);
+    const cursorPath = path.join(root, "cursor.json");
+    fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, cursor: 0 }));
+    vi.spyOn(fs, "watch").mockReturnValue(Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as FSWatcher);
+    const events = [0, 1, 2].map((index) => ({ topic: "t", createdAt: 999_000 + index })) as MeshEvent[];
+    let reads = 0;
+    const mesh = { root, latestOffset: vi.fn(() => 99), tail: vi.fn(() => reads++ === 0
+      ? { events, nextOffset: 30, cursors: [10, 20, 30] }
+      : { events: [], nextOffset: 999 }) };                // the log was compacted since
+    const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 7 },
+      { cursorPath, maxReplayAgeMs: 60_000, beforePoll: () => true, onEvent: (event) => event !== events[1] });
+    monitors.push(monitor);
+    monitor.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).cursor).toBe(10);   // just past the first event
+    expect(reads).toBe(1);
+  });
 
   it("uses polling when watch creation fails and ignores malformed cursors", async () => {
     const s = setup('{"format":2,"cursor":3}');

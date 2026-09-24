@@ -1,5 +1,8 @@
+import fs from "node:fs";
 import net from "node:net";
-import { randomUUID } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   AgentTransportAdapter,
   AgentTransportHandle,
@@ -72,10 +75,38 @@ const responseError = (response: HerdrErrorResponse): Error | undefined => {
   );
 };
 
+// Every layout.apply spawns a tab, a pty and a worker in the Herdr server. On dev1 an
+// actor fan-out drove 260 of them in five minutes and froze Herdr (smarty-dev#266).
+const SPAWNS_PER_MINUTE = 20;
+const SPAWN_WAIT_LIMIT_MS = 120_000;
+
+export interface HerdrTransportOptions {
+  /** Spawn ledger shared by every Fabric process that launches into one Herdr server. */
+  spawnLedgerDir?: string;
+  spawnsPerMinute?: number;
+  now?: () => number;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+}
+
+const abortableSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, ms);
+    const abort = (): void => { clearTimeout(timer); reject(signal?.reason); };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+
+// Launches in flight in this process, by Herdr server and run id: a repeated launch of
+// the same run joins the pending one instead of applying a second layout.
+const launching = new Map<string, Promise<AgentTransportHandle>>();
+
 export class HerdrTransport implements AgentTransportAdapter {
   readonly kind = "herdr" as const;
 
-  constructor(private readonly environment: NodeJS.ProcessEnv = process.env) {}
+  constructor(
+    private readonly environment: NodeJS.ProcessEnv = process.env,
+    private readonly options: HerdrTransportOptions = {},
+  ) {}
 
   async available(): Promise<boolean> {
     if (
@@ -93,9 +124,21 @@ export class HerdrTransport implements AgentTransportAdapter {
     }
   }
 
-  async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
+  launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
+    const key = `${this.environment.HERDR_SOCKET_PATH ?? ""}\0${request.id}`;
+    const pending = launching.get(key);
+    if (pending) return pending;
+    const launched = this.#launch(request).finally(() => {
+      if (launching.get(key) === launched) launching.delete(key);
+    });
+    launching.set(key, launched);
+    return launched;
+  }
+
+  async #launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     const workspaceId = this.environment.HERDR_WORKSPACE_ID;
     if (!workspaceId) throw new Error("Herdr transport requires HERDR_WORKSPACE_ID");
+    await this.#claimSpawnSlot(request.signal);
     // layout.apply is not idempotent: remember the existing tabs so a dropped reply can
     // adopt the pane Herdr already created instead of launching a second worker.
     const tabsBefore = await this.#tabs(workspaceId).then(
@@ -177,6 +220,53 @@ export class HerdrTransport implements AgentTransportAdapter {
       throw new HerdrApiError("Herdr layout.apply did not return a pane id", undefined);
     }
     return paneId;
+  }
+
+  // Takes one of this minute's spawn slots for the Herdr server, waiting for the next
+  // minute when all are taken. A slot is a file created exclusively, so every Fabric
+  // process on the host shares one budget without a lock or a daemon.
+  // ponytail: fixed minute windows allow up to twice the budget across a boundary;
+  // a sliding window needs shared state that a file per slot cannot give.
+  async #claimSpawnSlot(signal: AbortSignal | undefined): Promise<void> {
+    const limit = this.options.spawnsPerMinute ?? SPAWNS_PER_MINUTE;
+    const now = this.options.now ?? Date.now;
+    const sleep = this.options.sleep ?? abortableSleep;
+    const directory = this.options.spawnLedgerDir ?? path.join(
+      os.tmpdir(),
+      "pi-fabric-herdr-spawns",
+      createHash("sha256").update(this.environment.HERDR_SOCKET_PATH ?? "").digest("hex").slice(0, 16),
+    );
+    const giveUpAt = now() + SPAWN_WAIT_LIMIT_MS;
+    for (;;) {
+      if (signal?.aborted) throw signal.reason;
+      const minute = Math.floor(now() / 60_000);
+      try {
+        fs.mkdirSync(directory, { recursive: true });
+        for (const entry of fs.readdirSync(directory)) {
+          if (Number.parseInt(entry, 10) < minute - 1) fs.rmSync(path.join(directory, entry), { force: true });
+        }
+        for (let slot = 0; slot < limit; slot++) {
+          try {
+            fs.closeSync(fs.openSync(path.join(directory, `${minute}-${slot}`), "wx"));
+            return;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          }
+        }
+      } catch {
+        // An unusable ledger must not stop agents: launch without the budget.
+        return;
+      }
+      const nextMinute = (minute + 1) * 60_000;
+      if (nextMinute > giveUpAt) {
+        throw new Error(
+          `Herdr pane budget exhausted: ${limit} launches per minute across Fabric on this host. ` +
+          "Use transport \"process\" for actors and background agents.",
+        );
+      }
+      // Jitter spreads the waiting launches across the next minute's first second.
+      await sleep(nextMinute - now() + Math.floor(Math.random() * 1_000), signal);
+    }
   }
 
   async #tabs(workspaceId: string): Promise<Array<{ tab_id?: string; label?: string }>> {

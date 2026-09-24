@@ -3,7 +3,7 @@ import net, { type Server } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { HerdrTransport } from "../src/agents/transports/herdr-transport.js";
+import { HerdrTransport, type HerdrTransportOptions } from "../src/agents/transports/herdr-transport.js";
 
 const servers: Server[] = [];
 const roots: string[] = [];
@@ -103,6 +103,10 @@ const startServer = async (options: { drop?: Drop } = {}) => {
 };
 
 const env = (socketPath: string) => ({ HERDR_ENV: "1", HERDR_SOCKET_PATH: socketPath, HERDR_WORKSPACE_ID: "w1" });
+// Each test keeps its spawn ledger beside its socket, inside the temporary root.
+const ledger = (socketPath: string) => path.join(path.dirname(socketPath), "spawns");
+const herdr = (socketPath: string, options: HerdrTransportOptions = {}) =>
+  new HerdrTransport(env(socketPath), { spawnLedgerDir: ledger(socketPath), ...options });
 const launchRequest = { id: "run-1", name: "review worker", cwd: "/repo", workerPath: "/fabric/worker.js", workerArguments: [] };
 
 describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
@@ -144,11 +148,7 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
 
   it("launches an argv-backed background tab and controls it by pane id", async () => {
     const { socketPath, requests } = await startServer();
-    const transport = new HerdrTransport({
-      HERDR_ENV: "1",
-      HERDR_SOCKET_PATH: socketPath,
-      HERDR_WORKSPACE_ID: "w1",
-    });
+    const transport = herdr(socketPath);
     const handle = await transport.launch({
       id: "agent-id",
       name: "review worker",
@@ -187,20 +187,20 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
   // smarty-dev#347: a dropped Herdr call must never respawn or duplicate a live worker.
   it("adopts the pane when the layout.apply reply is dropped after Herdr created it", async () => {
     const { socketPath, requests } = await startServer({ drop: "apply-after-create" });
-    const handle = await new HerdrTransport(env(socketPath)).launch(launchRequest);
+    const handle = await herdr(socketPath).launch(launchRequest);
     expect(handle.sessionId).toBe("w1:p2");
     expect(requests.filter((request) => request.method === "layout.apply")).toHaveLength(1);
   });
 
   it("fails without a second launch when the dropped layout.apply created nothing", async () => {
     const { socketPath, requests } = await startServer({ drop: "apply-before-create" });
-    await expect(new HerdrTransport(env(socketPath)).launch(launchRequest)).rejects.toThrow("closed without a response");
+    await expect(herdr(socketPath).launch(launchRequest)).rejects.toThrow("closed without a response");
     expect(requests.filter((request) => request.method === "layout.apply")).toHaveLength(1);
   });
 
   it("does not try to recover from a definitive Herdr error", async () => {
     const { socketPath, requests } = await startServer({ drop: "apply-error" });
-    await expect(new HerdrTransport(env(socketPath)).launch(launchRequest)).rejects.toThrow("invalid_layout");
+    await expect(herdr(socketPath).launch(launchRequest)).rejects.toThrow("invalid_layout");
     expect(requests.filter((request) => request.method === "tab.list")).toHaveLength(1); // only the pre-launch snapshot
   });
 
@@ -217,5 +217,80 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
     await new Promise<void>((resolve) => healthy.server.close(() => resolve()));
     fs.rmSync(healthy.socketPath, { force: true });
     await expect(live.isAlive()).resolves.toBe(false);            // the Herdr server is gone
+  });
+
+  // smarty-dev#266: 2,264 layout.apply calls from fleet actors froze dev1's Herdr.
+  describe("layout.apply budget", () => {
+    const applies = (requests: Array<{ method: string }>) =>
+      requests.filter((request) => request.method === "layout.apply").length;
+    const clock = (start: number) => {
+      const state = { now: start, sleeps: [] as number[] };
+      return {
+        state,
+        now: () => state.now,
+        sleep: async (ms: number, signal?: AbortSignal) => {
+          if (signal?.aborted) throw signal.reason;
+          state.sleeps.push(ms);
+          state.now += ms;
+        },
+      };
+    };
+
+    it("joins a repeated launch of the same run to the pending one", async () => {
+      const { socketPath, requests } = await startServer();
+      const transport = herdr(socketPath);
+      const [first, second] = await Promise.all([transport.launch(launchRequest), transport.launch(launchRequest)]);
+      expect(second).toBe(first);
+      expect(applies(requests)).toBe(1);
+    });
+
+    it("shares one per-minute budget across processes and waits for the next minute", async () => {
+      const { socketPath, requests } = await startServer();
+      const time = clock(1_000 * 60_000 + 5_000);
+      // A transport per launch stands in for separate Fabric processes: only the ledger is shared.
+      const launch = (id: string) =>
+        herdr(socketPath, { spawnsPerMinute: 2, now: time.now, sleep: time.sleep }).launch({ ...launchRequest, id });
+      await launch("run-a");
+      await launch("run-b");
+      expect(time.state.sleeps).toEqual([]);
+      await launch("run-c");
+      expect(applies(requests)).toBe(3);
+      expect(time.state.sleeps).toHaveLength(1);
+      expect(time.state.sleeps[0]).toBeGreaterThanOrEqual(55_000);
+      expect(Math.floor(time.state.now / 60_000)).toBe(1_001);
+    });
+
+    it("fails without applying when no slot frees within the wait limit", async () => {
+      const { socketPath, requests } = await startServer();
+      const time = clock(2_000 * 60_000);
+      fs.mkdirSync(ledger(socketPath), { recursive: true });
+      for (let minute = 2_000; minute <= 2_003; minute++) fs.writeFileSync(path.join(ledger(socketPath), `${minute}-0`), "");
+      const transport = herdr(socketPath, { spawnsPerMinute: 1, now: time.now, sleep: time.sleep });
+      await expect(transport.launch(launchRequest)).rejects.toThrow("Herdr pane budget exhausted");
+      expect(applies(requests)).toBe(0);
+    });
+
+    it("stops waiting when the manager closes", async () => {
+      const { socketPath, requests } = await startServer();
+      const time = clock(3_000 * 60_000);
+      fs.mkdirSync(ledger(socketPath), { recursive: true });
+      fs.writeFileSync(path.join(ledger(socketPath), "3000-0"), "");
+      const closing = new AbortController();
+      const transport = herdr(socketPath, {
+        spawnsPerMinute: 1,
+        now: time.now,
+        sleep: async (ms, signal) => { closing.abort(new Error("Fabric agent manager is closing")); await time.sleep(ms, signal); },
+      });
+      await expect(transport.launch({ ...launchRequest, signal: closing.signal })).rejects.toThrow("closing");
+      expect(applies(requests)).toBe(0);
+    });
+
+    it("launches without the budget when the ledger is unusable", async () => {
+      const { socketPath, requests } = await startServer();
+      const blocked = path.join(path.dirname(socketPath), "not-a-directory");
+      fs.writeFileSync(blocked, "");
+      await herdr(socketPath, { spawnLedgerDir: blocked }).launch(launchRequest);
+      expect(applies(requests)).toBe(1);
+    });
   });
 });

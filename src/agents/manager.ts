@@ -632,7 +632,7 @@ export class AgentManager {
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     if (this.#closing) throw new Error("Fabric agent manager is closing");
-    const pending = adapter.launch(request);
+    const pending = adapter.launch({ ...request, signal: this.#closeAbort.signal });
     this.#launches.add(pending);
     try {
       const transport = await pending;

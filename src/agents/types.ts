@@ -254,6 +254,8 @@ export interface AgentTransportLaunch {
   cwd: string;
   workerPath: string;
   workerArguments: string[];
+  /** Aborted when the agent manager closes; a transport may stop waiting to launch. */
+  signal?: AbortSignal;
 }
 
 export interface AgentTransportHandle {

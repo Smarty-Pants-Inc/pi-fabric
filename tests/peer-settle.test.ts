@@ -4,6 +4,7 @@ import {
   buildPeerCards,
   peerLabelPrefix,
   type FabricPeerCard,
+  type PeerSettleResult,
 } from "../src/topology/peer-settle.js";
 import type { FabricPeerInfo } from "../src/topology/types.js";
 
@@ -183,6 +184,26 @@ describe("awaitPeerSettle during a mesh write stall", () => {
   it("refuses to arm while the mesh is stalled", async () => {
     await expect(awaitPeerSettle({ poll: () => [], stalled: () => stalled }))
       .resolves.toEqual({ ok: false, error: stalled.message });
+  });
+
+  // Review F1 on #24: a vanished peer is a departure only after a later heartbeat commit.
+  it("counts a vanished peer as settled only after a heartbeat commit that follows its disappearance", async () => {
+    let live: FabricPeerInfo[] = [peer("session:aaa", { status: "running" })];
+    let confirmed = Date.now();
+    let result: PeerSettleResult | undefined;
+    void awaitPeerSettle({ poll: () => live, confirmedAt: () => confirmed, settledForMs: 60_000, pollMs: 5 })
+      .then((settled) => { result = settled; });
+    await sleep(20);
+    live = [];
+    await sleep(60);
+    expect(result).toBeUndefined();                            // no commit since it vanished
+    live = [peer("session:aaa", { status: "idle" })];          // back: the absence is forgotten
+    await sleep(20);
+    live = [];
+    await sleep(20);
+    confirmed = Date.now();
+    await sleep(40);
+    expect(result).toEqual({ ok: true });
   });
 
   it("reports a stall that starts while waiting instead of settling", async () => {

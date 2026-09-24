@@ -66,6 +66,11 @@ export interface AwaitPeerSettleOptions {
 	onUpdate?: (progress: PeerSettleProgress) => void;
 	/** A stalled mesh makes peers look departed; report it instead of "settled". */
 	stalled?: () => Error | undefined;
+	/**
+	 * When this host last committed a mesh heartbeat. A vanished peer counts as departed
+	 * only after a commit later than its disappearance showed the mesh working.
+	 */
+	confirmedAt?: () => number | undefined;
 }
 
 const matchesSelector = (peer: FabricPeerInfo, selector: string): boolean => {
@@ -85,6 +90,8 @@ interface WatchedPeer {
 	/** Last time the peer was observed running; undefined when quiet since arming. */
 	lastRunningAt: number | undefined;
 	settled: boolean;
+	/** When the peer was first seen missing; cleared when it reappears. */
+	missingSince?: number;
 }
 
 /**
@@ -156,9 +163,12 @@ export const awaitPeerSettle = (options: AwaitPeerSettleOptions): Promise<PeerSe
 				if (entry.settled) continue;
 				const peer = byId.get(entry.id);
 				if (!peer) {
-					entry.settled = true;
+					entry.missingSince ??= current;
+					const confirmed = options.confirmedAt?.();
+					if (confirmed === undefined || confirmed > entry.missingSince) entry.settled = true;
 					continue;
 				}
+				delete entry.missingSince;
 				entry.label = peer.label ?? peer.name;
 				const running = peer.status === "running";
 				if (running) {

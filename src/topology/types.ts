@@ -99,6 +99,8 @@ export interface FabricParticipantSource {
   peers(now?: number): FabricPeerInfo[];
   /** The reason peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
   writeStalled?(now?: number): Error | undefined;
+  /** When this host last committed its heartbeat through the mesh. */
+  confirmedAt?(): number;
   refresh(): Promise<void>;
   scheduleRefresh(): void;
 }

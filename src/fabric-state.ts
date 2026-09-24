@@ -249,6 +249,7 @@ export class FabricState {
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
   peerInfos(): FabricPeerInfo[] { return this.#current()?.peerInfos() ?? []; }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }
+  participantsConfirmedAt(): number | undefined { return this.#current()?.participantsConfirmedAt(); }
   componentGraph(): FabricComponentGraph {
     return this.#current()?.componentGraph() ?? { components: [], edges: [], cycles: [] };
   }

@@ -124,6 +124,9 @@ const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
 const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 const RESIDENT_HOST_EVENT_TOPIC = "fabric.actor.host-event";
+// A failing actor is silent (a failed directive run stays silent), so after this many
+// consecutive failed activations the host tells the owner's Main once (smarty-dev#390).
+export const ACTOR_FAILURE_NOTICE_AFTER = 3;
 const normalizeCapabilityRequirements = (
   requirements: readonly (string | FabricCapabilityRequirement)[] = [],
 ): FabricCapabilityRequirement[] => {
@@ -197,6 +200,7 @@ export class ActorRegistryOwnershipError extends Error {
 
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
+  readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
   readonly #actorRoot: string;
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
@@ -1305,6 +1309,8 @@ export class ActorManager {
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
+        // A run ended by a stop (agents.stop, a signal) is interrupted, not failing.
+        let runStopped = false;
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
         try {
@@ -1349,6 +1355,7 @@ export class ActorManager {
             await this.#saveActors();
           }
           runCompleted = result.status === "completed";
+          runStopped = result.status === "stopped";
           if (result.status !== "completed") {
             if (actor.responseMode === "directive") {
               // A failed directive run is non-fatal: stay silent and keep the
@@ -1371,11 +1378,15 @@ export class ActorManager {
               };
               this.#recordMessage(actor, silent);
               item.resolve?.(structuredClone(silent));
+              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped);
               continue;
             }
             throw new Error(result.error || `Actor run ${result.status}`);
           }
           const message = this.#outgoingMessage(actor, item, result);
+          // Only a completed run whose output is a valid message ends a failure streak: a
+          // run that keeps returning an invalid directive is failing too.
+          this.#failureStreaks.delete(actor.id);
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
             throw new Error(`Fabric actor ownership moved before delivery: ${actor.id}`);
@@ -1437,6 +1448,7 @@ export class ActorManager {
           };
           this.#recordMessage(actor, failed);
           item.reject?.(new Error(message));
+          this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped);
         } finally {
           await capabilityLease?.release().catch(() => undefined);
           // Retain a durable copy of the run's event log + status in the
@@ -1466,6 +1478,44 @@ export class ActorManager {
       // concurrent #ensureDrain observes `draining === false` and starts a
       // fresh drain instead of stranding a just-enqueued item.
       actor.draining = false;
+    }
+  }
+
+  // Counts consecutive failed activations and, once per streak, tells the owner's Main:
+  // a blind supervisor is otherwise silent for as long as it stays broken.
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean): void {
+    // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
+    // starts a turn must never cut through the stop-the-world halt.
+    if (interrupted || this.#halted || this.#closing) return;
+    const streak = this.#failureStreaks.get(actor.id) ?? { count: 0, notified: false };
+    streak.count += 1;
+    this.#failureStreaks.set(actor.id, streak);
+    if (streak.notified || streak.count < ACTOR_FAILURE_NOTICE_AFTER) return;
+    streak.notified = true;
+    const reason = error.split("\n")[0]!.slice(0, 300);
+    const text =
+      `Fabric host notice: actor ${actor.name} failed its last ${streak.count} activations, so it is not acting on its events. ` +
+      `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
+      `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it.`;
+    try {
+      this.onDeliver({
+        actor: this.#publicInfo(actor),
+        message: {
+          id: randomUUID(),
+          actorId: actor.id,
+          actorName: actor.name,
+          direction: "out",
+          source: "fabric-host",
+          createdAt: Date.now(),
+          action: "message",
+          text,
+        },
+        // A host alarm: it reaches Main and starts a turn whatever the actor's own delivery.
+        delivery: "followUp",
+        triggerTurn: true,
+      });
+    } catch {
+      // Best effort: the failures stay in the actor's messages and run records.
     }
   }
 

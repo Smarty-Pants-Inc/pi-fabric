@@ -206,12 +206,15 @@ if (task.includes("HANG")) {
 } else {
   const fail = task.includes("FAIL_DIRECTIVE");
   const stopDirective = task.includes("STOP_DIRECTIVE");
+  const emptyMessage = task.includes("EMPTY_MESSAGE_DIRECTIVE");
   const directive = schema?.properties?.action
-    ? {
-        action: stopDirective ? "stop" : "message",
-        message: stopDirective ? "fake actor role complete" : "fake actor advice",
-        ...(images.length > 0 ? { data: { imageCount: images.length } } : {}),
-      }
+    ? emptyMessage
+      ? { action: "message" }
+      : {
+          action: stopDirective ? "stop" : "message",
+          message: stopDirective ? "fake actor role complete" : "fake actor advice",
+          ...(images.length > 0 ? { data: { imageCount: images.length } } : {}),
+        }
     : undefined;
   const now = Date.now();
   const largeText = task.includes("LARGE_RESULT") ? "x".repeat(100_000) : undefined;

@@ -20,6 +20,7 @@ queue_rules:
       - base = main
       - -draft
       - check-success = smarty-review
+      - check-success = review/astra
       - check-success = smarty-land-ready
       - check-success = check (ubuntu-latest)
       - check-success = check (windows-latest)

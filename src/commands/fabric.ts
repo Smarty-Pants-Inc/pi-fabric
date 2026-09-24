@@ -218,6 +218,11 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
     void (async () => {
       try {
         await state.ensure(request.context);
+        const stalled = state.writeStalled?.();
+        if (stalled) {
+          request.respond({ ok: false, error: stalled.message });
+          return;
+        }
         request.respond({ ok: true, cards: buildPeerCards(state.peerInfos()) });
       } catch (error) {
         request.respond({
@@ -239,6 +244,8 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         }
         request.respond(await awaitPeerSettle({
           poll: () => state.peerInfos(),
+          stalled: () => state.writeStalled?.(),
+          confirmedAt: () => state.participantsConfirmedAt?.(),
           ...(request.selector !== undefined ? { selector: request.selector } : {}),
           ...(request.settledForMs !== undefined ? { settledForMs: request.settledForMs } : {}),
           ...(request.signal ? { signal: request.signal } : {}),

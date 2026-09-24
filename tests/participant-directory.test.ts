@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
+import { awaitPeerSettle, type PeerSettleResult } from "../src/topology/peer-settle.js";
 
 const roots: string[] = [];
 const directories: ParticipantDirectory[] = [];
@@ -504,5 +505,197 @@ describe("ParticipantDirectory", () => {
     const steady = again.mock.calls.filter(([, target]) => String(target).endsWith("state.json")).length;
     again.mockRestore();
     expect(steady).toBe(1);
+  });
+
+  // smarty-dev#266: a stopped mesh lock holder expired every lease; sessions() said [].
+  const stallDirectory = (name: string, source: () => FabricParticipantRecord[]) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: "main", sessionId: name };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 150 });
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 300,
+    });
+    directory.registerSource(source);
+    directories.push(directory);
+    return { directory, mesh, identity };
+  };
+
+  it("reports a write-stalled mesh without throwing from its own reads, then recovers", async () => {
+    const { directory, mesh, identity } = stallDirectory("stall", () => [rootRecord("session:stall", "session:stall", "stall")]);
+    await directory.start();
+    expect(directory.sessions().map((session) => session.id)).toEqual([identity.id]);
+    expect(directory.writeStalled()).toBeUndefined();
+
+    // A live holder that never releases: the store must not take its lock over.
+    const lockPath = path.join(mesh.root, ".lock");
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+    await expect.poll(() => directory.writeStalled()?.message ?? "", { timeout: 5_000, interval: 50 })
+      .toMatch(/^Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock/);
+    // Timers, the dashboard and ownership checks read these: they must never throw.
+    expect(() => directory.sessions()).not.toThrow();
+    expect(() => directory.peers()).not.toThrow();
+    expect(directory.get("session:departed")).toBeUndefined();
+
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    await expect.poll(() => directory.writeStalled(), { timeout: 5_000, interval: 50 }).toBeUndefined();
+    expect(directory.sessions().map((session) => session.id)).toEqual([identity.id]);
+  });
+
+  // Review F1/F3 on #24: two hosts on one mesh. A peer's lease can lapse before this host's
+  // lock wait times out, and this host's heartbeat can run late.
+  const meshPair = (reader: { heartbeatMs: number; leaseMs: number }, peer: { heartbeatMs: number; leaseMs: number }) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    // The peer's identity is not "main": a main also writes a legacy session entry, whose fixed
+    // 15 s lease (the production host lease) would outlive these scaled leases.
+    const make = (name: string, timing: { heartbeatMs: number; leaseMs: number }) => {
+      const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: name === "peer" ? "actor" : "main", sessionId: name };
+      const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 10_000 });
+      const directory = new ParticipantDirectory(mesh, {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing,
+      });
+      directory.registerSource(() => [rootRecord(identity.id, identity.id, name)]);
+      directories.push(directory);
+      return directory;
+    };
+    const lockPath = path.join(meshRoot, ".lock");
+    return {
+      reader: make("reader", reader),
+      peer: make("peer", peer),
+      hold: () => {
+        fs.mkdirSync(lockPath, { mode: 0o700 });
+        fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+      },
+      release: () => fs.rmSync(lockPath, { recursive: true, force: true }),
+    };
+  };
+  const seesPeer = (directory: ParticipantDirectory) => directory.peers().some((peer) => peer.id === "session:peer");
+
+  it("never settles a peer that lapsed behind a stalled lock, and reports it before the lock timeout", async () => {
+    const { reader, peer, hold, release } = meshPair({ heartbeatMs: 600, leaseMs: 20_000 }, { heartbeatMs: 100, leaseMs: 400 });
+    await Promise.all([reader.start(), peer.start()]);
+    await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
+    await vi.waitFor(() => expect(Date.now() - reader.confirmedAt()).toBeLessThan(40), { timeout: 5_000, interval: 5 });
+    hold();                                                    // right after the reader's last commit
+    const started = Date.now();
+    let result: PeerSettleResult | undefined;
+    void awaitPeerSettle({
+      poll: () => reader.peers(),
+      stalled: () => reader.writeStalled(),
+      confirmedAt: () => reader.confirmedAt(),
+      selector: "session:peer",
+      settledForMs: 60_000,
+      pollMs: 20,
+    }).then((settled) => { result = settled; });
+    // The peer lapses while the reader's own heartbeat is not yet overdue: the plain read omits
+    // it, but peer-settle does not take the absence as a departure.
+    await vi.waitFor(() => expect(seesPeer(reader)).toBe(false), { timeout: 3_000, interval: 10 });
+    expect(reader.writeStalled()).toBeUndefined();
+    // review/astra on a85b2c4: a settle armed now sees no peer at all; it must not succeed either.
+    let late: PeerSettleResult | undefined;
+    void awaitPeerSettle({
+      poll: () => reader.peers(),
+      stalled: () => reader.writeStalled(),
+      confirmedAt: () => reader.confirmedAt(),
+      settledForMs: 60_000,
+      pollMs: 20,
+    }).then((settled) => { late = settled; });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(result).toBeUndefined();
+    expect(late).toBeUndefined();
+    // Two heartbeat intervals without a commit: the lapse now reads as unknown visibility.
+    await vi.waitFor(() => expect(result).toBeDefined(), { timeout: 5_000, interval: 20 });
+    expect(result).toEqual({ ok: false, error: expect.stringMatching(/1 peer lease lapsed while this host's heartbeat has not committed/) });
+    expect(reader.writeStalled()?.message).toMatch(/^Fabric mesh is write-stalled: 1 peer lease lapsed/);
+    await vi.waitFor(() => expect(late).toEqual({ ok: false, error: expect.stringMatching(/peer lease lapsed/) }), { timeout: 2_000, interval: 20 });
+    expect(Date.now() - started).toBeLessThan(5_000);          // long before the 10 s lock timeout
+    release();
+    await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
+    await vi.waitFor(() => expect(reader.writeStalled()).toBeUndefined(), { timeout: 5_000, interval: 20 });
+  }, 20_000);
+
+  it("settles a peer that genuinely departed on a working mesh, without a stall report", async () => {
+    const { reader, peer } = meshPair({ heartbeatMs: 100, leaseMs: 2_000 }, { heartbeatMs: 100, leaseMs: 400 });
+    await Promise.all([reader.start(), peer.start()]);
+    await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
+    vi.spyOn(peer, "refresh").mockResolvedValue(undefined);    // the peer crashes: no renewals, no cleanup
+    let flagged = false;
+    const settled = awaitPeerSettle({
+      poll: () => { if (reader.writeStalled()) flagged = true; return reader.peers(); },
+      stalled: () => reader.writeStalled(),
+      confirmedAt: () => reader.confirmedAt(),
+      selector: "session:peer",
+      settledForMs: 60_000,
+      pollMs: 10,
+    });
+    await expect(settled).resolves.toEqual({ ok: true });
+    expect(flagged).toBe(false);
+  }, 20_000);
+
+  it("keeps fresh listings usable while a lock wait lasts longer than a heartbeat", async () => {
+    const { reader, peer, hold, release } = meshPair({ heartbeatMs: 200, leaseMs: 5_000 }, { heartbeatMs: 200, leaseMs: 5_000 });
+    await Promise.all([reader.start(), peer.start()]);
+    await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
+    hold();
+    let flagged = false;
+    let missing = false;
+    const until = Date.now() + 1_500;                          // more than seven heartbeats, less than the 10 s timeout
+    while (Date.now() < until) {
+      if (reader.writeStalled()) flagged = true;
+      if (!seesPeer(reader)) missing = true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    release();
+    expect(flagged).toBe(false);
+    expect(missing).toBe(false);
+  }, 20_000);
+
+  it("does not report a stall for lock waits shorter than one heartbeat", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:brief", name: "main", kind: "main", sessionId: "brief" };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 10_000 });
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 400, leaseMs: 1_200,
+    });
+    directory.registerSource(() => [rootRecord(identity.id, identity.id, "brief")]);
+    directories.push(directory);
+    await directory.start();
+    const lockPath = path.join(mesh.root, ".lock");
+    let flagged = false;
+    for (let round = 0; round < 6; round++) {
+      // Ordinary contention: another writer holds the lock for 60 ms at a time.
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, "owner"), `brief\n${process.pid}\n${Date.now()}\n`);
+      const until = Date.now() + 60;
+      while (Date.now() < until) {
+        if (directory.writeStalled()) flagged = true;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      fs.rmSync(lockPath, { recursive: true, force: true });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      if (directory.writeStalled()) flagged = true;
+    }
+    expect(flagged).toBe(false);
+  });
+
+  it("returns an empty directory without a stall report when the mesh is healthy", async () => {
+    const { directory } = stallDirectory("empty", () => []);
+    await directory.start();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(directory.sessions()).toEqual([]);
+    expect(directory.writeStalled()).toBeUndefined();
+  });
+
+  it("does not report a stall for a heartbeat failure that is not a lock timeout", async () => {
+    const { directory, mesh } = stallDirectory("disk", () => [rootRecord("session:disk", "session:disk", "disk")]);
+    await directory.start();
+    vi.spyOn(mesh, "writeBatch").mockRejectedValue(new Error("ENOSPC: no space left on device"));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(directory.writeStalled()).toBeUndefined();
+    expect(() => directory.sessions()).not.toThrow();
   });
 });

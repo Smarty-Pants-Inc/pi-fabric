@@ -108,6 +108,22 @@ const command = (operation: FabricControlCommand["operation"]): FabricControlCom
 });
 
 describe("agents provider message routing service boundaries", () => {
+  // smarty-dev#266: during a mesh write stall, get() finds nobody; local delivery must still work.
+  it("steers a local child during a mesh write stall and names the stall for unknown targets", async () => {
+    const { router, agents, participants } = routing();
+    const stalled = new Error("Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock held by pid 7 (alive, state T stopped)");
+    Object.assign(participants, { writeStalled: vi.fn(() => stalled) });
+    participants.get.mockReturnValue(undefined);
+    agents.status.mockImplementation((id) => {
+      if (id === "child") return { id: "child", name: "Child" } as ReturnType<Ports[0]["status"]>;
+      throw new Error("Unknown Fabric agent");
+    });
+    agents.steer.mockReturnValue({ messageId: "local-msg" } as ReturnType<Ports[0]["steer"]>);
+
+    await expect(router.routeMessage("child", "hi", undefined, "steer")).resolves.toMatchObject({ routed: "local", messageId: "local-msg" });
+    await expect(router.routeMessage("gone", "hi", undefined, "steer")).rejects.toThrow(stalled.message);
+  });
+
   it("preserves passive Main delivery and caller identity without actor validation", async () => {
     const { router, main, actors } = routing();
     const from = { id: "source", name: "Source", kind: "main" as const };

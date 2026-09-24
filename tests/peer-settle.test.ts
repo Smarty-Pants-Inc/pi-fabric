@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   awaitPeerSettle,
   buildPeerCards,
   peerLabelPrefix,
   type FabricPeerCard,
+  type PeerSettleResult,
 } from "../src/topology/peer-settle.js";
 import type { FabricPeerInfo } from "../src/topology/types.js";
 
@@ -173,5 +174,95 @@ describe("awaitPeerSettle", () => {
         signal: controller.signal,
       }),
     ).resolves.toEqual({ ok: false, error: "cancelled" });
+  });
+});
+
+// smarty-dev#266: during a mesh write stall every peer looks departed ("settled").
+describe("awaitPeerSettle during a mesh write stall", () => {
+  const stalled = new Error("Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock held by pid 7");
+
+  it("refuses to arm while the mesh is stalled", async () => {
+    await expect(awaitPeerSettle({ poll: () => [], stalled: () => stalled }))
+      .resolves.toEqual({ ok: false, error: stalled.message });
+  });
+
+  // Review F1 on #24: a vanished peer is a departure only after a later heartbeat commit.
+  it("counts a vanished peer as settled only after a heartbeat commit that follows its disappearance", async () => {
+    let live: FabricPeerInfo[] = [peer("session:aaa", { status: "running" })];
+    let confirmed = Date.now();
+    let result: PeerSettleResult | undefined;
+    void awaitPeerSettle({ poll: () => live, confirmedAt: () => confirmed, settledForMs: 60_000, pollMs: 5 })
+      .then((settled) => { result = settled; });
+    await sleep(20);
+    live = [];
+    await sleep(60);
+    expect(result).toBeUndefined();                            // no commit since it vanished
+    live = [peer("session:aaa", { status: "idle" })];          // back: the absence is forgotten
+    await sleep(20);
+    live = [];
+    await sleep(20);
+    confirmed = Date.now();
+    await sleep(40);
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("waits for a commit after arming before an empty or partial snapshot counts as settled", async () => {
+    let live: FabricPeerInfo[] = [];
+    let confirmed = Date.now() - 1_000;
+    let result: PeerSettleResult | undefined;
+    void awaitPeerSettle({ poll: () => live, confirmedAt: () => confirmed, settledForMs: 30, pollMs: 5 })
+      .then((settled) => { result = settled; });
+    await sleep(40);
+    expect(result).toBeUndefined();                            // empty, but not confirmed
+    // The arming snapshot missed it; it shows up in the same poll as the confirming commit.
+    live = [peer("session:late", { status: "running" })];
+    confirmed = Date.now();
+    await sleep(60);
+    expect(result).toBeUndefined();                            // now watched, and still running
+    live = [peer("session:late", { status: "idle" })];
+    await vi.waitFor(() => expect(result).toEqual({ ok: true }), { timeout: 2_000, interval: 10 });
+  });
+
+  it("checks a peer that settled before confirmation again on the confirming snapshot", async () => {
+    let live: FabricPeerInfo[] = [peer("session:quiet", { status: "idle" })];
+    let confirmed = Date.now() - 1_000;
+    let result: PeerSettleResult | undefined;
+    void awaitPeerSettle({ poll: () => live, confirmedAt: () => confirmed, settledForMs: 30, pollMs: 5 })
+      .then((settled) => { result = settled; });
+    await sleep(60);                                           // quiet for 30 ms: provisionally settled
+    expect(result).toBeUndefined();
+    live = [peer("session:quiet", { status: "running" })];     // it resumes before the confirming poll
+    confirmed = Date.now();
+    await sleep(60);
+    expect(result).toBeUndefined();
+    live = [peer("session:quiet", { status: "idle" })];
+    await vi.waitFor(() => expect(result).toEqual({ ok: true }), { timeout: 2_000, interval: 10 });
+  });
+
+  it("reports a stall that starts while waiting instead of settling", async () => {
+    let stall: Error | undefined;
+    const waiting = awaitPeerSettle({
+      poll: () => (stall ? [] : [peer("session:busy", { status: "running" })]),
+      stalled: () => stall,
+      pollMs: 20,
+      settledForMs: 10_000,
+    });
+    await sleep(50);
+    stall = stalled;
+    await expect(waiting).resolves.toEqual({ ok: false, error: stalled.message });
+  });
+
+  it("finishes with ok:false when a later poll throws, instead of escaping its timer", async () => {
+    let calls = 0;
+    const waiting = awaitPeerSettle({
+      poll: () => {
+        calls += 1;
+        if (calls > 2) throw new Error("directory read failed");
+        return [peer("session:busy", { status: "running" })];
+      },
+      pollMs: 20,
+      settledForMs: 10_000,
+    });
+    await expect(waiting).resolves.toEqual({ ok: false, error: "directory read failed" });
   });
 });

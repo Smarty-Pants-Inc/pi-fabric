@@ -24,6 +24,11 @@ const PARTICIPANT_LEASE_MS = 15_000;
 const keyFor = (prefix: string, id: string): string =>
   prefix + createHash("sha256").update(id).digest("hex");
 
+const isMeshLockTimeout = (error: unknown): error is Error =>
+  error instanceof Error &&
+  ((error as Error & { code?: unknown }).code === "FABRIC_MESH_LOCK_TIMEOUT" ||
+    error.message.startsWith("Timed out waiting for the Fabric mesh lock"));
+
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -245,6 +250,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshing: Promise<void> | undefined;
   #refreshScheduled = false;
   #refreshAgain = false;
+  #refreshedAt = Date.now();
+  #refreshStartedAt: number | undefined;
+  #refreshError: unknown;
   #quiescing = false;
 
   constructor(
@@ -267,6 +275,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async start(): Promise<void> {
     if (this.#timer) return;
     this.#closed = false;
+    this.#refreshError = undefined;
+    this.#refreshedAt = Date.now();
     let initialError: unknown;
     try {
       await this.refresh();
@@ -301,12 +311,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async refresh(): Promise<void> {
     if (this.#closed) return;
     if (this.#refreshing) return this.#refreshing;
+    this.#refreshStartedAt = Date.now();
     const operation = this.#refresh();
     this.#refreshing = operation;
     try {
       await operation;
+      this.#refreshedAt = Date.now();
+      this.#refreshError = undefined;
+    } catch (error) {
+      this.#refreshError = error;
+      throw error;
     } finally {
-      if (this.#refreshing === operation) this.#refreshing = undefined;
+      if (this.#refreshing === operation) {
+        this.#refreshing = undefined;
+        this.#refreshStartedAt = undefined;
+      }
       if (this.#refreshAgain) {
         this.#refreshAgain = false;
         this.scheduleRefresh();
@@ -395,6 +414,59 @@ export class ParticipantDirectory implements FabricParticipantSource {
   get(id: string, now = Date.now()): FabricParticipantInfo | undefined {
     const target = id === "main" ? this.options.rootId : id;
     return this.list({ scope: "project" }, now).find((participant) => participant.id === target);
+  }
+
+  // A stalled mesh writer (for example a signal-stopped lock holder, smarty-dev#266)
+  // stops every host lease from renewing, so peers soon look departed. This reports it;
+  // the directory's own reads (get, list, sessions, peers) never throw, because timers,
+  // the dashboard and local ownership checks consume them. User-facing listings and
+  // "unknown participant" answers turn it into an error instead of an empty answer.
+  // Two signals: this host's heartbeat failed on a mesh-lock timeout; or, before any
+  // timeout, a peer lease lapsed after this host's last committed heartbeat while that
+  // commit is two intervals overdue (or the heartbeat failed). The same lock may be what
+  // stopped the peer renewing, so the lapse is not a departure yet. Elapsed wait alone is
+  // not a signal: a complete listing of fresh leases stays usable under long contention.
+  // ponytail: before the commit is overdue a plain listing can still omit such a peer for
+  // up to two intervals; peer-settle, the decision that acts on absence, waits for a later
+  // commit instead (confirmedAt). Revisit if another consumer acts on absence.
+  writeStalled(now = Date.now()): Error | undefined {
+    if (!this.options.enabled || this.#closed) return undefined;
+    const error = this.#refreshError;
+    if (isMeshLockTimeout(error)) {
+      return new Error(
+        `Fabric mesh is write-stalled: ${error.message}. Participant leases have not renewed for ` +
+          `${Math.round((now - this.#refreshedAt) / 1000)} s, so peer visibility is unknown, not empty.`,
+      );
+    }
+    const confirmed = this.#refreshedAt;
+    const unconfirmed = error !== undefined || now - confirmed > 2 * this.#heartbeatMs;
+    if (!unconfirmed) return undefined;
+    const lapsed = this.#lapsedSince(confirmed, now);
+    if (lapsed === 0) return undefined;
+    return new Error(
+      `Fabric mesh is write-stalled: ${lapsed} peer lease${lapsed === 1 ? "" : "s"} lapsed while this host's ` +
+        `heartbeat has not committed for ${((now - confirmed) / 1000).toFixed(1)} s, so peer visibility is unknown, not empty.`,
+    );
+  }
+
+  /** When this host last committed its heartbeat: lapses before it happened on a working mesh. */
+  confirmedAt(): number {
+    return this.#refreshedAt;
+  }
+
+  // Peer leases (host leases, and legacy session entries) that lapsed in (since, now].
+  #lapsedSince(since: number, now: number): number {
+    let lapsed = 0;
+    for (const entry of this.mesh.listAll(HOST_PREFIX)) {
+      const host = hostFromEntry(entry);
+      if (host && host.id !== this.options.hostId && host.expiresAt > since && host.expiresAt <= now) lapsed += 1;
+    }
+    for (const entry of this.mesh.listAll(LEGACY_SESSION_PREFIX)) {
+      const expiresAt = entry.updatedAt + PARTICIPANT_LEASE_MS;
+      const id = isObject(entry.value) ? entry.value.id : undefined;
+      if (id !== this.options.rootId && expiresAt > since && expiresAt <= now) lapsed += 1;
+    }
+    return lapsed;
   }
 
   self(now = Date.now()): FabricParticipantInfo {

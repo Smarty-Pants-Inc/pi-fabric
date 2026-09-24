@@ -297,6 +297,16 @@ export class FabricRuntimeState {
     return this.#participants?.peers() ?? [];
   }
 
+  /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
+  writeStalled(): Error | undefined {
+    return this.#participants?.writeStalled();
+  }
+
+  /** When this host last committed its mesh heartbeat, if it has a directory. */
+  participantsConfirmedAt(): number | undefined {
+    return this.#participants?.confirmedAt();
+  }
+
   componentGraph(): FabricComponentGraph {
     return this.#componentLoader?.graph() ?? { components: [], edges: [], cycles: [] };
   }

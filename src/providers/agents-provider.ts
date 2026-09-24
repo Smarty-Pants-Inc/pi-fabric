@@ -630,7 +630,7 @@ export class AgentsProvider implements FabricProvider {
         if (this.mainAgent.matches(id)) {
           if (this.mainAgent.local) return this.mainAgent.info(context.extensionContext);
           const root = this.participants.get(this.mainAgent.id);
-          if (!root) throw new Error(`Unknown Fabric Main participant: ${this.mainAgent.id}`);
+          if (!root) throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric Main participant: ${this.mainAgent.id}`);
           return root;
         }
         try {
@@ -654,7 +654,7 @@ export class AgentsProvider implements FabricProvider {
           if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
         }
         const participant = this.participants.get(id);
-        if (!participant) throw new Error(`Unknown Fabric participant: ${id}`);
+        if (!participant) throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric participant: ${id}`);
         return participant;
       }
       case "list":
@@ -666,8 +666,15 @@ export class AgentsProvider implements FabricProvider {
                 kind === "root" || kind === "agent" || kind === "actor",
             )
           : undefined;
+        const scope = this.#participantScope(args.scope, "project");
+        // Every scope but local reads the shared directory (lineage includes descendants
+        // in other runtimes), so each is unknown, not short, during a write stall.
+        const stalled = scope !== "local" && args.includeStale !== true
+          ? this.participants.writeStalled?.()
+          : undefined;
+        if (stalled) throw stalled;
         return this.participants.list({
-          scope: this.#participantScope(args.scope, "project"),
+          scope,
           ...(kinds ? { kinds } : {}),
           ...(args.includeStale === true ? { includeStale: true } : {}),
         });
@@ -676,11 +683,17 @@ export class AgentsProvider implements FabricProvider {
         return this.participants.self();
       case "main":
         return this.mainAgent.info(context.extensionContext);
-      case "sessions":
+      case "sessions": {
+        const stalled = this.participants.writeStalled?.();
+        if (stalled) throw stalled;
         return this.participants.sessions?.() ??
           this.participants.list({ scope: "project", kinds: ["root"] });
-      case "peers":
+      }
+      case "peers": {
+        const stalled = this.participants.writeStalled?.();
+        if (stalled) throw stalled;
         return this.participants.peers();
+      }
       case "subscribe": {
         const events = Array.isArray(args.events)
           ? args.events.filter(isFabricLifecycleEventType)
@@ -1219,6 +1232,10 @@ export class AgentsProvider implements FabricProvider {
   #listAgents(scopeValue: unknown): Array<AgentRunRecord | AgentHandleInfo | ReturnType<FabricParticipantSource["self"]>> {
     const scope = this.#participantScope(scopeValue, "local");
     if (scope === "local") return this.manager.list();
+    // Like agents.members: a mesh-dependent listing (project or lineage) during a write
+    // stall is unknown, not short.
+    const stalled = this.participants.writeStalled?.();
+    if (stalled) throw stalled;
     const local = new Map<string, AgentRunRecord | AgentHandleInfo>();
     const append = (record: AgentRunRecord | AgentHandleInfo): void => {
       local.set(record.id, record);
@@ -1270,7 +1287,7 @@ export class AgentsProvider implements FabricProvider {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
     }
     const participant = this.participants.get(id);
-    if (!participant) throw new Error(`Unknown Fabric participant: ${id}`);
+    if (!participant) throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric participant: ${id}`);
     if (!participant.capabilities.includes("stop")) {
       throw new Error(`Fabric participant ${id} cannot be stopped`);
     }

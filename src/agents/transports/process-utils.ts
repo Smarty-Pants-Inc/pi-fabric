@@ -250,7 +250,12 @@ export const spawnDetached = async (
       } catch { /* process group already exited */ }
     },
     async isAlive() {
-      return !exited && processIsAlive(pid);
+      if (exited) return false;
+      if (processIsAlive(pid)) return true;
+      // Gone once is gone for good: the probe can see the exit before the "exit" event
+      // (Windows), and any later answer for this number is another process.
+      exited = true;
+      return false;
     },
   };
 };

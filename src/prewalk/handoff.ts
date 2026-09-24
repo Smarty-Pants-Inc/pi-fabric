@@ -4,10 +4,8 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { FabricResultFormat } from "../config.js";
-import {
-  NESTED_TOOL_CALL_ID_PREFIX,
-  type FabricCallAudit,
-} from "../core/action-registry.js";
+import type { FabricCallAudit } from "../core/action-registry.js";
+import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX as NESTED_TOOL_CALL_ID_PREFIX } from "../protocol.js";
 import type { FabricExecutionResult } from "../execution-service.js";
 import type {
   FabricInvocationActivityUpdate,

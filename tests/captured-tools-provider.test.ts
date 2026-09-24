@@ -157,7 +157,8 @@ describe("CapturedToolsProvider", () => {
     });
     expect(context.approve).toHaveBeenCalledWith(
       expect.objectContaining({ ref: "extensions.compat_tool", risk: "execute" }),
-      { value: "hello!" },
+      // The trusted interceptor changes its private invocation copy, not the approval record.
+      { value: "hello" },
     );
     expect(context.update).toHaveBeenCalledWith("compat_tool: halfway");
     expect(lifecycleEvents).toEqual([

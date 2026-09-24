@@ -110,7 +110,7 @@ describe("provider binding generations", () => {
       description: "Effect conflicts",
       async list() { return []; },
       async describe(name) {
-        if (!["first", "second", "distinct", "unknown"].includes(name)) return undefined;
+        if (!["first", "second", "distinct", "unknown", "overflow", "wildcard"].includes(name)) return undefined;
         return {
           name,
           description: name,
@@ -120,7 +120,10 @@ describe("provider binding generations", () => {
             kind: "transactional",
             ...(name === "unknown"
               ? {}
-              : { resources: [name === "distinct" ? "workspace:b" : "workspace:a"] }),
+              : { resources: name === "overflow"
+                ? [...Array.from({ length: 64 }, (_, i) => `other:${i}`), "workspace:a"]
+                : name === "wildcard" ? ["*"]
+                : [name === "distinct" ? "workspace:b" : "workspace:a"] }),
             ordering: "ordered",
           },
         };
@@ -160,6 +163,8 @@ describe("provider binding generations", () => {
     await expect(call("unknown", "strict")).rejects.toThrow(
       "effects.first [*] (unknown resource footprint; declare resources and ordering)",
     );
+    await expect(call("overflow", "strict")).rejects.toThrow("unknown resource footprint");
+    await expect(call("wildcard", "strict")).rejects.toThrow("unknown resource footprint");
     const distinctAudits: Parameters<ActionRegistry["invoke"]>[2]["audits"] = [];
     await expect(call("distinct", "strict", distinctAudits)).resolves.toBe("distinct");
     expect(distinctAudits[0]?.effectConflicts).toBeUndefined();

@@ -8,7 +8,7 @@ import {
   type SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
 import type { JsonObject } from "@earendil-works/pi-ai";
-import { compileFabricSummary, rawContextTokens } from "../compaction/hook.js";
+import { compileFabricSummary, rawContextTokens, type FabricCompactionBudget } from "../compaction/hook.js";
 import {
   compactionRequestBoundsError,
   encodeCompactionRequest,
@@ -52,11 +52,10 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 interface HandoffCompactionOutcome {
-  applied: boolean;
-  reason?: string;
-  sections?: string[];
-  tokensBefore?: number;
-  firstKeptEntryId?: string;
+  applied: true;
+  sections: string[];
+  tokensBefore: number;
+  firstKeptEntryId: string;
 }
 
 // Validate the model-facing agents.handoff `compact` option against the same
@@ -261,6 +260,7 @@ export const writeHandoffSession = (
   directory: string,
   transfer?: ThinkingTransferInput,
   compaction?: HandoffCompactionRequest,
+  compactionBudget?: FabricCompactionBudget,
 ): string => {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const policy = transfer ? thinkingTransferPolicy(transfer) : "preserved";
@@ -280,10 +280,17 @@ export const writeHandoffSession = (
     report = translated.report;
     session = materializeBranch({ ...seed, sourceBranch: translated.entries }, cwd, directory);
   }
-  // Append the compaction entry before settings sync and the outer tool result
-  // so the executor's context opens with the deterministic summary, followed
-  // by the kept tail, then the boundary artifacts appended afterwards. The
-  // file retains the full raw branch, mirroring Pi's append-only compaction.
+  synchronizeSourceSettings(session, seed);
+  session.appendMessage(seed.outerToolResult);
+  if (digest) {
+    session.appendCustomMessageEntry(THINKING_DIGEST_CUSTOM_TYPE, digest.content, false, {
+      policy,
+      citedBlocks: digest.citedBlocks,
+    });
+  }
+  // Budget the complete inherited context, including the outer result and
+  // digest. The cut must see both sides of the outer tool pair. Raw entries
+  // remain in the append-only child file even when the pair is summarized.
   let compactionOutcome: HandoffCompactionOutcome | undefined;
   if (compaction) {
     const branchEntries = session.getBranch();
@@ -296,9 +303,11 @@ export const writeHandoffSession = (
         })
       : compaction.instructions;
     const tokensBefore = rawContextTokens(branchEntries);
-    const compiled = compileFabricSummary(branchEntries, tokensBefore, undefined, customInstructions);
+    const compiled = compileFabricSummary(branchEntries, tokensBefore, undefined, customInstructions,
+      compactionBudget ? { ...compactionBudget, calibrateUsage: false } : undefined);
     if ("cancel" in compiled) {
-      compactionOutcome = { applied: false, reason: compiled.reason };
+      // A requested bounded handoff must not silently launch the unbounded fork.
+      throw new Error(`Handoff compaction cancelled: ${compiled.reason}`);
     } else {
       session.appendCompaction(
         compiled.compaction.summary,
@@ -315,27 +324,12 @@ export const writeHandoffSession = (
       };
     }
   }
-  synchronizeSourceSettings(session, seed);
-  session.appendMessage(seed.outerToolResult);
-  if (digest) {
-    session.appendCustomMessageEntry(THINKING_DIGEST_CUSTOM_TYPE, digest.content, false, {
-      policy,
-      citedBlocks: digest.citedBlocks,
-    });
-  }
   session.appendCustomEntry("pi-fabric-handoff", {
     sourceSessionId: seed.sourceSessionId,
     boundary: "fabric_exec_end",
     ...(compactionOutcome
       ? {
-          compaction: compactionOutcome.applied
-            ? {
-                applied: true,
-                sections: compactionOutcome.sections,
-                tokensBefore: compactionOutcome.tokensBefore,
-                firstKeptEntryId: compactionOutcome.firstKeptEntryId,
-              }
-            : { applied: false, reason: compactionOutcome.reason },
+          compaction: compactionOutcome,
         }
       : {}),
     ...(transfer && report

@@ -1,0 +1,7 @@
+{
+  "authorityIssue": [["grants", "AuthorityGrants"], "AuthorityState"],
+  "authorityLive": [["authority", "AuthorityState"], "boolean"],
+  "authorityAllows": [["authority", "AuthorityState"], ["grant", "AuthorityText"], "boolean"],
+  "authorityDerive": [["parent", "AuthorityState"], ["candidate", "AuthorityGrants"], "AuthorityState"],
+  "authorityRelease": [["authority", "AuthorityState"], "AuthorityState"]
+}

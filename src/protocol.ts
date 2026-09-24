@@ -249,6 +249,8 @@ export interface FabricCapabilityBindingView {
   descriptorHash: string;
 }
 
+/** Immutable issuer-owned authority, not a serializable bearer grant.
+ * Another registry must resolve a fresh view; copies and released views are invalid. */
 export interface FabricCommittedCapabilityView {
   id: string;
   /** Runtime-local digest including provider binding generations. */

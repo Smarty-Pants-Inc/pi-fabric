@@ -129,7 +129,7 @@ describe("compaction reconstruction QA", () => {
     const checked = checkProbes(fixture.summary, probes);
     const report = qaReport(fixture.events, fixture.events.length, fixture.summary);
 
-    expect(probes.some((probe) => probe.class === "content" && probe.id === "goal")).toBe(true);
+    expect(probes.some((probe) => probe.class === "content" && probe.id.startsWith("dialogue:"))).toBe(true);
     expect(probes.some((probe) => probe.class === "content" && probe.answer === "compaction.md")).toBe(true);
     expect(probes.some((probe) => probe.class === "content" && probe.answer === "read src/missing.ts: ENOENT: no such file or directory")).toBe(true);
     expect(probes.some((probe) => probe.id.startsWith("commit:"))).toBe(false);

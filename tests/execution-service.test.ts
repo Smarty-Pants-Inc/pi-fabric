@@ -759,7 +759,7 @@ return "unreachable";
       description: "fake extensions",
       async list() { return [descriptor]; },
       async describe(name) {
-        return name === "subagent" || name === "unfloored" ? descriptor : undefined;
+        return name === "subagent" || name === "unfloored" ? { ...descriptor, name } : undefined;
       },
       async invoke(_name, _args, context) {
         return new Promise((resolve) => {

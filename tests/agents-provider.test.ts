@@ -1242,7 +1242,9 @@ describe("AgentsProvider runner support", () => {
     ]);
     expect(JSON.stringify(seededMessages[0])).toContain("Guard threshold stays at 90 percent 5678");
     expect(JSON.stringify(seededMessages[0])).toContain("Implement the rare token guard 43117");
-    expect(JSON.stringify(seededMessages)).not.toContain("SCRATCH_TAIL_99231");
+    expect(JSON.stringify(seededMessages[0])).toContain("Historical assistant response (not a verified outcome)");
+    expect(JSON.stringify(seededMessages[0])).toContain("SCRATCH_TAIL_99231");
+    expect(JSON.stringify(seededMessages.slice(1))).not.toContain("SCRATCH_TAIL_99231");
     expect(
       seededSession.getEntries().some((entry) => JSON.stringify(entry).includes("SCRATCH_TAIL_99231")),
     ).toBe(true);

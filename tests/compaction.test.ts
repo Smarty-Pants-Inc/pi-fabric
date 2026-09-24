@@ -703,7 +703,7 @@ describe("compaction golden determinism", () => {
     const first = compileFabricSummary(session, 1000) as { compaction: { summary: string } };
     const second = compileFabricSummary(session, 1000) as { compaction: { summary: string } };
     expect(second.compaction.summary).toBe(first.compaction.summary);
-    expect(first.compaction.summary).toContain("[Session Goal]");
+    expect(first.compaction.summary).toContain("[Recent user directions and discussion]");
     expect(first.compaction.summary).toContain("[Files And Changes]");
     expect(first.compaction.summary).toContain("(under src/)");
     expect(first.compaction.summary).toContain("Written:");
@@ -725,7 +725,7 @@ describe("compaction golden determinism", () => {
     expect(compaction.summary).not.toContain("[Commits]");
     expect(compaction.summary).not.toContain("[Outstanding Context]");
     expect(compaction.summary).not.toContain("[Earlier Turns]");
-    const goalIdx = compaction.summary.indexOf("[Session Goal]");
+    const goalIdx = compaction.summary.indexOf("[Recent user directions and discussion]");
     const statusIdx = compaction.summary.indexOf("[Current Status]");
     const transIdx = compaction.summary.indexOf("---");
     expect(goalIdx).toBeLessThan(statusIdx);
@@ -1570,7 +1570,7 @@ describe("compaction empty and tiny history edge cases", () => {
     const a = compileFabricSummary(session, 1000) as { compaction: { summary: string } };
     const b = compileFabricSummary(session, 1000) as { compaction: { summary: string } };
     expect(b.compaction.summary).toBe(a.compaction.summary);
-    expect(a.compaction.summary).toContain("[Session Goal]");
+    expect(a.compaction.summary).toContain("[Recent user directions and discussion]");
   });
 });
 
@@ -1640,11 +1640,11 @@ describe("compaction section composition", () => {
       user("final review"),
     );
     const { compaction } = compileFabricSummary(session, 1000) as { compaction: { summary: string } };
-    // Goal truncated to 3 lines + ellipsis.
-    expect(compaction.summary).toContain("goal line one");
-    expect(compaction.summary).toContain("goal line three");
-    expect(compaction.summary).toContain("…");
-    expect(compaction.summary).toContain("- second request");
-    expect(compaction.summary).not.toContain("- final review");
+    // Recent instructions retain every paragraph; the raw final review is
+    // addressed rather than duplicated across the cut.
+    expect(compaction.summary).toContain("goal line one\ngoal line two\ngoal line three\ngoal line four");
+    expect(compaction.summary).toContain("second request");
+    expect(compaction.summary).not.toContain("final review");
+    expect(compaction.summary).toContain("retained raw");
   });
 });

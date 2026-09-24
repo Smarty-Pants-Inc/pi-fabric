@@ -299,7 +299,7 @@ silent fallback to blocking execution.
 
 Live-session branch snapshots carry entry IDs only, are taken when each
 queued request starts, and are checked again before returning its result.
-Navigation during retrieval rejects the request instead of returning evidence
+Navigation during retrieval rejects the request to avoid returning evidence
 from a different live branch. Registered host-backed adapters remain in their
 authorized owning host and keep their existing cancellation contracts.
 

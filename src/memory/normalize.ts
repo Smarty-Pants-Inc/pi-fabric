@@ -6,6 +6,7 @@ import {
 } from "../compaction/branch-details.js";
 import { readFabricProjectionTrace } from "../compaction/trace-events.js";
 import type { SessionLineage } from "./lineage.js";
+import { lineageSelected } from "../verified/policy.js";
 
 export interface MemoryIndexPrivacyPolicy {
   indexThinking: boolean;
@@ -582,7 +583,10 @@ export const normalizeRecords = (
     const type = asString(raw.type);
     const ordinal = rawOrdinal;
     rawOrdinal += 1;
-    if (options.lineage && options.lineage.entryOrdinals !== null && !options.lineage.entryOrdinals.has(ordinal)) {
+    if (!lineageSelected(
+      !options.lineage || options.lineage.entryOrdinals === null,
+      options.lineage?.entryOrdinals?.has(ordinal) ?? false,
+    )) {
       continue;
     }
     if (

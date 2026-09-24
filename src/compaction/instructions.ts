@@ -21,6 +21,7 @@ export interface CompactionInstructionPolicy {
   truncated: boolean;
   preserveCount: number;
   omittedPreserveCount: number;
+  renderedOmittedBytes?: number;
 }
 
 type CompactionInstructionErrorCode =

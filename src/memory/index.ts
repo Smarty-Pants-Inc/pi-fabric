@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { coverageComplete } from "../verified/policy.js";
 import fs from "node:fs";
 import path from "node:path";
 import { foldSessionDigest, type SessionDigest } from "./digest.js";
@@ -459,7 +460,7 @@ export const fitDigestCache = (digest: DigestShard, maxBytes: number): DigestSha
   applyCacheMetrics(digest);
   if (digest.cacheBytes <= maxBytes) return digest;
 
-  digest.indexCoverage.complete = false;
+  digest.indexCoverage.complete = coverageComplete(digest.indexCoverage.complete, true);
   if (!digest.indexCoverage.reasons.includes("max_cold_cache_bytes")) {
     digest.indexCoverage.reasons.push("max_cold_cache_bytes");
   }

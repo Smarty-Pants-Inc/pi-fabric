@@ -118,7 +118,7 @@ describe("MeshStore", () => {
     expect(fs.readFileSync(statePath, "utf8")).toBe("");
   });
 
-  it("quarantines unrecoverable state JSON and keeps serving an empty table", async () => {
+  it("keeps unreadable state as a write barrier while serving an empty table", async () => {
     const store = createStore();
     const statePath = path.join(store.root, "state.json");
     fs.mkdirSync(store.root, { recursive: true });
@@ -126,17 +126,9 @@ describe("MeshStore", () => {
 
     expect(store.listAll()).toEqual([]);
     expect(store.get("shared/value")).toBeUndefined();
-    expect(fs.existsSync(statePath)).toBe(false);
-    const damaged = fs.readdirSync(store.root).filter((name) => name.startsWith("state.json.damaged."));
-    expect(damaged).toHaveLength(1);
-    expect(fs.readFileSync(path.join(store.root, damaged[0]!), "utf8")).toBe("{");
-
-    const restored = await store.put({ key: "shared/value", value: { revision: 1 }, identity });
-    expect(restored.value).toEqual({ revision: 1 });
-    expect(store.get("shared/value")?.value).toEqual({ revision: 1 });
-    expect(JSON.parse(fs.readFileSync(statePath, "utf8")).entries["shared/value"].value).toEqual({
-      revision: 1,
-    });
+    expect(fs.readFileSync(statePath, "utf8")).toBe("{");
+    await expect(store.put({ key: "shared/value", value: { revision: 1 }, identity })).rejects.toThrow("invalid state format");
+    expect(fs.readFileSync(statePath, "utf8")).toBe("{");
   });
 
   it("supports complete internal prefix scans independently of public read limits", async () => {
@@ -182,13 +174,15 @@ describe("MeshStore", () => {
     expect(store.get("tasks/task-1")?.value).toEqual({ status: "claimed", owner: "worker" });
     expect(store.list("tasks/")).toHaveLength(1);
 
-    await store.delete({ key: "tasks/task-1", ifVersion: claimed.version });
+    expect(await store.delete({ key: "tasks/task-1", ifVersion: claimed.version })).toEqual({
+      deleted: true, version: 3,
+    });
     const recreated = await store.put({
       key: "tasks/task-1",
       value: { status: "ready-again" },
       identity,
     });
-    expect(recreated.version).toBe(3);
+    expect(recreated.version).toBe(4);
     await expect(
       store.put({
         key: "tasks/task-1",
@@ -244,7 +238,7 @@ describe("MeshStore", () => {
 
     expect(state.tombstoneOrder).toEqual(["state/b", "state/c"]);
     expect(state.versions["state/a"]).toBeUndefined();
-    expect(recreated.version).toBe(1);
+    expect(recreated.version).toBe(7);
   });
 });
 

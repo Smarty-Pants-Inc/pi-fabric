@@ -164,6 +164,36 @@ describe("component calculus laws", () => {
     await registry.close();
   });
 
+  it("does not lose a conflicting 65th resource before installing a revertible effect", async () => {
+    const registry = new ActionRegistry();
+    const supervisor = new FabricComponentSupervisor(registry, { invocationContext });
+    let landed = false;
+    try {
+      await supervisor.start({ id: "large", component: "large" }, {
+        name: "large", guarantee: "revertible",
+        activate(context) {
+          context.defer(() => {}, {
+            resources: [...Array.from({ length: 64 }, (_, i) => `resource:${i}`), "shared"],
+            ordering: "ordered",
+          });
+        },
+      });
+      await expect(supervisor.start({ id: "peer", component: "peer" }, {
+        name: "peer", guarantee: "revertible",
+        async activate(context) {
+          await context.effect(() => { landed = true; return () => {}; }, {
+            resources: ["shared"], ordering: "ordered",
+          });
+        },
+      })).rejects.toThrow("non-independent effects");
+      expect(landed).toBe(false);
+      expect(supervisor.status("peer").state).toBe("failed");
+    } finally {
+      await supervisor.close();
+      await registry.close();
+    }
+  });
+
   it("refuses to truncate the evidence needed for a revertible guarantee", async () => {
     const registry = new ActionRegistry();
     const supervisor = new FabricComponentSupervisor(registry, { invocationContext });

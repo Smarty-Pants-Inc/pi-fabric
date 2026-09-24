@@ -9,6 +9,7 @@ import {
   writeHandoffSession,
 } from "../src/agents/handoff.js";
 import type { AgentToolResultMessage } from "../src/agents/types.js";
+import { rawContextTokens } from "../src/compaction/hook.js";
 
 const roots: string[] = [];
 const usage = {
@@ -387,13 +388,15 @@ describe("trajectory handoff sessions", () => {
       "toolResult",
     ]);
     const summary = JSON.stringify(messages[0]);
-    expect(summary).toContain("[Session Goal]");
+    expect(summary).toContain("[Recent user directions and discussion]");
     expect(summary).toContain("Implement the token guard 43117");
     expect(summary).toContain("[Compaction Request]");
     expect(summary).toContain("Threshold is 90 percent of the context window");
-    // Projected one-liners clip long scratch text out of the live context...
-    expect(JSON.stringify(messages)).not.toContain("SCRATCH_TAIL_99231");
-    // ...while the append-only file retains the raw branch underneath the compaction marker.
+    // This is visible assistant text, not thinking: the response preceding
+    // the raw user reply now survives in full when it fits the dialogue budget.
+    expect(summary).toContain("SCRATCH_TAIL_99231");
+    expect(summary).toContain("not a verified outcome");
+    // The append-only file still retains the original branch beneath the marker.
     expect(
       child.getEntries().some((entry) => JSON.stringify(entry).includes("SCRATCH_TAIL_99231")),
     ).toBe(true);
@@ -412,6 +415,85 @@ describe("trajectory handoff sessions", () => {
       data: { compaction: { applied: true, firstKeptEntryId: proceedEntryId } },
     });
     expect(messages.at(-1)).toEqual(result);
+  });
+
+  it("bounds huge trajectories through repeated compacted handoffs", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-handoff-bounds-"));
+    roots.push(root);
+    let source = SessionManager.inMemory(root);
+    source.appendMessage({ role: "user", content: "Retain the architectural boundary.", timestamp: 1 });
+    for (let cycle = 0; cycle < 4; cycle++) {
+      for (let i = 0; i < 32; i++) source.appendMessage(assistant([{ type: "text", text: `Work ${i}: ${"x".repeat(16_000)}` }]));
+      const id = `outer-cycle-${cycle}`;
+      source.appendMessage(assistant([{ type: "toolCall", id, name: "fabric_exec", arguments: {} }]));
+      const seed = snapshotHandoffSession(source, undefined, outerResult(id), id);
+      const child = SessionManager.open(writeHandoffSession(seed, root, path.join(root, `child-${cycle}`), undefined, {}));
+      const messages = child.buildSessionContext().messages;
+      expect(messages.filter(m => m.role === "compactionSummary")).toHaveLength(1);
+      expect(rawContextTokens(child.getBranch())).toBeLessThan(30_000);
+      expect(messages.at(-1)).toMatchObject({ role: "toolResult", toolCallId: id });
+      expect(JSON.stringify(messages)).toContain(`\"id\":\"${id}\"`);
+      expect(child.getBranch().filter(e => e.type === "compaction")).toHaveLength(cycle + 1);
+      source = child;
+    }
+  });
+
+  it("budgets the finalized outer result and never leaves its result orphaned", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-handoff-result-"));
+    roots.push(root);
+    const source = SessionManager.inMemory(root);
+    source.appendMessage({ role: "user", content: "Read a large result.", timestamp: 1 });
+    source.appendMessage(assistant([{ type: "toolCall", id: "huge-result", name: "fabric_exec", arguments: {} }]));
+    const result = outerResult("huge-result");
+    result.content = [{ type: "text", text: "x".repeat(500_000) }];
+    const seed = snapshotHandoffSession(source, undefined, result, "huge-result");
+    const child = SessionManager.open(writeHandoffSession(seed, root, path.join(root, "child"), undefined, {}));
+    expect(rawContextTokens(child.getBranch())).toBeLessThan(30_000);
+    expect(child.buildSessionContext().messages.map(m => m.role)).toEqual(["compactionSummary"]);
+    expect(child.getBranch().some(e => e.type === "message" && e.message.role === "toolResult")).toBe(true);
+    expect(source.getBranch().some(e => e.type === "compaction")).toBe(false);
+  });
+
+  it("includes thinking-transfer digests in the budget and compacted prefix", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-handoff-digest-budget-"));
+    roots.push(root);
+    const source = SessionManager.inMemory(root);
+    source.appendMessage({ role: "user", content: `Implement the guard. ${"x".repeat(60_000)}`, timestamp: 1 });
+    source.appendMessage(assistant([
+      { type: "thinking", thinking: "Plan the token guard", thinkingSignature: "opaque" },
+      { type: "toolCall", id: "digest-budget", name: "fabric_exec", arguments: {} },
+    ]));
+    const seed = snapshotHandoffSession(source, undefined, outerResult("digest-budget"), "digest-budget");
+    const child = SessionManager.open(writeHandoffSession(seed, root, path.join(root, "child"), {
+      source: { provider: "anthropic", modelId: "frontier", api: "anthropic-messages" },
+      target: { provider: "openai", modelId: "executor", api: "openai-responses", reasoning: true },
+    }, {}, { contextWindow: 200_000, targetContextRatio: 0.65, reserveTokens: 16384, keepRecentTokens: 0 }));
+    const entries = child.getBranch();
+    const digest = entries.findIndex(e => e.type === "custom_message" && e.customType === "pi-fabric-handoff-thinking");
+    const marker = entries.findIndex(e => e.type === "compaction");
+    expect(digest).toBeGreaterThan(-1);
+    expect(digest).toBeLessThan(marker);
+    expect(entries[marker]).toMatchObject({ tokensBefore: rawContextTokens(entries.slice(0, marker)), details: { budget: { retainedRawTokens: 0 } } });
+    expect(child.buildSessionContext().messages.map(m => m.role)).toEqual(["compactionSummary"]);
+  });
+
+  it("uses destination limits without calibrating from foreign model usage", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-handoff-budget-"));
+    roots.push(root);
+    const source = SessionManager.inMemory(root);
+    source.appendMessage({ role: "user", content: "Continue the bounded task.", timestamp: 1 });
+    for (let i = 0; i < 40; i++) {
+      const message = assistant([{ type: "text", text: "x".repeat(16_000) }]);
+      if (message.role === "assistant") message.usage = { ...usage, input: (i + 1) * 1000, totalTokens: (i + 1) * 1000 };
+      source.appendMessage(message);
+    }
+    source.appendMessage(assistant([{ type: "toolCall", id: "target-budget", name: "fabric_exec", arguments: {} }]));
+    const seed = snapshotHandoffSession(source, undefined, outerResult("target-budget"), "target-budget");
+    const child = SessionManager.open(writeHandoffSession(seed, root, path.join(root, "child"), undefined, {}, { contextWindow: 40_000, targetContextRatio: 0.5, reserveTokens: 5000, keepRecentTokens: 2500 }));
+    const marker = child.getBranch().find(e => e.type === "compaction");
+    expect(marker).toMatchObject({ details: { budget: { contextWindow: 40_000, keepRecentTokens: 2500, rawTailTokenBudget: 2500, tokenScale: 1, fixedOverheadTokens: 0 } } });
+    expect(rawContextTokens(child.getBranch())).toBeLessThan(11_000);
+    expect(() => writeHandoffSession(seed, root, path.join(root, "too-small"), undefined, {}, { contextWindow: 10, targetContextRatio: 0.5, reserveTokens: 5, keepRecentTokens: 0 })).toThrow("Handoff compaction cancelled");
   });
 
   it("applies the default compaction for a bare compact request", () => {
@@ -491,7 +573,6 @@ describe("trajectory handoff sessions", () => {
     });
     expect(child.buildSessionContext().messages.map((message) => message.role)).toEqual([
       "compactionSummary",
-      "toolResult",
     ]);
     expect(child.getEntries().at(-1)).toMatchObject({
       type: "custom",

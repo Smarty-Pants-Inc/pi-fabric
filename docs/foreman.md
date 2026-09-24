@@ -13,12 +13,12 @@ Fabric already has the required primitives for **session-bound, lifecycle-driven
 | Independent long-running controller with local state | `jev.spawn`, `JevProgramManager` in `src/jev/manager.ts` | One persistent QuickJS program; Main does not wait. Session-owned, not restart-durable. |
 | Observe coding progress at a decision point | `observe.events`, `program.nextEvent()`, `JevObservationHost` in `src/jev/observation.ts` | `turn_end` and `agent_settled` are the same local event names used by actors; no polling required. |
 | Bounded observation, history, and instruction evidence | Explicit `observe.include`, queue/age/character bounds; schema-bounded program input and local history | Settlement itself carries no transcript. Cache opted-in turn evidence; never assume hidden history access. Repository instructions are an explicitly supplied snapshot. |
-| Ten parallel semantic questions | One `jev.evaluate` request with ten `noul` questions; `src/jev/client.ts` validates answers | Implementation, tests, requirements, verification, readiness, progress, stuck, off-track, instruction drift, and human need. Code—not Jev—selects actions. |
+| Ten parallel semantic questions | One `jev.evaluate` request with ten `noul` questions; `src/jev/client.ts` validates answers | Implementation, tests, requirements, verification, readiness, progress, stuck, off-track, instruction drift, and human need. Code selects actions; Jev does not. |
 | Continue, steer, or request another pass | `program.advise` / `jev.advise` with `steer` or `followUp` and explicit `triggerTurn` | Same delivery semantics as actors, with additional Jev freshness and feedback gates. Advice is asynchronous, not a pre-tool veto. |
 | Coding workers and independent verifiers | Existing `agents.spawn` / `agents.run`, tool allowlists, worktrees, status/log/wait | Main is the worker in this profile. Main can launch a verifier and execute approved targeted checks; the observer does not acquire worker-launch authority. |
 | Stop/retry an owned child | Existing `agents.stop`, then an explicitly bounded fresh `agents.spawn` | Stop is not rollback; retries are policy, not a primitive. The default sidecar does not stop Main or retry workers automatically. |
 | Structured progress and inspection | `program.emit`, `jev.status`, terminal envelopes | Latest 64 events in memory, not Foreman's atomic state file and append-only durable run store. |
-| Persistent coordination when actually needed | Existing `mesh.put` CAS state, `mesh.publish`, durable actors and participant subscriptions | Requires explicit capabilities and trusted mesh configuration. A Jev run is not a mesh participant or a durable subscription target. |
+| Persistent coordination when needed | Existing `mesh.put` CAS state, `mesh.publish`, durable actors and participant subscriptions | Requires explicit capabilities and trusted mesh configuration. A Jev run is not a mesh participant or a durable subscription target. |
 | Bounded cost and interruption | Program limits, host ceilings, `jev.stop`, shared Main halt path | Main abort/Escape, tree navigation, and provider retirement cancel observers. Token usage is post-request, not a hard dollar cap. |
 
 `FabricRuntimeState.dispatchHostEvent` feeds both actors and Jev from the same lifecycle, while `haltAdvisors` stops both. Jev is available with mesh disabled. Normal reasoning actors may receive a sanitized recent transcript and use broader host events; Jev deliberately requires an explicit text projection and exposes a smaller event allowlist. That difference is an authorization boundary, not a reason to add implicit transcript access.
@@ -35,7 +35,7 @@ The skill ships an executable starter in both kernel trees. The Python entry poi
 4. `FINISH_REVIEW` is only a candidate for Main's acceptance review. Main must inspect independent verifier findings and actual targeted test/build results before claiming completion. Semantic scores and verifier prose are not passing checks.
 5. The observer retires on new input, escalation, a finish-review candidate, inference failure, or its budgets. Terminal `completed` means the program returned valid output, not that the software job is complete. Main inspects `result.outcome`.
 
-Requested limits are 15 minutes, 20 assessments, 600 host calls, 40,000 reported tokens, and 120 consumed events, clamped to trusted host ceilings. Inference failure ends the profile with a labeled escalation rather than spinning on 429/529 or guessing an answer. Read [Jev's budget and auth rules](jev.md) before launch. No live API test is necessary to install or verify the skill.
+Requested limits are 15 minutes, 20 assessments, 600 host calls, 40,000 reported tokens, and 120 consumed events, clamped to trusted host ceilings. Inference failure ends the profile with a labeled escalation, without spinning on 429/529 or guessing an answer. Read [Jev's budget and auth rules](jev.md) before launch. No live API test is necessary to install or verify the skill.
 
 ### Delivery is deliberately bounded
 
@@ -47,7 +47,7 @@ Escalation and limit outcomes stop the observer, not Main. Even an accepted paus
 
 - Main replaces the Codex App Server worker. Existing Pi/Claude runners can be composed separately; no new Codex App Server transport is implied.
 - Turn/settlement boundaries replace streamed subprocess output and periodic observations, as requested. Silence causes no inference.
-- Bounded selected evidence replaces automatic Git/shell observation. The program has no shell authority and no secret/history access. If the instruction snapshot changes, review and explicitly replace the observer rather than assume it refreshed.
+- Bounded selected evidence replaces automatic Git/shell observation. The program has no shell authority and no secret/history access. If the instruction snapshot changes, review and explicitly replace the observer; do not assume it refreshed.
 - Jev programs do not survive host restarts. In-memory status is not durable recovery. Existing mesh primitives can store explicit checkpoints, but they do not resume a lost QuickJS context or make effects exactly once.
 - The skill does not weaken feedback prevention to reproduce an unbounded factory loop. Use a reasoning actor when persistent conversational supervision with its different context/lifecycle contract is desired.
 

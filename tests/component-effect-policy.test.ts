@@ -11,8 +11,9 @@ describe("component effect policy", () => {
     expect(registrationEffect(trackedRegistration(undefined, "fallback"))).toEqual({ label: "fallback", kind: "transactional", resources: ["*"], ordering: "unknown" });
     const normalized = registrationEffect({ label: " named ", resources: ["", "a", "a", "x".repeat(300)] });
     expect(normalized.label).toBe("named");
-    expect(normalized.resources).toEqual(["a", "x".repeat(256)]);
-    expect(registrationEffect({ resources: Array.from({ length: 70 }, (_, index) => String(index)) }).resources).toHaveLength(64);
+    expect(normalized.resources).toEqual(["*"]);
+    expect(registrationEffect({ resources: ["a", "a", "b"] }).resources).toEqual(["a", "b"]);
+    expect(registrationEffect({ resources: Array.from({ length: 70 }, (_, index) => String(index)) }).resources).toEqual(["*"]);
   });
 
   it("ignores read-only actions and projects effectful action metadata", () => {

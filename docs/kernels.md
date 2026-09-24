@@ -22,14 +22,14 @@ Process runtimes can import native modules from guest code: Node guests use `awa
 
 ### The Bun namespace in Bun guests
 
-When **Runtime (TS)** is `bun-process`, guest programs receive the child's real Bun module namespace as the `__bun` global — no import needed:
+When **Runtime (TS)** is `bun-process`, guest programs receive the child's real Bun module namespace as the `__bun` global, with no import needed:
 
 ```ts
 const config = await __bun.file("/tmp/config.json").json();
 const files = [...new __bun.Glob("**/*.ts").scanSync({ cwd: "src" })];
 ```
 
-`__bun` is `undefined` under `node-process` and `quickjs`; the child resolves the Bun specifier only when it actually runs under Bun. Namespace objects come from the child's module realm, so prefer structural checks over `instanceof` across the sandbox boundary.
+`__bun` is `undefined` under `node-process` and `quickjs`; the child resolves the Bun specifier only when it runs under Bun. Namespace objects come from the child's module realm, so prefer structural checks over `instanceof` across the sandbox boundary.
 
 See [configuration](configuration.md) for save scopes, timeout ceilings, result formatting, and the full reference.
 

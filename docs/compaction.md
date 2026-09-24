@@ -64,18 +64,18 @@ defers overflow and manual compactions.
 5. **Serialization is deterministic and bounded.** Identical branch entries and instructions produce byte-identical output. The rendered result is at most 32 KiB in UTF-8.
 6. **The nominal model window is the safety boundary.** Fabric never treats it as a target to fill. Fabric calibrates Pi's structural token estimate against `preparation.tokensBefore`, retains the largest closure-safe suffix within Pi's bounded `keepRecentTokens` continuity budget, and treats the configured occupancy ratio, Pi response reserve, estimator-error margin, and pre-compaction size as hard ceilings. Undocumented provider headroom never enters the budget.
 
-These invariants prevent summary-chain drift and deterministic
+These invariants prevent compounding summary-chain drift, not all semantic
 forgetting. Pi replaces the previous rendered summary on each compaction.
-Fabric still re-derives the original goal, cumulative successful file
-addresses, error state, and user scope changes from raw branch history every
-time.
+Fabric re-derives recent dialogue, historical requests, cumulative successful
+file addresses, and error state from raw branch history every time. The
+protected dialogue window is bounded continuity, not permanent decision memory.
 
 ## Loss model and memory
 
 Fabric compaction is **source-lossless and addressably lossless**. The model's bounded continuation view does not stay byte-for-byte lossless:
 
 - Compaction appends a marker. It never deletes or rewrites raw session JSONL. The active parent-linked session branch remains ground truth.
-- The model receives a bounded deterministic projection plus the recent raw continuity tail. Fabric preserves typed goals, declared Fabric run intent paired with aggregate outcomes, file operations, failures, status, and stable addresses through mechanical rules. Arbitrary old prose, tool-output bodies, and thinking may fall out of the inline view.
+- The model receives a bounded deterministic projection plus the recent raw continuity tail. Fabric preserves role-labelled recent dialogue, historical requests, declared Fabric run intent paired with aggregate outcomes, file operations, failures, status, and stable addresses through mechanical rules. Arbitrary old prose, tool-output bodies, and thinking may fall out of the inline view.
 - Every sampled omission records a count and source entry-id range. `memory.expand` can re-read exact untruncated source by stable entry ID or operation address with source-hash and lineage checks.
 - The memory index remains derived and disposable. Compaction works without successful indexing, and it never treats an incomplete index as ground truth. Exact expansion reads session JSONL.
 
@@ -92,7 +92,8 @@ active branch entries ─┬─► live window ─► calibrated token budget �
 ```
 
 - `normalize.ts` converts raw message and top-level `custom_message` entries to typed events. It selects custom content only from typed string or text parts, keeps JSON details depth/node/collection/string/byte bounded, and omits malformed details while otherwise valid content stays. Assistant thinking parts count as deliberation, so normalization never turns them into events. Summaries carry side effects and state, and truncated scratchpad text that could read as fact stays out. The compactor records how many thinking blocks it erased, so the omission stays auditable. Only `toolCallId` pairs each tool call with its result. A completed `fabric_exec` with a non-empty typed `display.name` contributes a bounded declared-intent event that carries its optional `display.description`, aggregate outcome, and call address. A `fabric_exec` result contributes nested events only through a valid `details.trace` V1 guard, or through the separate strict legacy `details.audits` adapter when no `trace` field exists.
-- `projections.ts` computes goal, file, operation-state, turn, status, and transcript views.
+- `dialogue.ts` selects the last three eligible user exchanges and their preceding text-bearing assistant responses, independent of tool-event volume. Fully raw exchanges are excluded before the three-exchange limit; summarized and crossing exchanges remain eligible. It joins text parts from the same assistant entry, excludes thinking, and bounds complete multiline excerpts with explicit omitted-byte markers. It never infers acceptance or supersession from prose.
+- `projections.ts` computes protected dialogue, historical request, file, operation-state, turn, status, and transcript views.
 - `enrichers.ts` permits deterministic optional annotations. Fabric ships no built-in enrichers.
 - `render.ts` independently bounds every rendered block and enforces the global UTF-8 limit.
 - `hook.ts` computes the live cut, selects cumulative source, emits v2 details, and implements Pi/pi-vcc precedence.
@@ -126,25 +127,61 @@ boundary fits, Fabric uses compact-all (`firstKeptEntryId: ""`), and no kept
 side remains to orphan either half. If the rendered deterministic summary
 itself would push the calibrated projection over the target, Fabric cancels
 the compaction to avoid persisting an expanding or over-budget result. If
-model metadata is unavailable, the legacy latest-turn closure-safe cut remains
-as a compatibility fallback.
+model metadata is unavailable, Fabric keeps the legacy closure-safe whole-turn
+cut only when that tail fits `keepRecentTokens` (20,000 by default). Oversized
+turns use the same bounded suffix selector, including assistant boundaries;
+if no legal suffix fits, Fabric compacts everything. Preparation settings
+still apply without a model window. This fallback emits no fabricated model
+window or calibrated budget metadata. Its bound is on structural raw-tail
+estimates plus the bounded summary, not unknown fixed provider overhead.
 
 The live cut determines only what Pi keeps. The summary source is the raw
 active-branch prefix before that new boundary. Normalization skips earlier
-compaction and branch-summary prose within that prefix.
+compaction and branch-summary prose within that prefix. For dialogue selection
+only, Fabric also reads user/assistant text in the kept tail. If an exchange
+crosses the cut, its summarized assistant response stays inline and its user
+reply is addressed as `retained raw`, without duplicating the reply. Fully raw
+exchanges need no summary copy and do not consume protected-window slots.
+Newer raw instructions still take precedence over earlier summarized context.
+This does not change cut selection.
+
+Compacted trajectory handoffs use the resolved destination model window,
+Fabric occupancy ceiling, and Pi's destination-specific compaction settings
+when available. Settings are read at handoff use, respecting project trust.
+Source-model usage does not calibrate a new executor; its budget uses structural
+estimates until target usage exists. The finalized outer tool result and any
+thinking-transfer digest enter the child log before compaction, so neither
+escapes the cut and the outer call/result pair remains closure-safe. A failed
+requested handoff compaction rejects the handoff and prevents the
+uncompacted fork from launching. Without destination metadata, the bounded fallback applies.
 
 ## Bounded sections
 
-Fabric emits the original first user goal first. Later user scope changes and
-the potentially large file, operation-state, and earlier-turn collections use
-deterministic earliest-plus-latest sampling. Every omission records a count
-and a source entry-id range. File lines also carry the source call entry id.
+Fabric leads with protected recent dialogue, then explicit compaction requests
+and historical requests. Each of the last three eligible summarized or
+cross-boundary user exchanges gets up to 3968 bytes including role/address
+headings. User text gets at least half the available text budget when needed;
+short replies leave room for the preceding assistant response. Complete
+multiline text survives whenever the exchange fits. Assistant replies are
+labelled **Historical assistant response (not a verified outcome)**: they may
+contain proposals, explanations, or old progress reports, not necessarily
+current state or accepted instructions. New eligible exchanges can age an
+exchange out; fully raw exchanges and more tool events alone cannot. There is
+no reset keyword detector or task ledger.
 
-Rendered block limits include their headers:
+Historical requests, files, operation-state, and earlier-turn collections still
+use deterministic earliest-plus-latest sampling. Sampled omissions record a
+count and source entry-id range. Protected excerpts instead report omitted
+UTF-8 bytes alongside their entry addresses. Historical requests are evidence
+of earlier instructions, not a reconstructed active mandate.
 
-| Block | UTF-8 limit |
+Rendered block ceilings include their headers. Historical blocks may receive
+less under shared-budget pressure:
+
+| Block | UTF-8 ceiling |
 | --- | ---: |
-| `[Session Goal]` | 4096 bytes |
+| `[Recent user directions and discussion]` | 12288 bytes |
+| `[Historical requests]` | 4096 bytes |
 | `[Compaction Request]` | 3072 bytes |
 | `[Files And Changes]` | 4608 bytes |
 | `[Fabric Activity]` | 2048 bytes |
@@ -154,16 +191,25 @@ Rendered block limits include their headers:
 | collapsed transcript | 5120 bytes |
 | footer | 1536 bytes |
 
-The limits sum below 32 KiB, leaving room for separators. A final UTF-8 guard
-enforces the global limit. Projection limits stay finite: 24 later goals, 24
-file addresses per operation kind, 32 operation-state records, 48 Fabric
-activity records, 32 earlier turns, and 40 transcript events. Omitted source
+These ceilings are not simultaneous reservations. Fabric renders protected
+dialogue and explicit requests first, then subtracts their actual UTF-8 size,
+the footer, separators, and final newline from the unchanged 32 KiB ceiling.
+Historical blocks keep their former ceilings whenever their capped content
+fits the remaining space. Only under pressure are they reduced proportionally
+to demand, reserving headers/omission markers or complete single-line blocks; sampling
+slack passes to later blocks. Small or absent dialogue therefore does not
+unconditionally shrink operational history. The raw-tail budget is unchanged,
+and a final UTF-8 guard remains in place. Projection limits stay finite: three
+eligible recent exchanges, 24 historical requests, 24 file addresses per
+operation kind, 32 operation-state records, 48 Fabric activity records, 32
+earlier turns, and 40 transcript events. Omitted source
 remains executable-addressable through entry-id ranges and the footer recall
 pointer.
 
 ## Sections
 
-- **Session Goal**: up to three bounded lines from the original first user message, followed by sampled later user scope changes.
+- **Recent user directions and discussion**: complete bounded user/preceding-assistant exchanges, with roles and entry IDs. This is source evidence, not an inferred current-goal declaration.
+- **Historical requests**: sampled older user requests, including the original objective once it leaves the recent window. The internal `goal` omission key remains for v2 compatibility.
 - **Compaction Request**: canonicalized, bounded custom instructions. See below.
 - **Files And Changes**: successful typed file-tool addresses grouped as Created, Written, Modified, or Read. `edit` counts as Modified. `write` counts as Written unless a typed result explicitly proves creation.
 - **Fabric Activity**: completed named `fabric_exec` runs as bounded `name → outcome` records that place an em dash between the name and the optional description, followed in source order by phases and significant non-file nested operations, including bash, agents, workflow, mesh, state, MCP, and extension refs. Named runs expose the exact assistant call entry ID while sourced raw, and their typed fact address after branch rehydration. Nested phases and operations expose stable `entryId/subordinal` addresses. The name and outcome are mandatory for a rendered run. The optional description decays first under tighter views.
@@ -183,7 +229,7 @@ through a valid typed `preserve` item or another typed state transition.
 The clean core retains only these mechanical text operations:
 
 - select text from typed user, assistant, top-level custom-message, tool-result, Fabric display-name/description, command-argument, error, phase, ref, and path fields.
-- split user text on literal newlines for bounded goal lines, or select the first line for one-line views.
+- join text parts belonging to one assistant entry; retain multiline dialogue text or select the first line for historical one-line views.
 - trim/collapse whitespace and truncate by fixed character or UTF-8 byte limits.
 - quote bounded user/custom/assistant/tool/error text without interpreting its content.
 - compare typed action/path, action/command, or ref/JSON-arguments identities exactly for resolution.
@@ -224,6 +270,14 @@ validates scalar grammar and surrogate pairing. It checks the preserve count
 before it iterates or canonicalizes values. Plain Pi and manual instructions
 stay explicit bounded text and never run through the typed protocol parser.
 
+Request rendering preserves complete items when they fit the 3 KiB block; it
+does not apply the historical 1024-byte line cap or drop middle items. If the
+block overflows, every item receives a bounded excerpt and explicit byte-loss
+marker. `instructionPolicy.truncated` includes rendering loss, and
+`renderedOmittedBytes` measures it separately from decoder truncation.
+`preserve` remains one-shot input to that compaction, not a durable pin.
+Neither `state.goal` nor state transitions are consulted to infer task intent.
+
 ## Compaction details v2
 
 New summaries emit `details.compactor: "fabric"` and `details.version: 2` with:
@@ -232,7 +286,8 @@ New summaries emit `details.compactor: "fabric"` and `details.version: 2` with:
 - branch, source-entry, event, and live-cut counts.
 - prior recognized Fabric v1/v2 marker counts.
 - per-projection omission counts, the typed preserve count (valid v1 requests cannot exceed the preserve limit), and the structural count of erased assistant thinking blocks.
-- instruction mode, canonicalization, source size, truncation, and preserve counts.
+- instruction mode, canonicalization, source size, decoder/rendering truncation, rendered omitted bytes, and preserve counts.
+- `omittedCounts.dialogueBytes` for protected dialogue clipping (UTF-8 bytes, not event count). These additive fields are optional when reading older v2 records.
 - stable kept/source entry-id addresses and the source timestamp.
 - when continuity budgeting is active: effective window, occupancy ceiling ratio/tokens, continuity target, reserve and reduction ceilings, the binding constraint, Pi reserve/recent settings, raw estimate, calibration scale, fixed overhead, raw-tail budget, retained raw tokens, and Fabric's `projectedTokensAfter`. Pi core independently recomputes its own `estimatedTokensAfter` after persisting the compaction. Legacy v2 records with `strategy: "adaptive"` remain recognized.
 
@@ -304,7 +359,10 @@ never reads branch summary prose. Later compaction can then resolve
 abandoned-branch failures against later exact successes, and custom context, files, and
 activity survive navigation or forks without any prose parsing. Pi supplies
 only the active path or the abandoned `entriesToSummarize` path to each
-compiler, so sibling branches cannot contaminate one another.
+compiler, so sibling branches cannot contaminate one another. Branch rendering
+also protects dialogue available in that supplied path, but the existing typed
+branch envelope does not carry arbitrary assistant responses. This patch does
+not extend decision retention across abandoned branches lacking raw dialogue.
 
 ## pi-vcc precedence
 
@@ -336,10 +394,15 @@ from rendered sections. QA probes follow the same bounded sampling policy as
 projections. The report checks directly rendered samples for content, and it
 validates omitted collections for count and range addressability. Mutation tests
 remove file, error, turn, latest Fabric run intent/outcome/address, and footer
-information to verify that the report detects loss.
+information to verify that the report detects loss. Additional source-derived
+probes require complete bounded, role-labelled recent dialogue excerpts: losing
+a later architecture paragraph, constraint, estimate, or user selection fails
+QA even when historical activity and recall pointers survive. When checking a
+split exchange, pass all normalized events and the summarized-prefix cut index
+so QA can see the retained user reply as well.
 
 Run:
 
 ```sh
-pnpm vitest run tests/compaction-qa.test.ts
+bunx vitest run tests/compaction-qa.test.ts tests/compaction-dialogue.test.ts
 ```

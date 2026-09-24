@@ -81,9 +81,24 @@ riding in on a change the selection did not cover.
 change is about dead exports or the lazy startup graph, never as a routine
 gate.
 
-Publishing runs `prepack`, which is `typecheck && build` (seconds), never the
-suite. After a version bump the artifact is verified through
+Publishing runs `prepack`, which is `proof:check && typecheck && build`, never the
+suite. `proof:check` requires the pinned Bend 2.0.26 compiler; normal builds verify
+the checked-in artifact hashes without requiring Bend. After a version bump the artifact is verified through
 `dist-tags` and `time["<version>"]` in the packument.
+
+## Verified policy kernels
+
+`LAWS.bend`, `proofs/resource-spec.bend`, `proofs/state-spec.bend`,
+`proofs/provider-spec.bend`, `proofs/authority-spec.bend`, and
+`proofs/lifecycle-spec.bend` and `proofs/storage-spec.bend` require independent specification review; never weaken
+a law to make an implementation pass. `PROOF.bend` proves the actual executable source in
+the registered kernel entry points. After changing these sources, the ABI, or the generation
+bridge, run `bun run proof:generate`, `bun run proof:check`, and the targeted
+`tests/verified-kernels.test.ts`, `tests/verified-resources.test.ts`,
+`tests/verified-providers.test.ts`, `tests/verified-authority.test.ts`,
+`tests/verified-lifecycle.test.ts`, `tests/verified-storage.test.ts`, and `tests/verified-artifact.test.ts` plus relevant integration tests. Do not hand-edit
+`src/verified/generated/`. See `docs/verified-kernels.md` for the acceptance ledger
+and explicit host/adapter assumptions. Always finish with `bun run build`.
 
 ## Package manager
 

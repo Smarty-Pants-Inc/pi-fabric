@@ -43,6 +43,11 @@ jobs:
       # Some integration tests execute the published worker entrypoints in dist.
       - name: Build
         run: bun run build
+      # Pi installs packages without peer or dev dependencies; the agent and memory
+      # workers run outside Pi's module aliases, so their imports must resolve there.
+      - name: Package install smoke (no peers, as pi install)
+        if: runner.os == 'Linux'
+        run: bun run smoke:package-install
       - name: Test Windows type-checker regression
         if: runner.os == 'Windows'
         run: bunx vitest run tests/type-checker.test.ts

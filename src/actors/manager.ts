@@ -1309,6 +1309,8 @@ export class ActorManager {
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
+        // A run ended by a stop (agents.stop, a signal) is interrupted, not failing.
+        let runStopped = false;
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
         try {
@@ -1353,6 +1355,7 @@ export class ActorManager {
             await this.#saveActors();
           }
           runCompleted = result.status === "completed";
+          runStopped = result.status === "stopped";
           if (result.status !== "completed") {
             if (actor.responseMode === "directive") {
               // A failed directive run is non-fatal: stay silent and keep the
@@ -1375,7 +1378,7 @@ export class ActorManager {
               };
               this.#recordMessage(actor, silent);
               item.resolve?.(structuredClone(silent));
-              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || result.status === "stopped");
+              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped);
               continue;
             }
             throw new Error(result.error || `Actor run ${result.status}`);
@@ -1445,7 +1448,7 @@ export class ActorManager {
           };
           this.#recordMessage(actor, failed);
           item.reject?.(new Error(message));
-          this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted);
+          this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped);
         } finally {
           await capabilityLease?.release().catch(() => undefined);
           // Retain a durable copy of the run's event log + status in the

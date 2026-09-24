@@ -533,6 +533,38 @@ describe("FabricControlPlane", () => {
     expect(receive).toHaveBeenCalledTimes(1);
   });
 
+  // smarty-dev#367: a retry after an acknowledgement timeout delivered the message twice.
+  it("waits past the deadline for the acknowledgement of a command the owner admitted in time", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const sender = plane(meshRoot, "host:sender", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    const receiver = plane(meshRoot, "host:receiver", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    // Admitted within the 100 ms deadline, acknowledged after it (a slow handler or a
+    // contended mesh lock): the sender must report the delivery, not a timeout.
+    receiver.start(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return { accepted: true, messageId: "late-but-delivered" };
+    });
+    sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "slow ack" }))
+      .resolves.toMatchObject({ acknowledged: true, messageId: "late-but-delivered" });
+  });
+
+  it("still times out, after the deadline plus a bounded grace, when no owner answers", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender", {}, { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    sender.start(() => ({ accepted: false }));
+    const started = Date.now();
+    // No receiver runs. The outcome is unknown, so the error must not promise a safe retry.
+    await expect(sender.request("host:receiver", "agent:target", "steer", { message: "nobody home" }))
+      .rejects.toThrow("the outcome is unknown and it may still be delivered, so a retry can deliver it twice");
+    const waited = Date.now() - started;
+    expect(waited).toBeGreaterThanOrEqual(100 + 200 - 20);   // the deadline plus 2 x 100 ms of grace
+    expect(waited).toBeLessThan(2_000);
+  });
+
   it("surfaces owner rejection instead of reporting an unverified queue", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);

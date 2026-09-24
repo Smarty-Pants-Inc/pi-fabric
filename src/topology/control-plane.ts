@@ -9,6 +9,11 @@ const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
+// The sender keeps waiting this long past the command deadline. The owner admits a
+// command only before its deadline, but its acknowledgement can queue for the mesh lock:
+// without this grace a delivered command was reported as timed out and then retried
+// (smarty-dev#367). A command not admitted by the deadline is acknowledged as expired.
+const MAX_CONTROL_ACK_GRACE_MS = 15_000;
 
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
 
@@ -239,13 +244,19 @@ export class FabricControlPlane {
     );
     const commandId = randomUUID();
     const requestedAt = Date.now();
+    const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
     let pendingRequest: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
       const timer = setTimeout(() => {
         const timedOut = this.#clearPending(commandId);
         if (timedOut) void this.#publishCancellation(commandId, timedOut);
-        reject(new Error("Timed out waiting for the remote Fabric owner to acknowledge " + targetId));
-      }, timeoutMs);
+        // The outcome is unknown: the owner may have admitted the command before its
+        // deadline. A retry is a new command, so it can deliver the message twice.
+        reject(new Error(
+          `Timed out waiting for the remote Fabric owner to acknowledge ${targetId}; ` +
+            "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
+        ));
+      }, timeoutMs + ackGraceMs);
       timer.unref();
       const pending: PendingControlRequest = {
         resolve,

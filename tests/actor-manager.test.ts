@@ -1470,6 +1470,243 @@ describe("ActorManager", () => {
     });
   });
 
+  // smarty-dev#442: an ownership flicker dropped about 20 queued PR events of a busy review
+  // actor. Queued mesh events (no caller) must survive it and run once ownership returns.
+  it.each([false, true])("keeps queued mesh events across an ownership flicker (persistent %s)", async (persistent) => {
+    let owned = true;
+    const { actors, mesh } = setup(persistent, () => owned);
+    const actor = await actors.create({
+      name: "reviewer",
+      instructions: "Review each event.",
+      topics: ["team.pulls"],
+      responseMode: "text",
+    });
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS event-1" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "team.pulls", from, text: "event-2" });
+    await mesh.publish({ topic: "team.pulls", from, text: "event-3" });
+    await waitFor(() => actors.status(actor.id).queued === 2);
+    actors.listOwned();                                            // ownership observed as true
+
+    owned = false;
+    actors.listOwned();                                            // observe the loss: park, abort the run
+    expect(actors.status(actor.id).queued).toBe(0);
+    owned = true;
+    actors.listOwned();                                            // observe the return: queued events come back
+
+    const ran = () => actors.messages(actor.id)
+      .filter((message) => message.direction === "out" && message.runId)
+      .map((message) => String((message as { text?: string }).text ?? "") + " " + message.source);
+    await waitFor(() => ran().length >= 3, 20_000);
+    const inbound = actors.messages(actor.id).filter((message) => message.direction === "in").length;
+    expect(inbound).toBe(3);
+    expect(actors.messages(actor.id).filter((message) => message.error?.startsWith("Dropped a queued event"))).toEqual([]);
+  }, 30_000);
+
+  // Records every actor activation (the manager cleans completed runs out of agents.list()).
+  // hold, when given, delays each run's result until it resolves (a deferred result).
+  const recordRuns = (agents: AgentManager, hold?: () => Promise<void>) => {
+    const runs: Array<{ task: string; startedAt: number; finishedAt?: number }> = [];
+    const run = agents.run.bind(agents);
+    vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+      const entry: { task: string; startedAt: number; finishedAt?: number } = { task: request.task, startedAt: Date.now() };
+      runs.push(entry);
+      try {
+        const result = await run(request, signal);
+        await hold?.();
+        return result;
+      } finally { entry.finishedAt = Date.now(); }
+    });
+    return runs;
+  };
+
+  // Astra review of #36, R1: a run that completes while ownership is elsewhere is recorded,
+  // never parked and run a second time.
+  it("records, and does not rerun, an event whose run completed while ownership was away", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(false, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "LIVE_WITH_PROGRESS once" });
+    // The manager has seen the run's progress, so an abort detaches it and it completes.
+    await waitFor(() => agents.list().some((run) => ((run as { turns?: number }).turns ?? 0) > 0));
+    owned = false;
+    actors.listOwned();                                        // the caller aborts; the progressing run is detached
+    await waitFor(() => actors.messages(actor.id).some((message) => message.error?.startsWith("Dropped a queued event")), 10_000);
+    owned = true;
+    actors.listOwned();
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(runs.filter((run) => run.task.includes("LIVE_WITH_PROGRESS once"))).toHaveLength(1);
+  }, 30_000);
+
+  // Astra review of #36, R2: ESC cancels parked events too, even with their restore already scheduled.
+  it("cancels parked events on an interrupt that arrives before their restore runs", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(false, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    // HANG has no progress, so the ownership loss always aborts it (a progressing run detaches).
+    await mesh.publish({ topic: "team.pulls", from, text: "HANG first" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "team.pulls", from, text: "held-2" });
+    await mesh.publish({ topic: "team.pulls", from, text: "held-3" });
+    await waitFor(() => actors.status(actor.id).queued === 2);
+    owned = false;
+    actors.listOwned();                                        // held-2 and held-3 park
+    owned = true;
+    actors.listOwned();                                        // their restore is scheduled ...
+    actors.haltAll();                                          // ... and ESC arrives first
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(runs.filter((run) => run.task.includes("held-"))).toEqual([]);
+    // Both parked events, and the in-flight one the ownership loss aborted, are recorded dropped.
+    expect(actors.messages(actor.id).filter((message) => message.error?.includes("halted by user interrupt"))).toHaveLength(3);
+  }, 30_000);
+
+  // Astra review of #36, R2 follow-up: ESC after an ownership loss cancels the aborted in-flight
+  // event; the next input must not run it again.
+  it("drops, and never reruns, an in-flight event that an ownership loss aborted and ESC cancelled", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(false, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "HANG cancel-me" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    owned = false;
+    actors.listOwned();                                        // ownership loss aborts the run
+    actors.haltAll();                                          // ESC before the aborted run returns
+    await waitFor(() => actors.messages(actor.id).some((message) => message.error?.includes("halted by user interrupt")), 10_000);
+    owned = true;
+    actors.listOwned();
+    actors.dispatchHostEvent("input", {});                     // the user resumes
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    expect(runs.filter((run) => run.task.includes("cancel-me"))).toHaveLength(1);
+  }, 30_000);
+
+  // review/astra on 7b47958, R2 and R4 across a persistent reload: the old drain's deferred
+  // result arrives after ownership returned (a new actor object) and after ESC.
+  it("cancels, and records on the live actor, a deferred in-flight event across a persistent reload", async () => {
+    let owned = true;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const { actors, mesh, agents } = setup(true, () => owned);
+    const runs = recordRuns(agents, () => held);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "HANG deferred" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    owned = false;
+    actors.listOwned();                                        // aborts the run; its result is held back
+    owned = true;
+    actors.listOwned();                                        // persistent reload: a new actor object
+    actors.haltAll();                                          // ESC while the old drain still waits
+    release();
+    await waitFor(() => actors.messages(actor.id).some((message) => message.error?.includes("halted by user interrupt")), 10_000);
+    actors.dispatchHostEvent("input", {});                     // the user resumes
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    expect(runs.filter((run) => run.task.includes("HANG deferred"))).toHaveLength(1);
+  }, 30_000);
+
+  // review/astra on ffc39e8, R5: restored events keep their freshness across a persistent reload.
+  it("runs the latest restored event, and keeps older ones stale, across a persistent ownership flip", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(true, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({
+      name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text",
+      validWhile: { version: 1, source: "({ activation, current }) => activation.sequence === current.latestActivationSequence" },
+    });
+    actors.listOwned();
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS older" });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS newest" });
+    await waitFor(() => actors.status(actor.id).queued === 2);
+    owned = false;
+    actors.listOwned();                                        // both queued events park
+    owned = true;
+    actors.listOwned();                                        // persistent reload: a new actor object
+    await waitFor(() => runs.some((run) => run.task.includes("newest") && run.finishedAt !== undefined), 15_000);
+    expect(runs.filter((run) => run.task.includes("newest"))).toHaveLength(1);
+    expect(runs.filter((run) => run.task.includes("older"))).toEqual([]);
+    expect(actors.messages(actor.id).some((message) => message.stale)).toBe(true);
+  }, 30_000);
+
+  // review/astra on ffc39e8, R6: a registry resync that replaces an unowned actor parks the
+  // aborted in-flight event for retry, like an ownership refresh does.
+  it.each(["every actor", "one of two actors"] as const)("retries an in-flight event aborted by a registry resync after ownership returns (%s unowned)", async (scope) => {
+    let owned = true;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let keeper: string | undefined;
+    // "one of two": another actor stays owned, so the resync takes its partial replacement path.
+    const { actors, mesh, agents, root } = setup(true, (id) => owned || id === keeper);
+    const runs = recordRuns(agents, () => held);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    if (scope === "one of two actors") {
+      keeper = (await actors.create({ name: "keeper", instructions: "Keep.", topics: ["team.other"], responseMode: "text" })).id;
+    }
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "HANG resync" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    owned = false;
+    const registry = path.join(root, "actors", "actors.json");
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(registry, later, later);                     // another host rewrote the registry
+    actors.listOwned();                                        // the resync replaces the unowned actor
+    owned = true;
+    actors.listOwned();                                        // ownership returns before the result
+    release();
+    await waitFor(() => runs.filter((run) => run.task.includes("HANG resync")).length === 2, 15_000);
+    actors.haltAll();
+  }, 30_000);
+
+  // Astra review of #36, R4: a drop recorded while unowned survives the ownership-return reload.
+  it("keeps a drop recorded while unowned across the persistent ownership reload", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(true, () => owned);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "LIVE_WITH_PROGRESS kept" });
+    await waitFor(() => agents.list().some((run) => ((run as { turns?: number }).turns ?? 0) > 0));
+    owned = false;
+    actors.listOwned();                                        // the progressing run is detached and completes unowned
+    await waitFor(() => actors.messages(actor.id).some((message) => message.error?.startsWith("Dropped a queued event")), 10_000);
+    owned = true;
+    actors.listOwned();                                        // persistent reload rebuilds the actor from its registry
+    expect(actors.messages(actor.id).some((message) => message.error?.startsWith("Dropped a queued event"))).toBe(true);
+  }, 30_000);
+
+  // Astra review of #36, R3: after a reload, restored work waits for the old drain's run.
+  it("runs restored events only after the reloaded actor's previous run settles", async () => {
+    let owned = true;
+    const { actors, mesh, agents } = setup(true, () => owned);
+    const runs = recordRuns(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    actors.listOwned();
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS serial-1" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await mesh.publish({ topic: "team.pulls", from, text: "serial-2" });
+    await waitFor(() => actors.status(actor.id).queued === 1);
+    await waitFor(() => agents.list().some((run) => ((run as { turns?: number }).turns ?? 0) > 0));
+    owned = false;
+    actors.listOwned();
+    owned = true;
+    actors.listOwned();                                        // reload: new actor object, serial-2 restored
+    await waitFor(() => runs.some((run) => run.task.includes("serial-2") && run.finishedAt !== undefined), 15_000);
+    const first = runs.filter((run) => run.task.includes("serial-1"));
+    const second = runs.filter((run) => run.task.includes("serial-2"));
+    expect(first).toHaveLength(1);                             // the detached run was not restarted
+    expect(second).toHaveLength(1);
+    expect(second[0]!.startedAt).toBeGreaterThanOrEqual(first[0]!.finishedAt!);
+  }, 30_000);
+
   it("routes host events and durable topic events to subscriptions", async () => {
     const { actors, mesh } = setup();
     const actor = await actors.create({

@@ -107,6 +107,10 @@ interface ManagedActor {
   lastRunId?: string;
   lastError?: string;
   abortController?: AbortController;
+  /** The in-flight run an ownership change aborted: its event is parked, not failed. */
+  ownershipAbort?: AbortController;
+  /** The in-flight run an explicit cancel (ESC) aborted: its event is dropped, never retried. */
+  cancelAbort?: AbortController;
   drain?: Promise<void>;
   draining: boolean;
 }
@@ -201,6 +205,10 @@ export class ActorRegistryOwnershipError extends Error {
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
+  /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
+  readonly #parked = new Map<string, ActorQueueItem[]>();
+  /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
+  readonly #draining = new Map<string, ManagedActor>();
   readonly #actorRoot: string;
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
@@ -465,13 +473,8 @@ export class ActorManager {
     this.#ceded.add(actor.id);
     this.#ownership.set(actor.id, false);
     actor.abortController?.abort();
-    for (const item of actor.queue.splice(0)) {
-      item.reject?.(
-        new Error(
-          `Fabric actor ${actor.name} (${actor.id}) residency transferred to another host`,
-        ),
-      );
-    }
+    this.#drop(actor, [...actor.queue.splice(0), ...this.#takeParked(actor.id)],
+      `Fabric actor ${actor.name} (${actor.id}) residency transferred to another host`);
     if (actor.status !== "stopped") actor.status = "idle";
     actor.updatedAt = Date.now();
     this.#emitChange();
@@ -1030,6 +1033,7 @@ export class ActorManager {
     if (event === "input" && this.#halted) {
       this.#halted = false;
       this.#meshMonitor.schedule();
+      this.#scheduleRestoreParked();
     }
     if (this.#halted) return false;
     if (MAIN_REVISION_EVENTS.has(event)) this.#mainRevision++;
@@ -1044,13 +1048,8 @@ export class ActorManager {
     actor.status = "stopped";
     actor.updatedAt = Date.now();
     actor.abortController?.abort();
-    for (const item of actor.queue.splice(0)) {
-      item.reject?.(
-        new Error(
-          `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`,
-        ),
-      );
-    }
+    this.#drop(actor, [...actor.queue.splice(0), ...this.#takeParked(actor.id)],
+      `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
     await this.mesh
       .publish({
@@ -1092,6 +1091,21 @@ export class ActorManager {
     // work) so an idle-but-subscribed actor is not re-armed by the interrupt's
     // own settle events.
     this.#halted = true;
+    // An explicit cancel beats an ownership retry: a run that an ownership loss already
+    // aborted must not be parked and run again after the interrupt. Drains are found by
+    // actor id, because a reload may have replaced the object an older drain still runs on.
+    for (const actor of new Set([...this.#actors.values(), ...this.#draining.values()])) {
+      if (!actor.abortController) continue;
+      actor.cancelAbort = actor.abortController;
+      delete actor.ownershipAbort;
+      if (this.#actors.get(actor.id) !== actor) actor.abortController.abort();
+    }
+    // Parked events are queued work too: an interrupt cancels them (recorded).
+    for (const [id, items] of [...this.#parked]) {
+      this.#parked.delete(id);
+      const owner = this.#actors.get(id);
+      if (owner) this.#drop(owner, items, `Fabric actor ${owner.name} (${owner.id}) halted by user interrupt`);
+    }
     for (const actor of this.#actors.values()) {
       if (!this.#canManage(actor.id) || actor.status === "stopped") continue;
       const inFlight = actor.abortController !== undefined;
@@ -1100,11 +1114,8 @@ export class ActorManager {
       // actor to idle once the aborted agent settles.
       actor.abortController?.abort();
       // Reject every queued item so subsequent execution is cancelled.
-      for (const item of actor.queue.splice(0)) {
-        item.reject?.(
-          new Error(`Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`),
-        );
-      }
+      this.#drop(actor, actor.queue.splice(0),
+        `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
       actor.updatedAt = Date.now();
       // If no run is in flight, settle the status now; otherwise the drain
       // loop's finally block owns the transition once the run settles.
@@ -1265,6 +1276,9 @@ export class ActorManager {
   #ensureDrain(actor: ManagedActor): void {
     if (
       actor.draining ||
+      // One activation at a time per actor session, even across a registry reload that
+      // replaced the object an older drain still runs on (smarty-dev#442).
+      this.#draining.has(actor.id) ||
       actor.status === "stopped" ||
       this.#closing ||
       !this.#canManage(actor.id)
@@ -1272,6 +1286,7 @@ export class ActorManager {
       return;
     }
     actor.draining = true;
+    this.#draining.set(actor.id, actor);
     const drain = this.#drain(actor);
     actor.drain = drain;
     const release = (): void => {
@@ -1346,6 +1361,24 @@ export class ActorManager {
             abortController.signal,
           );
           runId = result.id;
+          // Captured before any check that can throw: a completed run is never parked and
+          // rerun, whatever happens to ownership afterwards.
+          runCompleted = result.status === "completed";
+          runStopped = result.status === "stopped";
+          const cancelled = actor.cancelAbort === abortController;
+          if (cancelled) delete actor.cancelAbort;
+          // A caller hears the run's own outcome; an event without one is recorded dropped.
+          if (cancelled && !runCompleted && !item.resolve && !item.reject) {
+            this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
+            continue;
+          }
+          if (actor.ownershipAbort === abortController && result.status !== "completed") {
+            // An ownership change stopped this run; the event runs again under its owner.
+            delete actor.ownershipAbort;
+            this.#park(actor, [item], `Fabric actor ${actor.name} (${actor.id}) ownership moved during a run`);
+            this.#scheduleRestoreParked();
+            continue;
+          }
           if (!this.#canManage(actor.id)) {
             throw new Error(`Fabric actor ownership moved during run: ${actor.id}`);
           }
@@ -1354,8 +1387,6 @@ export class ActorManager {
             actor.runnerSessionId = result.runnerSessionId;
             await this.#saveActors();
           }
-          runCompleted = result.status === "completed";
-          runStopped = result.status === "stopped";
           if (result.status !== "completed") {
             if (actor.responseMode === "directive") {
               // A failed directive run is non-fatal: stay silent and keep the
@@ -1376,7 +1407,7 @@ export class ActorManager {
                 runId: result.id,
                 usage: result.usage,
               };
-              this.#recordMessage(actor, silent);
+              this.#recordMessage(this.#liveActor(actor), silent);
               item.resolve?.(structuredClone(silent));
               this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped);
               continue;
@@ -1392,10 +1423,10 @@ export class ActorManager {
             throw new Error(`Fabric actor ownership moved before delivery: ${actor.id}`);
           }
           if (!beforeDelivery.valid) {
-            this.#recordStale(actor, item, beforeDelivery.reason, result.id, result.usage);
+            this.#recordStale(this.#liveActor(actor), item, beforeDelivery.reason, result.id, result.usage);
             continue;
           }
-          this.#recordMessage(actor, message);
+          this.#recordMessage(this.#liveActor(actor), message);
           await this.mesh
             .publish({
               topic: "fabric.actor.output",
@@ -1432,8 +1463,22 @@ export class ActorManager {
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          if (!this.#canManage(actor.id)) {
-            item.reject?.(new Error(message));
+          if (actor.cancelAbort === abortController) {
+            delete actor.cancelAbort;
+            if (!runCompleted && !item.resolve && !item.reject) {
+              this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
+              continue;
+            }
+          }
+          const ownershipAborted = actor.ownershipAbort === abortController;
+          if (ownershipAborted) delete actor.ownershipAbort;
+          if (!this.#canManage(actor.id) || ownershipAborted) {
+            // An ownership change cut the run off. An event without a caller is kept for
+            // the next owner run instead of lost (smarty-dev#442); one whose run already
+            // completed is recorded, not rerun, so its side effects do not repeat.
+            if (runCompleted) this.#drop(actor, [item], message);
+            else this.#park(actor, [item], message);
+            this.#scheduleRestoreParked();
             continue;
           }
           actor.lastError = message;
@@ -1446,7 +1491,7 @@ export class ActorManager {
             createdAt: Date.now(),
             error: message,
           };
-          this.#recordMessage(actor, failed);
+          this.#recordMessage(this.#liveActor(actor), failed);
           item.reject?.(new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped);
         } finally {
@@ -1478,6 +1523,10 @@ export class ActorManager {
       // concurrent #ensureDrain observes `draining === false` and starts a
       // fresh drain instead of stranding a just-enqueued item.
       actor.draining = false;
+      if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
+      // A reload may have moved this actor's queue to a new object while this drain ran.
+      const live = this.#actors.get(actor.id);
+      if (live && live !== actor && live.queue.length > 0) queueMicrotask(() => this.#ensureDrain(live));
     }
   }
 
@@ -1886,7 +1935,13 @@ export class ActorManager {
     this.#registryFingerprint = fingerprint;
     const ownsAny = [...this.#actors.keys()].some((id) => this.#ownershipDecision(id));
     if (!ownsAny) {
-      for (const actor of this.#actors.values()) actor.abortController?.abort();
+      const previous = [...this.#actors.values()];
+      for (const actor of this.#actors.values()) {
+        this.#markOwnershipAbort(actor);
+        actor.abortController?.abort();
+        this.#park(actor, actor.queue.splice(0),
+          `Fabric actor ${actor.name} (${actor.id}) reloaded from its registry`);
+      }
       this.#actors.clear();
       this.#ownership.clear();
       this.#locallyCreated.clear();
@@ -1894,15 +1949,22 @@ export class ActorManager {
       for (const actor of this.#actors.values()) {
         this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
       }
+      this.#carryMessages(previous);
+      this.#scheduleRestoreParked();
       return;
     }
     const owned = new Set<string>();
+    const replaced: ManagedActor[] = [];
     for (const [id, actor] of this.#actors) {
       if (this.#ownershipDecision(id)) {
         owned.add(id);
         continue;
       }
+      this.#markOwnershipAbort(actor);
       actor.abortController?.abort();
+      this.#park(actor, actor.queue.splice(0),
+        `Fabric actor ${actor.name} (${actor.id}) is not owned by this host`);
+      replaced.push(actor);
       this.#actors.delete(id);
       this.#ownership.delete(id);
       this.#locallyCreated.delete(id);
@@ -1913,6 +1975,8 @@ export class ActorManager {
         this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
       }
     }
+    this.#carryMessages(replaced);
+    this.#scheduleRestoreParked();
   }
 
   #loadActors(onlyMissing = false): void {
@@ -2278,24 +2342,29 @@ export class ActorManager {
       const next = this.#ownershipDecision(actor.id);
       this.#ownership.set(actor.id, next);
       if (previous && !next) {
+        this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
-        for (const item of actor.queue.splice(0)) {
-          item.reject?.(
-            new Error(
-              `Fabric actor ${actor.name} (${actor.id}) ownership moved to another host`,
-            ),
-          );
-        }
+        this.#park(actor, actor.queue.splice(0),
+          `Fabric actor ${actor.name} (${actor.id}) ownership moved to another host`);
         if (actor.status !== "stopped") actor.status = "idle";
       } else if (!previous && next) {
         acquired = true;
       }
       if (!next) this.#maybeAdoptOrphan(actor);
     }
-    if (!acquired || !this.#persistent || this.#closing) return;
+    if (!acquired || !this.#persistent || this.#closing) {
+      this.#scheduleRestoreParked();
+      return;
+    }
     this.#reloadingOwnership = true;
+    const previous = [...this.#actors.values()];
     try {
-      for (const actor of this.#actors.values()) actor.abortController?.abort();
+      for (const actor of this.#actors.values()) {
+        this.#markOwnershipAbort(actor);
+        actor.abortController?.abort();
+        this.#park(actor, actor.queue.splice(0),
+          `Fabric actor ${actor.name} (${actor.id}) reloaded when its ownership returned`);
+      }
       this.#actors.clear();
       this.#ownership.clear();
       this.#locallyCreated.clear();
@@ -2303,9 +2372,105 @@ export class ActorManager {
       for (const actor of this.#actors.values()) {
         this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
       }
+      this.#carryMessages(previous);
     } finally {
       this.#reloadingOwnership = false;
     }
+    this.#scheduleRestoreParked();
+  }
+
+  // Queued mesh and host events have no caller to tell, and the mesh cursor has already
+  // moved past them, so a transient ownership change must not drop them: they wait here
+  // and run again once this host owns the actor. Caller items (ask, steer) are rejected
+  // as before, so their caller hears about the move (smarty-dev#442).
+  #park(actor: ManagedActor, items: readonly ActorQueueItem[], reason: string): void {
+    const parked = this.#parked.get(actor.id) ?? [];
+    for (const item of items) {
+      if (item.resolve || item.reject) item.reject?.(new Error(reason));
+      else parked.push(item);
+    }
+    while (parked.length > this.meshConfig.actorQueueLimit) {
+      this.#recordDropped(actor, parked.shift()!, `${reason}; the parked queue is full`);
+    }
+    if (parked.length > 0) this.#parked.set(actor.id, parked);
+  }
+
+  // A registry reload replaces actor objects while a drain still runs on the old one; its
+  // results belong on the live object, or they vanish from the actor's messages.
+  #liveActor(actor: ManagedActor): ManagedActor {
+    return this.#actors.get(actor.id) ?? actor;
+  }
+
+  // An in-flight run that an ownership change aborts is parked and retried, not failed,
+  // unless an explicit cancel (ESC) already claimed it.
+  #markOwnershipAbort(actor: ManagedActor): void {
+    if (actor.abortController && actor.cancelAbort !== actor.abortController) {
+      actor.ownershipAbort = actor.abortController;
+    }
+  }
+
+  // A reload rebuilds actor objects from the registry. Messages recorded while this host
+  // did not own an actor (drops above all) were never saved there; keep them. The
+  // activation counter carries over too, so restored events keep their freshness.
+  #carryMessages(previous: readonly ManagedActor[]): void {
+    for (const old of previous) {
+      const live = this.#actors.get(old.id);
+      if (!live || live === old) continue;
+      live.latestActivationSequence = Math.max(live.latestActivationSequence, old.latestActivationSequence);
+      const known = new Set(live.messages.map((message) => message.id));
+      for (const message of old.messages) {
+        if (!known.has(message.id)) this.#recordMessage(live, message);
+      }
+    }
+  }
+
+  #takeParked(id: string): ActorQueueItem[] {
+    const parked = this.#parked.get(id) ?? [];
+    this.#parked.delete(id);
+    return parked;
+  }
+
+  // Explicit cancellation (stop, cede, interrupt): callers are rejected, and every event
+  // without a caller is recorded as dropped instead of vanishing.
+  #drop(actor: ManagedActor, items: readonly ActorQueueItem[], reason: string): void {
+    for (const item of items) {
+      if (item.resolve || item.reject) item.reject?.(new Error(reason));
+      else this.#recordDropped(actor, item, reason);
+    }
+  }
+
+  #recordDropped(actor: ManagedActor, item: ActorQueueItem, reason: string): void {
+    // A late result may drop an event on an object a reload has replaced: record it on the live one.
+    this.#recordMessage(this.#actors.get(actor.id) ?? actor, {
+      id: randomUUID(),
+      actorId: actor.id,
+      actorName: actor.name,
+      direction: "out",
+      source: item.source,
+      createdAt: Date.now(),
+      error: `Dropped a queued event: ${reason}`,
+      data: { droppedItemId: item.id },
+    });
+  }
+
+  #scheduleRestoreParked(): void {
+    if (this.#parked.size === 0 || this.#closing) return;
+    queueMicrotask(() => {
+      // An interrupt holds parked work until the user resumes (the halt gate).
+      if (this.#halted || this.#closing) return;
+      for (const [id, items] of [...this.#parked]) {
+        const actor = this.#actors.get(id);
+        if (!actor || actor.status === "stopped" || !this.#canManageCached(id)) continue;
+        this.#parked.delete(id);
+        actor.queue.unshift(...items);
+        while (actor.queue.length > this.meshConfig.actorQueueLimit) {
+          this.#recordDropped(actor, actor.queue.pop()!, "the queue was full when parked events returned");
+        }
+        actor.status = "queued";
+        actor.updatedAt = Date.now();
+        this.#ensureDrain(actor);
+      }
+    });
   }
 
   #canManageCached(id: string): boolean {

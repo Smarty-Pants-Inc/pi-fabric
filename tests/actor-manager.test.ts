@@ -84,6 +84,69 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+// smarty-dev#448: presence writes lost on a contended mesh lock left the mesh without a new
+// actor, or with a removed one.
+describe("ActorManager presence under a stalled mesh lock", () => {
+  const stalledSetup = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-presence-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { lockTimeoutMs: 150 });
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const identity: MeshIdentity = { id: "session:presence", name: "main", kind: "main", sessionId: "presence" };
+    const make = () => {
+      const manager = new ActorManager("presence", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+        { actorRoot: path.join(root, "actors"), persistent: true, presenceRetryMs: 50 });
+      actorManagers.push(manager);
+      return manager;
+    };
+    const lockPath = path.join(mesh.root, ".lock");
+    const hold = () => {
+      fs.mkdirSync(mesh.root, { recursive: true });
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+    };
+    const release = () => fs.rmSync(lockPath, { recursive: true, force: true });
+    return { mesh, make, hold, release, identity };
+  };
+
+  it("publishes a new actor's presence once a stalled lock frees", async () => {
+    const { mesh, make, hold, release } = stalledSetup();
+    const actors = make();
+    hold();
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    expect(mesh.get(`actors/presence/${actor.id}`)).toBeUndefined();
+    release();
+    await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
+  }, 20_000);
+
+  it("deletes a removed actor's presence once a stalled lock frees", async () => {
+    const { mesh, make, hold, release } = stalledSetup();
+    const actors = make();
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
+    hold();
+    await actors.remove(actor.id);
+    expect(mesh.get(`actors/presence/${actor.id}`)).toBeDefined();
+    release();
+    await waitFor(() => mesh.get(`actors/presence/${actor.id}`) === undefined, 5_000);
+  }, 20_000);
+
+  it("reaps this session's orphan presence at start, and nothing of another scope or writer", async () => {
+    const { mesh, make, identity } = stalledSetup();
+    const other = { ...identity, id: "session:other" };
+    await mesh.put({ key: "actors/presence/ghost", value: { id: "ghost", scope: "project" }, identity });
+    await mesh.put({ key: "actors/presence/session-scoped", value: { id: "session-scoped", scope: "session" }, identity });
+    await mesh.put({ key: "actors/presence/foreign", value: { id: "foreign", scope: "project" }, identity: other });
+    make();                                                    // project scope (the mesh default)
+    await waitFor(() => mesh.get("actors/presence/ghost") === undefined, 5_000);
+    expect(mesh.get("actors/presence/session-scoped")).toBeDefined();
+    expect(mesh.get("actors/presence/foreign")).toBeDefined();
+  }, 20_000);
+});
+
 describe("ActorManager", () => {
   it("updates inference context on the same identity, preserves policy/history, and restores it", async () => {
     const s = setup(true);

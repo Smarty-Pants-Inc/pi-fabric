@@ -101,6 +101,7 @@ const standalone = await build({
   sourcemap: true,
   metafile: true,
   logLevel: "info",
+  banner: { js: "// Bundles TypeBox (MIT, Copyright (c) 2017-2026 Haydn Paterson); see THIRD_PARTY_NOTICES.md." },
   plugins: [{
     name: "external-except-host-provided",
     setup(pluginBuild) {

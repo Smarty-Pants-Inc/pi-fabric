@@ -448,6 +448,34 @@ export class MeshStore {
     return events.map((event) => jsonClone(event));
   }
 
+  /**
+   * The sequence of the oldest event still in the log, read from its first line. Undefined when
+   * it cannot tell (no log, or no readable event near its start): callers must then keep
+   * anything that depends on an event still being replayable.
+   */
+  oldestSequence(): number | undefined {
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(this.#eventsPath, "r");
+      const readBytes = Math.min(fs.fstatSync(descriptor).size, this.maxEventBytes + 1);
+      const head = Buffer.allocUnsafe(readBytes);
+      const bytesRead = fs.readSync(descriptor, head, 0, readBytes, 0);
+      const text = head.subarray(0, bytesRead).toString("utf8");
+      for (const line of text.slice(0, text.lastIndexOf("\n") + 1).split("\n")) {
+        try {
+          const parsed = JSON.parse(line) as { sequence?: unknown };
+          if (typeof parsed.sequence === "number" && Number.isSafeInteger(parsed.sequence)) return parsed.sequence;
+        } catch { /* skip a malformed line */ }
+      }
+      return undefined;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw error;
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+  }
+
   latestSequence(): number {
     return Math.max(this.#readSequence(), this.#readLastEventSequence());
   }

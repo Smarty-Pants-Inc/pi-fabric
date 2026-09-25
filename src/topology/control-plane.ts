@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
 import type { FabricActorRunBinding } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 
@@ -14,6 +15,8 @@ const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 // without this grace a delivered command was reported as timed out and then retried
 // (smarty-dev#367). A command not admitted by the deadline is acknowledged as expired.
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
+// Records other hosts left in the shared state before smarty-dev#643 are checked this often.
+const LEGACY_SEEN_CLEANUP_MS = 15 * 60 * 1_000;
 
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
 
@@ -94,6 +97,8 @@ interface FabricControlSeenRecord {
   commandId: string;
   targetId: string;
   expiresAt: number;
+  /** The command event's sequence, or an upper bound for a record moved from the shared state. */
+  sequence?: number;
   acceptance?: FabricControlAcceptance;
 }
 
@@ -158,6 +163,15 @@ export class FabricControlPlane {
   #closed = false;
   #handler: FabricControlHandler | undefined;
   #seenCleanupAt = 0;
+  #legacySeenCleanupAt = Date.now();
+  /**
+   * This host's dedupe records with their outcomes. Only this host reads them, so they live in
+   * its own store under the mesh root rather than the shared state that every runtime parses
+   * and every heartbeat rewrites under the one lock (smarty-dev#643). The host id is stable
+   * across reloads. While runtimes before this change may run, each claim is also made in the
+   * shared state (see #acceptCommand).
+   */
+  readonly #seen: MeshStore;
 
   constructor(
     readonly mesh: MeshStore,
@@ -166,6 +180,11 @@ export class FabricControlPlane {
   ) {
     this.#pollMs = Math.max(20, options.pollMs ?? DEFAULT_POLL_MS);
     this.#ackTimeoutMs = Math.max(this.#pollMs * 4, options.acknowledgementTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS);
+    this.#seen = new MeshStore(
+      path.join(mesh.root, "control-seen", createHash("sha256").update(options.hostId).digest("hex").slice(0, 32)),
+      mesh.maxEventBytes,
+      mesh.maxReadEvents,
+    );
     // Replay the retained log from its current generation. Durable claims
     // recover unclaimed commands and make interrupted outcomes explicit without re-execution.
     this.#offset = 0;
@@ -403,6 +422,7 @@ export class FabricControlPlane {
       }
       if (tail.events.length < 100) break;
     }
+    await this.#cleanupSeen(Date.now()).catch(() => undefined);
   }
 
   #acceptAcknowledgement(event: MeshEvent): void {
@@ -435,7 +455,6 @@ export class FabricControlPlane {
       return;
     }
     const now = Date.now();
-    await this.#cleanupSeen(now);
     const deadlineAt = Math.min(
       command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs,
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
@@ -455,7 +474,7 @@ export class FabricControlPlane {
     }
 
     const key = controlSeenKey(this.options.hostId, command.commandId);
-    const duplicate = controlSeenRecord(this.mesh.get(key)?.value);
+    const duplicate = this.#seenRecord(key);
     if (duplicate) {
       if (
         duplicate.hostId === this.options.hostId &&
@@ -475,7 +494,10 @@ export class FabricControlPlane {
 
     let claim;
     try {
-      claim = await this.mesh.put({
+      // One claim authority across versions (smarty-dev#643, phase 1): runtimes before this
+      // change claim only the shared key, so this runtime claims it first and runs the command
+      // only when that claim wins too. The outcome is kept only in this host's own store.
+      await this.mesh.put({
         key,
         value: {
           format: 1,
@@ -487,8 +509,21 @@ export class FabricControlPlane {
         identity: this.identity,
         ifVersion: 0,
       });
+      claim = await this.#seen.put({
+        key,
+        value: {
+          format: 1,
+          hostId: this.options.hostId,
+          commandId: command.commandId,
+          targetId: command.targetId,
+          expiresAt: deadlineAt + this.#ackTimeoutMs,
+          sequence: event.sequence,
+        } satisfies FabricControlSeenRecord,
+        identity: this.identity,
+        ifVersion: 0,
+      });
     } catch {
-      const raced = controlSeenRecord(this.mesh.get(key)?.value);
+      const raced = this.#seenRecord(key);
       if (
         raced?.hostId === this.options.hostId &&
         raced.commandId === command.commandId &&
@@ -511,6 +546,7 @@ export class FabricControlPlane {
       key,
       claim.version,
       deadlineAt,
+      event.sequence,
     );
     if (command.operation === "ask") {
       this.#activeHandlers.add(execution);
@@ -538,6 +574,7 @@ export class FabricControlPlane {
     key: string,
     claimVersion: number,
     deadlineAt: number,
+    sequence: number,
   ): Promise<void> {
     const controller = new AbortController();
     this.#activeCommands.set(command.commandId, {
@@ -553,7 +590,10 @@ export class FabricControlPlane {
     try {
       let acceptance: FabricControlAcceptance;
       try {
-        acceptance = this.#handler
+        // The claim can wait for a lock, or this process can pause after it commits: the deadline
+        // may have passed since admission. An expired command is recorded, not run.
+        if (Date.now() > deadlineAt) acceptance = { accepted: false, error: "Fabric control command expired" };
+        else acceptance = this.#handler
           ? await this.#handler(command, from, controller.signal)
           : { accepted: false, error: "Fabric owner has no control handler" };
       } catch (error) {
@@ -564,7 +604,7 @@ export class FabricControlPlane {
       }
       acceptance = this.#boundedAcceptance(acceptance);
       try {
-        await this.mesh.put({
+        await this.#seen.put({
           key,
           value: {
             format: 1,
@@ -572,6 +612,7 @@ export class FabricControlPlane {
             commandId: command.commandId,
             targetId: command.targetId,
             expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
+            sequence,
             acceptance,
           } satisfies FabricControlSeenRecord,
           identity: this.identity,
@@ -602,9 +643,39 @@ export class FabricControlPlane {
     };
   }
 
+  // This host's record for a command: its own store (with the outcome) first, then the shared
+  // state, where every claim is also made and where runtimes before smarty-dev#643 keep outcomes.
+  #seenRecord(key: string): FabricControlSeenRecord | undefined {
+    return controlSeenRecord(this.#seen.get(key)?.value) ?? controlSeenRecord(this.mesh.get(key)?.value);
+  }
+
   async #cleanupSeen(now: number): Promise<void> {
     if (now - this.#seenCleanupAt < this.#ackTimeoutMs) return;
     this.#seenCleanupAt = now;
+    // A restarting owner replays the retained log from its start, so a record stays while its
+    // command is still in the log: past its expiry, and below the log's oldest sequence.
+    const oldest = this.mesh.oldestSequence();
+    if (oldest !== undefined) {
+      const stale = this.#seen.listAll(CONTROL_SEEN_PREFIX).filter((entry) => {
+        const record = controlSeenRecord(entry.value);
+        return !record || (record.expiresAt < now && record.sequence !== undefined && record.sequence < oldest);
+      });
+      if (stale.length > 0) {
+        await this.#seen.writeBatch({
+          identity: this.identity,
+          ops: stale.map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+        });
+      }
+    }
+    if (now - this.#legacySeenCleanupAt >= LEGACY_SEEN_CLEANUP_MS) {
+      this.#legacySeenCleanupAt = now;
+      await this.#cleanupLegacySeen(now);
+    }
+  }
+
+  // Records left in the shared state by runtimes before smarty-dev#643, any host's: delete one
+  // once it has expired and its command is no longer in the retained log.
+  async #cleanupLegacySeen(now: number): Promise<void> {
     const candidates = this.mesh.listAll(CONTROL_SEEN_PREFIX).flatMap((entry) => {
       const record = controlSeenRecord(entry.value);
       return !record || record.expiresAt < now ? [{ entry, record }] : [];

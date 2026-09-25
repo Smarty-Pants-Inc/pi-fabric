@@ -149,6 +149,28 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage).not.toHaveBeenCalled();
   });
 
+  // smarty-dev#733: org's turn ended aborted at 05:28Z; every later turn came from voice or peer
+  // messages (no typed input), and 7 detached results stayed parked until 10:02Z.
+  it("delivers results parked after an abort to the next turn Main runs, without typed input", async () => {
+    const h = harness();
+    h.boundary("aborted");
+    h.idle();
+    h.emit("agent_settled");
+    h.inbox.enqueue(result("a"));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).not.toHaveBeenCalled();                 // no turn started for results alone
+    h.idle(false);
+    const joined = h.emit("before_agent_start") as { message: { details: { ids: string[] } } };   // a peer message's turn
+    expect(joined.message.details.ids).toEqual(["a"]);
+    h.boundary("stop");
+    h.idle();
+    h.emit("agent_settled");
+    h.inbox.enqueue(result("b"));                                  // later results wake idle Main again
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(h.sendMessage.mock.calls[0]![0].details.ids).toEqual(["b"]);
+  });
+
   it("checks the abort signal even before the aborted turn event arrives", async () => {
     const h = harness();
     Object.defineProperty(h.context, "signal", { value: AbortSignal.abort() });

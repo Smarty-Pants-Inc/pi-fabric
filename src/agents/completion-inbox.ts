@@ -42,6 +42,11 @@ export class AgentCompletionInbox {
       });
     subscribe("before_agent_start", (_event, ctx) => {
         this.#context = ctx;
+        // Any new run ends a suspension, not only typed input: after an abort the inbox must
+        // not start a turn by itself, but results parked since then join the next turn Main
+        // runs for any reason. A voice- or peer-driven session may never see typed input
+        // again, and its results stayed parked for hours (smarty-dev#733).
+        this.#suspended = false;
         let message: CompletionMessage | undefined;
         // Join the user's first inference; do not enqueue an extra turn behind it.
         this.#flush((value) => { message = value; });

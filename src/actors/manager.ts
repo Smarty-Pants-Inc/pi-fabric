@@ -21,7 +21,7 @@ import { AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readJsonlPage } from "../log-tail.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
-import { FABRIC_ACTOR_HOST_EVENTS, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import type {
   FabricActorBindingScope,
   FabricActorDelivery,
@@ -83,6 +83,7 @@ interface ManagedActor {
   responseMode: FabricActorResponseMode;
   triggerTurn: boolean;
   coalesce: boolean;
+  coalesceKey?: string;
   residency: FabricParticipantResidency;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
@@ -132,6 +133,17 @@ const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 const PRESENCE_RETRY_MS = 5_000;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
+const COALESCE_KEY_LOAD_PATTERN = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
+
+// The value at a dotted path in a mesh event's data, when it is a string or a finite number.
+const meshCoalesceValue = (data: unknown, keyPath: string): string | number | undefined => {
+  let value: unknown = data;
+  for (const segment of keyPath.split(".")) {
+    if (typeof value !== "object" || value === null || Array.isArray(value) || !Object.hasOwn(value, segment)) return undefined;
+    value = (value as Record<string, unknown>)[segment];
+  }
+  return typeof value === "string" || (typeof value === "number" && Number.isFinite(value)) ? value : undefined;
+};
 const RESIDENT_HOST_EVENT_TOPIC = "fabric.actor.host-event";
 // A failing actor is silent (a failed directive run stays silent), so after this many
 // consecutive failed activations the host tells the owner's Main once (smarty-dev#390).
@@ -425,6 +437,7 @@ export class ActorManager {
       throw new Error(`Invalid Fabric actor runner: ${String(request.runner)}`);
     }
     validateActorInferenceContext(request.inferenceContext, runner);
+    validateActorCoalesceKey(request.coalesceKey);
     const kernel = this.agents.resolveKernel({
       ...(request.kernel !== undefined ? { kernel: request.kernel } : {}),
       runner,
@@ -452,6 +465,7 @@ export class ActorManager {
       responseMode: request.responseMode ?? "text",
       triggerTurn: deliveryPolicy.triggerTurn,
       coalesce: request.coalesce ?? true,
+      ...(request.coalesceKey ? { coalesceKey: request.coalesceKey } : {}),
       residency,
       runner,
       ...(kernel ? { kernel } : {}),
@@ -633,6 +647,19 @@ export class ActorManager {
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
   }
+  /** Set or clear (null) the queue coalesce key for mesh events (smarty-dev#705). */
+  async setCoalesceKey(id: string, coalesceKey: string | null): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    if (coalesceKey === null) delete actor.coalesceKey;
+    else {
+      validateActorCoalesceKey(coalesceKey);
+      actor.coalesceKey = coalesceKey;
+    }
+    actor.updatedAt = Date.now();
+    await this.#publishPresence(actor);
+    return this.#publicInfo(actor);
+  }
+
 
   /**
    * Replace an existing actor's host-event subscriptions. Already-queued work
@@ -861,6 +888,7 @@ export class ActorManager {
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
+      ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
       ...(actor.requirements.length > 0
         ? { requires: actor.requirements.map((requirement) => ({ ...requirement })) }
         : {}),
@@ -1851,7 +1879,12 @@ export class ActorManager {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);
         } else {
-          this.#enqueue(actor, `mesh:${event.topic}`, event);
+          const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
+          // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
+          // so a joined key could merge two topics' subjects. Keeps the value's type.
+          this.#enqueue(actor, `mesh:${event.topic}`, event, key === undefined ? {} : {
+            coalesceKey: JSON.stringify(["mesh", event.topic, key]),
+          });
         }
         this.#delivered.add(delivery);
         if (this.#delivered.size > DELIVERED_EVENT_MEMORY) {
@@ -2022,6 +2055,7 @@ export class ActorManager {
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
+      ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
       requirements: actor.requirements,
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
@@ -2211,6 +2245,9 @@ export class ActorManager {
         ...(typeof record.timeoutMs === "number" ? { timeoutMs: record.timeoutMs } : {}),
         ...(typeof record.extensions === "boolean" ? { extensions: record.extensions } : {}),
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
+        ...(typeof record.coalesceKey === "string" && COALESCE_KEY_LOAD_PATTERN.test(record.coalesceKey)
+          ? { coalesceKey: record.coalesceKey }
+          : {}),
         requirements,
         ...(typeof record.capabilityDigest === "string"
           ? { capabilityDigest: record.capabilityDigest }
@@ -2325,6 +2362,7 @@ export class ActorManager {
       timeoutMs: actor.timeoutMs ?? this.agents.config.timeoutMs,
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
+      ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
       requirements: actor.requirements.map((requirement) => ({ ...requirement })),
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.missingCapabilities

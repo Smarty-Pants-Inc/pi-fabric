@@ -2234,6 +2234,21 @@ describe("AgentsProvider steering", () => {
     ).rejects.toThrow("Unknown Fabric participant");
   });
 
+  // smarty-dev#705: the queue key for mesh events, set at creation or later.
+  it("creates an actor with a coalesceKey and sets, clears and validates it", async () => {
+    const { provider } = setup();
+    const actor = (await provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", topics: ["github.demo.pulls"], coalesce: false, coalesceKey: "payload.number",
+    }, context)) as { id: string; coalesceKey?: string };
+    expect(actor.coalesceKey).toBe("payload.number");
+    await expect(provider.invoke("setCoalesceKey", { id: actor.id, coalesceKey: null }, context)).resolves.not.toHaveProperty("coalesceKey");
+    await expect(provider.invoke("setCoalesceKey", { id: actor.id, coalesceKey: "payload.pull_request.number" }, context))
+      .resolves.toMatchObject({ coalesceKey: "payload.pull_request.number" });
+    await expect(provider.invoke("setCoalesceKey", { id: actor.id, coalesceKey: "not a path" }, context)).rejects.toThrow("Invalid actor coalesceKey");
+    await expect(provider.invoke("setCoalesceKey", { id: actor.id }, context)).rejects.toThrow("coalesceKey is required");
+    await expect(provider.invoke("create", { name: "bad", instructions: "x", coalesceKey: "" }, context)).rejects.toThrow("Invalid actor coalesceKey");
+  });
+
   it("setSteeringMode routes to a local agent", async () => {
     const { provider, root } = setup();
     const handle = (await provider.invoke(

@@ -6,7 +6,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
-import { FABRIC_ACTOR_HOST_EVENTS, validateActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext } from "./types.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
@@ -159,7 +159,7 @@ export class GlobalActorRegistry {
    * the supplied fields are replaced; the rest are preserved. Re-validates any
    * changed field.
    */
-  update(idOrName: string, patch: Partial<FabricActorRequest>): GlobalActorDefinition {
+  update(idOrName: string, patch: Omit<Partial<FabricActorRequest>, "coalesceKey"> & { coalesceKey?: string | null }): GlobalActorDefinition {
     const existing = resolveDefinition(this.#actors, idOrName);
     if (!existing) throw new Error(`Unknown global actor: ${idOrName}`);
     const merged: FabricActorRequest = {
@@ -193,6 +193,13 @@ export class GlobalActorRegistry {
         : existing.inferenceContext !== undefined
           ? { inferenceContext: existing.inferenceContext }
           : {}),
+      ...(patch.coalesceKey === null
+        ? {}
+        : patch.coalesceKey !== undefined
+          ? { coalesceKey: patch.coalesceKey }
+          : existing.coalesceKey !== undefined
+            ? { coalesceKey: existing.coalesceKey }
+            : {}),
       ...(patch.validWhile !== undefined
         ? { validWhile: patch.validWhile }
         : existing.validWhile
@@ -253,6 +260,7 @@ export class GlobalActorRegistry {
       ...(def.timeoutMs ? { timeoutMs: def.timeoutMs } : {}),
       ...(typeof def.extensions === "boolean" ? { extensions: def.extensions } : {}),
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
+      ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
       ...(def.validWhile ? { validWhile: clone(def.validWhile) } : {}),
     };
     return request;
@@ -305,6 +313,7 @@ export class GlobalActorRegistry {
     const timeoutMs = typeof def.timeoutMs === "number" ? def.timeoutMs : undefined;
     const extensions = typeof def.extensions === "boolean" ? def.extensions : undefined;
     validateActorInferenceContext(def.inferenceContext, runner);
+    validateActorCoalesceKey(def.coalesceKey);
     const requires = normalizeRequirements(def.requires);
     const validWhile = def.validWhile?.version === 1 &&
       typeof def.validWhile.source === "string" &&
@@ -333,6 +342,7 @@ export class GlobalActorRegistry {
       ...(extensions !== undefined ? { extensions } : {}),
       ...(requires && requires.length > 0 ? { requires } : {}),
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
+      ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
       ...(validWhile ? { validWhile } : {}),
     };
   }
@@ -396,6 +406,7 @@ export class GlobalActorRegistry {
       let requires: FabricCapabilityRequirement[] | undefined;
       try {
         validateActorInferenceContext(record.inferenceContext, runner);
+        validateActorCoalesceKey(record.coalesceKey);
         requires = normalizeRequirements(record.requires);
       } catch {
         continue;
@@ -428,6 +439,7 @@ export class GlobalActorRegistry {
         ...(extensions !== undefined ? { extensions } : {}),
         ...(requires && requires.length > 0 ? { requires } : {}),
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
+        ...(record.coalesceKey !== undefined ? { coalesceKey: record.coalesceKey } : {}),
         ...(validWhile ? { validWhile } : {}),
       };
       this.#actors.set(def.id, def);

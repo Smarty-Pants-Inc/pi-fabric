@@ -103,6 +103,16 @@ export function validateActorInferenceContext(value: unknown, runner?: string): 
   }
 }
 
+const COALESCE_KEY_PATTERN = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
+
+/** A dotted path into a mesh event's data, such as "payload.number" (smarty-dev#705). */
+export function validateActorCoalesceKey(value: unknown): asserts value is string | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string" || value.length > 200 || !COALESCE_KEY_PATTERN.test(value)) {
+    throw new Error(`Invalid actor coalesceKey: ${String(value)} (use a dotted path such as payload.number)`);
+  }
+}
+
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 export type FabricActorStatus = "idle" | "queued" | "running" | "stopped";
@@ -187,6 +197,11 @@ export interface FabricActorRequest {
   /** Required for steer/followUp; must be false or omitted for mailbox/nextTurn. */
   triggerTurn?: boolean;
   coalesce?: boolean;
+  /**
+   * A dotted path into a mesh event's data, such as "payload.number". A queued event of the
+   * same topic with the same value there is replaced by the newer one, in its queue place.
+   */
+  coalesceKey?: string;
   /** session actors stop with their Pi host; durable actors transfer to a resident host. */
   residency?: FabricParticipantResidency;
   runner?: FabricAgentRunner;
@@ -232,6 +247,7 @@ export interface FabricActorInfo {
   responseMode: FabricActorResponseMode;
   triggerTurn: boolean;
   coalesce: boolean;
+  coalesceKey?: string;
   residency?: FabricParticipantResidency;
   /** Effective value for this caller after session bindings overlay project defaults. */
   model?: string;

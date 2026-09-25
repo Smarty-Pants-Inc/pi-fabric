@@ -489,6 +489,16 @@ Fabric sanitizes host-event JSON before placing it in the mailbox. The JSON incl
 
 Actors handle one message at a time. By default, they coalesce repeated host events, which is useful for `message_update` and `tool_execution_update`. They restore from the trusted project actor registry.
 
+Mesh events queue one by one. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced, so an event that arrives during a run still gets its own activation. A review actor that reads the current pull request head is the typical case:
+
+```ts
+const reviewers = await agents.actors();
+const reviewer = reviewers.find((actor) => actor.name === "review-astra");
+if (reviewer) await agents.setCoalesceKey({ id: reviewer.id, coalesceKey: "payload.number" });
+```
+
+Pass `coalesceKey` to `agents.create` for a new actor, or `null` to `agents.setCoalesceKey` to clear it.
+
 ### Native asynchronous vision handoff
 
 A vision handoff does not require a separate extension that watches events. Create one persistent actor, select a multimodal model, and subscribe to `input`. Fabric automatically detects and attaches images from the prompt. Passive `steer` sends the description to Main without starting an unrelated idle turn. Set `coalesce: false` to preserve separate image prompts while the vision actor is busy:

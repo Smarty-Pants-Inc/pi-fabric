@@ -1,6 +1,6 @@
 import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
@@ -253,6 +253,7 @@ const actorRequest = (
     );
   }
   validateActorInferenceContext(args.inferenceContext, runner);
+  validateActorCoalesceKey(args.coalesceKey);
   const requestedKernel = checkedKernel(args.kernel);
   const kernelRequest = {
     runner,
@@ -285,6 +286,7 @@ const actorRequest = (
       : {}),
     ...(typeof args.triggerTurn === "boolean" ? { triggerTurn: args.triggerTurn } : {}),
     ...(typeof args.coalesce === "boolean" ? { coalesce: args.coalesce } : {}),
+    ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
     ...(args.residency === "session" || args.residency === "durable"
       ? { residency: args.residency }
       : {}),
@@ -1018,6 +1020,15 @@ export class AgentsProvider implements FabricProvider {
           return this.globalActors.update(String(args.id), { inferenceContext: args.inferenceContext });
         }
         return this.actorManager.setInferenceContext(String(args.id), args.inferenceContext);
+      }
+      case "setCoalesceKey": {
+        const coalesceKey = args.coalesceKey === null ? null : args.coalesceKey;
+        if (coalesceKey !== null) {
+          validateActorCoalesceKey(coalesceKey);
+          if (coalesceKey === undefined) throw new Error("coalesceKey is required (a dotted path, or null to clear)");
+        }
+        if (args.scope === "global") return this.globalActors.update(String(args.id), { coalesceKey });
+        return this.actorManager.setCoalesceKey(String(args.id), coalesceKey);
       }
       case "setEvents": {
         const events = Array.isArray(args.events)

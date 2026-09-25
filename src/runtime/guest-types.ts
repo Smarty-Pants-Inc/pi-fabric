@@ -617,6 +617,8 @@ interface FabricActorRequestBase {
   topics?: string[];
   responseMode?: "text" | "directive";
   coalesce?: boolean;
+  /** Dotted path into a mesh event's data; a queued event with the same value is replaced. */
+  coalesceKey?: string;
   runner?: FabricAgentRunner;
   model?: string;
   thinking?: FabricThinking;
@@ -646,6 +648,7 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   responseMode: "text" | "directive";
   triggerTurn: boolean;
   coalesce: boolean;
+  coalesceKey?: string;
   runner: FabricAgentRunner;
   validWhile?: { version: 1; source: string };
 };
@@ -663,6 +666,7 @@ interface FabricActorInfo {
   responseMode: "text" | "directive";
   triggerTurn: boolean;
   coalesce: boolean;
+  coalesceKey?: string;
   model?: string;
   thinking?: FabricThinking;
   binding?: FabricActorRunBinding & { scope: "session"; sessionId: string; updatedAt?: number };
@@ -756,6 +760,7 @@ interface FabricAgentsApi {
   setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;
   setDeliveryPolicy(args: {
     id: string;

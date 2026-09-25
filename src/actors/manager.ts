@@ -2,6 +2,7 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
+import { reapDeadSessionPresence } from "./presence-reaper.js";
 import os from "node:os";
 import path from "node:path";
 import type { FabricCapabilityRequirement } from "../components/types.js";
@@ -226,6 +227,7 @@ export class ActorManager {
   readonly #rootId: string;
   readonly #meshMonitor: ActorMeshMonitor;
   readonly #relayParticipantSteering: boolean;
+  readonly #deadSessionReap: boolean | { deadAfterMs: number };
   readonly #logs: ActorLogStore;
   readonly #acquireCapabilityView:
     | ((
@@ -292,6 +294,11 @@ export class ActorManager {
       /** With meshCursorPath: on resume, replay only events newer than this (ms). */
       meshReplayAgeMs?: number;
       relayParticipantSteering?: boolean;
+      /**
+       * Reap actor presence of sessions gone for a day, on the retention sweep (smarty-dev#448).
+       * On for the primary scope manager of a persistent runtime; the window is for tests.
+       */
+      reapDeadSessionPresence?: boolean | { deadAfterMs: number };
       retention?: FabricRetentionConfig;
       acquireCapabilityView?(
         requirements: readonly FabricCapabilityRequirement[],
@@ -311,6 +318,7 @@ export class ActorManager {
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
+    this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
     this.#logs = new ActorLogStore(
       mesh,
       meshConfig,
@@ -1866,6 +1874,12 @@ export class ActorManager {
     this.#refreshOwnership();
     for (const actor of this.#actors.values()) {
       if (this.#canManage(actor.id)) this.#logs.pruneRuns(actor, now);
+    }
+    if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
+      void reapDeadSessionPresence(this.mesh, this.identity, {
+        ownSessionId: this.sessionId,
+        ...(typeof this.#deadSessionReap === "object" ? { deadAfterMs: this.#deadSessionReap.deadAfterMs } : {}),
+      }).catch(() => undefined);
     }
   }
 

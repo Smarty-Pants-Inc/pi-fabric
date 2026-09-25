@@ -45,6 +45,8 @@ export class ActorDirectory extends ActorManager {
       ...(persistent ? { actorRoot: roots[secondaryScope] } : {}),
       ...(cursorPaths ? { meshCursorPath: cursorPaths[secondaryScope] } : {}),
       relayParticipantSteering: false,
+      // The primary scope manager already reaps dead sessions' presence for this runtime.
+      reapDeadSessionPresence: false,
       actorScope: secondaryScope,
     });
     this.#defaultScope = defaultScope;

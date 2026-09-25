@@ -533,6 +533,8 @@ If the owner lease and lineage root both disappear, a matching trusted host can 
 
 Registry writes take a stale-safe lock and merge only actors owned by the writer. A local save preserves newer records from another owner.
 
+Each live actor publishes a presence record in the shared mesh state. When a session has been gone for a day, with no host lease, no legacy session entry and no presence write in that time, any runtime on the root removes its leftover presence records on its retention sweep. Each removal is checked against the record's version. A session that comes back publishes its presence again when it loads its actors.
+
 `agents.setModel` and `agents.setThinking` change the current Pi session by default. In project scope, their binding files are separate from `actors.json`. Pass `scope: "project"` to change the shared default; only the owner can do so. Values passed to `ask` or `tell` affect one activation. Fabric resolves values in this order:
 
 ```text

@@ -268,6 +268,71 @@ describe("MeshStore", () => {
     expect(() => store.get("tasks/__proto__")).toThrow("Invalid Fabric mesh key");
   });
 
+  // smarty-dev#557: every read({ after }) parsed the whole log from its first byte; on the fleet
+  // that is 43 MB for each drain of a lifecycle subscription.
+  describe("reads after a sequence", () => {
+    const bytesRead = <T>(run: () => T): { value: T; bytes: number } => {
+      const reads = vi.spyOn(fs, "readSync");
+      try {
+        const value = run();
+        return { value, bytes: reads.mock.results.reduce((sum, result) => sum + (result.value as number), 0) };
+      } finally {
+        reads.mockRestore();
+      }
+    };
+    const sequences = (events: Array<{ sequence: number }>) => events.map((event) => event.sequence);
+
+    it("start where the last read ended and return what a full scan returns", async () => {
+      const store = createStore();
+      for (let index = 1; index <= 200; index++) {
+        await store.publish({ topic: index % 2 ? "odd" : "even", from: identity, text: "x".repeat(500) });
+      }
+      const size = fs.statSync(path.join(store.root, "events.jsonl")).size;
+      expect(sequences(store.read({ after: 0 }))).toEqual(Array.from({ length: 100 }, (_, i) => i + 1));
+      const second = bytesRead(() => store.read({ after: 100 }));
+      expect(sequences(second.value)).toEqual(Array.from({ length: 100 }, (_, i) => i + 101));
+      expect(second.bytes).toBeLessThan(size * 0.6);                      // from the middle, not the start
+      await store.publish({ topic: "odd", from: identity, text: "new" });
+      const next = bytesRead(() => store.read({ after: 200 }));
+      expect(sequences(next.value)).toEqual([201]);
+      expect(next.bytes).toBeLessThan(2_000);                             // only the new line
+      const reference = new MeshStore(store.root, 64 * 1024, 100);         // no hint: a full scan
+      for (const input of [{ after: 200 }, { after: 50, limit: 3 }, { after: 150, topic: "even", limit: 5 }, { after: 199 }]) {
+        expect(sequences(store.read(input))).toEqual(sequences(reference.read(input)));
+      }
+    });
+
+    it("scan the whole log again after a rotation, even when an old offset falls on a line boundary", async () => {
+      const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-rotated-"));
+      roots.push(meshRoot);
+      const store = new MeshStore(meshRoot, 512, 100, { maxEventLogBytes: 3_000, retainedEventLogBytes: 1_200 });
+      // Lines of one length, so the old offset is also a line boundary in the rotated log.
+      const publish = (sequence: number) =>
+        store.publish({ topic: "t", from: identity, text: "x".repeat(120 - String(sequence).length) });
+      for (let sequence = 1; sequence <= 3; sequence++) await publish(sequence);
+      expect(sequences(store.read({ after: 0 }))).toEqual([1, 2, 3]);
+      for (let sequence = 4; sequence <= 40; sequence++) await publish(sequence);
+      expect(fs.readFileSync(path.join(meshRoot, "generation"), "utf8").trim()).not.toBe("0");
+      const expected = sequences(new MeshStore(meshRoot, 512, 100).read({ after: 3 }));
+      expect(expected.at(-1)).toBe(40);
+      expect(sequences(store.read({ after: 3 }))).toEqual(expected);
+    });
+
+    it("scan the whole log again when the remembered offset no longer ends a line", async () => {
+      const store = createStore();
+      await store.publish({ topic: "t", from: identity, text: "a" });
+      for (let index = 2; index <= 5; index++) await store.publish({ topic: "t", from: identity, text: "x".repeat(400) });
+      expect(sequences(store.read({ after: 0 }))).toEqual([1, 2, 3, 4, 5]);
+      await store.publish({ topic: "t", from: identity, text: "x".repeat(400) });
+      await store.publish({ topic: "t", from: identity, text: "x".repeat(400) });
+      // Rewritten in place without its short first line: the same file, every line moved.
+      const log = path.join(store.root, "events.jsonl");
+      const content = fs.readFileSync(log);
+      fs.writeFileSync(log, content.subarray(content.indexOf(0x0a) + 1));
+      expect(sequences(store.read({ after: 5 }))).toEqual([6, 7]);
+    });
+  });
+
   it("compacts oversized event logs and resets stale tail cursors", async () => {
     const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-bounded-"));
     roots.push(meshRoot);

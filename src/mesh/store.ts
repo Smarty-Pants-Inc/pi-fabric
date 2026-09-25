@@ -353,6 +353,8 @@ export class MeshStore {
   readonly #lockTimeoutMs: number;
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
+  /** Where the last read({ after }) scan ended: a later read past that sequence starts there. */
+  #readHint: { generation: number; inode: number; offset: number; sequence: number } | undefined;
   #stateCache:
     | { device: number; inode: number; size: number; modifiedAt: number; parsedAt: number; state: MeshStateFile }
     | undefined;
@@ -572,20 +574,36 @@ export class MeshStore {
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r");
-      const size = fs.fstatSync(descriptor).size;
+      const stat = fs.fstatSync(descriptor);
+      const size = stat.size;
       const events: MeshEvent[] = [];
-      let position = 0;
+      // Sequences rise in log order (appends run under the lock), so every line before the
+      // hint has a sequence at or below it and cannot match a read after it. Without this,
+      // each read scanned the whole log (tens of MB on the fleet) from the start
+      // (smarty-dev#557). A rotated log is a new file and generation, and the hint must end a line.
+      const generation = this.#readGeneration();
+      const hint = this.#readHint?.generation === generation && this.#readHint.inode === stat.ino
+        ? this.#readHint
+        : undefined;
+      let position =
+        hint && hint.sequence <= after && hint.offset <= size && this.#endsLine(descriptor, hint.offset)
+          ? hint.offset
+          : 0;
+      let scanned: { offset: number; sequence: number } | undefined;
       let lineChunks: Buffer[] = [];
       let lineBytes = 0;
       let skippingOversizedLine = false;
       let reachedLimit = false;
 
-      const emitLine = (): void => {
+      const emitLine = (lineEnd?: number): void => {
         if (!skippingOversizedLine && lineBytes > 0) {
           const decoded = Buffer.concat(lineChunks, lineBytes).toString("utf8");
           const line = decoded.endsWith(String.fromCharCode(13)) ? decoded.slice(0, -1) : decoded;
           try {
             const event = JSON.parse(line) as MeshEvent;
+            if (typeof event.sequence === "number" && lineEnd !== undefined) {
+              scanned = { offset: lineEnd, sequence: event.sequence };
+            }
             if (
               typeof event.sequence === "number" &&
               event.sequence > after &&
@@ -606,6 +624,7 @@ export class MeshStore {
         const chunk = Buffer.allocUnsafe(readLength);
         const bytesRead = fs.readSync(descriptor, chunk, 0, readLength, position);
         if (bytesRead <= 0) break;
+        const chunkStart = position;
         position += bytesRead;
         const captured = chunk.subarray(0, bytesRead);
         let segmentStart = 0;
@@ -624,11 +643,14 @@ export class MeshStore {
             }
           }
           if (newline < 0) break;
-          emitLine();
+          emitLine(chunkStart + newline + 1);
           segmentStart = newline + 1;
         }
       }
       if (!reachedLimit && (lineBytes > 0 || skippingOversizedLine)) emitLine();
+      if (scanned && scanned.sequence > (hint?.sequence ?? -1)) {
+        this.#readHint = { generation, inode: stat.ino, ...scanned };
+      }
       return events;
     } catch (error) {
       if (errorCode(error) === "ENOENT") return [];
@@ -636,6 +658,12 @@ export class MeshStore {
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
     }
+  }
+
+  #endsLine(descriptor: number, offset: number): boolean {
+    if (offset === 0) return true;
+    const byte = Buffer.allocUnsafe(1);
+    return fs.readSync(descriptor, byte, 0, 1, offset - 1) === 1 && byte[0] === 0x0a;
   }
 
   #eventMatches(event: MeshEvent, input: { topic?: string; to?: string }): boolean {

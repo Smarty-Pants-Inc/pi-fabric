@@ -77,7 +77,7 @@ import { ResidencyClient } from "../residency/client.js";
 import { ResidentActorClient } from "../residency/actor-client.js";
 import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
-import { AgentMessageRouter } from "./agents-message-router.js";
+import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
@@ -654,7 +654,7 @@ export class AgentsProvider implements FabricProvider {
           if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
         }
         const participant = this.participants.get(id);
-        if (!participant) throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric participant: ${id}`);
+        if (!participant) throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, id);
         return participant;
       }
       case "list":
@@ -1287,7 +1287,7 @@ export class AgentsProvider implements FabricProvider {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
     }
     const participant = this.participants.get(id);
-    if (!participant) throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric participant: ${id}`);
+    if (!participant) throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, id);
     if (!participant.capabilities.includes("stop")) {
       throw new Error(`Fabric participant ${id} cannot be stopped`);
     }

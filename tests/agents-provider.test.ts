@@ -2201,6 +2201,15 @@ describe("AgentsProvider steering", () => {
     ).toBe(true);
   });
 
+  // smarty-dev#447: status and stop said only "Unknown Fabric participant", without the reason.
+  it("says why status and stop cannot resolve an id", async () => {
+    const { provider } = setup();
+    for (const action of ["status", "stop"] as const) {
+      await expect(provider.invoke(action, { id: "session:never" }, context))
+        .rejects.toThrow("Unknown Fabric participant: session:never (no record on this mesh root");
+    }
+  });
+
   it("rejects an unknown remote id instead of broadcasting an unverified steer", async () => {
     const { provider } = setup();
     await expect(

@@ -19,6 +19,7 @@ describe("structured agent results", () => {
     for (const text of [
       '{"action":"silent"}', '  \n{"action": "silent"}\n', '```json\n{"action":"silent"}\n```', '```\n{"action":"silent"}\n```',
       'Here it is:\n```json\n{"action":"silent"}\n```',            // a fence marks the value explicitly
+      '```JSON \n{"action":"silent"}\n```',
     ]) {
       expect(validate(text)).toMatchObject({ status: "completed", value: { action: "silent" } });
     }
@@ -38,6 +39,11 @@ describe("structured agent results", () => {
       // Two fences: which one is the result is ambiguous.
       '```json\n{"action":"message","message":"x"}\n```\nor\n```json\n{"action":"silent"}\n```',
       'Fenced, but not JSON:\n```json\n{action: silent}\n```',
+      // review/astra on #56: a second fence with another tag counts too.
+      '```json\n{"action":"silent"}\n```\nThen:\n```text\nposted the install line\n```',
+      '```json\n{"action":"silent"}\n```\n```typescript\nconst x = 1;\n```',
+      // One fence, but not a JSON one.
+      '```ts\n{"action":"silent"}\n```',
     ];
     for (const text of replies) {
       const result = validate(text);

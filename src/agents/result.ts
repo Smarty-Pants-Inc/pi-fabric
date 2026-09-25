@@ -61,15 +61,19 @@ export const parseStructuredResult = (text: string): unknown => {
   } catch (error) {
     reason = error instanceof Error ? error.message : String(error);
   }
-  const fences = [...trimmed.matchAll(/```(?:json)?\s*\n([\s\S]*?)\n```/gi)];
-  if (fences.length === 1) {
+  // Every code fence counts, whatever its language tag; the one fence must be json or untagged.
+  const fences = [...trimmed.matchAll(/```([^\n`]*)\n([\s\S]*?)\n```/g)];
+  const tag = fences[0]?.[1]?.trim() ?? "";
+  if (fences.length > 1) {
+    reason = `found ${fences.length} code fences`;
+  } else if (fences.length === 1 && tag !== "" && tag.toLowerCase() !== "json") {
+    reason = `the code fence is tagged ${tag}, not json`;
+  } else if (fences.length === 1) {
     try {
-      return JSON.parse(fences[0]![1]!);
+      return JSON.parse(fences[0]![2]!);
     } catch (error) {
       reason = `in the code fence: ${error instanceof Error ? error.message : String(error)}`;
     }
-  } else if (fences.length > 1) {
-    reason = `found ${fences.length} code fences`;
   }
   throw new Error(`the reply must be one JSON value, or have one code fence around it (${reason})`);
 };

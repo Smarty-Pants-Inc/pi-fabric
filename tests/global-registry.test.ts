@@ -63,6 +63,17 @@ describe("GlobalActorRegistry", () => {
     expect(registry.resolve("missing")).toBeUndefined();
   });
 
+  it("lists and reloads a guarded template with validWhile as serialized source", () => {
+    const { agentDir, registry } = setup();
+    const validWhile = { version: 1 as const, source: "({ activation }) => activation.kind !== \"mesh\"" };
+    registry.create({ ...baseRequest, validWhile });
+    for (const listed of [registry.list(), new GlobalActorRegistry(agentDir, 64 * 1024).list()]) {
+      expect(listed).toHaveLength(1);
+      expect(listed[0]!.validWhile).toEqual(validWhile);
+      expect(typeof listed[0]!.validWhile).toBe("object");
+    }
+  });
+
   it("persists across instances in the same agent dir", () => {
     const { agentDir, registry } = setup();
     registry.create({ ...baseRequest, extensions: false });

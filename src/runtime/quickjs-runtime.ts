@@ -513,7 +513,7 @@ globalThis.agents = Object.freeze({
   setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
   clearMessages: (args) => __call("agents.clearMessages", args),
   setInstructions: (args) => __call("agents.setInstructions", args),
-  actors: () => __call("agents.actors", {}),
+  actors: (args = {}) => __call("agents.actors", args),
   messages: (args) => __call("agents.messages", args),
   remove: (args) => __call("agents.remove", args),
   // Keyword keys for the actor-template routes, spelled as the provider,

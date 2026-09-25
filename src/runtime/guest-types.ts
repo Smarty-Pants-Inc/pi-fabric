@@ -635,6 +635,20 @@ type FabricActorRequest = FabricActorRequestBase & (
   | { delivery: "nextTurn"; triggerTurn?: false }
   | { delivery: "steer" | "followUp"; triggerTurn: boolean }
 );
+/** A stored global template. The registry keeps validWhile as source; it is not callable. */
+type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_ms"> & {
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  events: FabricActorHostEvent[];
+  topics: string[];
+  delivery: FabricActorDelivery;
+  responseMode: "text" | "directive";
+  triggerTurn: boolean;
+  coalesce: boolean;
+  runner: FabricAgentRunner;
+  validWhile?: { version: 1; source: string };
+};
 interface FabricActorInfo {
   kernel?: FabricKernel;
   pythonRuntime?: "cpython" | "monty";
@@ -765,7 +779,7 @@ interface FabricAgentsApi {
   actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorInfo>;
   actors(args?: { scope?: "project" }): Promise<FabricActorInfo[]>;
   /** Project-independent templates in the global registry. */
-  actors(args: { scope: "global" }): Promise<Array<FabricActorRequest & { id: string; createdAt: number; updatedAt: number }>>;
+  actors(args: { scope: "global" }): Promise<FabricActorTemplate[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
   remove(args: { id: string }): Promise<{ removed: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */
@@ -773,7 +787,7 @@ interface FabricAgentsApi {
   /** Stamp a global template into the current project as a fresh live actor with no inherited history. */
   "import"(args: { id?: string; name?: string; as?: string }): Promise<FabricActorInfo>;
   /** Export a live project actor's definition to the global registry as a project-independent template. */
-  "export"(args: { id: string; overwrite?: boolean }): Promise<FabricActorRequest & { id: string; createdAt: number; updatedAt: number }>;
+  "export"(args: { id: string; overwrite?: boolean }): Promise<FabricActorTemplate>;
   log(args: {
     id: string;
     type?: "session" | "run" | "all";

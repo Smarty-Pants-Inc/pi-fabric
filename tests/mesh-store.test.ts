@@ -333,6 +333,18 @@ describe("MeshStore", () => {
     });
   });
 
+  it("reports the oldest sequence still in the log", async () => {
+    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-oldest-"));
+    roots.push(meshRoot);
+    const store = new MeshStore(meshRoot, 512, 100, { maxEventLogBytes: 2_000, retainedEventLogBytes: 800 });
+    expect(store.oldestSequence()).toBeUndefined();                       // no log yet
+    await store.publish({ topic: "t", from: identity, text: "first" });
+    expect(store.oldestSequence()).toBe(1);
+    for (let index = 0; index < 30; index++) await store.publish({ topic: "t", from: identity, text: `event-${index}` });
+    expect(store.oldestSequence()).toBe(store.read({ after: 0, limit: 100 })[0]!.sequence);
+    expect(store.oldestSequence()).toBeGreaterThan(1);                     // rotated
+  });
+
   it("compacts oversized event logs and resets stale tail cursors", async () => {
     const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-bounded-"));
     roots.push(meshRoot);

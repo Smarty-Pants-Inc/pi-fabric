@@ -47,6 +47,94 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  // smarty-dev#643: dedupe records lived in the shared state (26% of it on the fleet), and each
+  // received command rewrote that whole file twice.
+  describe("dedupe records", () => {
+    const seenKey = (hostId: string, commandId: string) =>
+      "topology/control-seen/" + createHash("sha256").update(`${hostId}\0${commandId}`).digest("hex");
+    const ownStore = (meshRoot: string, hostId: string) =>
+      new MeshStore(path.join(meshRoot, "control-seen", createHash("sha256").update(hostId).digest("hex").slice(0, 32)), 64 * 1024, 1_000);
+    const command = (commandId: string, to: string) => ({
+      topic: "fabric.control.command", kind: "steer", from: identity("host:sender"), to,
+      data: { version: 1, commandId, targetId: "agent:target", operation: "steer", replyTo: "host:sender", message: "m", requestedAt: Date.now() },
+    });
+    const ackFor = (store: MeshStore, commandId: string) =>
+      store.read({ topic: "fabric.control.ack", limit: 100 }).find((event) => (event.data as { commandId?: string }).commandId === commandId);
+
+    it("are kept in the owner's own store with the command's sequence, not in the shared state", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const sender = plane(meshRoot, "host:sender");
+      const receiver = plane(meshRoot, "host:receiver");
+      sender.start(() => ({ accepted: false }));
+      receiver.start((received) => ({ accepted: true, messageId: "local:" + received.commandId }));
+      await new Promise((resolve) => setTimeout(resolve, 100));             // past its one-time legacy move
+      const result = await sender.request("host:receiver", "agent:target", "steer", { message: "once" });
+      const commandEvent = store.read({ topic: "fabric.control.command", limit: 10 }).at(-1)!;
+      const commandId = (commandEvent.data as { commandId: string }).commandId;
+      expect(result.messageId).toBe("local:" + commandId);
+      expect(store.listAll("topology/control-seen/")).toEqual([]);
+      expect(ownStore(meshRoot, "host:receiver").get(seenKey("host:receiver", commandId))?.value).toMatchObject({
+        hostId: "host:receiver", commandId, sequence: commandEvent.sequence, acceptance: { accepted: true },
+      });
+    });
+
+    it("left in the shared state move to the owner's store once and still answer a replay", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      await store.publish(command("command:old", "host:receiver"));          // replayed at startup
+      const legacy = (hostId: string, commandId: string) => store.put({
+        key: seenKey(hostId, commandId), identity: identity(hostId), ifVersion: 0, value: {
+          format: 1, hostId, commandId, targetId: "agent:target", expiresAt: Date.now() + 60_000,
+          acceptance: { accepted: true, messageId: "earlier:" + commandId },
+        },
+      });
+      await legacy("host:receiver", "command:old");
+      await legacy("host:other", "command:foreign");
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn(() => ({ accepted: true }));
+      receiver.start(receive);
+      await vi.waitFor(() => expect(store.get(seenKey("host:receiver", "command:old"))).toBeUndefined(), { timeout: 3_000, interval: 20 });
+      expect(receive).not.toHaveBeenCalled();                                // answered from the record
+      expect(ackFor(store, "command:old")?.data).toMatchObject({ accepted: true, messageId: "earlier:command:old" });
+      expect(ownStore(meshRoot, "host:receiver").get(seenKey("host:receiver", "command:old"))?.value).toMatchObject({
+        commandId: "command:old", acceptance: { messageId: "earlier:command:old" }, sequence: store.latestSequence(),
+      });
+      expect(store.get(seenKey("host:other", "command:foreign"))).toBeDefined();   // another host's: untouched
+      await store.publish(command("command:old", "host:receiver"));          // republished after the move
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(receive).not.toHaveBeenCalled();
+    });
+
+    it("are deleted only once expired and their command has left the log", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const storeOptions: MeshStoreOptions = { maxEventLogBytes: 80_000, retainedEventLogBytes: 40_000 };
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000, storeOptions);
+      const sender = plane(meshRoot, "host:sender", storeOptions, { acknowledgementTimeoutMs: 200 });
+      const receiver = plane(meshRoot, "host:receiver", storeOptions, { acknowledgementTimeoutMs: 200 });
+      const receive = vi.fn(() => ({ accepted: true }));
+      sender.start(() => ({ accepted: false }));
+      receiver.start(receive);
+      await sender.request("host:receiver", "agent:target", "steer", { message: "once" });
+      const commandId = (store.read({ topic: "fabric.control.command", limit: 10 }).at(-1)!.data as { commandId: string }).commandId;
+      const own = ownStore(meshRoot, "host:receiver");
+      await new Promise((resolve) => setTimeout(resolve, 900));             // expired, still in the log
+      expect(own.get(seenKey("host:receiver", commandId))).toBeDefined();
+      for (let index = 0; index < 100; index++) {                          // rotate it out of the log
+        await store.publish({ topic: "compact", from: identity("host:publisher"), text: "x".repeat(900) });
+      }
+      expect(store.oldestSequence()).toBeGreaterThan(1);
+      await vi.waitFor(() => expect(own.get(seenKey("host:receiver", commandId))).toBeUndefined(), { timeout: 3_000, interval: 20 });
+      expect(receive).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("routes to one execution owner and returns its acknowledgement", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);

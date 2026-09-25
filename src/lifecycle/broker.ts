@@ -35,6 +35,8 @@ export class LifecycleBroker {
   #publishTail: Promise<void> = Promise.resolve();
   #pollScheduled = false;
   #closed = false;
+  /** Cursors past events that matched nothing, not yet saved, by subscription id. */
+  readonly #unsaved = new Map<string, number>();
 
   constructor(
     readonly mesh: MeshStore,
@@ -198,21 +200,39 @@ export class LifecycleBroker {
 
   async #drain(): Promise<void> {
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
+    const listed = new Set<string>();
     let latestSequence: number | undefined;
     for (const entry of entries) {
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
+      listed.add(subscription.id);
       // Only the target's host drains a subscription. Pass over other hosts' targets (from
       // memory) and caught-up subscriptions before the directory read: that read parses every
       // participant and host record, and ran for every subscription on every poll of every
       // host, about a quarter of a core per idle Pi on the fleet mesh (smarty-dev#557).
       if (this.participants.publishes?.(subscription.to) === false) continue;
       latestSequence ??= this.mesh.latestSequence();
-      if (latestSequence <= subscription.afterSequence) continue;
+      if (latestSequence <= this.#cursor(subscription)) continue;
       const target = this.participants.get(subscription.to);
       if (!target || target.stale || !target.local) continue;
       await this.#drainSubscription(entry, subscription);
     }
+    for (const id of this.#unsaved.keys()) if (!listed.has(id)) this.#unsaved.delete(id);
+  }
+
+  #cursor(subscription: FabricLifecycleSubscription): number {
+    return Math.max(subscription.afterSequence, this.#unsaved.get(subscription.id) ?? 0);
+  }
+
+  // Each save rewrites the whole shared state file, and the owner saved after every new mesh
+  // event: most of the fleet's state writes (smarty-dev#557). A cursor that passed only events
+  // matching nothing stays in memory until it leads the saved one by a read page. A restart
+  // scans those events again and skips them again. A delivery, a matching event skipped for
+  // good, and an error to set or clear are saved at once.
+  #keepUnsaved(subscription: FabricLifecycleSubscription, cursor: number): boolean {
+    if (subscription.lastError !== undefined || cursor - subscription.afterSequence >= this.#maxReadEvents) return false;
+    this.#unsaved.set(subscription.id, cursor);
+    return true;
   }
 
   async #drainSubscription(
@@ -223,21 +243,24 @@ export class LifecycleBroker {
     let subscription = initial;
     while (!this.#closed) {
       const latestSequence = this.mesh.latestSequence();
-      if (latestSequence <= subscription.afterSequence) return;
+      const from = this.#cursor(subscription);
+      if (latestSequence <= from) return;
       const events = this.mesh.read({
-        after: subscription.afterSequence,
+        after: from,
         limit: this.#maxReadEvents,
       });
       if (events.length === 0) {
+        if (this.#keepUnsaved(subscription, latestSequence)) return;
         await this.#replace(entry, {
           ...subscription,
           afterSequence: latestSequence,
           updatedAt: Date.now(),
-        }).catch(() => undefined);
+        }).then(() => this.#unsaved.delete(subscription.id), () => undefined);
         return;
       }
 
-      let cursor = subscription.afterSequence;
+      let cursor = from;
+      let decided = false;
       let lastDeliveredAt = subscription.lastDeliveredAt;
       let lastEventId = subscription.lastEventId;
       for (const meshEvent of events) {
@@ -246,11 +269,11 @@ export class LifecycleBroker {
           cursor = Math.max(cursor, meshEvent.sequence);
           continue;
         }
-        const matches =
+        const candidate =
           lifecycle.source.id === subscription.from &&
-          subscription.events.includes(lifecycle.event) &&
-          this.#sourceIsCurrentOwner(lifecycle);
-        if (!matches) {
+          subscription.events.includes(lifecycle.event);
+        if (!candidate || !this.#sourceIsCurrentOwner(lifecycle)) {
+          decided ||= candidate;
           cursor = lifecycle.sequence;
           continue;
         }
@@ -263,10 +286,11 @@ export class LifecycleBroker {
             updatedAt: Date.now(),
             lastError: error instanceof Error ? error.message : String(error),
           };
-          await this.#replace(entry, failed).catch(() => undefined);
+          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), () => undefined);
           return;
         }
         cursor = lifecycle.sequence;
+        decided = true;
         lastDeliveredAt = Date.now();
         lastEventId = lifecycle.id;
         if (subscription.once) {
@@ -277,6 +301,10 @@ export class LifecycleBroker {
         }
       }
 
+      if (!decided && this.#keepUnsaved(subscription, cursor)) {
+        if (events.length < this.#maxReadEvents) return;
+        continue;
+      }
       const updated: FabricLifecycleSubscription = {
         ...subscription,
         afterSequence: cursor,
@@ -287,6 +315,7 @@ export class LifecycleBroker {
       delete updated.lastError;
       const next = await this.#replace(entry, updated).catch(() => undefined);
       if (!next) return;
+      this.#unsaved.delete(subscription.id);
       entry = next;
       subscription = updated;
       if (events.length < this.#maxReadEvents) return;

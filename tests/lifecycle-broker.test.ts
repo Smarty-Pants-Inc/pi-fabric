@@ -131,10 +131,9 @@ describe("LifecycleBroker", () => {
     expect(gets).not.toHaveBeenCalled();
     expect(lists).not.toHaveBeenCalled();
     // A new event puts this host's subscription behind: it is read and drained, the other is not.
+    const reads = vi.spyOn(mesh, "read");
     await mesh.publish({ topic: "unrelated", from: sourceIdentity, text: "two" });
-    const latest = mesh.latestSequence();
-    await waitFor(() => (mesh.get("topology/subscriptions/here")?.value as FabricLifecycleSubscription)
-      .afterSequence === latest);
+    await waitFor(() => reads.mock.calls.length > 0);
     expect(new Set(gets.mock.calls.map(([id]) => id))).toEqual(new Set([targetIdentity.id]));
     expect((mesh.get("topology/subscriptions/elsewhere")?.value as FabricLifecycleSubscription).afterSequence)
       .toBe(0);
@@ -221,6 +220,88 @@ describe("LifecycleBroker", () => {
       },
     });
     await waitFor(() => target.list().length === 0);
+  });
+
+  // smarty-dev#557: the target's host saved the cursor after every new mesh event, a whole
+  // shared-state write each, although almost none of those events matched.
+  it("saves a cursor for a delivery or a decided skip, and otherwise only once a page ahead", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const delivered: FabricLifecycleEvent[] = [];
+    const directory = participants(targetIdentity.id);
+    const target = new LifecycleBroker(mesh, targetIdentity, directory,
+      { enabled: true, pollMs: 20, maxReadEvents: 5 }, (_subscription, event) => { delivered.push(event); });
+    const publisher = new LifecycleBroker(mesh, sourceIdentity, participants(sourceIdentity.id),
+      { enabled: true, pollMs: 60_000, maxReadEvents: 5 }, () => {});
+    brokers.push(target, publisher);
+    const { id } = await target.subscribe({
+      from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once: false,
+    });
+    const saved = () => mesh.get(`topology/subscriptions/${id}`)!;
+    const cursor = () => (saved().value as FabricLifecycleSubscription).afterSequence;
+    const unrelated = () => mesh.publish({ topic: "unrelated", from: sourceIdentity, text: "noise" });
+    const version = saved().version;
+    const reads = vi.spyOn(mesh, "read");
+    target.start();
+    for (let index = 0; index < 3; index++) await unrelated();
+    await waitFor(() => reads.mock.calls.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(saved().version).toBe(version);                         // passed unmatched events: not saved
+    const gets = vi.spyOn(directory, "get");
+    const settled = reads.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(reads.mock.calls.length).toBe(settled);                 // caught up in memory: no more reads,
+    expect(gets).not.toHaveBeenCalled();                           // and no directory reads either
+    await unrelated();
+    await unrelated();                                             // five unsaved: a page ahead
+    await waitFor(() => cursor() === mesh.latestSequence());
+    await publisher.publish({ source, event: "pi.agent_settled" });
+    await waitFor(() => delivered.length === 1);
+    await waitFor(() => cursor() === mesh.latestSequence());       // a delivery: saved at once
+    expect((saved().value as FabricLifecycleSubscription).lastEventId).toBe(delivered[0]!.id);
+    await publisher.publish({ source: { ...source, ownerHostId: "host:forged" }, event: "pi.agent_settled" });
+    await waitFor(() => cursor() === mesh.latestSequence());       // skipped for good: saved at once
+    expect(delivered).toHaveLength(1);
+  });
+
+  it("scans unsaved events again after a restart without delivering anything twice", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const delivered: string[] = [];
+    const broker = () => {
+      const value = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
+        { enabled: true, pollMs: 20, maxReadEvents: 100 }, (_subscription, event) => { delivered.push(event.id); });
+      brokers.push(value);
+      return value;
+    };
+    const publisher = new LifecycleBroker(mesh, sourceIdentity, participants(sourceIdentity.id),
+      { enabled: true, pollMs: 60_000, maxReadEvents: 100 }, () => {});
+    brokers.push(publisher);
+    const first = broker();
+    const { id } = await first.subscribe({
+      from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
+      delivery: "followUp", triggerTurn: false, once: false,
+    });
+    first.start();
+    await publisher.publish({ source, event: "pi.agent_settled" });
+    await waitFor(() => delivered.length === 1);
+    await publisher.publish({ source, event: "pi.turn_end" });   // not subscribed: stays unsaved
+    await mesh.publish({ topic: "unrelated", from: sourceIdentity, text: "noise" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await first.close();
+    const savedCursor = (mesh.get(`topology/subscriptions/${id}`)!.value as FabricLifecycleSubscription).afterSequence;
+    expect(savedCursor).toBeLessThan(mesh.latestSequence());
+    const second = broker();
+    second.start();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(delivered).toHaveLength(1);
+    await publisher.publish({ source, event: "pi.agent_settled" });
+    await waitFor(() => delivered.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(new Set(delivered).size).toBe(2);
   });
 
   // review/astra on #49: with the runtime read cache, a publisher's cached listing must not

@@ -630,7 +630,7 @@ export class AgentsProvider implements FabricProvider {
         if (this.mainAgent.matches(id)) {
           if (this.mainAgent.local) return this.mainAgent.info(context.extensionContext);
           const root = this.participants.get(this.mainAgent.id);
-          if (!root) throw this.participants.writeStalled?.() ?? new Error(`Unknown Fabric Main participant: ${this.mainAgent.id}`);
+          if (!root) throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");
           return root;
         }
         try {

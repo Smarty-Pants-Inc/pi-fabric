@@ -95,6 +95,11 @@ export interface FabricPeerInfo {
 export interface FabricParticipantSource {
   list(options?: FabricParticipantListOptions, now?: number): FabricParticipantInfo[];
   get(id: string, now?: number, options?: { fresh?: boolean }): FabricParticipantInfo | undefined;
+  /**
+   * Whether this host publishes the participant (`main` names the lineage root), from memory.
+   * False means get(id) is not local, so a caller can pass over the id without a mesh read.
+   */
+  publishes?(id: string): boolean;
   self(now?: number): FabricParticipantInfo;
   /** All live root Pi session agents, including the current lineage root. */
   sessions?(now?: number): FabricParticipantInfo[];

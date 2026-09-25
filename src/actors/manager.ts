@@ -13,7 +13,7 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { AgentManager } from "../agents/manager.js";
@@ -127,6 +127,8 @@ const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
 ]);
 const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
+/** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
+const PRESENCE_RETRY_MS = 5_000;
 const RESIDENT_HOST_EVENT_TOPIC = "fabric.actor.host-event";
 // A failing actor is silent (a failed directive run stays silent), so after this many
 // consecutive failed activations the host tells the owner's Main once (smarty-dev#390).
@@ -241,6 +243,16 @@ export class ActorManager {
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
+  readonly #pendingPresence = new Set<string>();
+  /** One presence write at a time per actor id; a queued one reads the latest state. */
+  readonly #presenceChains = new Map<string, Promise<void>>();
+  readonly #presenceQueued = new Set<string>();
+  /** Actor ids named by the last successfully parsed registry (undefined until one is). */
+  #registryIds: Set<string> | undefined;
+  /** Orphan deletes, fenced to the entry version seen when it was found. */
+  readonly #orphanPresence = new Map<string, number>();
+  #presenceTimer: NodeJS.Timeout | undefined;
+  #presenceRetryMs = PRESENCE_RETRY_MS;
   #closing = false;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
   // mesh dispatch are frozen so interrupted actors are not re-armed by the
@@ -272,6 +284,8 @@ export class ActorManager {
       claimResidency?: FabricParticipantResidency;
       rootId?: string;
       meshCursorPath?: string;
+      /** Retry delay for failed presence writes (tests use a short one). */
+      presenceRetryMs?: number;
       relayParticipantSteering?: boolean;
       retention?: FabricRetentionConfig;
       acquireCapabilityView?(
@@ -325,6 +339,10 @@ export class ActorManager {
       },
     });
     this.#meshMonitor.start();
+    this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
+    // Presence entries this runtime wrote for actors it no longer knows (a remove whose
+    // delete never landed) are orphans: reap them once at start.
+    setTimeout(() => this.#reapOrphanPresence(), 0).unref();
   }
 
   subscribe(listener: () => void): () => void {
@@ -1138,7 +1156,7 @@ export class ActorManager {
     this.#emitChange();
     fs.rmSync(path.dirname(actor.sessionFile), { recursive: true, force: true });
     await this.#saveActors(new Set([actor.id]));
-    await this.mesh.delete({ key: this.#presenceKey(actor.id) }).catch(() => ({ deleted: false }));
+    await this.#writePresence(actor.id);                      // the actor is gone: a delete
     if (retainedRunId) await this.agents.cleanup(retainedRunId).catch(() => ({ cleaned: false }));
     return { removed: true };
   }
@@ -1147,6 +1165,10 @@ export class ActorManager {
     if (this.#closing) return;
     this.#closing = true;
     this.#meshMonitor.close();
+    if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
+    this.#presenceTimer = undefined;
+    // Let presence writes already in flight finish before the runtime goes.
+    await Promise.allSettled([...this.#presenceChains.values()]);
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
     this.#listeners.clear();
@@ -1833,25 +1855,13 @@ export class ActorManager {
     if (!this.#canManage(actor.id)) return;
     this.#emitChange();
     await this.#saveActors();
-    await this.mesh
-      .put({
-        key: this.#presenceKey(actor.id),
-        value: this.#publicInfo(actor),
-        identity: this.identity,
-      })
-      .catch(() => undefined);
+    await this.#writePresence(actor.id);
   }
 
   async #publishBindingView(actor: ManagedActor): Promise<void> {
     this.#emitChange();
     if (!this.#canManage(actor.id)) return;
-    await this.mesh
-      .put({
-        key: this.#presenceKey(actor.id),
-        value: this.#publicInfo(actor),
-        identity: this.identity,
-      })
-      .catch(() => undefined);
+    await this.#writePresence(actor.id);
   }
 
   #emitChange(): void {
@@ -1861,6 +1871,88 @@ export class ActorManager {
       } catch {
         // UI observers must not interrupt actor state transitions.
       }
+    }
+  }
+
+  // Writes an actor's presence as it is now: its record while this host manages it, or a
+  // delete once it is gone. A failed write (a contended mesh lock) is retried until it lands,
+  // so the mesh never keeps a stale entry or misses a new actor (smarty-dev#448).
+  // Writes are serialized per id, and each reads the state only when it runs, so a write that
+  // waited on the lock can never land after a newer one (a removed actor put back).
+  #writePresence(id: string): Promise<void> {
+    if (this.#presenceQueued.has(id)) return this.#presenceChains.get(id)!;
+    this.#presenceQueued.add(id);
+    const previous = this.#presenceChains.get(id) ?? Promise.resolve();
+    const next = previous.then(() => {
+      this.#presenceQueued.delete(id);
+      return this.#writePresenceNow(id);
+    });
+    this.#presenceChains.set(id, next);
+    void next.finally(() => {
+      if (this.#presenceChains.get(id) === next) this.#presenceChains.delete(id);
+    });
+    return next;
+  }
+
+  async #writePresenceNow(id: string): Promise<void> {
+    const actor = this.#actors.get(id);
+    if (actor && !this.#canManageCached(id)) {
+      this.#pendingPresence.delete(id);                        // another host owns its presence
+      return;
+    }
+    const fence = actor ? undefined : this.#orphanPresence.get(id);
+    try {
+      if (actor) {
+        await this.mesh.put({ key: this.#presenceKey(id), value: this.#publicInfo(actor), identity: this.identity });
+      } else {
+        await this.mesh.delete({ key: this.#presenceKey(id), ...(fence !== undefined ? { ifVersion: fence } : {}) });
+      }
+      this.#pendingPresence.delete(id);
+      this.#orphanPresence.delete(id);
+    } catch (error) {
+      if (fence !== undefined && error instanceof Error && error.message.includes("compare-and-swap failed")) {
+        // Someone wrote this entry since it was found orphaned: it is not ours to delete.
+        this.#pendingPresence.delete(id);
+        this.#orphanPresence.delete(id);
+        return;
+      }
+      this.#pendingPresence.add(id);
+      this.#schedulePresenceRetry();
+    }
+  }
+
+  #schedulePresenceRetry(): void {
+    if (this.#presenceTimer || this.#closing || this.#pendingPresence.size === 0) return;
+    this.#presenceTimer = setTimeout(() => {
+      this.#presenceTimer = undefined;
+      void (async () => {
+        for (const id of [...this.#pendingPresence]) {
+          if (this.#closing) return;
+          await this.#writePresence(id);
+        }
+      })();
+    }, this.#presenceRetryMs);
+    this.#presenceTimer.unref();
+  }
+
+  // Reaps only against a registry that was read and parsed: an unreadable or malformed
+  // actors.json proves nothing about which actors exist, so their presence stays.
+  #reapOrphanPresence(): void {
+    if (this.#closing || !this.meshConfig.enabled || !this.#persistent || !this.#registryIds) return;
+    const prefix = `actors/${this.sessionId}/`;
+    let entries: MeshStateEntry[];
+    try {
+      entries = this.mesh.listAll(prefix);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const id = entry.key.slice(prefix.length);
+      const scope = (entry.value as { scope?: unknown } | null)?.scope;
+      if (id.includes("/") || scope !== this.#actorScope || entry.updatedBy.id !== this.identity.id) continue;
+      if (this.#actors.has(id) || this.#registryIds.has(id)) continue;
+      this.#orphanPresence.set(id, entry.version);
+      void this.#writePresence(id);
     }
   }
 
@@ -1991,6 +2083,10 @@ export class ActorManager {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
     const records = (parsed as { actors?: unknown }).actors;
     if (!Array.isArray(records)) return;
+    // Every id the registry names, loadable or not: the orphan reaper's only evidence.
+    this.#registryIds = new Set(records.flatMap((value) =>
+      typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string"
+        ? [(value as { id: string }).id] : []));
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
       const record = value as Partial<ManagedActor>;

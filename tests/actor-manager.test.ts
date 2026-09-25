@@ -84,6 +84,150 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+// smarty-dev#448: presence writes lost on a contended mesh lock left the mesh without a new
+// actor, or with a removed one.
+describe("ActorManager presence under a stalled mesh lock", () => {
+  const stalledSetup = (presenceRetryMs = 50) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-presence-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { lockTimeoutMs: 150 });
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const identity: MeshIdentity = { id: "session:presence", name: "main", kind: "main", sessionId: "presence" };
+    const make = () => {
+      const manager = new ActorManager("presence", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+        { actorRoot: path.join(root, "actors"), persistent: true, presenceRetryMs });
+      actorManagers.push(manager);
+      return manager;
+    };
+    const lockPath = path.join(mesh.root, ".lock");
+    const hold = () => {
+      fs.mkdirSync(mesh.root, { recursive: true });
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+    };
+    const release = () => fs.rmSync(lockPath, { recursive: true, force: true });
+    return { mesh, make, hold, release, identity };
+  };
+
+  it("publishes a new actor's presence once a stalled lock frees", async () => {
+    const { mesh, make, hold, release } = stalledSetup();
+    const actors = make();
+    hold();
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    expect(mesh.get(`actors/presence/${actor.id}`)).toBeUndefined();
+    release();
+    await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
+  }, 20_000);
+
+  it("deletes a removed actor's presence once a stalled lock frees", async () => {
+    const { mesh, make, hold, release } = stalledSetup();
+    const actors = make();
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
+    hold();
+    await actors.remove(actor.id);
+    expect(mesh.get(`actors/presence/${actor.id}`)).toBeDefined();
+    release();
+    await waitFor(() => mesh.get(`actors/presence/${actor.id}`) === undefined, 5_000);
+  }, 20_000);
+
+  // review/astra on #46, F1: a presence write held on the lock must not land after a newer one.
+  it("never puts a removed actor back when an older presence write lands late", async () => {
+    const { mesh, make } = stalledSetup();
+    const actors = make();
+    const put = mesh.put.bind(mesh);
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    let held = 0;
+    vi.spyOn(mesh, "put").mockImplementation(async (input) => {
+      if (input.key.startsWith("actors/presence/") && held++ === 0) await gate;   // the create's write sleeps
+      return put(input);
+    });
+    const created = actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    await waitFor(() => held === 1);
+    const actor = actors.list().find((candidate) => candidate.name === "reviewer")!;
+    const removed = actors.remove(actor.id);                   // its delete must wait behind that write
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    open();
+    await created;
+    await removed;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(mesh.get(`actors/presence/${actor.id}`)).toBeUndefined();
+  }, 20_000);
+
+  it("lets close() wait for a presence write in flight", async () => {
+    const { mesh, make } = stalledSetup();
+    const actors = make();
+    const put = mesh.put.bind(mesh);
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    let held = 0;
+    vi.spyOn(mesh, "put").mockImplementation(async (input) => {
+      if (input.key.startsWith("actors/presence/") && held++ === 0) await gate;
+      return put(input);
+    });
+    const created = actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    await waitFor(() => held === 1);
+    let closed = false;
+    const closing = actors.close().then(() => { closed = true; });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(closed).toBe(false);
+    open();
+    await closing;
+    await created.catch(() => undefined);
+    expect(closed).toBe(true);
+  }, 20_000);
+
+  // review/astra on #46, F2: an orphan delete that failed keeps its version fence on retry.
+  it("does not delete an orphan entry that another writer replaced before the retry", async () => {
+    const { mesh, make, hold, release, identity } = stalledSetup(1_000);
+    await mesh.put({ key: "actors/presence/ghost", value: { id: "ghost", scope: "project" }, identity });
+    const actorsDir = path.join(path.dirname(mesh.root), "actors");
+    fs.mkdirSync(actorsDir, { recursive: true });
+    fs.writeFileSync(path.join(actorsDir, "actors.json"), JSON.stringify({ actors: [] }));
+    hold();
+    make();                                                    // the reap's delete fails on the lock (150 ms)
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    release();
+    // Before the 1 s retry, another writer replaces the entry.
+    const replaced = await mesh.put({ key: "actors/presence/ghost", value: { id: "ghost", scope: "project", again: true }, identity: { ...identity, id: "session:other" } });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(mesh.get("actors/presence/ghost")?.version).toBe(replaced.version);
+  }, 20_000);
+
+  // review/astra on #46, F3: a registry that cannot be read proves nothing; presence stays.
+  it.each([["malformed", "{"], ["with an unloadable record", JSON.stringify({ actors: [{ id: "kept" }] })]])(
+    "keeps presence when the registry is %s", async (_case, registry) => {
+      const { mesh, make, identity } = stalledSetup();
+      await mesh.put({ key: "actors/presence/kept", value: { id: "kept", scope: "project" }, identity });
+      const actorsDir = path.join(path.dirname(mesh.root), "actors");
+      fs.mkdirSync(actorsDir, { recursive: true });
+      fs.writeFileSync(path.join(actorsDir, "actors.json"), registry);
+      make();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(mesh.get("actors/presence/kept")).toBeDefined();
+    }, 20_000);
+
+  it("reaps this session's orphan presence at start, and nothing of another scope or writer", async () => {
+    const { mesh, make, identity } = stalledSetup();
+    const other = { ...identity, id: "session:other" };
+    await mesh.put({ key: "actors/presence/ghost", value: { id: "ghost", scope: "project" }, identity });
+    await mesh.put({ key: "actors/presence/session-scoped", value: { id: "session-scoped", scope: "session" }, identity });
+    await mesh.put({ key: "actors/presence/foreign", value: { id: "foreign", scope: "project" }, identity: other });
+    // The registry was read and no longer lists "ghost" (a remove whose delete never landed).
+    const actorsDir = path.join(path.dirname(mesh.root), "actors");
+    fs.mkdirSync(actorsDir, { recursive: true });
+    fs.writeFileSync(path.join(actorsDir, "actors.json"), JSON.stringify({ actors: [] }));
+    make();                                                    // project scope (the mesh default)
+    await waitFor(() => mesh.get("actors/presence/ghost") === undefined, 5_000);
+    expect(mesh.get("actors/presence/session-scoped")).toBeDefined();
+    expect(mesh.get("actors/presence/foreign")).toBeDefined();
+  }, 20_000);
+});
+
 describe("ActorManager", () => {
   it("updates inference context on the same identity, preserves policy/history, and restores it", async () => {
     const s = setup(true);

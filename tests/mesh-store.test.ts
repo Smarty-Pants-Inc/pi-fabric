@@ -302,6 +302,23 @@ describe("MeshStore", () => {
       }
     });
 
+    // A host's lifecycle subscriptions all sit at one cursor when a new event arrives; with one
+    // remembered point, the first read moved it and every other reader scanned the whole log.
+    it("serve several readers at one cursor, and a reader a few events behind", async () => {
+      const store = createStore();
+      for (let index = 1; index <= 200; index++) await store.publish({ topic: "t", from: identity, text: "x".repeat(500) });
+      expect(sequences(store.read({ after: 100 })).at(-1)).toBe(200);
+      await store.publish({ topic: "t", from: identity, text: "new" });
+      for (let reader = 0; reader < 3; reader++) {
+        const next = bytesRead(() => store.read({ after: 200 }));
+        expect(sequences(next.value)).toEqual([201]);
+        expect(next.bytes).toBeLessThan(2_000);
+      }
+      const behind = bytesRead(() => store.read({ after: 190 }));
+      expect(sequences(behind.value)).toEqual(Array.from({ length: 11 }, (_, i) => i + 191));
+      expect(behind.bytes).toBeLessThan(15_000);
+    });
+
     it("scan the whole log again after a rotation, even when an old offset falls on a line boundary", async () => {
       const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-rotated-"));
       roots.push(meshRoot);

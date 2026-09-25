@@ -93,6 +93,8 @@ const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
 export const RUNTIME_MESH_READ_CACHE_MS = 2_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
+// Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
+const READ_HINT_LINES = 128;
 const CURSOR_OFFSET_BASE = 2 ** 32;
 
 const delay = (milliseconds: number): Promise<void> =>
@@ -353,8 +355,13 @@ export class MeshStore {
   readonly #lockTimeoutMs: number;
   readonly #staleLockMs: number;
   readonly #readCacheMs: number;
-  /** Where the last read({ after }) scan ended: a later read past that sequence starts there. */
-  #readHint: { generation: number; inode: number; offset: number; sequence: number } | undefined;
+  /**
+   * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
+   * read starts at the last one at or below its cursor. One remembered point was not enough:
+   * several readers at one cursor (a host's lifecycle subscriptions after a new event) moved it
+   * past each other, and all but the first scanned the whole log again (smarty-dev#557).
+   */
+  #readHints: { generation: number; inode: number; lines: Array<{ sequence: number; offset: number }> } | undefined;
   #stateCache:
     | { device: number; inode: number; size: number; modifiedAt: number; parsedAt: number; state: MeshStateFile }
     | undefined;
@@ -610,14 +617,17 @@ export class MeshStore {
       // each read scanned the whole log (tens of MB on the fleet) from the start
       // (smarty-dev#557). A rotated log is a new file and generation, and the hint must end a line.
       const generation = this.#readGeneration();
-      const hint = this.#readHint?.generation === generation && this.#readHint.inode === stat.ino
-        ? this.#readHint
-        : undefined;
-      let position =
-        hint && hint.sequence <= after && hint.offset <= size && this.#endsLine(descriptor, hint.offset)
-          ? hint.offset
-          : 0;
-      let scanned: { offset: number; sequence: number } | undefined;
+      const hints = this.#readHints?.generation === generation && this.#readHints.inode === stat.ino
+        ? this.#readHints.lines
+        : [];
+      let position = 0;
+      for (let index = hints.length - 1; index >= 0; index--) {
+        const hint = hints[index]!;
+        if (hint.sequence > after) continue;
+        if (hint.offset <= size && this.#endsLine(descriptor, hint.offset)) position = hint.offset;
+        break;
+      }
+      const scanned: Array<{ sequence: number; offset: number }> = [];
       let lineChunks: Buffer[] = [];
       let lineBytes = 0;
       let skippingOversizedLine = false;
@@ -630,7 +640,8 @@ export class MeshStore {
           try {
             const event = JSON.parse(line) as MeshEvent;
             if (typeof event.sequence === "number" && lineEnd !== undefined) {
-              scanned = { offset: lineEnd, sequence: event.sequence };
+              scanned.push({ sequence: event.sequence, offset: lineEnd });
+              if (scanned.length > 2 * READ_HINT_LINES) scanned.splice(0, scanned.length - READ_HINT_LINES);
             }
             if (
               typeof event.sequence === "number" &&
@@ -676,8 +687,15 @@ export class MeshStore {
         }
       }
       if (!reachedLimit && (lineBytes > 0 || skippingOversizedLine)) emitLine();
-      if (scanned && scanned.sequence > (hint?.sequence ?? -1)) {
-        this.#readHint = { generation, inode: stat.ino, ...scanned };
+      if (scanned.length > 0) {
+        const lines = new Map(hints.map((hint) => [hint.sequence, hint.offset]));
+        for (const line of scanned) lines.set(line.sequence, line.offset);
+        this.#readHints = {
+          generation,
+          inode: stat.ino,
+          lines: [...lines].sort((left, right) => left[0] - right[0]).slice(-READ_HINT_LINES)
+            .map(([sequence, offset]) => ({ sequence, offset })),
+        };
       }
       return events;
     } catch (error) {

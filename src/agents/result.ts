@@ -49,10 +49,13 @@ export const parseStructuredValue = (text: string): unknown => {
   return JSON.parse(trimmed);
 };
 
-// The structured-result contract: the reply is one JSON value, or it has exactly one code fence
-// and the fence holds the value. Unfenced text around a value is not searched: the search took
-// incidental braces or a bracketed name from prose, and an object picked out of prose would
-// pass a contract violation as a valid result (smarty-dev#576).
+// The structured-result contract, one positional rule: the reply ends with exactly one JSON
+// value that starts on its own line (the last line that starts with { or [), or it has exactly
+// one code fence around the value. Commentary before the final value is allowed: Fabric asks
+// directive actors to finish with the object, and models write a sentence first. Nothing may
+// follow the value, and a second value on its own line before it is ambiguous. The reply is
+// not searched for whichever object parses: incidental braces or a bracketed name inside
+// prose are never the value (smarty-dev#576).
 export const parseStructuredResult = (text: string): unknown => {
   const trimmed = text.trim();
   let reason: string;
@@ -74,8 +77,45 @@ export const parseStructuredResult = (text: string): unknown => {
     } catch (error) {
       reason = `in the code fence: ${error instanceof Error ? error.message : String(error)}`;
     }
+  } else {
+    const lines = trimmed.split("\n");
+    let start = lines.length - 1;
+    while (start >= 0 && !lines[start]!.startsWith("{") && !lines[start]!.startsWith("[")) start--;
+    if (start > 0) {
+      let value: unknown;
+      let parsed = false;
+      try {
+        value = JSON.parse(lines.slice(start).join("\n"));
+        parsed = true;
+      } catch (error) {
+        reason = `in the final value: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      if (parsed) {
+        // An earlier value on its own lines, single-line or pretty-printed, makes the reply
+        // ambiguous: from each earlier line that starts with { or [, try every block that ends
+        // on a line ending with } or ] before the final value.
+        let earlier = false;
+        for (let from = 0; from < start && !earlier; from++) {
+          if (!lines[from]!.startsWith("{") && !lines[from]!.startsWith("[")) continue;
+          for (let to = from; to < start && !earlier; to++) {
+            const end = lines[to]!.trimEnd();
+            if (!end.endsWith("}") && !end.endsWith("]")) continue;
+            try {
+              JSON.parse(lines.slice(from, to + 1).join("\n"));
+              earlier = true;
+            } catch {
+              // Not a complete value here.
+            }
+          }
+        }
+        if (!earlier) return value;
+        reason = "found more than one JSON value";
+      }
+    }
   }
-  throw new Error(`the reply must be one JSON value, or have one code fence around it (${reason})`);
+  throw new Error(
+    `the reply must end with one JSON value on its own line, or have one code fence around it (${reason})`,
+  );
 };
 
 export function validateAgentResult<T extends { status: string; text: string; value?: unknown; error?: string }>(record: T, schema?: Record<string, unknown>): T {

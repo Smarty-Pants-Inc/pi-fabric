@@ -1650,7 +1650,7 @@ export class ActorManager {
     const responseInstruction =
       actor.responseMode === "directive"
         ? [
-            "For every message, finish with only one JSON object.",
+            "For every message, end your reply with exactly one JSON object on its own line; nothing may follow it.",
             'Use {"action":"silent"} when no intervention or reply is useful.',
             'Use {"action":"message","message":"concise text","data":{}} to reply.',
             'Use {"action":"stop","message":"optional final text"} when your role is complete.',

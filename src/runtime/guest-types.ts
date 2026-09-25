@@ -763,7 +763,9 @@ interface FabricAgentsApi {
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
   actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorInfo>;
-  actors(): Promise<FabricActorInfo[]>;
+  actors(args?: { scope?: "project" }): Promise<FabricActorInfo[]>;
+  /** Project-independent templates in the global registry. */
+  actors(args: { scope: "global" }): Promise<Array<FabricActorRequest & { id: string; createdAt: number; updatedAt: number }>>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
   remove(args: { id: string }): Promise<{ removed: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */

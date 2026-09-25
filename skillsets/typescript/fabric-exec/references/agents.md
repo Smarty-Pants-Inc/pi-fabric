@@ -87,7 +87,10 @@ return agents.subscribe({
 `when` is guest-only and must be a pure synchronous predicate over immutable successful-call facts. It is deleted before the host validates the request:
 
 ```ts
-await pi.edit({ path: "src/guard.ts", edits: [{ oldText, newText }] });
+await pi.edit({
+  path: "src/guard.ts",
+  edits: [{ oldText: "return false;", newText: "return true;" }],
+});
 await agents.handoff({
   model: "anthropic/claude-haiku-4-5",
   task: "Continue from this completed Fabric invocation.",

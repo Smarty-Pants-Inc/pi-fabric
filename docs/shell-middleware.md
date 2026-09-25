@@ -9,7 +9,7 @@ An extension implementing **standard local bash plus environment/output filters*
 can explicitly hand nested `pi.bash` execution to Fabric by attaching a host-local
 capability to its registered `ToolDefinition`:
 
-```ts
+```ts host
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 
 const middleware = {

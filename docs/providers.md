@@ -4,7 +4,7 @@ Fabric [captures normal `pi.registerTool()` tools automatically](configuration.m
 
 Fabric mounts each non-kernel first-party provider through a pinned component. External providers can use direct registration with a host-owned lifetime. A provider that belongs to a supervised external component calls `context.provide()` for staged publication and rolling replacement. The same component link controls dependency withdrawal.
 
-```ts
+```ts host
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   FABRIC_PROVIDER_DISCOVER_EVENT,
@@ -42,7 +42,7 @@ export default function extension(pi: ExtensionAPI) {
 
 Each provider owns its schemas, its state, and how its actions execute. Pi Fabric validates arguments, enforces the declared risk policy, records nested-call audits, and propagates cancellation. A provider can also enrich the generic [activity surface](interface.md#data-driven-activity) without registering a TUI component:
 
-```ts
+```ts host
 async invoke(actionName, args, context) {
   context.activity?.({ type: "entity", id: job.id, kind: "custom", name: job.name });
   context.activity?.({ type: "progress", message: "Indexing package 3/12" });
@@ -76,7 +76,7 @@ invocation path. See [incremental activity reads](interface.md#incremental-activ
 
 Trusted embedding code can opt into a closed-world provider authority:
 
-```ts
+```ts host
 import piFabric, { FABRIC_MANAGED_HOST_VERSION } from "pi-fabric";
 
 if (FABRIC_MANAGED_HOST_VERSION !== 1) throw new Error("Unsupported managed host");
@@ -124,7 +124,7 @@ A proxied event carries:
 - text `content` holding the raw string result or a JSON projection;
 - `details` matching `FabricToolResultProxyDetailsV1`, whose `result` is the exact host-side structured value.
 
-```ts
+```ts host
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   FABRIC_NESTED_TOOL_CALL_ID_PREFIX,

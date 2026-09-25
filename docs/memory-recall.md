@@ -34,7 +34,7 @@ The lightweight `pi-fabric/memory` entry exports `PortableMemorySource`,
 `createMemorySourceRegistry`, `createMemorySourceClient`, and
 `memoryActionSchemas`. It does not load the extension or UI runtime.
 
-```ts
+```ts host
 import {
   createMemorySourceClient,
   createMemorySourceRegistry,
@@ -122,7 +122,7 @@ cache files with `0600` permissions on a best-effort basis.
 A hot shard holds bounded normalized entry text plus `indexCoverage`. Each
 cold digest contains:
 
-```ts
+```ts host
 {
   cacheVersion: 6,
   kind: "digest",
@@ -332,7 +332,7 @@ and cold session candidates after filtering. Unknown omitted candidates stay
 outside those totals.
 Coverage reports:
 
-```ts
+```ts host
 coverage: {
   complete: boolean,
   indexedSessions: number,
@@ -373,7 +373,7 @@ returns `ambiguous_address`. Fabric returns no source records in either case.
 
 `memory.recall` returns one flat, bounded hit stream:
 
-```ts
+```ts host
 type FabricCall = {
   ref: "memory.recall" | "memory.expand";
   args: Record<string, unknown>;
@@ -395,7 +395,7 @@ or redundant counts and prose.
 
 A hot or explicitly resolved entry hit carries evidence plus one action:
 
-```ts
+```ts host
 {
   kind: "entry",
   sessionId,
@@ -423,7 +423,7 @@ A hot or explicitly resolved entry hit carries evidence plus one action:
 A cold candidate cannot claim an exact source entry. It carries only
 session-level evidence and a recall action:
 
-```ts
+```ts host
 {
   kind: "session",
   sessionId,
@@ -442,6 +442,7 @@ separate source or action-specific pointer objects. Dispatch either hit without
 branch-specific plumbing:
 
 ```ts
+const { hits: [hit] } = await memory.recall({ query: "timeout", scope: "project" });
 const detail = await tools.call(hit.follow);
 ```
 
@@ -449,6 +450,7 @@ When a statically typed result is useful, discriminate the hit and call the
 known provider method:
 
 ```ts
+const { hits: [hit] } = await memory.recall({ query: "timeout", scope: "project" });
 const detail = hit.kind === "entry"
   ? await memory.expand(hit.follow.args)
   : await memory.recall(hit.follow.args);
@@ -482,6 +484,8 @@ indices, stable entry IDs, operation addresses, or an inclusive range.
 `before` and `after` add adjacent entries around exactly one selected anchor:
 
 ```ts
+const { hits: [hit] } = await memory.recall({ query: "timeout", scope: "project" });
+if (hit.kind !== "entry") throw new Error("expected an entry hit");
 const exact = await memory.expand(hit.follow.args);
 const around = await memory.expand({
   ...hit.follow.args,
@@ -489,7 +493,7 @@ const around = await memory.expand({
   after: 3,
 });
 const operation = await memory.expand({
-  session,
+  session: hit.sessionId,
   operationAddresses: ["entry-uuid/7"],
 });
 ```
@@ -504,7 +508,9 @@ Expansion never silently slices away a long record. Every returned chunk has
 non-null `next`; follow it to reconstruct the exact text:
 
 ```ts
-let chunk = await memory.expand(args);
+const { hits: [hit] } = await memory.recall({ query: "timeout", scope: "project" });
+if (hit.kind !== "entry") throw new Error("expected an entry hit");
+let chunk = await memory.expand(hit.follow.args);
 while (chunk.next !== null && chunk.next !== undefined) {
   chunk = await memory.expand(chunk.next.args);
 }
@@ -520,6 +526,8 @@ the query language is the surrounding TypeScript. `memory.walk` is a
 guest-only combinator, not a fourth host action and not a serialized callback:
 
 ```ts
+const [current] = (await memory.sessions({ scope: "session" })).sessions ?? [];
+const session = current.id;
 const failedFiles = new Set<string>();
 const parents = new Map<string, string | null>();
 

@@ -6,6 +6,14 @@ import { describe, expect, it } from "vitest";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
 import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 
+/** TypeScript fences; the `host` info word marks host, extension or library code. */
+const typeScriptBlocks = (markdown: string) =>
+  [...markdown.matchAll(/^```(?:ts|typescript)(?:[ \t]+([^\n]*))?\n([\s\S]*?)\n```/gm)].map((match) => ({
+    host: (match[1] ?? "").trim().split(/\s+/).includes("host"),
+    code: match[2]!,
+    line: markdown.slice(0, match.index).split("\n").length,
+  }));
+
 const stableProviderActions = {
   memory: ["recall", "expand", "sessions"],
   state: ["transition", "get", "history", "complexity", "verify", "goal", "checkGoal"],
@@ -100,10 +108,7 @@ describe("fabric-exec skill provider contracts", () => {
       .filter((entry) => entry.isDirectory())
       .map((entry) => path.join("skillsets/typescript", entry.name, "SKILL.md"))
       .filter((file) => fs.existsSync(file));
-    skillFiles.push(
-      "skillsets/typescript/fabric-ambient/references/setup.md",
-      "docs/schema-enforcement.md",
-    );
+    skillFiles.push("skillsets/typescript/fabric-ambient/references/setup.md");
 
     for (const file of skillFiles) {
       const markdown = fs.readFileSync(file, "utf8");
@@ -118,6 +123,38 @@ describe("fabric-exec skill provider contracts", () => {
         }
       }
     }
+  });
+
+  it("type-checks every unmarked TypeScript block in the exec references and docs", () => {
+    const files = ["skillsets/typescript/fabric-exec/references", "docs"].flatMap((dir) =>
+      fs.readdirSync(dir).filter((name) => name.endsWith(".md")).map((name) => path.join(dir, name)));
+    let checked = 0;
+    for (const file of files) {
+      for (const block of typeScriptBlocks(fs.readFileSync(file, "utf8"))) {
+        if (block.host) continue;
+        checked += 1;
+        const result = typeCheckFabricCode(block.code, GUEST_TYPE_DECLARATIONS);
+        expect(result.errors, `${file}:${block.line} is not a guest program; fix it or mark it \`ts host\``)
+          .toEqual([]);
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+  });
+
+  it("skips a `ts host` block and checks unmarked ts and typescript blocks", () => {
+    const markdown = [
+      "```ts host", 'import x from "pi-fabric/protocol";', "```",
+      "```ts", "return 1;", "```",
+      "```typescript", "return undefinedName;", "```",
+    ].join("\n");
+    const blocks = typeScriptBlocks(markdown);
+    expect(blocks.map(({ host, line }) => ({ host, line }))).toEqual([
+      { host: true, line: 1 },
+      { host: false, line: 4 },
+      { host: false, line: 7 },
+    ]);
+    expect(typeCheckFabricCode(blocks[0]!.code, GUEST_TYPE_DECLARATIONS).errors).not.toEqual([]);
+    expect(typeCheckFabricCode(blocks[2]!.code, GUEST_TYPE_DECLARATIONS).errors).not.toEqual([]);
   });
 
   it("marks and resolves every relative Markdown reference in a skill", () => {

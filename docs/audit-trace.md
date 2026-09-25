@@ -6,7 +6,7 @@ The serialized final details object never exceeds 512 KiB. Consumers use current
 
 ## Envelope
 
-```ts
+```ts host
 interface FabricPersistedExecutionDetailsV1 {
   success: boolean;
   trace: FabricExecutionTraceV1;

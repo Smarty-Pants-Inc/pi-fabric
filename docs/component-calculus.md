@@ -128,7 +128,7 @@ Take two effects $a$ and $b$. Safe reordering needs more than non-overlapping co
 
 Pi Fabric uses a conservative, declared approximation:
 
-```ts
+```ts host
 effect: {
   resources: ["workspace:project"],
   ordering: "commutative" | "ordered" | "unknown"

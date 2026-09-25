@@ -180,6 +180,18 @@ describe("MeshStore", () => {
     }
   }, 60_000);
 
+  it("reports the cursor just past each event, so a reader can resume at any event", async () => {
+    const store = createStore();
+    const from = identity;
+    for (const text of ["a", "b", "c"]) await store.publish({ topic: "t", from, text });
+    const page = store.tail(0, 10);
+    expect(page.events.map((event) => event.text)).toEqual(["a", "b", "c"]);
+    expect(page.cursors).toHaveLength(3);
+    expect(page.cursors![2]).toBe(page.nextOffset);
+    expect(store.tail(page.cursors![0]!, 10).events.map((event) => event.text)).toEqual(["b", "c"]);
+    expect(store.tail(page.cursors![1]!, 10).events.map((event) => event.text)).toEqual(["c"]);
+  });
+
   it("keeps unreadable state as a write barrier while serving an empty table", async () => {
     const store = createStore();
     const statePath = path.join(store.root, "state.json");

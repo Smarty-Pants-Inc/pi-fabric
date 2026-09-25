@@ -15,17 +15,32 @@ export class ActorMeshMonitor {
   #polling = false;
   #closed = false;
   #started = false;
+  /** Events created before this are not delivered when resuming from a saved cursor. */
+  #replayFloor: number | undefined;
+  /** Resumed from a saved cursor and not yet at the end of the log. */
+  #catchingUp = false;
 
   constructor(
     readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail">,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
+      /**
+       * On resume from a saved cursor, deliver only events newer than this many ms, so a
+       * restart replays the gap it missed and not a long downtime (#37's replay storm).
+       */
+      maxReplayAgeMs?: number | undefined;
       beforePoll(): boolean;
-      onEvent(event: MeshEvent): void;
+      /** false: a receiver is full; while catching up, the event is offered again later. */
+      onEvent(event: MeshEvent): boolean | void;
     },
   ) {
-    this.#offset = this.#readCursor() ?? mesh.latestOffset();
+    const saved = this.#readCursor();
+    this.#offset = saved ?? mesh.latestOffset();
+    if (saved !== undefined && callbacks.maxReplayAgeMs !== undefined) {
+      this.#replayFloor = Date.now() - callbacks.maxReplayAgeMs;
+      this.#catchingUp = true;
+    }
   }
 
   start(): void {
@@ -87,10 +102,29 @@ export class ActorMeshMonitor {
     if (!this.callbacks.beforePoll()) return;
     this.#polling = true;
     try {
-      const tail = this.mesh.tail(this.#offset, this.config.maxReadEvents);
-      this.#offset = tail.nextOffset;
-      for (const event of tail.events) this.callbacks.onEvent(event);
+      // Live and catch-up both read whole pages. Live advances first, so a failing dispatch
+      // never blocks the stream; the cursor file is committed after the page.
+      const start = this.#offset;
+      const tail = this.mesh.tail(start, this.config.maxReadEvents);
+      if (this.#catchingUp && tail.events.length === 0) this.#catchingUp = false;
+      const catchingUp = this.#catchingUp;
+      if (!catchingUp) this.#offset = tail.nextOffset;
+      for (const [index, event] of tail.events.entries()) {
+        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor) continue;
+        if (this.callbacks.onEvent(event) === false && catchingUp) {
+          // A full actor queue rejected this event while catching up (smarty-dev#472): keep
+          // the cursor on it and offer it again later; earlier events are already delivered.
+          // The boundary comes from this same read, so a compaction since cannot move it.
+          this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
+          this.#writeCursor();
+          return;
+        }
+      }
+      if (catchingUp) this.#offset = tail.nextOffset;
       this.#writeCursor();
+      // Yield to the event loop between catch-up pages, so timers such as the lease
+      // heartbeat keep running through a long backlog.
+      if (catchingUp) setImmediate(() => this.schedule());
     } finally {
       this.#polling = false;
     }

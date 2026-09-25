@@ -129,6 +129,8 @@ const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
+/** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
+const DELIVERED_EVENT_MEMORY = 4_096;
 const RESIDENT_HOST_EVENT_TOPIC = "fabric.actor.host-event";
 // A failing actor is silent (a failed directive run stays silent), so after this many
 // consecutive failed activations the host tells the owner's Main once (smarty-dev#390).
@@ -253,6 +255,7 @@ export class ActorManager {
   readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
+  readonly #delivered = new Set<string>();
   #closing = false;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
   // mesh dispatch are frozen so interrupted actors are not re-armed by the
@@ -286,6 +289,8 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
+      /** With meshCursorPath: on resume, replay only events newer than this (ms). */
+      meshReplayAgeMs?: number;
       relayParticipantSteering?: boolean;
       retention?: FabricRetentionConfig;
       acquireCapabilityView?(
@@ -327,6 +332,7 @@ export class ActorManager {
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
+      maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
@@ -335,7 +341,8 @@ export class ActorManager {
       },
       onEvent: (event) => {
         if (event.topic === "fabric.steer") this.#relaySteer(event);
-        else if (!event.topic.startsWith("fabric.control.")) this.#dispatchMeshEvent(event);
+        else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
+        return true;
       },
     });
     this.#meshMonitor.start();
@@ -1326,6 +1333,8 @@ export class ActorManager {
         this.#canManage(actor.id)
       ) {
         const item = actor.queue.shift();
+        // A freed slot lets a catch-up that a full queue deferred continue at once.
+        this.#meshMonitor.schedule();
         if (!item) break;
         const inferenceContext = actor.inferenceContext;
         actor.status = "running";
@@ -1817,22 +1826,35 @@ export class ActorManager {
     }
   }
 
-  #dispatchMeshEvent(event: MeshEvent): void {
+  // Returns false when an owned receiver's queue was full; the monitor then offers the event
+  // again while it catches up, and actors that already took it are skipped.
+  #dispatchMeshEvent(event: MeshEvent): boolean {
     this.#refreshOwnership();
+    let full = false;
     for (const actor of this.#actors.values()) {
       if (!this.#canManage(actor.id) || actor.status === "stopped") continue;
       const addressed = event.to === actor.id || event.to === actor.name;
       const subscribed = actor.topics.includes(event.topic);
       if (!addressed && !subscribed) continue;
       if (event.from.id === actor.id && !addressed) continue;
+      const delivery = `${actor.id}\0${event.id}`;
+      if (this.#delivered.has(delivery)) continue;
       try {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);
         } else {
           this.#enqueue(actor, `mesh:${event.topic}`, event);
         }
-      } catch { /* skip event for a full or stopped actor */ }
+        this.#delivered.add(delivery);
+        if (this.#delivered.size > DELIVERED_EVENT_MEMORY) {
+          this.#delivered.delete(this.#delivered.values().next().value!);
+        }
+      } catch (error) {
+        // A stopped actor or other failure skips the event, as before; a full queue defers it.
+        if (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached")) full = true;
+      }
     }
+    return !full;
   }
 
   async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {

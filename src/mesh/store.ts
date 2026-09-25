@@ -27,6 +27,8 @@ export interface MeshEvent {
 export interface MeshTailResult {
   events: MeshEvent[];
   nextOffset: number;
+  /** The cursor just past each event, from the same read (so a reader can stop at any event). */
+  cursors?: number[];
 }
 
 export interface MeshStateEntry {
@@ -500,6 +502,7 @@ export class MeshStore {
       const buffer = Buffer.allocUnsafe(chunkBytes);
       const bytesRead = fs.readSync(descriptor, buffer, 0, chunkBytes, position);
       const events: MeshEvent[] = [];
+      const cursors: number[] = [];
       let lineStart = 0;
       let consumed = 0;
       for (let index = 0; index < bytesRead; index++) {
@@ -510,7 +513,10 @@ export class MeshStore {
         if (line) {
           try {
             const event = JSON.parse(line) as MeshEvent;
-            if (typeof event.sequence === "number") events.push(event);
+            if (typeof event.sequence === "number") {
+              events.push(event);
+              cursors.push(this.#encodeCursor(generation, position + consumed));
+            }
           } catch { /* skip malformed mesh log line */ }
         }
         if (events.length >= boundedLimit) break;
@@ -518,6 +524,7 @@ export class MeshStore {
       return {
         events: events.map((event) => jsonClone(event)),
         nextOffset: this.#encodeCursor(generation, position + consumed),
+        cursors,
       };
     } catch (error) {
       if (errorCode(error) === "ENOENT") {

@@ -36,8 +36,8 @@ describe("structured agent results", () => {
       // The #576 retro's cases: braces or a bracketed name in the prose are never the value.
       'The check ran with {} options and found nothing new.\n{"action":"silent"}',
       'smarty-agents[bot] posted the install line; nothing to steer.\n{"action":"silent"}',
-      // A final value that spans lines.
-      'Steer:\n{\n  "action": "message",\n  "message": "Rebase #57."\n}',
+      // A final value that spans lines, after commentary with a bracketed list.
+      'Checked [#56, #57] and {nothing} else.\nSteer:\n{\n  "action": "message",\n  "message": "Rebase #57."\n}',
     ];
     expect(validate(replies[0]!)).toMatchObject({ status: "completed", value: { action: "silent" } });
     for (const text of replies.slice(1, 4)) expect(validate(text), text).toMatchObject({ status: "completed", value: { action: "silent" } });
@@ -49,6 +49,10 @@ describe("structured agent results", () => {
       '{"action":"silent"}\nDone.',                                  // something follows the value
       '{"action":"message","message":"x"}\n{"action":"silent"}',      // two values: ambiguous
       'Either\n{"action":"message","message":"x"}\nor\n{"action":"silent"}',
+      // review/astra on #60: an earlier value that spans lines is a second value too.
+      '{\n  "action": "stop"\n}\n{"action":"silent"}',
+      'First:\n[\n  {"action": "message", "message": "x"}\n]\nThen:\n{"action":"silent"}',
+      '{\n  "action": "message",\n  "message": "x"\n}\n\n{\n  "action": "silent"\n}',
       'Result: {"action":"silent"}',                                 // not on its own line
       'Nothing to do.\n{"action": silent}',                          // the final value is not JSON
       'No JSON here at all.',

@@ -91,15 +91,23 @@ export const parseStructuredResult = (text: string): unknown => {
         reason = `in the final value: ${error instanceof Error ? error.message : String(error)}`;
       }
       if (parsed) {
-        const earlier = lines.slice(0, start).some((line) => {
-          if (!line.startsWith("{") && !line.startsWith("[")) return false;
-          try {
-            JSON.parse(line);
-            return true;
-          } catch {
-            return false;
+        // An earlier value on its own lines, single-line or pretty-printed, makes the reply
+        // ambiguous: from each earlier line that starts with { or [, try every block that ends
+        // on a line ending with } or ] before the final value.
+        let earlier = false;
+        for (let from = 0; from < start && !earlier; from++) {
+          if (!lines[from]!.startsWith("{") && !lines[from]!.startsWith("[")) continue;
+          for (let to = from; to < start && !earlier; to++) {
+            const end = lines[to]!.trimEnd();
+            if (!end.endsWith("}") && !end.endsWith("]")) continue;
+            try {
+              JSON.parse(lines.slice(from, to + 1).join("\n"));
+              earlier = true;
+            } catch {
+              // Not a complete value here.
+            }
           }
-        });
+        }
         if (!earlier) return value;
         reason = "found more than one JSON value";
       }

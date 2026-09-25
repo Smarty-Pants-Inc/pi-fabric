@@ -6,6 +6,15 @@ import { describe, expect, it } from "vitest";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
 import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 
+// A ```ts or ```typescript fence is a fabric_exec guest program; ```ts host marks
+// host, extension, or library code that the guest type check skips.
+const typeScriptFences = (markdown: string) =>
+  [...markdown.matchAll(/^```(?:ts|typescript)([^\n]*)\n([\s\S]*?)\n```/gm)].map((match) => ({
+    info: match[1]!.trim(),
+    code: match[2]!,
+    line: markdown.slice(0, match.index).split("\n").length,
+  }));
+
 const stableProviderActions = {
   memory: ["recall", "expand", "sessions"],
   state: ["transition", "get", "history", "complexity", "verify", "goal", "checkGoal"],
@@ -100,10 +109,7 @@ describe("fabric-exec skill provider contracts", () => {
       .filter((entry) => entry.isDirectory())
       .map((entry) => path.join("skillsets/typescript", entry.name, "SKILL.md"))
       .filter((file) => fs.existsSync(file));
-    skillFiles.push(
-      "skillsets/typescript/fabric-ambient/references/setup.md",
-      "docs/schema-enforcement.md",
-    );
+    skillFiles.push("skillsets/typescript/fabric-ambient/references/setup.md");
 
     for (const file of skillFiles) {
       const markdown = fs.readFileSync(file, "utf8");
@@ -118,6 +124,39 @@ describe("fabric-exec skill provider contracts", () => {
         }
       }
     }
+  });
+
+  it("skips ts host fences and checks every other TypeScript fence", () => {
+    const markdown = [
+      "```ts host",
+      "import type { ExtensionAPI } from \"@earendil-works/pi-coding-agent\";",
+      "```",
+      "```typescript",
+      "return agents.main();",
+      "```",
+    ].join("\n");
+    expect(typeScriptFences(markdown).map(({ info, line }) => ({ info, line }))).toEqual([
+      { info: "host", line: 1 },
+      { info: "", line: 4 },
+    ]);
+    expect(typeCheckFabricCode(typeScriptFences(markdown)[0]!.code, GUEST_TYPE_DECLARATIONS).errors)
+      .not.toEqual([]);
+  });
+
+  it("type-checks every guest TypeScript fence in the reference and product docs", () => {
+    const files = ["skillsets/typescript/fabric-exec/references", "docs"].flatMap((dir) =>
+      fs.readdirSync(dir).filter((name) => name.endsWith(".md")).map((name) => path.join(dir, name)));
+    let checked = 0;
+    for (const file of files) {
+      for (const block of typeScriptFences(fs.readFileSync(file, "utf8"))) {
+        const where = `${file}:${block.line}`;
+        expect(["", "host"], `${where} has an unknown fence info string`).toContain(block.info);
+        if (block.info === "host") continue;
+        checked++;
+        expect(typeCheckFabricCode(block.code, GUEST_TYPE_DECLARATIONS).errors, where).toEqual([]);
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
   });
 
   it("marks and resolves every relative Markdown reference in a skill", () => {

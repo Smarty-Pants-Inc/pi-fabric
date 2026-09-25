@@ -154,6 +154,7 @@ Fabric ships a general-purpose, theme-aware activity surface that works with any
 The surface is data-driven. Fabric automatically instruments nested provider calls, agents, persistent actors, and task-shaped mesh entries. A workflow can add domain-specific labels and arbitrary progress, and it needs no extension UI code:
 
 ```ts
+const packages = ["core", "cli", "docs"];
 await workflow.configure({ name: "Release train", description: "Build, verify, and publish" });
 await phase("Build", { total: packages.length });
 await workflow.item({
@@ -168,7 +169,7 @@ await workflow.event({ message: "Canary passed", level: "success" });
 
 External Fabric providers can emit structured `context.activity()` updates for an entity, a progress message, or metrics. The TUI stays generic, and a virtual provider can still expose richer live state.
 
-```ts
+```ts host
 async invoke(actionName, args, context) {
   context.activity?.({ type: "entity", id: job.id, kind: "custom", name: job.name });
   context.activity?.({ type: "progress", message: "Indexing package 3/12" });

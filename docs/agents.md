@@ -49,6 +49,10 @@ Use `agents.models({ runner: "pi" })` and copy the returned `key` verbatim, or u
 For independent launches, await `Promise.allSettled` and inspect every result. An uncaught `Promise.all` rejection ends the Fabric program and can abort sibling calls still in flight; it does not prove every requested model was unavailable. Already completed calls are not rolled back, so retain successful handles and retry only failed launches.
 
 ```ts
+const requests = [
+  { task: "Review the parser.", model: "anthropic/claude-sonnet-4-6" },
+  { task: "Review the renderer.", model: "openai-codex/gpt-5.6-sol" },
+];
 const results = await Promise.allSettled(requests.map(request => agents.spawn(request)));
 return results.map(result => result.status === "fulfilled"
   ? { ok: true, handle: result.value }
@@ -170,7 +174,10 @@ Pi finalizes the native outer `fabric_exec` tool result after the complete Fabri
 Fabric sets no special count or size limit for handoffs. The normal `fabric_exec` output and trace projection limits apply before the boundary. Handoff fails closed when Fabric cannot identify the active outer turn or when that turn belongs to an incomplete parallel top-level tool batch.
 
 ```ts
-await pi.edit({ path: "src/guard.ts", edits: [{ oldText, newText }] });
+await pi.edit({
+  path: "src/guard.ts",
+  edits: [{ oldText: "if (token) {", newText: "if (token && !expired) {" }],
+});
 await agents.handoff({
   model: "anthropic/claude-haiku-4-5",
   task: "Continue from this completed Fabric invocation.",
@@ -438,6 +445,8 @@ call override → session binding → project default → Fabric or runner defau
 ```
 
 ```ts
+const [actor] = await agents.actors();
+
 // Change only this Pi session.
 await agents.setModel({ id: actor.id, model: "anthropic/claude-sonnet-4-6" });
 await agents.setThinking({ id: actor.id, thinking: "low" });
@@ -544,6 +553,7 @@ Delivery can stay in `mailbox` or enter the main session through `steer`, `follo
 Pi actors use full inference history by default. To exclude **prior activations** from model input without removing their journals, select `inferenceContext: "activation"` at creation or change the existing actor:
 
 ```ts
+const [actor] = await agents.actors();
 await agents.setInferenceContext({ id: actor.id, inferenceContext: "activation" });
 const selected = await agents.actorStatus({ id: actor.id });
 // Restore the default policy explicitly:
@@ -559,6 +569,7 @@ Activation mode requires a Pi CLI with the process-local `--no-auto-compaction` 
 The actor cannot change delivery from its response. The owner can update a live actor or global template and keep its history:
 
 ```ts
+const [actor] = await agents.actors();
 await agents.setDeliveryPolicy({
   id: actor.id,
   delivery: "steer",
@@ -573,6 +584,7 @@ Set `scope: "global"` to update a reusable template. In the dashboard, press `y`
 `agents.log()` reads bounded pages from JSONL logs. It does not load the full file. The first call returns the newest entries. If `hasMore` is true, pass the returned `before` cursor to load the next older page. For an actor session, use `sessionHasMore` and `sessionBefore`:
 
 ```ts
+const { id } = await agents.spawn({ task: "Map the persistence layer." });
 const newest = await agents.log({ id, type: "run", lines: 100 });
 if ("before" in newest && newest.hasMore) {
   const older = await agents.log({ id, type: "run", lines: 100, before: newest.before });
@@ -589,7 +601,7 @@ Persistent actors belong to a project mesh. If you want to reuse a persona in se
 
 ```ts
 // Store a reusable persona in the global registry. This does not create a live actor.
-return agents.create({
+await agents.create({
   name: "security-reviewer",
   instructions: "Review changes for security defects. Reply with a directive only for material drift.",
   events: ["agent_settled"],
@@ -598,12 +610,16 @@ return agents.create({
 });
 
 // List the templates. Then create a new actor from one in the current project.
-const [template] = agents.actors({ scope: "global" });
-return agents.import({ name: template.name });                       // create it without inherited history
-return agents.import({ name: "security-reviewer", as: "security-reviewer-2" }); // rename it if the name exists
+const [template] = (await tools.call({
+  ref: "agents.actors",
+  args: { scope: "global" },
+})) as FabricActorInfo[];
+await agents.import({ name: template.name });                       // create it without inherited history
+await agents.import({ name: "security-reviewer", as: "security-reviewer-2" }); // rename it if the name exists
 
 // Copy a tuned project actor to the global library without its history.
-return agents.export({ id: actorId, overwrite: true });
+const [actor] = await agents.actors();
+await agents.export({ id: actor.id, overwrite: true });
 
 // Change the default instruction and continuation policy of a template.
 await agents.setInstructions({ id: template.id, instructions: "Be brief.", scope: "global" });

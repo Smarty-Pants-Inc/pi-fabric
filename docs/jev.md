@@ -128,6 +128,8 @@ Use named Fabric payloads when large code strings are awkward to quote. In a Jev
 A reactive controller can use `while (true)` with these primitives. Observe fresh state, construct questions/candidate IDs, evaluate, verify applicability, act, and observe again. Revalidate target IDs/revisions before applying a decision. Define a no-match or escalation path. There is no mandatory model-generated planning step in the loop and no built-in 10 Hz guarantee: end-to-end rate includes observation, inference, and action latency.
 
 ```ts
+// Pass the route-tickets program above as the named payload `routeTickets`.
+const specification: FabricJevProgram = JSON.parse(π.routeTickets);
 const task = await jev.spawn({ program: specification, input: [{ text: "Settings crashes" }] });
 // Main can do other work now.
 const progress = await jev.status({ id: task.id, after: 0 });
@@ -158,7 +160,7 @@ Read the application's own state through a page bridge using `browser.cdp` and `
 
 Jev selects a tactic; code decides how to execute it. A timed pulse with an epoch guard is what survives a realtime loop: apply an input mask, hold it for a bounded interval, release it only while it is still the newest pulse, then re-observe.
 
-```ts
+```ts host
 let epoch = 0;
 async function pulse(mask: string, durationMs: number) {
   const mine = ++epoch;
@@ -174,7 +176,7 @@ Revalidate the revision you decided from before applying anything. A rejected or
 
 A realtime loop needs a deterministic fallback for every degraded decision: a failed request, an invalid response, or confidence below your threshold. Compute the fallback in code, replace the judgment, and record it, so the UI and telemetry never present it as a model decision.
 
-```ts
+```ts host
 let degraded = false;
 try {
   const decision = await jev.evaluate({ state, questions });

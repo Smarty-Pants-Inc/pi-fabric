@@ -40,12 +40,19 @@ export class AgentCompletionInbox {
         }
         this.#flush();
       });
+    // Any new run ends a suspension, not only typed input: after an abort the inbox must not
+    // start a run by itself, but results parked since then join the next run Main makes for any
+    // reason. A voice- or peer-driven session may never see typed input again, and its results
+    // stayed parked for hours (smarty-dev#733). A run started by a triggered custom message
+    // (peer delivery, voice) emits agent_start but neither input nor before_agent_start, so
+    // agent_start ends the suspension; the results then go in at that run's first turn_end.
+    subscribe("agent_start", (_event, ctx) => {
+        this.#context = ctx;
+        this.#suspended = false;
+      });
     subscribe("before_agent_start", (_event, ctx) => {
         this.#context = ctx;
-        // Any new run ends a suspension, not only typed input: after an abort the inbox must
-        // not start a turn by itself, but results parked since then join the next turn Main
-        // runs for any reason. A voice- or peer-driven session may never see typed input
-        // again, and its results stayed parked for hours (smarty-dev#733).
+        // A prompt-started run: its results join the first inference.
         this.#suspended = false;
         let message: CompletionMessage | undefined;
         // Join the user's first inference; do not enqueue an extra turn behind it.

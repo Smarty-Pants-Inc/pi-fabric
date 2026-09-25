@@ -149,26 +149,55 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage).not.toHaveBeenCalled();
   });
 
-  // smarty-dev#733: org's turn ended aborted at 05:28Z; every later turn came from voice or peer
-  // messages (no typed input), and 7 detached results stayed parked until 10:02Z.
-  it("delivers results parked after an abort to the next turn Main runs, without typed input", async () => {
+  // smarty-dev#733: org's turn ended aborted at 05:28Z; every later run came from voice or peer
+  // messages (no typed input), and 7 detached results stayed parked until 10:02Z. Pi starts a run
+  // for a triggered custom message (sendCustomMessage -> _runAgentPrompt) without input or
+  // before_agent_start; agent_start, turn_end, agent_end and agent_settled still fire.
+  it("delivers results parked after an abort into the next run a custom message starts", async () => {
     const h = harness();
     h.boundary("aborted");
     h.idle();
     h.emit("agent_settled");
     h.inbox.enqueue(result("a"));
     await vi.advanceTimersByTimeAsync(100);
-    expect(h.sendMessage).not.toHaveBeenCalled();                 // no turn started for results alone
+    expect(h.sendMessage).not.toHaveBeenCalled();                 // no run started for results alone
     h.idle(false);
-    const joined = h.emit("before_agent_start") as { message: { details: { ids: string[] } } };   // a peer message's turn
-    expect(joined.message.details.ids).toEqual(["a"]);
+    h.emit("agent_start");                                         // a peer message's run
+    h.emit("turn_start");
+    h.boundary("toolUse");                                         // its first turn boundary
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(h.sendMessage.mock.calls[0]![0].details.ids).toEqual(["a"]);
+    expect(h.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: true });
     h.boundary("stop");
     h.idle();
     h.emit("agent_settled");
     h.inbox.enqueue(result("b"));                                  // later results wake idle Main again
     await vi.advanceTimersByTimeAsync(100);
-    expect(h.sendMessage).toHaveBeenCalledOnce();
-    expect(h.sendMessage.mock.calls[0]![0].details.ids).toEqual(["b"]);
+    expect(h.sendMessage).toHaveBeenCalledTimes(2);
+    expect(h.sendMessage.mock.calls[1]![0].details.ids).toEqual(["b"]);
+  });
+
+  it("delivers results parked after an abort into the first inference of a prompt-started run", async () => {
+    const h = harness();
+    h.boundary("aborted");
+    h.idle();
+    h.emit("agent_settled");
+    h.inbox.enqueue(result("a"));
+    await vi.advanceTimersByTimeAsync(100);
+    h.idle(false);
+    const joined = h.emit("before_agent_start") as { message: { details: { ids: string[] } } };
+    expect(joined.message.details.ids).toEqual(["a"]);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("still starts no run by itself after an abort while nothing else runs", async () => {
+    const h = harness();
+    h.boundary("error");
+    h.idle();
+    h.emit("agent_settled");
+    for (const id of ["a", "b", "c"]) h.inbox.enqueue(result(id));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.sendMessage).not.toHaveBeenCalled();
   });
 
   it("checks the abort signal even before the aborted turn event arrives", async () => {

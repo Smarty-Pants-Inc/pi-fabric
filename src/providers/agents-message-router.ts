@@ -14,6 +14,25 @@ import type { FabricAgentRunner } from "../config.js";
 // ponytail: 5 min covers every lease flap seen in the fleet; a longer lapse reads as ended.
 const LAPSED_ROOT_REPLY_WINDOW_MS = 5 * 60_000;
 // Route messages using only the ownership, delivery, and binding ports needed here.
+// Says why a target cannot be resolved; the prefix stays "Unknown <label>: <id>".
+export const unknownParticipant = (
+  participants: Pick<FabricParticipantSource, "lastKnown">,
+  id: string,
+  label = "Fabric participant",
+): Error => {
+  const known = participants.lastKnown?.(id);
+  if (!known) {
+    return new Error(
+      `Unknown ${label}: ${id} (no record on this mesh root: the session has ended, ` +
+        "has not joined yet, or uses another mesh root)",
+    );
+  }
+  const when = Number.isFinite(known.lapsedMs)
+    ? `its lease lapsed ${Math.round(known.lapsedMs / 1000)} s ago`
+    : "its host is gone or was replaced";
+  return new Error(`Unknown ${label}: ${id} (${when}, so the session has probably ended)`);
+};
+
 export class AgentMessageRouter {
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
@@ -29,21 +48,6 @@ export class AgentMessageRouter {
     const known = this.participants.lastKnown?.(id);
     if (!known || known.participant.kind !== "root" || known.lapsedMs > LAPSED_ROOT_REPLY_WINDOW_MS) return undefined;
     return known.participant;
-  }
-
-  // Says why a target cannot be resolved; the prefix stays "Unknown <label>: <id>".
-  #unknownParticipant(id: string, label = "Fabric participant"): Error {
-    const known = this.participants.lastKnown?.(id);
-    if (!known) {
-      return new Error(
-        `Unknown ${label}: ${id} (no record on this mesh root: the session has ended, ` +
-          "has not joined yet, or uses another mesh root)",
-      );
-    }
-    const when = Number.isFinite(known.lapsedMs)
-      ? `its lease lapsed ${Math.round(known.lapsedMs / 1000)} s ago`
-      : "its host is gone or was replaced";
-    return new Error(`Unknown ${label}: ${id} (${when}, so the session has probably ended)`);
   }
 
   async routeMessage(
@@ -83,7 +87,7 @@ export class AgentMessageRouter {
       const participant = remoteRoot ?? this.participants.get(this.mainAgent.id) ??
         this.#recentlyLapsedRoot(this.mainAgent.id);
       if (!participant) {
-        throw this.participants.writeStalled?.() ?? this.#unknownParticipant(this.mainAgent.id, "Fabric Main participant");
+        throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");
       }
       if (!participant.capabilities.includes(kind)) {
         throw new Error(`Fabric participant ${participant.id} does not support ${kind}`);
@@ -127,7 +131,7 @@ export class AgentMessageRouter {
       target = this.resolveActorTarget(id);
     } catch (error) {
       if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) {
-        throw this.participants.writeStalled?.() ?? this.#unknownParticipant(id);
+        throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, id);
       }
       throw error;
     }

@@ -2201,6 +2201,28 @@ describe("AgentsProvider steering", () => {
     ).toBe(true);
   });
 
+  // smarty-dev#447: status and stop said only "Unknown Fabric participant", without the reason.
+  it("says why status and stop cannot resolve an id", async () => {
+    const { provider } = setup();
+    for (const action of ["status", "stop"] as const) {
+      await expect(provider.invoke(action, { id: "session:never" }, context))
+        .rejects.toThrow("Unknown Fabric participant: session:never (no record on this mesh root");
+    }
+  });
+
+  // review/astra on #57: the remote-Main branch of status said only "Unknown Fabric Main participant".
+  it("says why status cannot resolve a remote Main, by alias and by id, after a write stall check", async () => {
+    let stalled: Error | undefined;
+    const { provider } = setup([], [], undefined, { writeStalled: () => stalled });
+    (provider.mainAgent as { local: boolean }).local = false;
+    for (const id of ["main", provider.mainAgent.id]) {
+      await expect(provider.invoke("status", { id }, context))
+        .rejects.toThrow(`Unknown Fabric Main participant: ${provider.mainAgent.id} (no record on this mesh root`);
+    }
+    stalled = new Error("Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock");
+    await expect(provider.invoke("status", { id: "main" }, context)).rejects.toThrow(stalled.message);
+  });
+
   it("rejects an unknown remote id instead of broadcasting an unverified steer", async () => {
     const { provider } = setup();
     await expect(

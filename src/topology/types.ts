@@ -103,6 +103,12 @@ export interface FabricParticipantSource {
   writeStalled?(now?: number): Error | undefined;
   /** When this host last committed its heartbeat through the mesh. */
   confirmedAt?(): number;
+  /**
+   * The record of a participant that get() no longer lists because its owner host's lease
+   * lapsed, and how long ago (Infinity when that host is gone or was replaced). Undefined
+   * when the participant is live or has no record on this mesh root.
+   */
+  lastKnown?(id: string, now?: number): { participant: FabricParticipantInfo; lapsedMs: number } | undefined;
   refresh(): Promise<void>;
   scheduleRefresh(): void;
 }

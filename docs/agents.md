@@ -358,6 +358,8 @@ For Main and one-shot agents, `steer` arrives after the tool calls in the curren
 
 Local routing returns `"main"` or `"local"`. For cross-process `steer`, `followUp`, and `stop`, Fabric resolves the exact owner of the target. It sends a control command addressed to that owner and waits for an acknowledgement that matches the version, target, and owner identity. Success returns `routed: "mesh", acknowledged: true` after this verified acknowledgement. Unknown IDs, stale owners, rejection, and timeout throw an error. The dashboard actions `s`, `u`, and `x` use the same route. Set `mesh.enabled` to use cross-process control. See [`references/agents.md`](../skillsets/typescript/fabric-exec/references/agents.md).
 
+A root session stays reachable for 5 minutes after its lease lapses, because a late heartbeat under mesh lock contention does not mean the session ended. Fabric sends the command to that root's last owner host, which acknowledges it when the session is alive. After 5 minutes, or when the target has no record on this mesh root, the `Unknown Fabric participant` error states the reason.
+
 ### Peer labels and queue gates
 
 Every root participant mints a project-scoped label such as `FAB-1` when it first publishes: the prefix derives from the project directory basename (initials for multi-word names, up to three letters for single-word names) and the number comes from a mesh-wide monotonic counter, so retired labels are never reused. Labels appear on participant records, peer projections, and the dashboard, giving other sessions' tooling a stable handle to show users in place of raw session ids.

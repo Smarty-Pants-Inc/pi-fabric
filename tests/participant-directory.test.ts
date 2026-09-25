@@ -453,6 +453,23 @@ describe("ParticipantDirectory", () => {
     });
   });
 
+  // smarty-dev#447: the record behind a lapsed lease stays readable for a reply and a reason.
+  it("reports how long ago a participant's lease lapsed, and nothing for live or unknown ids", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const identity: MeshIdentity = { id: "session:alpha", name: "main", kind: "main", sessionId: "alpha" };
+    const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => [rootRecord(identity.id, identity.id, "alpha")]);
+    await directory.start();
+    await vi.waitFor(() => expect(directory.list({ scope: "project" })).toHaveLength(1), { timeout: 5_000, interval: 50 });
+    expect(directory.lastKnown(identity.id)).toBeUndefined();                     // live
+    expect(directory.lastKnown("session:nobody")).toBeUndefined();                // no record
+    const later = Date.now() + 60_000;
+    const known = directory.lastKnown(identity.id, later);
+    expect(known?.participant).toMatchObject({ id: identity.id, kind: "root", stale: true });
+    expect(known!.lapsedMs).toBeGreaterThan(0);
+    expect(known!.lapsedMs).toBeLessThanOrEqual(60_000);
+  });
+
   it("hides every participant owned by an expired host lease", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
     roots.push(root);

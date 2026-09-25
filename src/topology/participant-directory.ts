@@ -452,6 +452,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
     );
   }
 
+  lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {
+    if (!this.options.enabled) return undefined;
+    const target = id === "main" ? this.options.rootId : id;
+    const participant = this.list({ scope: "project", includeStale: true }, now)
+      .find((candidate) => candidate.id === target);
+    if (!participant?.stale) return undefined;
+    const entry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId));
+    const host = entry ? hostFromEntry(entry) : undefined;
+    const sameHost = host && host.identity.id === participant.ownerIdentityId && host.rootId === participant.rootId;
+    return { participant, lapsedMs: sameHost ? Math.max(0, now - host.expiresAt) : Number.POSITIVE_INFINITY };
+  }
+
   get(id: string, now = Date.now(), options: { fresh?: boolean } = {}): FabricParticipantInfo | undefined {
     const target = id === "main" ? this.options.rootId : id;
     return this.list({ scope: "project", ...(options.fresh ? { fresh: true } : {}) }, now)

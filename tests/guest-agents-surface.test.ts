@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { CPYTHON_CHILD_SOURCE } from "../src/runtime/cpython-child-source.js";
-import { guestTypeDeclarations } from "../src/runtime/guest-types.js";
+import { GUEST_TYPE_DECLARATIONS, guestTypeDeclarations } from "../src/runtime/guest-types.js";
 import { GUEST_SETUP, QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 
 // AgentsProvider.invoke implements every descriptor, and the audit projection,
 // docs, and arg repair all spell the same refs. Only the TypeScript prelude
@@ -55,6 +56,51 @@ describe("guest agents surface", () => {
       { ref: "agents.export", args: { id: "actor-1", overwrite: true } },
     ]);
     expect(result.value).toMatchObject({ unbound: [] });
+  });
+
+  it("forwards the actors scope so global templates and project actors stay distinct", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute(
+      `const project = await agents.actors();
+       const explicit = await agents.actors({ scope: "project" });
+       const templates = await agents.actors({ scope: "global" });
+       return { project, explicit, templates };`,
+      async (ref, args) => {
+        calls.push({ ref, args });
+        return (args as { scope?: string }).scope === "global" ? ["template"] : ["actor"];
+      },
+      { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 },
+    );
+
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([
+      { ref: "agents.actors", args: {} },
+      { ref: "agents.actors", args: { scope: "project" } },
+      { ref: "agents.actors", args: { scope: "global" } },
+    ]);
+    expect(result.value).toEqual({ project: ["actor"], explicit: ["actor"], templates: ["template"] });
+  });
+
+  it("types a stored template's validWhile as serialized source, not a callable", () => {
+    const read = typeCheckFabricCode(
+      `const [template] = await agents.actors({ scope: "global" });
+       const exported = await agents.export({ id: "actor-1" });
+       const sources: string[] = [template.validWhile?.source, exported.validWhile?.source];
+       const actors = await agents.actors();
+       return { sources, status: actors[0]?.status };`,
+      GUEST_TYPE_DECLARATIONS,
+    );
+    expect(read.errors).toEqual([]);
+
+    for (const call of [
+      `const [template] = await agents.actors({ scope: "global" });
+       return template.validWhile?.({} as never);`,
+      `const exported = await agents.export({ id: "actor-1" });
+       return exported.validWhile?.({} as never);`,
+    ]) {
+      expect(typeCheckFabricCode(call, GUEST_TYPE_DECLARATIONS).errors.map((error) => error.message))
+        .toEqual([expect.stringContaining("not callable")]);
+    }
   });
 
   it("keeps the Python kernel's dynamic agents proxy in place", () => {

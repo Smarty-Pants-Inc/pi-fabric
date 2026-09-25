@@ -69,7 +69,7 @@ Catalog replacement uses the same path. A newer definition revision rolls every 
 
 Registration is versioned. Like an external provider, a component may arrive through an eager event or answer a discovery handshake:
 
-```ts
+```ts host
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   FABRIC_COMPONENT_DISCOVER_EVENT,
@@ -190,7 +190,7 @@ A component can contribute bounded system guidance without adding model-specific
 
 Configured components activate eagerly, before the first model turn. A standalone package can therefore contain only its registration bridge and component definition:
 
-```ts
+```ts host
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   FABRIC_COMPONENT_DISCOVER_EVENT,
@@ -307,7 +307,7 @@ Every activation runs inside a `FabricEffectScope`:
 
 Action descriptors carry effect metadata:
 
-```ts
+```ts host
 effect: {
   kind: "none" | "scoped" | "transactional" | "emission",
   resources: ["optional:resource-identity"],
@@ -323,7 +323,7 @@ When a descriptor omits this metadata, Fabric normalizes it conservatively. A `r
 
 A component may install another supervised component as a registration effect:
 
-```ts
+```ts host
 const child = context.use(workerDefinition, {
   id: "worker",
   config: { queue: "reviews" },

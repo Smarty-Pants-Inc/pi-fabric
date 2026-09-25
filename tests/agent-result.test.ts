@@ -26,35 +26,49 @@ describe("structured agent results", () => {
     expect(validate("ignored", { action: "message", message: "hi" })).toMatchObject({ status: "completed" });
   });
 
-  it("reject unfenced text around the value instead of searching it, with a reason that says so", () => {
+  // Fabric asks directive actors to finish with the object, and supervisors write a sentence
+  // first: pi-fabric#56 rejected that and failed 7 of 27 activations after its install.
+  it("accept commentary followed by one final JSON value on its own line", () => {
     const replies = [
-      // Incidental empty braces in the prose, then the intended object (the retro's case).
+      // Live supervisor replies after #56 (B8, 05:40Z).
+      'PR #666 is ci-admission-owner\'s follow-up for #432, so no steer is needed.\n\n{"action":"silent"}',
+      'Mergify bot status comment, author association NONE — not a request.\n\n{"action":"silent"}',
+      // The #576 retro's cases: braces or a bracketed name in the prose are never the value.
       'The check ran with {} options and found nothing new.\n{"action":"silent"}',
-      // A bracketed bot name in the prose.
       'smarty-agents[bot] posted the install line; nothing to steer.\n{"action":"silent"}',
-      // One valid object after prose: still a contract violation, not a silent result.
-      'Nothing to do.\n{"action":"silent"}',
-      '{"action":"silent"}\nDone.',
-      '{"action":"silent"}\n{"action":"message","message":"x"}',
-      // Two fences: which one is the result is ambiguous.
+      // A final value that spans lines.
+      'Steer:\n{\n  "action": "message",\n  "message": "Rebase #57."\n}',
+    ];
+    expect(validate(replies[0]!)).toMatchObject({ status: "completed", value: { action: "silent" } });
+    for (const text of replies.slice(1, 4)) expect(validate(text), text).toMatchObject({ status: "completed", value: { action: "silent" } });
+    expect(validate(replies[4]!)).toMatchObject({ status: "completed", value: { action: "message", message: "Rebase #57." } });
+  });
+
+  it("reject a reply without one final value, with a reason that says so", () => {
+    const replies = [
+      '{"action":"silent"}\nDone.',                                  // something follows the value
+      '{"action":"message","message":"x"}\n{"action":"silent"}',      // two values: ambiguous
+      'Either\n{"action":"message","message":"x"}\nor\n{"action":"silent"}',
+      'Result: {"action":"silent"}',                                 // not on its own line
+      'Nothing to do.\n{"action": silent}',                          // the final value is not JSON
+      'No JSON here at all.',
       '```json\n{"action":"message","message":"x"}\n```\nor\n```json\n{"action":"silent"}\n```',
       'Fenced, but not JSON:\n```json\n{action: silent}\n```',
-      // review/astra on #56: a second fence with another tag counts too.
       '```json\n{"action":"silent"}\n```\nThen:\n```text\nposted the install line\n```',
       '```json\n{"action":"silent"}\n```\n```typescript\nconst x = 1;\n```',
-      // One fence, but not a JSON one.
       '```ts\n{"action":"silent"}\n```',
     ];
     for (const text of replies) {
       const result = validate(text);
       expect(result.status, text).toBe("failed");
-      expect(result.error).toMatch(/^Structured agent output was invalid: the reply must be one JSON value, or have one code fence around it \(/);
+      expect(result.error).toMatch(/^Structured agent output was invalid: the reply must end with one JSON value on its own line, or have one code fence around it \(/);
       expect(result).not.toHaveProperty("value");
     }
   });
 
   it("still reject a JSON value that does not match the schema", () => {
     expect(validate('{"action":"shout"}')).toMatchObject({ status: "failed", error: expect.stringMatching(/^Structured agent output was invalid: /) });
+    expect(validate('Steering.\n{"action":"shout"}')).toMatchObject({ status: "failed" });
     expect(validate("{}").error).not.toContain("code fence");
   });
 });

@@ -61,7 +61,7 @@ describe("FabricControlPlane", () => {
     const ackFor = (store: MeshStore, commandId: string) =>
       store.read({ topic: "fabric.control.ack", limit: 100 }).find((event) => (event.data as { commandId?: string }).commandId === commandId);
 
-    it("are kept in the owner's own store with the command's sequence, not in the shared state", async () => {
+    it("keep the outcome in the owner's own store; the shared state holds only the claim", async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
       roots.push(root);
       const meshRoot = path.join(root, "mesh");
@@ -75,39 +75,129 @@ describe("FabricControlPlane", () => {
       const commandEvent = store.read({ topic: "fabric.control.command", limit: 10 }).at(-1)!;
       const commandId = (commandEvent.data as { commandId: string }).commandId;
       expect(result.messageId).toBe("local:" + commandId);
-      expect(store.listAll("topology/control-seen/")).toEqual([]);
+      const shared = store.listAll("topology/control-seen/");
+      expect(shared.map((entry) => entry.key)).toEqual([seenKey("host:receiver", commandId)]);
+      expect(shared[0]!.value).not.toHaveProperty("acceptance");            // one shared write, no outcome
+      expect(shared[0]!.version).toBe(store.get(shared[0]!.key)!.version);
       expect(ownStore(meshRoot, "host:receiver").get(seenKey("host:receiver", commandId))?.value).toMatchObject({
         hostId: "host:receiver", commandId, sequence: commandEvent.sequence, acceptance: { accepted: true },
       });
     });
 
-    it("left in the shared state move to the owner's store once and still answer a replay", async () => {
+    it("left in the shared state by older runtimes still answer a replay, and stay there", async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
       roots.push(root);
       const meshRoot = path.join(root, "mesh");
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       await store.publish(command("command:old", "host:receiver"));          // replayed at startup
-      const legacy = (hostId: string, commandId: string) => store.put({
-        key: seenKey(hostId, commandId), identity: identity(hostId), ifVersion: 0, value: {
-          format: 1, hostId, commandId, targetId: "agent:target", expiresAt: Date.now() + 60_000,
-          acceptance: { accepted: true, messageId: "earlier:" + commandId },
+      await store.put({
+        key: seenKey("host:receiver", "command:old"), identity: identity("host:receiver"), ifVersion: 0, value: {
+          format: 1, hostId: "host:receiver", commandId: "command:old", targetId: "agent:target", expiresAt: Date.now() + 60_000,
+          acceptance: { accepted: true, messageId: "earlier:command:old" },
         },
       });
-      await legacy("host:receiver", "command:old");
-      await legacy("host:other", "command:foreign");
       const receiver = plane(meshRoot, "host:receiver");
       const receive = vi.fn(() => ({ accepted: true }));
       receiver.start(receive);
-      await vi.waitFor(() => expect(store.get(seenKey("host:receiver", "command:old"))).toBeUndefined(), { timeout: 3_000, interval: 20 });
-      expect(receive).not.toHaveBeenCalled();                                // answered from the record
+      await vi.waitFor(() => expect(ackFor(store, "command:old")).toBeDefined(), { timeout: 3_000, interval: 20 });
       expect(ackFor(store, "command:old")?.data).toMatchObject({ accepted: true, messageId: "earlier:command:old" });
-      expect(ownStore(meshRoot, "host:receiver").get(seenKey("host:receiver", "command:old"))?.value).toMatchObject({
-        commandId: "command:old", acceptance: { messageId: "earlier:command:old" }, sequence: store.latestSequence(),
-      });
-      expect(store.get(seenKey("host:other", "command:foreign"))).toBeDefined();   // another host's: untouched
-      await store.publish(command("command:old", "host:receiver"));          // republished after the move
+      await store.publish(command("command:old", "host:receiver"));          // republished
       await new Promise((resolve) => setTimeout(resolve, 150));
       expect(receive).not.toHaveBeenCalled();
+      expect(store.get(seenKey("host:receiver", "command:old"))).toBeDefined(); // older runtimes still rely on it
+    });
+
+    // review/astra on #58, F2: a runtime before this change claims only the shared key and never
+    // reads the owner's store. Its admission is get(key) then put(key, ifVersion 0).
+    const olderRuntimeAdmits = (store: MeshStore, commandId: string) => ({
+      checked: store.get(seenKey("host:receiver", commandId), { fresh: true }) === undefined,
+      claim: () => store.put({
+        key: seenKey("host:receiver", commandId), identity: identity("host:receiver"), ifVersion: 0,
+        value: { format: 1, hostId: "host:receiver", commandId, targetId: "agent:target", expiresAt: Date.now() + 60_000 },
+      }).then(() => true, () => false),
+    });
+
+    it("run a command once when an older runtime of the same host checked it first and claims it later", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      await store.publish(command("command:race", "host:receiver"));
+      const older = olderRuntimeAdmits(store, "command:race");               // paused after its check
+      expect(older.checked).toBe(true);
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn(() => ({ accepted: true }));
+      receiver.start(receive);
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
+      const olderRuns = (await older.claim()) ? 1 : 0;                       // it resumes and claims
+      expect(receive.mock.calls.length + olderRuns).toBe(1);
+    });
+
+    it("run a command once when an older runtime of the same host claimed it first", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      await store.publish(command("command:taken", "host:receiver"));
+      const older = olderRuntimeAdmits(store, "command:taken");
+      expect(older.checked && await older.claim()).toBe(true);               // it runs the command
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn(() => ({ accepted: true }));
+      receiver.start(receive);
+      await vi.waitFor(() => expect(ackFor(store, "command:taken")).toBeDefined(), { timeout: 3_000, interval: 20 });
+      expect(receive).not.toHaveBeenCalled();
+      expect(ackFor(store, "command:taken")?.data).toMatchObject({ accepted: false });
+    });
+
+    // review/astra on #58, F1: the deadline can pass while the claim waits for a lock, or after it
+    // commits and before its promise resumes; the handler must not run then.
+    const expiringCommand = async (meshRoot: string, commandId: string, deadlineInMs: number) => {
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const requestedAt = Date.now();
+      await store.publish({ ...command(commandId, "host:receiver"),
+        data: { ...command(commandId, "host:receiver").data, requestedAt, deadlineAt: requestedAt + deadlineInMs } });
+      return store;
+    };
+
+    it("do not run a command whose claim returned after its deadline", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = await expiringCommand(meshRoot, "command:late", 400);
+      const put = MeshStore.prototype.put;
+      vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function (this: MeshStore, input) {
+        const result = await put.call(this, input);                           // the claim commits ...
+        if (this.root.includes("control-seen") && input.ifVersion === 0) await new Promise((resolve) => setTimeout(resolve, 600));
+        return result;                                                        // ... and returns late
+      });
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn(() => ({ accepted: true }));
+      receiver.start(receive);
+      await vi.waitFor(() => expect(ackFor(store, "command:late")).toBeDefined(), { timeout: 3_000, interval: 20 });
+      expect(receive).not.toHaveBeenCalled();
+      expect(ackFor(store, "command:late")?.data).toMatchObject({ accepted: false, error: "Fabric control command expired" });
+      expect(ownStore(meshRoot, "host:receiver").get(seenKey("host:receiver", "command:late"))?.value)
+        .toMatchObject({ acceptance: { accepted: false, error: "Fabric control command expired" } });
+    });
+
+    it("do not run a command whose claim waited for the owner's store lock past its deadline", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = await expiringCommand(meshRoot, "command:locked", 400);
+      const own = ownStore(meshRoot, "host:receiver");
+      await own.put({ key: "warm", value: 1, identity: identity("host:receiver") });   // the store exists
+      const lock = path.join(own.root, ".lock");
+      fs.mkdirSync(lock);                                                     // another writer holds it
+      fs.writeFileSync(path.join(lock, "owner"), `held\n${process.pid}\n${Date.now()}\n`);   // a live owner
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn(() => ({ accepted: true }));
+      receiver.start(receive);
+      await new Promise((resolve) => setTimeout(resolve, 700));              // past the deadline
+      fs.rmSync(lock, { recursive: true, force: true });                     // the lock is released
+      await vi.waitFor(() => expect(ackFor(store, "command:locked")).toBeDefined(), { timeout: 5_000, interval: 20 });
+      expect(receive).not.toHaveBeenCalled();
+      expect(ackFor(store, "command:locked")?.data).toMatchObject({ accepted: false, error: "Fabric control command expired" });
     });
 
     it("are deleted only once expired and their command has left the log", async () => {

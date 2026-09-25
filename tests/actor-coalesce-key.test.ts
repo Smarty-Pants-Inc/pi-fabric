@@ -75,6 +75,33 @@ describe("actor coalesceKey for mesh events", () => {
     expect(tasks[2]).toContain("rev-other");
   }, 30_000);
 
+  // review/astra on #61: a ':'-joined key merged topic "work" with value "review:string:42" and
+  // topic "work:string:review" with value "42", and lost the first event.
+  it("never merges subjects of different topics or of different value types", async () => {
+    const { root, mesh, actors } = setup();
+    const topics = ["github.demo.pulls", "work", "work:string:review"];
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics, coalesce: false, coalesceKey: "payload.number" });
+    await mesh.publish({ topic: "github.demo.pulls", from, text: "LIVE_WITH_PROGRESS" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    const event = (topic: string, number: string | number, revision: string) =>
+      mesh.publish({ topic, from, data: { payload: { number, revision } } });
+    await event("work", "review:string:42", "rev-joined-a");
+    await event("work:string:review", "42", "rev-joined-b");
+    await event("work", 42, "rev-number");                                             // number, not "42"
+    await event("work", "42", "rev-string");
+    await waitFor(() => actors.status(actor.id).queued === 4);
+    await waitFor(() => actors.messages(actor.id).filter((message) => message.direction === "out").length === 5);
+    const tasks = runTasks(root, actors, actor.id).filter((task) => task.includes("rev-"));
+    expect(tasks).toHaveLength(4);
+    expect(tasks[0]).toMatch(/"topic": "work",[\s\S]*rev-joined-a/);
+    expect(tasks[1]).toMatch(/"topic": "work:string:review",[\s\S]*rev-joined-b/);
+    expect(tasks[2]).toContain("rev-number");
+    expect(tasks[3]).toContain("rev-string");
+    // The inbox records each event under its own topic.
+    const sources = actors.messages(actor.id).filter((message) => message.direction === "in").map((message) => message.source);
+    expect(sources.slice(1)).toEqual(["mesh:work", "mesh:work:string:review", "mesh:work", "mesh:work"]);
+  }, 30_000);
+
   it("queues every event without a key, and an event without a scalar value at the path", async () => {
     const { root, mesh, actors } = setup();
     const plain = await actors.create({ name: "plain", instructions: "Review.", topics: ["github.demo.pulls"], coalesce: false });

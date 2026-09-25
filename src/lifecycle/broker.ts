@@ -198,9 +198,17 @@ export class LifecycleBroker {
 
   async #drain(): Promise<void> {
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
+    let latestSequence: number | undefined;
     for (const entry of entries) {
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
+      // Only the target's host drains a subscription. Pass over other hosts' targets (from
+      // memory) and caught-up subscriptions before the directory read: that read parses every
+      // participant and host record, and ran for every subscription on every poll of every
+      // host, about a quarter of a core per idle Pi on the fleet mesh (smarty-dev#557).
+      if (this.participants.publishes?.(subscription.to) === false) continue;
+      latestSequence ??= this.mesh.latestSequence();
+      if (latestSequence <= subscription.afterSequence) continue;
       const target = this.participants.get(subscription.to);
       if (!target || target.stale || !target.local) continue;
       await this.#drainSubscription(entry, subscription);

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import {
   FABRIC_PARTICIPANT_LIFECYCLE_TOPIC,
@@ -94,6 +94,52 @@ afterEach(async () => {
 });
 
 describe("LifecycleBroker", () => {
+  // smarty-dev#557: every host read the whole directory for every subscription on every poll,
+  // about a quarter of a core per idle Pi on the fleet mesh.
+  it("reads the directory only for subscriptions behind the log whose target this host publishes", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const here = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: targetIdentity.id, rootId: targetIdentity.id, identity: targetIdentity,
+      heartbeatMs: 60_000, leaseMs: 60_000,
+    });
+    here.registerSource(() => [here.root({
+      id: targetIdentity.id, name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host",
+      updatedAt: 1, pendingMessages: false, local: true,
+    })]);
+    expect(here.publishes(targetIdentity.id)).toBe(false);          // nothing published yet
+    await here.refresh();
+    expect([here.publishes(targetIdentity.id), here.publishes("main"), here.publishes(sourceIdentity.id)])
+      .toEqual([true, true, false]);
+    const subscribe = (id: string, to: string, afterSequence: number) => mesh.put({
+      key: `topology/subscriptions/${id}`, identity: targetIdentity, value: {
+        format: 1, id, from: source.id, events: ["pi.agent_settled"], to, delivery: "followUp",
+        triggerTurn: false, once: false, afterSequence, createdAt: 1, updatedAt: 1, createdBy: targetIdentity,
+      } satisfies FabricLifecycleSubscription,
+    });
+    await mesh.publish({ topic: "unrelated", from: sourceIdentity, text: "one" });
+    await subscribe("elsewhere", sourceIdentity.id, 0);            // behind, but another host's target
+    await subscribe("here", targetIdentity.id, mesh.latestSequence()); // this host's, caught up
+    const gets = vi.spyOn(here, "get");
+    const lists = vi.spyOn(here, "list");
+    const broker = new LifecycleBroker(mesh, targetIdentity, here,
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, () => {});
+    brokers.push(broker);
+    broker.start();
+    await new Promise((resolve) => setTimeout(resolve, 200));      // about ten polls
+    expect(gets).not.toHaveBeenCalled();
+    expect(lists).not.toHaveBeenCalled();
+    // A new event puts this host's subscription behind: it is read and drained, the other is not.
+    await mesh.publish({ topic: "unrelated", from: sourceIdentity, text: "two" });
+    const latest = mesh.latestSequence();
+    await waitFor(() => (mesh.get("topology/subscriptions/here")?.value as FabricLifecycleSubscription)
+      .afterSequence === latest);
+    expect(new Set(gets.mock.calls.map(([id]) => id))).toEqual(new Set([targetIdentity.id]));
+    expect((mesh.get("topology/subscriptions/elsewhere")?.value as FabricLifecycleSubscription).afterSequence)
+      .toBe(0);
+  });
+
   it("delivers only new matching source events and removes one-shot subscriptions", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
     roots.push(root);

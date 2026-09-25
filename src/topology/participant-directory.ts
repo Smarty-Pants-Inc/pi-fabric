@@ -464,6 +464,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return { participant, lapsedMs: sameHost ? Math.max(0, now - host.expiresAt) : Number.POSITIVE_INFINITY };
   }
 
+  // With the mesh enabled, every local record on it is one this host published at its last
+  // refresh, so false is exact for get(id)?.local. A record left by this host's previous run, before its first
+  // refresh here, counts as not published; it is removed or republished on that refresh.
+  publishes(id: string): boolean {
+    return this.#localRecords.has(id === "main" ? this.options.rootId : id);
+  }
+
   get(id: string, now = Date.now(), options: { fresh?: boolean } = {}): FabricParticipantInfo | undefined {
     const target = id === "main" ? this.options.rootId : id;
     return this.list({ scope: "project", ...(options.fresh ? { fresh: true } : {}) }, now)

@@ -328,6 +328,12 @@ export type MeshBatchOperation =
       key: string;
       ifVersion?: number;
       onConflict?: "skip" | "abort" | ((current: MeshStateEntry | undefined) => "skip" | "abort");
+      /**
+       * Evaluated under the lock, against the state as this batch has changed it so far; false
+       * skips the delete. For a delete that depends on another key (a participant whose owner
+       * host must still be gone at commit, smarty-dev#367).
+       */
+      condition?: (current: (key: string) => MeshStateEntry | undefined) => boolean;
     };
 
 export interface MeshBatchResult {
@@ -837,9 +843,15 @@ export class MeshStore {
       const results: MeshBatchResult[] = [];
       let changed = false;
       const now = Date.now();
+      const current = (key: string): MeshStateEntry | undefined =>
+        Object.hasOwn(state.entries, key) ? jsonClone(state.entries[key]) : undefined;
       for (const op of input.ops) {
         const slot = stateSlot(state, op.key);
         const existing = state.entries[op.key];
+        if (op.kind === "delete" && op.condition && !op.condition(current)) {
+          results.push({ key: op.key, applied: false, version: slot.version });
+          continue;
+        }
         if (op.ifVersion !== undefined && op.ifVersion !== slot.version) {
           const policy = typeof op.onConflict === "function"
             ? op.onConflict(existing ? jsonClone(existing) : undefined)

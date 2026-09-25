@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,11 +22,12 @@ const store = () => {
   roots.push(root);
   return new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
 };
+const hostKey = (id: string) => "topology/hosts/" + createHash("sha256").update(id).digest("hex");
 const host = (mesh: MeshStore, id: string, expiresAt: number) =>
-  mesh.put({ key: `topology/hosts/${id}`, value: { format: 1, id, expiresAt }, identity: writer });
+  mesh.put({ key: hostKey(id), value: { format: 1, id, expiresAt }, identity: writer });
 const participant = (mesh: MeshStore, id: string, ownerHostId: string) =>
   mesh.put({ key: `topology/participants/${id}`, value: { format: 1, id, ownerHostId }, identity: writer });
-const keys = (entries: Array<{ key: string }>) => entries.map((entry) => entry.key).sort();
+const keys = (records: Array<{ entry: { key: string } }>) => records.map((record) => record.entry.key).sort();
 
 // smarty-dev#367: 160 of 199 host records in the fleet's shared state belonged to dead hosts,
 // with their participants; a host removes its own records only on a clean shutdown.
@@ -44,7 +46,7 @@ describe("records of dead hosts", () => {
     await participant(mesh, "own-root", "own");
     await participant(mesh, "orphan", "vanished");                // no host record, written just now
     expect(keys(deadHostRecords(mesh, { ownHostId: "own", now })))
-      .toEqual(["topology/hosts/dead", "topology/participants/dead-agent", "topology/participants/dead-root"]);
+      .toEqual([hostKey("dead"), "topology/participants/dead-agent", "topology/participants/dead-root"].sort());
     // Past the window, the orphan without a host record goes too.
     expect(keys(deadHostRecords(mesh, { ownHostId: "own", now: now + 7 * HOUR })))
       .toContain("topology/participants/orphan");
@@ -62,12 +64,70 @@ describe("records of dead hosts", () => {
       return original(input);
     });
     expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
-    expect(mesh.get("topology/hosts/dead")).toBeUndefined();
+    expect(mesh.get(hostKey("dead"))).toBeUndefined();
     expect(mesh.get("topology/participants/dead-root")).toBeDefined();
     batch.mockClear();
     await mesh.delete({ key: "topology/participants/dead-root" });
     expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(0);
     expect(batch).not.toHaveBeenCalled();
+  });
+
+  // review/astra on #63: the two scans are separate reads, and per-record version fences did not
+  // protect the host's liveness, so a host renewing in between lost its participants.
+  it("keeps a host and its participants when the host renews between the host and participant scans", async () => {
+    const mesh = store();
+    const now = Date.now();
+    await host(mesh, "back", now - 7 * HOUR);
+    await participant(mesh, "back-root", "back");
+    // The host's heartbeat (a live lease and its participant) lands after the host scan and before
+    // the participant scan, so the participant is read at its new version.
+    const listAll = mesh.listAll.bind(mesh);
+    let heartbeat: Promise<unknown> | undefined;
+    vi.spyOn(mesh, "listAll").mockImplementation((prefix, options) => {
+      if (prefix === "topology/participants/" && !heartbeat) {
+        heartbeat = mesh.writeBatch({ identity: writer, ops: [
+          { kind: "put", key: hostKey("back"), value: { format: 1, id: "back", expiresAt: now + 60_000 } },
+          { kind: "put", key: "topology/participants/back-root", value: { format: 1, id: "back-root", ownerHostId: "back" } },
+        ] });
+      }
+      return listAll(prefix, options);
+    });
+    const writeBatch = mesh.writeBatch.bind(mesh);
+    vi.spyOn(mesh, "writeBatch").mockImplementation(async (input) => {
+      if (input.ops.every((op) => op.kind === "delete")) await heartbeat;
+      return writeBatch(input);
+    });
+    expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(0);
+    expect(mesh.get(hostKey("back"))).toBeDefined();
+    expect(mesh.get("topology/participants/back-root")).toBeDefined();
+  });
+
+  it("keeps a host's participants when only its lease renews before the delete commits", async () => {
+    const mesh = store();
+    const now = Date.now();
+    await host(mesh, "back", now - 7 * HOUR);
+    await participant(mesh, "back-root", "back");                // unchanged: not rewritten by the renewal
+    const original = mesh.writeBatch.bind(mesh);
+    vi.spyOn(mesh, "writeBatch").mockImplementationOnce(async (input) => {
+      await host(mesh, "back", now + 60_000);                    // a lease-only heartbeat
+      return original(input);
+    });
+    expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(0);
+    expect(mesh.get(hostKey("back"))).toBeDefined();
+    expect(mesh.get("topology/participants/back-root")).toBeDefined();
+  });
+
+  it("keeps an orphan participant whose host appears before the delete commits", async () => {
+    const mesh = store();
+    const now = Date.now();
+    await participant(mesh, "orphan", "returning");
+    const original = mesh.writeBatch.bind(mesh);
+    vi.spyOn(mesh, "writeBatch").mockImplementationOnce(async (input) => {
+      await host(mesh, "returning", now + 7 * HOUR + 60_000);    // the host comes back with a live lease
+      return original(input);
+    });
+    expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now: now + 7 * HOUR })).toBe(0);
+    expect(mesh.get("topology/participants/orphan")).toBeDefined();
   });
 
   it("is swept by a directory after its heartbeat, at most once per sweep interval, never its own records", async () => {
@@ -90,15 +150,15 @@ describe("records of dead hosts", () => {
     const off = make(false);
     await off.start();
     await new Promise((resolve) => setTimeout(resolve, 400));
-    expect(mesh.get("topology/hosts/dead")).toBeDefined();         // disabled: no sweep
+    expect(mesh.get(hostKey("dead"))).toBeDefined();         // disabled: no sweep
     await off.close();
     directories.length = 0;
     const batches = vi.spyOn(mesh, "writeBatch");
     const on = make({ sweepMs: 600 });
     await on.start();
     await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(mesh.get("topology/hosts/dead")).toBeDefined();         // the first sweep waits an interval too
-    await vi.waitFor(() => expect(mesh.get("topology/hosts/dead")).toBeUndefined(), { timeout: 3_000, interval: 20 });
+    expect(mesh.get(hostKey("dead"))).toBeDefined();         // the first sweep waits an interval too
+    await vi.waitFor(() => expect(mesh.get(hostKey("dead"))).toBeUndefined(), { timeout: 3_000, interval: 20 });
     expect(mesh.get("topology/participants/dead-root")).toBeUndefined();
     expect(on.list({ scope: "project" }).map((entry) => entry.id)).toEqual([identity.id]);   // its own records stay
     const sweeps = () => batches.mock.calls.filter(([input]) => input.ops.every((op) => op.kind === "delete")).length;

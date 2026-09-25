@@ -21,6 +21,13 @@ const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
 const PARTICIPANT_LEASE_MS = 15_000;
+/**
+ * Change-driven refreshes (agent UI updates, actor changes) run at most once per this
+ * interval, and write only when a published record changed (smarty-dev#367: each write
+ * rewrites the whole shared mesh state under its lock). The heartbeat timer still renews
+ * the lease every heartbeat interval.
+ */
+const CHANGE_REFRESH_MIN_MS = 1_000;
 const keyFor = (prefix: string, id: string): string =>
   prefix + createHash("sha256").update(id).digest("hex");
 
@@ -250,6 +257,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshing: Promise<void> | undefined;
   #refreshScheduled = false;
   #refreshAgain = false;
+  #refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  /** When the last change-driven refresh started (the throttle's reference). */
+  #changeRefreshAt = 0;
+  /** Whether the refresh in flight renews the lease (a heartbeat) or only publishes changes. */
+  #refreshingFull = false;
   #refreshedAt = Date.now();
   #refreshStartedAt: number | undefined;
   #refreshError: unknown;
@@ -294,6 +306,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (initialError) throw initialError;
   }
 
+  // Publishes changed local records soon: at once after a quiet second, otherwise at the
+  // end of that second (one write for a burst of changes).
   scheduleRefresh(): void {
     if (this.#closed) return;
     if (this.#refreshing) {
@@ -302,30 +316,56 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     if (this.#refreshScheduled) return;
     this.#refreshScheduled = true;
-    queueMicrotask(() => {
+    const run = (): void => {
       this.#refreshScheduled = false;
-      void this.refresh().catch(() => undefined);
-    });
+      this.#refreshTimer = undefined;
+      void this.#runRefresh(false).catch(() => undefined);
+    };
+    const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
+    if (wait <= 0) {
+      queueMicrotask(run);
+      return;
+    }
+    this.#refreshTimer = setTimeout(run, wait);
+    this.#refreshTimer.unref?.();
   }
 
+  /** A heartbeat: publishes the records and renews this host's lease. */
   async refresh(): Promise<void> {
     if (this.#closed) return;
-    if (this.#refreshing) return this.#refreshing;
-    this.#refreshStartedAt = Date.now();
-    const operation = this.#refresh();
-    this.#refreshing = operation;
+    if (this.#refreshing) {
+      if (this.#refreshingFull) return this.#refreshing;
+      // A change-only refresh may skip its write; renew the lease right after it.
+      return this.#refreshing.catch(() => undefined).then(() => this.refresh());
+    }
+    return this.#runRefresh(true);
+  }
+
+  async #runRefresh(full: boolean): Promise<void> {
+    if (this.#closed) return;
+    if (this.#refreshing) {
+      this.#refreshAgain = true;
+      return;
+    }
+    const startedAt = Date.now();
+    this.#refreshStartedAt = startedAt;
+    if (!full) this.#changeRefreshAt = startedAt;
+    const operation = this.#refresh(full);
+    const settled = operation.then(() => undefined);
+    settled.catch(() => undefined);                            // awaiters still see a failure
+    this.#refreshing = settled;
+    this.#refreshingFull = full;
     try {
-      await operation;
+      const committed = await operation;
+      if (!committed) return;
       this.#refreshedAt = Date.now();
       this.#refreshError = undefined;
     } catch (error) {
       this.#refreshError = error;
       throw error;
     } finally {
-      if (this.#refreshing === operation) {
-        this.#refreshing = undefined;
-        this.#refreshStartedAt = undefined;
-      }
+      this.#refreshing = undefined;
+      this.#refreshStartedAt = undefined;
       if (this.#refreshAgain) {
         this.#refreshAgain = false;
         this.scheduleRefresh();
@@ -557,6 +597,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    this.#refreshScheduled = false;
     await this.#refreshing?.catch(() => undefined);
     if (!this.options.enabled) return;
     const owned = this.mesh
@@ -574,7 +617,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (hostEntry) await this.mesh.delete({ key: hostEntry.key, ifVersion: hostEntry.version }).catch(() => undefined);
   }
 
-  async #refresh(): Promise<void> {
+  // Returns whether it wrote. A change-only refresh (full false) writes nothing when no
+  // published record differs from the mesh.
+  async #refresh(full: boolean): Promise<boolean> {
     const now = Date.now();
     const desired = new Map<string, FabricParticipantRecord>();
     for (const source of this.#sources) {
@@ -596,7 +641,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#ensurePeerLabels(desired);
     this.#localRecords.clear();
     for (const [id, record] of desired) this.#localRecords.set(id, record);
-    if (!this.options.enabled) return;
+    if (!this.options.enabled) return true;
 
     const root = [...desired.values()].find(
       (participant) => participant.kind === "root" && participant.id === this.options.rootId,
@@ -604,34 +649,36 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // Every write of this heartbeat goes into ONE locked state write (smarty-dev#367):
     // each separate put rewrote the whole shared state file under the mesh lock.
     const ops: MeshBatchOperation[] = [];
+    let changed = false;
     const legacySessionKey = this.#legacySessionKey();
     if (legacySessionKey && this.#quiescing) {
       const legacy = this.mesh.get(legacySessionKey);
       if (legacy?.updatedBy.id === this.options.identity.id) {
         ops.push({ kind: "delete", key: legacy.key, ifVersion: legacy.version, onConflict: "skip" });
+        changed = true;
       }
     } else if (root && legacySessionKey && root.cwd && root.sessionId) {
-      ops.push({
-        kind: "put",
-        key: legacySessionKey,
-        value: {
-          id: root.id,
-          name: root.label ?? `Peer ${root.sessionId.slice(0, 8)}`,
-          ...(root.label ? { label: root.label } : {}),
-          kind: "peer",
-          status: root.status === "running" ? "running" : "idle",
-          runner: "pi",
-          transport: "host",
-          cwd: root.cwd,
-          sessionId: root.sessionId,
-          ...(root.model ? { model: root.model } : {}),
-          ...(root.thinking ? { thinking: root.thinking } : {}),
-          startedAt: root.startedAt,
-          updatedAt: now,
-          pendingMessages: root.pendingMessages === true,
-          local: false,
-        },
-      });
+      const legacyValue = {
+      id: root.id,
+      name: root.label ?? `Peer ${root.sessionId.slice(0, 8)}`,
+      ...(root.label ? { label: root.label } : {}),
+      kind: "peer",
+      status: root.status === "running" ? "running" : "idle",
+      runner: "pi",
+      transport: "host",
+      cwd: root.cwd,
+      sessionId: root.sessionId,
+      ...(root.model ? { model: root.model } : {}),
+      ...(root.thinking ? { thinking: root.thinking } : {}),
+      startedAt: root.startedAt,
+      updatedAt: now,
+      pendingMessages: root.pendingMessages === true,
+      local: false,
+      };
+      const current = this.mesh.get(legacySessionKey)?.value;
+      if (JSON.stringify({ ...(isObject(current) ? current : {}), updatedAt: undefined }) !==
+        JSON.stringify({ ...legacyValue, updatedAt: undefined })) changed = true;
+      ops.push({ kind: "put", key: legacySessionKey, value: legacyValue });
     }
 
     const existing = this.mesh
@@ -657,6 +704,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return actor ? [[actor.id, actor.ownerIdentityId] as const] : [];
         }),
     );
+    // A change-driven refresh needs a change beyond the timestamps that sources stamp on
+    // every read (Main's info() sets updatedAt to now).
+    const withoutTime = (value: unknown): string =>
+      JSON.stringify({ ...(isObject(value) ? value : {}), updatedAt: undefined });
     for (const record of desired.values()) {
       const current = existingById.get(record.id);
       if (current && JSON.stringify(current.participant) === JSON.stringify(record)) continue;
@@ -678,6 +729,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           continue;
         }
       }
+      if (!current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
       ops.push({
         kind: "put",
         key,
@@ -693,8 +745,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     for (const { entry, participant } of existing) {
       if (desired.has(participant.id)) continue;
+      changed = true;
       ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
     }
+    if (!full && !changed) return false;                       // nothing to publish
 
     // Stamp this host's lease at commit time, under the lock: a refresh that
     // outruns its own lease must not publish an already-expired lease, which
@@ -714,6 +768,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }),
     });
     await this.mesh.writeBatch({ identity: this.options.identity, ops });
+    return true;
   }
 
   /**

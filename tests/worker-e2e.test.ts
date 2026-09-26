@@ -479,7 +479,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
   // smarty-dev#967: a directive run takes its reply from the fabric_reply call, never from prose.
   it.each([
     ["the tool call", "tool", "completed", "tool"],
-    ["JSON-only text (until the roles name the tool)", "json", "completed", "text"],
+    ["JSON-only text, which is not a reply", "json", "failed", undefined],
     ["prose around the JSON", "prose", "failed", undefined],
   ] as const)("takes a directive reply from %s", async (_case, reply, status, via) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));

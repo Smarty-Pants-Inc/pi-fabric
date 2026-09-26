@@ -1359,22 +1359,13 @@ const main = async (): Promise<void> => {
         : `${runnerLabel(options.runner)} exited with code ${exitCode ?? "unknown"}`);
   }
   if (record.status === "completed" && replyFile) {
-    // The reply is the tool call's arguments. Until the roles name the tool, a final text that is
-    // one JSON object and nothing else is taken too, and marked; prose is never scraped for it.
+    // The reply is the tool call's arguments, and nothing else: final text is never parsed for it,
+    // not even JSON-only text (smarty-dev#967; the roles name the tool since smarty-dev#1105).
     try {
       record.value = JSON.parse(fs.readFileSync(replyFile, "utf8")) as unknown;
       record.replyVia = "tool";
     } catch {
-      const text = record.text.trim();
-      try {
-        const value = text.startsWith("{") ? JSON.parse(text) as unknown : undefined;
-        if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-          record.value = value;
-          record.replyVia = "text";
-        }
-      } catch {
-        // Not JSON-only text.
-      }
+      // No fabric_reply call.
     }
     if (record.value === undefined) {
       record.status = "failed";

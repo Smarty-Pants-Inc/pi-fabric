@@ -139,8 +139,8 @@ export interface AgentRunRecord {
   turns: number;
   toolCalls: number;
   text: string;
-  /** How a structured reply arrived: its tool call, or JSON-only final text (smarty-dev#967). */
-  replyVia?: "tool" | "text";
+  /** How a structured reply arrived: its fabric_reply tool call (smarty-dev#967). */
+  replyVia?: "tool";
   value?: unknown;
   error?: string;
   stderr?: string;

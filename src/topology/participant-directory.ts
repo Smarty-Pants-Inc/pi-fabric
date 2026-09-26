@@ -20,7 +20,7 @@ const PEER_SEQ_KEY = "topology/peer-seq";
 const HOST_PREFIX = "topology/hosts/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
-export const PARTICIPANT_HEARTBEAT_MS = 5_000;
+const PARTICIPANT_HEARTBEAT_MS = 5_000;
 const PARTICIPANT_LEASE_MS = 15_000;
 /**
  * Change-driven refreshes (agent UI updates, actor changes) run at most once per this

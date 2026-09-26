@@ -23,10 +23,12 @@ import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, shouldShowFabricWidget } from "./widget.js";
 import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
-import { PARTICIPANT_HEARTBEAT_MS } from "../topology/participant-directory.js";
 
 const WIDGET_ID = "pi-fabric";
 const ACTIVITY_REFRESH_MS = 100;
+// The participant heartbeat (src/topology/participant-directory.ts); kept local so the startup
+// graph does not load the topology module.
+const REMOTE_REFRESH_MS = 5_000;
 
 const emptySnapshot = (): FabricDashboardSnapshot => {
   const now = Date.now();
@@ -610,7 +612,7 @@ export class FabricUiController {
     // and re-rendering its TUI twice a second (smarty-dev#251: about 14% of a core each).
     const delay = this.ownsInput || localActive
       ? this.state.config.ui.refreshMs
-      : Math.max(this.state.config.ui.refreshMs, PARTICIPANT_HEARTBEAT_MS);
+      : Math.max(this.state.config.ui.refreshMs, REMOTE_REFRESH_MS);
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       this.#refresh(false);

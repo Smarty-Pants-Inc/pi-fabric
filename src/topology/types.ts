@@ -28,6 +28,10 @@ export interface FabricParticipantRecord {
    * participant via the mesh peer sequence. Never reused after a peer leaves.
    */
   label?: string;
+  /** The root's fleet role, for example "project-agent" (smarty-dev#784). */
+  role?: string;
+  /** The checkout that owns the root's git common directory (smarty-dev#784). */
+  project?: string;
   status: string;
   residency?: FabricParticipantResidency;
   runner: FabricAgentRunner;
@@ -78,6 +82,8 @@ export interface FabricPeerInfo {
   name: string;
   /** Minted peer label when the owning host publishes one. */
   label?: string;
+  role?: string;
+  project?: string;
   kind: "peer";
   status: "idle" | "running";
   runner: "pi";

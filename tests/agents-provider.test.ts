@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -618,6 +619,27 @@ describe("AgentsProvider runner support", () => {
 
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     expect((await provider.describe("peers", context))?.risk).toBe("read");
+  });
+
+  // smarty-dev#784: a worktree agent finds its project agent by role and project.
+  it("returns this session's project agent", async () => {
+    const project = projectOf(process.cwd());
+    const base = {
+      format: 1 as const, kind: "root" as const, name: "main", status: "idle", runner: "pi", transport: "host",
+      capabilities: ["steer", "followUp", "fabric"] as FabricParticipantInfo["capabilities"],
+      startedAt: 1, updatedAt: 2, controlProtocol: "v1" as const, local: false, stale: false,
+    };
+    const lead = {
+      ...base, id: "session:lead", rootId: "session:lead", ownerHostId: "session:lead", ownerIdentityId: "session:lead",
+      sessionId: "lead", role: "project-agent", project, cwd: project,
+    } as FabricParticipantInfo;
+    const other = {
+      ...base, id: "session:other", rootId: "session:other", ownerHostId: "session:other", ownerIdentityId: "session:other",
+      sessionId: "other", role: "project-agent", project: "/elsewhere", cwd: "/elsewhere",
+    } as FabricParticipantInfo;
+    const { provider } = setup([], [other, lead]);
+    await expect(provider.invoke("projectAgent", {}, context)).resolves.toMatchObject({ id: "session:lead" });
+    expect((await provider.describe("projectAgent", context))?.risk).toBe("read");
   });
 
   it("lists current and peer roots as symmetric session agents", async () => {

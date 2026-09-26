@@ -123,6 +123,10 @@ interface FabricMainAgentInfo {
 }
 interface FabricPeerInfo {
   id: string;
+  /** The root's fleet role, for example "project-agent". */
+  role?: string;
+  /** The checkout that owns the root's git common directory. */
+  project?: string;
   name: string;
   kind: "peer";
   status: "idle" | "running";
@@ -144,6 +148,10 @@ type FabricParticipantCapability = "steer" | "followUp" | "stop" | "ask" | "acto
 interface FabricParticipantInfo {
   format: 1;
   id: string;
+  /** The root's fleet role, for example "project-agent". */
+  role?: string;
+  /** The checkout that owns the root's git common directory. */
+  project?: string;
   kind: FabricParticipantKind;
   rootId: string;
   ownerHostId: string;
@@ -742,6 +750,8 @@ interface FabricAgentsApi {
   main(): Promise<FabricMainAgentInfo>;
   sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
+  /** The live project agent for this session's project (role project-agent, same git common checkout). */
+  projectAgent(): Promise<FabricParticipantInfo>;
   subscribe(args: {
     from: string;
     events: FabricLifecycleEventType[];

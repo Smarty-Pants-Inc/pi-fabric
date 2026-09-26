@@ -1,5 +1,6 @@
 import os from "node:os";
 import path from "node:path";
+import { resolveAgentDir } from "../core/agent-dir.js";
 import type { FabricAgentConfig } from "../config.js";
 
 /**
@@ -15,7 +16,11 @@ import type { FabricAgentConfig } from "../config.js";
  * subagent usage with zero configuration while pi itself never lists these
  * files. Root resolves as:
  *
- *   PI_FABRIC_AGENT_DIR env  >  agents.sessionExportDir  >  ~/.pi/agent
+ *   PI_FABRIC_AGENT_DIR env  >  agents.sessionExportDir  >  pi's agent dir
+ *
+ * pi's agent dir is the parent's profile: PI_CODING_AGENT_DIR, else ~/.pi/agent. A fleet
+ * profile's run exports therefore sit beside its own sessions, not in the default profile
+ * (smarty-dev#847: they read as default-profile sessions).
  *
  * Prefer an isolated store instead? Set agents.sessionExportDir to
  * ~/.pi-fabric/agent and register it as a ccusage pi.stores named store.
@@ -51,7 +56,7 @@ export const resolveSessionExportDir = (config: FabricAgentConfig): string | und
   const raw =
     process.env[SESSION_EXPORT_ENV]?.trim() ||
     config.sessionExportDir.trim() ||
-    path.join(os.homedir(), ".pi", "agent");
+    resolveAgentDir();
   return expandHome(raw);
 };
 

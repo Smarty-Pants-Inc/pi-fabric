@@ -123,6 +123,92 @@ describe("actor coalesceKey for mesh events", () => {
     expect(runTasks(root, actors, keyed.id).filter((task) => task.includes("rev-"))).toHaveLength(1);
   }, 30_000);
 
+  // smarty-dev#1065: review actors still queued several events per PR. Three paths bypassed the key.
+  it("merges work queued before the key was set, when it is set", async () => {
+    const { root, mesh, actors } = setup();
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["github.demo.pulls"], coalesce: false });
+    await mesh.publish({ topic: "github.demo.pulls", from, text: "LIVE_WITH_PROGRESS" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await pull(mesh, 1, "rev-a");
+    await pull(mesh, 2, "rev-x");
+    await pull(mesh, 1, "rev-b");
+    await waitFor(() => actors.status(actor.id).queued === 3);
+    await actors.setCoalesceKey(actor.id, "payload.number");
+    expect(actors.status(actor.id).queued).toBe(2);
+    await waitFor(() => actors.messages(actor.id).filter((message) => message.direction === "out").length === 3);
+    const tasks = runTasks(root, actors, actor.id).filter((task) => task.includes('"number":'));
+    expect(tasks.map((task) => task.match(/rev-[a-z]+/)![0])).toEqual(["rev-b", "rev-x"]);   // PR 1 in its first place
+  }, 30_000);
+
+  // A HANG run in flight is aborted by the ownership loss and retried first when ownership returns,
+  // so PR 1's parked event cannot start, however the polls interleave (review/astra on #86: a
+  // running event rightly gets a follow-up, which made run counts racy on Windows).
+  it("merges an event that arrives while the same PR's work is parked", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-key-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    let owned = true;
+    const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+      actorRoot: path.join(root, "actors"), persistent: true, canManageActor: () => owned,
+    });
+    closers.push(async () => { await actors.close(); await agents.close(); });
+    const actor = await actors.create({
+      name: "reviewer", instructions: "Review.", topics: ["github.demo.pulls"], coalesce: false, coalesceKey: "payload.number",
+    });
+    actors.listOwned();
+    await mesh.publish({ topic: "github.demo.pulls", from, text: "HANG first" });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await pull(mesh, 1, "rev-a");
+    await waitFor(() => actors.status(actor.id).queued === 1);
+    owned = false;
+    actors.listOwned();                                           // rev-a parks; HANG is aborted and parked
+    await waitFor(() => actors.status(actor.id).status !== "running");
+    owned = true;
+    await pull(mesh, 1, "rev-b");                                 // before or after the parked work returns
+    await pull(mesh, 2, "rev-x");
+    const queued = () => {
+      const dir = path.join(root, "actors", actor.id);
+      const file = fs.readdirSync(dir).find((name) => /^queue-.+\.json$/.test(name));
+      const items = file ? (JSON.parse(fs.readFileSync(path.join(dir, file), "utf8")) as { items: Array<{ payload: { text?: string; data?: { payload?: { number?: number; revision?: string } } } }> }).items : [];
+      return items.map((item) => item.payload.data?.payload ?? item.payload.text);
+    };
+    await waitFor(() => actors.status(actor.id).status === "running" && actors.status(actor.id).queued === 2, 20_000);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(actors.status(actor.id).queued).toBe(2);
+    expect(queued().slice(1)).toEqual([{ action: "synchronize", number: 1, revision: "rev-b" }, { action: "synchronize", number: 2, revision: "rev-x" }]);
+  }, 40_000);
+
+  it("merges a restored queue file from before the key", async () => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "reviewer", instructions: "Review.", topics: ["github.demo.pulls"], coalesce: false });
+    await first.mesh.publish({ topic: "github.demo.pulls", from, text: "LIVE_WITH_PROGRESS" });
+    await waitFor(() => first.actors.status(actor.id).status === "running");
+    await pull(first.mesh, 1, "rev-a");
+    await pull(first.mesh, 2, "rev-x");
+    await pull(first.mesh, 1, "rev-b");
+    await waitFor(() => first.actors.status(actor.id).queued === 3);
+    await first.actors.setCoalesceKey(actor.id, null);           // the registry keeps no key
+    await first.actors.close();
+    closers.length = 0;
+    await first.agents.close();
+    // The key arrives with the next start (an activation re-applied while it was down).
+    const registry = path.join(first.root, "actors", "actors.json");
+    const records = JSON.parse(fs.readFileSync(registry, "utf8")) as { actors?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>;
+    const list = Array.isArray(records) ? records : records.actors!;
+    list.find((record) => record.id === actor.id)!.coalesceKey = "payload.number";
+    fs.writeFileSync(registry, JSON.stringify(records));
+    const second = setup(first.root);
+    await waitFor(() => second.actors.messages(actor.id).filter((message) => message.direction === "out" && !message.error).length >= 3, 20_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const ran = runTasks(first.root, second.actors, actor.id).filter((task) => task.includes('"number":'));
+    expect(ran.filter((task) => /"number":\s*1\b/.test(task))).toHaveLength(1);
+    expect(ran.find((task) => /"number":\s*1\b/.test(task))).toContain("rev-b");
+    expect(ran.filter((task) => /"number":\s*2\b/.test(task))).toHaveLength(1);
+  }, 40_000);
+
   it("is set and cleared on an existing actor, validated, and kept across a restart", async () => {
     const first = setup();
     const actor = await first.actors.create({ name: "reviewer", instructions: "Review.", topics: ["github.demo.pulls"] });

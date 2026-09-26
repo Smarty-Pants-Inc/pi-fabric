@@ -680,6 +680,7 @@ export class ActorManager {
     else {
       validateActorCoalesceKey(coalesceKey);
       actor.coalesceKey = coalesceKey;
+      this.#mergeCoalesced(actor);                              // work queued before the key (smarty-dev#1065)
     }
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
@@ -1308,7 +1309,9 @@ export class ActorManager {
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
     if (options.coalesceKey) {
-      const existing = actor.queue.find((item) => item.coalesceKey === options.coalesceKey);
+      // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
+      const existing = [...actor.queue, ...(this.#parked.get(actor.id) ?? [])]
+        .find((item) => item.coalesceKey === options.coalesceKey);
       if (existing) {
         existing.payload = structuredClone(payload);
         if (options.images && options.images.length > 0) {
@@ -2873,6 +2876,73 @@ export class ActorManager {
     }
   }
 
+  // smarty-dev#1065: the key of a queued mesh item under the actor's coalesceKey, from its event. An
+  // item queued before the key was set has none yet; a caller's ask never has one.
+  #meshItemKey(actor: ManagedActor, item: ActorQueueItem): string | undefined {
+    if (item.coalesceKey) return item.coalesceKey;
+    if (!actor.coalesceKey || item.resolve || item.reject || !item.source.startsWith("mesh:")) return undefined;
+    const event = item.payload as { topic?: unknown; data?: unknown } | undefined;
+    if (typeof event?.topic !== "string") return undefined;
+    const value = meshCoalesceValue(event.data, actor.coalesceKey);
+    return value === undefined ? undefined : JSON.stringify(["mesh", event.topic, value]);
+  }
+
+  // Whether item carries a newer event than other. Mesh events compare by their sequence in the
+  // shared mesh log: activation counters are per manager, so a queue restored after an adoption
+  // mixes two lineages' counters (review/astra F1 on #86). Anything else by activation order.
+  #newerEvent(item: ActorQueueItem, other: ActorQueueItem): boolean {
+    const sequence = (value: ActorQueueItem): number | undefined => {
+      const event = value.payload as { sequence?: unknown } | undefined;
+      return value.source.startsWith("mesh:") && typeof event?.sequence === "number" ? event.sequence : undefined;
+    };
+    const mine = sequence(item);
+    const theirs = sequence(other);
+    return mine !== undefined && theirs !== undefined
+      ? mine > theirs
+      : item.activation.sequence > other.activation.sequence;
+  }
+
+  // Merges parked and queued items that share a coalesce key, as #enqueue does for a new event: the
+  // first in run order (parked work returns ahead of the queue) keeps its place and takes the newest
+  // event. Backfills the key of items queued before it was set. A running item is never touched.
+  #mergeCoalesced(actor: ManagedActor): void {
+    const parked = this.#parked.get(actor.id) ?? [];
+    const kept = new Map<string, ActorQueueItem>();
+    const merged = new Set<ActorQueueItem>();
+    let changed = false;
+    for (const item of [...parked, ...actor.queue]) {
+      const key = this.#meshItemKey(actor, item);
+      if (key === undefined) continue;
+      if (item.coalesceKey !== key) {
+        item.coalesceKey = key;
+        changed = true;
+      }
+      const first = kept.get(key);
+      if (!first) {
+        kept.set(key, item);
+        continue;
+      }
+      if (this.#newerEvent(item, first)) {
+        first.payload = item.payload;
+        if (item.images) first.images = item.images;
+        else delete first.images;
+        first.createdAt = item.createdAt;
+        first.activation = { ...item.activation, id: first.id };
+        first.binding = item.binding;
+      }
+      if (item.resumed) first.resumed = true;
+      merged.add(item);
+      changed = true;
+    }
+    if (merged.size > 0) {
+      const rest = parked.filter((item) => !merged.has(item));
+      if (rest.length > 0) this.#parked.set(actor.id, rest);
+      else this.#parked.delete(actor.id);
+      actor.queue.splice(0, actor.queue.length, ...actor.queue.filter((item) => !merged.has(item)));
+    }
+    if (changed) this.#persistQueue(actor.id);
+  }
+
   #takeParked(id: string): ActorQueueItem[] {
     const parked = this.#parked.get(id) ?? [];
     this.#parked.delete(id);
@@ -2913,6 +2983,7 @@ export class ActorManager {
         if (!actor || actor.status === "stopped" || !this.#canManageCached(id)) continue;
         this.#parked.delete(id);
         actor.queue.unshift(...items);
+        this.#mergeCoalesced(actor);                            // a returning item may duplicate a queued one
         while (actor.queue.length > this.meshConfig.actorQueueLimit + actor.queue.filter((queued) => queued.resumed).length) {
           this.#recordDropped(actor, actor.queue.pop()!, "the queue was full when parked events returned");
         }

@@ -280,6 +280,21 @@ describe("ActorManager presence under a stalled mesh lock", () => {
 
 // smarty-dev#472: a Main-hosted actor lost every event published while its session reloaded,
 // because each runtime started its mesh stream at the tail.
+const recordRuns = (agents: AgentManager, hold?: () => Promise<void>) => {
+  const runs: Array<{ task: string; startedAt: number; finishedAt?: number }> = [];
+  const run = agents.run.bind(agents);
+  vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+    const entry: { task: string; startedAt: number; finishedAt?: number } = { task: request.task, startedAt: Date.now() };
+    runs.push(entry);
+    try {
+      const result = await run(request, signal);
+      await hold?.();
+      return result;
+    } finally { entry.finishedAt = Date.now(); }
+  });
+  return runs;
+};
+
 describe("ActorManager across a session reload", () => {
   const reloadable = (root: string, mesh: MeshStore, agents: AgentManager, replayAgeMs = 10 * 60_000, actorQueueLimit?: number) => {
     const manager = new ActorManager(
@@ -391,6 +406,118 @@ describe("ActorManager across a session reload", () => {
     expect(replies(/^fake worker complete$/)).toHaveLength(2);           // each queued item once
     expect(replies(/^live attempt/).length).toBeLessThanOrEqual(2);     // the interrupted run at most twice
     expect(fs.existsSync(path.join(root, "actors", actor.id, "queue.json"))).toBe(false);
+  }, 60_000);
+
+  // review/astra F2 on #79: one running plus a full waiting queue must all survive a restart.
+  it("keeps one running and a full waiting queue across a restart, dropping none", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const runs = recordRuns(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const before = reloadable(root, mesh, agents, undefined, 2);
+    const actor = await before.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => before.status(actor.id).status === "running", 10_000);
+    await mesh.publish({ topic: "team.pulls", from, text: "waiting-a" });
+    await mesh.publish({ topic: "team.pulls", from, text: "waiting-b" });                // exactly the limit
+    await waitFor(() => before.status(actor.id).queued === 2, 10_000);
+    await before.close();
+    reloadable(root, mesh, agents, undefined, 2);
+    await waitFor(() => runs.filter((run) => /waiting-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(runs.filter((run) => run.task.includes("waiting-a"))).toHaveLength(1);
+    expect(runs.filter((run) => run.task.includes("waiting-b"))).toHaveLength(1);
+  }, 60_000);
+
+  // review/astra F3 on #79: freshness state must survive with the queue, or the latest pending
+  // activation reads as superseded after a restart.
+  it("keeps validWhile freshness across a restart: the latest item runs, older ones stay stale", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const runs = recordRuns(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const before = reloadable(root, mesh, agents);
+    const actor = await before.create({
+      name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false,
+      validWhile: { version: 1, source: "({ activation, current }) => activation.sequence === current.latestActivationSequence" },
+    });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => before.status(actor.id).status === "running", 10_000);
+    await mesh.publish({ topic: "team.pulls", from, text: "older" });
+    await mesh.publish({ topic: "team.pulls", from, text: "newest" });
+    await waitFor(() => before.status(actor.id).queued === 2, 10_000);
+    await before.close();
+    const after = reloadable(root, mesh, agents);
+    await waitFor(() => runs.some((run) => run.task.includes("newest") && run.finishedAt !== undefined), 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(runs.filter((run) => run.task.includes("newest"))).toHaveLength(1);
+    expect(runs.filter((run) => run.task.includes("older"))).toEqual([]);
+    expect(after.messages(actor.id).some((message) => message.stale)).toBe(true);
+  }, 60_000);
+
+  // review/astra F1 on #79: a passive view of another host's actor must not delete or replace the
+  // owner's persisted queue.
+  it("keeps the owner's queue file when a passive host refreshes the actor, and the owner restores it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const runs = recordRuns(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const host = (name: string, owns: boolean) => {
+      const manager = new ActorManager(
+        name, { id: `session:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId: "session:owner", claimResidency: "session",
+          canManageActor: () => owns, lineageAlive: () => true,
+          meshCursorPath: path.join(root, `cursor-${name}.json`),
+        },
+      );
+      actorManagers.push(manager);
+      return manager;
+    };
+    const passiveHost = (name: string) => {
+      const manager = new ActorManager(
+        name, { id: `session:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId: `session:${name}`, claimResidency: "session",
+          canManageActor: () => false, lineageAlive: () => true,
+        },
+      );
+      actorManagers.push(manager);
+      return manager;
+    };
+    const owner = host("owner", true);
+    const actor = await owner.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => owner.status(actor.id).status === "running", 10_000);
+    await mesh.publish({ topic: "team.pulls", from, text: "held-a" });
+    await mesh.publish({ topic: "team.pulls", from, text: "held-b" });
+    await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
+    const queueFile = path.join(root, "actors", actor.id, "queue.json");
+    const passive = passiveHost("passive");                   // loads the foreign actor
+    await owner.setInstructions(actor.id, "Review carefully.");          // a registry change ...
+    passive.listOwned();                                                // ... that the passive view picks up
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).items).toHaveLength(3);
+    await owner.close();
+    host("owner", true);                                                // the owner restarts
+    await waitFor(() => runs.filter((run) => /held-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 30_000);
   }, 60_000);
 
   it("does not replay events older than the replay window after a long downtime", async () => {
@@ -1835,20 +1962,6 @@ describe("ActorManager", () => {
 
   // Records every actor activation (the manager cleans completed runs out of agents.list()).
   // hold, when given, delays each run's result until it resolves (a deferred result).
-  const recordRuns = (agents: AgentManager, hold?: () => Promise<void>) => {
-    const runs: Array<{ task: string; startedAt: number; finishedAt?: number }> = [];
-    const run = agents.run.bind(agents);
-    vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
-      const entry: { task: string; startedAt: number; finishedAt?: number } = { task: request.task, startedAt: Date.now() };
-      runs.push(entry);
-      try {
-        const result = await run(request, signal);
-        await hold?.();
-        return result;
-      } finally { entry.finishedAt = Date.now(); }
-    });
-    return runs;
-  };
 
   // Astra review of #36, R1: a run that completes while ownership is elsewhere is recorded,
   // never parked and run a second time.

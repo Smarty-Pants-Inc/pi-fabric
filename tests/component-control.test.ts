@@ -297,6 +297,25 @@ describe("live component control", () => {
     expect(await h.call("demo.get")).toBe("healthy");
   }, 2000);
 
+  // smarty-dev#883: the watcher took its baseline on its first asynchronous poll, so a
+  // replacement made right after watching started was never reported (this test flaked, 2 in 5
+  // under load, waiting for the first reconcile).
+  it("reports a replacement made right after watching starts", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-watch-"));
+    cleanup.push(async () => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, "components.json");
+    fs.writeFileSync(file, JSON.stringify({ components: [] }));
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const changed = vi.fn();
+      const stop = watchComponentConfiguration([file], changed);
+      cleanup.push(async () => stop());
+      fs.writeFileSync(`${file}.tmp`, JSON.stringify({ components: [], attempt }));
+      fs.renameSync(`${file}.tmp`, file);                                 // before any poll ran
+      await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
+      stop();
+    }
+  });
+
   it("reconciles atomic file replacements automatically and stops watching on disposal", async () => {
     const h = await harness();
     const changed = vi.fn(() => { void h.control.reconcile(); });

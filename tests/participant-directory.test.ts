@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { LIVENESS_POLICY_KEY, readHostLeases, STATE_LEASE_RENEW_MS } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -79,6 +80,61 @@ const createDirectory = (
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+// smarty-dev#816: heartbeats were 78% of all writes under the one mesh lock, each a rewrite of
+// the whole shared state. Hosts also renew a file lease of their own, without the lock.
+describe("ParticipantDirectory host leases", () => {
+  const identityOf = (name: string): MeshIdentity => ({ id: `session:${name}`, name: "main", kind: "main", sessionId: name });
+  const setup = async (policy: boolean) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    if (policy) {
+      await store.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner") });
+    }
+    const alpha = createDirectory(meshRoot, identityOf("alpha"), "session:alpha", () => [rootRecord("session:alpha", "session:alpha", "alpha")]);
+    const beta = createDirectory(meshRoot, identityOf("beta"), "session:beta", () => [rootRecord("session:beta", "session:beta", "beta")]);
+    await alpha.start();
+    await beta.start();
+    const hostEntry = () => store.listAll("topology/hosts/", { fresh: true })
+      .find((entry) => (entry.value as { id?: string }).id === "session:alpha");
+    return { meshRoot, store, alpha, beta, hostEntry };
+  };
+  const alphaBatches = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls.filter((call) => (call[0] as { identity: MeshIdentity }).identity.id === "session:alpha").length;
+
+  it("renew a file lease on every heartbeat, and still the shared record without the fleet owner's policy", async () => {
+    const { meshRoot, hostEntry } = await setup(false);
+    const before = hostEntry()!.updatedAt;
+    await new Promise((resolve) => setTimeout(resolve, 450));      // several 100 ms heartbeats
+    expect(readHostLeases(meshRoot).get("session:alpha")?.expiresAt).toBeGreaterThan(Date.now());
+    expect(hostEntry()!.updatedAt).toBeGreaterThan(before);
+  });
+
+  it("under the policy, renew only the file lease, and peers still see the host live", async () => {
+    const { beta, hostEntry } = await setup(true);
+    const batches = vi.spyOn(MeshStore.prototype, "writeBatch");
+    const shared = hostEntry()!;
+    await new Promise((resolve) => setTimeout(resolve, 600));      // twice the 300 ms lease
+    expect(alphaBatches(batches)).toBe(0);                         // no locked write for a renewal
+    expect(hostEntry()!.version).toBe(shared.version);
+    expect((hostEntry()!.value as { expiresAt: number }).expiresAt).toBeLessThan(Date.now());
+    // includeStale keeps the participant's own record, not the legacy session entry (15 s lease).
+    expect(beta.list({ scope: "project", includeStale: true }).find((participant) => participant.id === "session:alpha"))
+      .toMatchObject({ stale: false });
+    batches.mockRestore();
+  });
+
+  it("under the policy, still renew the shared record every STATE_LEASE_RENEW_MS", async () => {
+    const { hostEntry } = await setup(true);
+    const shared = hostEntry()!;
+    const now = Date.now;
+    vi.spyOn(Date, "now").mockImplementation(() => now() + STATE_LEASE_RENEW_MS);
+    await vi.waitFor(() => expect(hostEntry()!.version).toBeGreaterThan(shared.version), { timeout: 2_000, interval: 20 });
+    vi.restoreAllMocks();
+  });
 });
 
 describe("ParticipantDirectory", () => {

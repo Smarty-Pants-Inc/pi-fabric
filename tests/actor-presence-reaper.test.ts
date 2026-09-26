@@ -7,6 +7,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import { deadSessionPresence, reapDeadSessionPresence } from "../src/actors/presence-reaper.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { writeHostLease } from "../src/topology/host-leases.js";
 
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
@@ -31,6 +32,18 @@ const lease = (mesh: MeshStore, key: string, value: Record<string, unknown>) =>
   mesh.put({ key: `topology/hosts/${key}`, value, identity: writer });
 
 // Every entry below is written now; "now" in the reaper is moved forward to age them.
+describe("dead sessions' actor presence with file leases (smarty-dev#816)", () => {
+  it("keeps a session whose host lease is renewed only in its file", async () => {
+    const { mesh } = store();
+    const t0 = Date.now();
+    await presence(mesh, "filed", "a1");
+    await presence(mesh, "gone", "a1");
+    writeHostLease(mesh.root, { id: "session:filed", rootId: "session:filed", identityId: "session:filed", updatedAt: t0, expiresAt: t0 + 2 * DAY });
+    const keys = deadSessionPresence(mesh, { ownSessionId: "mine", now: t0 + DAY + HOUR }).map((entry) => entry.key);
+    expect(keys).toEqual(["actors/gone/a1"]);
+  });
+});
+
 describe("dead sessions' actor presence (smarty-dev#448)", () => {
   it("selects only sessions with no lease, legacy entry or presence write within the window", async () => {
     const { mesh } = store();

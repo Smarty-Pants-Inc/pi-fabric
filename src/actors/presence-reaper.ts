@@ -1,4 +1,5 @@
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
+import { readHostLeases } from "../topology/host-leases.js";
 
 /** A session counts as gone only when nothing has shown it alive for this long. */
 export const DEAD_SESSION_PRESENCE_MS = 24 * 60 * 60 * 1000;
@@ -28,7 +29,7 @@ const leaseSessions = (value: unknown): string[] => {
  * few seconds, and a session that comes back republishes its presence when it loads.
  */
 export const deadSessionPresence = (
-  mesh: Pick<MeshStore, "listAll">,
+  mesh: Pick<MeshStore, "listAll"> & { root?: string },
   options: { ownSessionId: string; now?: number; deadAfterMs?: number },
 ): MeshStateEntry[] => {
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_SESSION_PRESENCE_MS);
@@ -42,6 +43,15 @@ export const deadSessionPresence = (
   for (const entry of mesh.listAll(LEGACY_SESSION_PREFIX, fresh)) {
     if (entry.updatedAt > cutoff) alive.add(entry.key.slice(LEGACY_SESSION_PREFIX.length));
   }
+  // Hosts renew file leases outside the shared state (smarty-dev#816).
+  if (typeof mesh.root === "string") {
+    for (const lease of readHostLeases(mesh.root).values()) {
+      if (lease.expiresAt <= cutoff) continue;
+      for (const session of leaseSessions({ id: lease.id, rootId: lease.rootId, identity: { id: lease.identityId } })) {
+        alive.add(session);
+      }
+    }
+  }
   const bySession = new Map<string, MeshStateEntry[]>();
   for (const entry of mesh.listAll(PRESENCE_PREFIX, fresh)) {
     const [session, actorId, ...rest] = entry.key.slice(PRESENCE_PREFIX.length).split("/");
@@ -54,7 +64,7 @@ export const deadSessionPresence = (
 
 /** Deletes dead sessions' presence in one batch, each fenced to the version it was seen at. */
 export const reapDeadSessionPresence = async (
-  mesh: Pick<MeshStore, "listAll" | "writeBatch">,
+  mesh: Pick<MeshStore, "listAll" | "writeBatch"> & { root?: string },
   identity: MeshIdentity,
   options: { ownSessionId: string; now?: number; deadAfterMs?: number },
 ): Promise<number> => {

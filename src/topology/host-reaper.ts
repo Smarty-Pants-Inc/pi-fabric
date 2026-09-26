@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
+import { type FabricHostLease, readHostLeases, removeHostLease } from "./host-leases.js";
 
 /** A host's records are removed when its lease expired this long ago (smarty-dev#367). */
 export const DEAD_HOST_RECORDS_MS = 6 * 60 * 60 * 1000;
@@ -15,11 +16,17 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 
 // A host lease entry that is gone for the window: its lease (or, without one, its last write)
-// is older than the cutoff.
-const leaseGone = (entry: MeshStateEntry, cutoff: number): boolean => {
-  const expiresAt = record(entry.value)?.expiresAt;
-  return (typeof expiresAt === "number" ? expiresAt : entry.updatedAt) <= cutoff;
+// is older than the cutoff, and so is the host's file lease (smarty-dev#816).
+const leaseGone = (entry: MeshStateEntry, cutoff: number, leases: ReadonlyMap<string, FabricHostLease>): boolean => {
+  const value = record(entry.value);
+  const expiresAt = value?.expiresAt;
+  const file = typeof value?.id === "string" ? leases.get(value.id)?.expiresAt : undefined;
+  return (typeof expiresAt === "number" ? expiresAt : entry.updatedAt) <= cutoff && (file === undefined || file <= cutoff);
 };
+
+// Hosts' file leases, when the store has a root to read them from.
+const fileLeases = (mesh: { root?: string }): ReadonlyMap<string, FabricHostLease> =>
+  typeof mesh.root === "string" ? readHostLeases(mesh.root) : new Map();
 
 interface DeadRecord { entry: MeshStateEntry; hostId: string }
 
@@ -30,17 +37,18 @@ interface DeadRecord { entry: MeshStateEntry; hostId: string }
  * shutdown, so killed or crashed hosts left them for good, and every runtime parsed them.
  */
 export const deadHostRecords = (
-  mesh: Pick<MeshStore, "listAll">,
+  mesh: Pick<MeshStore, "listAll"> & { root?: string },
   options: { ownHostId: string; now?: number; deadAfterMs?: number },
 ): DeadRecord[] => {
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
   const fresh = { fresh: true };
   const hosts = new Map<string, boolean>();
   const dead: DeadRecord[] = [];
+  const leases = fileLeases(mesh);
   for (const entry of mesh.listAll(HOST_PREFIX, fresh)) {
     const id = record(entry.value)?.id;
     if (typeof id !== "string" || entry.key !== hostKey(id)) continue;
-    const gone = id !== options.ownHostId && leaseGone(entry, cutoff);
+    const gone = id !== options.ownHostId && leaseGone(entry, cutoff, leases);
     hosts.set(id, gone);
     if (gone) dead.push({ entry, hostId: id });
   }
@@ -60,7 +68,7 @@ export const deadHostRecords = (
  * Returns how many it removed.
  */
 export const reapDeadHostRecords = async (
-  mesh: Pick<MeshStore, "listAll" | "writeBatch">,
+  mesh: Pick<MeshStore, "listAll" | "writeBatch"> & { root?: string },
   identity: MeshIdentity,
   options: { ownHostId: string; now?: number; deadAfterMs?: number },
 ): Promise<number> => {
@@ -78,9 +86,17 @@ export const reapDeadHostRecords = async (
       // record, where the orphan rule held at selection and the version fence holds since).
       condition: (current: (key: string) => MeshStateEntry | undefined) => {
         const host = current(hostKey(hostId));
-        return host === undefined || leaseGone(host, cutoff);
+        return host === undefined || leaseGone(host, cutoff, fileLeases(mesh));
       },
     })),
   });
+  // A reaped host's file lease goes too, once it is as old.
+  if (typeof mesh.root === "string") {
+    const leases = readHostLeases(mesh.root);
+    for (const hostId of new Set(dead.map((item) => item.hostId))) {
+      const lease = leases.get(hostId);
+      if (lease && lease.expiresAt <= cutoff) removeHostLease(mesh.root, hostId);
+    }
+  }
   return results.filter((result) => result.applied).length;
 };

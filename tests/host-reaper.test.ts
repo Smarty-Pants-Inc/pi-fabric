@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { deadHostRecords, reapDeadHostRecords } from "../src/topology/host-reaper.js";
+import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 
 const roots: string[] = [];
@@ -50,6 +51,22 @@ describe("records of dead hosts", () => {
     // Past the window, the orphan without a host record goes too.
     expect(keys(deadHostRecords(mesh, { ownHostId: "own", now: now + 7 * HOUR })))
       .toContain("topology/participants/orphan");
+  });
+
+  // smarty-dev#816: hosts renew a file lease outside the shared state, and under the fleet
+  // owner's policy renew their shared record only every few minutes.
+  it("keeps a host whose file lease is fresh, and removes a dead host's file lease with it", async () => {
+    const mesh = store();
+    const now = Date.now();
+    await host(mesh, "filed", now - 7 * HOUR);                    // shared lease old ...
+    await participant(mesh, "filed-root", "filed");
+    writeHostLease(mesh.root, { id: "filed", rootId: "filed", identityId: "filed", updatedAt: now, expiresAt: now + 10_000 });
+    await host(mesh, "dead", now - 7 * HOUR);
+    writeHostLease(mesh.root, { id: "dead", rootId: "dead", identityId: "dead", updatedAt: now - 8 * HOUR, expiresAt: now - 7 * HOUR });
+    expect(keys(deadHostRecords(mesh, { ownHostId: "own", now }))).toEqual([hostKey("dead")]);   // ... file lease fresh
+    expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
+    expect(mesh.get(hostKey("filed"))).toBeDefined();
+    expect([...readHostLeases(mesh.root).keys()]).toEqual(["filed"]);
   });
 
   it("deletes in one batch fenced to the versions it saw, and writes nothing when none are dead", async () => {

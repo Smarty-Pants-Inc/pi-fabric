@@ -8,7 +8,7 @@ import {
   type MeshIdentity,
   type MeshStoreOptions,
 } from "../src/mesh/store.js";
-import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { CONTROL_CLAIMS_POLICY_KEY, FabricControlPlane } from "../src/topology/control-plane.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
@@ -199,6 +199,78 @@ describe("FabricControlPlane", () => {
       expect(receive).not.toHaveBeenCalled();
       expect(ackFor(store, "command:locked")?.data).toMatchObject({ accepted: false, error: "Fabric control command expired" });
     });
+
+    // smarty-dev#816: shared claims were kept until their command left the event log (compacted
+    // only at 64 MiB); 2,858 expired claims made up 46% of the shared state and saturated the lock.
+    it("in the shared state go once expired plus a grace when the fleet owner allows it and the command had its own deadline", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const start = Date.now();
+      const MINUTE = 60_000;
+      const later = start + 16 * MINUTE;                                   // past the 15-min sweep interval
+      const claim = (commandId: string, value: Record<string, unknown>) => store.put({
+        key: seenKey("host:other", commandId), identity: identity("host:other"), ifVersion: 0,
+        value: { format: 1, hostId: "host:other", commandId, targetId: "agent:target", ...value },
+      });
+      for (const id of ["command:flagged", "command:grace", "command:legacy"]) {
+        await store.publish(command(id, "host:other"));                    // all still in the log
+      }
+      await claim("command:flagged", { expiresAt: start, explicitDeadline: true });
+      await claim("command:grace", { expiresAt: later - 5 * MINUTE, explicitDeadline: true });   // inside the grace
+      await claim("command:legacy", { expiresAt: start });                // an older writer: no flag
+      await store.put({ key: CONTROL_CLAIMS_POLICY_KEY, value: { version: 1, sharedClaims: "expiry" }, identity: identity("host:owner") });
+      const receiver = plane(meshRoot, "host:receiver");
+      receiver.start(() => ({ accepted: true }));
+      const sender = plane(meshRoot, "host:sender");
+      sender.start(() => ({ accepted: false }));
+      await sender.request("host:receiver", "agent:target", "steer", { message: "once" });
+      const fresh = store.listAll("topology/control-seen/").find((entry) =>
+        (entry.value as { hostId?: string }).hostId === "host:receiver");
+      expect(fresh?.value).toMatchObject({ explicitDeadline: true });    // new claims carry the flag
+      const batches = vi.spyOn(MeshStore.prototype, "writeBatch");
+      const now = Date.now;
+      vi.spyOn(Date, "now").mockImplementation(() => now() - start + later);
+      await vi.waitFor(() => expect(store.get(seenKey("host:other", "command:flagged"))).toBeUndefined(),
+        { timeout: 3_000, interval: 20 });
+      expect(store.get(seenKey("host:other", "command:grace"))).toBeDefined();
+      expect(store.get(seenKey("host:other", "command:legacy"))).toBeDefined();   // still in the log
+      const sweeps = batches.mock.calls.filter(([input]) => input.ops.every((op) => op.kind === "delete")
+        && input.ops.some((op) => op.key.startsWith("topology/control-seen/")));
+      expect(sweeps.length).toBeGreaterThanOrEqual(1);
+      expect(sweeps[0]![0].ops.every((op) => op.ifVersion !== undefined)).toBe(true);   // one fenced batch
+    });
+
+    // review/astra on #65: a runtime before phase 1 checks the deadline only at admission and knows
+    // only the shared claim. Without the fleet owner's policy, the shared claim must outlive expiry.
+    it("keep the shared claim for a paused older runtime through the sweep and tombstone eviction", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const requestedAt = Date.now();
+      await store.publish({ ...command("command:paused", "host:receiver"),
+        data: { ...command("command:paused", "host:receiver").data, requestedAt, deadlineAt: requestedAt + 5_000 } });
+      const older = olderRuntimeAdmits(store, "command:paused");            // passed admission, then pauses
+      expect(older.checked).toBe(true);
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn(() => ({ accepted: true }));
+      receiver.start(receive);
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
+      expect(store.get(seenKey("host:receiver", "command:paused"))?.value).toMatchObject({ explicitDeadline: true });
+      const now = Date.now;
+      vi.spyOn(Date, "now").mockImplementation(() => now() + 16 * 60_000);   // past expiry, grace and sweep
+      await new Promise((resolve) => setTimeout(resolve, 300));             // sweeps run
+      for (let index = 0; index < 1_010; index++) {                         // evict every older tombstone
+        await store.writeBatch({ identity: identity("host:noise"), ops: [
+          { kind: "put", key: `noise/${index}`, value: index }, { kind: "delete", key: `noise/${index}` },
+        ] });
+      }
+      const olderRuns = (await older.claim()) ? 1 : 0;                      // the older runtime resumes
+      expect(receive.mock.calls.length + olderRuns).toBe(1);
+      expect(store.get(seenKey("host:receiver", "command:paused"))).toBeDefined();
+    }, 60_000);
 
     it("are deleted only once expired and their command has left the log", async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));

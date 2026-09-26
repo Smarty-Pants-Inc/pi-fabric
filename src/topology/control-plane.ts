@@ -17,6 +17,11 @@ const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
 // Records other hosts left in the shared state before smarty-dev#643 are checked this often.
 const LEGACY_SEEN_CLEANUP_MS = 15 * 60 * 1_000;
+// A shared claim for a command with an explicit deadline is deleted this long after it expires,
+// once the fleet owner has ended support for runtimes before phase 1 (see #cleanupLegacySeen).
+const SHARED_SEEN_GRACE_MS = 10 * 60 * 1_000;
+/** Host-reserved policy key; { version: 1, sharedClaims: "expiry" } enables expiry reclamation. */
+export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
 
@@ -97,6 +102,8 @@ interface FabricControlSeenRecord {
   commandId: string;
   targetId: string;
   expiresAt: number;
+  /** The command carried its own deadlineAt, so every receiver computes the same deadline. */
+  explicitDeadline?: boolean;
   /** The command event's sequence, or an upper bound for a record moved from the shared state. */
   sequence?: number;
   acceptance?: FabricControlAcceptance;
@@ -505,6 +512,7 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           expiresAt: deadlineAt + this.#ackTimeoutMs,
+          ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
         ifVersion: 0,
@@ -673,36 +681,52 @@ export class FabricControlPlane {
     }
   }
 
-  // Records left in the shared state by runtimes before smarty-dev#643, any host's: delete one
-  // once it has expired and its command is no longer in the retained log.
+  // Shared-state records, any host's (smarty-dev#643, #816). By default one goes once it has
+  // expired and its command has left the event log: a runtime before phase 1 (before Fabric
+  // B8) checks the deadline only at admission and knows no other fence, so it could pass
+  // admission, pause, and claim again after an earlier deletion (review/astra on #65).
+  // ponytail: the log rule kept 2,858 expired claims (46% of the shared state) and saturated
+  // the mesh lock, because the log compacts only at 64 MiB. Once no runtime before phase 1
+  // remains on the root, the fleet owner sets CONTROL_CLAIMS_POLICY_KEY to
+  // { version: 1, sharedClaims: "expiry" }; then a claim for a command with its own deadline goes
+  // 10 minutes after it expires. That ends support for those runtimes on this root: one started
+  // afterwards could run a command twice in that pause. Runtime versions cannot be told apart
+  // automatically, since two processes of one host write the same lease key.
   async #cleanupLegacySeen(now: number): Promise<void> {
-    const candidates = this.mesh.listAll(CONTROL_SEEN_PREFIX).flatMap((entry) => {
+    const expired = this.mesh.listAll(CONTROL_SEEN_PREFIX).flatMap((entry) => {
       const record = controlSeenRecord(entry.value);
       return !record || record.expiresAt < now ? [{ entry, record }] : [];
     });
-    if (candidates.length === 0) return;
+    if (expired.length === 0) return;
+    const policy = this.mesh.get(CONTROL_CLAIMS_POLICY_KEY, { fresh: true })?.value;
+    const expiryReclaim = isObject(policy) && policy.version === 1 && policy.sharedClaims === "expiry";
+    const reclaimable = ({ record }: { record: FabricControlSeenRecord | undefined }): boolean =>
+      expiryReclaim && record?.explicitDeadline === true && record.expiresAt + SHARED_SEEN_GRACE_MS < now;
+    const dead = expired.filter(reclaimable);
+    const unflagged = expired.filter((candidate) => !reclaimable(candidate));
 
-    const sought = new Set(
-      candidates.flatMap(({ record }) => record ? [record.commandId] : []),
-    );
-    const retained = new Set<string>();
-    let offset = 0;
-    while (sought.size > retained.size) {
-      const page = this.mesh.tail(offset, this.mesh.maxReadEvents);
-      for (const event of page.events) {
-        if (event.topic !== CONTROL_TOPIC || !isObject(event.data)) continue;
-        const commandId = event.data.commandId;
-        if (typeof commandId === "string" && sought.has(commandId)) retained.add(commandId);
+    if (unflagged.length > 0) {
+      const sought = new Set(unflagged.flatMap(({ record }) => record ? [record.commandId] : []));
+      const retained = new Set<string>();
+      let offset = 0;
+      while (sought.size > retained.size) {
+        const page = this.mesh.tail(offset, this.mesh.maxReadEvents);
+        for (const event of page.events) {
+          if (event.topic !== CONTROL_TOPIC || !isObject(event.data)) continue;
+          const commandId = event.data.commandId;
+          if (typeof commandId === "string" && sought.has(commandId)) retained.add(commandId);
+        }
+        if (page.events.length < this.mesh.maxReadEvents || page.nextOffset === offset) break;
+        offset = page.nextOffset;
       }
-      if (page.events.length < this.mesh.maxReadEvents || page.nextOffset === offset) break;
-      offset = page.nextOffset;
+      dead.push(...unflagged.filter(({ record }) => !record || !retained.has(record.commandId)));
     }
-
-    await Promise.allSettled(
-      candidates
-        .filter(({ record }) => !record || !retained.has(record.commandId))
-        .map(({ entry }) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })),
-    );
+    if (dead.length === 0) return;
+    // One write for the whole sweep, each delete fenced to the version it saw.
+    await this.mesh.writeBatch({
+      identity: this.identity,
+      ops: dead.map(({ entry }) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+    });
   }
 
   async #publishAcknowledgement(

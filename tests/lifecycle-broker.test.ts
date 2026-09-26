@@ -10,6 +10,7 @@ import {
 } from "../src/lifecycle/types.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { removeHostLease } from "../src/topology/host-leases.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantSource,
@@ -356,9 +357,9 @@ describe("LifecycleBroker", () => {
       }]);
       return value;
     };
-    const sourceDirectory = directory(sourceMesh, sourceIdentity, 300);
+    const sourceDirectory = directory(sourceMesh, sourceIdentity, 1_000);
     const targetDirectory = directory(targetMesh, targetIdentity, 60_000);   // the receiver stays live
-    await sourceDirectory.refresh();                           // the source's lease: 300 ms
+    await sourceDirectory.refresh();                           // the source's lease: 1 s
     await targetDirectory.refresh();
     const deliveries: FabricLifecycleEvent[] = [];
     const target = new LifecycleBroker(targetMesh, targetIdentity, targetDirectory,
@@ -370,9 +371,12 @@ describe("LifecycleBroker", () => {
       from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
       delivery: "followUp", triggerTurn: false, once: false,
     });
-    await new Promise((resolve) => setTimeout(resolve, 400));  // the cached lease has lapsed
+    await new Promise((resolve) => setTimeout(resolve, 1_100));  // the cached lease has lapsed
     expect(targetDirectory.get(source.id)).toBeUndefined();   // the receiver's cached view
     await sourceDirectory.refresh();                           // the source renews ...
+    // ... only in the shared state, as a runtime before host lease files does: a file lease is
+    // read fresh, and would already show the renewal (smarty-dev#816).
+    removeHostLease(meshRoot, source.id);
     await publisher.publish({ source, event: "pi.agent_settled", occurredAt: 7 });   // ... and publishes
     expect(targetDirectory.get(source.id)).toBeUndefined();   // still the stale cached view
     target.start();

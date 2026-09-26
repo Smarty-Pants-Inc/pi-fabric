@@ -12,6 +12,15 @@ import type {
 } from "./types.js";
 
 import { reapDeadHostRecords } from "./host-reaper.js";
+import {
+  fileLeasesOnly,
+  hostLeaseExpiry,
+  LIVENESS_POLICY_KEY,
+  readHostLeases,
+  removeHostLease,
+  STATE_LEASE_RENEW_MS,
+  writeHostLease,
+} from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 
 const PARTICIPANT_PREFIX = "topology/participants/";
@@ -399,14 +408,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       return [...byId.values()];
     }
     const read = { fresh: options.fresh === true };
-    const hosts = new Map(
-      this.mesh
-        .listAll(HOST_PREFIX, read)
-        .flatMap((entry) => {
-          const host = hostFromEntry(entry);
-          return host ? [[host.id, host] as const] : [];
-        }),
-    );
+    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read));
     const byId = new Map<string, FabricParticipantInfo>();
     for (const entry of this.mesh.listAll(PARTICIPANT_PREFIX, read)) {
       const participant = participantFromEntry(entry);
@@ -462,6 +464,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
     );
   }
 
+  // Valid host records by id, each with its effective expiry: the later of its shared-state
+  // lease and its file lease (smarty-dev#816).
+  #liveHosts(entries: Iterable<MeshStateEntry>): Map<string, FabricHostRecord> {
+    const leases = readHostLeases(this.mesh.root);
+    const hosts = new Map<string, FabricHostRecord>();
+    for (const entry of entries) {
+      const host = hostFromEntry(entry);
+      if (host) hosts.set(host.id, { ...host, expiresAt: hostLeaseExpiry(leases, host) });
+    }
+    return hosts;
+  }
+
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {
     if (!this.options.enabled) return undefined;
     const target = id === "main" ? this.options.rootId : id;
@@ -469,7 +483,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       .find((candidate) => candidate.id === target);
     if (!participant?.stale) return undefined;
     const entry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId));
-    const host = entry ? hostFromEntry(entry) : undefined;
+    const host = entry ? this.#liveHosts([entry]).get(participant.ownerHostId) : undefined;
     const sameHost = host && host.identity.id === participant.ownerIdentityId && host.rootId === participant.rootId;
     return { participant, lapsedMs: sameHost ? Math.max(0, now - host.expiresAt) : Number.POSITIVE_INFINITY };
   }
@@ -528,9 +542,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // Peer leases (host leases, and legacy session entries) that lapsed in (since, now].
   #lapsedSince(since: number, now: number): number {
     let lapsed = 0;
-    for (const entry of this.mesh.listAll(HOST_PREFIX)) {
-      const host = hostFromEntry(entry);
-      if (host && host.id !== this.options.hostId && host.expiresAt > since && host.expiresAt <= now) lapsed += 1;
+    for (const host of this.#liveHosts(this.mesh.listAll(HOST_PREFIX)).values()) {
+      if (host.id !== this.options.hostId && host.expiresAt > since && host.expiresAt <= now) lapsed += 1;
     }
     for (const entry of this.mesh.listAll(LEGACY_SESSION_PREFIX)) {
       const expiresAt = entry.updatedAt + PARTICIPANT_LEASE_MS;
@@ -656,6 +669,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         await this.mesh.delete({ key: legacy.key, ifVersion: legacy.version }).catch(() => undefined);
       }
     }
+    removeHostLease(this.mesh.root, this.options.hostId);
     const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
     if (hostEntry) await this.mesh.delete({ key: hostEntry.key, ifVersion: hostEntry.version }).catch(() => undefined);
   }
@@ -763,7 +777,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       if (occupiedParticipant && occupiedParticipant.ownerHostId !== this.options.hostId) {
         const ownerEntry = this.mesh.get(keyFor(HOST_PREFIX, occupiedParticipant.ownerHostId));
-        const owner = ownerEntry && hostFromEntry(ownerEntry);
+        const owner = ownerEntry && this.#liveHosts([ownerEntry]).get(occupiedParticipant.ownerHostId);
         if (
           owner &&
           owner.expiresAt >= now &&
@@ -792,6 +806,36 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
     }
     if (!full && !changed) return false;                       // nothing to publish
+    // The file lease is renewed first and on every heartbeat, without the mesh lock
+    // (smarty-dev#816). Under the fleet owner's policy, a renewal that changes nothing writes
+    // only the file, plus the shared host record every STATE_LEASE_RENEW_MS.
+    if (!this.#quiescing) {
+      const leaseAt = Date.now();
+      writeHostLease(this.mesh.root, {
+        id: this.options.hostId,
+        rootId: this.options.rootId,
+        identityId: this.options.identity.id,
+        updatedAt: leaseAt,
+        expiresAt: leaseAt + this.#leaseMs,
+      });
+      if (!changed && fileLeasesOnly(this.mesh.get(LIVENESS_POLICY_KEY)?.value)) {
+        const own = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
+        const host = own && hostFromEntry(own);
+        if (
+          host &&
+          host.rootId === this.options.rootId &&
+          host.identity.id === this.options.identity.id &&
+          host.startedAt === this.#startedAt &&
+          leaseAt - host.updatedAt < STATE_LEASE_RENEW_MS
+        ) {
+          // The file shows only that this host is alive. A committed heartbeat also certifies
+          // that the shared state is writable (confirmedAt; peer-settle relies on it, #24), so
+          // take the lock once without a write: a stalled mesh still stops confirmation.
+          await this.mesh.confirmWritable();
+          return true;
+        }
+      }
+    }
 
     // Stamp this host's lease at commit time, under the lock: a refresh that
     // outruns its own lease must not publish an already-expired lease, which

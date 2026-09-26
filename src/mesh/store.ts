@@ -783,6 +783,17 @@ export class MeshStore {
     });
   }
 
+  /**
+   * Takes and releases the mesh lock without writing the state: evidence that the shared state is
+   * writable now, for a heartbeat that renewed only its file lease. It also drops this store's
+   * cached view, so a read after the confirmation cannot return an earlier snapshot.
+   */
+  async confirmWritable(): Promise<void> {
+    await this.#withLock(() => {
+      this.#stateCache = undefined;
+    });
+  }
+
   async delete(input: {
     key: string;
     ifVersion?: number;

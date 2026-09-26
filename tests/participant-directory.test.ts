@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { LIVENESS_POLICY_KEY, readHostLeases, STATE_LEASE_RENEW_MS } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -79,6 +80,146 @@ const createDirectory = (
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+// smarty-dev#816: heartbeats were 78% of all writes under the one mesh lock, each a rewrite of
+// the whole shared state. Hosts also renew a file lease of their own, without the lock.
+describe("ParticipantDirectory host leases", () => {
+  const identityOf = (name: string): MeshIdentity => ({ id: `session:${name}`, name: "main", kind: "main", sessionId: name });
+  const setup = async (policy: boolean) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    if (policy) {
+      await store.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner") });
+    }
+    const alpha = createDirectory(meshRoot, identityOf("alpha"), "session:alpha", () => [rootRecord("session:alpha", "session:alpha", "alpha")]);
+    const beta = createDirectory(meshRoot, identityOf("beta"), "session:beta", () => [rootRecord("session:beta", "session:beta", "beta")]);
+    await alpha.start();
+    await beta.start();
+    const hostEntry = () => store.listAll("topology/hosts/", { fresh: true })
+      .find((entry) => (entry.value as { id?: string }).id === "session:alpha");
+    return { meshRoot, store, alpha, beta, hostEntry };
+  };
+  const alphaBatches = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls.filter((call) => (call[0] as { identity: MeshIdentity }).identity.id === "session:alpha").length;
+
+  it("renew a file lease on every heartbeat, and still the shared record without the fleet owner's policy", async () => {
+    const { meshRoot, hostEntry } = await setup(false);
+    const before = hostEntry()!.updatedAt;
+    await new Promise((resolve) => setTimeout(resolve, 450));      // several 100 ms heartbeats
+    expect(readHostLeases(meshRoot).get("session:alpha")?.expiresAt).toBeGreaterThan(Date.now());
+    expect(hostEntry()!.updatedAt).toBeGreaterThan(before);
+  });
+
+  it("under the policy, renew only the file lease, and peers still see the host live", async () => {
+    const { beta, hostEntry } = await setup(true);
+    const batches = vi.spyOn(MeshStore.prototype, "writeBatch");
+    const shared = hostEntry()!;
+    await new Promise((resolve) => setTimeout(resolve, 600));      // twice the 300 ms lease
+    expect(alphaBatches(batches)).toBe(0);                         // no locked write for a renewal
+    expect(hostEntry()!.version).toBe(shared.version);
+    expect((hostEntry()!.value as { expiresAt: number }).expiresAt).toBeLessThan(Date.now());
+    // includeStale keeps the participant's own record, not the legacy session entry (15 s lease).
+    expect(beta.list({ scope: "project", includeStale: true }).find((participant) => participant.id === "session:alpha"))
+      .toMatchObject({ stale: false });
+    batches.mockRestore();
+  });
+
+  // review/astra F1 on #68: a file-only renewal must not certify that the shared state is
+  // writable; otherwise a live peer blocked behind a held lock reads as departed (#24).
+  it("under the policy, never settle a peer that lapsed behind a held lock, and report the stall", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    await new MeshStore(meshRoot, 64 * 1024, 1_000).put({
+      key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner"),
+    });
+    let peerStatus: "idle" | "running" = "idle";
+    const make = (name: string, timing: { heartbeatMs: number; leaseMs: number }) => {
+      // A non-main peer: a main also writes a legacy session entry with a fixed 15 s lease.
+      const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: name === "peer" ? "actor" : "main", sessionId: name };
+      const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 10_000 }), {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing,
+      });
+      directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, name), ...(name === "peer" ? { status: peerStatus } : {}) }]);
+      directories.push(directory);
+      return directory;
+    };
+    const reader = make("reader", { heartbeatMs: 100, leaseMs: 2_000 });
+    const peer = make("peer", { heartbeatMs: 100, leaseMs: 400 });
+    await Promise.all([reader.start(), peer.start()]);
+    const seesPeer = () => reader.peers().some((candidate) => candidate.id === "session:peer");
+    await vi.waitFor(() => expect(seesPeer()).toBe(true), { timeout: 5_000, interval: 20 });
+    const lockPath = path.join(meshRoot, ".lock");
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+    try {
+      peerStatus = "running";
+      void peer.refresh().catch(() => undefined);                 // renews its file, then blocks
+      let result: PeerSettleResult | undefined;
+      void awaitPeerSettle({
+        poll: () => reader.peers(),
+        stalled: () => reader.writeStalled(),
+        confirmedAt: () => reader.confirmedAt(),
+        selector: "session:peer",
+        settledForMs: 60_000,
+        pollMs: 20,
+      }).then((settled) => { result = settled; });
+      await vi.waitFor(() => expect(seesPeer()).toBe(false), { timeout: 3_000, interval: 10 });   // its lease lapsed
+      await vi.waitFor(() => expect(result).toBeDefined(), { timeout: 5_000, interval: 20 });
+      expect(result).toEqual({ ok: false, error: expect.stringMatching(/peer lease lapsed/) });
+    } finally {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    }
+  });
+
+  // review/astra F2 on #68: production stores cache reads (2 s). A confirmation must not leave a
+  // snapshot from before it, or peer-settle certifies a peer list that is already out of date.
+  it("under the policy, read peers after a file-only confirmation, not from an earlier cache", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    await new MeshStore(meshRoot, 64 * 1024, 1_000).put({
+      key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner"),
+    });
+    const make = (name: string, status: "idle" | "running") => {
+      const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: name === "observer" ? "main" : "actor", sessionId: name };
+      const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000, { readCacheMs: 60_000 }), {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 2_000,
+      });
+      directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, name), status }]);
+      directories.push(directory);
+      return directory;
+    };
+    const observer = make("observer", "idle");
+    await observer.start();
+    await new Promise((resolve) => setTimeout(resolve, 300));        // file-only heartbeats now
+    expect(observer.peers()).toEqual([]);                           // primes the 60 s cached view
+    const joined = make("joined", "running");
+    await joined.start();                                           // a running peer joins
+    let result: PeerSettleResult | undefined;
+    void awaitPeerSettle({
+      poll: () => observer.peers(),
+      stalled: () => observer.writeStalled(),
+      confirmedAt: () => observer.confirmedAt(),
+      settledForMs: 60_000,
+      pollMs: 20,
+    }).then((settled) => { result = settled; });
+    await vi.waitFor(() => expect(observer.peers().map((peer) => peer.id)).toEqual(["session:joined"]), { timeout: 2_000, interval: 20 });
+    await new Promise((resolve) => setTimeout(resolve, 400));        // several confirmed heartbeats
+    expect(result).toBeUndefined();                                 // still waiting for the running peer
+  });
+
+  it("under the policy, still renew the shared record every STATE_LEASE_RENEW_MS", async () => {
+    const { hostEntry } = await setup(true);
+    const shared = hostEntry()!;
+    const now = Date.now;
+    vi.spyOn(Date, "now").mockImplementation(() => now() + STATE_LEASE_RENEW_MS);
+    await vi.waitFor(() => expect(hostEntry()!.version).toBeGreaterThan(shared.version), { timeout: 2_000, interval: 20 });
+    vi.restoreAllMocks();
+  });
 });
 
 describe("ParticipantDirectory", () => {

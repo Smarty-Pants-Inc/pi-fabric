@@ -134,7 +134,8 @@ describe("cooperative bash middleware", () => {
     // immediate case failed there too). shell-hang.test.ts covers the pid itself.
     if (result.details?.pid !== undefined) expect(result.details.pid).toEqual(expect.any(Number));
     expect(result.output).not.toContain(SECRET);
-    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toEqual(expect.any(Number)));
+    // A slow Git Bash start can take the run past vi.waitFor's default 1 s (smarty-dev#883).
+    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toEqual(expect.any(Number)), { timeout: 10_000 });
     const log = fs.readFileSync(result.details!.logPath!, "utf8");
     expect(log).toContain("[filtered]");
     expect(log).not.toContain(SECRET);

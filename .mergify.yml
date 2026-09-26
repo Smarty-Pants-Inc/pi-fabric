@@ -16,6 +16,11 @@ queue_rules:
       - check-success = smarty-land-ready
       - check-success = check (ubuntu-latest)
       - check-success = check (windows-latest)
+      - or:
+          - check-success = review/security
+          - and:
+              - -head ~= ^sync/upstream-
+              - -label = needs-security-pass
     merge_conditions:
       - base = main
       - -draft
@@ -24,6 +29,11 @@ queue_rules:
       - check-success = smarty-land-ready
       - check-success = check (ubuntu-latest)
       - check-success = check (windows-latest)
+      - or:
+          - check-success = review/security
+          - and:
+              - -head ~= ^sync/upstream-
+              - -label = needs-security-pass
 
 # GitHub suspended smarty-agents (2026-09-25); the review agent queues as the write App's bot,
 # which has no collaborator permission (smarty-dev#562). Humans with write access still can.

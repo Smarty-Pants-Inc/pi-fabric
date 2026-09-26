@@ -914,6 +914,7 @@ export class AgentManager {
         "--steer-file",
         steerFile,
         ...(schemaFile ? ["--schema-file", schemaFile] : []),
+        ...(schemaFile && request.replyTool && runner === "pi" ? ["--reply-tool", "true"] : []),
         ...(branch ? ["--branch", branch] : []),
         ...(worktree ? ["--worktree", worktree] : []),
       ];

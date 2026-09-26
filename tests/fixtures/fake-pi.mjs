@@ -203,6 +203,20 @@ switch (behavior) {
     emit({ type: "agent_settled" });
     process.exit(0);
   }
+  case "reply-tool": {
+    // smarty-dev#967: the reply-tool hook is loaded and allowed, and its env is set. FAKE_PI_REPLY
+    // picks what the model does: call the tool, or reply in text (JSON only, or with prose).
+    const argv = process.argv.slice(2);
+    const hook = argv.findIndex((arg, index) => arg === "-e" && /reply-tool\.(js|ts)$/.test(argv[index + 1] ?? ""));
+    const tools = (argv[argv.indexOf("--tools") + 1] ?? "").split(",");
+    if (hook < 0 || !tools.includes("fabric_reply") || !process.env.PI_FABRIC_REPLY_FILE) process.exit(81);
+    const mode = process.env.FAKE_PI_REPLY || "tool";
+    if (mode === "tool") fs.writeFileSync(process.env.PI_FABRIC_REPLY_FILE, JSON.stringify({ action: "silent" }));
+    const text = mode === "tool" ? "" : mode === "json" ? '{"action":"silent"}' : 'Agent progress comment, nothing to steer.\n{"action":"silent"}';
+    emit({ type: "message_end", message: { role: "assistant", content: text } });
+    emit({ type: "agent_settled" });
+    process.exit(0);
+  }
   case "success":
   default:
     emit({ type: "message_end", message: { role: "assistant", content: "hi" } });

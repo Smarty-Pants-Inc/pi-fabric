@@ -63,6 +63,8 @@ export interface AgentRunRequest {
   worktree?: boolean;
   residency?: FabricParticipantResidency;
   schema?: Record<string, unknown>;
+  /** With a schema on the Pi runner: the result is one fabric_reply tool call (smarty-dev#967). */
+  replyTool?: boolean;
   systemPrompt?: string;
   sessionFile?: string;
   /** Host-owned actor activation policy, not a one-shot provider argument. */
@@ -137,6 +139,8 @@ export interface AgentRunRecord {
   turns: number;
   toolCalls: number;
   text: string;
+  /** How a structured reply arrived: its tool call, or JSON-only final text (smarty-dev#967). */
+  replyVia?: "tool" | "text";
   value?: unknown;
   error?: string;
   stderr?: string;
@@ -194,6 +198,8 @@ export interface AgentWorkerOptions {
   lifecycleFile: string;
   logFile: string;
   schemaFile?: string;
+  /** Take the structured result from one fabric_reply tool call, not the final text (smarty-dev#967). */
+  replyTool?: boolean;
   cwd: string;
   piBinary: string;
   claudeBinary: string;

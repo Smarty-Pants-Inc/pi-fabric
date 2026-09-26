@@ -919,6 +919,40 @@ describe("ActorManager across a session reload", () => {
     expect(judged().every((message) => message.stale)).toBe(true);
   }, 60_000);
 
+  // review/astra F2 on #89: the same, with the host activation held only in the overflow: the running
+  // item and the queue (limit 1) are asks, which are never saved, so the overflow is the only saved work.
+  it.each([
+    ["taskRevision", "input"],
+    ["mainRevision", "main activity"],
+  ] as const)("keeps a host activation held in the overflow and made stale by %s stale across a restart", async (field, change) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const before = reloadable(root, mesh, agents, undefined, 1);
+    const actor = await before.create({
+      name: "watcher", instructions: "Watch.", events: ["tool_error"], responseMode: "text", coalesce: false,
+      validWhile: { version: 1, source: `({ activation, current }) => activation.kind !== "hostEvent" || activation.${field} === current.${field}` },
+    });
+    const running = before.ask(actor.id, "HANG a caller's request").catch(() => undefined);
+    await waitFor(() => before.status(actor.id).status === "running", 10_000);
+    const waiting = before.ask(actor.id, "a second caller's request").catch(() => undefined);
+    await waitFor(() => before.status(actor.id).queued === 1, 10_000);
+    before.dispatchHostEvent("tool_error", { error: "obsolete-error" });          // into the overflow
+    await waitFor(() => before.status(actor.id).queued === 2, 10_000);
+    if (change === "input") before.dispatchHostEvent("input", { text: "a new task" });
+    else before.noteMainActivity();
+    await before.close();
+    await Promise.all([running, waiting]);
+    const after = reloadable(root, mesh, agents, undefined, 1);
+    const judged = () => after.messages(actor.id).filter((message) => message.direction === "out" && message.source === "host:tool_error");
+    await waitFor(() => judged().length >= 1, 30_000);
+    expect(judged().every((message) => message.stale)).toBe(true);
+  }, 60_000);
+
   // review/astra F1 (third review) on #79: a registry resync that finds this host no longer owns an
   // actor parks its work while the cached decision still says it owns it. That write must stay in
   // this host's own file: the new owner's queue file is never written, replaced or deleted.

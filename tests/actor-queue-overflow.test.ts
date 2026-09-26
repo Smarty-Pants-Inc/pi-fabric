@@ -92,6 +92,31 @@ describe("actor queue overflow", () => {
     void fast;
   }, 60_000);
 
+  // review/astra F1 on #89: cancelling a queued ask frees a slot; the overflow must fill it at once,
+  // so the waiting event runs without another arrival and nothing newer overtakes it.
+  it.each([
+    ["with no further event", false],
+    ["ahead of a newer event", true],
+  ] as const)("runs an overflow item after a cancelled ask frees its slot, %s", async (_case, newer) => {
+    const w = world(1);
+    const actors = w.manager();
+    const slow = await actors.create({ name: "slow", instructions: "Supervise.", topics: ["team.events"], responseMode: "text", coalesce: false });
+    await w.mesh.publish({ topic: "team.direct", to: slow.id, from, text: "BLOCK slow's long run" });
+    await waitFor(() => actors.status(slow.id).status === "running");
+    const controller = new AbortController();
+    const cancelled = actors.ask(slow.id, "a caller's request", undefined, controller.signal).catch((error: Error) => error.message);
+    await waitFor(() => actors.status(slow.id).queued === 1);
+    await w.mesh.publish({ topic: "team.events", from, text: "ev-1" });            // into the overflow
+    await waitFor(() => actors.status(slow.id).queued === 2);
+    controller.abort();                                                            // frees the queue slot
+    expect(await cancelled).toMatch(/cancelled/);
+    if (newer) await w.mesh.publish({ topic: "team.events", from, text: "ev-2" });
+    w.release();
+    await waitFor(() => w.events("slow").length === (newer ? 2 : 1), 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(w.events("slow")).toEqual(newer ? ["ev-1", "ev-2"] : ["ev-1"]);
+  }, 60_000);
+
   it("records, and never silently loses, an event past the queue and its overflow", async () => {
     const w = world(1);                                           // overflow cap: 8
     const actors = w.manager();

@@ -836,6 +836,10 @@ export class ActorManager {
         const index = actor.queue.findIndex((queued) => queued.id === item.id);
         if (index >= 0) {
           actor.queue.splice(index, 1);
+          // The freed slot takes the oldest overflow item at once, so nothing newer overtakes it
+          // and nothing waits for another arrival (review/astra F1 on #89).
+          this.#refill(actor);
+          if (actor.queue.length > 0) this.#ensureDrain(actor);
           if (actor.queue.length === 0 && actor.status === "queued") {
             actor.status = "idle";
             delete actor.missingCapabilities;
@@ -2407,7 +2411,9 @@ export class ActorManager {
     if (!this.#persistent) return;
     for (const actor of this.#actors.values()) {
       const inFlight = this.#inFlight.get(actor.id);
-      const held = [...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#parked.get(actor.id) ?? [])];
+      const held = [
+        ...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
+      ];
       if (held.some((item) => !item.resolve && !item.reject)) this.#persistQueue(actor.id);
     }
   }

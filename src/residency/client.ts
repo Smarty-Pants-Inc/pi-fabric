@@ -18,6 +18,7 @@ import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
   RESIDENT_HOST_FORMAT,
+  isResidentHostId,
   residentDeliveryPrefix,
   residentHostId,
   sleepUnlessAborted,
@@ -515,7 +516,10 @@ export class ResidencyClient {
       typeof value.triggerTurn !== "boolean" ||
       typeof value.from !== "object" ||
       value.from === null ||
-      entry.updatedBy.id !== this.hostId
+      // This root's resident host, or for an actor's message another root's resident host whose
+      // root is gone: its actors' messages go to the project agent (smarty-dev#878).
+      (entry.updatedBy.id !== this.hostId &&
+        !(value.from.kind === "actor" && isResidentHostId(entry.updatedBy.id)))
     ) {
       return;
     }

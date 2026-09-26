@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { participantRole, projectOf, resolveProjectAgent } from "../src/topology/project-identity.js";
+import { deliveryRoot, participantRole, projectOf, resolveProjectAgent } from "../src/topology/project-identity.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -68,6 +68,19 @@ describe("project identity", () => {
     ];
     expect(resolveProjectAgent(live, P("/p/smarty-dev")).id).toBe("session:dev-lead");
     expect(resolveProjectAgent(live, P("/p/knowledge")).id).toBe("session:knowledge");
+  });
+
+  // smarty-dev#878: a durable actor's messages follow its project's agent once its root is gone.
+  it("delivers to the root while it is live, else to the project's live project agent, else still to the root", () => {
+    const next = root("session:new-dev-lead", { role: "project-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev"), startedAt: 9 });
+    const worktree = root("session:worktree", { role: "worktree-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev/worktrees/x") });
+    const other = root("session:knowledge", { role: "project-agent", project: P("/p/knowledge"), cwd: P("/p/knowledge") });
+    const old = root("session:dev-lead", { role: "project-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev"), startedAt: 1 });
+    // While the root lives, even a newer project agent does not take its messages.
+    expect(deliveryRoot("session:dev-lead", [old, next, worktree], P("/p/smarty-dev"))).toBe("session:dev-lead");
+    expect(deliveryRoot("session:dev-lead", [next, worktree, other], P("/p/smarty-dev"))).toBe("session:new-dev-lead");
+    // Counterexamples: never a worktree agent of the project, nor another project's agent.
+    expect(deliveryRoot("session:dev-lead", [worktree, other], P("/p/smarty-dev"))).toBe("session:dev-lead");
   });
 
   it("falls back to a root without a role whose cwd is the project checkout, and explains a miss", () => {

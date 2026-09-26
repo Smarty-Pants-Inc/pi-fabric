@@ -736,6 +736,110 @@ describe("ActorManager across a session reload", () => {
     await h.ranOnce();
   }, 60_000);
 
+  // smarty-dev#878: the project registry is fleet-wide, so any Main could adopt an orphaned session
+  // actor. Only the project agent of the actor's project adopts it, and the actor's next message
+  // then reaches that new session.
+  it("lets only the project agent of an orphaned actor's project adopt it, and delivers to the adopter", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const alive = new Map<string, boolean>([["session:owner", true]]);
+    const delivered = new Map<string, string[]>();
+    const host = (name: string, project: string, role: string) => {
+      const value = new ActorManager(
+        name, { id: `session:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents,
+        ({ message }) => { if (message.text) delivered.set(name, [...(delivered.get(name) ?? []), message.text]); },
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId: `session:${name}`, claimResidency: "session",
+          project, role, adoptionGraceMs: 0, meshCursorPath: path.join(root, `cursor-${name}.json`),
+          canManageActor: () => (name === "owner" && alive.get("session:owner") ? true : undefined),
+          lineageAlive: (rootId) => alive.get(rootId) ?? true,
+        },
+      );
+      actorManagers.push(value);
+      return value;
+    };
+    const owner = host("owner", "/p/dev", "project-agent");
+    const actor = await owner.create({
+      name: "supervisor", instructions: "Supervise.", topics: ["team.pulls"], responseMode: "text", delivery: "steer", triggerTurn: false,
+    });
+    await owner.close();
+    alive.set("session:owner", false);
+    // Counterexamples: another project's agent, and a worktree agent of the same project.
+    const other = host("other", "/p/knowledge", "project-agent");
+    const worktree = host("worktree", "/p/dev", "worktree-agent");
+    other.listOwned();
+    worktree.listOwned();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(other.status(actor.id).rootId).toBe("session:owner");
+    const successor = host("successor", "/p/dev", "project-agent");
+    await waitFor(() => successor.status(actor.id).rootId === "session:successor", 10_000);
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "a pull request" });
+    await waitFor(() => (delivered.get("successor") ?? []).length > 0, 20_000);
+    expect(delivered.get("other")).toBeUndefined();
+    expect(delivered.get("worktree")).toBeUndefined();
+  }, 60_000);
+
+  // review/astra F1 and F2 on #80: two projects share the fleet actor directory. After project A's
+  // project agent and its resident host die, neither project B's resident host nor the resident
+  // host of a live worktree agent of A's project may adopt A's durable supervisor, so neither
+  // receives its output; the resident host of A's replacement project agent adopts it and gets it.
+  it("lets only the project agent's resident host of a durable actor's project adopt it, and delivers its output there", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const alive = new Map<string, boolean>([["session:a", true]]);
+    const delivered = new Map<string, Array<{ text: string; project?: string }>>();
+    const resident = (rootId: string, project: string, role = "project-agent") => {
+      const value = new ActorManager(
+        rootId, { id: `resident:${rootId}`, name: "resident", kind: "agent", sessionId: rootId }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents,
+        ({ actor, message }) => {
+          if (message.text) delivered.set(rootId, [...(delivered.get(rootId) ?? []), { text: message.text, ...(actor.project ? { project: actor.project } : {}) }]);
+        },
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId, claimResidency: "durable", project, role,
+          adoptionGraceMs: 0, meshCursorPath: path.join(root, `cursor-${rootId}.json`),
+          canManageActor: () => (rootId === "session:a" && alive.get("session:a") ? true : undefined),
+          lineageAlive: (lineage) => alive.get(lineage) ?? true,
+        },
+      );
+      actorManagers.push(value);
+      return value;
+    };
+    const residentA = resident("session:a", "/p/a");
+    const actor = await residentA.create({
+      name: "supervisor", instructions: "Supervise.", topics: ["team.pulls"], responseMode: "text",
+      residency: "durable", delivery: "steer", triggerTurn: false,
+    });
+    expect(actor.project).toBe("/p/a");                                   // resident-side creation records it
+    await residentA.close();
+    alive.set("session:a", false);                                        // A's Main and resident host are gone
+    const residentB = resident("session:b", "/p/b");                      // an unrelated project's resident host
+    const residentW = resident("session:w", "/p/a", "worktree-agent");   // a live worktree agent of A's project
+    residentB.listOwned();
+    residentW.listOwned();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(residentB.status(actor.id).rootId).toBe("session:a");
+    expect(residentW.status(actor.id).rootId).toBe("session:a");
+    const residentA2 = resident("session:a2", "/p/a");                    // A's replacement project agent's host
+    await waitFor(() => residentA2.status(actor.id).rootId === "session:a2", 10_000);
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "a pull request" });
+    await waitFor(() => (delivered.get("session:a2") ?? []).length > 0, 20_000);
+    expect(delivered.get("session:a2")![0]!.project).toBe("/p/a");       // routed by the actor's project
+    expect(delivered.get("session:b")).toBeUndefined();
+    expect(delivered.get("session:w")).toBeUndefined();
+  }, 60_000);
+
   // review/astra F3 (re-review) on #79: a host revision that changed after the last queue write
   // must not roll back on restart and make obsolete work valid again.
   it.each([

@@ -241,6 +241,8 @@ export interface FabricActorInfo {
   /** Length of those instructions, in UTF-16 code units (JavaScript string length). */
   instructionsLength?: number;
   rootId?: string;
+  /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
+  project?: string;
   status: FabricActorStatus;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;

@@ -2887,6 +2887,21 @@ export class ActorManager {
     return value === undefined ? undefined : JSON.stringify(["mesh", event.topic, value]);
   }
 
+  // Whether item carries a newer event than other. Mesh events compare by their sequence in the
+  // shared mesh log: activation counters are per manager, so a queue restored after an adoption
+  // mixes two lineages' counters (review/astra F1 on #86). Anything else by activation order.
+  #newerEvent(item: ActorQueueItem, other: ActorQueueItem): boolean {
+    const sequence = (value: ActorQueueItem): number | undefined => {
+      const event = value.payload as { sequence?: unknown } | undefined;
+      return value.source.startsWith("mesh:") && typeof event?.sequence === "number" ? event.sequence : undefined;
+    };
+    const mine = sequence(item);
+    const theirs = sequence(other);
+    return mine !== undefined && theirs !== undefined
+      ? mine > theirs
+      : item.activation.sequence > other.activation.sequence;
+  }
+
   // Merges parked and queued items that share a coalesce key, as #enqueue does for a new event: the
   // first in run order (parked work returns ahead of the queue) keeps its place and takes the newest
   // event. Backfills the key of items queued before it was set. A running item is never touched.
@@ -2907,7 +2922,7 @@ export class ActorManager {
         kept.set(key, item);
         continue;
       }
-      if (item.activation.sequence > first.activation.sequence) {
+      if (this.#newerEvent(item, first)) {
         first.payload = item.payload;
         if (item.images) first.images = item.images;
         else delete first.images;

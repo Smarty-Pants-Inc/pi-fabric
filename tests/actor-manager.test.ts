@@ -701,7 +701,7 @@ describe("ActorManager across a session reload", () => {
       expect(runs.filter((run) => run.task.includes("backlog-a"))).toHaveLength(1);
       expect(runs.filter((run) => run.task.includes("backlog-b"))).toHaveLength(1);
     };
-    return { root, alive, host, deadOwnerBacklog, interruptedAdoption, runs, ranOnce };
+    return { root, mesh, alive, host, deadOwnerBacklog, interruptedAdoption, runs, ranOnce };
   };
 
   // review/astra F6 on #79: a Main and its resident host share a root and the actor directory but
@@ -723,6 +723,49 @@ describe("ActorManager across a session reload", () => {
 
   // review/astra F7 on #79: A's backlog, B's claim with an interrupted copy, then A adopts the actor
   // back from dead B. A's own queue file is its committed work, never a predecessor to delete.
+  // review/astra F1 on #86: coalescing a restored queue must keep the newest event of a PR, and
+  // activation counters are per manager: the dead owner's high counter must not beat the adopter's
+  // newer event. The adopter accepts it before its restart recovers the owner's queue.
+  it("keeps a PR's newest event when an adopter merges the dead owner's queue with its own", async () => {
+    const h = lineages();
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const pull = (revision: string) => h.mesh.publish({ topic: "team.pulls", from, data: { payload: { number: 1, revision } } });
+    h.alive.set("session:a", true);
+    const owner = h.host("owner", "session:a", "session", () => (h.alive.get("session:a") ? true : undefined));
+    const actor = await owner.create({
+      name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false, coalesceKey: "payload.number",
+    });
+    for (const filler of ["one", "two", "three", "four"]) await h.mesh.publish({ topic: "team.pulls", from, text: filler });
+    await waitFor(() => owner.messages(actor.id).filter((message) => message.direction === "out").length === 4, 20_000);
+    await h.mesh.publish({ topic: "team.pulls", from, text: "HANG owner" });
+    await waitFor(() => owner.status(actor.id).status === "running", 10_000);
+    await pull("rev-old");                                        // the owner's activation 6
+    await waitFor(() => owner.status(actor.id).queued === 1, 10_000);
+    await owner.close();
+    h.alive.set("session:a", false);
+    const ownerFile = path.join(h.root, "actors", actor.id, queueFiles(h.root, actor.id)[0]!.name);
+    const readFileSync = fs.readFileSync;
+    const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (target === ownerFile) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+      return (readFileSync as (target: fs.PathOrFileDescriptor, options?: unknown) => string | Buffer)(target, options);
+    }) as typeof fs.readFileSync);
+    const adopter = h.host("adopter", "session:b", "session", () => undefined);
+    await waitFor(() => adopter.status(actor.id).rootId === "session:b", 10_000);
+    await h.mesh.publish({ topic: "team.pulls", from, text: "HANG adopter" });
+    await waitFor(() => adopter.status(actor.id).status === "running", 10_000);
+    await pull("rev-new");                                        // the adopter's activation 2
+    await waitFor(() => adopter.status(actor.id).queued === 1, 10_000);
+    await adopter.close();
+    spy.mockRestore();
+    const restarted = h.host("adopter", "session:b", "session", () => undefined);   // recovers the owner's queue
+    await waitFor(() => restarted.status(actor.id).status === "running", 10_000);    // a HANG runs first
+    await waitFor(() => !fs.existsSync(ownerFile), 10_000);
+    const items = queueFiles(h.root, actor.id).flatMap((file) =>
+      (JSON.parse(file.text) as { items: Array<{ payload: { data?: { payload?: { revision?: string } } } }> }).items)
+      .map((item) => item.payload.data?.payload?.revision).filter(Boolean);
+    expect(items).toEqual(["rev-new"]);
+  }, 60_000);
+
   it("keeps a returning predecessor's own queue when it adopts back from an interrupted successor", async () => {
     const h = lineages();
     const { actor, file } = await h.deadOwnerBacklog("session:a", "session");

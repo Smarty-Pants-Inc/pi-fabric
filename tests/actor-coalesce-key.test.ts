@@ -140,6 +140,9 @@ describe("actor coalesceKey for mesh events", () => {
     expect(tasks.map((task) => task.match(/rev-[a-z]+/)![0])).toEqual(["rev-b", "rev-x"]);   // PR 1 in its first place
   }, 30_000);
 
+  // A HANG run in flight is aborted by the ownership loss and retried first when ownership returns,
+  // so PR 1's parked event cannot start, however the polls interleave (review/astra on #86: a
+  // running event rightly gets a follow-up, which made run counts racy on Windows).
   it("merges an event that arrives while the same PR's work is parked", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-key-"));
     roots.push(root);
@@ -149,30 +152,34 @@ describe("actor coalesceKey for mesh events", () => {
     });
     let owned = true;
     const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
-      actorRoot: path.join(root, "actors"), persistent: false, canManageActor: () => owned,
+      actorRoot: path.join(root, "actors"), persistent: true, canManageActor: () => owned,
     });
     closers.push(async () => { await actors.close(); await agents.close(); });
     const actor = await actors.create({
       name: "reviewer", instructions: "Review.", topics: ["github.demo.pulls"], coalesce: false, coalesceKey: "payload.number",
     });
     actors.listOwned();
-    await mesh.publish({ topic: "github.demo.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await mesh.publish({ topic: "github.demo.pulls", from, text: "HANG first" });
     await waitFor(() => actors.status(actor.id).status === "running");
     await pull(mesh, 1, "rev-a");
     await waitFor(() => actors.status(actor.id).queued === 1);
     owned = false;
-    actors.listOwned();                                           // PR 1's queued event parks
-    expect(actors.status(actor.id).queued).toBe(0);
+    actors.listOwned();                                           // rev-a parks; HANG is aborted and parked
+    await waitFor(() => actors.status(actor.id).status !== "running");
     owned = true;
-    await pull(mesh, 1, "rev-b");                                 // dispatched before the parked work returns
+    await pull(mesh, 1, "rev-b");                                 // before or after the parked work returns
     await pull(mesh, 2, "rev-x");
-    await waitFor(() => actors.messages(actor.id).filter((message) => message.direction === "out" && message.runId).length >= 2, 20_000);
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-    const ran = runTasks(root, actors, actor.id).filter((task) => task.includes("rev-"));
-    expect(ran.filter((task) => /rev-[ab]/.test(task))).toHaveLength(1);               // PR 1 once, newest
-    expect(ran.find((task) => /rev-[ab]/.test(task))).toContain("rev-b");
-    expect(ran.filter((task) => task.includes("rev-x"))).toHaveLength(1);
-  }, 30_000);
+    const queued = () => {
+      const dir = path.join(root, "actors", actor.id);
+      const file = fs.readdirSync(dir).find((name) => /^queue-.+\.json$/.test(name));
+      const items = file ? (JSON.parse(fs.readFileSync(path.join(dir, file), "utf8")) as { items: Array<{ payload: { text?: string; data?: { payload?: { number?: number; revision?: string } } } }> }).items : [];
+      return items.map((item) => item.payload.data?.payload ?? item.payload.text);
+    };
+    await waitFor(() => actors.status(actor.id).status === "running" && actors.status(actor.id).queued === 2, 20_000);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(actors.status(actor.id).queued).toBe(2);
+    expect(queued().slice(1)).toEqual([{ action: "synchronize", number: 1, revision: "rev-b" }, { action: "synchronize", number: 2, revision: "rev-x" }]);
+  }, 40_000);
 
   it("merges a restored queue file from before the key", async () => {
     const first = setup();

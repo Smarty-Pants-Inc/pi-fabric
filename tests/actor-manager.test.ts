@@ -520,6 +520,84 @@ describe("ActorManager across a session reload", () => {
     await waitFor(() => runs.filter((run) => /held-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 30_000);
   }, 60_000);
 
+  // review/astra F1 (re-review) on #79: the empty queue a new owner parks before it reloads must
+  // not delete the dead owner's file.
+  it.each([
+    ["starts after the owner died", false],
+    ["was running before the owner died", true],
+  ] as const)("lets an adopter that %s run the dead owner's accepted backlog", async (_order, successorFirst) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const runs = recordRuns(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    let ownerAlive = true;
+    const manager = (name: string, owns: () => boolean | undefined) => {
+      const value = new ActorManager(
+        name, { id: `session:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId: `session:${name}`, claimResidency: "session",
+          canManageActor: owns, lineageAlive: (rootId) => rootId !== "session:owner" || ownerAlive,
+          adoptionGraceMs: 0, meshCursorPath: path.join(root, `cursor-${name}.json`),
+        },
+      );
+      actorManagers.push(value);
+      return value;
+    };
+    const owner = manager("owner", () => (ownerAlive ? true : undefined));
+    const actor = await owner.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => owner.status(actor.id).status === "running", 10_000);
+    await mesh.publish({ topic: "team.pulls", from, text: "backlog-a" });
+    await mesh.publish({ topic: "team.pulls", from, text: "backlog-b" });
+    await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
+    if (successorFirst) manager("successor", () => undefined);  // a passive view, then adopts via refresh
+    await owner.close();
+    ownerAlive = false;                                         // the owner's lineage is dead
+    if (!successorFirst) manager("successor", () => undefined); // adopts during its own start
+    // Either way the successor's cursor starts at the log's end: no replay can mask a loss.
+    await waitFor(() => runs.filter((run) => /backlog-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 30_000);
+  }, 60_000);
+
+  // review/astra F3 (re-review) on #79: a host revision that changed after the last queue write
+  // must not roll back on restart and make obsolete work valid again.
+  it.each([
+    ["taskRevision", "input"],
+    ["mainRevision", "main activity"],
+  ] as const)("keeps a host activation made stale by %s stale across a restart", async (field, change) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const runs = recordRuns(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const before = reloadable(root, mesh, agents);
+    const actor = await before.create({
+      name: "watcher", instructions: "Watch.", topics: ["team.pulls"], events: ["tool_error"], responseMode: "text", coalesce: false,
+      validWhile: { version: 1, source: `({ activation, current }) => activation.kind !== "hostEvent" || activation.${field} === current.${field}` },
+    });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => before.status(actor.id).status === "running", 10_000);
+    before.dispatchHostEvent("tool_error", { error: "obsolete-error" });
+    await waitFor(() => before.status(actor.id).queued === 1, 10_000);
+    if (change === "input") before.dispatchHostEvent("input", { text: "a new task" });   // not subscribed: no queue write
+    else before.noteMainActivity();
+    await before.close();
+    const after = reloadable(root, mesh, agents);
+    // The restored host activation is judged, not dropped: it ends as a stale message.
+    const judged = () => after.messages(actor.id).filter((message) => message.direction === "out" && message.source === "host:tool_error");
+    await waitFor(() => judged().length >= 1, 30_000);
+    expect(judged().every((message) => message.stale)).toBe(true);
+  }, 60_000);
+
   it("does not replay events older than the replay window after a long downtime", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
     roots.push(root);

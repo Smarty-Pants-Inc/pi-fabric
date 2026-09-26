@@ -465,6 +465,55 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
+  // smarty-dev#1043: each 500 ms poll gathered and deep-compared every input while local work
+  // was active (about 11% of a busy Main). A poll now rebuilds only when a cheap stamp moved.
+  it("rebuilds a polled snapshot only when a stamp moved: Main at once, remote state at most every 5 s", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    state.config.ui.refreshMs = 500;
+    vi.mocked(state.actors.list).mockReturnValue([]);
+    const activity = new FabricActivityStore();
+    let stamp = "state-1";
+    const participantInfos = vi.fn(() => []);
+    Object.assign(state, {
+      activity,
+      participantInfos,
+      config: { ...state.config, mesh: { enabled: true } },
+      mesh: { ...state.mesh, tail: vi.fn(() => ({ events: [], nextOffset: 0 })), stateStamp: vi.fn(() => stamp) },
+    });
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    const gathered = () => participantInfos.mock.calls.length;
+    try {
+      controller.start(context);
+      activity.start("live", { name: "local work" });            // keeps the poll at refreshMs
+      await vi.advanceTimersByTimeAsync(200);                     // its own event-driven rebuild
+      const settled = gathered();
+      await vi.advanceTimersByTimeAsync(4_000);                   // 8 polls, nothing moved
+      expect(gathered()).toBe(settled);
+      expect(controller.snapshot().now).toBeGreaterThanOrEqual(Date.now() - 500);   // ages still move
+      stamp = "state-2";                                          // remote state changed
+      await vi.advanceTimersByTimeAsync(500);
+      expect(gathered()).toBe(settled);                           // less than 5 s since the last build
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(gathered()).toBe(settled + 1);                       // then once
+      const afterRemote = gathered();
+      vi.mocked(state.mainAgentInfo).mockReturnValue({
+        ...vi.mocked(state.mainAgentInfo)(), status: "running",
+      } as ReturnType<FabricState["mainAgentInfo"]>);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(gathered()).toBe(afterRemote + 1);                   // Main's own state: at once
+      const afterMain = gathered();
+      await vi.advanceTimersByTimeAsync(14_000);
+      expect(gathered()).toBe(afterMain);
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(gathered()).toBe(afterMain + 1);                     // a lapsing lease: every 15 s
+    } finally {
+      controller.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("ticks the activity widget elapsed clock while nested calls are idle", async () => {
     vi.useFakeTimers();
     const state = stubState();

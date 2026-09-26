@@ -919,6 +919,17 @@ export class MeshStore {
     });
   }
 
+  /** Changes whenever the shared state file does: a cheap test before reading it again. */
+  stateStamp(): string | undefined {
+    try {
+      this.#readCachedState();
+    } catch {
+      return undefined;
+    }
+    const cached = this.#stateCache;
+    return cached ? `${cached.device}:${cached.inode}:${cached.size}:${cached.modifiedAt}` : undefined;
+  }
+
   #readCachedState(fresh = false): MeshStateFile {
     const recent = this.#stateCache;
     if (!fresh && recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {

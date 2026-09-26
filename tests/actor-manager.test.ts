@@ -357,7 +357,9 @@ describe("ActorManager across a session reload", () => {
     expect(replies()).toHaveLength(34);                      // every event ran, none twice
   }, 120_000);
 
-  it("offers a deferred catch-up event again only to the actor whose queue was full", async () => {
+  // smarty-dev#1065: a full queue no longer defers the catch-up cursor: the event waits in that
+  // actor's overflow, and the other actor gets it once, at once.
+  it("gives a catch-up event to every actor once, keeping it in the overflow of the actor whose queue was full", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
     roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -377,9 +379,9 @@ describe("ActorManager across a session reload", () => {
     const after = reloadable(root, mesh, agents, undefined, 2);
     const idleReplies = () => after.messages(idle.id).filter((message) => message.direction === "out" && !message.error);
     await waitFor(() => idleReplies().length === 1, 15_000);
-    await new Promise((resolve) => setTimeout(resolve, 3_000));  // the busy actor stays full; retries go on
+    await new Promise((resolve) => setTimeout(resolve, 3_000));  // the busy actor stays full
     expect(idleReplies()).toHaveLength(1);
-    expect(after.status(busy.id).queued).toBe(2);
+    expect(after.status(busy.id).queued).toBe(3);                // 2 queued and the shared event in overflow
     after.haltAll();
   }, 40_000);
 

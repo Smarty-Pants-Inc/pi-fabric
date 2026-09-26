@@ -237,6 +237,9 @@ export class ActorManager {
   // snapshot taken before the load (a passive view, or the empty queue a new owner parks before
   // it reloads) would replace or delete the owner's accepted work (review/astra F1 on #79).
   readonly #ownQueueRead = new Set<string>();
+  // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
+  // holding the mesh cursor for every actor of this manager (or being lost in live mode).
+  readonly #overflow = new Map<string, ActorQueueItem[]>();
   // Predecessor queue files taken over, deleted after this lineage's own file is next written.
   readonly #takenOver = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
@@ -546,7 +549,7 @@ export class ActorManager {
     this.#ceded.add(actor.id);
     this.#ownership.set(actor.id, false);
     actor.abortController?.abort();
-    this.#drop(actor, [...actor.queue.splice(0), ...this.#takeParked(actor.id)],
+    this.#drop(actor, [...this.#takeQueued(actor), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) residency transferred to another host`);
     if (actor.status !== "stopped") actor.status = "idle";
     actor.updatedAt = Date.now();
@@ -1140,7 +1143,7 @@ export class ActorManager {
     actor.status = "stopped";
     actor.updatedAt = Date.now();
     actor.abortController?.abort();
-    this.#drop(actor, [...actor.queue.splice(0), ...this.#takeParked(actor.id)],
+    this.#drop(actor, [...this.#takeQueued(actor), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
     await this.mesh
@@ -1206,7 +1209,7 @@ export class ActorManager {
       // actor to idle once the aborted agent settles.
       actor.abortController?.abort();
       // Reject every queued item so subsequent execution is cancelled.
-      this.#drop(actor, actor.queue.splice(0),
+      this.#drop(actor, this.#takeQueued(actor),
         `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
       actor.updatedAt = Date.now();
       // If no run is in flight, settle the status now; otherwise the drain
@@ -1310,7 +1313,7 @@ export class ActorManager {
     const sequence = ++actor.latestActivationSequence;
     if (options.coalesceKey) {
       // Parked work (waiting for ownership, or restored after a restart) coalesces too (smarty-dev#1065).
-      const existing = [...actor.queue, ...(this.#parked.get(actor.id) ?? [])]
+      const existing = [...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
         .find((item) => item.coalesceKey === options.coalesceKey);
       if (existing) {
         existing.payload = structuredClone(payload);
@@ -1327,7 +1330,8 @@ export class ActorManager {
         return existing;
       }
     }
-    if (actor.queue.length >= this.meshConfig.actorQueueLimit) {
+    const callerless = !options.resolve && !options.reject;
+    if (actor.queue.length >= this.meshConfig.actorQueueLimit && !callerless) {
       throw new Error(
         `Fabric actor queue limit reached for ${actor.name} (${this.meshConfig.actorQueueLimit})`,
       );
@@ -1347,7 +1351,19 @@ export class ActorManager {
       ...(options.reject ? { reject: options.reject } : {}),
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
     };
-    actor.queue.push(item);
+    if (actor.queue.length >= this.meshConfig.actorQueueLimit) {
+      // A full queue must not hold other actors' delivery (smarty-dev#1065): the item waits in this
+      // actor's overflow, and past its cap it is recorded as dropped, never lost silently.
+      const overflow = this.#overflow.get(actor.id) ?? [];
+      if (overflow.length >= this.#overflowCap()) {
+        this.#recordDropped(actor, item, `its queue (${this.meshConfig.actorQueueLimit}) and overflow (${this.#overflowCap()}) are full`);
+        return item;
+      }
+      overflow.push(item);
+      this.#overflow.set(actor.id, overflow);
+    } else {
+      actor.queue.push(item);
+    }
     this.#persistQueue(actor.id);
     actor.status = "queued";
     actor.updatedAt = Date.now();
@@ -1404,6 +1420,7 @@ export class ActorManager {
         this.#canManage(actor.id)
       ) {
         const item = actor.queue.shift();
+        this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
@@ -1558,7 +1575,7 @@ export class ActorManager {
           item.resolve?.(structuredClone(message));
           if (message.action === "stop") {
             actor.status = "stopped";
-            actor.queue.splice(0).forEach((queued) =>
+            this.#takeQueued(actor).forEach((queued) =>
               queued.reject?.(
                 new Error(
                   `Fabric actor ${actor.name} (${actor.id}) stopped itself with a stop directive while messages were queued`,
@@ -2169,7 +2186,7 @@ export class ActorManager {
       for (const actor of this.#actors.values()) {
         this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
-        this.#park(actor, actor.queue.splice(0),
+        this.#park(actor, this.#takeQueued(actor),
           `Fabric actor ${actor.name} (${actor.id}) reloaded from its registry`);
       }
       this.#actors.clear();
@@ -2192,7 +2209,7 @@ export class ActorManager {
       }
       this.#markOwnershipAbort(actor);
       actor.abortController?.abort();
-      this.#park(actor, actor.queue.splice(0),
+      this.#park(actor, this.#takeQueued(actor),
         `Fabric actor ${actor.name} (${actor.id}) is not owned by this host`);
       replaced.push(actor);
       this.#actors.delete(id);
@@ -2410,7 +2427,9 @@ export class ActorManager {
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
     const inFlight = this.#inFlight.get(actorId);
-    const items = [...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#parked.get(actorId) ?? [])]
+    const items = [
+      ...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#overflow.get(actorId) ?? []), ...(this.#parked.get(actorId) ?? []),
+    ]
       .filter((item) => !item.resolve && !item.reject);
     const file = this.#ownQueueFile(actor);
     try {
@@ -2636,7 +2655,7 @@ export class ActorManager {
         ? { missingCapabilities: [...actor.missingCapabilities] }
         : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),
-      queued: actor.queue.length,
+      queued: actor.queue.length + (this.#overflow.get(actor.id)?.length ?? 0),
       messages: actor.messages.length,
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
@@ -2795,7 +2814,7 @@ export class ActorManager {
       if (previous && !next) {
         this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
-        this.#park(actor, actor.queue.splice(0),
+        this.#park(actor, this.#takeQueued(actor),
           `Fabric actor ${actor.name} (${actor.id}) ownership moved to another host`);
         if (actor.status !== "stopped") actor.status = "idle";
       } else if (!previous && next) {
@@ -2813,7 +2832,7 @@ export class ActorManager {
       for (const actor of this.#actors.values()) {
         this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
-        this.#park(actor, actor.queue.splice(0),
+        this.#park(actor, this.#takeQueued(actor),
           `Fabric actor ${actor.name} (${actor.id}) reloaded when its ownership returned`);
       }
       this.#actors.clear();
@@ -2840,7 +2859,7 @@ export class ActorManager {
       if (item.resolve || item.reject) item.reject?.(new Error(reason));
       else parked.push(item);
     }
-    while (parked.length > this.meshConfig.actorQueueLimit + parked.filter((queued) => queued.resumed).length) {
+    while (parked.length > this.meshConfig.actorQueueLimit + this.#overflowCap() + parked.filter((queued) => queued.resumed).length) {
       this.#recordDropped(actor, parked.shift()!, `${reason}; the parked queue is full`);
     }
     if (parked.length > 0) this.#parked.set(actor.id, parked);
@@ -2910,7 +2929,8 @@ export class ActorManager {
     const kept = new Map<string, ActorQueueItem>();
     const merged = new Set<ActorQueueItem>();
     let changed = false;
-    for (const item of [...parked, ...actor.queue]) {
+    const overflow = this.#overflow.get(actor.id) ?? [];
+    for (const item of [...parked, ...actor.queue, ...overflow]) {
       const key = this.#meshItemKey(actor, item);
       if (key === undefined) continue;
       if (item.coalesceKey !== key) {
@@ -2939,8 +2959,31 @@ export class ActorManager {
       if (rest.length > 0) this.#parked.set(actor.id, rest);
       else this.#parked.delete(actor.id);
       actor.queue.splice(0, actor.queue.length, ...actor.queue.filter((item) => !merged.has(item)));
+      const restOverflow = overflow.filter((item) => !merged.has(item));
+      if (restOverflow.length > 0) this.#overflow.set(actor.id, restOverflow);
+      else this.#overflow.delete(actor.id);
+      this.#refill(actor);
     }
     if (changed) this.#persistQueue(actor.id);
+  }
+
+  // The queue and its overflow, emptied, in run order.
+  #takeQueued(actor: ManagedActor): ActorQueueItem[] {
+    const overflow = this.#overflow.get(actor.id) ?? [];
+    this.#overflow.delete(actor.id);
+    return [...actor.queue.splice(0), ...overflow];
+  }
+
+  #overflowCap(): number {
+    return this.meshConfig.actorQueueLimit * 8;
+  }
+
+  // Moves overflow into the queue as it frees up, in order.
+  #refill(actor: ManagedActor): void {
+    const overflow = this.#overflow.get(actor.id);
+    if (!overflow) return;
+    while (overflow.length > 0 && actor.queue.length < this.meshConfig.actorQueueLimit) actor.queue.push(overflow.shift()!);
+    if (overflow.length === 0) this.#overflow.delete(actor.id);
   }
 
   #takeParked(id: string): ActorQueueItem[] {
@@ -2984,8 +3027,15 @@ export class ActorManager {
         this.#parked.delete(id);
         actor.queue.unshift(...items);
         this.#mergeCoalesced(actor);                            // a returning item may duplicate a queued one
-        while (actor.queue.length > this.meshConfig.actorQueueLimit + actor.queue.filter((queued) => queued.resumed).length) {
-          this.#recordDropped(actor, actor.queue.pop()!, "the queue was full when parked events returned");
+        // Past the limit, returning work waits in the overflow, ahead of what arrived since.
+        const room = this.meshConfig.actorQueueLimit + actor.queue.filter((queued) => queued.resumed).length;
+        if (actor.queue.length > room) {
+          const excess = actor.queue.splice(room);
+          const overflow = [...excess, ...(this.#overflow.get(actor.id) ?? [])];
+          while (overflow.length > this.#overflowCap()) {
+            this.#recordDropped(actor, overflow.pop()!, "the queue and its overflow were full when parked events returned");
+          }
+          this.#overflow.set(actor.id, overflow);
         }
         actor.status = "queued";
         actor.updatedAt = Date.now();

@@ -489,7 +489,7 @@ Fabric sanitizes host-event JSON before placing it in the mailbox. The JSON incl
 
 Actors handle one message at a time. By default, they coalesce repeated host events, which is useful for `message_update` and `tool_execution_update`. They restore from the trusted project actor registry.
 
-Mesh events queue one by one. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced, so an event that arrives during a run still gets its own activation. A review actor that reads the current pull request head is the typical case:
+Mesh events queue one by one. Past `mesh.actorQueueLimit`, an actor's callerless work waits in its own overflow (up to eight times the limit), which is saved with its queue and runs in order as the queue drains, so one busy actor never holds other actors' delivery. Past the overflow, an event is recorded on the actor as dropped. An `ask` to a full queue still fails at once. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced, so an event that arrives during a run still gets its own activation. A review actor that reads the current pull request head is the typical case:
 
 ```ts
 const reviewers = await agents.actors();

@@ -281,7 +281,7 @@ class ResidentHost {
           deliveryRoot(
             config.rootId,
             this.participants.list({ scope: "project", kinds: ["root"] }),
-            actor.project ?? projectOf(config.cwd),
+            actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
           ),
         ).catch(() => undefined);
       },
@@ -293,7 +293,7 @@ class ResidentHost {
         rootId: config.rootId,
         // Recorded on every actor it creates, and the only project whose orphans it adopts, and
         // then only as a project agent's host.
-        project: projectOf(config.cwd),
+        project: (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
         role: typeof config.role === "string" ? config.role : undefined,
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: config.retention,

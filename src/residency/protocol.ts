@@ -81,6 +81,8 @@ export interface ResidentHostConfig {
   projectRoot: string;
   /** The root's fleet role; only a project agent's hosts adopt a project's orphans (smarty-dev#878). */
   role?: string;
+  /** The root's project (participantProject), which can differ from its cwd's (smarty-dev#977). */
+  project?: string;
   meshRoot: string;
   actorRoot: string;
   sessionActorRoot?: string;

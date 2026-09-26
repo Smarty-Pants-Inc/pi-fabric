@@ -1,5 +1,5 @@
 import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js";
-import { projectOf, resolveProjectAgent } from "../topology/project-identity.js";
+import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
 import type {
@@ -717,7 +717,7 @@ export class AgentsProvider implements FabricProvider {
         if (stalled) throw stalled;
         const roots = this.participants.sessions?.() ??
           this.participants.list({ scope: "project", kinds: ["root"] });
-        return resolveProjectAgent(roots, projectOf(context.cwd));
+        return resolveProjectAgent(roots, participantProject(context.cwd));
       }
       case "subscribe": {
         const events = Array.isArray(args.events)

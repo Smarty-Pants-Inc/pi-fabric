@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { participantRole, projectOf } from "./project-identity.js";
+import { participantProject, participantRole } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type {
@@ -643,7 +643,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       runner: "pi",
       transport: "host",
       capabilities: ["steer", "followUp", "fabric"],
-      ...(main.cwd ? { cwd: main.cwd, project: projectOf(main.cwd) } : {}),
+      ...(main.cwd ? { cwd: main.cwd, project: participantProject(main.cwd) } : {}),
       ...(role ? { role } : {}),
       ...(main.sessionId ? { sessionId: main.sessionId } : {}),
       ...(main.model ? { model: main.model } : {}),

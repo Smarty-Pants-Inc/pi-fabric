@@ -639,6 +639,103 @@ describe("ActorManager across a session reload", () => {
     expect(runs.filter((run) => run.task.includes("backlog-b"))).toHaveLength(1);
   }, 60_000);
 
+  // Hosts that share one project actor directory, each a lineage: a root and a claimed residency.
+  const lineages = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const alive = new Map<string, boolean>();
+    const host = (name: string, rootId: string, claimResidency: "session" | "durable", owns: () => boolean | undefined) => {
+      const value = new ActorManager(
+        name, { id: `${rootId}:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId, claimResidency, canManageActor: owns,
+          lineageAlive: (lineage) => alive.get(lineage) ?? true, adoptionGraceMs: 0,
+          meshCursorPath: path.join(root, `cursor-${name}.json`),        // one per host, across its restarts
+        },
+      );
+      actorManagers.push(value);
+      return value;
+    };
+    // An owner that accepts a running item and a two-item backlog, then dies.
+    const deadOwnerBacklog = async (rootId: string, residency: "session" | "durable") => {
+      alive.set(rootId, true);
+      const owner = host(`owner-${residency}`, rootId, residency, () => (alive.get(rootId) ? true : undefined));
+      const actor = await owner.create({
+        name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false, residency,
+      });
+      const from = { id: "peer", name: "peer", kind: "actor" as const };
+      await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+      await waitFor(() => owner.status(actor.id).status === "running", 10_000);
+      await mesh.publish({ topic: "team.pulls", from, text: "backlog-a" });
+      await mesh.publish({ topic: "team.pulls", from, text: "backlog-b" });
+      await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
+      await owner.close();
+      alive.set(rootId, false);
+      const file = path.join(root, "actors", actor.id, queueFiles(root, actor.id)[0]!.name);
+      return { actor, file };
+    };
+    // An adopter whose copy of the backlog fails (the file cannot be read), and which then dies.
+    const interruptedAdoption = async (file: string, rootId: string, claim: "session" | "durable", actorId: string) => {
+      const readFileSync = fs.readFileSync;
+      const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, options?: unknown) => {
+        if (target === file) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+        return (readFileSync as (target: fs.PathOrFileDescriptor, options?: unknown) => string | Buffer)(target, options);
+      }) as typeof fs.readFileSync);
+      const adopter = host(`adopter-${claim}`, rootId, claim, () => undefined);
+      await waitFor(() => adopter.status(actorId).rootId === rootId, 10_000);
+      await adopter.close();
+      alive.set(rootId, false);
+      spy.mockRestore();
+    };
+    const runs = recordRuns(agents);
+    const ranOnce = async () => {
+      const finished = (text: string) => runs.filter((run) => run.task.includes(text) && run.finishedAt !== undefined);
+      await waitFor(() => finished("backlog-a").length > 0 && finished("backlog-b").length > 0, 30_000);
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(runs.filter((run) => run.task.includes("backlog-a"))).toHaveLength(1);
+      expect(runs.filter((run) => run.task.includes("backlog-b"))).toHaveLength(1);
+    };
+    return { root, alive, host, deadOwnerBacklog, interruptedAdoption, runs, ranOnce };
+  };
+
+  // review/astra F6 on #79: a Main and its resident host share a root and the actor directory but
+  // claim different residencies. After an interrupted claim of a durable actor, the Main that
+  // loads first must leave the predecessor's file alone; the resident host then recovers it.
+  it("lets only the claiming residency of a shared root take over an interrupted adoption's backlog", async () => {
+    const h = lineages();
+    const { actor, file } = await h.deadOwnerBacklog("session:a", "durable");
+    await h.interruptedAdoption(file, "session:b", "durable", actor.id);   // resident B claims, then dies
+    h.alive.set("session:b", true);
+    h.host("main-b", "session:b", "session", () => undefined);            // Main B loads first
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(fs.existsSync(file)).toBe(true);
+    expect(h.runs.filter((run) => /backlog-[ab]/.test(run.task))).toEqual([]);
+    h.host("adopter-durable", "session:b", "durable", () => undefined);   // resident B restarts
+    await h.ranOnce();
+    await waitFor(() => !fs.existsSync(file), 10_000);
+  }, 60_000);
+
+  // review/astra F7 on #79: A's backlog, B's claim with an interrupted copy, then A adopts the actor
+  // back from dead B. A's own queue file is its committed work, never a predecessor to delete.
+  it("keeps a returning predecessor's own queue when it adopts back from an interrupted successor", async () => {
+    const h = lineages();
+    const { actor, file } = await h.deadOwnerBacklog("session:a", "session");
+    await h.interruptedAdoption(file, "session:b", "session", actor.id);   // B claims, then dies
+    h.alive.set("session:a", true);
+    const back = h.host("owner-session", "session:a", "session", () => undefined);   // A adopts back
+    await waitFor(() => back.status(actor.id).rootId === "session:a", 10_000);
+    expect(fs.existsSync(file)).toBe(true);
+    await back.close();                                                   // before the backlog runs
+    h.host("owner-session", "session:a", "session", () => undefined);    // and restarts once more
+    await h.ranOnce();
+  }, 60_000);
+
   // review/astra F3 (re-review) on #79: a host revision that changed after the last queue write
   // must not roll back on restart and make obsolete work valid again.
   it.each([

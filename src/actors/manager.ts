@@ -2413,7 +2413,7 @@ export class ActorManager {
     } catch {
       return false;                                         // best-effort; memory still runs the work
     }
-    for (const source of this.#takenOver.get(actorId) ?? []) fs.rmSync(source, { force: true });
+    for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) fs.rmSync(source, { force: true });
     this.#takenOver.delete(actorId);
     return true;
   }
@@ -2435,10 +2435,14 @@ export class ActorManager {
   // whose files hold work; this lineage takes those files over right after it adopts the actor
   // and again when it first loads it, so a crash or read error between the claim and the copy
   // only delays the copy. A taken-over file is deleted once this lineage's own file is written.
+  // Only the claiming lineage takes over: its root and its residency (a Main and its resident host
+  // share a root, review/astra F6 on #79), and never from its own file (F7).
   #takeOverPredecessors(actor: ManagedActor): void {
-    if (actor.rootId !== this.#rootId) return;
+    if (actor.rootId !== this.#rootId || (this.#claimResidency ?? actor.residency) !== actor.residency) return;
+    const own = this.#ownQueueFile(actor);
     for (const rootId of actor.adoptedFrom ?? []) {
       const file = this.#queueFile(actor.id, rootId, actor.residency);
+      if (file === own) continue;
       const saved = this.#readQueue(file);
       if (saved === undefined) continue;
       this.#takenOver.set(actor.id, new Set([...(this.#takenOver.get(actor.id) ?? []), file]));
@@ -2712,8 +2716,10 @@ export class ActorManager {
         // The claim and the queue copy cannot commit together, so the claim names the roots whose
         // files still hold work; the copy completes on adoption, or on this lineage's next load.
         const earlier = Array.isArray(current.adoptedFrom) ? current.adoptedFrom : [];
+        // Never this lineage itself: a returning predecessor keeps its own file (F7).
         actor.adoptedFrom = [...new Set([expectedRootId, ...earlier])].filter((root): root is string =>
-          typeof root === "string" && fs.existsSync(this.#queueFile(actor.id, root, actor.residency)));
+          typeof root === "string" && root !== this.#rootId &&
+          fs.existsSync(this.#queueFile(actor.id, root, actor.residency)));
         actor.rootId = this.#rootId;
         actor.adoptedAt = Date.now();
         actor.updatedAt = Date.now();

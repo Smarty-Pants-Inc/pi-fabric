@@ -919,15 +919,17 @@ export class MeshStore {
     });
   }
 
-  /** Changes whenever the shared state file does: a cheap test before reading it again. */
+  /**
+   * Changes whenever the shared state file does, from its metadata alone: a poll can test it
+   * without reading or parsing the file (review/astra F1 on #84).
+   */
   stateStamp(): string | undefined {
     try {
-      this.#readCachedState();
+      const stat = fs.statSync(this.#statePath);
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
     } catch {
       return undefined;
     }
-    const cached = this.#stateCache;
-    return cached ? `${cached.device}:${cached.inode}:${cached.size}:${cached.modifiedAt}` : undefined;
   }
 
   #readCachedState(fresh = false): MeshStateFile {

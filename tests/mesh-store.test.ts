@@ -428,6 +428,34 @@ describe("MeshStore", () => {
   });
 });
 
+// smarty-dev#1043 (review/astra F1 on #84): the dashboard polls this stamp twice a second, so it
+// must see another process's write from the file's metadata alone, without reading the state.
+describe("MeshStore.stateStamp", () => {
+  it("changes after another store writes the state, without reading or parsing it", async () => {
+    const reader = createStore({ readCacheMs: 60_000 });
+    const writer = new MeshStore(reader.root, 64 * 1024, 100);
+    expect(reader.stateStamp()).toBeUndefined();                        // no state file yet
+    await writer.put({ key: "a", value: 1, identity });
+    expect(reader.get("a")?.value).toBe(1);                              // the reader's cache is warm
+    const before = reader.stateStamp();
+    expect(before).toBeDefined();
+    await writer.put({ key: "a", value: "a much longer value", identity });
+    const read = vi.spyOn(fs, "readFileSync");
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      const after = reader.stateStamp();
+      expect(after).toBeDefined();
+      expect(after).not.toBe(before);
+      expect(read).not.toHaveBeenCalled();
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      read.mockRestore();
+      parse.mockRestore();
+    }
+    expect(reader.stateStamp()).toBe(reader.stateStamp());              // stable while unchanged
+  });
+});
+
 describe("MeshStore.writeBatch", () => {
   it("applies puts and deletes in one write, with per-operation compare-and-swap", async () => {
     const store = createStore();

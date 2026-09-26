@@ -2686,14 +2686,11 @@ export class ActorManager {
     // host adopts "durable" actors.
     if (actor.residency !== this.#claimResidency) return;
     // smarty-dev#878: the project registry is fleet-wide, so any Main or resident host could adopt
-    // an orphan, and its work then went to an unrelated project. Only a host of the actor's project
-    // adopts it now: for a session actor its project agent, for a durable actor a resident host of
-    // that project, whose deliveries follow the project's agent. A record from before projects
-    // were recorded keeps the old rule.
-    if (
-      actor.project !== undefined &&
-      (this.#project !== actor.project || (this.#claimResidency === "session" && this.#role !== "project-agent"))
-    ) return;
+    // an orphan, and its work then went to an unrelated session. Only the project agent of the
+    // actor's project adopts it now, through its Main (session actors) or its resident host
+    // (durable actors), never a worktree agent's host of that project (review/astra F2 on #80).
+    // A record from before projects were recorded keeps the old rule.
+    if (actor.project !== undefined && (this.#project !== actor.project || this.#role !== "project-agent")) return;
     // Only when the directory has no live opinion about the actor itself.
     if (this.#canManageActor(actor.id) !== undefined) return;
     // Only when the lineage root itself is provably dead. This refuses

@@ -291,8 +291,10 @@ class ResidentHost {
         lineageAlive,
         claimResidency: "durable",
         rootId: config.rootId,
-        // Recorded on every actor it creates, and the only project whose orphans it adopts.
+        // Recorded on every actor it creates, and the only project whose orphans it adopts, and
+        // then only as a project agent's host.
         project: projectOf(config.cwd),
+        role: typeof config.role === "string" ? config.role : undefined,
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: config.retention,
         resolvePiModel: resolveResidentPiModel,

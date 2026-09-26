@@ -762,6 +762,7 @@ export class FabricRuntimeState {
             sessionId,
             cwd: context.cwd,
             projectRoot,
+            ...(participantRole() ? { role: participantRole()! } : {}),
             meshRoot,
             actorRoot: actorRoots.project,
             sessionActorRoot: actorRoots.session,

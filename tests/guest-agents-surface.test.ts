@@ -103,6 +103,19 @@ describe("guest agents surface", () => {
     }
   });
 
+  // review/astra F2 on #73: role and project are part of the guest contract, not only the host's.
+  it("types role and project on peers, sessions and the project agent", () => {
+    const read = typeCheckFabricCode(
+      `const lead: Pick<Awaited<ReturnType<typeof agents.projectAgent>>, "id" | "role" | "project"> = await agents.projectAgent();
+       const peers: Array<Pick<FabricPeerInfo, "id" | "role" | "project">> = await agents.peers();
+       const sessions = await agents.sessions();
+       const roles: Array<string | undefined> = sessions.map((session) => session.role);
+       return { lead, peers, roles, project: sessions[0]?.project };`,
+      GUEST_TYPE_DECLARATIONS,
+    );
+    expect(read.errors).toEqual([]);
+  });
+
   it("keeps the Python kernel's dynamic agents proxy in place", () => {
     expect(CPYTHON_CHILD_SOURCE).toContain('"agents"');
   });

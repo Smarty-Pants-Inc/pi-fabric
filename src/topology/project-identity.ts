@@ -12,6 +12,16 @@ export const participantRole = (env: NodeJS.ProcessEnv = process.env): string | 
 
 const projects = new Map<string, string>();
 
+// One spelling per directory: Windows reports a temp or home path in 8.3 short form (RUNNER~1)
+// from the cwd, but git records the long form in a worktree's gitdir.
+const canonical = (dir: string): string => {
+  try {
+    return fs.realpathSync.native(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+};
+
 /**
  * The project a directory belongs to: the checkout that owns its git common directory, so every
  * linked worktree of one repository maps to the same main checkout. Outside git, the directory.
@@ -51,6 +61,7 @@ export const projectOf = (cwd: string): string => {
     }
     if (path.dirname(dir) === dir) break;
   }
+  project = canonical(project);
   projects.set(cwd, project);
   return project;
 };
@@ -71,11 +82,11 @@ interface ProjectRoot {
 export const resolveProjectAgent = <T extends ProjectRoot>(roots: readonly T[], project: string): T => {
   const tagged = roots.filter((root) => root.role === "project-agent" && root.project === project);
   const untagged = roots.filter((root) =>
-    root.role === undefined && root.project === undefined && root.cwd !== undefined && path.resolve(root.cwd) === project);
+    root.role === undefined && root.project === undefined && root.cwd !== undefined && canonical(root.cwd) === project);
   const candidates = tagged.length > 0 ? tagged : untagged;
   if (candidates.length === 0) {
     const inProject = roots
-      .filter((root) => (root.project ?? (root.cwd ? path.resolve(root.cwd) : undefined)) === project)
+      .filter((root) => (root.project ?? (root.cwd ? canonical(root.cwd) : undefined)) === project)
       .map((root) => `${root.id} (${root.role ?? "no role"})`);
     throw new Error(
       `No live project agent for ${project}. ` +

@@ -414,13 +414,17 @@ export class MeshStore {
     from: MeshIdentity;
     to?: string;
     text?: string;
+    /** A function receives the commit time, under the lock (smarty-dev#816). */
     data?: unknown;
   }): Promise<MeshEvent> {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
-    const eventData = input.data === undefined ? undefined : jsonClone(input.data);
+    const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
+    const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
     return this.#withLock(() => {
       this.#repairEventLog();
+      const createdAt = Date.now();
+      const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
       const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
       const event: MeshEvent = {
         id: randomUUID(),
@@ -431,7 +435,7 @@ export class MeshStore {
         ...(input.to ? { to: input.to } : {}),
         ...(input.text !== undefined ? { text: input.text } : {}),
         ...(eventData !== undefined ? { data: eventData } : {}),
-        createdAt: Date.now(),
+        createdAt,
       };
       const line = JSON.stringify(event);
       if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {

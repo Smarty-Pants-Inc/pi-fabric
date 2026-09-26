@@ -58,9 +58,28 @@ describe("resolveSessionExportDir", () => {
 
   it("defaults to pi's agent dir so trackers pick subagent usage up unconfigured", () => {
     delete process.env[SESSION_EXPORT_ENV];
-    expect(resolveSessionExportDir(config(true))).toBe(
-      path.join(os.homedir(), ".pi", "agent"),
-    );
+    const profile = process.env.PI_CODING_AGENT_DIR;
+    delete process.env.PI_CODING_AGENT_DIR;
+    try {
+      expect(resolveSessionExportDir(config(true))).toBe(
+        path.join(os.homedir(), ".pi", "agent"),
+      );
+    } finally {
+      if (profile !== undefined) process.env.PI_CODING_AGENT_DIR = profile;
+    }
+  });
+
+  // smarty-dev#847: a fleet profile's run exports landed in the default profile.
+  it("follows the parent's profile (PI_CODING_AGENT_DIR) when one is set", () => {
+    delete process.env[SESSION_EXPORT_ENV];
+    const profile = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = "/tmp/fleet-profile";
+    try {
+      expect(resolveSessionExportDir(config(true))).toBe("/tmp/fleet-profile");
+    } finally {
+      if (profile === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = profile;
+    }
   });
 
   it("prefers the env override over the configured directory", () => {

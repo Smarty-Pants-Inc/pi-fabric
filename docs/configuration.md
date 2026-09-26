@@ -458,15 +458,17 @@ Other agent settings:
 - `maxTokensPerChild`: cumulative token bound per child (0 disables).
 - `notifyOnComplete`: show concise detached `agents.spawn()` completion notices and batch unread results for Main at a safe tool-turn boundary (or wake idle Main). `wait`/`join` and terminal `status` retract pending notifications; running/UI status does not. Escape/error parks results until new input.
 - `sessionExport`: export each agent run's usage as an attributed pi-format session file (on by default).
-- `sessionExportDir`: override the export store root (default `~/.pi-fabric/agent`, with `PI_FABRIC_AGENT_DIR` taking precedence).
+- `sessionExportDir`: override the export store root. The default is pi's agent dir: `PI_CODING_AGENT_DIR` when set, else `~/.pi/agent`. `PI_FABRIC_AGENT_DIR` takes precedence over both.
 
 ### Usage tracking with external tools
 
 Fabric children run with `--no-session`, so token trackers that scrape session files (tokscale, ccusage, …) cannot see subagent token usage or cost. With `sessionExport` enabled (the default), every child writes one usage-only session file (tokens and cost, never transcript content) to:
 
 ```text
-~/.pi/agent/sessions/.fabric/<encoded-cwd>/<run>.jsonl
+<pi agent dir>/sessions/.fabric/<encoded-cwd>/<run>.jsonl
 ```
+
+`<pi agent dir>` is the parent's profile: `PI_CODING_AGENT_DIR` when set, else `~/.pi/agent`. These files record usage only. They are not the child's Pi session: the child runs on the parent's profile and settings.
 
 Fabric attributes each file through a `session_info` marker (`fabricagent-<name>`). This placement works because tokscale and ccusage walk pi's session store recursively, and pi's own resume picker reads only its immediate `<encoded-cwd>` directory. **Both trackers count Fabric subagents with zero configuration, and pi's session UI never lists these files**. The exported sessions behave like a co-hosted namespace inside pi's store.
 

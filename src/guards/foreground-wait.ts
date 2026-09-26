@@ -236,11 +236,8 @@ class WaitEstimator {
     this.#index += 1;
     const header = this.#word() ?? "";
     let count = 1;
-    const cStyle = /^\(\(\s*\w+\s*=\s*(-?\d+)\s*;\s*\w+\s*(<=?|>=?)\s*(-?\d+)\s*;/.exec(header);
-    if (cStyle) {
-      const [, from, comparison, to] = cStyle;
-      const span = Math.abs(Number(to) - Number(from)) + (comparison!.endsWith("=") ? 1 : 0);
-      count = Math.max(0, span);
+    if (header.startsWith("((")) {
+      count = cStyleIterations(header);
       this.#index += 1;
     } else {
       this.#index += 1;                                        // the loop variable
@@ -248,7 +245,7 @@ class WaitEstimator {
         this.#index += 1;
         const items: string[] = [];
         while (this.#word() !== undefined) items.push(this.#word()!), this.#index += 1;
-        count = items.reduce((sum, item) => sum + loopItems(item), 0) || 1;
+        count = items.reduce((sum, item) => sum + loopItems(item), 0);
       }
     }
     this.#expect("do");
@@ -274,7 +271,8 @@ class WaitEstimator {
       while (at < args.length && args[at]!.word.startsWith("-")) at += /^-(k|s)$|^--(kill-after|signal)$/.test(args[at]!.word) ? 2 : 1;
       const limit = duration(args[at]?.word ?? "");
       const inner = this.#simple(args.slice(at + 1));
-      return limit === undefined ? inner : Math.min(limit, inner);
+      // `timeout 0` disables the deadline.
+      return limit === undefined || limit === 0 ? inner : Math.min(limit, inner);
     }
     if (WRAPPERS.has(name)) return this.#simple(args);
     if (name === "env" || name === "nice" || name === "ionice" || name === "stdbuf") {
@@ -293,18 +291,60 @@ class WaitEstimator {
   }
 }
 
+// Iterations from `first` stepping by `step` while within `last` (inclusive); 0 for an empty
+// range, Infinity for a step that never reaches it.
+const steps = (first: number, step: number, last: number): number => {
+  if (step === 0) return first === last ? Number.POSITIVE_INFINITY : 0;
+  if ((step > 0 && first > last) || (step < 0 && first < last)) return 0;
+  return Math.floor((last - first) / step) + 1;
+};
+
 // How many items a `for … in` word yields: seq and brace ranges are counted, other words once.
 const loopItems = (item: string): number => {
   const seq = /^\$\(\s*seq\s+(-?\d+)(?:\s+(-?\d+))?(?:\s+(-?\d+))?\s*\)$/.exec(item);
   if (seq) {
     const [, a, b, c] = seq;
-    if (c !== undefined) return Math.max(0, Math.floor((Number(c) - Number(a)) / Math.max(1, Math.abs(Number(b)))) + 1);
-    if (b !== undefined) return Math.max(0, Number(b) - Number(a) + 1);
-    return Math.max(0, Number(a));
+    if (c !== undefined) return steps(Number(a), Number(b), Number(c));      // seq FIRST INCREMENT LAST
+    if (b !== undefined) return steps(Number(a), 1, Number(b));              // seq FIRST LAST
+    return steps(1, 1, Number(a));                                           // seq LAST
   }
-  const range = /^\{(-?\d+)\.\.(-?\d+)\}$/.exec(item);
-  if (range) return Math.abs(Number(range[2]) - Number(range[1])) + 1;
+  const range = /^\{(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?\}$/.exec(item);
+  if (range) {
+    const [, a, b, s] = range;
+    const step = Math.abs(Number(s ?? 1)) || 1;
+    return steps(Number(a), Number(b) >= Number(a) ? step : -step, Number(b));
+  }
   return 1;
+};
+
+// A C-style header `((v=A; v OP B; STEP))`: its iterations, Infinity when it never ends, and 1
+// when a part is not a literal.
+const cStyleIterations = (header: string): number => {
+  const parts = header.replace(/^\(\(|\)\)$/g, "").split(";").map((part) => part.trim());
+  if (parts.length !== 3) return 1;
+  const [init, condition, update] = parts as [string, string, string];
+  if (condition === "") return Number.POSITIVE_INFINITY;
+  const start = /^(\w+)\s*=\s*(-?\d+)$/.exec(init);
+  const test = /^(\w+)\s*(<=|<|>=|>)\s*(-?\d+)$/.exec(condition);
+  if (!start || !test || test[1] !== start[1]) return 1;
+  const name = start[1]!;
+  const step = new RegExp(`^(?:${name}\\+\\+|\\+\\+${name})$`).test(update) ? 1
+    : new RegExp(`^(?:${name}--|--${name})$`).test(update) ? -1
+    : (() => {
+      const compound = new RegExp(`^${name}\\s*([+-])=\\s*(\\d+)$`).exec(update)
+        ?? new RegExp(`^${name}\\s*=\\s*${name}\\s*([+-])\\s*(\\d+)$`).exec(update);
+      return compound ? (compound[1] === "-" ? -1 : 1) * Number(compound[2]) : undefined;
+    })();
+  if (step === undefined) return 1;
+  const first = Number(start[2]);
+  const bound = Number(test[3]);
+  const operator = test[2]!;
+  const last = operator === "<" ? bound - 1 : operator === ">" ? bound + 1 : bound;
+  const rising = operator.startsWith("<");
+  if ((rising && step <= 0) || (!rising && step >= 0)) {
+    return (rising ? first <= last : first >= last) ? Number.POSITIVE_INFINITY : 0;
+  }
+  return steps(first, step, last);
 };
 
 /**

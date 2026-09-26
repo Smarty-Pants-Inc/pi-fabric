@@ -17,6 +17,11 @@ describe("foreground wait guard", () => {
     ["a background job that is then waited for", "sleep 900 & wait", 900],
     // review/astra F2 on #71: counts apply to their own loop body; nested loops multiply.
     ["a genuinely nested loop", "for i in {1..3}; do for j in {1..3}; do sleep 40; done; done", 360],
+    // review/astra F4/F5 on #71: stepped and falling ranges, and timeout 0 (no deadline).
+    ["a falling seq loop", "for remaining in $(seq 14 -1 1); do sleep 300; done", 4_200],
+    ["a stepped seq loop", "for i in $(seq 0 60 600); do sleep 60; done", 660],
+    ["a C-style loop that counts down", "for ((n=20; n>0; n--)); do sleep 30; done", 600],
+    ["a long sleep under timeout 0", "timeout 0 sleep 900", 900],
   ])("refuses %s", (_name, command, seconds) => {
     expect(foregroundWaitSeconds(command)).toBe(seconds);
     expect(foregroundWaitRefusal(command)).toMatch(/Fabric refused this command: its foreground wait is about \d/);
@@ -29,6 +34,8 @@ describe("foreground wait guard", () => {
     expect(foregroundWaitSeconds("timeout 120 bash -c 'while ! test -f done; do sleep 5; done'")).toBe(120);
     expect(foregroundWaitRefusal("timeout 120 bash -c 'while ! test -f done; do sleep 5; done'")).toBeUndefined();
     expect(foregroundWaitRefusal("while ! test -f done; do sleep 5; done", 120)).toBeUndefined();   // the tool's timeout
+    expect(foregroundWaitRefusal("timeout 0 bash -c 'while true; do sleep 60; done'")).toMatch(/an unbounded wait/);
+    expect(foregroundWaitRefusal("for ((;;)); do sleep 1; done")).toMatch(/an unbounded wait/);
   });
 
   it.each([
@@ -45,6 +52,10 @@ describe("foreground wait guard", () => {
     ["sleep as text in a heredoc", "body=$(cat <<'EOF'\nthe agent ran sleep 900 in a loop\nEOF\n); gh api x -f body=\"$body\"", 0],
     ["sleep as text in a quoted argument", "git commit -m \"fix: no more sleep 900 loops\"", 0],
     ["an if with a short branch", "if test -f x; then sleep 60; else sleep 30; fi", 60],
+    ["a C-style loop with a step", "for ((elapsed=0; elapsed<240; elapsed+=30)); do sleep 30; done", 240],
+    ["an empty seq range", "for i in $(seq 5 1); do sleep 900; done", 0],
+    ["a stepped brace range", "for i in {0..100..25}; do sleep 60; done", 300],
+    ["a C-style loop with v=v+S", "for ((i=1; i<=4; i=i+1)); do sleep 60; done", 240],
   ])("allows %s", (_name, command, seconds) => {
     expect(foregroundWaitSeconds(command)).toBe(seconds);
     expect(foregroundWaitRefusal(command)).toBeUndefined();

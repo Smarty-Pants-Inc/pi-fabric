@@ -278,7 +278,6 @@ export class FabricControlPlane {
       Math.min(MAX_CONTROL_TIMEOUT_MS, Math.floor(options.timeoutMs ?? this.#ackTimeoutMs)),
     );
     const commandId = randomUUID();
-    const requestedAt = Date.now();
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
     let pendingRequest: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
@@ -325,7 +324,9 @@ export class FabricControlPlane {
         kind: operation,
         from: this.identity,
         to: ownerHostId,
-        data: {
+        // Stamped at commit (smarty-dev#816): the owner gets the whole timeout, not what is
+        // left after this sender waited for the mesh lock (2-3 s under load).
+        data: (committedAt: number): FabricControlCommand => ({
           version: 1,
           commandId,
           targetId,
@@ -335,9 +336,9 @@ export class FabricControlPlane {
           ...(input.data !== undefined ? { data: input.data } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
           ...(input.binding !== undefined ? { binding: input.binding } : {}),
-          requestedAt,
-          deadlineAt: requestedAt + timeoutMs,
-        } satisfies FabricControlCommand,
+          requestedAt: committedAt,
+          deadlineAt: committedAt + timeoutMs,
+        }),
       });
       pendingRequest!.commandPublished = true;
       if (pendingRequest!.cancellationRequested) {

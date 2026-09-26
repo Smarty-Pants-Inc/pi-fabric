@@ -47,6 +47,31 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  // smarty-dev#816: the deadline was stamped before the sender waited for the mesh lock (2-3 s
+  // under load), so the owner got only what was left of the 5 s, or nothing.
+  it("stamps a command's deadline when its publish commits, after the sender's lock wait", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const sender = plane(meshRoot, "host:sender");
+    const receiver = plane(meshRoot, "host:receiver");
+    const receive = vi.fn(() => ({ accepted: true, messageId: "delivered" }));
+    sender.start(() => ({ accepted: false }));
+    receiver.start(receive);
+    const original = MeshStore.prototype.publish;
+    vi.spyOn(MeshStore.prototype, "publish").mockImplementation(async function (this: MeshStore, input) {
+      if (input.topic === "fabric.control.command" && input.kind === "steer") {
+        await new Promise((resolve) => setTimeout(resolve, 1_200));    // a lock wait past the 1 s timeout
+      }
+      return original.call(this, input);
+    });
+    const result = await sender.request("host:receiver", "agent:target", "steer", { message: "late" });
+    expect(result.messageId).toBe("delivered");
+    expect(receive).toHaveBeenCalledTimes(1);
+    const event = new MeshStore(meshRoot, 64 * 1024, 1_000).read({ topic: "fabric.control.command", limit: 10 }).at(-1)!;
+    expect((event.data as { requestedAt: number }).requestedAt).toBe(event.createdAt);
+  });
+
   // smarty-dev#424: a lock timeout while the owner claimed, recorded or acknowledged a command
   // dropped it without an acknowledgement or a retry (dev-lead: 30 of 61 commands in 6 h).
   describe("after a lock timeout", () => {

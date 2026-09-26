@@ -107,7 +107,7 @@ Fabric separates **identity** from **execution ownership**. Each root, one-shot 
 
 Cross-process control targets one resolved owner. The sender addresses a versioned command to that owner and accepts a reply only when its target and wire identity match. Before execution, the owner checks the target against its local managers. Unknown, stale, rejected, spoofed, replayed, and expired commands fail closed.
 
-The owner claims each command ID in reserved state before execution and stores the result before replying. Claims remain while the command is present in the bounded retained event log. A restart can return the stored result without running the command again. A crash after the claim but before the result returns an explicit indeterminate rejection.
+The owner claims each command ID in reserved state before execution and stores the result before replying. The owner's own claims remain while the command is present in the bounded retained event log. The compatibility claim in the shared state goes 10 minutes after it expires when the command carried its own deadline, because every owner rejects an expired command at admission. A restart can return the stored result without running the command again. A crash after the claim but before the result returns an explicit indeterminate rejection.
 
 Long actor asks run outside the control poll loop, so they do not block stop or cancellation commands. The request deadline aborts work on the owner. Caller cancellation sends an authenticated cancel command to the same owner. Actor replies share one mesh byte budget across text and structured data; an unexpected oversized result becomes an explicit rejection and never becomes a silent timeout.
 

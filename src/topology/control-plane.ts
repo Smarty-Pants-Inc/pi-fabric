@@ -17,6 +17,8 @@ const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
 // Records other hosts left in the shared state before smarty-dev#643 are checked this often.
 const LEGACY_SEEN_CLEANUP_MS = 15 * 60 * 1_000;
+// A shared claim for a command with an explicit deadline is deleted this long after it expires.
+const SHARED_SEEN_GRACE_MS = 10 * 60 * 1_000;
 
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
 
@@ -97,6 +99,8 @@ interface FabricControlSeenRecord {
   commandId: string;
   targetId: string;
   expiresAt: number;
+  /** The command carried its own deadlineAt, so every receiver computes the same deadline. */
+  explicitDeadline?: boolean;
   /** The command event's sequence, or an upper bound for a record moved from the shared state. */
   sequence?: number;
   acceptance?: FabricControlAcceptance;
@@ -505,6 +509,7 @@ export class FabricControlPlane {
           commandId: command.commandId,
           targetId: command.targetId,
           expiresAt: deadlineAt + this.#ackTimeoutMs,
+          ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
         ifVersion: 0,
@@ -673,36 +678,45 @@ export class FabricControlPlane {
     }
   }
 
-  // Records left in the shared state by runtimes before smarty-dev#643, any host's: delete one
-  // once it has expired and its command is no longer in the retained log.
+  // Shared-state records, any host's (smarty-dev#643, #816). A shared claim only fences a runtime
+  // before phase 1 of the same host, and every runtime rejects a command past its deadline at
+  // admission, so a claim for a command with its own deadline goes once it expired plus a grace:
+  // no clock is trusted beyond the one admission already trusts. Waiting for the command to leave
+  // the event log (compacted only at 64 MiB) kept 2,858 expired claims, 46% of the shared state,
+  // and saturated the mesh lock. Records without that flag (older writers, where a receiver with
+  // another acknowledgement timeout could compute a later deadline) keep the log rule.
   async #cleanupLegacySeen(now: number): Promise<void> {
-    const candidates = this.mesh.listAll(CONTROL_SEEN_PREFIX).flatMap((entry) => {
+    const expired = this.mesh.listAll(CONTROL_SEEN_PREFIX).flatMap((entry) => {
       const record = controlSeenRecord(entry.value);
       return !record || record.expiresAt < now ? [{ entry, record }] : [];
     });
-    if (candidates.length === 0) return;
+    if (expired.length === 0) return;
+    const dead = expired.filter(({ record }) =>
+      record?.explicitDeadline === true && record.expiresAt + SHARED_SEEN_GRACE_MS < now);
+    const unflagged = expired.filter(({ record }) => record?.explicitDeadline !== true);
 
-    const sought = new Set(
-      candidates.flatMap(({ record }) => record ? [record.commandId] : []),
-    );
-    const retained = new Set<string>();
-    let offset = 0;
-    while (sought.size > retained.size) {
-      const page = this.mesh.tail(offset, this.mesh.maxReadEvents);
-      for (const event of page.events) {
-        if (event.topic !== CONTROL_TOPIC || !isObject(event.data)) continue;
-        const commandId = event.data.commandId;
-        if (typeof commandId === "string" && sought.has(commandId)) retained.add(commandId);
+    if (unflagged.length > 0) {
+      const sought = new Set(unflagged.flatMap(({ record }) => record ? [record.commandId] : []));
+      const retained = new Set<string>();
+      let offset = 0;
+      while (sought.size > retained.size) {
+        const page = this.mesh.tail(offset, this.mesh.maxReadEvents);
+        for (const event of page.events) {
+          if (event.topic !== CONTROL_TOPIC || !isObject(event.data)) continue;
+          const commandId = event.data.commandId;
+          if (typeof commandId === "string" && sought.has(commandId)) retained.add(commandId);
+        }
+        if (page.events.length < this.mesh.maxReadEvents || page.nextOffset === offset) break;
+        offset = page.nextOffset;
       }
-      if (page.events.length < this.mesh.maxReadEvents || page.nextOffset === offset) break;
-      offset = page.nextOffset;
+      dead.push(...unflagged.filter(({ record }) => !record || !retained.has(record.commandId)));
     }
-
-    await Promise.allSettled(
-      candidates
-        .filter(({ record }) => !record || !retained.has(record.commandId))
-        .map(({ entry }) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })),
-    );
+    if (dead.length === 0) return;
+    // One write for the whole sweep, each delete fenced to the version it saw.
+    await this.mesh.writeBatch({
+      identity: this.identity,
+      ops: dead.map(({ entry }) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+    });
   }
 
   async #publishAcknowledgement(

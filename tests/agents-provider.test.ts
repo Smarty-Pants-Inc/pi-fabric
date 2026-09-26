@@ -2092,6 +2092,15 @@ describe("AgentsProvider global actors", () => {
     await provider.invoke("remove", { id: template.id, scope: "global" }, context);
     expect(globalActors.list()).toEqual([]);
   });
+
+  // smarty-dev#918: remove({ id }) on a template answered only "Unknown Fabric actor".
+  it("points an unscoped remove of a global template to the global scope", async () => {
+    const { provider, globalActors } = setup();
+    const template = (await provider.invoke("create", { ...createRequest, scope: "global" }, context)) as { id: string };
+    await expect(provider.invoke("remove", { id: template.id }, context))
+      .rejects.toThrow(/is a global template: remove it with agents\.remove\(\{ id, scope: "global" \}\)/);
+    expect(globalActors.list()).toHaveLength(1);                        // nothing removed
+  });
 });
 
 describe("AgentsProvider steering", () => {

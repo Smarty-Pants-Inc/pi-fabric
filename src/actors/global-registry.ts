@@ -94,27 +94,32 @@ const resolveDefinition = (
  * any project or mesh, so the same templates are available across every
  * project. Operations are pure file I/O and do not require the mesh to be
  * enabled; only importing (which creates a live actor via ActorManager) does.
- * The registry is read into memory once at construction; run `/fabric reload`
- * to pick up templates added by other Pi sessions. Writes are atomic (write
- * to a temp file then rename) so concurrent sessions cannot corrupt the
- * store, though truly simultaneous edits are last-write-wins.
+ * Every read reloads the file when another session changed it, and every write
+ * re-reads the file and applies only its own change (smarty-dev#918: a write
+ * from a session's startup-time copy erased templates other sessions had added
+ * since, and brought back removed ones). Writes are atomic (write to a temp
+ * file then rename) so concurrent sessions cannot corrupt the store, though
+ * truly simultaneous edits are last-write-wins.
  */
 export class GlobalActorRegistry {
   readonly #actors = new Map<string, GlobalActorDefinition>();
   readonly #path: string;
   readonly #maxBytes: number;
+  #fingerprint: string | undefined;
 
   constructor(agentDir: string, maxInstructionsBytes: number) {
     this.#path = path.join(agentDir, "fabric", "actors", "global-actors.json");
     this.#maxBytes = maxInstructionsBytes;
-    this.#load();
+    this.#refresh();
   }
 
   list(): GlobalActorDefinition[] {
+    this.#refresh();
     return [...this.#actors.values()].map(clone);
   }
 
   resolve(idOrName: string): GlobalActorDefinition | undefined {
+    this.#refresh();
     const found = resolveDefinition(this.#actors, idOrName);
     return found ? clone(found) : undefined;
   }
@@ -126,6 +131,7 @@ export class GlobalActorRegistry {
    * definition.
    */
   create(def: FabricActorRequest, overwrite = false): GlobalActorDefinition {
+    this.#refresh(true);
     const validated = this.#validate(def);
     const existing = [...this.#actors.values()].find((actor) => actor.name === validated.name);
     if (existing) {
@@ -160,6 +166,7 @@ export class GlobalActorRegistry {
    * changed field.
    */
   update(idOrName: string, patch: Omit<Partial<FabricActorRequest>, "coalesceKey"> & { coalesceKey?: string | null }): GlobalActorDefinition {
+    this.#refresh(true);
     const existing = resolveDefinition(this.#actors, idOrName);
     if (!existing) throw new Error(`Unknown global actor: ${idOrName}`);
     const merged: FabricActorRequest = {
@@ -227,6 +234,7 @@ export class GlobalActorRegistry {
   }
 
   remove(idOrName: string): { removed: boolean } {
+    this.#refresh(true);
     const existing = resolveDefinition(this.#actors, idOrName);
     if (!existing) return { removed: false };
     this.#actors.delete(existing.id);
@@ -347,17 +355,52 @@ export class GlobalActorRegistry {
     };
   }
 
-  #load(): void {
+  #stat(): string | undefined {
+    try {
+      const stat = fs.statSync(this.#path);
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Reload when the file is not the one this registry last read. A read that fails keeps the
+  // previous snapshot and is not marked current, so the next call tries again; a write whose
+  // reload fails throws instead of saving a copy that could erase other sessions' templates.
+  #refresh(forWrite = false): void {
+    const fingerprint = this.#stat();
+    if (fingerprint !== undefined && fingerprint === this.#fingerprint) return;
+    let loaded: Map<string, GlobalActorDefinition>;
+    try {
+      loaded = this.#load();
+    } catch (error) {
+      this.#fingerprint = undefined;
+      if (forWrite) {
+        throw new Error(`The global actor registry could not be read, so it was not changed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    this.#actors.clear();
+    for (const [id, def] of loaded) this.#actors.set(id, def);
+    this.#fingerprint = fingerprint;
+  }
+
+  // The registry file's templates. A missing file is an empty registry; an unreadable or
+  // malformed one throws (smarty-dev#918: treating it as empty let a later write erase it).
+  #load(): Map<string, GlobalActorDefinition> {
+    const actors = new Map<string, GlobalActorDefinition>();
     let parsed: unknown;
     try {
       parsed = JSON.parse(fs.readFileSync(this.#path, "utf8"));
     } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
-      return;
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return actors;
+      throw error;
     }
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("the global actor registry is not a JSON object");
+    }
     const records = (parsed as { actors?: unknown }).actors;
-    if (!Array.isArray(records)) return;
+    if (!Array.isArray(records)) throw new Error("the global actor registry has no actors list");
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
       const record = value as Partial<GlobalActorDefinition>;
@@ -442,12 +485,17 @@ export class GlobalActorRegistry {
         ...(record.coalesceKey !== undefined ? { coalesceKey: record.coalesceKey } : {}),
         ...(validWhile ? { validWhile } : {}),
       };
-      this.#actors.set(def.id, def);
+      actors.set(def.id, def);
     }
+    return actors;
   }
 
   #save(): void {
     const file: RegistryFile = { format: 1, actors: [...this.#actors.values()] };
     atomicWrite(this.#path, file);
+    // Not stat'ed here: another session may already have replaced the file, and binding its
+    // identity to this copy would hide that change (review/astra F1 on #77). The next call
+    // rereads the file.
+    this.#fingerprint = undefined;
   }
 }

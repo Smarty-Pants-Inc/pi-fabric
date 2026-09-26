@@ -236,6 +236,10 @@ export interface FabricActorInfo {
   id: string;
   scope: FabricActorStorageScope;
   name: string;
+  /** sha256 (hex) of the actor's default instructions, as setInstructions stored them. */
+  instructionsDigest?: string;
+  /** Length of those instructions, in UTF-16 code units (JavaScript string length). */
+  instructionsLength?: number;
   rootId?: string;
   status: FabricActorStatus;
   runner: FabricAgentRunner;

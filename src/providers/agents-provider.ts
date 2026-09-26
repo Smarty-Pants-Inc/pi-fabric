@@ -1076,7 +1076,17 @@ export class AgentsProvider implements FabricProvider {
         return this.actorManager.clearMessages(String(args.id));
       case "remove": {
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
-        const { actor, participant } = this.#resolveActorTarget(String(args.id));
+        let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
+        try {
+          target = this.#resolveActorTarget(String(args.id));
+        } catch (error) {
+          // A template is not a live actor (smarty-dev#918): say how to remove it.
+          const template = this.globalActors.resolve(String(args.id));
+          if (!template) throw error;
+          throw new Error(`${error instanceof Error ? error.message : String(error)}. ` +
+            `${template.name} (${template.id}) is a global template: remove it with agents.remove({ id, scope: "global" })`);
+        }
+        const { actor, participant } = target;
         if (actor && this.actorManager.owns(actor.id)) return this.actorManager.remove(actor.id);
         const residency = actor?.residency ?? participant?.residency;
         if (residency !== "durable") throw new Error("Only the owning host can remove this actor");

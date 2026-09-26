@@ -738,7 +738,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "export",
     description:
-      "Export a live project actor's definition to the global registry as a project-independent template, without any history (no messages, session, or run logs). Throws on a name collision unless overwrite is true.",
+      "Write a live project actor's definition to the global registry as a project-independent template, without any history (no messages, session, or run logs). This is a write, not a read: remove the template with agents.remove({ id, scope: \"global\" }). Read a live actor's instructions digest with agents.actorStatus. Throws on a name collision unless overwrite is true.",
     inputSchema: {
       type: "object",
       properties: {

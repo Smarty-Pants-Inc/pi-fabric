@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -148,6 +149,17 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     // Before: each delivery re-decided all 8 actors 4 times (enqueue, drain, record twice).
     expect(decisions.mock.calls.length).toBeGreaterThan(0);
     expect(decisions.mock.calls.length).toBeLessThan(1_200);
+  });
+
+  // smarty-dev#918: callers verify setInstructions by digest, without reading the registry file.
+  it("reports the instructions digest and length, and updates them on setInstructions", async () => {
+    const { actors } = setup();
+    const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+    const actor = await actors.create({ name: "digest", instructions: "First.", topics: ["team.pulls"], responseMode: "text" });
+    expect(actors.status(actor.id)).toMatchObject({ instructionsDigest: sha("First."), instructionsLength: 6 });
+    await actors.setInstructions(actor.id, "Second text.");
+    expect(actors.list().find((info) => info.id === actor.id)).toMatchObject({ instructionsDigest: sha("Second text."), instructionsLength: 12 });
+    expect(actors.status(actor.id)).not.toHaveProperty("instructions");
   });
 
   it("publishes a new actor's presence once a stalled lock frees", async () => {

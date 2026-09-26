@@ -416,23 +416,25 @@ describe("FabricControlPlane", () => {
       const meshRoot = path.join(root, "mesh");
       const storeOptions: MeshStoreOptions = { maxEventLogBytes: 80_000, retainedEventLogBytes: 40_000 };
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000, storeOptions);
-      const sender = plane(meshRoot, "host:sender", storeOptions, { acknowledgementTimeoutMs: 200 });
-      const receiver = plane(meshRoot, "host:receiver", storeOptions, { acknowledgementTimeoutMs: 200 });
+      // smarty-dev#883: a 200 ms deadline expired before a slow Windows runner claimed the command.
+      const sender = plane(meshRoot, "host:sender", storeOptions, { acknowledgementTimeoutMs: 1_000 });
+      const receiver = plane(meshRoot, "host:receiver", storeOptions, { acknowledgementTimeoutMs: 1_000 });
       const receive = vi.fn(() => ({ accepted: true }));
       sender.start(() => ({ accepted: false }));
       receiver.start(receive);
       await sender.request("host:receiver", "agent:target", "steer", { message: "once" });
       const commandId = (store.read({ topic: "fabric.control.command", limit: 10 }).at(-1)!.data as { commandId: string }).commandId;
       const own = ownStore(meshRoot, "host:receiver");
-      await new Promise((resolve) => setTimeout(resolve, 900));             // expired, still in the log
+      // Expired (at deadline + 1 s) and past one more 1 s cleanup pass, but still in the log.
+      await new Promise((resolve) => setTimeout(resolve, 3_200));
       expect(own.get(seenKey("host:receiver", commandId))).toBeDefined();
       for (let index = 0; index < 100; index++) {                          // rotate it out of the log
         await store.publish({ topic: "compact", from: identity("host:publisher"), text: "x".repeat(900) });
       }
       expect(store.oldestSequence()).toBeGreaterThan(1);
-      await vi.waitFor(() => expect(own.get(seenKey("host:receiver", commandId))).toBeUndefined(), { timeout: 3_000, interval: 20 });
+      await vi.waitFor(() => expect(own.get(seenKey("host:receiver", commandId))).toBeUndefined(), { timeout: 5_000, interval: 20 });
       expect(receive).toHaveBeenCalledTimes(1);
-    });
+    }, 15_000);
   });
 
   it("routes to one execution owner and returns its acknowledgement", async () => {

@@ -232,7 +232,7 @@ export class ActorManager {
   // Actors whose queue file this manager has loaded as their owner. Only these may write it: a
   // snapshot taken before the load (a passive view, or the empty queue a new owner parks before
   // it reloads) would replace or delete the owner's accepted work (review/astra F1 on #79).
-  readonly #queueLoaded = new Set<string>();
+  readonly #ownQueueRead = new Set<string>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
   readonly #actorRoot: string;
@@ -352,14 +352,10 @@ export class ActorManager {
       sessionId,
       this.#persistent && meshConfig.enabled ? this.#actorRoot : undefined,
     );
-    if (this.#persistent && meshConfig.enabled) {
-      this.#restoreFreshness();
-      this.#loadActors();
-    }
+    if (this.#persistent && meshConfig.enabled) this.#loadActors();
     this.#registryFingerprint = this.#registry.fingerprint();
     for (const actor of this.#actors.values()) {
       this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
-      this.#restoreQueue(actor);
     }
     this.#acquireCapabilityView = options.acquireCapabilityView;
     this.#sweepRetainedRuns();
@@ -504,7 +500,7 @@ export class ActorManager {
     };
     this.#actors.set(id, actor);
     this.#locallyCreated.add(id);
-    this.#queueLoaded.add(id);                                  // a new actor has no queue file
+    this.#ownQueueRead.add(id);                                 // a new actor has no queue file
     this.#ownership.set(id, true);
     await this.#publishPresence(actor);
     await this.mesh
@@ -961,7 +957,7 @@ export class ActorManager {
 
   noteMainActivity(idle = false): void {
     this.#mainRevision++;
-    this.#persistFreshness();
+    this.#persistRevisions();
     this.#mainIdle = idle;
   }
 
@@ -1076,7 +1072,7 @@ export class ActorManager {
     const revisions = `${this.#mainRevision}:${this.#taskRevision}`;
     this.#mainRevision = Math.max(this.#mainRevision, Math.floor(data.mainRevision));
     this.#taskRevision = Math.max(this.#taskRevision, Math.floor(data.taskRevision));
-    if (`${this.#mainRevision}:${this.#taskRevision}` !== revisions) this.#persistFreshness();
+    if (`${this.#mainRevision}:${this.#taskRevision}` !== revisions) this.#persistRevisions();
     this.#mainIdle = data.idle;
     const images = Array.isArray(data.images)
       ? data.images.filter(
@@ -1118,7 +1114,7 @@ export class ActorManager {
     if (this.#halted) return false;
     if (MAIN_REVISION_EVENTS.has(event)) this.#mainRevision++;
     if (event === "input") this.#taskRevision++;
-    if (MAIN_REVISION_EVENTS.has(event)) this.#persistFreshness();
+    if (MAIN_REVISION_EVENTS.has(event)) this.#persistRevisions();
     this.#mainIdle = idle;
     return true;
   }
@@ -2321,7 +2317,11 @@ export class ActorManager {
         }
       }
       this.#actors.set(actor.id, actor);
-      this.#restoreQueue(actor);
+      // Once per process: later a live process's memory, not the file, holds its work.
+      if (!this.#ownQueueRead.has(actor.id)) {
+        this.#ownQueueRead.add(actor.id);
+        this.#restoreQueue(actor, this.#ownQueueFile(actor), false);
+      }
       added++;
       void this.#publishPresence(actor).catch(() => undefined);
     }
@@ -2330,59 +2330,49 @@ export class ActorManager {
   }
 
   // smarty-dev#878: an actor's queue lived only in memory, while the mesh cursor already sat past
-  // the queued events, so a restart lost them (33 on one relaunch). Pending items without a
-  // caller (mesh and host events) are kept beside the actor, the running one until its run
-  // ends, and a restart restores them through the parked path, which waits for ownership. A
-  // restored item can run twice when the process died mid-run; one that keeps dying with its
-  // process is dropped after its third attempt.
-  // The manager's host revisions, written whenever they change: a restart must not roll them
-  // back and make activations they had made stale valid again (review/astra F3 on #79).
-  #freshnessFile(): string {
-    return path.join(this.#actorRoot, "freshness.json");
+  // the queued events, so a restart lost them (33 on one relaunch). Invariants (design note on #878):
+  // - Writer: each lineage (a root and the residency it claims) has its own file per actor, and
+  //   only that lineage writes it; an adopter also deletes a dead lineage's file after merging it.
+  //   So no host writes, replaces or deletes another's work (review/astra F1 on #79).
+  // - Content: the lineage's pending items without a caller (mesh and host events) plus the
+  //   running one, rewritten on every change, whatever the ownership: a drop, cancel or finish
+  //   while unowned is recorded too. Ownership only decides what runs, through the parked path.
+  // - Reads: once per process, when the actor first loads; an adoption reads the dead lineage's
+  //   file. A regain reads nothing: memory already holds the work, without what was cancelled or
+  //   finished (review/astra F4). An item can run twice when its process died mid-run; one
+  //   restored three times without finishing is dropped.
+  #lineageKey(parts: readonly string[]): string {
+    return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 16);
   }
 
-  #restoreFreshness(): void {
-    try {
-      const saved = JSON.parse(fs.readFileSync(this.#freshnessFile(), "utf8")) as { mainRevision?: unknown; taskRevision?: unknown };
-      const counter = (value: unknown): number =>
-        typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
-      this.#mainRevision = Math.max(this.#mainRevision, counter(saved.mainRevision));
-      this.#taskRevision = Math.max(this.#taskRevision, counter(saved.taskRevision));
-    } catch {
-      // No saved revisions: a first start.
+  // Host revisions only judge restored work, so they live in the queue files beside it (per root,
+  // since each Main counts its own) and are rewritten whenever they change, so a restart cannot
+  // roll them back and make obsolete work valid again (review/astra F3 on #79).
+  #persistRevisions(): void {
+    if (!this.#persistent) return;
+    for (const actor of this.#actors.values()) {
+      const inFlight = this.#inFlight.get(actor.id);
+      const held = [...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#parked.get(actor.id) ?? [])];
+      if (held.some((item) => !item.resolve && !item.reject)) this.#persistQueue(actor.id);
     }
   }
 
-  #persistFreshness(): void {
-    if (!this.#persistent || this.#closing) return;
-    try {
-      writeJsonAtomic(this.#freshnessFile(), { format: 1, mainRevision: this.#mainRevision, taskRevision: this.#taskRevision });
-    } catch {
-      // Best-effort, like the queue file.
-    }
+  #queueFile(actorId: string, rootId: string, residency: string): string {
+    return path.join(this.#actorRoot, actorId, `queue-${this.#lineageKey([rootId, residency])}.json`);
   }
 
-  #queueFile(actorId: string): string {
-    return path.join(this.#actorRoot, actorId, "queue.json");
-  }
-
-  // The queue file belongs to the actor's current owner: this manager's root and residency, and
-  // owned now. A passive view of another host's actor never writes, deletes or restores it
-  // (review/astra F1 on #79).
-  #ownsQueue(actor: ManagedActor, fresh = false): boolean {
-    return actor.rootId === this.#rootId &&
-      (this.#claimResidency === undefined || actor.residency === this.#claimResidency) &&
-      (fresh ? this.#ownershipDecision(actor.id) : this.#canManageCached(actor.id));
+  #ownQueueFile(actor: ManagedActor): string {
+    return this.#queueFile(actor.id, this.#rootId, this.#claimResidency ?? actor.residency);
   }
 
   #persistQueue(actorId: string): void {
     if (!this.#persistent || this.#closing) return;
     const actor = this.#actors.get(actorId);
-    if (!actor || !this.#queueLoaded.has(actorId) || !this.#ownsQueue(actor)) return;
+    if (!actor) return;
     const inFlight = this.#inFlight.get(actorId);
     const items = [...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#parked.get(actorId) ?? [])]
       .filter((item) => !item.resolve && !item.reject);
-    const file = this.#queueFile(actorId);
+    const file = this.#ownQueueFile(actor);
     try {
       if (items.length === 0) {
         fs.rmSync(file, { force: true });
@@ -2402,9 +2392,11 @@ export class ActorManager {
           return [];
         }
       });
-      // The actor's activation sequence, so validWhile judges the items the same way after a
-      // restart (review/astra F3 on #79). Host revisions live in freshness.json.
-      writeJsonAtomic(file, { format: 1, items: records, latestActivationSequence: actor.latestActivationSequence });
+      // What validWhile reads, so it judges the items the same way after a restart.
+      writeJsonAtomic(file, {
+        format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
+        mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
+      });
     } catch {
       // Queue persistence is best-effort; the in-memory queue still runs.
     }
@@ -2415,31 +2407,50 @@ export class ActorManager {
     this.#persistQueue(actorId);
   }
 
-  // Loads an owned actor's queue file once per ownership: at startup, after an adoption, or when
-  // ownership returns. Items already held in memory (parked, queued or running) keep their place.
-  // Every place that grants ownership calls this (startup, an adoption, ownership returning),
-  // since an adoption can complete synchronously during construction (review/astra F1 on #79).
-  #restoreQueue(actor: ManagedActor, decideNow = false): void {
-    if (!this.#persistent || this.#queueLoaded.has(actor.id) || !this.#ownsQueue(actor, decideNow)) return;
-    this.#queueLoaded.add(actor.id);
+  // Merges a queue file's items into the actor's parked work (which waits for ownership), skipping
+  // any item this manager already holds. Returns whether the file existed. This lineage's own file
+  // shares its revision counters, which continue from the saved ones; another root's file counts
+  // its own Main, so its host activations shift to judge the same against this manager's counters.
+  #restoreQueue(actor: ManagedActor, file: string, foreign: boolean): boolean {
+    if (!this.#persistent) return false;
     let parsed: unknown;
     try {
-      parsed = JSON.parse(fs.readFileSync(this.#queueFile(actor.id), "utf8"));
+      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     } catch {
-      return;
+      return false;
     }
-    const saved = parsed as { format?: unknown; items?: unknown; latestActivationSequence?: unknown };
+    const saved = parsed as {
+      format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown;
+    };
     const records = saved.format === 1 ? saved.items : undefined;
-    if (!Array.isArray(records)) return;
+    if (!Array.isArray(records)) return true;
     const counter = (value: unknown): number =>
       typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
     actor.latestActivationSequence = Math.max(actor.latestActivationSequence, counter(saved.latestActivationSequence));
+    const savedMain = counter(saved.mainRevision);
+    const savedTask = counter(saved.taskRevision);
+    if (!foreign) {
+      this.#mainRevision = Math.max(this.#mainRevision, savedMain);
+      this.#taskRevision = Math.max(this.#taskRevision, savedTask);
+    }
+    const shift = (activation: FabricActorActivation): FabricActorActivation =>
+      foreign && activation.kind === "hostEvent"
+        ? {
+            ...activation,
+            mainRevision: activation.mainRevision + this.#mainRevision - savedMain,
+            taskRevision: activation.taskRevision + this.#taskRevision - savedTask,
+          }
+        : activation;
+    const held = new Set([
+      ...actor.queue, ...(this.#parked.get(actor.id) ?? []),
+      ...(this.#inFlight.has(actor.id) ? [this.#inFlight.get(actor.id)!] : []),
+    ].map((item) => item.id));
     const restored: ActorQueueItem[] = [];
     for (const record of records) {
       if (typeof record !== "object" || record === null) continue;
       const value = record as Partial<ActorQueueItem> & { attempts?: unknown };
       if (
-        typeof value.id !== "string" || typeof value.source !== "string" ||
+        typeof value.id !== "string" || typeof value.source !== "string" || held.has(value.id) ||
         typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null
       ) continue;
       const attempts = (typeof value.attempts === "number" ? value.attempts : 0) + 1;
@@ -2448,7 +2459,7 @@ export class ActorManager {
         source: value.source,
         payload: value.payload,
         createdAt: value.createdAt,
-        activation: value.activation,
+        activation: shift(value.activation as FabricActorActivation),
         binding: typeof value.binding === "object" && value.binding !== null ? value.binding : {},
         ...(Array.isArray(value.images) ? { images: value.images } : {}),
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
@@ -2465,14 +2476,9 @@ export class ActorManager {
       if (typeof eventId === "string") this.#delivered.add(`${actor.id}\0${eventId}`);
       restored.push(item);
     }
-    const held = new Set([
-      ...actor.queue, ...(this.#parked.get(actor.id) ?? []),
-      ...(this.#inFlight.has(actor.id) ? [this.#inFlight.get(actor.id)!] : []),
-    ].map((item) => item.id));
-    const fresh = restored.filter((item) => !held.has(item.id));
-    if (fresh.length === 0) return;
-    this.#parked.set(actor.id, [...fresh, ...(this.#parked.get(actor.id) ?? [])]);
+    if (restored.length > 0) this.#parked.set(actor.id, [...restored, ...(this.#parked.get(actor.id) ?? [])]);
     this.#persistQueue(actor.id);
+    return true;
   }
 
   #resolvedModel(runner: FabricAgentRunner, model: string): string {
@@ -2677,7 +2683,9 @@ export class ActorManager {
       });
       if (adopted) {
         this.#persistedRoots.set(actor.id, this.#rootId);
-        this.#restoreQueue(this.#actors.get(actor.id) ?? actor, true);
+        // The dead lineage's accepted work moves into this lineage's file.
+        const dead = this.#queueFile(actor.id, expectedRootId, actor.residency);
+        if (this.#restoreQueue(this.#actors.get(actor.id) ?? actor, dead, true)) fs.rmSync(dead, { force: true });
       } else {
         const current = this.#registry.records().find((record) => record.id === actor.id);
         if (!current) {
@@ -2707,7 +2715,6 @@ export class ActorManager {
       const next = this.#ownershipDecision(actor.id);
       this.#ownership.set(actor.id, next);
       if (previous && !next) {
-        this.#queueLoaded.delete(actor.id);                    // the next owner's file, from now on
         this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
         this.#park(actor, actor.queue.splice(0),
@@ -2715,7 +2722,6 @@ export class ActorManager {
         if (actor.status !== "stopped") actor.status = "idle";
       } else if (!previous && next) {
         acquired = true;
-        this.#restoreQueue(actor, true);
       }
       if (!next) this.#maybeAdoptOrphan(actor);
     }

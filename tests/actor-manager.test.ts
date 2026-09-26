@@ -295,6 +295,14 @@ const recordRuns = (agents: AgentManager, hold?: () => Promise<void>) => {
   return runs;
 };
 
+// An actor's queue files, one per host lineage (root and residency) that holds work for it.
+const queueFiles = (root: string, actorId: string): Array<{ name: string; text: string }> => {
+  const dir = path.join(root, "actors", actorId);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((name) => /^queue-.+\.json$/.test(name)).sort()
+    .map((name) => ({ name, text: fs.readFileSync(path.join(dir, name), "utf8") }));
+};
+
 describe("ActorManager across a session reload", () => {
   const reloadable = (root: string, mesh: MeshStore, agents: AgentManager, replayAgeMs = 10 * 60_000, actorQueueLimit?: number) => {
     const manager = new ActorManager(
@@ -405,7 +413,7 @@ describe("ActorManager across a session reload", () => {
     await new Promise((resolve) => setTimeout(resolve, 2_000));
     expect(replies(/^fake worker complete$/)).toHaveLength(2);           // each queued item once
     expect(replies(/^live attempt/).length).toBeLessThanOrEqual(2);     // the interrupted run at most twice
-    expect(fs.existsSync(path.join(root, "actors", actor.id, "queue.json"))).toBe(false);
+    expect(queueFiles(root, actor.id)).toEqual([]);
   }, 60_000);
 
   // review/astra F2 on #79: one running plus a full waiting queue must all survive a restart.
@@ -509,12 +517,13 @@ describe("ActorManager across a session reload", () => {
     await mesh.publish({ topic: "team.pulls", from, text: "held-a" });
     await mesh.publish({ topic: "team.pulls", from, text: "held-b" });
     await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
-    const queueFile = path.join(root, "actors", actor.id, "queue.json");
     const passive = passiveHost("passive");                   // loads the foreign actor
     await owner.setInstructions(actor.id, "Review carefully.");          // a registry change ...
     passive.listOwned();                                                // ... that the passive view picks up
     await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).items).toHaveLength(3);
+    const files = queueFiles(root, actor.id);
+    expect(files).toHaveLength(1);                                      // the owner's, and only it
+    expect(JSON.parse(files[0]!.text).items).toHaveLength(3);
     await owner.close();
     host("owner", true);                                                // the owner restarts
     await waitFor(() => runs.filter((run) => /held-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 30_000);
@@ -596,6 +605,110 @@ describe("ActorManager across a session reload", () => {
     const judged = () => after.messages(actor.id).filter((message) => message.direction === "out" && message.source === "host:tool_error");
     await waitFor(() => judged().length >= 1, 30_000);
     expect(judged().every((message) => message.stale)).toBe(true);
+  }, 60_000);
+
+  // review/astra F1 (third review) on #79: a registry resync that finds this host no longer owns an
+  // actor parks its work while the cached decision still says it owns it. That write must stay in
+  // this host's own file: the new owner's queue file is never written, replaced or deleted.
+  it("never writes the new owner's queue file when a registry resync parks an actor this host lost", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const owns = { a: true, b: false };
+    const manager = (name: "a" | "b") => {
+      const value = new ActorManager(
+        name, { id: `session:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId: `session:${name}`, claimResidency: "session",
+          canManageActor: () => owns[name], meshCursorPath: path.join(root, `cursor-${name}.json`),
+        },
+      );
+      actorManagers.push(value);
+      return value;
+    };
+    const a = manager("a");
+    const b = manager("b");
+    const actor = await a.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
+    await mesh.publish({ topic: "team.pulls", from, text: "HANG a-first" });
+    await waitFor(() => a.status(actor.id).status === "running", 10_000);
+    await mesh.publish({ topic: "team.pulls", from, text: "a-held" });
+    await waitFor(() => a.status(actor.id).queued === 1, 10_000);
+    const [aFile] = queueFiles(root, actor.id);
+    // The directory hands the actor to B, which accepts work before A notices.
+    owns.b = true;
+    b.listOwned();
+    await mesh.publish({ topic: "team.pulls", from, text: "HANG b-first" });
+    await mesh.publish({ topic: "team.pulls", from, text: "b-held" });
+    await waitFor(() => b.status(actor.id).queued === 1 && queueFiles(root, actor.id).length === 2, 10_000);
+    await waitFor(() => a.status(actor.id).queued === 3, 10_000);        // A still takes events too
+    const bFile = queueFiles(root, actor.id).find((file) => file.name !== aFile!.name)!;
+    expect(JSON.parse(bFile.text).items).toHaveLength(2);
+    // In one step, so no poll comes between: A loses the actor and the registry changes. A's
+    // resync then parks the actor's work while A's cache still says A owns it.
+    owns.a = false;
+    const registry = path.join(root, "actors", "actors.json");
+    fs.utimesSync(registry, new Date(), new Date(Date.now() + 5_000));
+    a.listOwned();
+    await new Promise((resolve) => setTimeout(resolve, 300));        // and a few polls
+    expect(queueFiles(root, actor.id).find((file) => file.name === bFile.name)?.text).toBe(bFile.text);
+    // Counterexample: A still records its own accepted work, in its own file.
+    const aItems = JSON.parse(queueFiles(root, actor.id).find((file) => file.name === aFile!.name)!.text).items;
+    expect(aItems.length).toBeGreaterThanOrEqual(3);
+  }, 60_000);
+
+  // review/astra F3 (third review) on #79: two Main sessions share a project's actor directory, but
+  // each counts its own host revisions. B's lower counter must not roll back A's across A's restart.
+  it("keeps each root's host revisions apart: after A restarts, its stale work stays stale and its current work runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const manager = (name: "a" | "b") => {
+      const value = new ActorManager(
+        name, { id: `session:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId: `session:${name}`, claimResidency: "session",
+          meshCursorPath: path.join(root, `cursor-${name}.json`),
+        },
+      );
+      actorManagers.push(value);
+      return value;
+    };
+    const watcher = (manager: ActorManager, topic: string) => manager.create({
+      name: `watcher-${topic}`, instructions: "Watch.", topics: [topic], events: ["tool_error"], responseMode: "text", coalesce: false,
+      validWhile: { version: 1, source: "({ activation, current }) => activation.kind !== \"hostEvent\" || activation.taskRevision === current.taskRevision" },
+    });
+    const a = manager("a");
+    const b = manager("b");
+    const actorA = await watcher(a, "team.a");
+    const actorB = await watcher(b, "team.b");
+    await mesh.publish({ topic: "team.a", from, text: "LIVE_WITH_PROGRESS a" });
+    await mesh.publish({ topic: "team.b", from, text: "LIVE_WITH_PROGRESS b" });
+    await waitFor(() => a.status(actorA.id).status === "running" && b.status(actorB.id).status === "running", 10_000);
+    a.dispatchHostEvent("input", { text: "task 1" });                  // A: taskRevision 1
+    a.dispatchHostEvent("tool_error", { error: "a-obsolete" });         // judged against 1
+    a.dispatchHostEvent("input", { text: "task 2" });                  // A: 2, so a-obsolete is stale
+    a.dispatchHostEvent("tool_error", { error: "a-current" });          // judged against 2
+    b.dispatchHostEvent("tool_error", { error: "b-work" });             // B holds work too ...
+    b.dispatchHostEvent("input", { text: "b task 1" });                // ... and saves its own revision 1 after A's 2
+    await waitFor(() => a.status(actorA.id).queued === 2, 10_000);
+    await a.close();
+    const restarted = manager("a");
+    const judged = () => restarted.messages(actorA.id)
+      .filter((message) => message.direction === "out" && message.source === "host:tool_error");
+    await waitFor(() => judged().length >= 2, 30_000);
+    expect(judged().map((message) => Boolean(message.stale))).toEqual([true, false]);   // a-obsolete, a-current
   }, 60_000);
 
   it("does not replay events older than the replay window after a long downtime", async () => {
@@ -2043,9 +2156,11 @@ describe("ActorManager", () => {
 
   // Astra review of #36, R1: a run that completes while ownership is elsewhere is recorded,
   // never parked and run a second time.
-  it("records, and does not rerun, an event whose run completed while ownership was away", async () => {
+  // review/astra F4 on #79: with persistence too, where a regain must not reread a file that
+  // still lists the completed work.
+  it.each([false, true])("records, and does not rerun, an event whose run completed while ownership was away (persistent %s)", async (persistent) => {
     let owned = true;
-    const { actors, mesh, agents } = setup(false, () => owned);
+    const { actors, mesh, agents } = setup(persistent, () => owned);
     const runs = recordRuns(agents);
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
     actors.listOwned();
@@ -2062,9 +2177,9 @@ describe("ActorManager", () => {
   }, 30_000);
 
   // Astra review of #36, R2: ESC cancels parked events too, even with their restore already scheduled.
-  it("cancels parked events on an interrupt that arrives before their restore runs", async () => {
+  it.each([false, true])("cancels parked events on an interrupt that arrives before their restore runs (persistent %s)", async (persistent) => {
     let owned = true;
-    const { actors, mesh, agents } = setup(false, () => owned);
+    const { actors, mesh, agents } = setup(persistent, () => owned);
     const runs = recordRuns(agents);
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
     actors.listOwned();
@@ -2088,9 +2203,9 @@ describe("ActorManager", () => {
 
   // Astra review of #36, R2 follow-up: ESC after an ownership loss cancels the aborted in-flight
   // event; the next input must not run it again.
-  it("drops, and never reruns, an in-flight event that an ownership loss aborted and ESC cancelled", async () => {
+  it.each([false, true])("drops, and never reruns, an in-flight event that an ownership loss aborted and ESC cancelled (persistent %s)", async (persistent) => {
     let owned = true;
-    const { actors, mesh, agents } = setup(false, () => owned);
+    const { actors, mesh, agents } = setup(persistent, () => owned);
     const runs = recordRuns(agents);
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
     actors.listOwned();

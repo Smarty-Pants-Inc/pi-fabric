@@ -552,6 +552,34 @@ describe("Fabric dynamic UI", () => {
     expect(withoutAgents.join("\n")).not.toContain("Package A");
   });
 
+  // smarty-dev#1089: every pane showed the same "5 running" for other sessions' runs.
+  it("counts and shows only runs rooted in this session; other roots' runs stay in the dashboard", () => {
+    const current = snapshot();
+    current.runs = [];
+    current.actors = [];
+    const base = current.agents[0]!;
+    const agent = (id: string, name: string, rootId?: string) => ({
+      ...base, id, name, status: "running", ...(rootId ? { rootId, local: rootId === current.main.id } : {}),
+    });
+    current.agents = [
+      agent("own-1", "own-worker", current.main.id),              // this root's run, from its participant
+      agent("own-2", "local-record"),                             // this root's run, no participant data yet
+      agent("other-1", "pages-oss", "session:pages"),
+      agent("other-2", "pagesoss-area-2", "session:pages"),
+      agent("other-3", "oc278-r6-astra-2", "session:openchamber"),
+    ];
+    const lines = new FabricWidget(theme, () => current, 12).render(160).join("\n");
+    expect(lines).toContain("2 running");
+    expect(lines).toContain("own-worker");
+    expect(lines).not.toMatch(/pages-oss|pagesoss-area-2|oc278-r6-astra-2/);
+    // Totals too: base usage is 4000 + 1200 tokens and $0.04 per agent, two of them ours.
+    expect(lines.split("\n")[0]).toContain("· 10k tok · $0.080");      // not 26k tok and $0.200
+    expect(shouldShowFabricWidget(current, "auto")).toBe(true);
+    current.agents = current.agents.filter((entry) => entry.id.startsWith("other-"));
+    expect(shouldShowFabricWidget(current, "auto")).toBe(false);   // others' runs alone do not open it
+    expect(new FabricWidget(theme, () => current, 12).render(160).join("\n")).not.toContain("running");
+  });
+
   it("does not mount the auto widget for standalone non-agent state", () => {
     const current = snapshot();
     current.runs = [];

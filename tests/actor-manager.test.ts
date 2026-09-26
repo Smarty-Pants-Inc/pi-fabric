@@ -112,6 +112,25 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     return { mesh, make, hold, release, identity };
   };
 
+  // smarty-dev#784: a host with 13 actors re-decided every actor's ownership once per actor for
+  // each mesh event, before the topic filter (182 directory reads per event), and its event
+  // loop saturated.
+  it("decides ownership once per mesh event, not once per actor", async () => {
+    const decisions = vi.fn((_id: string) => true as boolean | undefined);
+    const { actors, mesh } = setup(false, decisions);
+    for (let index = 0; index < 10; index++) {
+      await actors.create({ name: `actor-${index}`, instructions: "Watch.", topics: [index === 0 ? "team.pulls" : `team.other-${index}`], responseMode: "text" });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    decisions.mockClear();
+    const from: MeshIdentity = { id: "session:other", name: "main", kind: "main", sessionId: "other" };
+    for (let index = 0; index < 20; index++) await mesh.publish({ topic: "fleet.noise", from, data: { index } });
+    await new Promise((resolve) => setTimeout(resolve, 400));                  // several 20 ms polls
+    // Before: 20 events x 10 actors x (1 + 10) decisions = 2,200. Now: 10 per event, plus the polls' own.
+    expect(decisions.mock.calls.length).toBeGreaterThan(0);
+    expect(decisions.mock.calls.length).toBeLessThan(600);
+  });
+
   it("publishes a new actor's presence once a stalled lock frees", async () => {
     const { mesh, make, hold, release } = stalledSetup();
     const actors = make();

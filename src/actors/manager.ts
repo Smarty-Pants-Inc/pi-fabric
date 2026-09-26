@@ -1865,14 +1865,18 @@ export class ActorManager {
   // Returns false when an owned receiver's queue was full; the monitor then offers the event
   // again while it catches up, and actors that already took it are skipped.
   #dispatchMeshEvent(event: MeshEvent): boolean {
+    // One ownership refresh per event. Each decision reads the participant directory, and
+    // re-deciding for every actor per actor (and before the topic filter) cost 182 directory
+    // reads per event on a host with 13 actors and saturated its event loop (smarty-dev#784).
     this.#refreshOwnership();
     let full = false;
     for (const actor of this.#actors.values()) {
-      if (!this.#canManage(actor.id) || actor.status === "stopped") continue;
+      if (actor.status === "stopped") continue;
       const addressed = event.to === actor.id || event.to === actor.name;
       const subscribed = actor.topics.includes(event.topic);
       if (!addressed && !subscribed) continue;
       if (event.from.id === actor.id && !addressed) continue;
+      if (!this.#canManageCached(actor.id)) continue;
       const delivery = `${actor.id}\0${event.id}`;
       if (this.#delivered.has(delivery)) continue;
       try {

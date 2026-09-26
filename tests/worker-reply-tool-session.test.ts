@@ -37,13 +37,19 @@ describe.skipIf(!built)("fabric_reply in a real Pi session with Fabric", () => {
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it.each(["full-code", "schema enforce"] as const)("keeps fabric_reply callable in %s mode and delivers the reply", async (mode) => {
+  // The actor does its work through fabric_exec first, which activates Fabric's runtime and with it
+  // the native call gate (Schema authorizer, direct approval), then replies (review/astra on #85).
+  it.each(["full-code", "schema enforce", "full-code with execute approvals denied"] as const)(
+    "keeps fabric_reply callable after fabric_exec in %s mode and delivers the reply",
+    async (mode) => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-reply-session-")));
     roots.push(root);
     const agentDir = path.join(root, "agent");
     fs.mkdirSync(agentDir, { recursive: true });
     if (mode === "schema enforce") {
       fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ schema: { mode: "enforce" } }));
+    } else if (mode === "full-code with execute approvals denied") {
+      fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ approvals: { execute: "deny" } }));
     }
     const schemaFile = path.join(root, "schema.json");
     const replyFile = path.join(root, "reply.json");
@@ -73,10 +79,16 @@ describe.skipIf(!built)("fabric_reply in a real Pi session with Fabric", () => {
     expect(active).toContain("fabric_reply");
     expect(active).not.toContain("bash");                         // Fabric does own the model's tools
 
-    faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_reply", { action: "message", message: "Look at #85." }))]);
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
+      fauxAssistantMessage(fauxToolCall("fabric_reply", { action: "message", message: "Look at #85." })),
+    ]);
     await session.prompt("an event");
+    const results = session.messages.filter((message) => message.role === "toolResult")
+      .map((message) => [(message as { toolName?: string }).toolName, (message as { isError?: boolean }).isError]);
+    expect(results).toEqual([["fabric_exec", false], ["fabric_reply", false]]);
     expect(JSON.parse(fs.readFileSync(replyFile, "utf8"))).toEqual({ action: "message", message: "Look at #85." });
-    const results = session.messages.filter((message) => message.role === "toolResult");
-    expect(results.map((message) => (message as { isError?: boolean }).isError)).toEqual([false]);
-  }, 60_000);
+    },
+    60_000,
+  );
 });

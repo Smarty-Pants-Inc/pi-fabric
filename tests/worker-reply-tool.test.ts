@@ -5,6 +5,7 @@ import { validateToolArguments } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { directiveSchema } from "../src/actors/manager.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { ownsRunReplyTool } from "../src/core/reply-tool-identity.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import replyTool, { REPLY_TOOL } from "../src/worker/reply-tool.js";
 
@@ -75,6 +76,21 @@ describe("fabric_reply worker hook", () => {
     catalog.replace([registered("fabric_reply", hook)] as never, {} as never,
       { ...DEFAULT_FABRIC_CONFIG.capture, enabled: true, hideFromModel: true }, path.join(root, "fabric.js"));
     expect(catalog.list().map((entry) => entry.name)).toEqual(["fabric_reply"]);
+  });
+
+  // review/astra on #85: the native call gate lets through only this run's reply tool.
+  it("owns the reply tool only from the exact hook file of a reply run", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-reply-"));
+    roots.push(root);
+    const hook = path.join(root, "reply-tool.js");
+    const other = path.join(root, "other-extension.js");
+    fs.writeFileSync(hook, "");
+    fs.writeFileSync(other, "");
+    const env = { PI_FABRIC_REPLY_FILE: path.join(root, "reply.json"), PI_FABRIC_REPLY_HOOK: fs.realpathSync(hook) };
+    expect(ownsRunReplyTool([{ name: "fabric_reply", sourceInfo: { path: hook } }], env)).toBe(true);
+    expect(ownsRunReplyTool([{ name: "fabric_reply", sourceInfo: { path: other } }], env)).toBe(false);
+    expect(ownsRunReplyTool([{ name: "other_tool", sourceInfo: { path: hook } }], env)).toBe(false);
+    expect(ownsRunReplyTool([{ name: "fabric_reply", sourceInfo: { path: hook } }], {})).toBe(false);
   });
 
   it("has Pi reject arguments outside the directive schema at the tool boundary", () => {

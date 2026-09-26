@@ -108,6 +108,7 @@ import { truncateMiddle } from "./util.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
+import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -280,6 +281,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     () => ownsFabricToolSource(pi.getAllTools(), FABRIC_EXTENSION_ENTRY_PATH),
     () => state.initialized ? state.execution.authorizer : undefined,
     () => state.initialized ? directToolApproval : undefined,
+    () => ownsRunReplyTool(pi.getAllTools()),
   );
 
   const inactiveCapturePolicy = {

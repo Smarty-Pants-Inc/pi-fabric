@@ -106,6 +106,31 @@ describe("FabricControlPlane", () => {
       expect(receive).toHaveBeenCalledTimes(1);
     });
 
+    // review/astra F1 on #67: a detached ask is consumed before it runs, so nothing retries its
+    // acknowledgement; keeping its outcome would grow memory without bound under contention.
+    it("of a detached ask, no outcome is kept: a replay is answered from the store alone", async () => {
+      const { meshRoot, receive } = await run();
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const ask = {
+        topic: "fabric.control.command", kind: "ask", from: identity("host:sender"), to: "host:receiver",
+        data: { version: 1, commandId: "command:ask", targetId: "agent:target", operation: "ask", replyTo: "host:sender",
+          message: "inspect", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 },
+      };
+      const acks = () => store.read({ topic: "fabric.control.ack", limit: 100 })
+        .filter((event) => (event.data as { commandId?: string }).commandId === "command:ask");
+      failOnce("put", (owner, input: { key?: string; value?: { acceptance?: unknown } }) =>
+        !shared(owner) && isClaim(input) && input.value?.acceptance !== undefined);
+      failOnce("publish", (_owner, input: { topic?: string }) => input.topic === "fabric.control.ack");
+      await store.publish(ask);
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(acks()).toHaveLength(0);                                       // not retried: detached
+      await store.publish(ask);                                             // a replay of the same command
+      await vi.waitFor(() => expect(acks()).toHaveLength(1), { timeout: 3_000, interval: 20 });
+      expect(acks()[0]!.data).toMatchObject({ accepted: false, error: expect.stringContaining("indeterminate") });
+      expect(receive).toHaveBeenCalledTimes(1);
+    });
+
     it("on the acknowledgement, the next poll publishes the real outcome, even past the deadline", async () => {
       const { receive, request } = await run();
       // A real lock wait (10 s) outlasts the deadline (1 s here): the retry must not answer "expired".

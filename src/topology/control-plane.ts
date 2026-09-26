@@ -166,9 +166,10 @@ export class FabricControlPlane {
   readonly #activeHandlers = new Set<Promise<void>>();
   // smarty-dev#424: progress kept across a retried command, since a lock timeout can come
   // between two of its writes. Shared claims this runtime won, by seen key; outcomes of
-  // commands that ran but whose acknowledgement is not yet published, by command id.
-  readonly #sharedClaims = new Set<string>();
-  readonly #unpublished = new Map<string, FabricControlAcceptance>();
+  // commands that ran but whose acknowledgement is not yet published, by command id. Each
+  // entry expires with its command's answer window and is evicted on the next drain.
+  readonly #sharedClaims = new Map<string, number>();
+  readonly #unpublished = new Map<string, { acceptance: FabricControlAcceptance; expiresAt: number }>();
   readonly #pollMs: number;
   readonly #ackTimeoutMs: number;
   #offset: number;
@@ -399,6 +400,8 @@ export class FabricControlPlane {
     await this.#polling?.catch(() => undefined);
     await this.#drain().catch(() => undefined);
     this.#closed = true;
+    this.#sharedClaims.clear();
+    this.#unpublished.clear();
     const cancellations: Promise<void>[] = [];
     for (const id of [...this.#pending.keys()]) {
       const pending = this.#clearPending(id);
@@ -425,6 +428,9 @@ export class FabricControlPlane {
   }
 
   async #drain(): Promise<void> {
+    const now = Date.now();
+    for (const [key, expiresAt] of this.#sharedClaims) if (expiresAt < now) this.#sharedClaims.delete(key);
+    for (const [id, kept] of this.#unpublished) if (kept.expiresAt < now) this.#unpublished.delete(id);
     while (true) {
       const tail = this.mesh.tail(this.#offset, 100);
       for (const event of tail.events) {
@@ -483,7 +489,7 @@ export class FabricControlPlane {
     const ran = this.#unpublished.get(command.commandId);
     if (ran) {
       // The command ran, and only its acknowledgement failed: send the real outcome.
-      if (answerable) await this.#publishAcknowledgement(command, ran);
+      if (answerable) await this.#publishAcknowledgement(command, ran.acceptance);
       this.#unpublished.delete(command.commandId);
       this.#sharedClaims.delete(key);
       return;
@@ -542,7 +548,7 @@ export class FabricControlPlane {
         identity: this.identity,
         ifVersion: 0,
       });
-      this.#sharedClaims.add(key);
+      this.#sharedClaims.set(key, deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4);
       claim = await this.#seen.put({
         key,
         value: {
@@ -663,9 +669,14 @@ export class FabricControlPlane {
       try {
         await this.#publishAcknowledgement(command, acceptance);
       } catch (error) {
-        // ponytail: an "ask" runs detached from the drain, so its kept outcome is sent only if
-        // the command is read again; asks are rare and their result has its own timeout.
-        this.#unpublished.set(command.commandId, acceptance);
+        // An "ask" runs detached from the drain, which has consumed it: nothing retries it, so
+        // its outcome is not kept (its sender's result wait times out instead).
+        if (command.operation !== "ask") {
+          this.#unpublished.set(command.commandId, {
+            acceptance,
+            expiresAt: deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4,
+          });
+        }
         throw error;
       }
     } finally {

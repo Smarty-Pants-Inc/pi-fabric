@@ -3,6 +3,10 @@ merge_queue:
   max_parallel_checks: 1
   reset_on_external_merge: always
 
+# smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
+# review. The Astra reviewer queues a ready PR after its success verdict; `hold` and DO NOT LAND
+# titles keep a PR out. Both lists stay equal, so Mergify checks an up-to-date PR in place
+# (smarty-dev#455) instead of rebuilding a draft.
 queue_rules:
   - name: default
     batch_size: 1
@@ -11,17 +15,17 @@ queue_rules:
     queue_conditions:
       - base = main
       - -draft
-      - check-success = smarty-review
+      - -label = hold
+      - -title ~= (?i)do not land
       - check-success = review/astra
-      - check-success = smarty-land-ready
       - check-success = check (ubuntu-latest)
       - check-success = check (windows-latest)
     merge_conditions:
       - base = main
       - -draft
-      - check-success = smarty-review
+      - -label = hold
+      - -title ~= (?i)do not land
       - check-success = review/astra
-      - check-success = smarty-land-ready
       - check-success = check (ubuntu-latest)
       - check-success = check (windows-latest)
 

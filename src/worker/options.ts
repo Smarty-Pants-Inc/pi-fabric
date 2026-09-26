@@ -66,6 +66,7 @@ export const parseWorkerOptions = (
   const thinking = optional(args, "thinking");
   const fabricExtensionPath = optional(args, "fabric-extension");
   const schemaFile = optional(args, "schema-file");
+  const replyTool = optional(args, "reply-tool") === "true";
   const imagesFile = optional(args, "images-file");
   const systemPrompt = optional(args, "system-prompt");
   const sessionFile = optional(args, "session-file");
@@ -155,6 +156,7 @@ export const parseWorkerOptions = (
     lifecycleFile: required(args, "lifecycle-file"),
     logFile: required(args, "log-file"),
     ...(schemaFile ? { schemaFile } : {}),
+    ...(replyTool ? { replyTool: true } : {}),
     cwd: required(args, "cwd"),
     piBinary: required(args, "pi-binary"),
     claudeBinary: required(args, "claude-binary"),

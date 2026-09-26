@@ -320,7 +320,22 @@ const main = async (): Promise<void> => {
     piArguments.push("-e", hookPath, "--no-auto-compaction");
   }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
-  if (options.tools.length > 0) piArguments.push("--tools", options.tools.join(","));
+  // smarty-dev#967: a structured Pi run replies through one tool call, never its final text.
+  const replyTool = options.replyTool === true && options.runner === "pi" && schema !== undefined;
+  const replyFile = replyTool ? path.join(path.dirname(options.statusFile), "reply.json") : undefined;
+  let replyHookPath: string | undefined;
+  if (replyTool) {
+    const hookPath = fileURLToPath(new URL(
+      import.meta.url.endsWith(".ts") ? "./worker/reply-tool.ts" : "./worker/reply-tool.js",
+      import.meta.url,
+    ));
+    if (!fs.existsSync(hookPath)) throw new Error("Reply tool hook is missing");
+    replyHookPath = fs.realpathSync(hookPath);
+    fs.rmSync(replyFile!, { force: true });
+    piArguments.push("-e", hookPath);
+  }
+  const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
+  if (piTools.length > 0) piArguments.push("--tools", piTools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
   if (options.model) piArguments.push("--model", options.model);
   if (thinking) piArguments.push("--thinking", thinking);
@@ -328,7 +343,9 @@ const main = async (): Promise<void> => {
   if (schema) {
     piArguments.push(
       "--append-system-prompt",
-      `Your final response must contain only JSON matching this schema, without Markdown fences:\n${schema}`,
+      replyTool
+        ? `Reply by calling the fabric_reply tool exactly once, as your last step. Its arguments are your reply and must match this schema:\n${schema}\nText outside that call is not delivered.`
+        : `Your final response must contain only JSON matching this schema, without Markdown fences:\n${schema}`,
     );
   }
   const claudeCli = options.runner === "claude" ? await loadClaudeCli() : undefined;
@@ -396,6 +413,9 @@ const main = async (): Promise<void> => {
       // allowlist, so both Pi and captured-tool providers enforce this
       // child-side allowlist before preparation, discovery, and invocation.
       PI_FABRIC_TOOL_ALLOWLIST: JSON.stringify(options.tools),
+      ...(replyTool
+        ? { PI_FABRIC_REPLY_SCHEMA_FILE: options.schemaFile!, PI_FABRIC_REPLY_FILE: replyFile!, PI_FABRIC_REPLY_HOOK: replyHookPath! }
+        : {}),
       ...(options.actorId ? { PI_FABRIC_ACTOR_ID: options.actorId } : {}),
       ...(options.actorName ? { PI_FABRIC_ACTOR_NAME: options.actorName } : {}),
       PI_FABRIC_CAPABILITY_REQUIREMENTS: JSON.stringify(
@@ -1337,6 +1357,30 @@ const main = async (): Promise<void> => {
       (exitCode === 0
         ? `${runnerLabel(options.runner)} agent reported an error before exiting`
         : `${runnerLabel(options.runner)} exited with code ${exitCode ?? "unknown"}`);
+  }
+  if (record.status === "completed" && replyFile) {
+    // The reply is the tool call's arguments. Until the roles name the tool, a final text that is
+    // one JSON object and nothing else is taken too, and marked; prose is never scraped for it.
+    try {
+      record.value = JSON.parse(fs.readFileSync(replyFile, "utf8")) as unknown;
+      record.replyVia = "tool";
+    } catch {
+      const text = record.text.trim();
+      try {
+        const value = text.startsWith("{") ? JSON.parse(text) as unknown : undefined;
+        if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+          record.value = value;
+          record.replyVia = "text";
+        }
+      } catch {
+        // Not JSON-only text.
+      }
+    }
+    if (record.value === undefined) {
+      record.status = "failed";
+      const snippet = record.text.trim().slice(0, 200);
+      record.error = `Directive reply missing: the run ended without a fabric_reply call${snippet ? ` (final text: ${snippet}${record.text.trim().length > 200 ? "…" : ""})` : ""}`;
+    }
   }
   if (record.status === "completed" && options.schemaFile) {
     try {

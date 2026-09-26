@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { directiveSchema } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { initBudgetLedger, readBudgetLedgerDetailed } from "../src/agents/budget-ledger.js";
 
@@ -474,6 +475,34 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       );
     }
   }, 30_000);
+
+  // smarty-dev#967: a directive run takes its reply from the fabric_reply call, never from prose.
+  it.each([
+    ["the tool call", "tool", "completed", "tool"],
+    ["JSON-only text (until the roles name the tool)", "json", "completed", "text"],
+    ["prose around the JSON", "prose", "failed", undefined],
+  ] as const)("takes a directive reply from %s", async (_case, reply, status, via) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
+    roots.push(root);
+    const previous = { behavior: process.env.FAKE_PI_BEHAVIOR, reply: process.env.FAKE_PI_REPLY };
+    process.env.FAKE_PI_BEHAVIOR = "reply-tool";
+    process.env.FAKE_PI_REPLY = reply;
+    try {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 5_000, maxConcurrent: 1 },
+        { workerPath, piBinary, runRoot: root });
+      managers.push(manager);
+      const result = await manager.run({ task: "an event", transport: "process", schema: directiveSchema, replyTool: true });
+      expect(result.status).toBe(status);
+      expect((result as { replyVia?: string }).replyVia).toBe(via);
+      if (status === "completed") expect(result.value).toEqual({ action: "silent" });
+      else expect(result.error).toMatch(/^Directive reply missing/);
+    } finally {
+      for (const [key, value] of [["FAKE_PI_BEHAVIOR", previous.behavior], ["FAKE_PI_REPLY", previous.reply]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
 
   it("rejects recursive Fabric for the Veda runner", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));

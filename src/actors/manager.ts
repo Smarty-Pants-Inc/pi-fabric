@@ -184,7 +184,7 @@ const readRunRecord = (filePath: string): AgentRunRecord | undefined => {
   }
 };
 
-const directiveSchema: Record<string, unknown> = {
+export const directiveSchema: Record<string, unknown> = {
   type: "object",
   properties: {
     action: { type: "string", enum: ["silent", "message", "stop"] },
@@ -1700,7 +1700,9 @@ export class ActorManager {
       ...(capabilityDigest ? { capabilityDigest } : {}),
       meshRoot: this.mesh.root,
       ...(item.images && item.images.length > 0 ? { images: item.images } : {}),
-      ...(actor.responseMode === "directive" ? { schema: directiveSchema } : {}),
+      ...(actor.responseMode === "directive"
+        ? { schema: directiveSchema, ...(actor.runner === "pi" ? { replyTool: true } : {}) }
+        : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(item.binding.model ? { model: item.binding.model } : {}),
       ...(item.binding.thinking ? { thinking: item.binding.thinking } : {}),
@@ -1711,8 +1713,17 @@ export class ActorManager {
   }
 
   #systemPrompt(actor: ManagedActor): string {
+    // smarty-dev#967: "end your reply with one JSON object" invited prose before it. A Pi actor
+    // replies through the fabric_reply tool, and its text is not delivered.
     const responseInstruction =
-      actor.responseMode === "directive"
+      actor.responseMode === "directive" && actor.runner === "pi"
+        ? [
+            "For every message, reply by calling the fabric_reply tool exactly once, as your last step. Text outside that call is not delivered.",
+            'Use {"action":"silent"} when no intervention or reply is useful.',
+            'Use {"action":"message","message":"concise text","data":{}} to reply.',
+            'Use {"action":"stop","message":"optional final text"} when your role is complete.',
+          ].join(" ")
+        : actor.responseMode === "directive"
         ? [
             "For every message, end your reply with exactly one JSON object on its own line; nothing may follow it.",
             'Use {"action":"silent"} when no intervention or reply is useful.',

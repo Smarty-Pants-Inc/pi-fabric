@@ -8,6 +8,7 @@ import type {
 import { readFabricExecutionTraceV1 } from "../audit/index.js";
 import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX as NESTED_TOOL_CALL_ID_PREFIX } from "../protocol.js";
 import { PI_CORE_TOOL_NAME_SET } from "./pi-tools.js";
+import { REPLY_TOOL_NAME } from "./reply-tool-identity.js";
 
 export interface FabricToolOwnershipHost {
   getActiveTools(): string[];
@@ -51,6 +52,8 @@ export class FabricToolLifecycle {
     readonly ownsFabricTool: () => boolean,
     readonly authorizer: () => FabricTopLevelToolAuthorizer | undefined,
     readonly approver: () => FabricTopLevelToolApprover | undefined = () => undefined,
+    // The worker's run-local reply tool, verified by its hook file (smarty-dev#967).
+    readonly ownsReplyTool: () => boolean = () => false,
   ) {}
 
   async toolCall(
@@ -66,6 +69,7 @@ export class FabricToolLifecycle {
       this.#outerCalls.add(event.toolCallId);
       return undefined;
     }
+    if (event.toolName === REPLY_TOOL_NAME && this.ownsReplyTool()) return undefined;
     await this.#authorizeTopLevel(event);
     const approver = this.approver();
     if (approver) {

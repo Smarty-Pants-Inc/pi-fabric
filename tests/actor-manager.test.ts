@@ -2035,6 +2035,26 @@ describe("ActorManager", () => {
     expect(deliveries).toEqual(["fake actor advice"]);
   });
 
+  // smarty-dev#967: a directive Pi actor replies through the fabric_reply tool, and its prompt no
+  // longer invites text before a trailing JSON object.
+  it("asks a directive Pi actor for a fabric_reply tool call, and only a Pi actor", async () => {
+    const { actors, agents } = setup();
+    const requests: Array<{ replyTool?: boolean; systemPrompt?: string; schema?: unknown; runner?: string }> = [];
+    const run = agents.run.bind(agents);
+    vi.spyOn(agents, "run").mockImplementation(async (request, signal) => {
+      requests.push(request as never);
+      return run(request, signal);
+    });
+    const pi = await actors.create({ name: "advisor", instructions: "Advise.", responseMode: "directive", delivery: "mailbox" });
+    await actors.ask(pi.id, "Review this turn");
+    expect(requests[0]).toMatchObject({ replyTool: true, schema: expect.any(Object) });
+    expect(requests[0]!.systemPrompt).toContain("calling the fabric_reply tool exactly once");
+    expect(requests[0]!.systemPrompt).not.toContain("end your reply with");
+    const text = await actors.create({ name: "notes", instructions: "Note.", responseMode: "text", delivery: "mailbox" });
+    await actors.ask(text.id, "Note this");
+    expect(requests[1]!.replyTool).toBeUndefined();
+  });
+
   it("requires explicit active delivery intent and rejects impossible trigger policies", async () => {
     const { actors } = setup();
 

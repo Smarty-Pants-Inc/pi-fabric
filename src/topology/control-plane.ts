@@ -17,8 +17,11 @@ const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
 // Records other hosts left in the shared state before smarty-dev#643 are checked this often.
 const LEGACY_SEEN_CLEANUP_MS = 15 * 60 * 1_000;
-// A shared claim for a command with an explicit deadline is deleted this long after it expires.
+// A shared claim for a command with an explicit deadline is deleted this long after it expires,
+// once the fleet owner has ended support for runtimes before phase 1 (see #cleanupLegacySeen).
 const SHARED_SEEN_GRACE_MS = 10 * 60 * 1_000;
+/** Host-reserved policy key; { version: 1, sharedClaims: "expiry" } enables expiry reclamation. */
+export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
 
@@ -678,22 +681,29 @@ export class FabricControlPlane {
     }
   }
 
-  // Shared-state records, any host's (smarty-dev#643, #816). A shared claim only fences a runtime
-  // before phase 1 of the same host, and every runtime rejects a command past its deadline at
-  // admission, so a claim for a command with its own deadline goes once it expired plus a grace:
-  // no clock is trusted beyond the one admission already trusts. Waiting for the command to leave
-  // the event log (compacted only at 64 MiB) kept 2,858 expired claims, 46% of the shared state,
-  // and saturated the mesh lock. Records without that flag (older writers, where a receiver with
-  // another acknowledgement timeout could compute a later deadline) keep the log rule.
+  // Shared-state records, any host's (smarty-dev#643, #816). By default one goes once it has
+  // expired and its command has left the event log: a runtime before phase 1 (before Fabric
+  // B8) checks the deadline only at admission and knows no other fence, so it could pass
+  // admission, pause, and claim again after an earlier deletion (review/astra on #65).
+  // ponytail: the log rule kept 2,858 expired claims (46% of the shared state) and saturated
+  // the mesh lock, because the log compacts only at 64 MiB. Once no runtime before phase 1
+  // remains on the root, the fleet owner sets CONTROL_CLAIMS_POLICY_KEY to
+  // { version: 1, sharedClaims: "expiry" }; then a claim for a command with its own deadline goes
+  // 10 minutes after it expires. That ends support for those runtimes on this root: one started
+  // afterwards could run a command twice in that pause. Runtime versions cannot be told apart
+  // automatically, since two processes of one host write the same lease key.
   async #cleanupLegacySeen(now: number): Promise<void> {
     const expired = this.mesh.listAll(CONTROL_SEEN_PREFIX).flatMap((entry) => {
       const record = controlSeenRecord(entry.value);
       return !record || record.expiresAt < now ? [{ entry, record }] : [];
     });
     if (expired.length === 0) return;
-    const dead = expired.filter(({ record }) =>
-      record?.explicitDeadline === true && record.expiresAt + SHARED_SEEN_GRACE_MS < now);
-    const unflagged = expired.filter(({ record }) => record?.explicitDeadline !== true);
+    const policy = this.mesh.get(CONTROL_CLAIMS_POLICY_KEY, { fresh: true })?.value;
+    const expiryReclaim = isObject(policy) && policy.version === 1 && policy.sharedClaims === "expiry";
+    const reclaimable = ({ record }: { record: FabricControlSeenRecord | undefined }): boolean =>
+      expiryReclaim && record?.explicitDeadline === true && record.expiresAt + SHARED_SEEN_GRACE_MS < now;
+    const dead = expired.filter(reclaimable);
+    const unflagged = expired.filter((candidate) => !reclaimable(candidate));
 
     if (unflagged.length > 0) {
       const sought = new Set(unflagged.flatMap(({ record }) => record ? [record.commandId] : []));

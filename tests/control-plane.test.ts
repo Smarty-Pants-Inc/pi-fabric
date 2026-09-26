@@ -8,7 +8,7 @@ import {
   type MeshIdentity,
   type MeshStoreOptions,
 } from "../src/mesh/store.js";
-import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { CONTROL_CLAIMS_POLICY_KEY, FabricControlPlane } from "../src/topology/control-plane.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
@@ -202,7 +202,7 @@ describe("FabricControlPlane", () => {
 
     // smarty-dev#816: shared claims were kept until their command left the event log (compacted
     // only at 64 MiB); 2,858 expired claims made up 46% of the shared state and saturated the lock.
-    it("in the shared state go once expired plus a grace when the command had its own deadline", async () => {
+    it("in the shared state go once expired plus a grace when the fleet owner allows it and the command had its own deadline", async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
       roots.push(root);
       const meshRoot = path.join(root, "mesh");
@@ -220,6 +220,7 @@ describe("FabricControlPlane", () => {
       await claim("command:flagged", { expiresAt: start, explicitDeadline: true });
       await claim("command:grace", { expiresAt: later - 5 * MINUTE, explicitDeadline: true });   // inside the grace
       await claim("command:legacy", { expiresAt: start });                // an older writer: no flag
+      await store.put({ key: CONTROL_CLAIMS_POLICY_KEY, value: { version: 1, sharedClaims: "expiry" }, identity: identity("host:owner") });
       const receiver = plane(meshRoot, "host:receiver");
       receiver.start(() => ({ accepted: true }));
       const sender = plane(meshRoot, "host:sender");
@@ -240,6 +241,36 @@ describe("FabricControlPlane", () => {
       expect(sweeps.length).toBeGreaterThanOrEqual(1);
       expect(sweeps[0]![0].ops.every((op) => op.ifVersion !== undefined)).toBe(true);   // one fenced batch
     });
+
+    // review/astra on #65: a runtime before phase 1 checks the deadline only at admission and knows
+    // only the shared claim. Without the fleet owner's policy, the shared claim must outlive expiry.
+    it("keep the shared claim for a paused older runtime through the sweep and tombstone eviction", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const requestedAt = Date.now();
+      await store.publish({ ...command("command:paused", "host:receiver"),
+        data: { ...command("command:paused", "host:receiver").data, requestedAt, deadlineAt: requestedAt + 5_000 } });
+      const older = olderRuntimeAdmits(store, "command:paused");            // passed admission, then pauses
+      expect(older.checked).toBe(true);
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn(() => ({ accepted: true }));
+      receiver.start(receive);
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
+      expect(store.get(seenKey("host:receiver", "command:paused"))?.value).toMatchObject({ explicitDeadline: true });
+      const now = Date.now;
+      vi.spyOn(Date, "now").mockImplementation(() => now() + 16 * 60_000);   // past expiry, grace and sweep
+      await new Promise((resolve) => setTimeout(resolve, 300));             // sweeps run
+      for (let index = 0; index < 1_010; index++) {                         // evict every older tombstone
+        await store.writeBatch({ identity: identity("host:noise"), ops: [
+          { kind: "put", key: `noise/${index}`, value: index }, { kind: "delete", key: `noise/${index}` },
+        ] });
+      }
+      const olderRuns = (await older.claim()) ? 1 : 0;                      // the older runtime resumes
+      expect(receive.mock.calls.length + olderRuns).toBe(1);
+      expect(store.get(seenKey("host:receiver", "command:paused"))).toBeDefined();
+    }, 60_000);
 
     it("are deleted only once expired and their command has left the log", async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));

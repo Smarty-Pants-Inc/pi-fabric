@@ -70,6 +70,7 @@ import {
 } from "../core/model-resolution.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
+import { agentWaitBound, describeWaitBound } from "../agents/wait-bound.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { isFabricThinking } from "../thinking.js";
 import { normalizeAgentRunRequest } from "../agents/request.js";
@@ -611,11 +612,24 @@ export class AgentsProvider implements FabricProvider {
       case "join":
       case "wait": {
         const id = String(args.id);
+        const timeoutMs = agentWaitBound(args.timeoutMs);
         if (this.residency?.hasAgent(id)) {
           const status = this.residency.statusAgent(id);
           context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
           context.update(`Waiting for durable agent ${status.name}`);
-          return this.residency.waitAgent(id, context.signal);
+          // Stopping the wait leaves the durable run and its unread result alone (smarty-dev#854).
+          const bound = AbortSignal.timeout(timeoutMs);
+          const signal = context.signal ? AbortSignal.any([context.signal, bound]) : bound;
+          try {
+            return await this.residency.waitAgent(id, signal);
+          } catch (error) {
+            if (!bound.aborted || context.signal?.aborted) throw error;
+            throw new Error(
+              `agents.wait: durable agent ${status.name} is still running after ${describeWaitBound(timeoutMs)}. ` +
+                "It continues, and its result arrives as a completion message: end the turn now, or pass a larger " +
+                "timeoutMs (up to 60 min) to wait longer.",
+            );
+          }
         }
         const status = this.manager.status(id);
         context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
@@ -625,6 +639,7 @@ export class AgentsProvider implements FabricProvider {
           id,
           context,
           this.agentToolPreviewEnabled,
+          { timeoutMs },
         );
       }
       case "status": {

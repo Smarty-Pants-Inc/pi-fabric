@@ -1421,6 +1421,26 @@ describe("AgentManager", () => {
     await expect(completion).resolves.toBe("fake worker complete");
   });
 
+  // smarty-dev#854: agents.wait without a bound blocked its session for over an hour.
+  it("bounds a wait: the run continues, nothing is consumed, and its completion is still delivered", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    let resolveCompletion: ((text: string) => void) | undefined;
+    const completion = new Promise<string>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+      onBackgroundComplete: (result) => resolveCompletion?.(result.text),
+    });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "LIVE_WITH_PROGRESS", transport: "process" });   // runs 1.5 s
+    await expect(manager.wait(handle.id, { timeoutMs: 300 })).rejects.toThrow(/is still running after 0\.3 s\. It continues/);
+    expect(manager.status(handle.id).status).toBe("running");
+    await expect(completion).resolves.toMatch(/^live attempt \d+ complete$/);
+  }, 15_000);
+
   it("surfaces the run-log tail when a worker exits without a terminal result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

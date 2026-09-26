@@ -1,4 +1,5 @@
 import { Value } from "typebox/value";
+import { AGENT_WAIT_MAX_MS } from "./wait-bound.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../providers/agents-actions.js";
 import { actionArgNormalizer } from "../providers/arg-normalization.js";
 import type { FabricActionDescriptor } from "../protocol.js";
@@ -33,7 +34,8 @@ export function agentServiceDescriptors(capabilities: AgentServiceCapabilities =
   const descriptors: FabricActionDescriptor[] = [
     {...run, description: "Run one host-authorized Pi child and wait for its result or pause", inputSchema: runSchema},
     {...native("spawn"), description: "Admit one host-authorized Pi child, or residency durable for an independent host worker", inputSchema: spawnSchema},
-    ...["wait", "join", "status", "stop"].map((name) => ({...native(name), inputSchema: object({id}, ["id"])})),
+    ...["wait", "join"].map((name) => ({...native(name), inputSchema: object({id, timeoutMs: {type: "number", minimum: 1_000, maximum: AGENT_WAIT_MAX_MS}}, ["id"])})),
+    ...["status", "stop"].map((name) => ({...native(name), inputSchema: object({id}, ["id"])})),
     {...native("list"), description: "List only the authenticated caller's direct children", inputSchema: object({})},
   ];
   if (capabilities.steer) descriptors.push({...native("steer"), inputSchema: object({id, message: {type: "string", minLength: 1}}, ["id", "message"])});

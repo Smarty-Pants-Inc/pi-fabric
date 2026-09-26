@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -1004,12 +1005,19 @@ export class AgentManager {
     return this.wait(handle.id);
   }
 
-  async wait(id: string): Promise<AgentRunResult> {
+  /**
+   * Waits for a run's result and consumes it. With timeoutMs, a run still going at the bound is
+   * detached instead (smarty-dev#854): it continues, nothing is consumed, and its result arrives
+   * as a completion message.
+   */
+  async wait(id: string, options: { timeoutMs?: number } = {}): Promise<AgentRunResult> {
     const managed = this.#requireRun(id);
     managed.background = false;
     if (!managed.settled) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
-      const result = await managed.result;
+      const result = options.timeoutMs === undefined
+        ? await managed.result
+        : await this.#boundedResult(managed, options.timeoutMs);
       this.#onResultConsumed?.(id);
       return result;
     }
@@ -1019,6 +1027,22 @@ export class AgentManager {
     }
     this.#onResultConsumed?.(id);
     return this.#withTransportMetadata(record, managed) as AgentRunResult;
+  }
+
+  #boundedResult(managed: ManagedAgent, timeoutMs: number): Promise<AgentRunResult> {
+    let timer: NodeJS.Timeout | undefined;
+    const bound = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        this.#detach(managed, "agents.wait reached its bound; the run continues");
+        reject(new Error(
+          `agents.wait: ${managed.name} is still running after ${describeWaitBound(timeoutMs)}. It continues, and its result ` +
+            "arrives as a completion message after this turn: end the turn now, or pass a larger timeoutMs " +
+            "(up to 60 min) to wait longer.",
+        ));
+      }, timeoutMs);
+      timer.unref?.();
+    });
+    return Promise.race([managed.result!, bound]).finally(() => clearTimeout(timer));
   }
 
   markForeground(id: string): void {

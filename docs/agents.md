@@ -24,13 +24,13 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 ## Agents
 
-`agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
+`agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, at most 60. A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
 ### Background completion inbox
 
 `agents.spawn` returns immediately; independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.
 
-`agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop.
+`agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop. Fabric refuses a foreground `bash` call, native or through `pi.bash`, whose sleeps add up to more than 5 minutes: a long `sleep`, a sleep in a counted `for` loop, or a sleep in a `while` or `until` loop without a `timeout`. A session that waits in the foreground takes no steer or ask. Start the poll detached, or wait for a completion message or a mesh event, and end the turn.
 
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results: Fabric does not start a turn to deliver them, and they join Main's next turn, whatever starts it (typed input, a peer message or another trigger). Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
 
@@ -393,7 +393,7 @@ if (peer) {
 
 Pi events use these names: `pi.input`, `pi.agent_start`, `pi.agent_end`, `pi.turn_end`, `pi.agent_settled`, `pi.tool_error`, and `pi.session_compact`. Runner-neutral terminal events use `run.completed`, `run.failed`, `run.stopped`, and `run.timed_out`. Recovery events use `run.resumed` for a relaunched attempt after an unexpected stop, and `run.detached` for a run that outlived its caller's cancellation. The `tokens.usage` event provides bounded usage. The `component.state` event reports supervised component transitions. Lifecycle envelopes contain source identity and bounded operational metadata. They do not contain session transcripts.
 
-A detached local `agents.spawn()` has a smaller convenience route. When `agents.notifyOnComplete` is enabled, terminal completion automatically sends Main a triggered follow-up. A call to `agents.wait()` makes the run foreground work and disables that detached notification.
+A detached local `agents.spawn()` has a smaller convenience route. When `agents.notifyOnComplete` is enabled, terminal completion automatically sends Main a triggered follow-up. A call to `agents.wait()` makes the run foreground work and disables that detached notification. A wait that reaches its bound detaches the run again, so the notification still arrives.
 
 For a code-owned typed alternative to a reasoning actor, use [Jev Main-turn observers](jev.md#main-turn-advisors-and-supervisors). They consume bounded selected event context with `program.nextEvent()`, work without mesh, and can explicitly opt into freshness-checked advice. They are session-owned Jev runs, not participant subscription targets.
 

@@ -6,7 +6,7 @@ Every method takes a single options object.
 
 ## One-shot child agents
 
-`agents.wait({id})` is canonical; `agents.join({id})` is its alias with the same arguments, result, progress, and detached-completion notification behavior. Jev uses the same naming: `jev.wait` with `jev.join` as an alias.
+`agents.wait({id})` is canonical; `agents.join({id})` is its alias with the same arguments, result, progress, and detached-completion notification behavior. `timeoutMs` bounds the wait: 5 minutes by default, at most 60. At the bound the child keeps running, the wait throws, and its result arrives as a completion message after the turn. Jev uses the same naming: `jev.wait` with `jev.join` as an alias.
 
 - `agents.run(args)` runs to completion and returns `FabricAgentResult` with `{ id, runner, kernel?, status, text, value?, error?, usage, turns, toolCalls, runnerSessionId? }`.
 - `agents.spawn(args)` returns a background `FabricAgentHandle` with an `id`. Then use `agents.wait({ id })`, `agents.status({ id })`, `agents.stop({ id })`.

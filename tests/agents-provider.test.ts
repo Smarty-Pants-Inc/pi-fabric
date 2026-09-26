@@ -1344,7 +1344,7 @@ describe("AgentsProvider runner support", () => {
     ) as { id: string; name: string };
 
     await provider.invoke(method, { id: handle.id }, previewContext);
-    expect(wait).toHaveBeenCalledExactlyOnceWith(handle.id);
+    expect(wait).toHaveBeenCalledExactlyOnceWith(handle.id, { timeoutMs: 5 * 60_000 });   // the default bound (smarty-dev#854)
 
     expect(updates.some((message) => message.startsWith("Agent wait-preview-agent:"))).toBe(true);
     expect(updates.join("\n")).not.toContain(handle.id.slice(0, 8));

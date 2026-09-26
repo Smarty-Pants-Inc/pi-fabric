@@ -1,4 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
@@ -630,6 +631,15 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   pi.on("tool_call", (event, context) =>
     fabricToolLifecycle.toolCall(event, context));
+
+  // smarty-dev#854: a foreground wait over the limit blocks this session from steers and asks.
+  pi.on("tool_call", (event) => {
+    if (event.toolName !== "bash") return undefined;
+    const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
+    if (typeof command !== "string") return undefined;
+    const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
+    return reason ? { block: true, reason } : undefined;
+  });
 
   // Pi 0.80.6 intentionally ignores `isError` returned by custom-tool
   // execute(). Repair the finalized outer result through official middleware.

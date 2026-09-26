@@ -731,9 +731,10 @@ interface FabricAgentsApi {
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
   spawn(args: FabricAgentRequest): Promise<FabricAgentHandle>;
-  wait(args: FabricAgentTargetArgs): Promise<FabricAgentResult>;
+  /** Bounded by timeoutMs (default 5 min, at most 60 min): a child still running keeps running and reports on completion. */
+  wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */
-  join(args: FabricAgentTargetArgs): Promise<FabricAgentResult>;
+  join(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   status(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricAgentHandle | FabricMainAgentInfo | FabricActorInfo | FabricParticipantInfo>;
   list(args?: { scope?: FabricParticipantScope }): Promise<Array<FabricAgentResult | FabricAgentHandle | FabricParticipantInfo>>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;

@@ -150,6 +150,19 @@ const idSchema = {
   additionalProperties: false,
 };
 
+// smarty-dev#854: a wait without a bound blocked its session for over an hour.
+export const AGENT_WAIT_DEFAULT_MS = 5 * 60 * 1_000;
+export const AGENT_WAIT_MAX_MS = 60 * 60 * 1_000;
+const waitSchema = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    timeoutMs: { type: "number", minimum: 1_000, maximum: AGENT_WAIT_MAX_MS },
+  },
+  required: ["id"],
+  additionalProperties: false,
+};
+
 const lifecycleEventSchema = {
   type: "string",
   enum: [...FABRIC_LIFECYCLE_EVENTS],
@@ -178,16 +191,16 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "wait",
-    description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification",
+    description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification. Bounded by timeoutMs (default 5 min, at most 60 min): a child still running then keeps running, the wait throws, and its result arrives as a completion message after the turn",
     effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
-    inputSchema: idSchema,
+    inputSchema: waitSchema,
     risk: "read",
   },
   {
     name: "join",
-    description: "Alias for agents.wait: wait for a previously spawned child agent with the same progress and completion-notification behavior",
+    description: "Alias for agents.wait: wait for a previously spawned child agent with the same bound, progress and completion-notification behavior",
     effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
-    inputSchema: idSchema,
+    inputSchema: waitSchema,
     risk: "read",
   },
   {

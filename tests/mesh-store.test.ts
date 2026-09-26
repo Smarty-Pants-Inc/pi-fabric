@@ -362,6 +362,24 @@ describe("MeshStore", () => {
     expect(store.oldestSequence()).toBeGreaterThan(1);                     // rotated
   });
 
+  it("skips a batch delete whose condition fails at commit, seeing earlier ops of the batch", async () => {
+    const store = createStore();
+    await store.put({ key: "owner/live", value: { alive: true }, identity });
+    await store.put({ key: "owner/gone", value: { alive: false }, identity });
+    await store.put({ key: "child/of-live", value: 1, identity });
+    await store.put({ key: "child/of-gone", value: 1, identity });
+    const ownerGone = (key: string) => (current: (key: string) => { value: unknown } | undefined) =>
+      !(current(key)?.value as { alive?: boolean } | undefined)?.alive;
+    const results = await store.writeBatch({ identity, ops: [
+      { kind: "delete", key: "owner/gone", condition: ownerGone("owner/gone") },
+      { kind: "delete", key: "child/of-gone", condition: ownerGone("owner/gone") },   // owner deleted above: absent
+      { kind: "delete", key: "child/of-live", condition: ownerGone("owner/live") },
+    ] });
+    expect(results.map((result) => result.applied)).toEqual([true, true, false]);
+    expect(store.get("child/of-live")).toBeDefined();
+    expect(store.get("owner/gone")).toBeUndefined();
+  });
+
   it("compacts oversized event logs and resets stale tail cursors", async () => {
     const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-bounded-"));
     roots.push(meshRoot);

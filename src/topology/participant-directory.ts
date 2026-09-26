@@ -11,6 +11,7 @@ import type {
   FabricPeerInfo,
 } from "./types.js";
 
+import { reapDeadHostRecords } from "./host-reaper.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 
 const PARTICIPANT_PREFIX = "topology/participants/";
@@ -28,6 +29,8 @@ const PARTICIPANT_LEASE_MS = 15_000;
  * the lease every heartbeat interval.
  */
 const CHANGE_REFRESH_MIN_MS = 1_000;
+/** How often a host sweeps records of long-dead hosts (smarty-dev#367); the first sweep waits too. */
+const DEAD_HOST_SWEEP_MS = 15 * 60 * 1_000;
 const keyFor = (prefix: string, id: string): string =>
   prefix + createHash("sha256").update(id).digest("hex");
 
@@ -242,6 +245,11 @@ export interface ParticipantDirectoryOptions {
   selfOwnerIdentityId?: string;
   heartbeatMs?: number;
   leaseMs?: number;
+  /**
+   * Sweep records of hosts gone for this long (default 6 h), at most every sweepMs (default
+   * 15 min, the first sweep waiting as long). false disables it (secondary directories, tests).
+   */
+  reapDeadHosts?: false | { deadAfterMs?: number; sweepMs?: number };
 }
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
@@ -265,6 +273,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshedAt = Date.now();
   #refreshStartedAt: number | undefined;
   #refreshError: unknown;
+  #deadHostSweepAt = Date.now();
   #quiescing = false;
 
   constructor(
@@ -360,6 +369,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!committed) return;
       this.#refreshedAt = Date.now();
       this.#refreshError = undefined;
+      if (full) this.#sweepDeadHosts();
     } catch (error) {
       this.#refreshError = error;
       throw error;
@@ -603,6 +613,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
       pendingMessages: main.pendingMessages,
       controlProtocol: "v1",
     };
+  }
+
+  // After a committed heartbeat only: a host that cannot write gains nothing from a sweep.
+  #sweepDeadHosts(): void {
+    const reap = this.options.reapDeadHosts;
+    if (!this.options.enabled || reap === false || this.#closed || this.#quiescing) return;
+    const now = Date.now();
+    if (now - this.#deadHostSweepAt < (reap?.sweepMs ?? DEAD_HOST_SWEEP_MS)) return;
+    this.#deadHostSweepAt = now;
+    void reapDeadHostRecords(this.mesh, this.options.identity, {
+      ownHostId: this.options.hostId,
+      now,
+      ...(reap?.deadAfterMs !== undefined ? { deadAfterMs: reap.deadAfterMs } : {}),
+    }).catch(() => undefined);
   }
 
   async quiesce(): Promise<void> {

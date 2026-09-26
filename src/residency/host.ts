@@ -164,6 +164,7 @@ class ResidentHost {
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
+      reapDeadHosts: false,                                    // its session's runtime sweeps
     });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       enabled: true,

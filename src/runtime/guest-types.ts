@@ -742,6 +742,8 @@ interface FabricAgentsApi {
   main(): Promise<FabricMainAgentInfo>;
   sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
+  /** The live project agent for this session's project (role project-agent, same git common checkout). */
+  projectAgent(): Promise<FabricParticipantInfo>;
   subscribe(args: {
     from: string;
     events: FabricLifecycleEventType[];

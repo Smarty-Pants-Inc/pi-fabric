@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { participantRole, projectOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type {
@@ -141,6 +142,8 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
     id: participant.id,
     name: participant.label ?? "Peer " + participant.sessionId.slice(0, 8),
     ...(participant.label ? { label: participant.label } : {}),
+    ...(typeof participant.role === "string" ? { role: participant.role } : {}),
+    ...(typeof participant.project === "string" ? { project: participant.project } : {}),
     kind: "peer",
     status: participant.status,
     runner: "pi",
@@ -627,6 +630,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   root(main: FabricMainAgentInfo): FabricParticipantRecord {
+    const role = participantRole();
     return {
       format: 1,
       id: main.id,
@@ -639,7 +643,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       runner: "pi",
       transport: "host",
       capabilities: ["steer", "followUp", "fabric"],
-      ...(main.cwd ? { cwd: main.cwd } : {}),
+      ...(main.cwd ? { cwd: main.cwd, project: projectOf(main.cwd) } : {}),
+      ...(role ? { role } : {}),
       ...(main.sessionId ? { sessionId: main.sessionId } : {}),
       ...(main.model ? { model: main.model } : {}),
       ...(main.thinking ? { thinking: main.thinking } : {}),

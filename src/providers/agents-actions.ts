@@ -256,7 +256,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "peers",
-    description: "List other live root Pi sessions sharing this project mesh. The dashboard-owning session remains Main; these targets are named peers.",
+    description: "List other live root Pi sessions sharing this project mesh, with their role and project when their runtime publishes them. The dashboard-owning session remains Main; these targets are named peers.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    risk: "read",
+  },
+  {
+    name: "projectAgent",
+    description: "Return the live project agent for this session's project: the root whose role is project-agent and whose project (the checkout that owns the git common directory) is this session's. A worktree agent reports to it. Throws with the reason when none is live.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },

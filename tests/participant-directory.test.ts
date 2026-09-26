@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -273,6 +274,35 @@ describe("ParticipantDirectory.get", () => {
     expect(beta.get("agent:alpha-child")).toMatchObject({ id: "agent:alpha-child", stale: false });
     expect(listed).not.toHaveBeenCalled();
     listed.mockRestore();
+  });
+});
+
+// smarty-dev#784: roots publish their role and project, and peers show them.
+describe("ParticipantDirectory role and project", () => {
+  it("publishes a root's role and project, and shows them on peers", async () => {
+    const previous = process.env.SMARTY_ROLE;
+    process.env.SMARTY_ROLE = "project-agent@5358e96a418f";
+    try {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const alphaIdentity: MeshIdentity = { id: "session:alpha", name: "main", kind: "main", sessionId: "alpha" };
+      const betaIdentity: MeshIdentity = { id: "session:beta", name: "main", kind: "main", sessionId: "beta" };
+      let alpha: ParticipantDirectory | undefined;
+      alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [alpha!.root({
+        id: alphaIdentity.id, name: "main", kind: "main", status: "idle", runner: "pi", transport: "host",
+        cwd: process.cwd(), sessionId: "alpha", startedAt: 1, updatedAt: 2, pendingMessages: false, local: true,
+      } as never)]);
+      const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")]);
+      await alpha.start();
+      await beta.start();
+      expect(beta.peers().find((peer) => peer.id === "session:alpha")).toMatchObject({
+        role: "project-agent", project: projectOf(process.cwd()),
+      });
+    } finally {
+      if (previous === undefined) delete process.env.SMARTY_ROLE;
+      else process.env.SMARTY_ROLE = previous;
+    }
   });
 });
 

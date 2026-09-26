@@ -29,6 +29,8 @@ const ACTIVITY_REFRESH_MS = 100;
 // The participant heartbeat (src/topology/participant-directory.ts); kept local so the startup
 // graph does not load the topology module.
 const REMOTE_REFRESH_MS = 5_000;
+// A poll with no changed input still rebuilds this often: a peer's lease lapses with time alone.
+const REMOTE_MAX_AGE_MS = 15_000;
 
 const emptySnapshot = (): FabricDashboardSnapshot => {
   const now = Date.now();
@@ -94,6 +96,10 @@ export class FabricUiController {
   #activeConversationReader: string | undefined;
   readonly #snapshotCache = new FabricDashboardSnapshotCache();
   #refreshGeneration = 0;
+  // What the last snapshot was built from, as cheap stamps (smarty-dev#1043).
+  #builtLocal: string | undefined;
+  #builtRemote: string | undefined;
+  #builtAt = 0;
 
   constructor(
     readonly state: FabricState,
@@ -159,6 +165,9 @@ export class FabricUiController {
     this.#conversationReaders.clear();
     this.#activeConversationReader = undefined;
     this.#snapshotCache.clear();
+    this.#builtLocal = undefined;
+    this.#builtRemote = undefined;
+    this.#builtAt = 0;
   }
 
   /** True while Fabric owns keyboard input, including asynchronous view setup. */
@@ -700,16 +709,47 @@ export class FabricUiController {
         this.#activityRevision = revision;
         this.#activityRunsDetailed = detailed;
       }
-      if (force || this.#dashboardOpen) this.#snapshotCache.clear();
-      this.#refreshGeneration++;
-      this.#snapshot = createDashboardSnapshot(
-        this.state,
-        this.#events,
-        context,
-        this.#activityRuns,
-        this.#dashboardOpen ? undefined : this.#snapshotCache,
-        this.#activityView !== undefined,
-      );
+      // smarty-dev#1043: a poll gathered every input (the whole participant list, actors, the
+      // mesh, the global registry) and deep-compared it twice a second while any local work was
+      // active: about 11% of a busy Main. Local changes already refresh through their own
+      // events, so a poll now rebuilds the snapshot only when a cheap stamp moved: Main's own
+      // state or the activity revision at once, remote state and mesh events at most every
+      // REMOTE_REFRESH_MS, and anything else (a lapsing lease) every REMOTE_MAX_AGE_MS. An open
+      // dashboard or conversation view stays live. The rest of the refresh runs either way.
+      const now = Date.now();
+      const main = this.state.mainAgentInfo(context);
+      const local = JSON.stringify([revision, main.status, main.model, main.thinking, main.pendingMessages,
+        this.state.widgetDismissedAt]);
+      const remoteOf = (meshStamp: string | undefined): string =>
+        JSON.stringify([this.#meshOffset, meshStamp, this.state.globalActors.stamp?.()]);
+      const remote = remoteOf(this.state.config.mesh.enabled ? this.state.mesh.stateStamp?.() : undefined);
+      const unchanged =
+        !force && !this.#dashboardOpen && !this.#conversationOpen && revision !== undefined &&
+        local === this.#builtLocal && now - this.#builtAt < REMOTE_MAX_AGE_MS &&
+        (remote === this.#builtRemote || now - this.#builtAt < REMOTE_REFRESH_MS);
+      if (unchanged) {
+        this.#snapshot = { ...this.#snapshot, now };           // elapsed times keep moving
+      } else {
+        // A rebuild for a remote change first revalidates the mesh read cache (a parse only when
+        // the file changed, at most every REMOTE_REFRESH_MS), so it shows the state it was built
+        // for. Every rebuild records the stamp of the payload it consumed, not the file's, so a
+        // payload older than the file keeps the gate open (review/astra F2 on #84).
+        const remoteRebuild = !force && !this.#dashboardOpen && !this.#conversationOpen && remote !== this.#builtRemote;
+        if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(true);
+        this.#builtLocal = local;
+        this.#builtAt = now;
+        if (force || this.#dashboardOpen) this.#snapshotCache.clear();
+        this.#refreshGeneration++;
+        this.#snapshot = createDashboardSnapshot(
+          this.state,
+          this.#events,
+          context,
+          this.#activityRuns,
+          this.#dashboardOpen ? undefined : this.#snapshotCache,
+          this.#activityView !== undefined,
+        );
+        this.#builtRemote = remoteOf(this.state.config.mesh.enabled ? this.state.mesh.cachedStateStamp?.() : undefined);
+      }
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.

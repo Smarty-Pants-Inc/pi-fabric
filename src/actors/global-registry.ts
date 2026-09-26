@@ -355,6 +355,11 @@ export class GlobalActorRegistry {
     };
   }
 
+  /** Changes whenever the registry file does. */
+  stamp(): string | undefined {
+    return this.#stat();
+  }
+
   #stat(): string | undefined {
     try {
       const stat = fs.statSync(this.#path);

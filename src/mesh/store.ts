@@ -919,6 +919,36 @@ export class MeshStore {
     });
   }
 
+  /**
+   * Changes whenever the shared state file does, from its metadata alone: a poll can test it
+   * without reading or parsing the file (review/astra F1 on #84).
+   */
+  stateStamp(): string | undefined {
+    try {
+      const stat = fs.statSync(this.#statePath);
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The stamp of the state payload that reads now return, from this store's cache: with fresh,
+   * after revalidating the cache against the file (a parse only when the file changed). A reader
+   * records what it consumed, not what is on disk (review/astra F2 on #84).
+   */
+  cachedStateStamp(fresh = false): string | undefined {
+    if (fresh) {
+      try {
+        this.#readCachedState(true);
+      } catch {
+        return undefined;
+      }
+    }
+    const cached = this.#stateCache;
+    return cached ? `${cached.device}:${cached.inode}:${cached.size}:${cached.modifiedAt}` : undefined;
+  }
+
   #readCachedState(fresh = false): MeshStateFile {
     const recent = this.#stateCache;
     if (!fresh && recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {

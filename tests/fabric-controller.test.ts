@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
@@ -5,6 +8,7 @@ import type { FabricActivityRun } from "../src/activity/types.js";
 import { FabricActivityStore } from "../src/activity/store.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricUiController } from "../src/ui/controller.js";
+import { MeshStore } from "../src/mesh/store.js";
 import type { FabricDashboard } from "../src/ui/dashboard.js";
 import { FabricWidget } from "../src/ui/widget.js";
 import "../src/ui/dashboard.js";
@@ -464,6 +468,101 @@ describe("FabricUiController dashboard wiring", () => {
       vi.useRealTimers();
     }
   });
+
+  // smarty-dev#1043: each 500 ms poll gathered and deep-compared every input while local work
+  // was active (about 11% of a busy Main). A poll now rebuilds only when a cheap stamp moved.
+  it("rebuilds a polled snapshot only when a stamp moved: Main at once, remote state at most every 5 s", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    state.config.ui.refreshMs = 500;
+    vi.mocked(state.actors.list).mockReturnValue([]);
+    const activity = new FabricActivityStore();
+    let stamp = "state-1";
+    const participantInfos = vi.fn(() => []);
+    Object.assign(state, {
+      activity,
+      participantInfos,
+      config: { ...state.config, mesh: { enabled: true } },
+      mesh: {
+        ...state.mesh, tail: vi.fn(() => ({ events: [], nextOffset: 0 })),
+        stateStamp: vi.fn(() => stamp), cachedStateStamp: vi.fn(() => stamp),
+      },
+    });
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    const gathered = () => participantInfos.mock.calls.length;
+    try {
+      controller.start(context);
+      activity.start("live", { name: "local work" });            // keeps the poll at refreshMs
+      await vi.advanceTimersByTimeAsync(200);                     // its own event-driven rebuild
+      const settled = gathered();
+      await vi.advanceTimersByTimeAsync(4_000);                   // 8 polls, nothing moved
+      expect(gathered()).toBe(settled);
+      expect(controller.snapshot().now).toBeGreaterThanOrEqual(Date.now() - 500);   // ages still move
+      stamp = "state-2";                                          // remote state changed
+      await vi.advanceTimersByTimeAsync(500);
+      expect(gathered()).toBe(settled);                           // less than 5 s since the last build
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(gathered()).toBe(settled + 1);                       // then once
+      const afterRemote = gathered();
+      vi.mocked(state.mainAgentInfo).mockReturnValue({
+        ...vi.mocked(state.mainAgentInfo)(), status: "running",
+      } as ReturnType<FabricState["mainAgentInfo"]>);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(gathered()).toBe(afterRemote + 1);                   // Main's own state: at once
+      const afterMain = gathered();
+      await vi.advanceTimersByTimeAsync(14_000);
+      expect(gathered()).toBe(afterMain);
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(gathered()).toBe(afterMain + 1);                     // a lapsing lease: every 15 s
+    } finally {
+      controller.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  // review/astra F2 on #84: a rebuild must show the state it records as built, even when the mesh
+  // read cache was warmed just before a remote write; and a rebuild that consumed an older cached
+  // payload must leave the gate open, not wait for the 15 s ceiling.
+  it.each(["a poll's remote rebuild", "an event-driven rebuild"] as const)(
+    "shows the remote state after %s with a freshly warmed mesh read cache",
+    async (order) => {
+      vi.useFakeTimers();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-dashboard-"));
+      const identity = { id: "session:writer", name: "writer", kind: "main" as const, sessionId: "writer" };
+      const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 2_000 });
+      const writer = new MeshStore(root, 64 * 1024, 100);
+      await writer.put({ key: "status", value: "A0", identity });
+      const state = stubState();
+      state.config.ui.refreshMs = 500;
+      vi.mocked(state.actors.list).mockReturnValue([]);
+      const activity = new FabricActivityStore();
+      Object.assign(state, { activity, config: { ...state.config, mesh: { enabled: true } }, mesh });
+      const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+      const controller = new FabricUiController(state);
+      const shown = () => controller.snapshot().state.find((entry) => entry.key === "status")?.value;
+      try {
+        controller.start(context);
+        activity.start("live", { name: "local work" });          // polls at refreshMs
+        await vi.advanceTimersByTimeAsync(4_700);
+        expect(shown()).toBe("A0");
+        await writer.put({ key: "status", value: "A", identity });
+        expect(mesh.get("status")?.value).toBe("A");             // another reader parses A: a warm cache
+        await writer.put({ key: "status", value: "B", identity });
+        if (order === "an event-driven rebuild") {
+          activity.beginCall("live", { callId: "c1", ref: "pi.read", args: {} });   // consumes the cached A
+          await vi.advanceTimersByTimeAsync(150);
+          expect(shown()).toBe("A");
+        }
+        await vi.advanceTimersByTimeAsync(order === "an event-driven rebuild" ? 5_500 : 1_000);
+        expect(shown()).toBe("B");
+      } finally {
+        controller.stop();
+        vi.useRealTimers();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("ticks the activity widget elapsed clock while nested calls are idle", async () => {
     vi.useFakeTimers();

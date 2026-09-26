@@ -66,6 +66,17 @@ describe("bounded shell lifecycle", () => {
     expect(fs.existsSync(path.dirname(job.pidPath))).toBe(false);
   });
 
+  // smarty-dev#883, review/astra F1 on #76: a slow shell start wrote its pid after the bounded
+  // read gave up, and the job never learned it.
+  it("learns a pid written after the first bounded read gave up", async () => {
+    const job = store().begin("bash", "slow start");
+    await expect(job.readPid()).resolves.toBeUndefined();                    // the bounded read gave up
+    fs.writeFileSync(job.pidPath, String(process.pid));                      // then the shell writes it
+    await vi.waitFor(() => expect(job.pid).toBe(process.pid), { timeout: 3_000, interval: 20 });
+    await expect(job.readPid()).resolves.toBe(process.pid);
+    await job.finish(0);
+  });
+
   it("bounds disk logs and retires spilled PID files while retaining readable logs", async () => {
     const job = store().begin("bash", "loud");
     fs.writeFileSync(job.pidPath, String(process.pid));

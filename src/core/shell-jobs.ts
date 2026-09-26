@@ -198,9 +198,31 @@ class FabricShellJob implements FabricShellJobHandle {
         }
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
+      this.#watchLatePid();
       return undefined;
     })();
     return this.#pidRead;
+  }
+
+  // A shell that starts slowly (Git Bash on Windows CI can take over a second) writes its pid
+  // after the bounded read above gave up. Keep looking until the job finishes, so a late pid
+  // still reaches info(), list() and later readPid() calls (smarty-dev#883).
+  #watchLatePid(): void {
+    const deadline = Date.now() + 5 * 60 * 1_000;
+    const timer = setInterval(() => {
+      if (this.finished || this.pid !== undefined || Date.now() > deadline) {
+        clearInterval(timer);
+        return;
+      }
+      void readFile(this.pidPath, "utf8").then((text) => {
+        const pid = parseShellPid(text);
+        if (pid === undefined || this.pid !== undefined || this.finished) return;
+        this.pid = pid;
+        this.#pidRead = Promise.resolve(pid);
+        clearInterval(timer);
+      }, () => undefined);
+    }, 100);
+    timer.unref?.();
   }
 
   spill(): void {

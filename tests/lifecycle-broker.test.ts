@@ -357,9 +357,9 @@ describe("LifecycleBroker", () => {
       }]);
       return value;
     };
-    const sourceDirectory = directory(sourceMesh, sourceIdentity, 300);
+    const sourceDirectory = directory(sourceMesh, sourceIdentity, 1_000);
     const targetDirectory = directory(targetMesh, targetIdentity, 60_000);   // the receiver stays live
-    await sourceDirectory.refresh();                           // the source's lease: 300 ms
+    await sourceDirectory.refresh();                           // the source's lease: 1 s
     await targetDirectory.refresh();
     const deliveries: FabricLifecycleEvent[] = [];
     const target = new LifecycleBroker(targetMesh, targetIdentity, targetDirectory,
@@ -371,7 +371,7 @@ describe("LifecycleBroker", () => {
       from: source.id, events: ["pi.agent_settled"], to: targetIdentity.id,
       delivery: "followUp", triggerTurn: false, once: false,
     });
-    await new Promise((resolve) => setTimeout(resolve, 400));  // the cached lease has lapsed
+    await new Promise((resolve) => setTimeout(resolve, 1_100));  // the cached lease has lapsed
     expect(targetDirectory.get(source.id)).toBeUndefined();   // the receiver's cached view
     await sourceDirectory.refresh();                           // the source renews ...
     // ... only in the shared state, as a runtime before host lease files does: a file lease is

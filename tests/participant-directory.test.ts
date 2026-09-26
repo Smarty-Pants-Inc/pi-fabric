@@ -127,6 +127,54 @@ describe("ParticipantDirectory host leases", () => {
     batches.mockRestore();
   });
 
+  // review/astra F1 on #68: a file-only renewal must not certify that the shared state is
+  // writable; otherwise a live peer blocked behind a held lock reads as departed (#24).
+  it("under the policy, never settle a peer that lapsed behind a held lock, and report the stall", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    await new MeshStore(meshRoot, 64 * 1024, 1_000).put({
+      key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner"),
+    });
+    let peerStatus: "idle" | "running" = "idle";
+    const make = (name: string, timing: { heartbeatMs: number; leaseMs: number }) => {
+      // A non-main peer: a main also writes a legacy session entry with a fixed 15 s lease.
+      const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: name === "peer" ? "actor" : "main", sessionId: name };
+      const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 10_000 }), {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing,
+      });
+      directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, name), ...(name === "peer" ? { status: peerStatus } : {}) }]);
+      directories.push(directory);
+      return directory;
+    };
+    const reader = make("reader", { heartbeatMs: 100, leaseMs: 2_000 });
+    const peer = make("peer", { heartbeatMs: 100, leaseMs: 400 });
+    await Promise.all([reader.start(), peer.start()]);
+    const seesPeer = () => reader.peers().some((candidate) => candidate.id === "session:peer");
+    await vi.waitFor(() => expect(seesPeer()).toBe(true), { timeout: 5_000, interval: 20 });
+    const lockPath = path.join(meshRoot, ".lock");
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
+    try {
+      peerStatus = "running";
+      void peer.refresh().catch(() => undefined);                 // renews its file, then blocks
+      let result: PeerSettleResult | undefined;
+      void awaitPeerSettle({
+        poll: () => reader.peers(),
+        stalled: () => reader.writeStalled(),
+        confirmedAt: () => reader.confirmedAt(),
+        selector: "session:peer",
+        settledForMs: 60_000,
+        pollMs: 20,
+      }).then((settled) => { result = settled; });
+      await vi.waitFor(() => expect(seesPeer()).toBe(false), { timeout: 3_000, interval: 10 });   // its lease lapsed
+      await vi.waitFor(() => expect(result).toBeDefined(), { timeout: 5_000, interval: 20 });
+      expect(result).toEqual({ ok: false, error: expect.stringMatching(/peer lease lapsed/) });
+    } finally {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    }
+  });
+
   it("under the policy, still renew the shared record every STATE_LEASE_RENEW_MS", async () => {
     const { hostEntry } = await setup(true);
     const shared = hostEntry()!;

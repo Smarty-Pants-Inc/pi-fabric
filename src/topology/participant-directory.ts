@@ -827,7 +827,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
           host.identity.id === this.options.identity.id &&
           host.startedAt === this.#startedAt &&
           leaseAt - host.updatedAt < STATE_LEASE_RENEW_MS
-        ) return true;
+        ) {
+          // The file shows only that this host is alive. A committed heartbeat also certifies
+          // that the shared state is writable (confirmedAt; peer-settle relies on it, #24), so
+          // take the lock once without a write: a stalled mesh still stops confirmation.
+          await this.mesh.confirmWritable();
+          return true;
+        }
       }
     }
 

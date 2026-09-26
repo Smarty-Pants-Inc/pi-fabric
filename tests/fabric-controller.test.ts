@@ -258,6 +258,49 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
+  // smarty-dev#251: on a shared mesh some peer is always present; polling remote records at
+  // refreshMs kept every idle Pi rebuilding its snapshot and re-rendering twice a second.
+  it("polls remote-only activity at the heartbeat interval and local activity at refreshMs", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    state.config.ui.refreshMs = 500;
+    vi.mocked(state.actors.list).mockReturnValue([]);
+    const remoteAgent = {
+      format: 1, id: "agent:remote", kind: "agent", rootId: "session:other", ownerHostId: "session:other",
+      ownerIdentityId: "session:other", name: "remote", status: "running", runner: "pi", transport: "host",
+      capabilities: [], startedAt: 1, updatedAt: 1, local: false, stale: false,
+    };
+    Object.assign(state, {
+      peerInfos: vi.fn(() => [{ id: "session:other", name: "other", kind: "main", status: "idle" }]),
+      participantInfos: vi.fn(() => [remoteAgent]),
+    });
+    const context = {
+      mode: "tui",
+      ui: { setWidget: vi.fn(), notify: vi.fn() },
+    } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      expect(controller.snapshot().agents.map((agent) => agent.id)).toContain("agent:remote");
+      expect(state.activity.runs).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(state.activity.runs).toHaveBeenCalledTimes(1);          // no 500 ms poll for peers
+      await vi.advanceTimersByTimeAsync(1);
+      expect(state.activity.runs).toHaveBeenCalledTimes(2);          // one per heartbeat
+      vi.mocked(state.activity.runs).mockReturnValue([{
+        id: "local-run", name: "Local", status: "running", phases: [], calls: [], items: [], events: [],
+        startedAt: 0, updatedAt: 0,
+      } as FabricActivityRun]);
+      await vi.advanceTimersByTimeAsync(5_000);                      // picks up the local run
+      expect(state.activity.runs).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(state.activity.runs).toHaveBeenCalledTimes(4);          // local activity: refreshMs
+    } finally {
+      controller.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("wakes settled UI state when actors or detached agents change", async () => {
     vi.useFakeTimers();
     const state = stubState();

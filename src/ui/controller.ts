@@ -23,6 +23,7 @@ import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, shouldShowFabricWidget } from "./widget.js";
 import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
+import { PARTICIPANT_HEARTBEAT_MS } from "../topology/participant-directory.js";
 
 const WIDGET_ID = "pi-fabric";
 const ACTIVITY_REFRESH_MS = 100;
@@ -592,21 +593,29 @@ export class FabricUiController {
       this.#timer = undefined;
     }
     if (this.#timer || !this.#context) return;
-    const active =
+    const localActive =
       this.#snapshot.runs.some((run) => run.status === "running") ||
-      this.#snapshot.peers.length > 0 ||
-      this.#snapshot.agents.some((agent) => isActiveStatus(agent.status)) ||
+      this.#snapshot.agents.some((agent) => agent.local !== false && isActiveStatus(agent.status)) ||
       this.#snapshot.actors.some(
         (actor) =>
           isActiveStatus(actor.status) ||
           Boolean(actor.worker && isActiveStatus(actor.worker.status)),
       );
-    if (!this.ownsInput && !active) return;
+    const remoteActive =
+      this.#snapshot.peers.length > 0 ||
+      this.#snapshot.agents.some((agent) => agent.local === false && isActiveStatus(agent.status));
+    if (!this.ownsInput && !localActive && !remoteActive) return;
+    // Remote records change at most once per owner heartbeat, and on a shared mesh some peer is
+    // always present, so polling them at refreshMs kept every idle Pi rebuilding the snapshot
+    // and re-rendering its TUI twice a second (smarty-dev#251: about 14% of a core each).
+    const delay = this.ownsInput || localActive
+      ? this.state.config.ui.refreshMs
+      : Math.max(this.state.config.ui.refreshMs, PARTICIPANT_HEARTBEAT_MS);
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       this.#refresh(false);
       this.#schedulePoll();
-    }, this.state.config.ui.refreshMs);
+    }, delay);
     this.#timer.unref();
   }
 

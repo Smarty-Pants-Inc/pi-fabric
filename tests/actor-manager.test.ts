@@ -573,6 +573,72 @@ describe("ActorManager across a session reload", () => {
     await waitFor(() => runs.filter((run) => /backlog-[ab]/.test(run.task) && run.finishedAt !== undefined).length === 2, 30_000);
   }, 60_000);
 
+  // review/astra F5 on #79: the registry claim and the queue copy cannot commit together. A restart
+  // between them, or a copy that cannot be written, must still recover the whole accepted backlog,
+  // with no cursor replay, and never delete the only durable copy.
+  it.each([
+    ["the adopter restarts after its claim but before it copies the backlog", "read"],
+    ["the adopter cannot write its own queue file", "write"],
+  ] as const)("recovers the dead owner's backlog when %s", async (_case, fault) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const runs = recordRuns(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    let ownerAlive = true;
+    const manager = (name: string, owns: () => boolean | undefined) => {
+      const value = new ActorManager(
+        name, { id: `session:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId: `session:${name}`, claimResidency: "session",
+          canManageActor: owns, lineageAlive: (rootId) => rootId !== "session:owner" || ownerAlive,
+          adoptionGraceMs: 0, meshCursorPath: path.join(root, `cursor-${name}.json`),
+        },
+      );
+      actorManagers.push(value);
+      return value;
+    };
+    const owner = manager("owner", () => (ownerAlive ? true : undefined));
+    const actor = await owner.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });
+    await waitFor(() => owner.status(actor.id).status === "running", 10_000);
+    await mesh.publish({ topic: "team.pulls", from, text: "backlog-a" });
+    await mesh.publish({ topic: "team.pulls", from, text: "backlog-b" });
+    await waitFor(() => owner.status(actor.id).queued === 2, 10_000);
+    await owner.close();
+    ownerAlive = false;
+    const ownerFile = path.join(root, "actors", actor.id, queueFiles(root, actor.id)[0]!.name);
+    const readFileSync = fs.readFileSync;
+    const renameSync = fs.renameSync;
+    const fail = (code: string) => Object.assign(new Error(`${code}: injected`), { code });
+    const spy = fault === "read"
+      ? vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+          if (file === ownerFile) throw fail("EIO");
+          return (readFileSync as (file: fs.PathOrFileDescriptor, options?: unknown) => string | Buffer)(file, options);
+        }) as typeof fs.readFileSync)
+      : vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+          if (path.basename(String(target)).startsWith("queue-")) throw fail("ENOSPC");
+          renameSync(source, target);
+        });
+    const first = manager("successor", () => undefined);                // claims the actor at once
+    await waitFor(() => first.status(actor.id).rootId === "session:successor", 10_000);
+    expect(fs.existsSync(ownerFile)).toBe(true);                         // the only durable copy stays
+    await first.close();                                                // and it dies before the backlog runs
+    spy.mockRestore();
+    manager("successor", () => undefined);                              // same cursor: no replay
+    const finished = (text: string) => runs.filter((run) => run.task.includes(text) && run.finishedAt !== undefined);
+    await waitFor(() => finished("backlog-a").length > 0 && finished("backlog-b").length > 0, 30_000);
+    await waitFor(() => !fs.existsSync(ownerFile), 10_000);              // deleted once the copy is written
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(runs.filter((run) => run.task.includes("backlog-a"))).toHaveLength(1);
+    expect(runs.filter((run) => run.task.includes("backlog-b"))).toHaveLength(1);
+  }, 60_000);
+
   // review/astra F3 (re-review) on #79: a host revision that changed after the last queue write
   // must not roll back on restart and make obsolete work valid again.
   it.each([

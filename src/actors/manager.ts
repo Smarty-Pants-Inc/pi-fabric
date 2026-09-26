@@ -78,6 +78,8 @@ interface ManagedActor {
   // this recently still has an adopter finding its footing — do not adopt
   // over it until ORPHAN_ADOPTION_RETRY_MS has elapsed.
   adoptedAt?: number;
+  // Roots whose queue files this lineage must take over (review/astra F5 on #79).
+  adoptedFrom?: string[];
   instructions: string;
   status: FabricActorStatus;
   events: FabricActorHostEvent[];
@@ -233,6 +235,8 @@ export class ActorManager {
   // snapshot taken before the load (a passive view, or the empty queue a new owner parks before
   // it reloads) would replace or delete the owner's accepted work (review/astra F1 on #79).
   readonly #ownQueueRead = new Set<string>();
+  // Predecessor queue files taken over, deleted after this lineage's own file is next written.
+  readonly #takenOver = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
   readonly #actorRoot: string;
@@ -2073,6 +2077,7 @@ export class ActorManager {
       name: actor.name,
       rootId: actor.rootId,
       ...(actor.adoptedAt !== undefined ? { adoptedAt: actor.adoptedAt } : {}),
+      ...(actor.adoptedFrom?.length ? { adoptedFrom: actor.adoptedFrom } : {}),
       instructions: actor.instructions,
       status: actor.status,
       events: actor.events,
@@ -2181,6 +2186,7 @@ export class ActorManager {
 
   #loadActors(onlyMissing = false): void {
     let added = 0;
+    const firstLoads: ManagedActor[] = [];
     let parsed: unknown;
     try {
       parsed = this.#registry.read();
@@ -2240,6 +2246,9 @@ export class ActorManager {
         name: record.name,
         rootId: typeof record.rootId === "string" ? record.rootId : this.#rootId,
         ...(typeof record.adoptedAt === "number" ? { adoptedAt: record.adoptedAt } : {}),
+        ...(Array.isArray(record.adoptedFrom)
+          ? { adoptedFrom: record.adoptedFrom.filter((root): root is string => typeof root === "string") }
+          : {}),
         instructions: record.instructions,
         status,
         events: Array.isArray(record.events)
@@ -2320,11 +2329,14 @@ export class ActorManager {
       // Once per process: later a live process's memory, not the file, holds its work.
       if (!this.#ownQueueRead.has(actor.id)) {
         this.#ownQueueRead.add(actor.id);
-        this.#restoreQueue(actor, this.#ownQueueFile(actor), false);
+        this.#restoreQueue(actor, this.#readQueue(this.#ownQueueFile(actor)), false);
+        firstLoads.push(actor);
       }
       added++;
       void this.#publishPresence(actor).catch(() => undefined);
     }
+    // After every own file, whose counters the predecessors' activations shift against.
+    for (const actor of firstLoads) this.#takeOverPredecessors(actor);
     if (added > 0) this.#emitChange();
     this.#scheduleRestoreParked();
   }
@@ -2332,15 +2344,15 @@ export class ActorManager {
   // smarty-dev#878: an actor's queue lived only in memory, while the mesh cursor already sat past
   // the queued events, so a restart lost them (33 on one relaunch). Invariants (design note on #878):
   // - Writer: each lineage (a root and the residency it claims) has its own file per actor, and
-  //   only that lineage writes it; an adopter also deletes a dead lineage's file after merging it.
-  //   So no host writes, replaces or deletes another's work (review/astra F1 on #79).
+  //   only that lineage writes it. An adopter deletes a predecessor's file only after it has
+  //   written the merged work to its own. So no host loses or overwrites another's work (F1, F5).
   // - Content: the lineage's pending items without a caller (mesh and host events) plus the
   //   running one, rewritten on every change, whatever the ownership: a drop, cancel or finish
   //   while unowned is recorded too. Ownership only decides what runs, through the parked path.
-  // - Reads: once per process, when the actor first loads; an adoption reads the dead lineage's
-  //   file. A regain reads nothing: memory already holds the work, without what was cancelled or
-  //   finished (review/astra F4). An item can run twice when its process died mid-run; one
-  //   restored three times without finishing is dropped.
+  // - Reads: its own file once per process, when the actor first loads; the predecessor files that
+  //   its registry claim names, on adoption and again at that load. A regain reads nothing: memory
+  //   already holds the work, without what was cancelled or finished (F4). An item can run twice
+  //   when its process died mid-run; one restored three times without finishing is dropped.
   #lineageKey(parts: readonly string[]): string {
     return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 16);
   }
@@ -2365,19 +2377,19 @@ export class ActorManager {
     return this.#queueFile(actor.id, this.#rootId, this.#claimResidency ?? actor.residency);
   }
 
-  #persistQueue(actorId: string): void {
-    if (!this.#persistent || this.#closing) return;
+  // Returns whether this lineage's file now holds the actor's work. Only then are the predecessor
+  // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
+  #persistQueue(actorId: string): boolean {
+    if (!this.#persistent || this.#closing) return false;
     const actor = this.#actors.get(actorId);
-    if (!actor) return;
+    if (!actor) return false;
     const inFlight = this.#inFlight.get(actorId);
     const items = [...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#parked.get(actorId) ?? [])]
       .filter((item) => !item.resolve && !item.reject);
     const file = this.#ownQueueFile(actor);
     try {
-      if (items.length === 0) {
-        fs.rmSync(file, { force: true });
-        return;
-      }
+      if (items.length === 0) fs.rmSync(file, { force: true });
+      else {
       const records = items.flatMap((item) => {
         try {
           return [JSON.parse(JSON.stringify({
@@ -2393,13 +2405,17 @@ export class ActorManager {
         }
       });
       // What validWhile reads, so it judges the items the same way after a restart.
-      writeJsonAtomic(file, {
-        format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
-        mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
-      });
+        writeJsonAtomic(file, {
+          format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
+          mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
+        });
+      }
     } catch {
-      // Queue persistence is best-effort; the in-memory queue still runs.
+      return false;                                         // best-effort; memory still runs the work
     }
+    for (const source of this.#takenOver.get(actorId) ?? []) fs.rmSync(source, { force: true });
+    this.#takenOver.delete(actorId);
+    return true;
   }
 
   #finishInFlight(actorId: string, item: ActorQueueItem): void {
@@ -2407,23 +2423,40 @@ export class ActorManager {
     this.#persistQueue(actorId);
   }
 
-  // Merges a queue file's items into the actor's parked work (which waits for ownership), skipping
-  // any item this manager already holds. Returns whether the file existed. This lineage's own file
-  // shares its revision counters, which continue from the saved ones; another root's file counts
-  // its own Main, so its host activations shift to judge the same against this manager's counters.
-  #restoreQueue(actor: ManagedActor, file: string, foreign: boolean): boolean {
-    if (!this.#persistent) return false;
-    let parsed: unknown;
+  #readQueue(file: string): unknown {
     try {
-      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+      return JSON.parse(fs.readFileSync(file, "utf8"));
     } catch {
-      return false;
+      return undefined;                                      // absent, or unreadable for now
     }
+  }
+
+  // Adoption handoff (review/astra F5 on #79). The registry claim names the predecessor roots
+  // whose files hold work; this lineage takes those files over right after it adopts the actor
+  // and again when it first loads it, so a crash or read error between the claim and the copy
+  // only delays the copy. A taken-over file is deleted once this lineage's own file is written.
+  #takeOverPredecessors(actor: ManagedActor): void {
+    if (actor.rootId !== this.#rootId) return;
+    for (const rootId of actor.adoptedFrom ?? []) {
+      const file = this.#queueFile(actor.id, rootId, actor.residency);
+      const saved = this.#readQueue(file);
+      if (saved === undefined) continue;
+      this.#takenOver.set(actor.id, new Set([...(this.#takenOver.get(actor.id) ?? []), file]));
+      this.#restoreQueue(actor, saved, true);
+    }
+  }
+
+  // Merges saved queue items into the actor's parked work (which waits for ownership), skipping
+  // any item or mesh event this manager already holds. This lineage's own file shares its revision
+  // counters, which continue from the saved ones; another root's file counts its own Main, so its
+  // host activations shift to judge the same against this manager's counters.
+  #restoreQueue(actor: ManagedActor, parsed: unknown, foreign: boolean): void {
+    if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
       format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
-    if (!Array.isArray(records)) return true;
+    if (!Array.isArray(records)) return;
     const counter = (value: unknown): number =>
       typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
     actor.latestActivationSequence = Math.max(actor.latestActivationSequence, counter(saved.latestActivationSequence));
@@ -2470,15 +2503,18 @@ export class ActorManager {
         this.#recordDropped(actor, item, "it was restored after three restarts that did not finish it");
         continue;
       }
-      // A cursor replay of the same mesh event must not queue it a second time.
+      // A cursor replay of the same mesh event must not queue it a second time, nor may a
+      // predecessor's copy of an event this manager already took.
       const eventId = value.source.startsWith("mesh:") && typeof value.payload === "object" && value.payload !== null
         ? (value.payload as { id?: unknown }).id : undefined;
-      if (typeof eventId === "string") this.#delivered.add(`${actor.id}\0${eventId}`);
+      if (typeof eventId === "string") {
+        if (this.#delivered.has(`${actor.id}\0${eventId}`)) continue;
+        this.#delivered.add(`${actor.id}\0${eventId}`);
+      }
       restored.push(item);
     }
     if (restored.length > 0) this.#parked.set(actor.id, [...restored, ...(this.#parked.get(actor.id) ?? [])]);
     this.#persistQueue(actor.id);
-    return true;
   }
 
   #resolvedModel(runner: FabricAgentRunner, model: string): string {
@@ -2673,6 +2709,11 @@ export class ActorManager {
         for (const record of records) {
           if (typeof record.rootId === "string") this.#persistedRoots.set(record.id, record.rootId);
         }
+        // The claim and the queue copy cannot commit together, so the claim names the roots whose
+        // files still hold work; the copy completes on adoption, or on this lineage's next load.
+        const earlier = Array.isArray(current.adoptedFrom) ? current.adoptedFrom : [];
+        actor.adoptedFrom = [...new Set([expectedRootId, ...earlier])].filter((root): root is string =>
+          typeof root === "string" && fs.existsSync(this.#queueFile(actor.id, root, actor.residency)));
         actor.rootId = this.#rootId;
         actor.adoptedAt = Date.now();
         actor.updatedAt = Date.now();
@@ -2683,9 +2724,7 @@ export class ActorManager {
       });
       if (adopted) {
         this.#persistedRoots.set(actor.id, this.#rootId);
-        // The dead lineage's accepted work moves into this lineage's file.
-        const dead = this.#queueFile(actor.id, expectedRootId, actor.residency);
-        if (this.#restoreQueue(this.#actors.get(actor.id) ?? actor, dead, true)) fs.rmSync(dead, { force: true });
+        this.#takeOverPredecessors(this.#actors.get(actor.id) ?? actor);
       } else {
         const current = this.#registry.records().find((record) => record.id === actor.id);
         if (!current) {

@@ -93,18 +93,39 @@ export class FabricComponentConfiguration implements ComponentConfigurationStore
 
 /** Stat watching handles missing files and atomic replacement on all supported hosts. */
 export function watchComponentConfiguration(paths: readonly string[], changed: () => void): () => void {
+  // The baseline is taken now, when watching starts (smarty-dev#883). fs.watchFile took it on its
+  // first asynchronous poll, so a write between the caller's reconcile and that poll was never
+  // reported. Few files, polled every 250 ms like before.
+  const signature = (file: string): string => {
+    try {
+      const stat = fs.statSync(file);
+      return `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    } catch {
+      return "missing";
+    }
+  };
+  const seen = new Map(paths.map((file) => [file, signature(file)] as const));
   let timer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
-  const listener = (current: fs.Stats, previous: fs.Stats) => {
-    if (closed || (current.mtimeMs === previous.mtimeMs && current.ctimeMs === previous.ctimeMs && current.size === previous.size && current.ino === previous.ino)) return;
+  const poll = setInterval(() => {
+    if (closed) return;
+    let differs = false;
+    for (const file of paths) {
+      const current = signature(file);
+      if (current !== seen.get(file)) {
+        seen.set(file, current);
+        differs = true;
+      }
+    }
+    if (!differs) return;
     clearTimeout(timer);
     timer = setTimeout(() => { timer = undefined; if (!closed) changed(); }, 50);
     timer.unref();
-  };
-  for (const file of paths) fs.watchFile(file, { persistent: false, interval: 250 }, listener);
+  }, 250);
+  poll.unref();
   return () => {
     closed = true;
     clearTimeout(timer);
-    for (const file of paths) fs.unwatchFile(file, listener);
+    clearInterval(poll);
   };
 }

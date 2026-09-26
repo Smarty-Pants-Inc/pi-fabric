@@ -47,11 +47,17 @@ const phaseProgress = (
   return { completed, total: Math.max(phase?.total ?? 0, statuses.length) };
 };
 
+// smarty-dev#1089: the widget is this session's status. Every pane showed the same "5 running" for
+// other sessions' runs (from the project-wide participant list), which misled agents about their own
+// state. Only runs rooted in this session count here; the dashboard still shows every root's runs.
+const ownAgents = (snapshot: FabricDashboardSnapshot): FabricDashboardSnapshot["agents"] =>
+  snapshot.agents.filter((agent) => agent.rootId === undefined || agent.rootId === snapshot.main.id);
+
 const totalTokens = (
   snapshot: FabricDashboardSnapshot,
   run: FabricActivityRun | undefined,
 ): number =>
-  snapshot.agents
+  ownAgents(snapshot)
     .filter((agent) => (run ? agent.runId === run.id : isActiveStatus(agent.status)))
     .reduce(
       (sum, agent) => sum + (agent.usage ? agent.usage.input + agent.usage.output : 0),
@@ -62,7 +68,7 @@ const totalCost = (
   snapshot: FabricDashboardSnapshot,
   run: FabricActivityRun | undefined,
 ): number =>
-  snapshot.agents
+  ownAgents(snapshot)
     .filter((agent) => (run ? agent.runId === run.id : isActiveStatus(agent.status)))
     .reduce((sum, agent) => sum + (agent.usage?.cost ?? 0), 0);
 
@@ -102,7 +108,7 @@ export const shouldShowFabricWidget = (
 ): boolean => {
   if (mode === "hidden") return false;
   if (mode === "always") return true;
-  if (snapshot.agents.some((agent) => isActiveStatus(agent.status))) return true;
+  if (ownAgents(snapshot).some((agent) => isActiveStatus(agent.status))) return true;
   if (snapshot.actors.some((actor) => actor.status !== "stopped")) return true;
   const run = snapshot.runs[0];
   if (!run) return false;
@@ -210,7 +216,7 @@ export class FabricWidget implements Component {
         candidateFinishedAt > (snapshot.widgetDismissedAt ?? 0))
         ? candidateRun
         : undefined;
-    const orderedAgents = orderAgentsByCreation(snapshot.agents);
+    const orderedAgents = orderAgentsByCreation(ownAgents(snapshot));
     const activeAgents = orderedAgents.filter((agent) => isActiveStatus(agent.status));
     const activeAgentIds = new Set(activeAgents.map((agent) => agent.id));
     const terminalAgents = run

@@ -129,9 +129,10 @@ describe("cooperative bash middleware", () => {
     fs.writeFileSync(path.join(h.cwd, "fixture"), `${SECRET}\n`);
     const result = await h.invoke({ command: "cat fixture; sleep 0.2; cat fixture", ...(immediate ? { run_in_background: true } : {}) });
     expect(result).toMatchObject({ ok: true, details: { running: true, logPath: expect.any(String) } });
-    // A handoff after 30 ms can come before a slow Git Bash (Windows CI) writes its pid file;
-    // readPid() then reports none. shell-hang.test.ts covers the pid itself.
-    if (immediate || result.details?.pid !== undefined) expect(result.details?.pid).toEqual(expect.any(Number));
+    // A handoff, after 30 ms or at once for a background run, can come before a slow Git Bash
+    // (Windows CI) writes its pid file; readPid() then reports none (smarty-dev#883: the
+    // immediate case failed there too). shell-hang.test.ts covers the pid itself.
+    if (result.details?.pid !== undefined) expect(result.details.pid).toEqual(expect.any(Number));
     expect(result.output).not.toContain(SECRET);
     await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toEqual(expect.any(Number)));
     const log = fs.readFileSync(result.details!.logPath!, "utf8");
@@ -177,7 +178,8 @@ describe("cooperative bash middleware", () => {
     const controller = new AbortController();
     const waiting = h.invoke({ command: "sleep 8" }, controller.signal);
     const rejected = expect(waiting).rejects.toThrow();
-    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.pid).toEqual(expect.any(Number)));
+    // Git Bash on Windows CI can take over a second to start (smarty-dev#883).
+    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.pid).toEqual(expect.any(Number)), { timeout: 10_000 });
     controller.abort(new Error("cancel probe"));
     await rejected;
     const result = await h.invoke({ command: "sleep 8", background: true });

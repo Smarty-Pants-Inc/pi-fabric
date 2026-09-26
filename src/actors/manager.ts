@@ -2581,6 +2581,7 @@ export class ActorManager {
       scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
+      ...(actor.project ? { project: actor.project } : {}),
       // The instruction text stays private; its digest lets a caller verify setInstructions
       // against a rendered role without reading the registry file (smarty-dev#918).
       instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
@@ -2684,12 +2685,14 @@ export class ActorManager {
     // Only residency-matched rows: Main adopts "session" actors, the resident
     // host adopts "durable" actors.
     if (actor.residency !== this.#claimResidency) return;
-    // smarty-dev#878: the project registry is fleet-wide, so any Main could adopt a session
-    // actor, and its work then went to an unrelated session. Only the project agent of the
-    // actor's project adopts it now. A record from before projects were recorded keeps the old rule.
+    // smarty-dev#878: the project registry is fleet-wide, so any Main or resident host could adopt
+    // an orphan, and its work then went to an unrelated project. Only a host of the actor's project
+    // adopts it now: for a session actor its project agent, for a durable actor a resident host of
+    // that project, whose deliveries follow the project's agent. A record from before projects
+    // were recorded keeps the old rule.
     if (
-      this.#claimResidency === "session" && actor.project !== undefined &&
-      (this.#role !== "project-agent" || this.#project !== actor.project)
+      actor.project !== undefined &&
+      (this.#project !== actor.project || (this.#claimResidency === "session" && this.#role !== "project-agent"))
     ) return;
     // Only when the directory has no live opinion about the actor itself.
     if (this.#canManageActor(actor.id) !== undefined) return;

@@ -10,6 +10,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import { projectOf } from "../src/topology/project-identity.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
   RESIDENT_HOST_FORMAT,
@@ -744,6 +745,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(residentActors.every((actor) => actor.residency === "durable")).toBe(true);
       expect(first.scope).toBe("project");
       expect(second.scope).toBe("session");
+      // smarty-dev#878: resident-side creation records the creating project too.
+      expect(residentActors.map((actor) => actor.project)).toEqual([projectOf(state.config.cwd), projectOf(state.config.cwd)]);
       expect(second.sessionFile).toContain(path.join(state.config.sessionActorRoot!, second.id));
       expect(new Set(residentActors.map((actor) => actor.sessionFile)).size).toBe(2);
 

@@ -785,6 +785,56 @@ describe("ActorManager across a session reload", () => {
     expect(delivered.get("worktree")).toBeUndefined();
   }, 60_000);
 
+  // review/astra F1 on #80: two projects share the fleet actor directory. After project A's hosts
+  // die, project B's resident host must not adopt A's durable supervisor, so B never receives its
+  // output; a resident host of A's project adopts it and gets it, for A's project agent.
+  it("lets only a resident host of a durable actor's project adopt it, and delivers its output there", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const alive = new Map<string, boolean>([["session:a", true]]);
+    const delivered = new Map<string, Array<{ text: string; project?: string }>>();
+    const resident = (rootId: string, project: string) => {
+      const value = new ActorManager(
+        rootId, { id: `resident:${rootId}`, name: "resident", kind: "agent", sessionId: rootId }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents,
+        ({ actor, message }) => {
+          if (message.text) delivered.set(rootId, [...(delivered.get(rootId) ?? []), { text: message.text, ...(actor.project ? { project: actor.project } : {}) }]);
+        },
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId, claimResidency: "durable", project,
+          adoptionGraceMs: 0, meshCursorPath: path.join(root, `cursor-${rootId}.json`),
+          canManageActor: () => (rootId === "session:a" && alive.get("session:a") ? true : undefined),
+          lineageAlive: (lineage) => alive.get(lineage) ?? true,
+        },
+      );
+      actorManagers.push(value);
+      return value;
+    };
+    const residentA = resident("session:a", "/p/a");
+    const actor = await residentA.create({
+      name: "supervisor", instructions: "Supervise.", topics: ["team.pulls"], responseMode: "text",
+      residency: "durable", delivery: "steer", triggerTurn: false,
+    });
+    expect(actor.project).toBe("/p/a");                                   // resident-side creation records it
+    await residentA.close();
+    alive.set("session:a", false);                                        // A's Main and resident host are gone
+    const residentB = resident("session:b", "/p/b");                      // an unrelated project's resident host
+    residentB.listOwned();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(residentB.status(actor.id).rootId).toBe("session:a");
+    const residentA2 = resident("session:a2", "/p/a");                    // A's replacement project agent's host
+    await waitFor(() => residentA2.status(actor.id).rootId === "session:a2", 10_000);
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "a pull request" });
+    await waitFor(() => (delivered.get("session:a2") ?? []).length > 0, 20_000);
+    expect(delivered.get("session:a2")![0]!.project).toBe("/p/a");       // routed by the actor's project
+    expect(delivered.get("session:b")).toBeUndefined();
+  }, 60_000);
+
   // review/astra F3 (re-review) on #79: a host revision that changed after the last queue write
   // must not roll back on restart and make obsolete work valid again.
   it.each([

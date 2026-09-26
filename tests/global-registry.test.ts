@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
 
@@ -273,4 +273,47 @@ describe("GlobalActorRegistry across sessions", () => {
     expect(second.remove(created.id)).toEqual({ removed: true });
     expect(first.list()).toEqual([]);
   });
+
+  // review/astra F1 on #77: a session that replaced the file right after this one's save must
+  // not be hidden by a fingerprint taken after the rename.
+  it("sees a replacement made right after its own save, and a later write keeps it", () => {
+    const dir = agentDir();
+    const first = new GlobalActorRegistry(dir, 64 * 1024);
+    const rename = fs.renameSync;
+    let replaced = false;
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (!replaced && String(to).endsWith("global-actors.json")) {
+        replaced = true;
+        new GlobalActorRegistry(dir, 64 * 1024).create(template("beta"));   // another session, at once
+      }
+    });
+    first.create(template("alpha"));
+    spy.mockRestore();
+    expect(first.list().map((t) => t.name).sort()).toEqual(["alpha", "beta"]);
+    first.create(template("later"));
+    expect(new GlobalActorRegistry(dir, 64 * 1024).list().map((t) => t.name).sort()).toEqual(["alpha", "beta", "later"]);
+  });
+
+  // review/astra F2 on #77: a failed reload must not look like an empty registry.
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "keeps its snapshot when the file cannot be read, refuses to write, and loses nothing after",
+    () => {
+      const dir = agentDir();
+      const first = new GlobalActorRegistry(dir, 64 * 1024);
+      first.create(template("alpha"));
+      expect(first.list()).toHaveLength(1);
+      new GlobalActorRegistry(dir, 64 * 1024).create(template("beta"));   // another session changes it
+      const file = path.join(dir, "fabric", "actors", "global-actors.json");
+      fs.chmodSync(file, 0o000);
+      try {
+        expect(first.list().map((t) => t.name)).toEqual(["alpha"]);       // the previous snapshot
+        expect(() => first.create(template("gamma"))).toThrow(/could not be read, so it was not changed/);
+      } finally {
+        fs.chmodSync(file, 0o600);
+      }
+      first.create(template("gamma"));
+      expect(new GlobalActorRegistry(dir, 64 * 1024).list().map((t) => t.name).sort()).toEqual(["alpha", "beta", "gamma"]);
+    },
+  );
 });

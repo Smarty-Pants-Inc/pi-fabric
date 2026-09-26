@@ -47,6 +47,100 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  // smarty-dev#424: a lock timeout while the owner claimed, recorded or acknowledged a command
+  // dropped it without an acknowledgement or a retry (dev-lead: 30 of 61 commands in 6 h).
+  describe("after a lock timeout", () => {
+    const lockTimeout = () => Object.assign(new Error("Timed out waiting for the Fabric mesh lock"), {
+      code: "FABRIC_MESH_LOCK_TIMEOUT",
+    });
+    const failOnce = <K extends "put" | "publish">(method: K, when: (store: MeshStore, input: never) => boolean, afterMs = 0) => {
+      const original = MeshStore.prototype[method] as (...args: unknown[]) => unknown;
+      let failed = false;
+      return vi.spyOn(MeshStore.prototype, method).mockImplementation(function (this: MeshStore, input: never) {
+        if (!failed && when(this, input)) {
+          failed = true;
+          return new Promise((_resolve, reject) => setTimeout(() => reject(lockTimeout()), afterMs));
+        }
+        return original.call(this, input);
+      } as never);
+    };
+    const run = async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const sender = plane(meshRoot, "host:sender");
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn((received: { commandId: string }) => ({ accepted: true, messageId: "local:" + received.commandId }));
+      sender.start(() => ({ accepted: false }));
+      receiver.start(receive);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return { meshRoot, receive, request: () => sender.request("host:receiver", "agent:target", "steer", { message: "once" }) };
+    };
+    const shared = (store: MeshStore) => !store.root.includes(`${path.sep}control-seen${path.sep}`);
+    const isClaim = (input: { key?: string }) => input.key?.startsWith("topology/control-seen/") === true;
+
+    it("on the shared claim, the command is claimed on the next poll and runs once", async () => {
+      const { receive, request } = await run();
+      const spy = failOnce("put", (store, input: { key?: string }) => shared(store) && isClaim(input));
+      const result = await request();
+      expect(result.messageId).toMatch(/^local:/);
+      expect(receive).toHaveBeenCalledTimes(1);
+      expect(spy.mock.results.some((entry) => entry.type === "return")).toBe(true);
+    });
+
+    it("between the shared and the own claim, the retry keeps its shared claim and runs once", async () => {
+      const { receive, request } = await run();
+      failOnce("put", (store, input: { key?: string; value?: { acceptance?: unknown } }) =>
+        !shared(store) && isClaim(input) && input.value?.acceptance === undefined);
+      const result = await request();
+      expect(result.messageId).toMatch(/^local:/);                           // not "indeterminate"
+      expect(receive).toHaveBeenCalledTimes(1);
+    });
+
+    it("while recording the outcome, the sender still gets it", async () => {
+      const { receive, request } = await run();
+      failOnce("put", (store, input: { key?: string; value?: { acceptance?: unknown } }) =>
+        !shared(store) && isClaim(input) && input.value?.acceptance !== undefined);
+      const result = await request();
+      expect(result.messageId).toMatch(/^local:/);
+      expect(receive).toHaveBeenCalledTimes(1);
+    });
+
+    // review/astra F1 on #67: a detached ask is consumed before it runs, so nothing retries its
+    // acknowledgement; keeping its outcome would grow memory without bound under contention.
+    it("of a detached ask, no outcome is kept: a replay is answered from the store alone", async () => {
+      const { meshRoot, receive } = await run();
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const ask = {
+        topic: "fabric.control.command", kind: "ask", from: identity("host:sender"), to: "host:receiver",
+        data: { version: 1, commandId: "command:ask", targetId: "agent:target", operation: "ask", replyTo: "host:sender",
+          message: "inspect", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 },
+      };
+      const acks = () => store.read({ topic: "fabric.control.ack", limit: 100 })
+        .filter((event) => (event.data as { commandId?: string }).commandId === "command:ask");
+      failOnce("put", (owner, input: { key?: string; value?: { acceptance?: unknown } }) =>
+        !shared(owner) && isClaim(input) && input.value?.acceptance !== undefined);
+      failOnce("publish", (_owner, input: { topic?: string }) => input.topic === "fabric.control.ack");
+      await store.publish(ask);
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 3_000, interval: 20 });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(acks()).toHaveLength(0);                                       // not retried: detached
+      await store.publish(ask);                                             // a replay of the same command
+      await vi.waitFor(() => expect(acks()).toHaveLength(1), { timeout: 3_000, interval: 20 });
+      expect(acks()[0]!.data).toMatchObject({ accepted: false, error: expect.stringContaining("indeterminate") });
+      expect(receive).toHaveBeenCalledTimes(1);
+    });
+
+    it("on the acknowledgement, the next poll publishes the real outcome, even past the deadline", async () => {
+      const { receive, request } = await run();
+      // A real lock wait (10 s) outlasts the deadline (1 s here): the retry must not answer "expired".
+      failOnce("publish", (_store, input: { topic?: string }) => input.topic === "fabric.control.ack", 1_200);
+      const result = await request();
+      expect(result.messageId).toMatch(/^local:/);
+      expect(receive).toHaveBeenCalledTimes(1);
+    });
+  });
+
   // smarty-dev#643: dedupe records lived in the shared state (26% of it on the fleet), and each
   // received command rewrote that whole file twice.
   describe("dedupe records", () => {

@@ -17,6 +17,9 @@ const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
 // Records other hosts left in the shared state before smarty-dev#643 are checked this often.
 const LEGACY_SEEN_CLEANUP_MS = 15 * 60 * 1_000;
+// A lock wait that timed out committed nothing, so the step that hit it is retried.
+const isLockTimeout = (error: unknown): boolean =>
+  isObject(error) && error.code === "FABRIC_MESH_LOCK_TIMEOUT";
 // A shared claim for a command with an explicit deadline is deleted this long after it expires,
 // once the fleet owner has ended support for runtimes before phase 1 (see #cleanupLegacySeen).
 const SHARED_SEEN_GRACE_MS = 10 * 60 * 1_000;
@@ -161,6 +164,12 @@ export class FabricControlPlane {
     { controller: AbortController; requesterId: string; targetId: string }
   >();
   readonly #activeHandlers = new Set<Promise<void>>();
+  // smarty-dev#424: progress kept across a retried command, since a lock timeout can come
+  // between two of its writes. Shared claims this runtime won, by seen key; outcomes of
+  // commands that ran but whose acknowledgement is not yet published, by command id. Each
+  // entry expires with its command's answer window and is evicted on the next drain.
+  readonly #sharedClaims = new Map<string, number>();
+  readonly #unpublished = new Map<string, { acceptance: FabricControlAcceptance; expiresAt: number }>();
   readonly #pollMs: number;
   readonly #ackTimeoutMs: number;
   #offset: number;
@@ -391,6 +400,8 @@ export class FabricControlPlane {
     await this.#polling?.catch(() => undefined);
     await this.#drain().catch(() => undefined);
     this.#closed = true;
+    this.#sharedClaims.clear();
+    this.#unpublished.clear();
     const cancellations: Promise<void>[] = [];
     for (const id of [...this.#pending.keys()]) {
       const pending = this.#clearPending(id);
@@ -417,16 +428,23 @@ export class FabricControlPlane {
   }
 
   async #drain(): Promise<void> {
+    const now = Date.now();
+    for (const [key, expiresAt] of this.#sharedClaims) if (expiresAt < now) this.#sharedClaims.delete(key);
+    for (const [id, kept] of this.#unpublished) if (kept.expiresAt < now) this.#unpublished.delete(id);
     while (true) {
       const tail = this.mesh.tail(this.#offset, 100);
-      this.#offset = tail.nextOffset;
       for (const event of tail.events) {
         if (event.sequence <= this.#lastSequence) continue;
+        // An event is consumed only once handled: a command that hit a lock timeout throws,
+        // and the next poll reads this page again from it (smarty-dev#424). Each retry is
+        // bounded by the command's deadline plus the acknowledgement grace.
+        if (event.to === this.options.hostId) {
+          if (event.topic === ACK_TOPIC) this.#acceptAcknowledgement(event);
+          else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
+        }
         this.#lastSequence = event.sequence;
-        if (event.to !== this.options.hostId) continue;
-        if (event.topic === ACK_TOPIC) this.#acceptAcknowledgement(event);
-        else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
       }
+      this.#offset = tail.nextOffset;
       if (tail.events.length < 100) break;
     }
     await this.#cleanupSeen(Date.now()).catch(() => undefined);
@@ -466,12 +484,23 @@ export class FabricControlPlane {
       command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs,
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
     );
+    const key = controlSeenKey(this.options.hostId, command.commandId);
+    const answerable = now <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4;
+    const ran = this.#unpublished.get(command.commandId);
+    if (ran) {
+      // The command ran, and only its acknowledgement failed: send the real outcome.
+      if (answerable) await this.#publishAcknowledgement(command, ran.acceptance);
+      this.#unpublished.delete(command.commandId);
+      this.#sharedClaims.delete(key);
+      return;
+    }
     if (now > deadlineAt || command.requestedAt - now > this.#ackTimeoutMs) {
+      this.#sharedClaims.delete(key);
       // A sender waits at most MAX_CONTROL_ACK_GRACE_MS past the deadline. An older command
       // is history: a restarting owner replays the retained log from its start, and
       // answering every past command added one locked publish each, thousands per
       // relaunch wave (smarty-dev#367). Only a sender that may still wait gets an answer.
-      if (now <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) {
+      if (answerable) {
         await this.#publishAcknowledgement(command, {
           accepted: false,
           error: "Fabric control command expired",
@@ -480,8 +509,10 @@ export class FabricControlPlane {
       return;
     }
 
-    const key = controlSeenKey(this.options.hostId, command.commandId);
-    const duplicate = this.#seenRecord(key);
+    // A shared claim this runtime already won is its own, not a duplicate.
+    const duplicate = this.#sharedClaims.has(key)
+      ? controlSeenRecord(this.#seen.get(key)?.value)
+      : this.#seenRecord(key);
     if (duplicate) {
       if (
         duplicate.hostId === this.options.hostId &&
@@ -504,7 +535,7 @@ export class FabricControlPlane {
       // One claim authority across versions (smarty-dev#643, phase 1): runtimes before this
       // change claim only the shared key, so this runtime claims it first and runs the command
       // only when that claim wins too. The outcome is kept only in this host's own store.
-      await this.mesh.put({
+      if (!this.#sharedClaims.has(key)) await this.mesh.put({
         key,
         value: {
           format: 1,
@@ -517,6 +548,7 @@ export class FabricControlPlane {
         identity: this.identity,
         ifVersion: 0,
       });
+      this.#sharedClaims.set(key, deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4);
       claim = await this.#seen.put({
         key,
         value: {
@@ -530,7 +562,9 @@ export class FabricControlPlane {
         identity: this.identity,
         ifVersion: 0,
       });
-    } catch {
+    } catch (error) {
+      if (isLockTimeout(error)) throw error;
+      this.#sharedClaims.delete(key);
       const raced = this.#seenRecord(key);
       if (
         raced?.hostId === this.options.hostId &&
@@ -548,6 +582,7 @@ export class FabricControlPlane {
       return;
     }
 
+    this.#sharedClaims.delete(key);
     const execution = this.#executeClaimedCommand(
       command,
       event.from,
@@ -626,10 +661,24 @@ export class FabricControlPlane {
           identity: this.identity,
           ifVersion: claimVersion,
         });
-      } catch {
-        return;
+      } catch (error) {
+        // A conflict means another owner holds this claim; a lock timeout wrote nothing, and
+        // the command has run, so its sender still gets the outcome.
+        if (!isLockTimeout(error)) return;
       }
-      await this.#publishAcknowledgement(command, acceptance);
+      try {
+        await this.#publishAcknowledgement(command, acceptance);
+      } catch (error) {
+        // An "ask" runs detached from the drain, which has consumed it: nothing retries it, so
+        // its outcome is not kept (its sender's result wait times out instead).
+        if (command.operation !== "ask") {
+          this.#unpublished.set(command.commandId, {
+            acceptance,
+            expiresAt: deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4,
+          });
+        }
+        throw error;
+      }
     } finally {
       clearTimeout(deadlineTimer);
       const active = this.#activeCommands.get(command.commandId);
@@ -751,6 +800,9 @@ export class FabricControlPlane {
           ...(acceptance.error ? { error: acceptance.error } : {}),
         },
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        // A lock timeout published nothing: the caller retries it (smarty-dev#424).
+        if (isLockTimeout(error)) throw error;
+      });
   }
 }

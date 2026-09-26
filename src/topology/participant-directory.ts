@@ -16,6 +16,7 @@ import {
   fileLeasesOnly,
   hostLeaseExpiry,
   LIVENESS_POLICY_KEY,
+  readHostLease,
   readHostLeases,
   removeHostLease,
   STATE_LEASE_RENEW_MS,
@@ -507,9 +508,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (participant?.id === target) {
         const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId), read);
         const owner = hostEntry ? hostFromEntry(hostEntry) : undefined;
+        const lease = owner ? readHostLease(this.mesh.root, owner.id) : undefined;
         if (
           owner &&
-          owner.expiresAt >= now &&
+          hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner) >= now &&
           owner.identity.id === participant.ownerIdentityId &&
           owner.rootId === participant.rootId
         ) {

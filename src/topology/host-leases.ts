@@ -95,6 +95,26 @@ export const readHostLeases = (meshRoot: string): Map<string, FabricHostLease> =
   return leases;
 };
 
+/** One host's file lease, from the same cache; for a single-participant lookup. */
+export const readHostLease = (meshRoot: string, hostId: string): FabricHostLease | undefined => {
+  const dir = path.join(meshRoot, LEASE_DIR);
+  const name = fileName(hostId);
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(path.join(dir, name));
+  } catch {
+    return undefined;
+  }
+  const known = cache.get(dir) ?? new Map();
+  cache.set(dir, known);
+  let slot = known.get(name);
+  if (!slot || slot.mtimeMs !== stat.mtimeMs || slot.size !== stat.size) {
+    slot = { mtimeMs: stat.mtimeMs, size: stat.size, lease: parseLease(path.join(dir, name), name) };
+    known.set(name, slot);
+  }
+  return slot.lease;
+};
+
 /** A host lease's effective expiry: the later of its shared-state lease and its file lease. */
 export const hostLeaseExpiry = (
   leases: ReadonlyMap<string, FabricHostLease>,

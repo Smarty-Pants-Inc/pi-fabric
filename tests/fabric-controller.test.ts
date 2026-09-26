@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
@@ -5,6 +8,7 @@ import type { FabricActivityRun } from "../src/activity/types.js";
 import { FabricActivityStore } from "../src/activity/store.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricUiController } from "../src/ui/controller.js";
+import { MeshStore } from "../src/mesh/store.js";
 import type { FabricDashboard } from "../src/ui/dashboard.js";
 import { FabricWidget } from "../src/ui/widget.js";
 import "../src/ui/dashboard.js";
@@ -479,7 +483,10 @@ describe("FabricUiController dashboard wiring", () => {
       activity,
       participantInfos,
       config: { ...state.config, mesh: { enabled: true } },
-      mesh: { ...state.mesh, tail: vi.fn(() => ({ events: [], nextOffset: 0 })), stateStamp: vi.fn(() => stamp) },
+      mesh: {
+        ...state.mesh, tail: vi.fn(() => ({ events: [], nextOffset: 0 })),
+        stateStamp: vi.fn(() => stamp), cachedStateStamp: vi.fn(() => stamp),
+      },
     });
     const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
     const controller = new FabricUiController(state);
@@ -513,6 +520,49 @@ describe("FabricUiController dashboard wiring", () => {
       vi.useRealTimers();
     }
   });
+
+  // review/astra F2 on #84: a rebuild must show the state it records as built, even when the mesh
+  // read cache was warmed just before a remote write; and a rebuild that consumed an older cached
+  // payload must leave the gate open, not wait for the 15 s ceiling.
+  it.each(["a poll's remote rebuild", "an event-driven rebuild"] as const)(
+    "shows the remote state after %s with a freshly warmed mesh read cache",
+    async (order) => {
+      vi.useFakeTimers();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-dashboard-"));
+      const identity = { id: "session:writer", name: "writer", kind: "main" as const, sessionId: "writer" };
+      const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 2_000 });
+      const writer = new MeshStore(root, 64 * 1024, 100);
+      await writer.put({ key: "status", value: "A0", identity });
+      const state = stubState();
+      state.config.ui.refreshMs = 500;
+      vi.mocked(state.actors.list).mockReturnValue([]);
+      const activity = new FabricActivityStore();
+      Object.assign(state, { activity, config: { ...state.config, mesh: { enabled: true } }, mesh });
+      const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+      const controller = new FabricUiController(state);
+      const shown = () => controller.snapshot().state.find((entry) => entry.key === "status")?.value;
+      try {
+        controller.start(context);
+        activity.start("live", { name: "local work" });          // polls at refreshMs
+        await vi.advanceTimersByTimeAsync(4_700);
+        expect(shown()).toBe("A0");
+        await writer.put({ key: "status", value: "A", identity });
+        expect(mesh.get("status")?.value).toBe("A");             // another reader parses A: a warm cache
+        await writer.put({ key: "status", value: "B", identity });
+        if (order === "an event-driven rebuild") {
+          activity.beginCall("live", { callId: "c1", ref: "pi.read", args: {} });   // consumes the cached A
+          await vi.advanceTimersByTimeAsync(150);
+          expect(shown()).toBe("A");
+        }
+        await vi.advanceTimersByTimeAsync(order === "an event-driven rebuild" ? 5_500 : 1_000);
+        expect(shown()).toBe("B");
+      } finally {
+        controller.stop();
+        vi.useRealTimers();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("ticks the activity widget elapsed clock while nested calls are idle", async () => {
     vi.useFakeTimers();

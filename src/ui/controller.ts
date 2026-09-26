@@ -720,9 +720,9 @@ export class FabricUiController {
       const main = this.state.mainAgentInfo(context);
       const local = JSON.stringify([revision, main.status, main.model, main.thinking, main.pendingMessages,
         this.state.widgetDismissedAt]);
-      const remote = JSON.stringify([this.#meshOffset,
-        this.state.config.mesh.enabled ? this.state.mesh.stateStamp?.() : undefined,
-        this.state.globalActors.stamp?.()]);
+      const remoteOf = (meshStamp: string | undefined): string =>
+        JSON.stringify([this.#meshOffset, meshStamp, this.state.globalActors.stamp?.()]);
+      const remote = remoteOf(this.state.config.mesh.enabled ? this.state.mesh.stateStamp?.() : undefined);
       const unchanged =
         !force && !this.#dashboardOpen && !this.#conversationOpen && revision !== undefined &&
         local === this.#builtLocal && now - this.#builtAt < REMOTE_MAX_AGE_MS &&
@@ -730,8 +730,13 @@ export class FabricUiController {
       if (unchanged) {
         this.#snapshot = { ...this.#snapshot, now };           // elapsed times keep moving
       } else {
+        // A rebuild for a remote change first revalidates the mesh read cache (a parse only when
+        // the file changed, at most every REMOTE_REFRESH_MS), so it shows the state it was built
+        // for. Every rebuild records the stamp of the payload it consumed, not the file's, so a
+        // payload older than the file keeps the gate open (review/astra F2 on #84).
+        const remoteRebuild = !force && !this.#dashboardOpen && !this.#conversationOpen && remote !== this.#builtRemote;
+        if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(true);
         this.#builtLocal = local;
-        this.#builtRemote = remote;
         this.#builtAt = now;
         if (force || this.#dashboardOpen) this.#snapshotCache.clear();
         this.#refreshGeneration++;
@@ -743,6 +748,7 @@ export class FabricUiController {
           this.#dashboardOpen ? undefined : this.#snapshotCache,
           this.#activityView !== undefined,
         );
+        this.#builtRemote = remoteOf(this.state.config.mesh.enabled ? this.state.mesh.cachedStateStamp?.() : undefined);
       }
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log

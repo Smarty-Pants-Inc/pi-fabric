@@ -175,6 +175,43 @@ describe("ParticipantDirectory host leases", () => {
     }
   });
 
+  // review/astra F2 on #68: production stores cache reads (2 s). A confirmation must not leave a
+  // snapshot from before it, or peer-settle certifies a peer list that is already out of date.
+  it("under the policy, read peers after a file-only confirmation, not from an earlier cache", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    await new MeshStore(meshRoot, 64 * 1024, 1_000).put({
+      key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner"),
+    });
+    const make = (name: string, status: "idle" | "running") => {
+      const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: name === "observer" ? "main" : "actor", sessionId: name };
+      const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000, { readCacheMs: 60_000 }), {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 2_000,
+      });
+      directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, name), status }]);
+      directories.push(directory);
+      return directory;
+    };
+    const observer = make("observer", "idle");
+    await observer.start();
+    await new Promise((resolve) => setTimeout(resolve, 300));        // file-only heartbeats now
+    expect(observer.peers()).toEqual([]);                           // primes the 60 s cached view
+    const joined = make("joined", "running");
+    await joined.start();                                           // a running peer joins
+    let result: PeerSettleResult | undefined;
+    void awaitPeerSettle({
+      poll: () => observer.peers(),
+      stalled: () => observer.writeStalled(),
+      confirmedAt: () => observer.confirmedAt(),
+      settledForMs: 60_000,
+      pollMs: 20,
+    }).then((settled) => { result = settled; });
+    await vi.waitFor(() => expect(observer.peers().map((peer) => peer.id)).toEqual(["session:joined"]), { timeout: 2_000, interval: 20 });
+    await new Promise((resolve) => setTimeout(resolve, 400));        // several confirmed heartbeats
+    expect(result).toBeUndefined();                                 // still waiting for the running peer
+  });
+
   it("under the policy, still renew the shared record every STATE_LEASE_RENEW_MS", async () => {
     const { hostEntry } = await setup(true);
     const shared = hostEntry()!;

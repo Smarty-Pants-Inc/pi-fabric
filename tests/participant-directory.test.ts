@@ -67,11 +67,15 @@ const createDirectory = (
   identity: MeshIdentity,
   rootId: string,
   source: () => FabricParticipantRecord[],
+  // smarty-dev#883: a test that does not exercise expiry uses a lease a starved Windows runner, whose
+  // timers stall, cannot outlast between a write and the read that follows it. The directory makes
+  // the lease at least two heartbeats.
+  lease: { heartbeatMs: number; leaseMs: number } = { heartbeatMs: 100, leaseMs: 300 },
 ): ParticipantDirectory => {
   const hostId = identity.kind === "main" ? identity.id : "runtime:" + identity.sessionId;
   const directory = new ParticipantDirectory(
     new MeshStore(meshRoot, 64 * 1024, 1_000),
-    { enabled: true, hostId, rootId, identity, heartbeatMs: 100, leaseMs: 300 },
+    { enabled: true, hostId, rootId, identity, ...lease },
   );
   directory.registerSource(source);
   directories.push(directory);
@@ -447,15 +451,18 @@ describe("ParticipantDirectory", () => {
       kind: "main",
       sessionId: "slow",
     };
+    // A lease of 1 s, and a write that outlasts it: the read after the commit keeps a 1 s margin,
+    // which a starved Windows runner used up with a 300 ms lease (smarty-dev#883). The lease is
+    // at least two heartbeats, so the heartbeat is 500 ms.
     const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => [
       rootRecord(identity.id, identity.id, "slow"),
       agentRecord("agent:slow", identity.id, identity.id, identity.id),
-    ]);
+    ], { heartbeatMs: 500, leaseMs: 1_000 });
     const write = directory.mesh.writeBatch.bind(directory.mesh);
-    // A contended Windows mesh makes the heartbeat write outlast the 300ms lease;
+    // A contended Windows mesh makes the heartbeat write outlast the lease;
     // the host lease is stamped at commit, so it must still be fresh afterwards.
     vi.spyOn(directory.mesh, "writeBatch").mockImplementation(async (input) => {
-      await new Promise((resolve) => setTimeout(resolve, 350));
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
       return write(input);
     });
 
@@ -557,7 +564,7 @@ describe("ParticipantDirectory", () => {
         error: "secret failure",
       } as FabricParticipantRecord,
       agentRecord("agent:wrong-lineage", "session:foreign", identity.id, identity.id),
-    ]);
+    ], { heartbeatMs: 100, leaseMs: 30_000 });                          // no expiry here (smarty-dev#883)
 
     await directory.start();
     expect(directory.mesh.get("sessions/private")?.value).toMatchObject({
@@ -617,14 +624,17 @@ describe("ParticipantDirectory", () => {
       kind: "actor",
       transport: "host",
     });
+    // The takeover follows alpha's close, not its expiry, so a slow runner must not expire alpha's
+    // lease first and hand beta the record early (smarty-dev#883).
+    const lease = { heartbeatMs: 100, leaseMs: 30_000 };
     const alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [
       rootRecord(alphaIdentity.id, alphaIdentity.id, "alpha"),
       shared(alphaIdentity),
-    ]);
+    ], lease);
     const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [
       rootRecord(betaIdentity.id, betaIdentity.id, "beta"),
       shared(betaIdentity),
-    ]);
+    ], lease);
 
     await alpha.start();
     // Mesh writes can lag a fresh enumeration on CI-bound filesystems

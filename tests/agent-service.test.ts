@@ -35,6 +35,44 @@ const hanging = () => {
 };
 afterEach(async () => {vi.restoreAllMocks(); await Promise.allSettled(services.splice(0).map((entry) => entry.close()));});
 
+// smarty-dev#854, review/astra F3 on #71: the hosted provider has its own wait path.
+describe("hosted agents.wait bound", () => {
+  const held = () => {
+    const entered = deferred<AgentExecutionRequest>();
+    const result = deferred<AgentExecutionResponse>();
+    const execute = vi.fn(async (request: AgentExecutionRequest) => {
+      request.signal.addEventListener("abort", () => result.resolve({status: "stopped"}), {once: true});
+      entered.resolve(request);
+      return result.promise;
+    });
+    return {entered, result, port: {execute, cleanup: vi.fn(async () => {})}};
+  };
+
+  it("ends only the wait at its bound: the child keeps running, and a later join returns its result", async () => {
+    const child = held();
+    const instance = service(child.port);
+    const handler = createAgentServiceHandler(instance, "root");
+    const handle = await instance.spawn("root", {task: "long"}) as {id: string};
+    await child.entered.promise;
+    await expect(handler("wait", {id: handle.id, timeoutMs: 1_000})).rejects.toThrow(/is still running after 1 s\. It continues/);
+    expect((await instance.status("root", handle.id)).status).toBe("running");
+    child.result.resolve({status: "completed", text: "done"});
+    await expect(handler("join", {id: handle.id, timeoutMs: 1_000})).resolves.toMatchObject({status: "completed", text: "done"});
+  });
+
+  it("bounds a wait without timeoutMs at the 5-minute default", async () => {
+    const child = held();
+    const instance = service(child.port);
+    const bounds = vi.spyOn(AbortSignal, "timeout");
+    const handle = await instance.spawn("root", {task: "long"}) as {id: string};
+    await child.entered.promise;
+    const waiting = createAgentServiceClient(createAgentServiceHandler(instance, "root")).wait(handle.id);
+    await vi.waitFor(() => expect(bounds).toHaveBeenCalledWith(5 * 60_000));
+    child.result.resolve({status: "completed", text: "done"});
+    await expect(waiting).resolves.toMatchObject({status: "completed"});
+  });
+});
+
 describe("hosted Fabric agent service", () => {
   it("shares native normalization/schema results, stable prepare identity, usage and private checkpoints", async () => {
     const events: AgentServiceEvent[] = [];

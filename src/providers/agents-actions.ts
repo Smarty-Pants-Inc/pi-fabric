@@ -1,4 +1,5 @@
 import { FABRIC_ACTOR_HOST_EVENTS } from "../actors/types.js";
+import { AGENT_WAIT_MAX_MS } from "../agents/wait-bound.js";
 import {
   MAX_COMPACTION_INSTRUCTIONS_CHARS,
   MAX_PRESERVE_ITEM_CHARS,
@@ -150,9 +151,6 @@ const idSchema = {
   additionalProperties: false,
 };
 
-// smarty-dev#854: a wait without a bound blocked its session for over an hour.
-export const AGENT_WAIT_DEFAULT_MS = 5 * 60 * 1_000;
-export const AGENT_WAIT_MAX_MS = 60 * 60 * 1_000;
 const waitSchema = {
   type: "object",
   properties: {

@@ -11,7 +11,7 @@ export function createAgentServiceHandler(service: AgentService, callerId: strin
       case "run": return service.run(callerId, args as unknown as AgentServiceRequest, signal);
       case "spawn": return service.spawn(callerId, args as unknown as AgentServiceRequest, signal);
       case "join":
-      case "wait": return service.wait(callerId, args.id as string, signal);
+      case "wait": return service.wait(callerId, args.id as string, signal, args.timeoutMs as number | undefined);
       case "status": return service.status(callerId, args.id as string);
       case "list": return service.list(callerId);
       case "stop": return service.stop(callerId, args.id as string);
@@ -37,8 +37,8 @@ export function createAgentServiceClient(dispatch: AgentServiceDispatcher, capab
     capabilities: Object.freeze({...capabilities}), dispatch,
     run: (request, signal) => record("run", request as unknown as Record<string, unknown>, signal),
     spawn: (request, signal) => record("spawn", request as unknown as Record<string, unknown>, signal),
-    wait: (id, signal) => record("wait", {id}, signal),
-    join: (id, signal) => record("wait", {id}, signal),
+    wait: (id, signal, timeoutMs) => record("wait", {id, ...(timeoutMs !== undefined ? {timeoutMs} : {})}, signal),
+    join: (id, signal, timeoutMs) => record("wait", {id, ...(timeoutMs !== undefined ? {timeoutMs} : {})}, signal),
     status: (id) => record("status", {id}),
     list: () => dispatch("list", {}) as Promise<AgentPublicRecord[]>,
     stop: (id) => record("stop", {id}),

@@ -2,58 +2,318 @@
 // `for … seq 1 14; sleep 300` loop). A blocked session takes no steer or ask and reads as
 // working, so the stall is invisible. This refuses a foreground bash command whose sleeps add up
 // to more than FOREGROUND_WAIT_LIMIT_S.
-// ponytail: a textual estimate, not a shell parser. It covers the waits seen live: a long sleep,
-// a sleep in a counted `for` loop, and a sleep in an unbounded `while`/`until` loop. A wait
-// hidden in a script or a program passes. Heredoc bodies and quoted strings count as data,
-// except a string run by `bash -c`/`sh -c`. Revisit if agents route around it.
+// ponytail: a small shell reader, not a shell. It follows lists, pipelines, background jobs and
+// `wait`, subshells and groups, `for` (counted by its word list, `seq`, `{a..b}` or a C-style
+// header), `while`/`until` (unbounded when they sleep), `if`, `timeout N` (bounding its own
+// command), foreground wrappers (nohup, setsid, env, nice, command, exec, time) and `bash -c`
+// scripts. Heredoc bodies, quoted arguments and comments are data. A wait hidden in a script file
+// or a program passes; an unknown loop list counts once. Revisit if agents route around it.
 
 export const FOREGROUND_WAIT_LIMIT_S = 300;
 
+type Token = { op: string } | { word: string; quoted?: string };
+
 const UNIT_SECONDS: Record<string, number> = { "": 1, s: 1, m: 60, h: 3_600, d: 86_400 };
-
-const duration = (value: string, unit: string | undefined): number =>
-  Number(value) * (UNIT_SECONDS[unit ?? ""] ?? 1);
-
-// The command text that runs: heredoc bodies and quoted data removed, `-c` scripts kept.
-const executableText = (command: string): string => {
-  let text = command.replace(/<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2\s*(?:\n|$)/g, "\n");
-  text = text.replace(/(-c\s+)?(['"])((?:\\.|(?!\2)[^\\])*)\2/g, (_match, script: string | undefined, _quote, body: string) =>
-    script ? ` ${body} ` : " \"\" ");
-  return text;
+const DURATION = /^(\d+(?:\.\d+)?)([smhd]?)$/;
+const duration = (word: string): number | undefined => {
+  const match = DURATION.exec(word);
+  return match ? Number(match[1]) * (UNIT_SECONDS[match[2]!] ?? 1) : undefined;
 };
 
-// A command that detaches its work does not block the session.
-const detached = (text: string): boolean =>
-  /\b(?:nohup|setsid|disown)\b/.test(text) || /(?:^|[^&|>])&\s*(?:$|\n|;|\))/.test(text);
+const tokenize = (text: string): Token[] => {
+  const tokens: Token[] = [];
+  const heredocs: string[] = [];
+  let index = 0;
+  const skipHeredocBodies = (): void => {
+    for (const delimiter of heredocs.splice(0)) {
+      while (index < text.length) {
+        const end = text.indexOf("\n", index);
+        const line = text.slice(index, end < 0 ? text.length : end);
+        index = end < 0 ? text.length : end + 1;
+        if (line.trim() === delimiter) break;
+      }
+    }
+  };
+  while (index < text.length) {
+    const char = text[index]!;
+    const next = text[index + 1];
+    if (char === " " || char === "\t" || char === "\r") { index += 1; continue; }
+    if (char === "\\" && next === "\n") { index += 2; continue; }
+    if (char === "#") { while (index < text.length && text[index] !== "\n") index += 1; continue; }
+    if (char === "\n") { tokens.push({ op: "\n" }); index += 1; skipHeredocBodies(); continue; }
+    if (char === ";") { tokens.push({ op: next === ";" ? ";;" : ";" }); index += next === ";" ? 2 : 1; continue; }
+    if (char === "&" && next !== ">") { tokens.push({ op: next === "&" ? "&&" : "&" }); index += next === "&" ? 2 : 1; continue; }
+    if (char === "|") { tokens.push({ op: next === "|" ? "||" : "|" }); index += next === "|" || next === "&" ? 2 : 1; continue; }
+    if (char === ")") { tokens.push({ op: ")" }); index += 1; continue; }
+    if (char === "(" && next !== "(") { tokens.push({ op: "(" }); index += 1; continue; }
+    if (char === "<" && next === "<" && text[index + 2] !== "<") {
+      index += text[index + 2] === "-" ? 3 : 2;
+      while (text[index] === " " || text[index] === "\t") index += 1;
+      let delimiter = "";
+      while (index < text.length && !/[\s;&|()<>]/.test(text[index]!)) delimiter += text[index++];
+      heredocs.push(delimiter.replace(/['"\\]/g, ""));
+      continue;
+    }
+    // A word: quotes, $(…), `…`, ${…} and ((…)) nest; redirections such as 2>&1 stay in the word.
+    let word = "";
+    let quoted: string | undefined;
+    let parts = 0;
+    while (index < text.length) {
+      const c = text[index]!;
+      if (/[\s;|)]/.test(c) || (c === "&" && text[index + 1] !== ">" && !/[<>]$/.test(word)) || (c === "(" && word === "" && text[index + 1] !== "(")) break;
+      parts += 1;
+      if (c === "'" || c === "\"") {
+        const start = index + 1;
+        index += 1;
+        while (index < text.length && text[index] !== c) index += c === "\"" && text[index] === "\\" ? 2 : 1;
+        const body = text.slice(start, Math.min(index, text.length));
+        word += body;
+        quoted = parts === 1 ? body : undefined;
+        index += 1;
+        continue;
+      }
+      if ((c === "$" && (text[index + 1] === "(" || text[index + 1] === "{")) || c === "`" || (c === "(" && text[index + 1] === "(")) {
+        const open = c === "`" ? "`" : c === "(" ? "(" : text[index + 1]!;
+        const close = open === "`" ? "`" : open === "(" ? ")" : "}";
+        const start = index;
+        index += c === "$" ? 2 : 1;
+        let depth = 1;
+        while (index < text.length && depth > 0) {
+          const d = text[index]!;
+          if (d === "\\") { index += 2; continue; }
+          if (open !== "`" && d === open) depth += 1;
+          else if (d === close) depth -= 1;
+          index += 1;
+        }
+        word += text.slice(start, index);
+        quoted = undefined;
+        continue;
+      }
+      if (c === "\\") { word += text.slice(index, index + 2); index += 2; continue; }
+      word += c;
+      quoted = undefined;
+      index += 1;
+    }
+    if (word !== "" || parts > 0) tokens.push({ word, ...(quoted !== undefined && parts === 1 ? { quoted } : {}) });
+    else index += 1;
+  }
+  return tokens;
+};
+
+const WRAPPERS = new Set(["nohup", "setsid", "command", "exec", "time", "builtin"]);
+const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
+const LIST_END = new Set(["do", "done", "then", "elif", "else", "fi", "esac", "}"]);
+
+class WaitEstimator {
+  #tokens: Token[];
+  #index = 0;
+  #background = 0;
+
+  constructor(tokens: Token[]) {
+    this.#tokens = tokens;
+  }
+
+  static script(text: string): number {
+    return new WaitEstimator(tokenize(text)).list(new Set());
+  }
+
+  #peek(): Token | undefined {
+    return this.#tokens[this.#index];
+  }
+
+  #word(): string | undefined {
+    const token = this.#peek();
+    return token && "word" in token ? token.word : undefined;
+  }
+
+  #op(): string | undefined {
+    const token = this.#peek();
+    return token && "op" in token ? token.op : undefined;
+  }
+
+  #skipSeparators(): void {
+    while (this.#op() === "\n" || this.#op() === ";") this.#index += 1;
+  }
+
+  #expect(word: string): void {
+    this.#skipSeparators();
+    if (this.#word() === word) this.#index += 1;
+  }
+
+  /** Commands until a closing keyword (or `)` in a subshell): sequences add up. */
+  list(ends: ReadonlySet<string>, closeParen = false): number {
+    let total = 0;
+    while (this.#index < this.#tokens.length) {
+      this.#skipSeparators();
+      const word = this.#word();
+      if (word !== undefined && ends.has(word)) break;
+      if (closeParen && this.#op() === ")") break;
+      if (this.#index >= this.#tokens.length) break;
+      const before = this.#index;
+      const seconds = this.#andOr(ends);
+      if (this.#op() === "&") {
+        this.#index += 1;
+        this.#background = Math.max(this.#background, seconds);
+      } else {
+        total += seconds;
+      }
+      if (this.#index === before) this.#index += 1;             // never stall on a stray token
+    }
+    return total;
+  }
+
+  #andOr(ends: ReadonlySet<string>): number {
+    let total = this.#pipeline(ends);
+    while (this.#op() === "&&" || this.#op() === "||") {
+      this.#index += 1;
+      this.#skipSeparators();
+      total += this.#pipeline(ends);
+    }
+    return total;
+  }
+
+  #pipeline(ends: ReadonlySet<string>): number {
+    let longest = this.#command(ends);
+    while (this.#op() === "|") {
+      this.#index += 1;
+      this.#skipSeparators();
+      longest = Math.max(longest, this.#command(ends));
+    }
+    return longest;
+  }
+
+  #command(ends: ReadonlySet<string>): number {
+    if (this.#op() === "(") {
+      this.#index += 1;
+      const seconds = this.list(new Set(), true);
+      if (this.#op() === ")") this.#index += 1;
+      return seconds;
+    }
+    const word = this.#word();
+    if (word === undefined || ends.has(word)) return 0;
+    if (word === "{") {
+      this.#index += 1;
+      const seconds = this.list(new Set(["}"]));
+      this.#expect("}");
+      return seconds;
+    }
+    if (word === "for") return this.#for();
+    if (word === "while" || word === "until") {
+      this.#index += 1;
+      const condition = this.list(new Set(["do"]));
+      this.#expect("do");
+      const body = this.list(new Set(["done"]));
+      this.#expect("done");
+      return condition + body > 0 ? Number.POSITIVE_INFINITY : 0;
+    }
+    if (word === "if") {
+      this.#index += 1;
+      let total = this.list(new Set(["then"]));
+      let branch = 0;
+      while (this.#index < this.#tokens.length) {
+        this.#expect(this.#word() === "elif" ? "elif" : "then");
+        branch = Math.max(branch, this.list(new Set(["elif", "else", "fi"])));
+        this.#skipSeparators();
+        const next = this.#word();
+        if (next === "elif") { this.#index += 1; total += this.list(new Set(["then"])); continue; }
+        if (next === "else") { this.#index += 1; branch = Math.max(branch, this.list(new Set(["fi"]))); }
+        break;
+      }
+      this.#expect("fi");
+      return total + branch;
+    }
+    if (word === "case") {
+      while (this.#index < this.#tokens.length && this.#word() !== "esac") this.#index += 1;
+      this.#index += 1;
+      return 0;
+    }
+    const words: Token[] = [];
+    while (this.#index < this.#tokens.length && this.#word() !== undefined) words.push(this.#tokens[this.#index++]!);
+    return this.#simple(words);
+  }
+
+  #for(): number {
+    this.#index += 1;
+    const header = this.#word() ?? "";
+    let count = 1;
+    const cStyle = /^\(\(\s*\w+\s*=\s*(-?\d+)\s*;\s*\w+\s*(<=?|>=?)\s*(-?\d+)\s*;/.exec(header);
+    if (cStyle) {
+      const [, from, comparison, to] = cStyle;
+      const span = Math.abs(Number(to) - Number(from)) + (comparison!.endsWith("=") ? 1 : 0);
+      count = Math.max(0, span);
+      this.#index += 1;
+    } else {
+      this.#index += 1;                                        // the loop variable
+      if (this.#word() === "in") {
+        this.#index += 1;
+        const items: string[] = [];
+        while (this.#word() !== undefined) items.push(this.#word()!), this.#index += 1;
+        count = items.reduce((sum, item) => sum + loopItems(item), 0) || 1;
+      }
+    }
+    this.#expect("do");
+    const body = this.list(new Set(["done"]));
+    this.#expect("done");
+    return body * count;
+  }
+
+  #simple(tokens: Token[]): number {
+    let rest = tokens.filter((token) => "word" in token && !/^[<>0-9&]*[<>]/.test(token.word)) as Array<{ word: string; quoted?: string }>;
+    while (rest.length > 0 && /^\w+=/.test(rest[0]!.word)) rest = rest.slice(1);
+    const name = rest[0]?.word;
+    if (name === undefined) return 0;
+    const args = rest.slice(1);
+    if (name === "sleep") return args.reduce((sum, arg) => sum + (duration(arg.word) ?? 0), 0);
+    if (name === "wait") {
+      const waited = this.#background;
+      this.#background = 0;
+      return waited;
+    }
+    if (name === "timeout") {
+      let at = 0;
+      while (at < args.length && args[at]!.word.startsWith("-")) at += /^-(k|s)$|^--(kill-after|signal)$/.test(args[at]!.word) ? 2 : 1;
+      const limit = duration(args[at]?.word ?? "");
+      const inner = this.#simple(args.slice(at + 1));
+      return limit === undefined ? inner : Math.min(limit, inner);
+    }
+    if (WRAPPERS.has(name)) return this.#simple(args);
+    if (name === "env" || name === "nice" || name === "ionice" || name === "stdbuf") {
+      let at = 0;
+      while (at < args.length && (args[at]!.word.startsWith("-") || /^\w+=/.test(args[at]!.word))) {
+        at += /^-(n|c|u)$/.test(args[at]!.word) ? 2 : 1;
+      }
+      return this.#simple(args.slice(at));
+    }
+    if (SHELLS.has(name.split("/").at(-1)!)) {
+      const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg.word));
+      const script = flag >= 0 ? args[flag + 1] : undefined;
+      if (script) return WaitEstimator.script(script.quoted ?? script.word);
+    }
+    return 0;
+  }
+}
+
+// How many items a `for … in` word yields: seq and brace ranges are counted, other words once.
+const loopItems = (item: string): number => {
+  const seq = /^\$\(\s*seq\s+(-?\d+)(?:\s+(-?\d+))?(?:\s+(-?\d+))?\s*\)$/.exec(item);
+  if (seq) {
+    const [, a, b, c] = seq;
+    if (c !== undefined) return Math.max(0, Math.floor((Number(c) - Number(a)) / Math.max(1, Math.abs(Number(b)))) + 1);
+    if (b !== undefined) return Math.max(0, Number(b) - Number(a) + 1);
+    return Math.max(0, Number(a));
+  }
+  const range = /^\{(-?\d+)\.\.(-?\d+)\}$/.exec(item);
+  if (range) return Math.abs(Number(range[2]) - Number(range[1])) + 1;
+  return 1;
+};
 
 /**
- * The foreground wait a bash command is expected to make, in seconds: the sum of its sleeps,
- * times the count of an enclosing counted loop; Infinity for a sleep in an unbounded loop. A
- * `timeout N` in the command, or the tool call's own timeout, bounds it.
+ * The foreground wait a bash command is expected to make, in seconds (Infinity for a sleep in an
+ * unbounded loop). The tool call's own timeout bounds it.
  */
 export const foregroundWaitSeconds = (command: string, toolTimeoutS?: number): number => {
-  const text = executableText(command);
-  if (detached(text)) return 0;
-  const sleeps = [...text.matchAll(/(?:^|[\s;&|(`{])sleep\s+(\d+(?:\.\d+)?)([smhd])?(?=[\s;&|)`}]|$)/g)]
-    .map((match) => duration(match[1]!, match[2]));
-  if (sleeps.length === 0) return 0;
-  let total = sleeps.reduce((sum, seconds) => sum + seconds, 0);
-  let count = 1;
-  for (const match of text.matchAll(/\bfor\b[^;\n]*?\bin\s+(?:\$\(\s*seq\s+(\d+)(?:\s+(\d+))?(?:\s+(\d+))?\s*\)|\{(\d+)\.\.(\d+)\})/g)) {
-    if (match[4] !== undefined) count *= Math.abs(Number(match[5]) - Number(match[4])) + 1;
-    else if (match[3] !== undefined) count *= Math.floor((Number(match[3]) - Number(match[1])) / Math.max(1, Number(match[2]))) + 1;
-    else if (match[2] !== undefined) count *= Number(match[2]) - Number(match[1]) + 1;
-    else count *= Number(match[1]);
-  }
-  for (const match of text.matchAll(/\bfor\s*\(\(\s*\w+\s*=\s*(\d+)\s*;\s*\w+\s*(<=?)\s*(\d+)\s*;/g)) {
-    count *= Number(match[3]) - Number(match[1]) + (match[2] === "<=" ? 1 : 0);
-  }
-  total *= Math.max(1, count);
-  if (/\b(?:while|until)\b/.test(text)) total = Number.POSITIVE_INFINITY;
-  const bounds = [...text.matchAll(/\btimeout\s+(?:-\S+\s+)*(\d+(?:\.\d+)?)([smhd])?\b/g)]
-    .map((match) => duration(match[1]!, match[2]));
-  if (toolTimeoutS !== undefined && toolTimeoutS > 0) bounds.push(toolTimeoutS);
-  return bounds.length > 0 ? Math.min(total, ...bounds) : total;
+  const seconds = WaitEstimator.script(command);
+  return toolTimeoutS !== undefined && toolTimeoutS > 0 ? Math.min(seconds, toolTimeoutS) : seconds;
 };
 
 /** A refusal for a foreground wait over the limit, or undefined to let the command run. */

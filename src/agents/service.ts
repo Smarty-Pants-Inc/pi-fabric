@@ -1,4 +1,5 @@
 import { AgentAdmission, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, waitForAgent, type AgentLifecycleState } from "./lifecycle.js";
+import { agentWaitBound, describeWaitBound } from "./wait-bound.js";
 import { validateAgentResult } from "./result.js";
 import { normalizeAgentServiceRequest } from "./service-schema.js";
 import type { AgentAuthorityBoundary, AgentPublicRecord, AgentControlRequest, AgentExecutionEvent, AgentExecutionResponse, AgentServiceCapabilities, AgentServiceEvent, AgentServiceOptions, AgentServiceRecord, AgentServiceRequest, AgentSessionRecord, AgentServiceSnapshot } from "./service-types.js";
@@ -64,7 +65,7 @@ export class AgentService {
 
   async run(callerId: string, request: AgentServiceRequest, signal?: AbortSignal): Promise<AgentPublicRecord> {
     const handle = await this.spawn(callerId, request, signal);
-    return this.wait(callerId, handle.id, signal);
+    return this.#waitFor(callerId, handle.id, signal);
   }
 
   async spawn(callerId: string, request: AgentServiceRequest, signal?: AbortSignal): Promise<AgentPublicRecord | AgentSessionRecord> {
@@ -80,18 +81,37 @@ export class AgentService {
     return this.#start(callerId, normalized, undefined, signal);
   }
 
-  async wait(callerId: string, id: string, signal?: AbortSignal): Promise<AgentPublicRecord> {
+  /**
+   * Waits for a direct child, bounded by timeoutMs (5 min by default, at most 60; smarty-dev#854).
+   * At the bound only the wait ends: the child keeps running and its result stays available.
+   */
+  async wait(callerId: string, id: string, signal?: AbortSignal, timeoutMs?: number): Promise<AgentPublicRecord> {
+    const bound = agentWaitBound(timeoutMs);
+    const timer = AbortSignal.timeout(bound);
+    try {
+      return await this.#waitFor(callerId, id, signal ? AbortSignal.any([signal, timer]) : timer);
+    } catch (error) {
+      if (!timer.aborted || signal?.aborted) throw error;
+      const entry = this.#child(callerId, id);
+      throw new Error(
+        `agents.wait: ${entry.record.name} is still running after ${describeWaitBound(bound)}. It continues: ` +
+          "check it later with agents.status or agents.wait, or pass a larger timeoutMs (up to 60 min).",
+      );
+    }
+  }
+
+  /** Alias for wait; authorization, bound and cancellation semantics are identical. */
+  join(callerId: string, id: string, signal?: AbortSignal, timeoutMs?: number): Promise<AgentPublicRecord> {
+    return this.wait(callerId, id, signal, timeoutMs);
+  }
+
+  async #waitFor(callerId: string, id: string, signal?: AbortSignal): Promise<AgentPublicRecord> {
     await this.#authorize(callerId);
     const entry = this.#child(callerId, id);
     const result = entry.lifecycle.result ?? Promise.resolve(copy(entry.record));
     const record = await waitForAgent(result, signal);
     await this.#authorize(callerId);
     return publicRecord(record);
-  }
-
-  /** Alias for wait; authorization and cancellation semantics are identical. */
-  join(callerId: string, id: string, signal?: AbortSignal): Promise<AgentPublicRecord> {
-    return this.wait(callerId, id, signal);
   }
 
   async status(callerId: string, id: string): Promise<AgentPublicRecord> {
@@ -212,7 +232,7 @@ export class AgentService {
     try {
       const request = normalizeAgentServiceRequest({...entry.request, ...(task !== undefined ? {task} : {})});
       await this.#start(callerId, request, entry, signal);
-      return await this.wait(callerId, id, signal);
+      return await this.#waitFor(callerId, id, signal);
     } finally { entry.resuming = false; }
   }
 

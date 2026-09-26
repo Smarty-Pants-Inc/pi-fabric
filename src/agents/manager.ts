@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -431,10 +432,6 @@ const runRootHasUnresolvedWorker = (root: string): boolean => {
     return false;
   }
 };
-
-/** A wait bound for a message: "0.3 s", "5 min". */
-export const describeWaitBound = (ms: number): string =>
-  ms < 60_000 ? `${Math.round(ms / 100) / 10} s` : `${Math.round(ms / 6_000) / 10} min`;
 
 export class AgentManager {
   readonly #runs = new Map<string, ManagedAgent>();

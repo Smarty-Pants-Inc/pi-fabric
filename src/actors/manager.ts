@@ -1,5 +1,5 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
@@ -2351,6 +2351,10 @@ export class ActorManager {
       scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
+      // The instruction text stays private; its digest lets a caller verify setInstructions
+      // against a rendered role without reading the registry file (smarty-dev#918).
+      instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
+      instructionsLength: actor.instructions.length,
       status: actor.status,
       runner: actor.runner,
       ...(actor.kernel ? { kernel: actor.kernel } : {}),

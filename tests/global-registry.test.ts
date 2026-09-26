@@ -227,3 +227,50 @@ describe("GlobalActorRegistry", () => {
     expect(() => registry.resolve("")).toThrow(/Ambiguous/);
   });
 });
+
+// smarty-dev#918 cross-session tests.
+const crossRoots: string[] = [];
+afterEach(() => {
+  for (const root of crossRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+const agentDir = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-global-"));
+  crossRoots.push(root);
+  return root;
+};
+const template = (name: string) => ({ name, instructions: `Be ${name}.` });
+
+// smarty-dev#918: each session read the registry once at startup and wrote its whole copy back,
+// so a write erased templates other sessions had added since and revived removed ones.
+describe("GlobalActorRegistry across sessions", () => {
+  it("sees another session's template, and a write keeps it", () => {
+    const dir = agentDir();
+    const first = new GlobalActorRegistry(dir, 64 * 1024);
+    const second = new GlobalActorRegistry(dir, 64 * 1024);        // both loaded an empty registry
+    const a = second.create(template("alpha"));
+    expect(first.resolve("alpha")?.id).toBe(a.id);                   // read reloads
+    first.create(template("beta"));                                  // write keeps alpha
+    expect(new GlobalActorRegistry(dir, 64 * 1024).list().map((t) => t.name).sort()).toEqual(["alpha", "beta"]);
+  });
+
+  it("does not bring back a template another session removed", () => {
+    const dir = agentDir();
+    const seed = new GlobalActorRegistry(dir, 64 * 1024);
+    seed.create(template("stale"));
+    const holder = new GlobalActorRegistry(dir, 64 * 1024);          // loaded with "stale"
+    expect(new GlobalActorRegistry(dir, 64 * 1024).remove("stale")).toEqual({ removed: true });
+    holder.create(template("fresh"));
+    expect(new GlobalActorRegistry(dir, 64 * 1024).list().map((t) => t.name)).toEqual(["fresh"]);
+  });
+
+  it("updates and removes against the current file", () => {
+    const dir = agentDir();
+    const first = new GlobalActorRegistry(dir, 64 * 1024);
+    const second = new GlobalActorRegistry(dir, 64 * 1024);
+    const created = second.create(template("gamma"));
+    expect(first.update(created.id, { instructions: "Changed." }).instructions).toBe("Changed.");
+    expect(second.resolve("gamma")?.instructions).toBe("Changed.");
+    expect(second.remove(created.id)).toEqual({ removed: true });
+    expect(first.list()).toEqual([]);
+  });
+});

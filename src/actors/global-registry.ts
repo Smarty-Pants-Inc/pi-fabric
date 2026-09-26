@@ -94,27 +94,32 @@ const resolveDefinition = (
  * any project or mesh, so the same templates are available across every
  * project. Operations are pure file I/O and do not require the mesh to be
  * enabled; only importing (which creates a live actor via ActorManager) does.
- * The registry is read into memory once at construction; run `/fabric reload`
- * to pick up templates added by other Pi sessions. Writes are atomic (write
- * to a temp file then rename) so concurrent sessions cannot corrupt the
- * store, though truly simultaneous edits are last-write-wins.
+ * Every read reloads the file when another session changed it, and every write
+ * re-reads the file and applies only its own change (smarty-dev#918: a write
+ * from a session's startup-time copy erased templates other sessions had added
+ * since, and brought back removed ones). Writes are atomic (write to a temp
+ * file then rename) so concurrent sessions cannot corrupt the store, though
+ * truly simultaneous edits are last-write-wins.
  */
 export class GlobalActorRegistry {
   readonly #actors = new Map<string, GlobalActorDefinition>();
   readonly #path: string;
   readonly #maxBytes: number;
+  #fingerprint: string | undefined;
 
   constructor(agentDir: string, maxInstructionsBytes: number) {
     this.#path = path.join(agentDir, "fabric", "actors", "global-actors.json");
     this.#maxBytes = maxInstructionsBytes;
-    this.#load();
+    this.#refresh();
   }
 
   list(): GlobalActorDefinition[] {
+    this.#refresh();
     return [...this.#actors.values()].map(clone);
   }
 
   resolve(idOrName: string): GlobalActorDefinition | undefined {
+    this.#refresh();
     const found = resolveDefinition(this.#actors, idOrName);
     return found ? clone(found) : undefined;
   }
@@ -126,6 +131,7 @@ export class GlobalActorRegistry {
    * definition.
    */
   create(def: FabricActorRequest, overwrite = false): GlobalActorDefinition {
+    this.#refresh();
     const validated = this.#validate(def);
     const existing = [...this.#actors.values()].find((actor) => actor.name === validated.name);
     if (existing) {
@@ -160,6 +166,7 @@ export class GlobalActorRegistry {
    * changed field.
    */
   update(idOrName: string, patch: Omit<Partial<FabricActorRequest>, "coalesceKey"> & { coalesceKey?: string | null }): GlobalActorDefinition {
+    this.#refresh();
     const existing = resolveDefinition(this.#actors, idOrName);
     if (!existing) throw new Error(`Unknown global actor: ${idOrName}`);
     const merged: FabricActorRequest = {
@@ -227,6 +234,7 @@ export class GlobalActorRegistry {
   }
 
   remove(idOrName: string): { removed: boolean } {
+    this.#refresh();
     const existing = resolveDefinition(this.#actors, idOrName);
     if (!existing) return { removed: false };
     this.#actors.delete(existing.id);
@@ -347,6 +355,24 @@ export class GlobalActorRegistry {
     };
   }
 
+  #stat(): string | undefined {
+    try {
+      const stat = fs.statSync(this.#path);
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Reload when the file is not the one this registry last read or wrote.
+  #refresh(): void {
+    const fingerprint = this.#stat();
+    if (fingerprint !== undefined && fingerprint === this.#fingerprint) return;
+    this.#actors.clear();
+    this.#load();
+    this.#fingerprint = fingerprint;
+  }
+
   #load(): void {
     let parsed: unknown;
     try {
@@ -449,5 +475,6 @@ export class GlobalActorRegistry {
   #save(): void {
     const file: RegistryFile = { format: 1, actors: [...this.#actors.values()] };
     atomicWrite(this.#path, file);
+    this.#fingerprint = this.#stat();
   }
 }

@@ -664,6 +664,10 @@ interface FabricActorInfo {
   kernel?: FabricKernel;
   pythonRuntime?: "cpython" | "monty";
   id: string;
+  /** sha256 (hex) of the actor's default instructions; compare after setInstructions. */
+  instructionsDigest?: string;
+  /** Length of those instructions (JavaScript string length). */
+  instructionsLength?: number;
   scope: "session" | "project";
   name: string;
   status: "idle" | "queued" | "running" | "stopped";

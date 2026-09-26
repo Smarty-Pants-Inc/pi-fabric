@@ -360,6 +360,39 @@ describe("ActorManager across a session reload", () => {
     after.haltAll();
   }, 40_000);
 
+  // smarty-dev#878: a relaunch lost 33 queued items: the queue lived only in memory while the
+  // mesh cursor already sat past the queued events.
+  it.each([false, true])("keeps queued and running items across a restart (cursor replayed from the start: %s)", async (replayAll) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const before = reloadable(root, mesh, agents);
+    const actor = await before.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
+    await mesh.publish({ topic: "team.pulls", from, text: "LIVE_WITH_PROGRESS first" });   // a 1.5 s run
+    await waitFor(() => before.status(actor.id).status === "running", 10_000);
+    await mesh.publish({ topic: "team.pulls", from, text: "queued 1" });
+    await mesh.publish({ topic: "team.pulls", from, text: "queued 2" });
+    await waitFor(() => before.status(actor.id).queued === 2, 10_000);
+    await before.close();                                    // the runtime goes mid-run
+    if (replayAll) {
+      // A crash before the cursor was written: the replay offers every event again.
+      fs.writeFileSync(path.join(root, "actors", "mesh-cursor.json"), JSON.stringify({ format: 1, cursor: 0 }));
+    }
+    const after = reloadable(root, mesh, agents);
+    const replies = (text: RegExp) => after.messages(actor.id)
+      .filter((message) => message.direction === "out" && !message.error && text.test(String(message.text ?? "")));
+    await waitFor(() => replies(/^fake worker complete$/).length >= 2 && replies(/^live attempt/).length >= 1, 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    expect(replies(/^fake worker complete$/)).toHaveLength(2);           // each queued item once
+    expect(replies(/^live attempt/).length).toBeLessThanOrEqual(2);     // the interrupted run at most twice
+    expect(fs.existsSync(path.join(root, "actors", actor.id, "queue.json"))).toBe(false);
+  }, 60_000);
+
   it("does not replay events older than the replay window after a long downtime", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
     roots.push(root);

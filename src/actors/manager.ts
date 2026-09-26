@@ -43,6 +43,7 @@ import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 
 export interface ActorMessageBindingOptions {
   /** Per-call values layered over this session binding. */
@@ -224,6 +225,11 @@ export class ActorManager {
   readonly #failureStreaks = new Map<string, { count: number; notified: boolean }>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
   readonly #parked = new Map<string, ActorQueueItem[]>();
+  // smarty-dev#878: the item each actor is running, persisted with its queue until the run ends.
+  readonly #inFlight = new Map<string, ActorQueueItem>();
+  // Actors whose persisted queue this manager has already restored.
+  readonly #restoredQueues = new Set<string>();
+  #startupLoad = false;
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
   readonly #actorRoot: string;
@@ -343,7 +349,16 @@ export class ActorManager {
       sessionId,
       this.#persistent && meshConfig.enabled ? this.#actorRoot : undefined,
     );
-    if (this.#persistent && meshConfig.enabled) this.#loadActors();
+    if (this.#persistent && meshConfig.enabled) {
+      // Only a fresh start restores persisted queues: an in-process reload keeps its own
+      // queues (parked in memory) and must not queue them a second time.
+      this.#startupLoad = true;
+      try {
+        this.#loadActors();
+      } finally {
+        this.#startupLoad = false;
+      }
+    }
     this.#registryFingerprint = this.#registry.fingerprint();
     for (const actor of this.#actors.values()) {
       this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
@@ -1291,6 +1306,7 @@ export class ActorManager {
         existing.createdAt = createdAt;
         existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
         existing.binding = binding;
+        this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
         return existing;
       }
@@ -1316,6 +1332,7 @@ export class ActorManager {
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
     };
     actor.queue.push(item);
+    this.#persistQueue(actor.id);
     actor.status = "queued";
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
@@ -1374,6 +1391,7 @@ export class ActorManager {
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
+        this.#inFlight.set(actor.id, item);
         const inferenceContext = actor.inferenceContext;
         actor.status = "running";
         actor.updatedAt = Date.now();
@@ -1384,6 +1402,7 @@ export class ActorManager {
         const beforeRun = await this.#validity(actor, item);
         if (!beforeRun.valid) {
           this.#recordStale(actor, item, beforeRun.reason);
+          this.#finishInFlight(actor.id, item);
           delete actor.abortController;
           actor.status = actor.queue.length > 0 ? "queued" : "idle";
           actor.updatedAt = Date.now();
@@ -1407,6 +1426,7 @@ export class ActorManager {
               actor.missingCapabilities = [...capabilityLease.missing];
               delete actor.capabilityDigest;
               actor.queue.unshift(item);
+              this.#inFlight.delete(actor.id);
               actor.status = "queued";
               actor.updatedAt = Date.now();
               await this.#publishPresence(actor);
@@ -1584,6 +1604,7 @@ export class ActorManager {
           delete actor.abortController;
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
+          this.#finishInFlight(actor.id, item);
           if (this.#canManage(actor.id)) await this.#publishPresence(actor);
         }
       }
@@ -2297,10 +2318,106 @@ export class ActorManager {
         }
       }
       this.#actors.set(actor.id, actor);
+      this.#restoreQueue(actor);
       added++;
       void this.#publishPresence(actor).catch(() => undefined);
     }
     if (added > 0) this.#emitChange();
+    this.#scheduleRestoreParked();
+  }
+
+  // smarty-dev#878: an actor's queue lived only in memory, while the mesh cursor already sat past
+  // the queued events, so a restart lost them (33 on one relaunch). Pending items without a
+  // caller (mesh and host events) are kept beside the actor, the running one until its run
+  // ends, and a restart restores them through the parked path, which waits for ownership. A
+  // restored item can run twice when the process died mid-run; one that keeps dying with its
+  // process is dropped after its third attempt.
+  #queueFile(actorId: string): string {
+    return path.join(this.#actorRoot, actorId, "queue.json");
+  }
+
+  #persistQueue(actorId: string): void {
+    if (!this.#persistent || this.#closing) return;
+    const actor = this.#actors.get(actorId);
+    if (!actor) return;
+    const inFlight = this.#inFlight.get(actorId);
+    const items = [...(inFlight ? [inFlight] : []), ...actor.queue, ...(this.#parked.get(actorId) ?? [])]
+      .filter((item) => !item.resolve && !item.reject);
+    const file = this.#queueFile(actorId);
+    try {
+      if (items.length === 0) {
+        fs.rmSync(file, { force: true });
+        return;
+      }
+      const records = items.flatMap((item) => {
+        try {
+          return [JSON.parse(JSON.stringify({
+            id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
+            activation: item.activation, binding: item.binding,
+            ...(item.images ? { images: item.images } : {}),
+            ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
+            attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
+          }))];
+        } catch {
+          return [];
+        }
+      });
+      writeJsonAtomic(file, { format: 1, items: records });
+    } catch {
+      // Queue persistence is best-effort; the in-memory queue still runs.
+    }
+  }
+
+  #finishInFlight(actorId: string, item: ActorQueueItem): void {
+    if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
+    this.#persistQueue(actorId);
+  }
+
+  #restoreQueue(actor: ManagedActor): void {
+    if (!this.#persistent || !this.#startupLoad || this.#restoredQueues.has(actor.id)) return;
+    this.#restoredQueues.add(actor.id);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(this.#queueFile(actor.id), "utf8"));
+    } catch {
+      return;
+    }
+    const records = (parsed as { format?: unknown; items?: unknown }).format === 1
+      ? (parsed as { items?: unknown }).items : undefined;
+    if (!Array.isArray(records)) return;
+    const restored: ActorQueueItem[] = [];
+    for (const record of records) {
+      if (typeof record !== "object" || record === null) continue;
+      const value = record as Partial<ActorQueueItem> & { attempts?: unknown };
+      if (
+        typeof value.id !== "string" || typeof value.source !== "string" ||
+        typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null
+      ) continue;
+      const attempts = (typeof value.attempts === "number" ? value.attempts : 0) + 1;
+      const item = {
+        id: value.id,
+        source: value.source,
+        payload: value.payload,
+        createdAt: value.createdAt,
+        activation: value.activation,
+        binding: typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        ...(Array.isArray(value.images) ? { images: value.images } : {}),
+        ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
+        attempts,
+      } as ActorQueueItem & { attempts: number };
+      if (attempts > 3) {
+        this.#recordDropped(actor, item, "it was restored after three restarts that did not finish it");
+        continue;
+      }
+      // A cursor replay of the same mesh event must not queue it a second time.
+      const eventId = value.source.startsWith("mesh:") && typeof value.payload === "object" && value.payload !== null
+        ? (value.payload as { id?: unknown }).id : undefined;
+      if (typeof eventId === "string") this.#delivered.add(`${actor.id}\0${eventId}`);
+      restored.push(item);
+    }
+    if (restored.length === 0) return;
+    this.#parked.set(actor.id, [...restored, ...(this.#parked.get(actor.id) ?? [])]);
+    this.#persistQueue(actor.id);
   }
 
   #resolvedModel(runner: FabricAgentRunner, model: string): string {
@@ -2585,6 +2702,7 @@ export class ActorManager {
       this.#recordDropped(actor, parked.shift()!, `${reason}; the parked queue is full`);
     }
     if (parked.length > 0) this.#parked.set(actor.id, parked);
+    this.#persistQueue(actor.id);
   }
 
   // A registry reload replaces actor objects while a drain still runs on the old one; its
@@ -2629,6 +2747,7 @@ export class ActorManager {
       if (item.resolve || item.reject) item.reject?.(new Error(reason));
       else this.#recordDropped(actor, item, reason);
     }
+    this.#persistQueue(actor.id);
   }
 
   #recordDropped(actor: ManagedActor, item: ActorQueueItem, reason: string): void {

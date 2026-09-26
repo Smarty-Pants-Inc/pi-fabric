@@ -274,6 +274,34 @@ describe("durable completion receipts", () => {
     return { id, result, runDirectory, metadataPath, key };
   };
 
+  // smarty-dev#878: a resident host whose root is gone sends its actors' messages to the project's
+  // project agent. That Main accepts an actor message from another root's resident host, and
+  // still nothing from a writer that is not a resident host.
+  it("delivers an actor message that another root's resident host addressed to this root", { timeout: 30_000 }, async () => {
+    const state = await rootHarness("retargeted-delivery");
+    const put = (id: string, writer: string, message: string) => state.mesh.put({
+      key: `${residentDeliveryPrefix(state.identity.id)}${id}`,
+      identity: { id: writer, name: "writer", kind: "agent" }, ifVersion: 0,
+      value: {
+        format: RESIDENT_HOST_FORMAT, id, rootId: state.identity.id,
+        from: { id: "actor-1", name: "supervisor", kind: "actor" },
+        delivery: "steer", triggerTurn: true, message, createdAt: 1,
+      },
+    });
+    await put("from-resident", residentHostId("session:departed-root"), "steer from the departed root's actor");
+    await put("from-intruder", "session:intruder", "steer from a writer that is not a resident host");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      client.start();
+      await waitFor(() => state.deliveries.length >= 1);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(state.deliveries.map((delivery) => delivery.message)).toEqual(["steer from the departed root's actor"]);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
   // review/astra on 3257dba, D1: the durable fallback cleanup keeps a possibly live worker's files.
   it("refuses the fallback cleanup of a durable run marked with an unresolved worker", async () => {
     const state = await rootHarness("unresolved-cleanup");

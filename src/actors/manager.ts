@@ -80,6 +80,8 @@ interface ManagedActor {
   adoptedAt?: number;
   // Roots whose queue files this lineage must take over (review/astra F5 on #79).
   adoptedFrom?: string[];
+  // The creating root's project (smarty-dev#878): only that project's agent adopts the actor.
+  project?: string;
   instructions: string;
   status: FabricActorStatus;
   events: FabricActorHostEvent[];
@@ -252,6 +254,8 @@ export class ActorManager {
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
+  readonly #project: string | undefined;
+  readonly #role: string | undefined;
   readonly #meshMonitor: ActorMeshMonitor;
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
@@ -315,6 +319,9 @@ export class ActorManager {
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
       rootId?: string;
+      /** This root's project and fleet role, which decide what it may adopt (smarty-dev#878). */
+      project?: string | undefined;
+      role?: string | undefined;
       meshCursorPath?: string;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
@@ -344,6 +351,8 @@ export class ActorManager {
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
+    this.#project = options.project;
+    this.#role = options.role;
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
     this.#logs = new ActorLogStore(
@@ -472,6 +481,7 @@ export class ActorManager {
       id,
       name,
       rootId: this.#rootId,
+      ...(this.#project ? { project: this.#project } : {}),
       instructions: request.instructions,
       status: "idle",
       events,
@@ -2078,6 +2088,7 @@ export class ActorManager {
       rootId: actor.rootId,
       ...(actor.adoptedAt !== undefined ? { adoptedAt: actor.adoptedAt } : {}),
       ...(actor.adoptedFrom?.length ? { adoptedFrom: actor.adoptedFrom } : {}),
+      ...(actor.project ? { project: actor.project } : {}),
       instructions: actor.instructions,
       status: actor.status,
       events: actor.events,
@@ -2245,6 +2256,7 @@ export class ActorManager {
         id: record.id,
         name: record.name,
         rootId: typeof record.rootId === "string" ? record.rootId : this.#rootId,
+        ...(typeof record.project === "string" ? { project: record.project } : {}),
         ...(typeof record.adoptedAt === "number" ? { adoptedAt: record.adoptedAt } : {}),
         ...(Array.isArray(record.adoptedFrom)
           ? { adoptedFrom: record.adoptedFrom.filter((root): root is string => typeof root === "string") }
@@ -2672,6 +2684,13 @@ export class ActorManager {
     // Only residency-matched rows: Main adopts "session" actors, the resident
     // host adopts "durable" actors.
     if (actor.residency !== this.#claimResidency) return;
+    // smarty-dev#878: the project registry is fleet-wide, so any Main could adopt a session
+    // actor, and its work then went to an unrelated session. Only the project agent of the
+    // actor's project adopts it now. A record from before projects were recorded keeps the old rule.
+    if (
+      this.#claimResidency === "session" && actor.project !== undefined &&
+      (this.#role !== "project-agent" || this.#project !== actor.project)
+    ) return;
     // Only when the directory has no live opinion about the actor itself.
     if (this.#canManageActor(actor.id) !== undefined) return;
     // Only when the lineage root itself is provably dead. This refuses

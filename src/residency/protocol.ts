@@ -59,6 +59,8 @@ const digest = (value: string): string =>
 export const residentHostId = (rootId: string): string =>
   `resident:${digest(rootId).slice(0, 24)}`;
 
+export const isResidentHostId = (id: string): boolean => /^resident:[0-9a-f]{24}$/.test(id);
+
 export const residentRoot = (meshRoot: string, rootId: string): string =>
   path.join(meshRoot, "residency", digest(rootId));
 

@@ -736,6 +736,55 @@ describe("ActorManager across a session reload", () => {
     await h.ranOnce();
   }, 60_000);
 
+  // smarty-dev#878: the project registry is fleet-wide, so any Main could adopt an orphaned session
+  // actor. Only the project agent of the actor's project adopts it, and the actor's next message
+  // then reaches that new session.
+  it("lets only the project agent of an orphaned actor's project adopt it, and delivers to the adopter", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const alive = new Map<string, boolean>([["session:owner", true]]);
+    const delivered = new Map<string, string[]>();
+    const host = (name: string, project: string, role: string) => {
+      const value = new ActorManager(
+        name, { id: `session:${name}`, name: "main", kind: "main", sessionId: name }, mesh,
+        { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents,
+        ({ message }) => { if (message.text) delivered.set(name, [...(delivered.get(name) ?? []), message.text]); },
+        {
+          actorRoot: path.join(root, "actors"), persistent: true, rootId: `session:${name}`, claimResidency: "session",
+          project, role, adoptionGraceMs: 0, meshCursorPath: path.join(root, `cursor-${name}.json`),
+          canManageActor: () => (name === "owner" && alive.get("session:owner") ? true : undefined),
+          lineageAlive: (rootId) => alive.get(rootId) ?? true,
+        },
+      );
+      actorManagers.push(value);
+      return value;
+    };
+    const owner = host("owner", "/p/dev", "project-agent");
+    const actor = await owner.create({
+      name: "supervisor", instructions: "Supervise.", topics: ["team.pulls"], responseMode: "text", delivery: "steer", triggerTurn: false,
+    });
+    await owner.close();
+    alive.set("session:owner", false);
+    // Counterexamples: another project's agent, and a worktree agent of the same project.
+    const other = host("other", "/p/knowledge", "project-agent");
+    const worktree = host("worktree", "/p/dev", "worktree-agent");
+    other.listOwned();
+    worktree.listOwned();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(other.status(actor.id).rootId).toBe("session:owner");
+    const successor = host("successor", "/p/dev", "project-agent");
+    await waitFor(() => successor.status(actor.id).rootId === "session:successor", 10_000);
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "a pull request" });
+    await waitFor(() => (delivered.get("successor") ?? []).length > 0, 20_000);
+    expect(delivered.get("other")).toBeUndefined();
+    expect(delivered.get("worktree")).toBeUndefined();
+  }, 60_000);
+
   // review/astra F3 (re-review) on #79: a host revision that changed after the last queue write
   // must not roll back on restart and make obsolete work valid again.
   it.each([

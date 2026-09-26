@@ -119,6 +119,7 @@ import {
   type FabricProvider,
   type FabricProviderDiscovery,
 } from "./protocol.js";
+import { participantRole, projectOf } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
@@ -709,6 +710,8 @@ export class FabricRuntimeState {
             lineageAlive,
             claimResidency: "session",
             rootId: mainAgentId,
+            project: projectOf(context.cwd),
+            role: participantRole(),
             retention: this.#config.retention,
             resolvePiModel: (model) => resolveParticipantPiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
@@ -725,6 +728,8 @@ export class FabricRuntimeState {
             lineageAlive,
             claimResidency: "session",
             rootId: mainAgentId,
+            project: projectOf(context.cwd),
+            role: participantRole(),
             retention: this.#config.retention,
             resolvePiModel: (model) => resolveParticipantPiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,

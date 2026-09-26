@@ -75,6 +75,19 @@ interface ProjectRoot {
 }
 
 /**
+ * Where a resident host delivers its actors' messages (smarty-dev#878): its root while that root
+ * is live, else the project's live project agent, else still its root, where the record waits.
+ */
+export const deliveryRoot = (rootId: string, liveRoots: readonly ProjectRoot[], project: string): string => {
+  if (liveRoots.some((root) => root.id === rootId)) return rootId;
+  try {
+    return resolveProjectAgent(liveRoots, project).id;
+  } catch {
+    return rootId;
+  }
+};
+
+/**
  * The live project agent for a project: the root with role "project-agent" and that project, the
  * most recently started when several match. A root from a runtime that publishes neither field
  * counts when its cwd is the project checkout (smarty-dev#784).

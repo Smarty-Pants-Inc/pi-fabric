@@ -36,6 +36,7 @@ import {
   type ResidentHostConfig,
   type ResidentHostOwner,
 } from "./protocol.js";
+import { deliveryRoot, projectOf } from "../topology/project-identity.js";
 
 const REQUEST_POLL_MS = 50;
 const IDLE_EXIT_MS = 30_000;
@@ -275,6 +276,13 @@ class ResidentHost {
           mode,
           triggers,
           message.data,
+          undefined,
+          // smarty-dev#878: once the root is gone, to the project's live project agent.
+          deliveryRoot(
+            config.rootId,
+            this.participants.list({ scope: "project", kinds: ["root"] }),
+            projectOf(config.cwd),
+          ),
         ).catch(() => undefined);
       },
       {
@@ -498,12 +506,14 @@ class ResidentHost {
     triggerTurn: boolean,
     data?: unknown,
     agentCompletionId?: string,
+    rootId = this.config.rootId,
   ): Promise<void> {
     const id = randomUUID();
+    const prefix = rootId === this.config.rootId ? this.#deliveryPrefix : residentDeliveryPrefix(rootId);
     const record: ResidentDeliveryRecord = {
       format: RESIDENT_HOST_FORMAT,
       id,
-      rootId: this.config.rootId,
+      rootId,
       from,
       delivery,
       triggerTurn,
@@ -514,14 +524,14 @@ class ResidentHost {
     };
     try {
       await this.mesh.put({
-        key: `${this.#deliveryPrefix}${id}`,
+        key: `${prefix}${id}`,
         value: record,
         identity: this.identity,
         ifVersion: 0,
       });
     } catch {
       await this.mesh.put({
-        key: `${this.#deliveryPrefix}${id}`,
+        key: `${prefix}${id}`,
         value: {
           ...record,
           message: message.slice(0, Math.max(1, this.config.mesh.eventContextChars)),

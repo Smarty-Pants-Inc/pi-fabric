@@ -323,12 +323,14 @@ const main = async (): Promise<void> => {
   // smarty-dev#967: a structured Pi run replies through one tool call, never its final text.
   const replyTool = options.replyTool === true && options.runner === "pi" && schema !== undefined;
   const replyFile = replyTool ? path.join(path.dirname(options.statusFile), "reply.json") : undefined;
+  let replyHookPath: string | undefined;
   if (replyTool) {
     const hookPath = fileURLToPath(new URL(
       import.meta.url.endsWith(".ts") ? "./worker/reply-tool.ts" : "./worker/reply-tool.js",
       import.meta.url,
     ));
     if (!fs.existsSync(hookPath)) throw new Error("Reply tool hook is missing");
+    replyHookPath = fs.realpathSync(hookPath);
     fs.rmSync(replyFile!, { force: true });
     piArguments.push("-e", hookPath);
   }
@@ -411,7 +413,9 @@ const main = async (): Promise<void> => {
       // allowlist, so both Pi and captured-tool providers enforce this
       // child-side allowlist before preparation, discovery, and invocation.
       PI_FABRIC_TOOL_ALLOWLIST: JSON.stringify(options.tools),
-      ...(replyTool ? { PI_FABRIC_REPLY_SCHEMA_FILE: options.schemaFile!, PI_FABRIC_REPLY_FILE: replyFile! } : {}),
+      ...(replyTool
+        ? { PI_FABRIC_REPLY_SCHEMA_FILE: options.schemaFile!, PI_FABRIC_REPLY_FILE: replyFile!, PI_FABRIC_REPLY_HOOK: replyHookPath! }
+        : {}),
       ...(options.actorId ? { PI_FABRIC_ACTOR_ID: options.actorId } : {}),
       ...(options.actorName ? { PI_FABRIC_ACTOR_NAME: options.actorName } : {}),
       PI_FABRIC_CAPABILITY_REQUIREMENTS: JSON.stringify(

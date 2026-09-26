@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { REPLY_TOOL_NAME } from "../core/reply-tool-identity.js";
+
 /** The tool a structured Pi run replies through (smarty-dev#967). */
-export const REPLY_TOOL = "fabric_reply";
+export const REPLY_TOOL = REPLY_TOOL_NAME;
 
 // smarty-dev#967: a directive actor was told to end its reply with one JSON object, and the host
 // scraped that object out of the final text, so 1,528 of 7,801 supervisor replies carried prose

@@ -2,6 +2,7 @@ import type { ExtensionRunner, RegisteredTool, SourceInfo, ToolDefinition } from
 import { wrapRegisteredToolForCapture } from "./wrapper.js";
 import type { FabricToolCaptureConfig } from "../config.js";
 import type { FabricRisk } from "../protocol.js";
+import { isRunReplyTool } from "../core/reply-tool-identity.js";
 
 export interface CapturedToolEntry {
   name: string;
@@ -64,6 +65,7 @@ export class CapturedToolCatalog {
     for (const registeredTool of registeredTools) {
       const { definition, sourceInfo } = registeredTool;
       if (sourceInfo.path === ownSourcePath) continue;
+      if (isRunReplyTool(definition.name, sourceInfo.path)) continue;     // host-owned (smarty-dev#967)
       this.#tools.set(definition.name, {
         name: definition.name,
         definition,

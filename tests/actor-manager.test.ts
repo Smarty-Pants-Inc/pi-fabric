@@ -35,6 +35,7 @@ const setup = (
     preparePiModel?: (model: string | undefined) => Promise<string | void>;
     resolvePiModel?: (model: string) => string;
   },
+  meshOverrides: Partial<typeof DEFAULT_FABRIC_CONFIG.mesh> = {},
 ) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-test-"));
   roots.push(root);
@@ -53,7 +54,7 @@ const setup = (
     kind: "main",
     sessionId: "test",
   };
-  const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };
+  const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, ...meshOverrides };
   const deliveries: string[] = [];
   const actors = new ActorManager(
     "test",
@@ -129,6 +130,24 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     // Before: 20 events x 10 actors x (1 + 10) decisions = 2,200. Now: 10 per event, plus the polls' own.
     expect(decisions.mock.calls.length).toBeGreaterThan(0);
     expect(decisions.mock.calls.length).toBeLessThan(600);
+  });
+
+  // review/astra F1 on #72: a matching event also enqueued, started a drain and recorded the
+  // message, and each of those re-decided every actor's ownership.
+  it("decides ownership once per matching mesh event too, with several subscribers and full queues", async () => {
+    const decisions = vi.fn((_id: string) => true as boolean | undefined);
+    const { actors, mesh } = setup(false, decisions, undefined, undefined, { actorQueueLimit: 2 });
+    for (let index = 0; index < 8; index++) {
+      await actors.create({ name: `actor-${index}`, instructions: "Watch.", topics: ["team.pulls"], responseMode: "text", coalesce: false });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    decisions.mockClear();
+    const from: MeshIdentity = { id: "session:other", name: "main", kind: "main", sessionId: "other" };
+    for (let index = 0; index < 20; index++) await mesh.publish({ topic: "team.pulls", from, data: { index } });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    // Before: each delivery re-decided all 8 actors 4 times (enqueue, drain, record twice).
+    expect(decisions.mock.calls.length).toBeGreaterThan(0);
+    expect(decisions.mock.calls.length).toBeLessThan(1_200);
   });
 
   it("publishes a new actor's presence once a stalled lock frees", async () => {

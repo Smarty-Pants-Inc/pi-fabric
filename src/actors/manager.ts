@@ -233,6 +233,8 @@ export class ActorManager {
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
   readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
+  // Set while one mesh event is delivered synchronously after a single ownership refresh.
+  #ownershipSnapshot = false;
   readonly #resolvePiModel: ((model: string) => string) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
@@ -1868,7 +1870,18 @@ export class ActorManager {
     // One ownership refresh per event. Each decision reads the participant directory, and
     // re-deciding for every actor per actor (and before the topic filter) cost 182 directory
     // reads per event on a host with 13 actors and saturated its event loop (smarty-dev#784).
+    // The snapshot holds for this synchronous delivery (enqueue, drain start, message record);
+    // work that resumes later decides again.
     this.#refreshOwnership();
+    this.#ownershipSnapshot = true;
+    try {
+      return this.#deliverMeshEvent(event);
+    } finally {
+      this.#ownershipSnapshot = false;
+    }
+  }
+
+  #deliverMeshEvent(event: MeshEvent): boolean {
     let full = false;
     for (const actor of this.#actors.values()) {
       if (actor.status === "stopped") continue;
@@ -1886,8 +1899,9 @@ export class ActorManager {
           const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
           // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
           // so a joined key could merge two topics' subjects. Keeps the value's type.
-          this.#enqueue(actor, `mesh:${event.topic}`, event, key === undefined ? {} : {
-            coalesceKey: JSON.stringify(["mesh", event.topic, key]),
+          this.#enqueue(actor, `mesh:${event.topic}`, event, {
+            ownershipChecked: true,
+            ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
           });
         }
         this.#delivered.add(delivery);
@@ -2652,7 +2666,7 @@ export class ActorManager {
   }
 
   #canManage(id: string): boolean {
-    this.#refreshOwnership();
+    if (!this.#ownershipSnapshot) this.#refreshOwnership();
     return this.#canManageCached(id);
   }
 

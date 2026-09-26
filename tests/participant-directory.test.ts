@@ -306,6 +306,41 @@ describe("ParticipantDirectory role and project", () => {
   });
 });
 
+describe("ParticipantDirectory root project", () => {
+  // smarty-dev#977: a lead whose cwd is a worktree of another repository publishes the project it
+  // names, so it is not taken for a project agent of that repository.
+  it("publishes PI_FABRIC_PROJECT as the root's project instead of its cwd's", async () => {
+    const previous = { role: process.env.SMARTY_ROLE, project: process.env.PI_FABRIC_PROJECT };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const own = path.join(root, "own-project");
+    fs.mkdirSync(own);
+    process.env.SMARTY_ROLE = "project-agent@5358e96a418f";
+    process.env.PI_FABRIC_PROJECT = own;
+    try {
+      const meshRoot = path.join(root, "mesh");
+      const alphaIdentity: MeshIdentity = { id: "session:alpha", name: "main", kind: "main", sessionId: "alpha" };
+      const betaIdentity: MeshIdentity = { id: "session:beta", name: "main", kind: "main", sessionId: "beta" };
+      let alpha: ParticipantDirectory | undefined;
+      alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [alpha!.root({
+        id: alphaIdentity.id, name: "main", kind: "main", status: "idle", runner: "pi", transport: "host",
+        cwd: process.cwd(), sessionId: "alpha", startedAt: 1, updatedAt: 2, pendingMessages: false, local: true,
+      } as never)]);
+      const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")]);
+      await alpha.start();
+      await beta.start();
+      const peer = beta.peers().find((candidate) => candidate.id === "session:alpha");
+      expect(peer).toMatchObject({ role: "project-agent", project: projectOf(own), cwd: process.cwd() });
+      expect(peer?.project).not.toBe(projectOf(process.cwd()));
+    } finally {
+      for (const [key, value] of [["SMARTY_ROLE", previous.role], ["PI_FABRIC_PROJECT", previous.project]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+});
+
 describe("ParticipantDirectory", () => {
   it("builds one project topology while preserving local ownership and lineage", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));

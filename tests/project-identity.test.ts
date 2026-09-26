@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { deliveryRoot, participantRole, projectOf, resolveProjectAgent } from "../src/topology/project-identity.js";
+import { deliveryRoot, participantProject, participantRole, projectOf, resolveProjectAgent } from "../src/topology/project-identity.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -45,6 +45,27 @@ describe("project identity", () => {
     fs.symlinkSync(base, alias);
     expect(projectOf(path.join(alias, "main"))).toBe(projectOf(path.join(base, "wt")));
     expect(projectOf(path.join(alias, "wt"))).toBe(main);
+  });
+
+  // smarty-dev#977: a lead whose cwd is a worktree of another repository names its own project.
+  it("takes a root's project from PI_FABRIC_PROJECT when set, else from its cwd", () => {
+    const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-project-")));
+    roots.push(base);
+    const repo = (name: string) => {
+      const dir = path.join(base, name);
+      fs.mkdirSync(path.join(dir, "sub"), { recursive: true });
+      git(dir, "init", "-q");
+      git(dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
+      return dir;
+    };
+    const host = repo("smarty-dev");                                 // the repository the lead's cwd is in
+    const own = repo("pi-fabric");                                   // the project it leads
+    git(host, "worktree", "add", "-q", path.join(base, "lead-home"));
+    const cwd = path.join(base, "lead-home");
+    expect(participantProject(cwd, {})).toBe(host);                  // without it: the cwd's repository
+    expect(participantProject(cwd, { PI_FABRIC_PROJECT: own })).toBe(own);
+    expect(participantProject(cwd, { PI_FABRIC_PROJECT: path.join(own, "sub") })).toBe(own);   // any path in it
+    expect(participantProject(cwd, { PI_FABRIC_PROJECT: "  " })).toBe(host);                 // blank: unset
   });
 
   it("reads the role from PI_FABRIC_ROLE, else SMARTY_ROLE without its stamp", () => {

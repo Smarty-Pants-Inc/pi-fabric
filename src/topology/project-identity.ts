@@ -66,6 +66,16 @@ export const projectOf = (cwd: string): string => {
   return project;
 };
 
+/**
+ * This root's project: the project of PI_FABRIC_PROJECT when that is set, else of its cwd. A lead
+ * whose cwd is a worktree of another repository names its own project, or it would count as a
+ * project agent of that repository (smarty-dev#977).
+ */
+export const participantProject = (cwd: string, env: NodeJS.ProcessEnv = process.env): string => {
+  const explicit = env.PI_FABRIC_PROJECT?.trim();
+  return projectOf(explicit ? path.resolve(explicit) : cwd);
+};
+
 interface ProjectRoot {
   id: string;
   role?: string;

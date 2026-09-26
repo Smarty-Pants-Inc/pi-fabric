@@ -16,6 +16,7 @@ import {
   fileLeasesOnly,
   hostLeaseExpiry,
   LIVENESS_POLICY_KEY,
+  readHostLease,
   readHostLeases,
   removeHostLease,
   STATE_LEASE_RENEW_MS,
@@ -497,6 +498,27 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   get(id: string, now = Date.now(), options: { fresh?: boolean } = {}): FabricParticipantInfo | undefined {
     const target = id === "main" ? this.options.rootId : id;
+    // One record and its owner's lease, not a clone of the whole directory: actor ownership
+    // checks call this per actor (smarty-dev#784). A missing or stale record takes the full
+    // list, which also knows legacy roots, so the answer is the same.
+    if (this.options.enabled) {
+      const read = { fresh: options.fresh === true };
+      const entry = this.mesh.get(keyFor(PARTICIPANT_PREFIX, target), read);
+      const participant = entry ? participantFromEntry(entry) : undefined;
+      if (participant?.id === target) {
+        const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId), read);
+        const owner = hostEntry ? hostFromEntry(hostEntry) : undefined;
+        const lease = owner ? readHostLease(this.mesh.root, owner.id) : undefined;
+        if (
+          owner &&
+          hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner) >= now &&
+          owner.identity.id === participant.ownerIdentityId &&
+          owner.rootId === participant.rootId
+        ) {
+          return { ...participant, local: participant.ownerHostId === this.options.hostId, stale: false };
+        }
+      }
+    }
     return this.list({ scope: "project", ...(options.fresh ? { fresh: true } : {}) }, now)
       .find((participant) => participant.id === target);
   }

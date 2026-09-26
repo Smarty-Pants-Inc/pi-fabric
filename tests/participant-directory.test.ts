@@ -222,6 +222,60 @@ describe("ParticipantDirectory host leases", () => {
   });
 });
 
+// smarty-dev#784: actor ownership checks call get() per actor; it listed and cloned the whole
+// directory each time.
+describe("ParticipantDirectory.get", () => {
+  it("reads one live participant without listing the directory, with the same answer as the list", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const alphaIdentity: MeshIdentity = { id: "session:alpha", name: "main", kind: "main", sessionId: "alpha" };
+    const betaIdentity: MeshIdentity = { id: "session:beta", name: "main", kind: "main", sessionId: "beta" };
+    const alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [
+      rootRecord(alphaIdentity.id, alphaIdentity.id, "alpha"),
+      agentRecord("agent:alpha-child", alphaIdentity.id, alphaIdentity.id, alphaIdentity.id),
+    ]);
+    const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")]);
+    await alpha.start();
+    await beta.start();
+    const expected = (id: string) => beta.list({ scope: "project" }).find((participant) => participant.id === id);
+    const listed = vi.spyOn(beta, "list");
+    for (const id of ["agent:alpha-child", "session:alpha", "session:beta"]) {
+      listed.mockClear();
+      const found = beta.get(id);
+      expect(listed).not.toHaveBeenCalled();
+      listed.mockRestore();
+      expect(found).toEqual(expected(id));
+      vi.spyOn(beta, "list");
+    }
+    const fallback = vi.spyOn(beta, "list");
+    expect(beta.get("agent:unknown")).toBeUndefined();                // absent: the full list decides
+    expect(fallback).toHaveBeenCalled();
+    fallback.mockRestore();
+  });
+
+  it("finds a participant whose host is alive only by its file lease, without listing", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const owner: MeshIdentity = { id: "session:owner", name: "main", kind: "main", sessionId: "owner" };
+    await new MeshStore(meshRoot, 64 * 1024, 1_000).put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: owner });
+    const alphaIdentity: MeshIdentity = { id: "session:alpha", name: "main", kind: "main", sessionId: "alpha" };
+    const betaIdentity: MeshIdentity = { id: "session:beta", name: "main", kind: "main", sessionId: "beta" };
+    const alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [
+      agentRecord("agent:alpha-child", alphaIdentity.id, alphaIdentity.id, alphaIdentity.id),
+    ]);
+    const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")]);
+    await alpha.start();
+    await beta.start();
+    await new Promise((resolve) => setTimeout(resolve, 600));        // past alpha's 300 ms shared lease
+    const listed = vi.spyOn(beta, "list");
+    expect(beta.get("agent:alpha-child")).toMatchObject({ id: "agent:alpha-child", stale: false });
+    expect(listed).not.toHaveBeenCalled();
+    listed.mockRestore();
+  });
+});
+
 describe("ParticipantDirectory", () => {
   it("builds one project topology while preserving local ownership and lineage", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));

@@ -5,36 +5,50 @@ import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
  * A root session's durable inbox (smarty-dev#754 §3.2 step 3): work events addressed to this root
  * on `fleet.*` topics that no steer or follow-up delivered. Senders publish a shadow record there
  * before they steer (the #1255 rule); a steer can time out or reach a root that is shutting down,
- * but the event stays in the mesh and in its archive. The root reconciles at turn start and when
- * it settles, from a processing cursor in mesh state that moves only past what it delivered.
+ * but the event stays in the mesh and in its archive. The root reconciles at turn start and when a
+ * completed run settles, from a processing cursor in mesh state.
  *
- * Delivery is at least once: after a restart, a work event whose steer came in the last minutes
- * before the cursor was saved can come again, marked as a possible repeat.
+ * A batch is saved as pending before it is delivered, and the cursor moves past it only once the
+ * session's own entries hold its message. Until then every reconcile delivers it again, so work
+ * survives a stop between the save and the session's write: delivery is at least once.
  */
 export const ROOT_INBOX_PREFIX = "topology/inbox/";
 export const WORK_TOPIC_PREFIX = "fleet.";
 export const ROOT_INBOX_CUSTOM_TYPE = "pi-fabric-inbox";
 /** A shadow record newer than this waits a reconcile, so its steer can arrive first and win. */
 const STEER_GRACE_MS = 60_000;
-/** Steers delivered in this process are remembered this long, to skip their shadow records. */
-const DELIVERED_TTL_MS = 6 * 60 * 60_000;
-/** The cursor is saved when it delivers, and otherwise at most this often. */
+/** A steer receipt matches a shadow record published this close to it, and one only. */
+const RECEIPT_WINDOW_MS = 10 * 60_000;
+/** Receipts are kept this long, and dropped at every reconcile after. */
+const RECEIPT_TTL_MS = 60 * 60_000;
+/** The cursor is saved when it moves past a delivered batch, and otherwise at most this often. */
 const SAVE_INTERVAL_MS = 10 * 60_000;
+/** One batch holds at most this many events and this much text; a longer text is cut. */
+const MAX_BATCH_EVENTS = 20;
+const MAX_BATCH_TEXT_BYTES = 32 * 1024;
+const MAX_EVENT_TEXT_BYTES = 8 * 1024;
+/** A pending batch the session never records is committed after this many deliveries. */
+const MAX_PENDING_ATTEMPTS = 5;
 
 export interface RootInboxBatch {
   events: MeshEvent[];
-  /** The sequence the cursor may move to once these events are delivered. */
+  /** The sequence the cursor moves to once these events are in the session. */
   through: number;
+}
+
+interface RootInboxState {
+  after: number;
+  pending?: { through: number; ids: string[]; attempts: number };
 }
 
 const fingerprint = (fromId: string, text: string): string =>
   createHash("sha256").update(`${fromId}\0${text.trim()}`).digest("hex");
 
 export class RootInbox {
-  #cursor: number | undefined;
-  #saved: number | undefined;
+  #state: RootInboxState | undefined;
+  #saved: string | undefined;
   #savedAt = 0;
-  readonly #delivered = new Map<string, number>();
+  readonly #receipts: Array<{ key: string; at: number }> = [];
 
   constructor(
     readonly mesh: MeshStore,
@@ -48,55 +62,120 @@ export class RootInbox {
     return ROOT_INBOX_PREFIX + createHash("sha256").update(this.identity.id).digest("hex").slice(0, 32);
   }
 
-  /** A steer or follow-up reached this root: its shadow record is not news. */
+  /** A steer or follow-up reached this root: one shadow record of it, published near now, is not news. */
   noteDelivered(fromId: string, text: string): void {
-    const now = this.#now();
-    for (const [key, at] of this.#delivered) if (now - at > DELIVERED_TTL_MS) this.#delivered.delete(key);
-    this.#delivered.set(fingerprint(fromId, text), now);
+    this.#receipts.push({ key: fingerprint(fromId, text), at: this.#now() });
   }
 
   /**
-   * The work events for this root past its cursor that no steer delivered. The scan stops at the
-   * first event younger than the steer grace, so the cursor never passes one it has not judged.
+   * The batch to deliver now. A pending batch the session holds is committed first; one it does
+   * not hold is delivered again. A new batch stops at the first event younger than the steer
+   * grace and at the batch bounds, so the cursor never passes an event it has not admitted.
    */
-  unseen(): RootInboxBatch {
-    let through = this.#load();
+  async next(sessionHolds: (ids: readonly string[]) => boolean): Promise<RootInboxBatch> {
+    const state = this.#load();
+    if (state.pending) {
+      if (sessionHolds(state.pending.ids) || state.pending.attempts >= MAX_PENDING_ATTEMPTS) {
+        state.after = Math.max(state.after, state.pending.through);
+        delete state.pending;
+        await this.#save(true);
+      } else {
+        state.pending.attempts++;
+        await this.#save(true);
+        return { events: this.#reread(state.after, state.pending), through: state.pending.through };
+      }
+    }
+    const batch = this.#scan(state.after);
+    if (batch.events.length === 0) {
+      state.after = batch.through;
+      await this.#save(false);
+      return batch;
+    }
+    state.pending = { through: batch.through, ids: batch.events.map((event) => event.id), attempts: 1 };
+    await this.#save(true);
+    return batch;
+  }
+
+  #scan(after: number): RootInboxBatch {
+    const now = this.#now();
+    for (let index = this.#receipts.length - 1; index >= 0; index--) {
+      if (now - this.#receipts[index]!.at > RECEIPT_TTL_MS) this.#receipts.splice(index, 1);
+    }
     const names = new Set(this.names().filter((name) => name.trim()));
-    const cutoff = this.#now() - (this.options.steerGraceMs ?? STEER_GRACE_MS);
+    const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
     const pageSize = this.options.pageSize ?? 500;
     const events: MeshEvent[] = [];
+    let through = after;
+    let bytes = 0;
     for (;;) {
       const page = this.mesh.read({ after: through, limit: pageSize });
       for (const event of page) {
         if (event.createdAt > cutoff) return { events, through };
+        if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to) && !this.#takeReceipt(event)) {
+          const size = Math.min(Buffer.byteLength(event.text ?? ""), MAX_EVENT_TEXT_BYTES);
+          if (events.length >= MAX_BATCH_EVENTS || (events.length > 0 && bytes + size > MAX_BATCH_TEXT_BYTES)) {
+            return { events, through };
+          }
+          events.push(event);
+          bytes += size;
+        }
         through = Math.max(through, event.sequence);
-        if (!event.topic.startsWith(WORK_TOPIC_PREFIX) || event.to === undefined || !names.has(event.to)) continue;
-        if (this.#delivered.has(fingerprint(event.from.id, event.text ?? ""))) continue;
-        events.push(event);
       }
       if (page.length < pageSize) return { events, through };
     }
   }
 
-  /** Moves the cursor after a batch. Saves it at once when the batch delivered anything. */
-  async advance(batch: RootInboxBatch): Promise<void> {
-    this.#cursor = Math.max(this.#load(), batch.through);
-    const due = batch.events.length > 0 || this.#now() - this.#savedAt >= SAVE_INTERVAL_MS;
-    if (!due || this.#saved === this.#cursor) return;
-    await this.mesh.put({ key: this.key, value: { after: this.#cursor }, identity: this.identity });
-    this.#saved = this.#cursor;
-    this.#savedAt = this.#now();
+  // A receipt stands for the one shadow record its steer copied: same sender and text, published
+  // within the window of the steer. It is used up by that record.
+  #takeReceipt(event: MeshEvent): boolean {
+    const key = fingerprint(event.from.id, event.text ?? "");
+    const index = this.#receipts.findIndex((receipt) => receipt.key === key && Math.abs(receipt.at - event.createdAt) <= RECEIPT_WINDOW_MS);
+    if (index < 0) return false;
+    this.#receipts.splice(index, 1);
+    return true;
   }
 
-  #load(): number {
-    if (this.#cursor !== undefined) return this.#cursor;
-    const value = this.mesh.get(this.key)?.value as { after?: unknown } | undefined;
-    const saved = typeof value?.after === "number" && Number.isSafeInteger(value.after) ? value.after : undefined;
+  #reread(after: number, pending: NonNullable<RootInboxState["pending"]>): MeshEvent[] {
+    const ids = new Set(pending.ids);
+    const found: MeshEvent[] = [];
+    const pageSize = this.options.pageSize ?? 500;
+    for (let cursor = after; cursor < pending.through;) {
+      const page = this.mesh.read({ after: cursor, limit: pageSize });
+      if (page.length === 0) break;
+      for (const event of page) {
+        if (event.sequence > pending.through) return found;
+        if (ids.has(event.id)) found.push(event);
+        cursor = Math.max(cursor, event.sequence);
+      }
+      if (page.length < pageSize) break;
+    }
+    return found;
+  }
+
+  #load(): RootInboxState {
+    if (this.#state) return this.#state;
+    const value = this.mesh.get(this.key)?.value as Partial<RootInboxState> | undefined;
+    const saved = typeof value?.after === "number" && Number.isSafeInteger(value.after);
+    const pending = value?.pending;
     // A root with no cursor starts at the present: the inbox is for what it misses from now on.
-    this.#cursor = saved ?? this.mesh.latestSequence();
-    this.#saved = saved;
-    this.#savedAt = saved === undefined ? 0 : this.#now();
-    return this.#cursor;
+    this.#state = {
+      after: saved ? value!.after! : this.mesh.latestSequence(),
+      ...(pending && Array.isArray(pending.ids) && typeof pending.through === "number"
+        ? { pending: { through: pending.through, ids: pending.ids.filter((id): id is string => typeof id === "string"), attempts: Number(pending.attempts) || 1 } }
+        : {}),
+    };
+    this.#saved = saved ? JSON.stringify(this.#state) : undefined;
+    this.#savedAt = saved ? this.#now() : 0;
+    return this.#state;
+  }
+
+  async #save(now: boolean): Promise<void> {
+    const text = JSON.stringify(this.#state);
+    if (text === this.#saved) return;
+    if (!now && this.#now() - this.#savedAt < SAVE_INTERVAL_MS) return;
+    await this.mesh.put({ key: this.key, value: JSON.parse(text) as RootInboxState, identity: this.identity });
+    this.#saved = text;
+    this.#savedAt = this.#now();
   }
 
   #now(): number {
@@ -104,8 +183,25 @@ export class RootInbox {
   }
 }
 
+/** Whether a session's recent entries hold the inbox message for these event ids. */
+export const sessionHoldsInboxBatch = (entries: readonly unknown[], ids: readonly string[], lookback = 500): boolean => {
+  for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
+    const entry = entries[index] as { type?: string; customType?: string; details?: { ids?: unknown } } | undefined;
+    if (entry?.type !== "custom_message" || entry.customType !== ROOT_INBOX_CUSTOM_TYPE) continue;
+    const held = Array.isArray(entry.details?.ids) ? new Set(entry.details.ids) : undefined;
+    if (held && ids.every((id) => held.has(id))) return true;
+  }
+  return false;
+};
+
 const escapeXml = (value: string): string =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
+const bounded = (text: string, sequence: number): string => {
+  if (Buffer.byteLength(text) <= MAX_EVENT_TEXT_BYTES) return text;
+  const cut = Buffer.from(text).subarray(0, MAX_EVENT_TEXT_BYTES).toString("utf8").replace(/\uFFFD$/u, "");
+  return `${cut}\n[cut at ${MAX_EVENT_TEXT_BYTES} bytes; read the whole event with mesh.read({ after: ${sequence - 1}, limit: 1 })]`;
+};
 
 /** The one message that brings a batch into the session. */
 export const rootInboxMessage = (events: readonly MeshEvent[]) => ({
@@ -118,11 +214,11 @@ export const rootInboxMessage = (events: readonly MeshEvent[]) => ({
       const attributes = [
         `id="${event.id}"`, `sequence="${event.sequence}"`, `topic="${escapeXml(event.topic)}"`, `kind="${escapeXml(event.kind)}"`,
         `from_name=${JSON.stringify(event.from.name)}`, `from_id=${JSON.stringify(event.from.id)}`,
-        ...(typeof data.ref === "string" ? [`ref=${JSON.stringify(data.ref)}`] : []),
-        ...(typeof data.key === "string" ? [`key=${JSON.stringify(data.key)}`] : []),
+        ...(typeof data.ref === "string" ? [`ref=${JSON.stringify(data.ref.slice(0, 256))}`] : []),
+        ...(typeof data.key === "string" ? [`key=${JSON.stringify(data.key.slice(0, 256))}`] : []),
         `at="${new Date(event.createdAt).toISOString()}"`,
       ];
-      return `<event ${attributes.join(" ")}>${escapeXml(event.text ?? "")}</event>`;
+      return `<event ${attributes.join(" ")}>${escapeXml(bounded(event.text ?? "", event.sequence))}</event>`;
     }),
     "</fabric-inbox>",
   ].join("\n"),

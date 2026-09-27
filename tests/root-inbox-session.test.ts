@@ -31,7 +31,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  const start = async () => {
+  const start = async (tokensPerSecond = 1_000) => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-inbox-session-")));
     roots.push(root);
     const agentDir = path.join(root, "agent");
@@ -40,7 +40,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const meshRoot = path.join(root, "mesh");
     process.env.PI_FABRIC_MESH_ROOT = meshRoot;
     process.env.PI_CODING_AGENT_DIR = agentDir;
-    const faux = fauxProvider({ tokensPerSecond: 1_000 });
+    const faux = fauxProvider({ tokensPerSecond });
     const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
     modelRuntime.registerNativeProvider(faux.provider);
     const loader = new DefaultResourceLoader({
@@ -86,6 +86,28 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     faux.setResponses([fauxAssistantMessage("again")]);
     await session.prompt("and again");
     expect(inboxMessages()).toHaveLength(1);
+  }, 60_000);
+
+  // review F3: stopping the Main must not start it again.
+  it("starts no turn when an aborted run settles, and brings the event with the next turn", async () => {
+    const slow = await start(10);
+    const { session, faux, inboxMessages, missedWork } = slow;
+    faux.setResponses([
+      () => { missedWork("Waiting while you were stopped."); return fauxAssistantMessage("a long answer ".repeat(300)); },
+    ]);
+    const prompted = session.prompt("work");
+    const deadline = Date.now() + 10_000;
+    while (!session.isStreaming && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await session.abort();
+    await prompted.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(session.isStreaming).toBe(false);
+    expect(inboxMessages()).toEqual([]);
+    faux.setResponses([fauxAssistantMessage("resumed")]);
+    await session.prompt("resume");
+    expect(inboxMessages()).toHaveLength(1);
+    expect(JSON.stringify(inboxMessages()[0])).toContain("Waiting while you were stopped.");
   }, 60_000);
 
   it("starts a turn for a work event that arrived during a run, when the run settles", async () => {

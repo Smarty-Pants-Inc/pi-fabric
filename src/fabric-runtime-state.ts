@@ -313,13 +313,9 @@ export class FabricRuntimeState {
     return this.#participants?.peers() ?? [];
   }
 
-  /** The work events this Main has not seen (smarty-dev#754); undefined when it has no inbox. */
-  rootInboxBatch(): RootInboxBatch | undefined {
-    return this.#rootInbox?.unseen();
-  }
-
-  async advanceRootInbox(batch: RootInboxBatch): Promise<void> {
-    await this.#rootInbox?.advance(batch);
+  /** The inbox batch this Main should see now (smarty-dev#754); undefined when it has no inbox. */
+  async nextRootInbox(sessionHolds: (ids: readonly string[]) => boolean): Promise<RootInboxBatch | undefined> {
+    return this.#rootInbox?.next(sessionHolds);
   }
 
   /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */

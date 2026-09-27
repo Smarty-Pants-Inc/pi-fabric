@@ -256,8 +256,9 @@ export class FabricState {
 
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
   peerInfos(): FabricPeerInfo[] { return this.#current()?.peerInfos() ?? []; }
-  rootInboxBatch(): RootInboxBatch | undefined { return this.#current()?.rootInboxBatch(); }
-  async advanceRootInbox(batch: RootInboxBatch): Promise<void> { await this.#current()?.advanceRootInbox(batch); }
+  async nextRootInbox(sessionHolds: (ids: readonly string[]) => boolean): Promise<RootInboxBatch | undefined> {
+    return this.#current()?.nextRootInbox(sessionHolds);
+  }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }
   participantsConfirmedAt(): number | undefined { return this.#current()?.participantsConfirmedAt(); }
   componentGraph(): FabricComponentGraph {

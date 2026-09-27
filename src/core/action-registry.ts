@@ -40,6 +40,7 @@ import {
   type FabricGuestTypeSources,
   type FabricInvocationActivityUpdate,
   type FabricInvocationContext,
+  type FabricInvocationOutcome,
   type FabricMediaBlock,
   type FabricNamedActionTypeSource,
   type FabricProvider,
@@ -1258,14 +1259,15 @@ export class ActionRegistry {
     }
   }
 
-  async endInvocation(parentToolCallId: string, timeoutMs = 1_000): Promise<void> {
+  /** Fail-closed: callers that do not prove success end the invocation as failed. */
+  async endInvocation(parentToolCallId: string, outcome: FabricInvocationOutcome = "failed", timeoutMs = 1_000): Promise<void> {
     this.#speculation?.onInvocationEnd?.(parentToolCallId);
     const providers = new Set(
       this.#providerBindings.entries().map((binding) => binding.provider),
     );
     const finalizers = [...providers].flatMap((provider) =>
       provider.invocationEnded
-        ? [this.#providerBindings.trackProvider(provider, () => provider.invocationEnded!(parentToolCallId), true)]
+        ? [this.#providerBindings.trackProvider(provider, () => provider.invocationEnded!(parentToolCallId, outcome), true)]
         : [],
     );
     await settleWithin(finalizers, timeoutMs);

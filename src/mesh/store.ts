@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
@@ -222,7 +222,7 @@ const readState = (filePath: string, maxBytes: number, recoverDamage = true): Me
     const stat = fs.statSync(filePath);
     if (stat.size > maxBytes) throw new Error(`state exceeds ${maxBytes} bytes`);
     if (stat.size === 0 && recoverDamage) return emptyState();
-    serialized = fs.readFileSync(filePath, "utf8");
+    serialized = readFileRetrying(filePath);            // a lock-free read can meet a replace on Windows
   } catch (error) {
     if (errorCode(error) === "ENOENT") return emptyState();
     const message = error instanceof Error ? error.message : String(error);

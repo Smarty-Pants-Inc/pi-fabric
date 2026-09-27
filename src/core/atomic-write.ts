@@ -36,6 +36,23 @@ const syncSleep = (() => {
   }
 })();
 
+// Windows fails an open with EPERM/EACCES/EBUSY while the file is being replaced by a rename
+// (the old file is pending deletion) or probed by a scanner: milliseconds, not a real answer.
+const RETRYABLE_READ_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/** readFileSync that retries the transient Windows open failures a few times, briefly. */
+export const readFileRetrying = (file: string, attempts = 5, delayMs = 5): string => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return fs.readFileSync(file, "utf8");
+    } catch (error) {
+      const code = errorCode(error);
+      if (attempt >= attempts || code === undefined || !RETRYABLE_READ_CODES.has(code)) throw error;
+      syncSleep(delayMs * attempt);
+    }
+  }
+};
+
 export const renameAtomic = (
   source: string,
   target: string,

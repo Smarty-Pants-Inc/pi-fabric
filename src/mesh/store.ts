@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
+import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 
 export interface MeshIdentity {
@@ -371,6 +372,7 @@ export class MeshStore {
   #stateCache:
     | { device: number; inode: number; size: number; modifiedAt: number; parsedAt: number; state: MeshStateFile }
     | undefined;
+  #oldestLive: { identity: string; sequence: number | undefined } | undefined;
 
   constructor(
     readonly root: string,
@@ -423,6 +425,8 @@ export class MeshStore {
     const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
     return this.#withLock(() => {
       this.#repairEventLog();
+      const archive = MeshArchive.fromRoot(this.root);
+      if (archive) this.#catchUpArchive(archive);
       const createdAt = Date.now();
       const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
       const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
@@ -441,8 +445,14 @@ export class MeshStore {
       if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
         throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
       }
-      fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+      // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
+      // The archive commits first (smarty-dev#754): if it fails, no reader ever sees the event.
+      // ponytail: its fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a burst of 160
+      // publishes held other writers up to 1.3 s at 5x the fleet rate. If the lock's held share
+      // matters (#816), sync after unlocking and let concurrent syncs share a journal commit.
       atomicWrite(this.#counterPath, sequence);
+      archive?.append([{ event, line }], { intent: true });
+      fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
       this.#compactEventLog();
       return event;
     });
@@ -458,11 +468,93 @@ export class MeshStore {
   ): MeshEvent[] {
     if (input.topic !== undefined) this.#validateTopic(input.topic);
     const limit = Math.max(1, Math.min(Math.floor(input.limit ?? 100), this.maxReadEvents));
+    const after = input.after === undefined ? undefined : Math.max(0, Math.floor(input.after));
     const events =
-      input.after === undefined
+      after === undefined
         ? this.#readRecentEvents(input, limit)
-        : this.#readEventsAfter(Math.max(0, Math.floor(input.after)), input, limit);
+        : this.#readArchivedAfter(after, input, limit) ?? this.#readEventsAfter(after, input, limit);
     return events.map((event) => jsonClone(event));
+  }
+
+  // A cursor older than the live log reads the archive, which holds every event since it was
+  // set (smarty-dev#754). The oldest live sequence changes only when the log is rewritten.
+  #readArchivedAfter(after: number, input: { topic?: string; to?: string }, limit: number): MeshEvent[] | undefined {
+    let identity: string;
+    try {
+      const stat = fs.statSync(this.#eventsPath);
+      identity = `${this.#readGeneration()}:${stat.ino}`;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw error;
+    }
+    if (this.#oldestLive?.identity !== identity) this.#oldestLive = { identity, sequence: this.oldestSequence() };
+    const oldest = this.#oldestLive.sequence;
+    if (oldest === undefined || after + 1 >= oldest) return undefined;
+    const archived = MeshArchive.fromRoot(this.root)
+      ?.readAfter(after, (event) => this.#eventMatches(event, input), limit, input.topic);
+    return archived?.length ? archived : undefined;
+  }
+
+  // Before a publish, under the lock, bring the live log and the archive level. The event of a
+  // publish that crashed after its archive append goes live now. Events that a store without
+  // the archive appended (an older Fabric, or before the archive was set) go into the archive.
+  #catchUpArchive(archive: MeshArchive): void {
+    const head = archive.head();
+    let lastLive = this.#readLastEventSequence();
+    if (head && head.sequence > lastLive && head.sequence === this.#readSequence()) {
+      const line = archive.headLine(head);
+      if (line !== undefined) {
+        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+        lastLive = head.sequence;
+      }
+    }
+    if ((head?.sequence ?? 0) < lastLive) archive.append(this.#liveEntriesAfter(head?.sequence ?? 0));
+  }
+
+  // Live lines after a sequence, oldest first. It reads back from the end, so the usual one or
+  // two unarchived events cost one chunk.
+  #liveEntriesAfter(after: number): MeshArchiveEntry[] {
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(this.#eventsPath, "r");
+      let position = fs.fstatSync(descriptor).size;
+      let carry = Buffer.alloc(0);
+      const entries: MeshArchiveEntry[] = [];
+      while (position > 0) {
+        const start = Math.max(0, position - EVENT_READ_CHUNK_BYTES);
+        const chunk = Buffer.allocUnsafe(position - start);
+        fs.readSync(descriptor, chunk, 0, chunk.length, start);
+        position = start;
+        const text = Buffer.concat([chunk, carry]);
+        // Before the first newline, a line may continue in the earlier chunk.
+        const split = position === 0 ? 0 : text.indexOf(0x0a) + 1;
+        if (split === 0 && position > 0) {
+          carry = text;
+          continue;
+        }
+        carry = text.subarray(0, split);
+        const lines = text.subarray(split).toString("utf8").split("\n");
+        for (let index = lines.length - 1; index >= 0; index--) {
+          const line = lines[index];
+          if (!line) continue;
+          let event: MeshEvent;
+          try {
+            event = JSON.parse(line) as MeshEvent;
+          } catch {
+            continue;
+          }
+          if (typeof event.sequence !== "number") continue;
+          if (event.sequence <= after) return entries.reverse();
+          entries.push({ event, line });
+        }
+      }
+      return entries.reverse();
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return [];
+      throw error;
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
   }
 
   /**

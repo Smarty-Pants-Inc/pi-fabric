@@ -69,6 +69,10 @@ export class FabricState {
   #cwd: string | undefined;
   #generation = 0;
   #everActivated = false;
+  // Set by shutdown(), cleared by the next session_start's bootstrap(). A tool call that
+  // starts during session_shutdown (a /reload mid-run) must not build a runtime that
+  // nothing shuts down and that outlives its ctx.
+  #shutDown = false;
   #activationHook: ActivationHook | undefined;
   #activationFailureHook: ActivationFailureHook | undefined;
   readonly #externalProviders = new Map<string, FabricProvider>();
@@ -154,6 +158,7 @@ export class FabricState {
   }
 
   async bootstrap(context: ExtensionContext): Promise<void> {
+    this.#shutDown = false;
     const generation = ++this.#generation;
     this.#cwd = context.cwd;
     // A failed config load must not leak the previous session's configuration
@@ -181,6 +186,7 @@ export class FabricState {
   }
 
   async initialize(context: ExtensionContext): Promise<void> {
+    this.#assertOpen();
     if (!this.#config || this.#cwd !== context.cwd) {
       await this.bootstrap(context);
     } else {
@@ -197,6 +203,7 @@ export class FabricState {
   }
 
   async ensure(context: ExtensionContext): Promise<void> {
+    this.#assertOpen();
     if (!this.#config || this.#cwd !== context.cwd) await this.bootstrap(context);
     await this.#activate(context, false);
   }
@@ -382,7 +389,12 @@ export class FabricState {
     );
   }
 
+  #assertOpen(): void {
+    if (this.#shutDown) throw new Error("Pi Fabric is shut down for this session (reload or session replacement); retry in the new session");
+  }
+
   async shutdown(): Promise<void> {
+    this.#shutDown = true;
     const generation = ++this.#generation;
     const activation = this.#activation;
     if (activation) await activation.catch(() => undefined);
@@ -414,6 +426,7 @@ export class FabricState {
       return this.#activate(context, reinitialize);
     }
     if (this.#runtime?.initialized && !reinitialize) return this.#runtime;
+    this.#assertOpen();
 
     const generation = this.#generation;
     const config = this.config;

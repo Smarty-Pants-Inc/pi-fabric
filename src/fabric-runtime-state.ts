@@ -167,6 +167,16 @@ export interface FabricRuntimeStateOptions {
 // ponytail: 10 min covers a reload wave's gap; a longer downtime is future-only by design.
 const MAIN_ACTOR_MESH_REPLAY_MS = 10 * 60_000;
 
+// A detached callback can outlive its ctx (reload, session replacement). Reading a stale
+// ctx throws, and a throw there is uncaught and exits Pi, so the notice is dropped.
+const notifyDetached = (context: ExtensionContext, message: string): void => {
+  try {
+    if (context.hasUI) context.ui.notify(message, "error");
+  } catch {
+    // Stale ctx: the runtime that owned this callback is closing.
+  }
+};
+
 export class FabricRuntimeState {
   #registry: ActionRegistry | undefined;
   #config: FabricConfig | undefined;
@@ -980,7 +990,7 @@ export class FabricRuntimeState {
     if (configuration && control) {
       this.#stopComponentWatch = watchComponentConfiguration(configuration.paths, () => {
         void control.reconcile().catch(error => {
-          if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
+          notifyDetached(context, `Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`);
         });
       });
       for (const warning of control.configuration().warnings) {
@@ -1029,7 +1039,7 @@ export class FabricRuntimeState {
     void (this.#componentControl?.reconcile(next.components) ?? this.#componentLoader?.reconcile(next.components))?.catch((error) => {
       if (this.#config) this.#config.components = previousComponents;
       const detail = error instanceof Error ? error.message : String(error);
-      if (context.hasUI) context.ui.notify(`Pi Fabric component reload failed: ${detail}`, "error");
+      notifyDetached(context, `Pi Fabric component reload failed: ${detail}`);
     });
   }
 

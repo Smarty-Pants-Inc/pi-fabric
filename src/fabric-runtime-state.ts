@@ -1,5 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
+import type { RecordsService } from "./records/service.js";
+import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
+import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import {
@@ -194,6 +197,8 @@ export class FabricRuntimeState {
   #jevObservationHost: JevObservationHost | undefined;
   #globalActors: GlobalActorRegistry | undefined;
   #rootInbox: RootInbox | undefined;
+  #records: Promise<RecordsService> | undefined;
+  #openRecords: (() => Promise<RecordsService>) | undefined;
   #mesh: MeshStore | undefined;
   #identity: MeshIdentity | undefined;
   #mainAgent: MainAgentController | undefined;
@@ -321,6 +326,20 @@ export class FabricRuntimeState {
   /** The inbox batch this Main should see now (smarty-dev#754); undefined when it has no inbox. */
   async nextRootInbox(session: RootInboxSession): Promise<RootInboxBatch | undefined> {
     return this.#rootInbox?.next(session);
+  }
+
+  /** The records addressed to this root past its processing cursor (smarty-dev#754 C4). */
+  async nextRecordsInbox(session: RecordsInboxSession): Promise<RecordsInboxBatch | undefined> {
+    if (!this.#openRecords) return undefined;
+    const service = await this.#openRecords();
+    return service.inbox?.next(session);
+  }
+
+  async #closeRecords(): Promise<void> {
+    const opening = this.#records;
+    this.#records = undefined;
+    this.#openRecords = undefined;
+    await opening?.then((service) => service.close()).catch(() => undefined);
   }
 
   /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
@@ -941,6 +960,45 @@ export class FabricRuntimeState {
     } else {
       this.#registry.markUnavailable("jev", enforceSchema ? "Jev network programs are unavailable in Schema enforce mode" : "disabled by configuration (jev.enabled=false)");
     }
+    if (!this.#managedHost && this.#config.records.enabled && this.#config.mesh.enabled && !enforceSchema) {
+      // The org's record (smarty-dev#754): the driver loads and the database connects at first use.
+      const recordsConfig = this.#config.records;
+      const mesh = this.#mesh;
+      const recordsIdentity = identity;
+      const root = identity.kind === "main" && mainAgent.local;
+      const recordsNames = () => [mainAgentId, this.pi.getSessionName?.() ?? ""];
+      this.#openRecords = () => {
+        this.#records ??= import("./records/service.js").then(({ RecordsService }) => RecordsService.open({
+          config: recordsConfig,
+          meshRoot: mesh.root,
+          identity: { id: recordsIdentity.id, name: recordsIdentity.name },
+          publisher: { publish: (input) => mesh.publish({ ...input, from: recordsIdentity }) },
+          ...(root ? {
+            names: recordsNames,
+            wake: async () => {
+              const service = await this.#records;
+              const batch = await service?.inbox?.next(recordsInboxSession(context.sessionManager.getEntries()));
+              if (batch?.records.length) this.pi.sendMessage(recordsInboxMessage(batch.records), { deliverAs: "followUp", triggerTurn: true });
+            },
+          } : {}),
+        })).catch((error: unknown) => {
+          // A failed open (the database is down) is retried at the next use, not cached.
+          this.#records = undefined;
+          throw error;
+        });
+        return this.#records;
+      };
+      const openRecords = this.#openRecords;
+      await builtins.install(createProviderComponent({
+        provider: "records",
+        description: "The org's durable record on its Node (PostgreSQL)",
+        create: () => new RecordsProvider(openRecords),
+      }));
+    } else {
+      this.#registry.markUnavailable("records", this.#config.records.enabled
+        ? "records need the mesh and a local host (not Schema enforce mode or a managed host)"
+        : 'disabled by configuration; set "records": { "enabled": true, "org": ..., "connection": {...} } in .pi/fabric.json');
+    }
     await builtins.memory(context, this.#config, sessionId);
     builtins.assertActive(this.#config);
     await this.#mountExecution(context, enforceSchema);
@@ -1376,6 +1434,7 @@ export class FabricRuntimeState {
     this.#sessionCapabilityLease = undefined;
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
+    await this.#closeRecords();
     await this.#agents?.close();
     await this.shellJobs.close();
     try {
@@ -1475,6 +1534,7 @@ export class FabricRuntimeState {
     this.#sessionCapabilityLease = undefined;
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
+    await this.#closeRecords();
     await this.#agents?.close();
     const externalNames = new Set(this.#externalProviders.keys());
     try {

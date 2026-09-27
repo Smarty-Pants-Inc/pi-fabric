@@ -17,6 +17,12 @@ const hasBun = (() => {
 })();
 
 describe("NodeProcessRuntime", () => {
+  it("routes the records primitive through the shared guest setup", async () => {
+    const result = await new NodeProcessRuntime().execute('return records.read({after:3});',
+      async (ref, args) => ({ref, args}), options);
+    expect(result).toMatchObject({terminationReason:"completed", value:{ref:"records.read", args:{after:3}}});
+  });
+
   it("routes the cache primitive through the shared guest setup", async () => {
     const result = await new NodeProcessRuntime().execute('return cache.status({target:"self"});',
       async (ref, args) => ({ref, args}), options);

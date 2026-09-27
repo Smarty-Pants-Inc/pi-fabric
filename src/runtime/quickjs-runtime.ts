@@ -437,6 +437,7 @@ globalThis.components = __providerProxy("components");
 globalThis.compact = __providerProxy("compact");
 globalThis.cache = __providerProxy("cache");
 globalThis.prewalk = __providerProxy("prewalk");
+globalThis.records = __providerProxy("records");
 globalThis.jev = __providerProxy("jev");
 const __createActor = async (args = {}) => {
   if (!args || typeof args !== "object" || Array.isArray(args)) {

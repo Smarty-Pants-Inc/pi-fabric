@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RootInboxBatch, RootInboxSession } from "./topology/root-inbox.js";
+import type { RecordsInboxBatch, RecordsInboxSession } from "./records/inbox.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
@@ -258,6 +259,9 @@ export class FabricState {
   peerInfos(): FabricPeerInfo[] { return this.#current()?.peerInfos() ?? []; }
   async nextRootInbox(session: RootInboxSession): Promise<RootInboxBatch | undefined> {
     return this.#current()?.nextRootInbox(session);
+  }
+  async nextRecordsInbox(session: RecordsInboxSession): Promise<RecordsInboxBatch | undefined> {
+    return this.#current()?.nextRecordsInbox(session);
   }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }
   participantsConfirmedAt(): number | undefined { return this.#current()?.participantsConfirmedAt(); }

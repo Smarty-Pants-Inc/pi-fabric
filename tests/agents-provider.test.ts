@@ -216,6 +216,26 @@ const setup = (
   };
 };
 
+// smarty-dev#1439: agents.compact on an actor id pointed nowhere ("Unknown Fabric agent").
+describe("AgentsProvider actor session reset", () => {
+  it("answers agents.compact on an actor id with a pointer to resetSession, and routes resetSession", async () => {
+    const { provider, actors } = setup();
+    const actor = await actors.create({ name: "reviewer", instructions: "Review." });
+    await expect(provider.invoke("compact", { id: actor.id }, context)).rejects.toThrow(
+      `reviewer (${actor.id}) is a Fabric actor, not a task agent: agents.compact compacts a running task agent. ` +
+        "To start an actor on a fresh session, use agents.resetSession({ id }).",
+    );
+    await expect(provider.invoke("compact", { id: "reviewer" }, context)).rejects.toThrow(/use agents\.resetSession/);
+    // Neither an agent nor an actor: the original error stands.
+    await expect(provider.invoke("compact", { id: "nobody-here" }, context)).rejects.toThrow(/Unknown Fabric agent/);
+    fs.mkdirSync(path.dirname(actor.sessionFile!), { recursive: true });
+    fs.writeFileSync(actor.sessionFile!, "{}\n");
+    await expect(provider.invoke("resetSession", { id: actor.id }, context)).resolves.toMatchObject({ id: actor.id });
+    expect(fs.existsSync(actor.sessionFile!)).toBe(false);
+    expect(fs.readdirSync(path.dirname(actor.sessionFile!)).some((name) => /^session\.jsonl\..+\.bak$/.test(name))).toBe(true);
+  });
+});
+
 describe("AgentsProvider runtime ownership lifecycle", () => {
   it("does not close shared runtime services when it is not the owner", async () => {
     const { agents, actors, globalActors, mainAgent, participants, control, lifecycle } = setup();

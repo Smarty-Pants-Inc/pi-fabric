@@ -150,6 +150,7 @@ const idOnlyAgentActions = new Set([
   "agents.setEvents",
   "agents.setDeliveryPolicy",
   "agents.clearMessages",
+  "agents.resetSession",
   "agents.setInstructions",
   "agents.messages",
   "agents.remove",

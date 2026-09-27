@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
-import type { FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
+import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
 import type { FabricKernel } from "../runtime/kernel.js";
@@ -93,6 +93,8 @@ export interface ResidentHostConfig {
   agents: FabricAgentConfig;
   mesh: FabricMeshConfig;
   retention: FabricRetentionConfig;
+  /** Absent in a config an older release wrote: the defaults apply. */
+  actors?: FabricActorsConfig;
   workerPath: string;
   fabricExtensionPath: string;
   piBinary: string;

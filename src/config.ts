@@ -243,6 +243,11 @@ export interface FabricRetentionConfig {
   actorRunArchiveMs: number;
 }
 
+export interface FabricActorsConfig {
+  /** Reset an actor's Pi session at a run boundary once its file exceeds this many bytes; 0 disables. */
+  maxSessionBytes: number;
+}
+
 export interface FabricMeshConfig {
   enabled: boolean;
   root?: string;
@@ -324,6 +329,7 @@ export interface FabricConfig {
   ui: FabricUiConfig;
   compaction: FabricCompactionConfig;
   retention: FabricRetentionConfig;
+  actors: FabricActorsConfig;
   mesh: FabricMeshConfig;
   memory: FabricMemoryConfig;
   jev: FabricJevConfig;
@@ -469,6 +475,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     orphanedTempRunMs: 6 * 60 * 60 * 1_000,
     oneShotRunMs: 24 * 60 * 60 * 1_000,
     actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
+  },
+  actors: {
+    maxSessionBytes: 20 * 1024 * 1024,
   },
   mesh: {
     enabled: true,
@@ -708,6 +717,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const ui = objectValue(input.ui);
   const compaction = objectValue(input.compaction);
   const retention = objectValue(input.retention);
+  const actors = objectValue(input.actors);
   const mesh = objectValue(input.mesh);
   const memory = objectValue(input.memory);
   const entropy = objectValue(input.entropy);
@@ -1104,6 +1114,14 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.retention.actorRunArchiveMs,
         60 * 60 * 1_000,
         365 * 24 * 60 * 60 * 1_000,
+      ),
+    },
+    actors: {
+      maxSessionBytes: boundedInteger(
+        actors.maxSessionBytes,
+        DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes,
+        0,
+        Number.MAX_SAFE_INTEGER,
       ),
     },
     mesh: {

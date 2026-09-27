@@ -690,6 +690,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "write",
   },
   {
+    name: "resetSession",
+    description:
+      "Start a persistent actor's next run on a fresh Pi session. An in-flight run finishes first; the old session is archived beside it (2 kept). Instructions, topics, bindings, the queue and messages are kept.",
+    inputSchema: idSchema,
+    risk: "agent",
+  },
+  {
     name: "remove",
     description:
       'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry.',

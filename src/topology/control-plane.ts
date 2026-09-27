@@ -46,6 +46,9 @@ export interface FabricControlCommand {
 export interface FabricControlAcceptance {
   accepted: boolean;
   messageId?: string;
+  /** The owner's followUp queue for a Main target (smarty-dev#1495). */
+  pendingFollowUps?: number;
+  oldestAgeS?: number;
   result?: unknown;
   error?: string;
 }
@@ -55,7 +58,19 @@ export interface FabricControlResult {
   messageId: string;
   routed: "mesh";
   acknowledged: true;
+  pendingFollowUps?: number;
+  oldestAgeS?: number;
 }
+
+/** A queue count from another owner: a non-negative whole number, or nothing. */
+const queueCount = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+
+const queueDepthOf = (source: Record<string, unknown>): { pendingFollowUps: number; oldestAgeS: number } | undefined => {
+  const pendingFollowUps = queueCount(source.pendingFollowUps);
+  const oldestAgeS = queueCount(source.oldestAgeS);
+  return pendingFollowUps === undefined || oldestAgeS === undefined ? undefined : { pendingFollowUps, oldestAgeS };
+};
 
 export type FabricControlHandler = (
   command: FabricControlCommand,
@@ -236,6 +251,7 @@ export class FabricControlPlane {
       messageId: acceptance.messageId ?? commandId,
       routed: "mesh",
       acknowledged: true,
+      ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
     };
   }
 
@@ -472,6 +488,7 @@ export class FabricControlPlane {
     pending.resolve({
       accepted: event.data.accepted === true,
       ...(typeof event.data.messageId === "string" ? { messageId: event.data.messageId } : {}),
+      ...queueDepthOf(event.data),
       ...(Object.prototype.hasOwnProperty.call(event.data, "result")
         ? { result: event.data.result }
         : {}),
@@ -801,6 +818,7 @@ export class FabricControlPlane {
           targetId: command.targetId,
           accepted: acceptance.accepted,
           ...(acceptance.messageId ? { messageId: acceptance.messageId } : {}),
+          ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
           ...(Object.prototype.hasOwnProperty.call(acceptance, "result")
             ? { result: acceptance.result }
             : {}),

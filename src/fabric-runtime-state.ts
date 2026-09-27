@@ -522,6 +522,7 @@ export class FabricRuntimeState {
       identity.kind === "main" ? sessionId : undefined,
     );
     this.#mainAgent = mainAgent;
+    mainAgent.attachFollowUpDrain(context, this.#config.mesh.followUpFlushMs);
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
     const configuredMeshRoot = this.#config.mesh.root;
     const meshRoot =
@@ -1361,6 +1362,7 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
+    this.#mainAgent?.closeFollowUpDrain();
     this.#suppressResidentGuidanceSync = true;
     await this.#deactivateRepairs();
     clearActiveCompiledSurface();
@@ -1460,6 +1462,7 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
+    this.#mainAgent?.closeFollowUpDrain();
     await this.shellJobs.close();
     await this.#deactivateRepairs();
     if (!this.#registry) return;

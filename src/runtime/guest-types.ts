@@ -757,6 +757,10 @@ interface FabricMessageDelivery {
   messageId: string;
   routed?: "local" | "main" | "mesh";
   acknowledged?: boolean;
+  /** For a Main target: followUps it has not read yet. Switch to steer when this or oldestAgeS grows. */
+  pendingFollowUps?: number;
+  /** For a Main target: the age in seconds of its oldest unread followUp (0 when none). */
+  oldestAgeS?: number;
 }
 interface FabricAgentsApi {
   run(args: FabricAgentRequest): Promise<FabricAgentResult>;

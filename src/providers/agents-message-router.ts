@@ -277,7 +277,12 @@ export class AgentMessageRouter {
           : {}),
         ...(command.data === undefined ? {} : { data: command.data }),
       });
-      return { accepted: true, messageId: result.messageId };
+      return {
+        accepted: true,
+        messageId: result.messageId,
+        ...(result.pendingFollowUps === undefined ? {} : { pendingFollowUps: result.pendingFollowUps }),
+        ...(result.oldestAgeS === undefined ? {} : { oldestAgeS: result.oldestAgeS }),
+      };
     }
     try {
       this.manager.status(command.targetId);

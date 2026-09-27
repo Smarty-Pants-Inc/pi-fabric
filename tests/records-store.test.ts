@@ -9,7 +9,7 @@ import { RecordsWatchdog } from "../src/records/watchdog.js";
 import { RecordsService } from "../src/records/service.js";
 import { normalizeRecordsConfig } from "../src/records/config.js";
 import { RecordsProvider } from "../src/providers/records-provider.js";
-import { bigIntToLsn, lsnToBigInt } from "../src/records/admission.js";
+import { bigIntToLsn, lsnToBigInt, WalGFrontierProvider } from "../src/records/admission.js";
 import { SharedFrontierProvider } from "../src/records/shared-frontier.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
 
@@ -509,6 +509,42 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
       expect((await pool.query("SELECT count(*)::int AS n FROM record_bounds")).rows[0].n).toBe(1);
       await store.transaction((client) => store.fillBounds(client, "all"));
       expect((await pool.query("SELECT count(*)::int AS n FROM record_bounds")).rows[0].n).toBe(2);
+    });
+
+    it("admits by the WAL-G report's contiguous FOUND prefix: a missing middle segment cuts it, newer segments do not count", async () => {
+      let offset = 0;
+      const { store, pool } = await storeFor();
+      const walfile = async (sql: string, values: unknown[] = []) => (await pool.query(`SELECT pg_walfile_name(${sql}) AS name`, values)).rows[0].name as string;
+      // Record A's COMMIT is in segment N; record B's in N+1; the insert position moves on to N+2.
+      await store.append(alice, { ref: REF, kind: "status", key: "a", text: "in segment N" });
+      const boundA = (await pool.query("SELECT bound::text AS bound FROM record_bounds b JOIN records r ON r.id = b.record_id WHERE r.key = 'a'")).rows[0].bound as string;
+      await pool.query("SELECT pg_switch_wal()");
+      await store.append(alice, { ref: REF, kind: "status", key: "b", text: "in segment N+1" });
+      const boundB = (await pool.query("SELECT bound::text AS bound FROM record_bounds b JOIN records r ON r.id = b.record_id WHERE r.key = 'b'")).rows[0].bound as string;
+      await pool.query("SELECT pg_switch_wal()");
+      const segA = await walfile("$1::pg_lsn", [boundA]);
+      const segB = await walfile("$1::pg_lsn", [boundB]);
+      expect(segB > segA).toBe(true);
+      const before = await walfile("$1::pg_lsn - 16777216", [boundA]);
+      const first = `${segA.slice(0, 8)}${"0".repeat(15)}1`;
+      const range = (start: string, end: string, status: string) => ({ timeline_id: 1, start_segment: start, end_segment: end, segments_count: 1, status });
+      // wal-g wal-verify integrity --json: the current segment is not listed; N is lost, N+1 is present.
+      let report: unknown = { integrity: { status: "WARNING", details: [range(first, before, "FOUND"), range(segA, segA, "MISSING_LOST"), range(segB, segB, "FOUND")] } };
+      const walg = new WalGFrontierProvider("m4max", ["wal-g", "wal-verify", "integrity", "--json"], {
+        run: async () => ({ stdout: JSON.stringify(report), stderr: "", code: 0 }),
+      });
+      const gate = new AdmissionGate({ providers: [walg], now: () => Date.now() + offset });
+      const gated = new RecordStore(pool as unknown as ClientPool, { org: "smarty-pants", origin: "dev1", admission: gate });
+      await gate.refresh();
+      // The frontier stops before the gap: the start of segment N, not the end of N+1.
+      expect(gate.frontier()).toBe(bigIntToLsn(lsnToBigInt(boundA) & ~(16n * 1024n * 1024n - 1n)));
+      offset = 302_000;
+      await expect(gated.append(alice, { ref: REF, kind: "status", key: "c", text: "next" })).rejects.toThrow(/^record archive lagging 30\d s; retry with the same key$/);
+      // Counterexample: segment N is archived after all; the prefix now runs through N+1, covering A and B.
+      report = { integrity: { status: "OK", details: [range(first, segB, "FOUND")] } };
+      await gate.refresh();
+      expect(lsnToBigInt(gate.frontier()!)).toBeGreaterThan(lsnToBigInt(boundB));
+      expect((await gated.append(alice, { ref: REF, kind: "status", key: "c", text: "next" })).sequence).toBe(3);
     });
 
     it("refuses when no target ever answered and records are old (fail closed)", async () => {

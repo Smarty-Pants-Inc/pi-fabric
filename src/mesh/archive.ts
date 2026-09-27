@@ -39,12 +39,10 @@ interface ArchiveHead {
   sequence: number;
   id: string;
   file: string;
-  /** The boot the head was written in (see currentBoot). */
-  boot?: string;
 }
 
 export interface MeshArchiveRecovery {
-  /** A reboot came since the head was written: the synced archive lines are the truth. */
+  /** This is the first publish of this boot: after a reboot, the synced archive lines are the truth. */
   rebooted: boolean;
   /** Archived events past the live log's end, in sequence order, to go live again. */
   promote: Array<MeshArchiveEntry & { file: string }>;
@@ -104,8 +102,8 @@ const writeAll = (descriptor: number, bytes: Buffer): void => {
 };
 
 // A process crash keeps the page cache, so every write before it survives. A power loss does
-// not: only synced data does. The head records the boot it was written in, so recovery knows
-// which of the two happened.
+// not: only synced data does. BOOT, written durably once per boot before the boot's first
+// archive append, tells recovery which of the two happened.
 let bootIdentity: string | undefined;
 export const currentBoot = (): string => {
   if (bootIdentity === undefined) {
@@ -118,8 +116,8 @@ export const currentBoot = (): string => {
   return bootIdentity;
 };
 
-// A new file's name lives in its directory, not in its data: after its first sync, sync its
-// directory and every directory made for it, so the file survives a power loss too.
+// A file's name lives in its directory, not in its data: a new name survives a power loss only
+// once its directory is synced too.
 const syncDirectory = (directory: string): void => {
   if (process.platform === "win32") return; // no directory handles to sync; NTFS journals names
   const descriptor = fs.openSync(directory, "r");
@@ -129,15 +127,18 @@ const syncDirectory = (directory: string): void => {
     fs.closeSync(descriptor);
   }
 };
-const syncNewFile = (file: string, firstCreated: string | undefined): void => {
-  let directory = path.dirname(file);
-  syncDirectory(directory);
-  if (firstCreated === undefined) return;
-  const top = path.dirname(firstCreated);
-  while (directory !== top && directory !== path.dirname(directory)) {
-    directory = path.dirname(directory);
-    syncDirectory(directory);
+
+const writeDurable = (file: string, text: string): void => {
+  const temporary = `${file}.${process.pid}.tmp`;
+  const descriptor = fs.openSync(temporary, "w", 0o600);
+  try {
+    writeAll(descriptor, Buffer.from(text, "utf8"));
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
   }
+  fs.renameSync(temporary, file);
+  syncDirectory(path.dirname(file));
 };
 
 // Truncate through its own read-write handle: Windows refuses to truncate through an append one.
@@ -184,19 +185,21 @@ export class MeshArchive {
    * line and syncs it. On any failure it cuts the line back out and throws.
    */
   begin(entry: MeshArchiveEntry): MeshArchivePending {
+    this.#requireRoot();
     const relative = this.#fileFor(entry.event, this.#headDay());
     const absolute = path.join(this.dir, relative);
     this.#describeMesh(entry.event.sequence);
-    const created = fs.existsSync(absolute) ? undefined : { first: fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 }) };
+    fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 });
     let descriptor: number | undefined = fs.openSync(absolute, "a+", 0o600);
     let pending: MeshArchivePending | undefined;
     try {
       this.#repairAndReadLast(descriptor, absolute);
       pending = { sequence: entry.event.sequence, id: entry.event.id, file: relative, size: fs.fstatSync(descriptor).size };
+      const fresh = pending.size === 0;
       writeFileAtomic(path.join(this.dir, "PENDING.json"), `${JSON.stringify(pending)}\n`);
       writeAll(descriptor, Buffer.from(`${entry.line}\n`, "utf8"));
       fs.fdatasyncSync(descriptor);
-      if (created) syncNewFile(absolute, created.first);
+      if (fresh) this.#syncDays(relative);
     } catch (error) {
       fs.closeSync(descriptor);
       descriptor = undefined;
@@ -225,26 +228,27 @@ export class MeshArchive {
   /**
    * Settles what a stop left, before a publish.
    *
-   * After a process crash in this boot, every completed write survived. A pending record at or
-   * below the head was committed (only its removal was lost), so it stays; any other is cut
-   * back out, and if its event did go live, the store's catch-up archives it again.
+   * In the boot that BOOT names, a process crash kept every completed write. A pending record
+   * at or below the head was committed (only its removal was lost), so it stays; any other is
+   * cut back out, and if its event did go live, the store's catch-up archives it again.
    *
-   * After a reboot, only synced data is sure: the live append, the head and PENDING's removal
+   * In a new boot, only synced data is sure: the live append, the head and PENDING's removal
    * of an acknowledged publish may all be gone, while its archive line was synced before the
    * publish returned. So nothing complete is discarded: a torn line is cut, and every archived
-   * event past the live log's end is returned to go live again. An event whose publish never
-   * returned may come back too; across a power loss delivery is at least once.
+   * event past the live log's end, on any day, is returned to go live again. An event whose
+   * publish never returned may come back too; across a power loss delivery is at least once.
+   * The store then calls recovered(), which records this boot.
    */
   recover(lastLive: number): MeshArchiveRecovery {
-    const head = this.head();
     const pending = this.pending();
-    if (head ? head.boot === currentBoot() : this.#days().length === 0) {
+    if (this.#readText("BOOT") === currentBoot()) {
       if (pending) {
-        if ((head?.sequence ?? 0) >= pending.sequence) fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
+        if ((this.head()?.sequence ?? 0) >= pending.sequence) fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
         else this.#cutBack(pending);
       }
       return { rebooted: false, promote: [] };
     }
+    this.#requireRoot();
     if (pending) {
       const absolute = path.join(this.dir, pending.file);
       if (fs.existsSync(absolute)) {
@@ -257,10 +261,10 @@ export class MeshArchive {
       }
       fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
     }
-    const from = head?.file.split("/").slice(0, 3).join("/");
     const found = new Map<string, MeshArchiveEntry & { file: string }>();
     for (const day of this.#days()) {
-      if (from !== undefined && day < from) continue;
+      const seal = this.#readJson<{ files: Record<string, SealFile> }>(`${day}/SEAL.json`);
+      if (seal && Math.max(0, ...Object.values(seal.files).map((file) => file.lastSequence)) <= lastLive) continue;
       for (const name of fs.readdirSync(path.join(this.dir, day)).filter((entry) => entry.endsWith(".jsonl"))) {
         for (const line of completeLines(fs.readFileSync(path.join(this.dir, day, name), "utf8"))) {
           const event = parseEvent(line);
@@ -271,10 +275,10 @@ export class MeshArchive {
     return { rebooted: true, promote: [...found.values()].sort((left, right) => left.event.sequence - right.event.sequence) };
   }
 
-  /** After a reboot's recovery: the promoted events are live; the head now carries this boot. */
+  /** After a new boot's recovery: the promoted events are live. Records the boot, durably. */
   recovered(last: (MeshArchiveEntry & { file: string }) | undefined): void {
-    const head = last ? { sequence: last.event.sequence, id: last.event.id, file: last.file } : this.head();
-    if (head) this.#writeHead(head);
+    if (last) this.#writeHead({ sequence: last.event.sequence, id: last.event.id, file: last.file });
+    writeDurable(path.join(this.dir, "BOOT"), currentBoot());
   }
 
   /**
@@ -283,13 +287,14 @@ export class MeshArchive {
    */
   catchUp(entries: MeshArchiveEntry[]): void {
     if (entries.length === 0) return;
+    this.#requireRoot();
     this.#describeMesh(entries[0]!.event.sequence);
     let floor = this.#headDay();
     const open = new Map<string, {
       descriptor: number;
       last: { sequence: number; id: string } | undefined;
-      absolute: string;
-      created: { first: string | undefined } | undefined;
+      relative: string;
+      fresh: boolean;
     }>();
     let last: ArchiveHead | undefined;
     try {
@@ -299,11 +304,12 @@ export class MeshArchive {
         let file = open.get(relative);
         if (!file) {
           const absolute = path.join(this.dir, relative);
-          const created = fs.existsSync(absolute) ? undefined : { first: fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 }) };
+          fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 });
           const descriptor = fs.openSync(absolute, "a+", 0o600);
-          file = { descriptor, last: undefined, absolute, created };
+          file = { descriptor, last: undefined, relative, fresh: false };
           open.set(relative, file);
           file.last = this.#repairAndReadLast(descriptor, absolute);
+          file.fresh = fs.fstatSync(descriptor).size === 0;
         }
         const previous = file.last;
         last = { sequence: event.sequence, id: event.id, file: relative };
@@ -313,9 +319,9 @@ export class MeshArchive {
         writeAll(file.descriptor, Buffer.from(`${line}\n`, "utf8"));
         file.last = { sequence: event.sequence, id: event.id };
       }
-      for (const { descriptor, absolute, created } of open.values()) {
+      for (const { descriptor, relative, fresh } of open.values()) {
         fs.fdatasyncSync(descriptor);
-        if (created) syncNewFile(absolute, created.first);
+        if (fresh) this.#syncDays(relative);
       }
     } finally {
       for (const { descriptor } of open.values()) fs.closeSync(descriptor);
@@ -421,8 +427,33 @@ export class MeshArchive {
     }
   }
 
+  // The archive root is made by whoever enables the archive, never here: a missing root (an
+  // unmounted disk, a moved tree) fails every publish instead of starting a new archive.
+  #requireRoot(): void {
+    if (!fs.statSync(this.dir, { throwIfNoEntry: false })?.isDirectory()) {
+      throw new Error(`Mesh event archive directory is missing: ${this.dir}`);
+    }
+  }
+
+  // A new or empty file's day, month and year directories may be new too: sync each, and the
+  // root, so the whole path survives a power loss. Run whenever the file was empty before its
+  // first line, so a retry after an interrupted attempt finishes the job.
+  #syncDays(relative: string): void {
+    const [year, month, day] = relative.split("/");
+    for (const directory of [`${year}/${month}/${day}`, `${year}/${month}`, `${year}`, ""]) syncDirectory(path.join(this.dir, directory));
+  }
+
+  #readText(relative: string): string | undefined {
+    try {
+      return fs.readFileSync(path.join(this.dir, relative), "utf8").trim();
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
   #writeHead(head: ArchiveHead): void {
-    writeFileAtomic(path.join(this.dir, "HEAD.json"), `${JSON.stringify({ ...head, boot: currentBoot() })}\n`);
+    writeFileAtomic(path.join(this.dir, "HEAD.json"), `${JSON.stringify(head)}\n`);
   }
 
   #describeMesh(firstSequence: number): void {

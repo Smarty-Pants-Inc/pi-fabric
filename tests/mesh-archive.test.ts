@@ -17,6 +17,7 @@ const setup = (options: { archive?: boolean; maxEventLogBytes?: number; retained
   const root = path.join(base, "mesh");
   const dir = path.join(base, "org", "mesh", "dev1", "fleet");
   fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); // whoever enables the archive makes its root
   const enable = () => fs.writeFileSync(path.join(root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir }));
   if (options.archive !== false) enable();
   const store = new MeshStore(root, 4_096, 500, {
@@ -236,7 +237,8 @@ describe("mesh event archive", () => {
     const [first, second] = live();
     const relative = path.relative(dir, target).split(path.sep).join("/");
     fs.writeFileSync(path.join(dir, "PENDING.json"), JSON.stringify({ sequence: 2, id: JSON.parse(second!).id, file: relative, size: Buffer.byteLength(`${first}\n`) }));
-    fs.writeFileSync(path.join(dir, "HEAD.json"), JSON.stringify({ sequence: 1, id: JSON.parse(first!).id, file: relative, boot: "an earlier boot" }));
+    fs.writeFileSync(path.join(dir, "HEAD.json"), JSON.stringify({ sequence: 1, id: JSON.parse(first!).id, file: relative }));
+    fs.writeFileSync(path.join(dir, "BOOT"), "an earlier boot");
     fs.writeFileSync(path.join(root, "events.jsonl"), `${first}\n`);
     fs.writeFileSync(path.join(root, "sequence"), "1");
 
@@ -244,7 +246,7 @@ describe("mesh event archive", () => {
     expect(live().map((line) => JSON.parse(line).sequence)).toEqual([1, 2, 3]);
     expect(live()[1]).toBe(second);
     expect(sequences(target)).toEqual([1, 2, 3]);
-    expect(JSON.parse(fs.readFileSync(path.join(dir, "HEAD.json"), "utf8")).boot).toBe(currentBoot());
+    expect(fs.readFileSync(path.join(dir, "BOOT"), "utf8")).toBe(currentBoot());
   });
 
   it("cuts a torn pending line after a reboot, and keeps its sequence unused", async () => {
@@ -255,7 +257,8 @@ describe("mesh event archive", () => {
     const relative = path.relative(dir, target).split(path.sep).join("/");
     fs.appendFileSync(target, '{"id":"22222222-2222-4222-8222-222222222222","sequence":2,"top');
     fs.writeFileSync(path.join(dir, "PENDING.json"), JSON.stringify({ sequence: 2, id: "22222222-2222-4222-8222-222222222222", file: relative, size: Buffer.byteLength(`${first}\n`) }));
-    fs.writeFileSync(path.join(dir, "HEAD.json"), JSON.stringify({ sequence: 1, id: JSON.parse(first!).id, file: relative, boot: "an earlier boot" }));
+    fs.writeFileSync(path.join(dir, "HEAD.json"), JSON.stringify({ sequence: 1, id: JSON.parse(first!).id, file: relative }));
+    fs.writeFileSync(path.join(dir, "BOOT"), "an earlier boot");
     fs.writeFileSync(path.join(root, "sequence"), "2");
     await store.publish({ topic: "ops.owner", from, text: "three" });
     expect(live().map((line) => JSON.parse(line).sequence)).toEqual([1, 3]);
@@ -272,15 +275,81 @@ describe("mesh event archive", () => {
     expect(sync.mock.invocationCallOrder[0]).toBeLessThan(append.mock.invocationCallOrder[liveAppend]!);
   });
 
-  it.skipIf(process.platform === "win32")("syncs the directories of a new archive file, and only then", async () => {
-    const { store } = setup();
-    const directorySync = vi.spyOn(fs, "fsyncSync");
+  const syncedDirectories = () => {
+    const opened = vi.spyOn(fs, "openSync");
+    return () => opened.mock.calls
+      .filter(([target, flags]) => flags === "r" && fs.statSync(String(target), { throwIfNoEntry: false })?.isDirectory())
+      .map(([target]) => String(target));
+  };
+
+  it.skipIf(process.platform === "win32")("syncs a new file's day, month, year and root directories, and only then (review F8)", async () => {
+    const { store, dir } = setup();
+    const synced = syncedDirectories();
     await store.publish({ topic: "ops.owner", from, text: "one" });
-    expect(directorySync.mock.calls.length).toBeGreaterThanOrEqual(2);
-    directorySync.mockClear();
+    const [year, month, day] = today().split("/");
+    const chain = [path.join(dir, year!, month!, day!), path.join(dir, year!, month!), path.join(dir, year!), dir];
+    expect(new Set(synced())).toEqual(new Set(chain));
+    vi.restoreAllMocks();
+    const later = syncedDirectories();
     await store.publish({ topic: "ops.owner", from, text: "two" });
-    expect(directorySync).not.toHaveBeenCalled();
+    expect(later()).toEqual([]);
   });
+
+  it.skipIf(process.platform === "win32")("finishes the directory syncs that an interrupted first attempt left (review F8)", async () => {
+    const { store, dir, file } = setup();
+    await store.publish({ topic: "ops.owner", from, text: "one" });
+    // The earlier attempt made the file and stopped before its first line and its syncs.
+    fs.writeFileSync(file(today(), "ops.new"), "");
+    const synced = syncedDirectories();
+    await store.publish({ topic: "ops.new", from, text: "two" });
+    const [year, month, day] = today().split("/");
+    expect(new Set(synced())).toEqual(new Set([path.join(dir, year!, month!, day!), path.join(dir, year!, month!), path.join(dir, year!), dir]));
+  });
+
+  it("fails every publish when the archive root is missing, instead of starting a new archive", async () => {
+    const { store, dir, live } = setup();
+    fs.rmSync(dir, { recursive: true, force: true });
+    await expect(store.publish({ topic: "ops.owner", from, text: "nowhere" })).rejects.toThrow("archive directory is missing");
+    expect(live()).toEqual([]);
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it("puts back acknowledged events of earlier days that a power loss took (review F9)", async () => {
+    const { store, dir, root, file, live } = setup({ maxEventLogBytes: 5_000, retainedEventLogBytes: 600 });
+    vi.useFakeTimers({ now: Date.parse("2026-09-27T23:59:58.000Z"), toFake: ["Date"] });
+    await store.publish({ topic: "ops.owner", from, text: "1" });
+    await store.publish({ topic: "ops.owner", from, text: "2" });
+    vi.setSystemTime(Date.parse("2026-09-28T00:00:01.000Z"));
+    await store.publish({ topic: "ops.owner", from, text: "3" });
+    const [first] = live();
+    // After the power loss: HEAD (day B, event 3) survived, the live log kept only event 1.
+    fs.writeFileSync(path.join(root, "events.jsonl"), `${first}\n`);
+    fs.writeFileSync(path.join(root, "sequence"), "1");
+    fs.writeFileSync(path.join(dir, "BOOT"), "an earlier boot");
+    await store.publish({ topic: "ops.owner", from, text: "4" });
+    expect(live().map((line) => JSON.parse(line).sequence)).toEqual([1, 2, 3, 4]);
+    expect(store.read({ after: 1, limit: 10 }).map((event) => event.sequence)).toEqual([2, 3, 4]);
+    expect([...fs.readFileSync(file("2026/09/27", "ops.owner"), "utf8").matchAll(/"sequence":(\d+)/g)].map((match) => Number(match[1]))).toEqual([1, 2]);
+  });
+
+  it.each([["after", "\n"], ["before", ""]])(
+    "rolls back a first publish that crashed %s its archive sync, in the same boot (review F2)",
+    async (_label, ending) => {
+      const { store, dir, root, file, live, sequences } = setup();
+      // The first publish of a fresh archive: BOOT is recorded, the line is written, then a
+      // process crash (no reboot) before the live append and before any HEAD.
+      fs.writeFileSync(path.join(dir, "BOOT"), currentBoot());
+      const target = file(today(), "ops.owner");
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      const orphan: MeshEvent = { id: "33333333-3333-4333-8333-333333333333", sequence: 1, topic: "ops.owner", kind: "message", from, text: "never live", createdAt: Date.now() };
+      fs.writeFileSync(target, `${JSON.stringify(orphan)}${ending}`);
+      fs.writeFileSync(path.join(dir, "PENDING.json"), JSON.stringify({ sequence: 1, id: orphan.id, file: path.relative(dir, target).split(path.sep).join("/"), size: 0 }));
+      fs.writeFileSync(path.join(root, "sequence"), "1");
+      await store.publish({ topic: "ops.owner", from, text: "two" });
+      expect(live().map((line) => JSON.parse(line).sequence)).toEqual([2]);
+      expect(sequences(target)).toEqual([2]);
+    },
+  );
 
   it("archives events that a store without the archive appended, without duplicates", async () => {
     const { store, enable, file, lines, live } = setup({ archive: false });

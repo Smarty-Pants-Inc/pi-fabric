@@ -124,6 +124,22 @@ export class AgentMessageRouter {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
     }
 
+    // An agent another host owns (a durable child in its spawner's resident host, or a peer's
+    // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
+    const remoteAgent = this.participants.get(id);
+    if (remoteAgent?.kind === "agent" && !remoteAgent.local) {
+      if (!remoteAgent.capabilities.includes(kind)) throw new Error(`Fabric participant ${remoteAgent.id} does not support ${kind}`);
+      if (!this.control) throw new Error("Fabric control plane is unavailable");
+      context?.activity?.({ type: "entity", id: remoteAgent.id, kind: "agent", name: remoteAgent.name });
+      return this.control.request(
+        remoteAgent.ownerHostId,
+        remoteAgent.id,
+        kind,
+        { message, data },
+        remoteAgent.ownerIdentityId,
+      );
+    }
+
     // Persistent actors consume both delivery modes through their serial mailbox.
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };

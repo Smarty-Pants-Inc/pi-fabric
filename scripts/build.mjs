@@ -51,6 +51,8 @@ const lazyEntryPoints = [
   "src/speculation/scanner.ts",
   "src/speculation/python-scanner.ts",
   "src/ui/dashboard.ts",
+  "src/ui/shell-tasks.ts",
+  "src/ui/languages/bend.ts",
   "src/ui/conversation.ts",
   "src/ui/conversation-host.ts",
   "src/ui/conversation-targets.ts",
@@ -63,6 +65,7 @@ const lazyEntryPoints = [
   "src/worker/reply-tool.ts",
   "src/worker/model-control.ts",
   "src/worker/options.ts",
+  "src/worker/recovery-watchdog.ts",
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
 ];

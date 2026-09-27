@@ -69,6 +69,10 @@ export class FabricUiController {
   #activityUnsubscribe: (() => void) | undefined;
   #actorUnsubscribe: (() => void) | undefined;
   #agentUnsubscribe: (() => void) | undefined;
+  #shellUnsubscribe: (() => void) | undefined;
+  #tasksOpen = false;
+  #tasksView: import("./shell-tasks.js").ShellTasksView | undefined;
+  #closeTasks: (() => void) | undefined;
   #scheduledRefresh: NodeJS.Timeout | undefined;
   #widgetTui: TUI | undefined;
   #dashboardTui: TUI | undefined;
@@ -118,12 +122,20 @@ export class FabricUiController {
     this.#activityUnsubscribe = this.state.activity.subscribe(() => this.#scheduleRefresh());
     this.#actorUnsubscribe = this.state.actors.subscribe(() => this.#scheduleRefresh());
     this.#agentUnsubscribe = this.state.agents.subscribeUi(() => this.#scheduleRefresh());
+    this.#shellUnsubscribe = this.state.shellJobs?.subscribe(() => this.#scheduleRefresh());
     this.#refresh();
     this.#schedulePoll();
   }
 
   stop(): void {
     this.#epoch++;
+    this.#closeTasks?.();
+    this.#closeTasks = undefined;
+    this.#tasksView?.dispose();
+    this.#tasksView = undefined;
+    this.#tasksOpen = false;
+    this.#shellUnsubscribe?.();
+    this.#shellUnsubscribe = undefined;
     this.#closeConversation?.();
     this.#closeConversation = undefined;
     this.#conversationView?.dispose();
@@ -172,10 +184,45 @@ export class FabricUiController {
 
   /** True while Fabric owns keyboard input, including asynchronous view setup. */
   get ownsInput(): boolean {
-    return this.#dashboardOpen || this.#conversationOpen;
+    return this.#dashboardOpen || this.#conversationOpen || this.#tasksOpen;
+  }
+
+  async openTasks(context: ExtensionContext, query?: string): Promise<void> {
+    if (this.ownsInput) return;
+    const jobs = this.state.shellJobs;
+    if (!jobs) { context.ui.notify("No shell task store in this session", "info"); return; }
+    const candidates = query ? jobs.list().filter(job => job.id === query || job.id.startsWith(query)) : [];
+    if (query && candidates.length !== 1) { context.ui.notify("Task ID is unknown or ambiguous", "warning"); return; }
+    if (context.mode !== "tui") {
+      context.ui.notify(JSON.stringify(query ? candidates[0] : jobs.list(), null, 2), "info");
+      return;
+    }
+    if (!this.state.config.ui.enabled) { context.ui.notify("The Fabric UI is disabled by ui.enabled", "warning"); return; }
+    if (!this.#context) this.start(context);
+    this.#tasksOpen = true;
+    const epoch = this.#epoch;
+    try {
+      const { ShellTasksView } = await import("./shell-tasks.js");
+      if (epoch !== this.#epoch) return;
+      await context.ui.custom<void>((tui, theme, _keys, done) => {
+        this.#closeTasks = () => done();
+        const id = candidates[0]?.id;
+        this.#tasksView = new ShellTasksView({ jobs, theme, done: () => done(), requestRender: () => tui.requestRender(),
+          rows: () => tui.terminal?.rows ?? 24, ...(id ? { id } : {}) });
+        return this.#tasksView;
+      }, { overlay: true, overlayOptions: { width: "94%", maxHeight: "90%", anchor: "center", margin: 1 } });
+    } finally {
+      if (epoch === this.#epoch) {
+        this.#tasksView?.dispose();
+        this.#tasksView = undefined;
+        this.#closeTasks = undefined;
+        this.#tasksOpen = false;
+      }
+    }
   }
 
   async openConversation(context: ExtensionContext, query?: string): Promise<void> {
+    if (this.#tasksOpen) return;
     if (context.mode !== "tui") {
       context.ui.notify("Fabric conversations are available in TUI mode", "warning");
       return;
@@ -605,6 +652,7 @@ export class FabricUiController {
     }
     if (this.#timer || !this.#context) return;
     const localActive =
+      this.#snapshot.shells?.some(job => job.finishedAt === undefined || Date.now() - job.finishedAt < 30000) ||
       this.#snapshot.runs.some((run) => run.status === "running") ||
       this.#snapshot.agents.some((agent) => agent.local !== false && isActiveStatus(agent.status)) ||
       this.#snapshot.actors.some(

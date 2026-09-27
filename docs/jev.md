@@ -1,8 +1,50 @@
-# Jev: typed System One programs
+# Jev: shell orchestration with explicit typed decisions
 
-Jev supplies small semantic judgments, not autoregressively generated text. Fabric lets the reasoning LLM author a TypeScript program and input/output schemas, then run that program in a persistent QuickJS context. The program may observe, ask Jev, act, maintain local state, and loop without another reasoning-model turn.
+Fabric follows the shell-first model of `jev-fabric`: ordinary code launches and supervises processes, consumes bounded evidence, and calls Jev **explicitly** only for a fuzzy decision. Exact checks need no model. Jev returns Choice, Noul, or Score values, never generated shell commands or prose.
+
+Programs run in persistent QuickJS contexts with exact granted capabilities. Use the existing `pi.bash` / `pi.powershell` and `tasks` provider, not a new process engine or browser/macOS bridge. No standalone `jev-fabric` installation is required. Unlike its native supervisor, Fabric programs and tasks are session-owned, not restart-durable.
 
 For guided authoring, invoke `/skill:fabric-jev <task>`. It is user-opt-in and available in both kernel skill trees. Python callers use `tools.call` dictionaries; the Jev program artifact itself remains TypeScript in QuickJS, without changing the outer Fabric kernel. See [skills](skills.md).
+
+## Shell-first workflow
+
+1. Launch an authorized command; code owns commands and arguments. Never execute model answers or untrusted output as shell source.
+2. Inspect exit status and parse exact markers before considering inference.
+3. For long work, use a tracked task and await `tasks.wait` or `tasks.watch` inside a bounded program, not repeated reasoning-model turns.
+4. Only if a semantic question remains, call `jev.evaluate` with consented, minimized state and a finite call/token budget. Map its typed answer to a branch already written in code.
+5. Verify the postcondition independently. A successful exit, match, or model answer is not proof the task succeeded.
+
+This example runs the repository's build without inference (adapt the command to the authorized task):
+
+```ts
+const run = await jev.run({
+  input: {command: "bun run build"},
+  program: {
+    name: "build-supervisor",
+    inputSchema: {type:"object", properties:{command:{type:"string"}}, required:["command"], additionalProperties:false},
+    outputSchema: {},
+    requires: ["pi.bash", "tasks.wait"],
+    limits: {timeoutMs:70000, maxEvaluations:0, maxToolCalls:10},
+    code: `
+      const started = await pi.bash({cmd:input.command, timeout:60, settle:true,
+        monitor:{delivery:"ui",timeoutMs:60000}});
+      const id = (started.details as {taskId?:string} | null)?.taskId;
+      if (!id) return {ok:started.ok,output:started.output};
+      await program.emit({taskId:id});
+      return await tools.call({ref:"tasks.wait",args:{id,timeoutMs:60000}});
+    `,
+  },
+});
+return {id:run.id, state:run.state, result:run.result ?? null, error:run.error ?? null};
+```
+
+`maxEvaluations: 0` rejects program inference before dispatch, even if accidentally granted. Omit `jev.evaluate` entirely for deterministic programs; they need no credentials. This does not disable a separately configured host auto-approval classifier or inference in a shell command: do not change approval policy implicitly.
+
+For filtered progress, launch with `monitor:{delivery:"ui",match:"BUILD:",intervalMs:1000,timeoutMs:60000}` and grant `tasks.watch`. Await `tools.call({ref:"tasks.watch",args:{id,after:cursor,timeoutMs:5000}})`, beginning with cursor 0. Consume `lines`, inspect `omitted`, and advance to `nextCursor`. `reason` is `event`, `finished`, or `timeout`. A match is evidence, not completion; an omitted batch is incomplete evidence. No automatic Jev calls or Main wakeups occur with UI-only delivery. See [task wait/watch](background-tasks.md#programmatic-wait-and-watch) for bounds and cancellation.
+
+Timeouts are ceilings, not delays: ready evidence returns immediately. `tasks.wait`/`watch` timing out or being cancelled never stops the task. Detached tasks belong to the Pi session, **not the Jev run**: `jev.stop` stops the program, while `tasks.stop` stops its task. Keep task IDs in progress events and configure finite shell/monitor deadlines. A foreground shell still follows caller cancellation until it detaches. For work that must outlive Pi itself, use an explicitly authorized standalone supervisor; Fabric does not claim durable recovery.
+
+Shell execution retains Fabric approvals, compatible shell middleware, and capability checks. It requires full-code mode and cannot silently replace an opaque captured shell backend. `pi.bash` accepts shell source, not literal argv or an interactive stdin handle. Use a reviewed script/file for quoting-sensitive arguments, pipes, or persistent subprocess I/O; bounded task previews are not a protocol transport.
 
 ## Authentication
 
@@ -160,7 +202,7 @@ Both are ordinary `jev.evaluate` batches: keep independent questions in one requ
 
 ### Observation stays structured state
 
-Read the application's own state through a page bridge using `browser.cdp` and `Runtime.evaluate`, or through a small application-specific provider, and project it into a compact object with a revision. Include the facts the judgment needs and nothing else: player/entity/environment fields, the previous action, and bounded history are usually enough. Screenshots are not part of the typed request contract; keep pixels out of `state`, and never send secrets.
+Read the application's own state through its CLI or a task-specific script, and project it into a compact object with a revision. Include the facts the judgment needs and nothing else: player/entity/environment fields, the previous action, and bounded history are usually enough. Screenshots are not part of the typed request contract; keep pixels out of `state`, and never send secrets.
 
 ### Code owns the motor layer
 
@@ -312,48 +354,11 @@ Default per-run limits: **60 seconds, 100 evaluations, 1,000 host calls, 100,000
 
 Duration can be configured up to 24 hours. Evaluation slots are reserved before dispatch, including failed requests. One evaluation may be in flight per program; batch independent questions to avoid building an inference backlog. Other granted tool calls may run concurrently. Token usage is reported **after** inference: exceeding the token threshold stops the program before it can use that answer, but the final request can overshoot the threshold and still incurs charges. This is not a hard dollar-spend limit. Request-size and evaluation-count limits are the pre-dispatch bounds. Failed requests with no usage report may still have incurred upstream charges.
 
-Every external action keeps Fabric argument validation, approvals, Schema policy, and a pinned capability generation. A restricted caller cannot widen its own capability view by spawning a program. Recursive Jev lifecycle calls are denied inside programs. Jev is unavailable in Schema enforce and managed-host modes. Other deliberately granted capabilities can be powerful: **granting `pi.bash` or an unrestricted evaluator is not a read-only sandbox** and can defeat data-isolation assumptions. Prefer narrow application connectors.
+Every external action keeps Fabric argument validation, approvals, Schema policy, and a pinned capability generation. A restricted caller cannot widen its own capability view by spawning a program. Recursive Jev lifecycle calls are denied inside programs. Jev is unavailable in Schema enforce and managed-host modes. Other deliberately granted capabilities can be powerful: **granting `pi.bash` or an unrestricted evaluator is not a read-only sandbox** and can defeat data-isolation assumptions. Shell effects run with host privileges; QuickJS isolation does not sandbox a granted shell. Use the harness-owned CLI and library contracts; add no Fabric adapter for them.
 
-## Browser Harness JS
+## Browser and desktop tools
 
-For the default guarded workflow, see [external connector components](harnesses.md). First load the harness-owned Pi extension; Fabric does not auto-register connector definitions. Then configure `interactionModulePath` and `allowedOrigins` to expose `browser.observe`, `browser.act`, and `browser.waitForChange`; the optional `macos-harness` component exposes the same concepts over native AX. These connectors do not depend on Jev. Prefer observed candidates over arbitrary evaluators for unknown UI decisions; retain exact deterministic routes and explicitly granted raw APIs for supported tasks and escape hatches. `act` validates inside the host operation, and an `executed` receipt is not verification of the goal.
-
-The following raw-CDP path remains available through the independently installed Browser Harness component. That connector imports your trusted Browser Harness SDK and maintains one connection. It is separate from Jev and usable through ordinary Fabric calls. Nothing scans or connects to your browser merely because Jev is enabled.
-
-```json
-{
-  "components": [{
-    "id": "browser",
-    "component": "browser-harness",
-    "config": {
-      "modulePath": "../browser-harness-js/skills/cdp/sdk/session.ts",
-      "wsUrl": "ws://127.0.0.1:9222/devtools/browser/REPLACE_WITH_YOUR_DEBUG_ID",
-      "allowedMethods": [
-        "Target.getTargets", "Target.attachToTarget",
-        "Accessibility.getFullAXTree", "Runtime.evaluate", "Input.dispatchMouseEvent"
-      ]
-    }
-  }]
-}
-```
-
-Use a dedicated authorized browser/debugging endpoint. Native TypeScript loading requires a compatible Node runtime (Pi's Node 24 baseline supports the SDK's type-strippable TS). The module is trusted host code, not guest code. `autoAllow` is always false. This adapter uses explicit CDP WebSocket connections, not automatic extension-relay discovery.
-
-```ts
-await tools.call({ ref: "browser.connect" });
-const attached = await tools.call({
-  ref: "browser.cdp",
-  args: { method: "Target.attachToTarget", params: { targetId: "YOUR_TARGET", flatten: true } },
-}) as { sessionId: string };
-const observation = await tools.call({
-  ref: "browser.cdp",
-  args: { method: "Accessibility.getFullAXTree", sessionId: attached.sessionId },
-});
-```
-
-A Jev program uses `requires: ["jev.evaluate", "browser.connect", "browser.cdp"]`. Page-scoped calls require explicit `sessionId`; there is no shared active-tab pointer to race between programs. Host `allowedMethods` are enforced and become part of the pinned action descriptor. CDP is always marked `execute`, including `Runtime.evaluate`: arbitrary page JavaScript cannot be made read-only by a label. Method grants are not origin/target restrictions. Calls have a timeout and at most 16 outstanding wire requests; cancelling a sent command cannot undo its browser effect.
-
-For tighter controls, expose a small application-specific Fabric provider in place of general CDP. Build compact records/candidate controls from observations, let Jev judge them, map selected IDs back to observed nodes in code, and verify the result. Screenshots are not part of this typed text/JSON adapter's Jev request contract.
+Use the existing harness CLIs through the shell, without Fabric-specific adapters, component configuration, or browser/macOS provider refs. Read [Harness CLI composition](harnesses.md) and the harness-owned skills first. Browser connections, native permissions, persistent controller state, and effect verification remain owned by the harness, not Jev.
 
 ## Verification
 
@@ -365,8 +370,8 @@ PI_FABRIC_JEV_LIVE=1 bunx vitest run tests/jev-live.test.ts
 PI_FABRIC_JEV_LIVE=1 PI_FABRIC_JEV_LOCALTERM=1 bunx vitest run tests/jev-live.test.ts
 ```
 
-After `bun run build`, `bun run test:jev:dist` checks the compiled public entry point, auth-only registration, foreground CDP composition with a simulated session, and background stop/wait, agent/Jev join aliases, and event-driven Main advice.
+After `bun run build`, `bun run test:jev:dist` checks the compiled public entry point, auth-only registration, foreground generic capability dispatch, and background stop/wait, agent/Jev join aliases, and event-driven Main advice.
 
-No real browser state or secrets are printed by these probes. Live tests exercise all three primitives, foreground/background inference loops, and a feedback controller using changing synthetic screen observations and source control IDs. `tests/jev-realtime-loop.test.ts` replays both realtime shapes offline: batched target heads with one request per tick, factorized control axes with pulse/epoch motor control, labeled degraded decisions, a death stop, and status/stop on a paced loop. Unit tests exercise the Browser Harness adapter with an injected session; they do not attach to a personal browser.
+No real browser state or secrets are printed by these probes. Live tests exercise all three primitives, foreground/background inference loops, and a feedback controller using changing synthetic screen observations and source control IDs. `tests/jev-realtime-loop.test.ts` replays both realtime shapes offline: batched target heads with one request per tick, factorized control axes with pulse/epoch motor control, labeled degraded decisions, a death stop, and status/stop on a paced loop. `tests/jev-shell.test.ts` exercises actual local subprocesses, event-driven wait/watch, zero-inference programs, one explicit mocked decision, and unchanged capability/approval gates. No personal browser or native app is controlled.
 
-Jev host APIs and types are exported from `pi-fabric/jev`. Connector implementations live in their own packages and register through `pi-fabric/protocol`. Browser adapter exports have been removed from `pi-fabric/jev`; load the Browser Harness-owned extension instead. Fabric lifecycle and trust semantics are detailed in [components.md](components.md). Current TypeSafe contracts: [API](https://docs.typesafe.ai/api), [Choice](https://docs.typesafe.ai/primitives/choice), [Noul](https://docs.typesafe.ai/primitives/noul), [Score](https://docs.typesafe.ai/primitives/score), and [confidence](https://docs.typesafe.ai/confidence).
+Jev host APIs and types are exported from `pi-fabric/jev`. There are no browser/macOS adapter exports. Generic optional providers can still register through `pi-fabric/protocol`, but harness CLI composition requires no provider registration. Fabric lifecycle and trust semantics are detailed in [components.md](components.md). Current TypeSafe contracts: [API](https://docs.typesafe.ai/api), [Choice](https://docs.typesafe.ai/primitives/choice), [Noul](https://docs.typesafe.ai/primitives/noul), [Score](https://docs.typesafe.ai/primitives/score), and [confidence](https://docs.typesafe.ai/confidence).

@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricShellJobStore } from "../core/shell-jobs.js";
+import { installFabricEscapeHalt } from "./escape-halt.js";
 
 const CTRL_B = "\x02";
 const CTRL_K = "\x0b";
@@ -17,6 +18,14 @@ export function installFabricShellHangKeys(
   options: ShellHangKeyOptions,
 ): () => void {
   if (context.mode !== "tui" || typeof context.ui.onTerminalInput !== "function") return () => {};
+  const stopMonitors = installFabricEscapeHalt(context, {
+    enabled: options.enabled, ownsInput: options.ownsInput, halted: () => false,
+    halt: () => {
+      let count = 0;
+      for (const job of options.jobs()?.live() ?? []) if (job.options.monitor && job.stop("Main interrupted")) count++;
+      return count;
+    },
+  });
   let chordArmedAt = 0;
   const unsubscribe = context.ui.onTerminalInput((data) => {
     if (options.ownsInput() || !options.enabled()) {
@@ -59,5 +68,5 @@ export function installFabricShellHangKeys(
     }
     return undefined;
   });
-  return unsubscribe;
+  return () => { stopMonitors(); unsubscribe(); };
 }

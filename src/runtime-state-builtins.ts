@@ -15,6 +15,7 @@ import { MeshProvider } from "./providers/mesh-provider.js";
 import { PiToolsProvider } from "./providers/pi-tools-provider.js";
 import { powerShellToolDefinitionFactory } from "./providers/pi-bash-cwd.js";
 import type { FabricShellJobStore } from "./core/shell-jobs.js";
+import { TasksProvider } from "./providers/tasks-provider.js";
 import { StateProvider } from "./providers/state-provider.js";
 
 import type { FabricManagedHost } from "./managed-host.js";
@@ -37,7 +38,7 @@ export class RuntimeStateBuiltins {
     cwd: string,
     config: FabricConfig,
     capturedTools: CapturedToolCatalog,
-    shell?: { jobs: FabricShellJobStore; getHangMs: () => number },
+    shell: { jobs: FabricShellJobStore; getHangMs: () => number },
   ): Promise<void> {
     let mcpProvider: McpProvider | undefined;
     const enforceSchema = config.schema.mode === "enforce";
@@ -62,11 +63,15 @@ export class RuntimeStateBuiltins {
             ? {requireCapturedOverrides: true, powerShellToolDefinitionFactory: undefined}
             : {
                 powerShellToolDefinitionFactory,
-                ...(shell
-                  ? { shellJobs: shell.jobs, getShellHangMs: shell.getHangMs }
-                  : {}),
+                shellJobs: shell.jobs, getShellHangMs: shell.getHangMs,
               },
         ),
+      }));
+    }
+    if (effectiveFullCodeMode && !this.managedHost) {
+      await this.install(createProviderComponent({
+        provider: "tasks", description: "Session-owned shell tasks and monitors",
+        create: () => new TasksProvider(shell.jobs),
       }));
     }
     await this.install(createProviderComponent({
@@ -156,7 +161,7 @@ export class RuntimeStateBuiltins {
 
   assertActive(config: FabricConfig): void {
     const expectedBuiltinProviders = new Set<string>([
-      ...(config.fullCodeMode || config.schema.mode === "enforce" ? ["pi"] : []),
+      ...(config.fullCodeMode || config.schema.mode === "enforce" ? ["pi", ...(!this.managedHost ? ["tasks"] : [])] : []),
       ...(config.fullCodeMode && config.capture.enabled && config.schema.mode !== "enforce" ? ["extensions"] : []),
       "mcp",
       ...(config.mesh.enabled ? ["mesh", "state"] : ["mesh", "state"].filter((name) => this.managedHost?.has(name))),

@@ -15,6 +15,9 @@ describe("fabric highlight", () => {
     expect(languageFromPath("data.json")).toBe("json");
     expect(languageFromPath("scripts/run.sh")).toBe("bash");
     expect(languageFromPath("Dockerfile")).toBe("dockerfile");
+    expect(languageFromPath("LAWS.bend")).toBe("bend");
+    expect(languageFromPath("proofs/resource-kernel.bend")).toBe("bend");
+    expect(languageFromPath("PROOF.BEND")).toBe("bend");
     expect(languageFromPath("unknown.zzz")).toBeUndefined();
   });
 

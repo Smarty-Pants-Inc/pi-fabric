@@ -64,6 +64,14 @@ const loadWorkerModelControl = async (): Promise<WorkerModelControlModule> => {
   return import(sourceModulePath) as Promise<WorkerModelControlModule>;
 };
 
+type WorkerRecoveryModule = typeof import("./worker/recovery-watchdog.js");
+
+const loadWorkerRecovery = async (): Promise<WorkerRecoveryModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/recovery-watchdog.js");
+  const sourceModulePath = "./worker/recovery-watchdog.ts";
+  return import(sourceModulePath) as Promise<WorkerRecoveryModule>;
+};
+
 type AgentResultModule = typeof import("./agents/result.js");
 
 const loadAgentResult = async (): Promise<AgentResultModule> => {
@@ -223,13 +231,14 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
     loadAgentResult(),
     loadWorkerModelControl(),
     loadWorkerEventProjection(),
+    loadWorkerRecovery(),
   ]);
   runRecordHelpers = loadedRunRecordHelpers;
   const {
@@ -448,6 +457,36 @@ const main = async (): Promise<void> => {
   let retryPending = false;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
+  let killTimer: NodeJS.Timeout | undefined;
+  let closeTimer: NodeJS.Timeout | undefined;
+  const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error));
+  const killChild = (): void => {
+    recoveryWatchdog.dispose();
+    if (closeTimer) clearTimeout(closeTimer);
+    terminateChild(child, "SIGTERM");
+    killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
+    killTimer.unref();
+    child.stdin?.end();
+  };
+  const failStalledChild = (error: string): void => {
+    if (terminalStatus) return;
+    terminalStatus = "failed";
+    terminalError = error;
+    record.error = error;
+    update();
+    appendLog(`${JSON.stringify({ type: "fabric_recovery_error", error })}\n`);
+    killChild();
+  };
+  const closeChild = (): void => {
+    child.stdin?.end();
+    recoveryWatchdog.clear();
+    if (closeTimer || killTimer) return;
+    // RPC EOF requests disposal, but a stuck extension can prevent process exit.
+    closeTimer = setTimeout(() => failStalledChild(
+      `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`,
+    ), KILL_GRACE_MS);
+    closeTimer.unref();
+  };
 
   // Auth checks and model_select hooks can be slow under concurrent launches.
   // Startup and admission share the overall run timeout below, not a shorter cap.
@@ -482,9 +521,7 @@ const main = async (): Promise<void> => {
       record.error = error;
       update();
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
-      terminateChild(child, "SIGTERM");
-      setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS).unref();
-      child.stdin?.end();
+      killChild();
     },
   }, activationWindow);
 
@@ -557,9 +594,7 @@ const main = async (): Promise<void> => {
       }
       child.stdin.write(`${JSON.stringify(frame)}\n`);
     },
-    close() {
-      child.stdin?.end();
-    },
+    close: closeChild,
     update(status) {
       record.compaction = status;
       update();
@@ -587,9 +622,7 @@ const main = async (): Promise<void> => {
       `Fabric token limit reached: ${total} tokens (limit ${options.maxTokens} set by agents.maxTokensPerChild); terminating child. ` +
       `The count is cumulative across the run and includes cache reads/writes, so it grows every turn; ` +
       `raise or disable agents.maxTokensPerChild in /fabric settings (0 disables), or split the task into smaller agent runs.`;
-    terminateChild(child, "SIGTERM");
-    setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS).unref();
-    child.stdin?.end();
+    killChild();
   };
 
   type ClaudeInputKind = "initial" | "steer" | "follow_up";
@@ -895,17 +928,36 @@ const main = async (): Promise<void> => {
         modelControl.observeAssistant(message as Record<string, unknown>);
       }
     }
+    if (event.type === "message_update" && !terminalStatus) {
+      const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
+      if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
+          typeof delta.delta === "string" && delta.delta.length > 0) recoveryWatchdog.progress();
+    }
     if (event.type === "agent_start") {
       emitLifecycle("pi.agent_start");
       retryPending = false;
-      sawAgentError = false;
-      if (!terminalStatus) terminalError = undefined;
+      // Starting a retry is not proof of recovery: preserve the error and timer
+      // until the model actually produces output.
+      return;
+    }
+    if (event.type === "auto_retry_start" && !terminalStatus) {
+      retryPending = true;
+      recoveryWatchdog.arm(terminalError ?? stringField(event.errorMessage) ?? "Pi retry stalled");
+      return;
+    }
+    if (event.type === "auto_retry_end" && !terminalStatus) {
+      retryPending = false;
+      if (event.success === false) {
+        sawAgentError = true;
+        terminalError = stringField(event.finalError) ?? terminalError ?? "Pi retries exhausted";
+        recoveryWatchdog.arm(terminalError);
+      }
       return;
     }
     if (event.type === "response" && event.command === "prompt" && event.success === false) {
       sawAgentError = true;
       if (!terminalStatus) terminalError = typeof event.error === "string" ? event.error : "Pi rejected the prompt";
-      child.stdin?.end();
+      closeChild();
       return;
     }
     if (event.type === "extension_ui_request") {
@@ -977,10 +1029,12 @@ const main = async (): Promise<void> => {
       });
       modelControl.observeAssistant(messageRecord);
       enforceTokenLimit();
-      if (messageRecord.stopReason === "error" && !terminalStatus) {
+      if ((messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") && !terminalStatus) {
         sawAgentError = true;
         terminalError = assistantError(messageRecord);
+        recoveryWatchdog.arm(terminalError);
       } else {
+        recoveryWatchdog.clear();
         sawAgentError = false;
         // Once a terminal cause is set (e.g. the per-child token guard), keep it;
         // a later non-error message_end must not clobber the reason we are
@@ -993,6 +1047,7 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_end") {
       emitLifecycle("pi.agent_end", { willRetry: event.willRetry === true });
       retryPending = event.willRetry === true;
+      if (retryPending && !terminalStatus) recoveryWatchdog.arm(terminalError ?? "Pi announced a retry but did not resume");
       return;
     }
     if (event.type === "agent_settled") {
@@ -1174,7 +1229,7 @@ const main = async (): Promise<void> => {
       ? `Agent emitted an oversized event line; first ${prefix.length} characters saved to: ${artifactPath}`
       : "Agent emitted an oversized event line";
     outputBuffer = "";
-    terminateChild(child, "SIGTERM");
+    killChild();
   };
 
   child.stdout?.on("data", (chunk: Buffer) => {
@@ -1222,8 +1277,7 @@ const main = async (): Promise<void> => {
     if (options.runner === "pi" && !modelControl.ready) {
       terminalError += "; Pi model admission did not complete; task was not sent";
     }
-    terminateChild(child, "SIGTERM");
-    setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS).unref();
+    killChild();
   }, options.timeoutMs);
   timeout.unref();
 
@@ -1231,8 +1285,7 @@ const main = async (): Promise<void> => {
     if (terminalStatus) return;
     terminalStatus = "stopped";
     terminalError = "Agent stopped";
-    terminateChild(child, "SIGTERM");
-    setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS).unref();
+    killChild();
   };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
@@ -1250,6 +1303,9 @@ const main = async (): Promise<void> => {
   if (steerTimer) clearInterval(steerTimer);
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
+  if (killTimer) clearTimeout(killTimer);
+  if (closeTimer) clearTimeout(closeTimer);
+  recoveryWatchdog.dispose();
   if (options.runner === "pi" && !modelControl.ready && !terminalStatus) {
     terminalStatus = "failed";
     terminalError = `Child Pi exited before requested model admission completed; task was not sent${stderr.trim() ? `: ${stderr.trim()}` : ""}`;

@@ -101,6 +101,25 @@ const harness = (options: { middleware?: unknown; optIn?: boolean; hangMs?: numb
 };
 
 describe("cooperative bash middleware", () => {
+  it("delivers monitor events only after cooperative output filtering and hooks", async () => {
+    const h = harness();
+    fs.writeFileSync(path.join(h.cwd, "fixture"), `${SECRET}\n`);
+    const events: unknown[] = [];
+    h.provider.shellJobs.subscribe(event => { if (event.type === "monitor") events.push(event); });
+    await h.invoke({ command: "cat fixture; sleep 1.3", monitor: { delivery: "wake", intervalMs: 1000 } });
+    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toBeDefined(), { timeout: 5000 });
+    expect(JSON.stringify(events)).toContain("[filtered]");
+    expect(JSON.stringify(events)).not.toContain(SECRET);
+    expect(h.runner.emitToolCall).toHaveBeenCalledOnce();
+    expect(h.fallback).not.toHaveBeenCalled();
+  });
+
+  it("does not bypass an opaque shell override for monitors", async () => {
+    const h = harness({ optIn: false });
+    await expect(h.invoke({ command: "echo forbidden", monitor: { delivery: "wake" } })).rejects.toThrow();
+    expect(h.provider.shellJobs.list()).toEqual([]);
+    expect(h.fallback).not.toHaveBeenCalled();
+  });
   it("advertises Fabric arguments without serializing host callbacks", async () => {
     const h = harness();
     const descriptor = await h.provider.describe("bash", h.context);

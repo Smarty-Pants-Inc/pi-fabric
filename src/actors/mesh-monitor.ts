@@ -29,6 +29,8 @@ export class ActorMeshMonitor {
   #last: { sequence: number; id: string } | undefined;
   /** On resume: the sequence to read work events after, from the archive, before the live log. */
   #archiveAfter: number | undefined;
+  /** The page start whose sequence gap the archive already filled (a real hole is checked once). */
+  #gapChecked: number | undefined;
 
   constructor(
     readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence">>,
@@ -119,11 +121,20 @@ export class ActorMeshMonitor {
       // never blocks the stream; the cursor file is committed after the page.
       const start = this.#offset;
       const tail = this.mesh.tail(start, this.config.maxReadEvents);
-      // A rewrite since this cursor restarts the stream at the retained log. The events in
-      // between are in the archive: read them from the last event handed on, then restart
-      // the stream at the new log's start. A later rewrite is caught the same way.
+      // A rewrite restarts the stream at the retained log; the events it cut are in the archive
+      // (it holds each event before it goes live). The generation and the events file are two
+      // reads, and a rewrite renames the file before it bumps the generation, so a page can come
+      // from a new file with an old generation, or from a stale byte offset into it. So trust
+      // the events too: a generation change, or a page that starts past the event after the last
+      // one handed on, re-arms the archive from that event and re-reads the current file from
+      // its start. Nothing is committed past the gap first; events already handed on are skipped.
       const generation = meshCursorGeneration(tail.nextOffset);
-      if (this.#last && this.mesh.read && generation !== meshCursorGeneration(start)) {
+      const first = tail.events[0];
+      const gap = first !== undefined && this.#last !== undefined && typeof first.sequence === "number" &&
+        first.sequence > this.#last.sequence + 1 && first.sequence !== this.#gapChecked;
+      if (this.#last && this.mesh.read && (generation !== meshCursorGeneration(start) || gap)) {
+        // A real sequence hole is checked once, so it cannot loop.
+        if (gap) this.#gapChecked = first!.sequence;
         this.#archiveAfter = this.#last.sequence;
         this.#offset = meshCursorAtStart(generation);
         this.#writeCursor();
@@ -135,7 +146,10 @@ export class ActorMeshMonitor {
       if (!catchingUp) this.#offset = tail.nextOffset;
       for (const [index, event] of tail.events.entries()) {
         if (this.#delivered(event)) continue;
-        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event)) continue;
+        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event)) {
+          if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
+          continue;
+        }
         const accepted = this.callbacks.onEvent(event);
         // A receiver that is full holds the event: while catching up, and for work events always
         // (smarty-dev#754), so work waits for room instead of being dropped.
@@ -184,8 +198,10 @@ export class ActorMeshMonitor {
         this.#writeCursor();
         return false;
       }
+      // Every event older than the live log counts as handed on, work or not, so the live log's
+      // first event follows it with no gap.
       this.#archiveAfter = event.sequence;
-      if (isWork(event)) this.#last = { sequence: event.sequence, id: event.id };
+      this.#last = { sequence: event.sequence, id: event.id };
     }
     if (older.length === page.length && page.length === this.config.maxReadEvents) {
       this.#writeCursor();

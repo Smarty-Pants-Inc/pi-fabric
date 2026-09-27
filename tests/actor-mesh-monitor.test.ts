@@ -367,3 +367,110 @@ describe("ActorMeshMonitor work-topic reconciliation, round 2", () => {
     expect(ticksAtRead.at(-1)!).toBeGreaterThan(ticksAtRead[0]!);          // timers ran between pages
   });
 });
+
+// review/astra round 3 on pi-fabric#97: the generation file and the events file are separate
+// reads, and a rewrite renames the file before it bumps the generation.
+describe("ActorMeshMonitor archive/live handoff across a rewrite's two writes", () => {
+  const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+  const setup = async (archived = true) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-r3-"));
+    roots.push(base);
+    const root = path.join(base, "mesh");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(path.join(base, "archive"));
+    if (archived) fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir: path.join(base, "archive") }));
+    const mesh = new MeshStore(root, 4_096, 500, { maxEventLogBytes: 1_000_000, retainedEventLogBytes: 500_000 });
+    const seen: MeshEvent[] = [];
+    const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 3 },
+      { cursorPath: path.join(base, "cursor.json"), beforePoll: () => true, onEvent: (event) => { seen.push(event); } });
+    monitors.push(monitor);
+    const poll = async (times: number) => { for (let index = 0; index < times; index++) { monitor.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); } };
+    // Work on odd numbers, noise on even ones, so the monitor's last event may be either. Every
+    // line has the same length, so an old file's byte offset lands on a line of the new one.
+    const publish = async (low: number, high: number) => {
+      for (let n = low; n <= high; n++) await mesh.publish({ topic: n % 2 ? "fleet.work.a" : "team.noise.x", from, text: label(n) });
+    };
+    const events = path.join(root, "events.jsonl");
+    const generation = path.join(root, "generation");
+    // What a rewrite leaves: the events file holds only the suffix from `keep`.
+    const renameLog = (keep: number) => {
+      const lines = fs.readFileSync(events, "utf8").split("\n").filter((line) => line && (JSON.parse(line) as MeshEvent).sequence >= keep);
+      fs.writeFileSync(`${events}.tmp`, lines.map((line) => `${line}\n`).join(""));
+      fs.renameSync(`${events}.tmp`, events);
+    };
+    const bumpGeneration = () => {
+      const current = fs.existsSync(generation) ? Number(JSON.parse(fs.readFileSync(generation, "utf8"))) : 0;
+      fs.writeFileSync(generation, JSON.stringify(current + 1));
+    };
+    const workTexts = () => seen.filter((event) => event.topic.startsWith("fleet.")).map((event) => event.text);
+    return { mesh, seen, poll, publish, renameLog, bumpGeneration, workTexts, events };
+  };
+  const label = (n: number) => `e${n}`.padEnd(2 * (2 - String(n).length) + String(n).length + 1, "_");
+  const odd = (low: number, high: number) => Array.from({ length: high - low + 1 }, (_, index) => low + index).filter((n) => n % 2).map(label);
+
+  it("fills the gap when the file is renamed and the generation not yet bumped", async () => {
+    const { mesh, poll, publish, renameLog, bumpGeneration, workTexts, events } = await setup();
+    await publish(1, 4);
+    await poll(5);
+    expect(workTexts()).toEqual(odd(1, 4));
+    await publish(5, 14);
+    expect(mesh.oldestSequence()).toBe(1);
+    const lines = fs.readFileSync(events, "utf8").split("\n").filter(Boolean);
+    expect(new Set(lines.map((line) => line.length)).size).toBe(1);
+    renameLog(9);                                            // events 5–8 leave the live log
+    // The old cursor's byte offset (after event 4) is now the start of event 13's line: a read
+    // there skips 9–12, which are in the live log, not the archive.
+    await poll(10);                                          // the generation is still the old one
+    expect(workTexts()).toEqual(odd(1, 14));
+    bumpGeneration();                                        // the rewrite's second write lands
+    await publish(15, 16);
+    await poll(10);
+    expect(workTexts()).toEqual(odd(1, 16));                 // each once, in order
+  });
+
+  it("fills the gap when the rewrite lands between the generation read and the file open", async () => {
+    const { poll, publish, renameLog, bumpGeneration, workTexts, events } = await setup();
+    await publish(1, 4);
+    await poll(5);
+    await publish(5, 14);
+    const open = fs.openSync.bind(fs);
+    let armed = true;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (armed && String(file) === events) {
+        armed = false;                                       // tail has read the old generation
+        renameLog(9);
+        bumpGeneration();
+      }
+      return (open as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    await poll(10);
+    expect(armed).toBe(false);
+    vi.mocked(fs.openSync).mockRestore();
+    await publish(15, 16);
+    await poll(10);
+    expect(workTexts()).toEqual(odd(1, 16));
+  });
+});
+
+describe("ActorMeshMonitor without an archive", () => {
+  it("passes a gap it cannot fill once, and does not stall on it", async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-r3-noarchive-"));
+    roots.push(base);
+    const root = path.join(base, "mesh");
+    const mesh = new MeshStore(root, 4_096, 500);
+    const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+    const seen: string[] = [];
+    const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 3 },
+      { cursorPath: path.join(base, "cursor.json"), beforePoll: () => true, onEvent: (event) => { seen.push(event.text ?? ""); } });
+    monitors.push(monitor);
+    const poll = async (times: number) => { for (let index = 0; index < times; index++) { monitor.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); } };
+    for (let n = 1; n <= 4; n++) await mesh.publish({ topic: "fleet.work.a", from, text: `e${n}` });
+    await poll(5);
+    for (let n = 5; n <= 14; n++) await mesh.publish({ topic: "fleet.work.a", from, text: `e${n}` });
+    const events = path.join(root, "events.jsonl");
+    const kept = fs.readFileSync(events, "utf8").split("\n").filter((line) => line && (JSON.parse(line) as MeshEvent).sequence >= 9);
+    fs.writeFileSync(events, kept.map((line) => `${line}\n`).join(""));   // 5–8 are gone for good
+    await poll(12);
+    expect(seen).toEqual(["e1", "e2", "e3", "e4", "e9", "e10", "e11", "e12", "e13", "e14"]);
+  });
+});

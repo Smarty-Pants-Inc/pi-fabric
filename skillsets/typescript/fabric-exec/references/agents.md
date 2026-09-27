@@ -130,6 +130,7 @@ Every live root, one-shot/recursive agent, and persistent actor is represented i
 - `agents.peers()` remains the compatibility view of other live roots as `Peer <session-prefix>`. It is derived from `agents.members`, not maintained by a second registry.
 - `agents.status({ id })` accepts any known participant id. Local runs/actors return full local detail; remote participants return their bounded directory summary.
 - `agents.steer({ id, message, data? })` and `agents.followUp(...)` target Main, a live one-shot child, or an actor without discarding context.
+- `agents.ask`, `agents.tell`, `agents.steer` and `agents.followUp` also accept `to` as an alias of `id` (give one target) and the positional form `(id, message)`. A root session id takes the form `id: "session:<sessionId>"`; there is no `sessionId` field.
 - `agents.stop({ id })` can stop a local or remotely owned agent/actor when its participant advertises `"stop"`. It returns the local agent result, local actor info, or an acknowledged remote control result according to the target.
 - `agents.setSteeringMode({ id, mode })` / `agents.setFollowUpMode({ id, mode })` remain local one-shot controls.
 
@@ -144,7 +145,7 @@ await agents.followUp({ id: main.id, message: "After the audit, reconcile the wo
 const handle = await agents.spawn({ task: "Audit auth flows.", tools: ["read", "grep", "find", "ls"] });
 // Watch progress, then redirect between turns without losing the child's context.
 const s = await agents.status({ id: handle.id });
-if (s.text.includes("rotating refresh tokens")) {
+if ("text" in s && s.text.includes("rotating refresh tokens")) {
   await agents.steer({ id: handle.id, message: "Skip refresh-token rotation; focus on session expiry only." });
   await agents.setSteeringMode({ id: handle.id, mode: "all" });
 }

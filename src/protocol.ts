@@ -384,6 +384,12 @@ export interface FabricProvider {
     actionName: string,
     context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor | undefined>;
+  /**
+   * Provider-owned argument rules that must see the caller's raw arguments,
+   * before generic key repair can rename or consume a field. Runs before
+   * repair; prepareArguments runs after it.
+   */
+  guardArguments?(actionName: string, args: Record<string, unknown>): Record<string, unknown>;
   prepareArguments?(
     actionName: string,
     args: Record<string, unknown>,

@@ -794,7 +794,13 @@ export class ActionRegistry {
         action.ref,
         action.inputSchema,
       ) as Record<string, unknown>;
-      const catalogInput = repairCatalogInput(action.ref, effectiveSchema, args);
+      const catalogInput = repairCatalogInput(
+        action.ref,
+        effectiveSchema,
+        provider.guardArguments
+          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args))
+          : args,
+      );
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
             this.#providerBindings.trackProvider(provider, () => provider.prepareArguments!(providerActionName, catalogInput.args, context)),
@@ -882,7 +888,13 @@ export class ActionRegistry {
         action.ref,
         action.inputSchema,
       ) as Record<string, unknown>;
-      const catalogInput = repairCatalogInput(action.ref, effectiveSchema, args);
+      const catalogInput = repairCatalogInput(
+        action.ref,
+        effectiveSchema,
+        provider.guardArguments
+          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args))
+          : args,
+      );
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
             this.#providerBindings.trackProvider(provider, () => provider.prepareArguments!(providerActionName, catalogInput.args, context)),

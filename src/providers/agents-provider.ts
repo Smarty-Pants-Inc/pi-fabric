@@ -319,6 +319,32 @@ const actorRequest = (
 // lexicon; no agents-specific table remains.
 export const normalizeAgentsArgs = actionArgNormalizer(() => AGENTS_ACTION_DESCRIPTORS);
 
+const MESSAGE_ACTIONS = new Set(["ask", "tell", "steer", "followUp"]);
+
+// Messaging calls accept "to" (the mesh.publish spelling) as an alias of "id".
+// sessionId is rejected with the exact fix: the generic synonym repair would
+// otherwise map it onto id without the "session:" prefix the directory needs.
+export const messageTargetArgs = (
+  actionName: string,
+  args: Record<string, unknown>,
+): Record<string, unknown> => {
+  if (!MESSAGE_ACTIONS.has(actionName)) return args;
+  if (Object.hasOwn(args, "sessionId")) {
+    const raw = String(args.sessionId).replace(/^session:/, "");
+    throw new Error(
+      `agents.${actionName} has no sessionId field: use id: 'session:${raw}'`,
+    );
+  }
+  if (!Object.hasOwn(args, "to")) return args;
+  const { to, ...rest } = args;
+  if (rest.id !== undefined && to !== undefined && rest.id !== to) {
+    throw new Error(
+      `agents.${actionName} got two targets, id ${JSON.stringify(rest.id)} and to ${JSON.stringify(to)}: give one (to is an alias of id)`,
+    );
+  }
+  return rest.id === undefined ? { ...rest, id: to } : rest;
+};
+
 export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
   readonly #router: AgentMessageRouter;
@@ -462,6 +488,12 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
   ): Record<string, unknown> {
     return normalizeAgentsArgs(actionName, args);
+  }
+
+  // Before generic repair: a learned sessionId -> id row would otherwise drop
+  // the "session:" prefix, and a to/id conflict must be seen as the caller wrote it.
+  guardArguments(actionName: string, args: Record<string, unknown>): Record<string, unknown> {
+    return messageTargetArgs(actionName, args);
   }
 
   async handoff(

@@ -124,6 +124,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #flushMs = 0;
   #suspended = false;
   #closed = false;
+  #wake: ReturnType<typeof setInterval> | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -277,14 +278,16 @@ export class MainAgentController implements FabricMainAgentTarget {
     });
     on("session_compact_failed", (event: { reason?: string }, ctx) => {
       this.#context = ctx;
+      // Pi clears the compaction state before this event, so Main is idle here.
       if (event.reason === "manual" && ctx.isIdle()) this.#release(false);
     });
-    on("agent_start", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
+    on("agent_start", (_event, ctx) => { this.#context = ctx; this.#suspended = false; this.#stopWake(); });
     on("input", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
   }
 
   /** Stop holding; any held followUps go to Pi's own followUp queue, as before the drain. */
   closeFollowUpDrain(): void {
+    this.#stopWake();
     for (const off of this.#unsubscribe.splice(0)) off();
     const held = this.#held.splice(0);
     this.#closed = true;
@@ -312,13 +315,24 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #wakeWhenIdle(): void {
-    // Pi clears its busy state after the event's handlers run; release once Main is idle.
-    setTimeout(() => {
-      if (!this.#closed && this.#context?.isIdle()) this.#release(true);
-    }, 0);
+    // Pi leaves its busy state only after every handler of the event has finished, which can
+    // take any time (review/astra F2 on pi-fabric#102): wait for idle, not one tick. A release
+    // or a new run ends the wait; a cancelled or failed operation releases without a run.
+    if (this.#wake || !this.#held.length) return;
+    this.#wake = setInterval(() => {
+      if (this.#closed || !this.#held.length) this.#stopWake();
+      else if (this.#context?.isIdle()) this.#release(true);
+    }, 25);
+    this.#wake.unref?.();
+  }
+
+  #stopWake(): void {
+    if (this.#wake) clearInterval(this.#wake);
+    this.#wake = undefined;
   }
 
   #release(triggerTurn: boolean): void {
+    this.#stopWake();
     if (!this.#held.length) return;
     this.#send(this.#held.splice(0), "followUp", triggerTurn, false);
   }

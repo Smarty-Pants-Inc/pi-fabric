@@ -174,8 +174,22 @@ const SKILL_REFERENCE_CUSTOM_TYPE = "pi-fabric-skill-reference";
 export const FABRIC_MANAGED_HOST_VERSION = 1;
 export type { FabricManagedHostOptions } from "./managed-host.js";
 import type { FabricManagedHostOptions } from "./managed-host.js";
-import { settledCompleted } from "./settled.js";
 
+// A run the user aborted, or one that failed, must not start another turn by itself. Newer Pi
+// names the outcome; for older Pi, the last assistant message's stop reason says it.
+const settledCompleted = (event: unknown, context: ExtensionContext): boolean => {
+  const outcome = (event as { outcome?: unknown }).outcome;
+  if (typeof outcome === "string") return outcome === "completed";
+  if (context.signal?.aborted) return false;
+  const entries = context.sessionManager.getEntries();
+  for (let index = entries.length - 1; index >= Math.max(0, entries.length - 50); index--) {
+    const entry = entries[index] as { type?: string; message?: { role?: string; stopReason?: string } };
+    if (entry.type === "message" && entry.message?.role === "assistant") {
+      return entry.message.stopReason !== "aborted" && entry.message.stopReason !== "error";
+    }
+  }
+  return true;
+};
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
 const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sessionManager.getEntries());

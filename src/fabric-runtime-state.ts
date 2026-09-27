@@ -104,6 +104,7 @@ import {
   type FabricAgentMessageResult,
   type FabricMainAgentInfo,
 } from "./main-agent.js";
+import { followUpDrainSupported } from "./host-compatibility.js";
 import { AgentsProvider } from "./providers/agents-provider.js";
 import { CompactProvider } from "./providers/compact-provider.js";
 import { CacheProvider } from "./providers/cache-provider.js";
@@ -522,7 +523,7 @@ export class FabricRuntimeState {
       identity.kind === "main" ? sessionId : undefined,
     );
     this.#mainAgent = mainAgent;
-    mainAgent.attachFollowUpDrain(context, this.#config.mesh.followUpFlushMs);
+    mainAgent.attachFollowUpDrain(context, followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0);
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
     const configuredMeshRoot = this.#config.mesh.root;
     const meshRoot =

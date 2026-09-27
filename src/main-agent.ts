@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
-import { settledCompleted } from "./settled.js";
 
 const MAIN_AGENT_ALIAS = "main";
 export type FabricAgentMessageDelivery = "steer" | "followUp";
@@ -247,14 +246,22 @@ export class MainAgentController implements FabricMainAgentTarget {
       }
       this.#flushDue();
     });
-    on("agent_settled", (event, ctx) => {
-      // A cancel after the last turn (in agent_before_settle, or of post-run compaction) sets
-      // no aborted turn_end: the settle outcome says it (review/astra F1 on pi-fabric#102).
-      const interrupted = this.#suspended || !settledCompleted(event, ctx);
+    // Main is about to go idle. Hand the held followUps to Pi's followUp queue here, the last
+    // boundary where Pi still continues the run for a queued message and where Pi itself drops
+    // that continuation when the user cancels (review/astra F1 on pi-fabric#102).
+    on("agent_before_settle", (event: { outcome?: string }, ctx) => {
       this.#context = ctx;
+      if (this.#suspended || (event.outcome !== undefined && event.outcome !== "completed")) return;
+      this.#release(true);
+    });
+    // Only followUps that arrived after that boundary are left. Start a run for them only on a
+    // settle Pi reports as completed: a cancel after the last turn sets no aborted turn_end, and
+    // a Pi that reports no outcome cannot rule one out, so they are appended for the next run.
+    on("agent_settled", (event: { outcome?: string }, ctx) => {
+      this.#context = ctx;
+      const completed = !this.#suspended && event.outcome === "completed";
       this.#suspended = false;
-      // After Escape, do not restart Main: append the held ones for its next run.
-      this.#release(!interrupted);
+      this.#release(completed);
     });
     on("agent_start", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
     on("input", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });

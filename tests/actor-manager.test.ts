@@ -403,6 +403,67 @@ describe("ActorManager across a session reload", () => {
     await asked;
   }, 30_000);
 
+  // review/astra round 2 F1 on pi-fabric#97: archive replay of more work than the queue and its
+  // overflow hold must wait for room, never drop.
+  it("delivers every work event an archive replay brings, more than its queue and overflow hold", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-work-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    fs.mkdirSync(meshRoot, { recursive: true });
+    fs.mkdirSync(path.join(root, "archive"));
+    fs.writeFileSync(path.join(meshRoot, "event-archive.json"), JSON.stringify({ version: 1, dir: path.join(root, "archive") }));
+    const mesh = new MeshStore(meshRoot, 16_384, 100, { maxEventLogBytes: 24_000, retainedEventLogBytes: 6_000 });
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    const before = reloadable(root, mesh, agents, 10 * 60_000, 2);          // queue 2, overflow 16
+    const actor = await before.create({ name: "worker", instructions: "Work.", topics: ["fleet.work.x"], responseMode: "text", coalesce: false });
+    await mesh.publish({ topic: "fleet.work.x", from, text: "w0" });
+    const answered = (manager: ActorManager) => manager.messages(actor.id).filter((message) => message.direction === "out" && !message.error).length;
+    await waitFor(() => answered(before) === 1, 10_000);
+    await waitFor(() => before.status(actor.id).status === "idle", 10_000);
+    await before.close();
+    for (let index = 1; index <= 40; index++) {
+      await mesh.publish({ topic: "fleet.work.x", from, text: `w${index}` });
+      await mesh.publish({ topic: "team.noise", from, text: "x".repeat(1_500) });
+    }
+    expect(mesh.oldestSequence()).toBeGreaterThan(10);                   // the first work events left the live log
+    const after = reloadable(root, mesh, agents, 10 * 60_000, 2);
+    // Each run's task names its event; the actor's message log keeps only its last 50 entries.
+    const runTexts = () => {
+      const runs = path.join(root, "actors", actor.id, "runs");
+      return fs.existsSync(runs) ? fs.readdirSync(runs).map((run) => {
+        try { return fs.readFileSync(path.join(runs, run, "task.txt"), "utf8").match(/"text":\s*"(w\d+)"/)?.[1]; } catch { return undefined; }
+      }) : [];
+    };
+    await waitFor(() => runTexts().length >= 41 && after.status(actor.id).status === "idle" && after.status(actor.id).queued === 0, 60_000);
+    expect(runTexts().sort()).toEqual(Array.from({ length: 41 }, (_, index) => `w${index}`).sort());
+  }, 90_000);
+
+  it("holds live work events a full queue and overflow cannot take, and delivers each once", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-work-live-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 16_384, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const manager = reloadable(root, mesh, agents, 10 * 60_000, 1);          // queue 1, overflow 8
+    const actor = await manager.create({ name: "worker", instructions: "Work.", topics: ["fleet.work.x"], responseMode: "text", coalesce: false });
+    const from = { id: "peer", name: "peer", kind: "actor" as const };
+    for (let index = 1; index <= 15; index++) await mesh.publish({ topic: "fleet.work.x", from, text: `LIVE_WITH_PROGRESS w${index}` });
+    const runTexts = () => {
+      const runs = path.join(root, "actors", actor.id, "runs");
+      return fs.existsSync(runs) ? fs.readdirSync(runs).map((run) => {
+        try { return fs.readFileSync(path.join(runs, run, "task.txt"), "utf8").match(/LIVE_WITH_PROGRESS (w\d+)/)?.[1]; } catch { return undefined; }
+      }) : [];
+    };
+    await waitFor(() => runTexts().length >= 15 && manager.status(actor.id).status === "idle" && manager.status(actor.id).queued === 0, 80_000);
+    expect(runTexts().sort()).toEqual(Array.from({ length: 15 }, (_, index) => `w${index + 1}`).sort());
+  }, 100_000);
+
   // review/astra on #45: catch-up must not overflow a 32-item queue silently.
   it("replays 34 missed events into a resumed idle actor, all of them, each once", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));

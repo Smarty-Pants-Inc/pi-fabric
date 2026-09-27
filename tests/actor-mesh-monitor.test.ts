@@ -209,3 +209,410 @@ describe("ActorMeshMonitor", () => {
     expect(s.onEvent).toHaveBeenCalledTimes(2);
   });
 });
+
+// smarty-dev#754 §3.2 step 3 (actors): work events are durable work. They skip the replay window,
+// and ones a live-log rewrite dropped while the host was away come back from the archive.
+describe("ActorMeshMonitor work-topic reconciliation", () => {
+  const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+  const store = (options: { archive?: boolean; maxEventLogBytes?: number; retainedEventLogBytes?: number } = {}) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-work-"));
+    roots.push(base);
+    const root = path.join(base, "mesh");
+    fs.mkdirSync(root, { recursive: true });
+    if (options.archive) {
+      const dir = path.join(base, "archive");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir }));
+    }
+    const mesh = new MeshStore(root, 4_096, 500, {
+      ...(options.maxEventLogBytes ? { maxEventLogBytes: options.maxEventLogBytes, retainedEventLogBytes: options.retainedEventLogBytes! } : {}),
+    });
+    return { mesh, cursorPath: path.join(base, "cursor.json") };
+  };
+  const monitor = (mesh: MeshStore, cursorPath: string, seen: MeshEvent[], maxReplayAgeMs?: number) => {
+    const value = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 50 }, {
+      cursorPath, beforePoll: () => true, onEvent: (event) => { seen.push(event); },
+      ...(maxReplayAgeMs !== undefined ? { maxReplayAgeMs } : {}),
+    });
+    monitors.push(value);
+    return value;
+  };
+  const drain = async (value: ActorMeshMonitor) => {
+    for (let index = 0; index < 20; index++) { value.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
+  };
+
+  it("delivers a work event older than the replay window, and still skips an old ordinary one", async () => {
+    const { mesh, cursorPath } = store();
+    const first: MeshEvent[] = [];
+    const before = monitor(mesh, cursorPath, first);
+    await mesh.publish({ topic: "team.x", from, text: "seen" });
+    await drain(before);
+    before.close();
+    await mesh.publish({ topic: "team.x", from, text: "old ordinary" });
+    await mesh.publish({ topic: "fleet.work.pi-fabric.1", to: "actor:a", from, text: "old work" });
+    const seen: MeshEvent[] = [];
+    await drain(monitor(mesh, cursorPath, seen, -60_000));   // every event is older than the window
+    expect(seen.map((event) => event.text)).toEqual(["old work"]);
+  });
+
+  it("delivers nothing twice when a rewrite restarts the stream on events already handed on", async () => {
+    const { mesh, cursorPath } = store({ archive: true, maxEventLogBytes: 6_000, retainedEventLogBytes: 1_500 });
+    const first: MeshEvent[] = [];
+    const before = monitor(mesh, cursorPath, first);
+    for (let index = 1; index <= 24; index++) await mesh.publish({ topic: "fleet.work.pi-fabric.1", to: "actor:a", from, text: `a${index}` });
+    await drain(before);
+    expect(first).toHaveLength(24);
+    before.close();
+    const generation = () => { try { return fs.readFileSync(path.join(mesh.root, "generation"), "utf8"); } catch { return ""; } };
+    const was = generation();
+    for (let index = 1; generation() === was && index <= 20; index++) await mesh.publish({ topic: "fleet.work.pi-fabric.1", to: "actor:a", from, text: `b${index}` });
+    const retained = mesh.read({ limit: 50 }).map((event) => event.text);
+    expect(retained.some((text) => text?.startsWith("a"))).toBe(true);          // the rewrite kept some delivered ones
+    const seen: MeshEvent[] = [];
+    await drain(monitor(mesh, cursorPath, seen, 10 * 60_000));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((event) => event.text?.startsWith("b"))).toBe(true);
+  });
+
+  it("reads work events a live-log rewrite dropped from the archive, each once, with nothing repeated", async () => {
+    const { mesh, cursorPath } = store({ archive: true, maxEventLogBytes: 6_000, retainedEventLogBytes: 1_500 });
+    const first: MeshEvent[] = [];
+    const before = monitor(mesh, cursorPath, first);
+    await mesh.publish({ topic: "fleet.work.pi-fabric.1", to: "actor:a", from, text: "work 0" });
+    await drain(before);
+    expect(first.map((event) => event.text)).toEqual(["work 0"]);
+    before.close();
+    // The host is away while the live log is rewritten several times.
+    for (let index = 1; index <= 40; index++) {
+      await mesh.publish({ topic: index % 5 === 0 ? "fleet.work.pi-fabric.1" : "team.noise", to: "actor:a", from, text: `${index % 5 === 0 ? "work" : "noise"} ${index}` });
+    }
+    expect(mesh.oldestSequence()).toBeGreaterThan(10);
+    const seen: MeshEvent[] = [];
+    await drain(monitor(mesh, cursorPath, seen, 10 * 60_000));
+    const work = seen.filter((event) => event.topic.startsWith("fleet.")).map((event) => event.text);
+    expect(work).toEqual(["work 5", "work 10", "work 15", "work 20", "work 25", "work 30", "work 35", "work 40"]);
+    expect(new Set(seen.map((event) => event.id)).size).toBe(seen.length);
+    expect(seen.some((event) => event.text === "work 0")).toBe(false);
+  });
+});
+
+// review/astra round 2 on pi-fabric#97.
+describe("ActorMeshMonitor work-topic reconciliation, round 2", () => {
+  const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+  const archivedStore = (maxEventLogBytes = 6_000, retainedEventLogBytes = 1_500) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-r2-"));
+    roots.push(base);
+    const root = path.join(base, "mesh");
+    const dir = path.join(base, "archive");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir }));
+    return { mesh: new MeshStore(root, 4_096, 500, { maxEventLogBytes, retainedEventLogBytes }), base, cursorPath: path.join(base, "cursor.json") };
+  };
+
+  // F2: a rewrite between the archive read and the tail read left a gap.
+  it("closes a gap that a rewrite opens while it reads the archive", async () => {
+    const { mesh, cursorPath } = archivedStore();
+    const seen: MeshEvent[] = [];
+    const first = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 50 }, { cursorPath, beforePoll: () => true, onEvent: (event) => { seen.push(event); } });
+    monitors.push(first);
+    await mesh.publish({ topic: "fleet.work.a", from, text: "w0" });
+    for (let index = 0; index < 5; index++) { first.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
+    first.close();
+    let n = 1;
+    const burst = async (count: number) => { for (let index = 0; index < count; index++, n++) await mesh.publish({ topic: n % 3 === 0 ? "fleet.work.a" : "team.noise", from, text: `${n % 3 === 0 ? "w" : "x"}${n}` }); };
+    await burst(40);                                             // the first rewrite, while away
+    const read = mesh.read.bind(mesh);
+    let rewrites = 0;
+    vi.spyOn(mesh, "read").mockImplementation((input) => {
+      const page = read(input);
+      if (rewrites++ === 0) void burst(40);                     // another rewrite during the archive read
+      return page;
+    });
+    const later: MeshEvent[] = [];
+    const again = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 50 }, { cursorPath, maxReplayAgeMs: 600_000, beforePoll: () => true, onEvent: (event) => { later.push(event); } });
+    monitors.push(again);
+    for (let index = 0; index < 60; index++) { again.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
+    const expected = Array.from({ length: n - 1 }, (_, index) => index + 1).filter((value) => value % 3 === 0).map((value) => `w${value}`);
+    expect(later.filter((event) => event.topic.startsWith("fleet.")).map((event) => event.text)).toEqual(expected);
+    expect(new Set(later.map((event) => event.id)).size).toBe(later.length);
+  });
+
+  // F3: archive catch-up yields between pages.
+  it("yields to the event loop between archive pages", async () => {
+    const { mesh, cursorPath } = archivedStore(40_000, 4_000);
+    const seen: MeshEvent[] = [];
+    const first = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 20 }, { cursorPath, beforePoll: () => true, onEvent: (event) => { seen.push(event); } });
+    monitors.push(first);
+    await mesh.publish({ topic: "fleet.work.a", from, text: "w0" });
+    for (let index = 0; index < 5; index++) { first.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
+    first.close();
+    for (let index = 1; index <= 400; index++) await mesh.publish({ topic: index % 50 === 0 ? "fleet.work.a" : "team.noise", from, text: `e${index}` });
+    expect(mesh.oldestSequence()).toBeGreaterThan(100);
+    let ticks = 0;
+    const heartbeat = setInterval(() => { ticks++; }, 1);
+    const ticksAtRead: number[] = [];
+    const read = mesh.read.bind(mesh);
+    vi.spyOn(mesh, "read").mockImplementation((input) => { ticksAtRead.push(ticks); return read(input); });
+    const later: MeshEvent[] = [];
+    const again = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 20 }, { cursorPath, maxReplayAgeMs: 600_000, beforePoll: () => true, onEvent: (event) => { later.push(event); } });
+    monitors.push(again);
+    try {
+      again.schedule();
+      await vi.waitFor(() => expect(later.filter((event) => event.topic.startsWith("fleet.")).length).toBe(8), { timeout: 10_000, interval: 5 });
+    } finally {
+      clearInterval(heartbeat);
+    }
+    expect(ticksAtRead.length).toBeGreaterThan(3);
+    expect(ticksAtRead.at(-1)!).toBeGreaterThan(ticksAtRead[0]!);          // timers ran between pages
+  });
+});
+
+// review/astra round 3 on pi-fabric#97: the generation file and the events file are separate
+// reads, and a rewrite renames the file before it bumps the generation.
+describe("ActorMeshMonitor archive/live handoff across a rewrite's two writes", () => {
+  const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+  const setup = async (archived = true) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-r3-"));
+    roots.push(base);
+    const root = path.join(base, "mesh");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(path.join(base, "archive"));
+    if (archived) fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir: path.join(base, "archive") }));
+    const mesh = new MeshStore(root, 4_096, 500, { maxEventLogBytes: 1_000_000, retainedEventLogBytes: 500_000 });
+    const seen: MeshEvent[] = [];
+    const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 3 },
+      { cursorPath: path.join(base, "cursor.json"), beforePoll: () => true, onEvent: (event) => { seen.push(event); } });
+    monitors.push(monitor);
+    const poll = async (times: number) => { for (let index = 0; index < times; index++) { monitor.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); } };
+    // Work on odd numbers, noise on even ones, so the monitor's last event may be either. Every
+    // line has the same length, so an old file's byte offset lands on a line of the new one.
+    const publish = async (low: number, high: number) => {
+      for (let n = low; n <= high; n++) await mesh.publish({ topic: n % 2 ? "fleet.work.a" : "team.noise.x", from, text: label(n) });
+    };
+    const events = path.join(root, "events.jsonl");
+    const generation = path.join(root, "generation");
+    // What a rewrite leaves: the events file holds only the suffix from `keep`.
+    const renameLog = (keep: number) => {
+      const lines = fs.readFileSync(events, "utf8").split("\n").filter((line) => line && (JSON.parse(line) as MeshEvent).sequence >= keep);
+      fs.writeFileSync(`${events}.tmp`, lines.map((line) => `${line}\n`).join(""));
+      fs.renameSync(`${events}.tmp`, events);
+    };
+    const bumpGeneration = () => {
+      const current = fs.existsSync(generation) ? Number(JSON.parse(fs.readFileSync(generation, "utf8"))) : 0;
+      fs.writeFileSync(generation, JSON.stringify(current + 1));
+    };
+    const workTexts = () => seen.filter((event) => event.topic.startsWith("fleet.")).map((event) => event.text);
+    return { mesh, seen, poll, publish, renameLog, bumpGeneration, workTexts, events };
+  };
+  const label = (n: number) => `e${n}`.padEnd(2 * (2 - String(n).length) + String(n).length + 1, "_");
+  const odd = (low: number, high: number) => Array.from({ length: high - low + 1 }, (_, index) => low + index).filter((n) => n % 2).map(label);
+
+  it("fills the gap when the file is renamed and the generation not yet bumped", async () => {
+    const { mesh, poll, publish, renameLog, bumpGeneration, workTexts, events } = await setup();
+    await publish(1, 4);
+    await poll(5);
+    expect(workTexts()).toEqual(odd(1, 4));
+    await publish(5, 14);
+    expect(mesh.oldestSequence()).toBe(1);
+    const lines = fs.readFileSync(events, "utf8").split("\n").filter(Boolean);
+    expect(new Set(lines.map((line) => line.length)).size).toBe(1);
+    renameLog(9);                                            // events 5–8 leave the live log
+    // The old cursor's byte offset (after event 4) is now the start of event 13's line: a read
+    // there skips 9–12, which are in the live log, not the archive.
+    await poll(10);                                          // the generation is still the old one
+    expect(workTexts()).toEqual(odd(1, 14));
+    bumpGeneration();                                        // the rewrite's second write lands
+    await publish(15, 16);
+    await poll(10);
+    expect(workTexts()).toEqual(odd(1, 16));                 // each once, in order
+  });
+
+  it("fills the gap when the rewrite lands between the generation read and the file open", async () => {
+    const { poll, publish, renameLog, bumpGeneration, workTexts, events } = await setup();
+    await publish(1, 4);
+    await poll(5);
+    await publish(5, 14);
+    const open = fs.openSync.bind(fs);
+    let armed = true;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (armed && String(file) === events) {
+        armed = false;                                       // tail has read the old generation
+        renameLog(9);
+        bumpGeneration();
+      }
+      return (open as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    await poll(10);
+    expect(armed).toBe(false);
+    vi.mocked(fs.openSync).mockRestore();
+    await publish(15, 16);
+    await poll(10);
+    expect(workTexts()).toEqual(odd(1, 16));
+  });
+
+  // review/astra round 4: a second rewrite lands during the retry read, after the first gap was
+  // seen but before the archive covered it. The generation file stays behind throughout.
+  it("fills a gap that a second rewrite moves during the retry read", async () => {
+    const { mesh, poll, publish, bumpGeneration, workTexts, events } = await setup();
+    await publish(1, 4);
+    await poll(5);
+    await publish(5, 13);
+    const all = fs.readFileSync(events, "utf8").split("\n").filter(Boolean);
+    // A rewrite renames a new file into place, as the store's compaction does.
+    const write = (low: number, high: number) => {
+      fs.writeFileSync(`${events}.tmp`, all
+        .filter((line) => { const sequence = (JSON.parse(line) as MeshEvent).sequence; return sequence >= low && sequence <= high; })
+        .map((line) => `${line}\n`).join(""));
+      fs.renameSync(`${events}.tmp`, events);
+    };
+    const tail = mesh.tail.bind(mesh);
+    let call = 0;
+    vi.spyOn(mesh, "tail").mockImplementation((cursor, limit) => {
+      call++;
+      if (call === 1) write(5, 9);       // the old offset (four lines) now points at event 9
+      if (call === 2) write(9, 13);      // the second rewrite, during the retry read
+      return tail(cursor, limit);
+    });
+    await poll(12);
+    expect(call).toBeGreaterThan(2);
+    expect(workTexts()).toEqual(odd(1, 13));                 // 5 and 7 before 9–13
+    vi.mocked(mesh.tail).mockRestore();
+    bumpGeneration();
+    await publish(14, 16);
+    await poll(10);
+    expect(workTexts()).toEqual(odd(1, 16));
+  });
+
+  // review/astra round 6 on pi-fabric#97: the gap lookup itself must not be fooled by a rewrite
+  // that lands after it chose where to look and before it opened the live log.
+  it("fills the gap when a rewrite lands inside the gap lookup", async () => {
+    const { mesh, poll, publish, workTexts, events } = await setup();
+    await publish(1, 4);
+    await poll(5);
+    await publish(5, 13);
+    const all = fs.readFileSync(events, "utf8").split("\n").filter(Boolean);
+    const write = (low: number, high: number) => {
+      fs.writeFileSync(`${events}.tmp`, all
+        .filter((line) => { const sequence = (JSON.parse(line) as MeshEvent).sequence; return sequence >= low && sequence <= high; })
+        .map((line) => `${line}\n`).join(""));
+      fs.renameSync(`${events}.tmp`, events);
+    };
+    const open = fs.openSync.bind(fs);
+    let opensAfterTail = -1;                                   // armed once the stale page is read
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (opensAfterTail >= 0 && String(file) === events && ++opensAfterTail === 2) write(9, 13);
+      return (open as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    const tail = mesh.tail.bind(mesh);
+    let calls = 0;
+    vi.spyOn(mesh, "tail").mockImplementation((cursor, limit) => {
+      if (++calls === 1) write(5, 9);                          // the old offset now points at event 9
+      const page = tail(cursor, limit);
+      if (calls === 1) opensAfterTail = 0;
+      return page;
+    });
+    await poll(12);
+    vi.mocked(fs.openSync).mockRestore();
+    vi.mocked(mesh.tail).mockRestore();
+    expect(opensAfterTail).toBeGreaterThanOrEqual(2);
+    expect(workTexts()).toEqual(odd(1, 13));                   // 5 and 7 before 9
+  });
+
+  // review/astra round 7 on pi-fabric#97: the archive was enabled after a retention cut, so it
+  // starts after the monitor's last event. Its events must still count in the gap lookup.
+  it("fills the archived part of a gap that starts before the archive", async () => {
+    const { mesh, poll, publish, bumpGeneration, workTexts, events } = await setup(false);
+    await publish(1, 4);
+    await poll(5);
+    await publish(5, 12);
+    const renameKeeping = (low: number) => {
+      const lines = fs.readFileSync(events, "utf8").split("\n").filter((line) => line && (JSON.parse(line) as MeshEvent).sequence >= low);
+      fs.writeFileSync(`${events}.tmp`, lines.map((line) => `${line}\n`).join(""));
+      fs.renameSync(`${events}.tmp`, events);
+    };
+    renameKeeping(9);                                         // a retention cut while no archive was set:
+    bumpGeneration();                                         // 5–8 are gone for good
+    const archiveDir = path.join(path.dirname(events), "..", "archive");
+    fs.writeFileSync(path.join(path.dirname(events), "event-archive.json"), JSON.stringify({ version: 1, dir: path.resolve(archiveDir) }));
+    await publish(13, 17);                                    // the archive backfills from 9
+    expect(mesh.nextEventAfter(4)?.sequence).toBe(9);
+    const tail = mesh.tail.bind(mesh);
+    let calls = 0;
+    vi.spyOn(mesh, "tail").mockImplementation((cursor, limit) => {
+      // Call 1 sees the generation change; the archive catch-up then finds nothing below 9.
+      // Call 2 reads a log renamed to keep 13–17, before its generation bump.
+      if (++calls === 2) renameKeeping(13);
+      return tail(cursor, limit);
+    });
+    await poll(15);
+    vi.mocked(mesh.tail).mockRestore();
+    expect(calls).toBeGreaterThan(2);
+    expect(workTexts()).toEqual([...odd(1, 4), ...odd(9, 17)]);   // 9 and 11 once, before 13
+  });
+});
+
+describe("ActorMeshMonitor without an archive", () => {
+  it("passes a gap it cannot fill once, and does not stall on it", async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-r3-noarchive-"));
+    roots.push(base);
+    const root = path.join(base, "mesh");
+    const mesh = new MeshStore(root, 4_096, 500);
+    const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+    const seen: string[] = [];
+    const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 3 },
+      { cursorPath: path.join(base, "cursor.json"), beforePoll: () => true, onEvent: (event) => { seen.push(event.text ?? ""); } });
+    monitors.push(monitor);
+    const poll = async (times: number) => { for (let index = 0; index < times; index++) { monitor.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); } };
+    for (let n = 1; n <= 4; n++) await mesh.publish({ topic: "fleet.work.a", from, text: `e${n}` });
+    await poll(5);
+    for (let n = 5; n <= 14; n++) await mesh.publish({ topic: "fleet.work.a", from, text: `e${n}` });
+    const events = path.join(root, "events.jsonl");
+    const kept = fs.readFileSync(events, "utf8").split("\n").filter((line) => line && (JSON.parse(line) as MeshEvent).sequence >= 9);
+    fs.writeFileSync(`${events}.tmp`, kept.map((line) => `${line}\n`).join(""));
+    fs.renameSync(`${events}.tmp`, events);                                  // 5–8 are gone for good
+    await poll(12);
+    expect(seen).toEqual(["e1", "e2", "e3", "e4", "e9", "e10", "e11", "e12", "e13", "e14"]);
+  });
+});
+
+// review/astra round 5 (F4) on pi-fabric#97: a failed publish leaves its reserved sequence as a
+// hole inside the live log. The stream passes it, with no rewrite, publish or restart after it.
+describe("ActorMeshMonitor and a failed publish's sequence hole", () => {
+  for (const archived of [true, false]) {
+    it(`delivers the events after a hole at a page boundary (${archived ? "with" : "without"} the archive)`, async () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-f4-"));
+      roots.push(base);
+      const root = path.join(base, "mesh");
+      fs.mkdirSync(root, { recursive: true });
+      if (archived) {
+        fs.mkdirSync(path.join(base, "archive"));
+        fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir: path.join(base, "archive") }));
+      }
+      const mesh = new MeshStore(root, 4_096, 500);
+      const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+      const seen: string[] = [];
+      const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 3 },
+        { cursorPath: path.join(base, "cursor.json"), beforePoll: () => true, onEvent: (event) => { seen.push(event.text ?? ""); } });
+      monitors.push(monitor);
+      const poll = async (times: number) => { for (let index = 0; index < times; index++) { monitor.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); } };
+      for (const text of ["e1", "e2", "e3"]) await mesh.publish({ topic: "fleet.work.a", from, text });
+      await poll(5);
+      expect(seen).toEqual(["e1", "e2", "e3"]);
+      const events = path.join(root, "events.jsonl");
+      const append = fs.appendFileSync.bind(fs);
+      let fail = true;
+      const spy = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        if (fail && String(file) === events) { fail = false; throw new Error("disk full"); }
+        return (append as (...args: unknown[]) => void)(file, ...rest);
+      }) as typeof fs.appendFileSync);
+      await expect(mesh.publish({ topic: "fleet.work.a", from, text: "e4" })).rejects.toThrow("disk full");
+      spy.mockRestore();
+      await mesh.publish({ topic: "fleet.work.a", from, text: "e5" });
+      await mesh.publish({ topic: "fleet.work.a", from, text: "e6" });
+      expect(mesh.read({ after: 0 }).map((event) => event.sequence)).toEqual([1, 2, 3, 5, 6]);
+      await poll(10);
+      expect(seen).toEqual(["e1", "e2", "e3", "e5", "e6"]);
+    });
+  }
+});

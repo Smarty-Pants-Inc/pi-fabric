@@ -97,6 +97,10 @@ const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
 const READ_HINT_LINES = 128;
 const CURSOR_OFFSET_BASE = 2 ** 32;
+/** A tail cursor's live-log generation: it changes when the log is rewritten. */
+export const meshCursorGeneration = (cursor: number): number => Math.floor(cursor / CURSOR_OFFSET_BASE);
+/** The cursor at the start of a generation's log. */
+export const meshCursorAtStart = (generation: number): number => generation * CURSOR_OFFSET_BASE;
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -481,6 +485,30 @@ export class MeshStore {
         ? this.#readRecentEvents(input, limit)
         : this.#readArchivedAfter(after, input, limit) ?? this.#readEventsAfter(after, input, limit);
     return events.map((event) => jsonClone(event));
+  }
+
+  /**
+   * The first committed event after a sequence. From the archive's first sequence on, only the
+   * archive answers: it holds each event before the event goes live, so it is one coherent
+   * source across a live-log rewrite (smarty-dev#754). Below it, and in a store without the
+   * archive, the live log answers: it is the only source there, so an event a rewrite cuts
+   * from that range is gone either way.
+   */
+  nextEventAfter(after: number): MeshEvent | undefined {
+    const archive = MeshArchive.fromRoot(this.root);
+    const first = archive?.firstSequence();
+    if (!archive || first === undefined) return this.#cloned(this.#readEventsAfter(after, {}, 1)[0]);
+    if (after + 1 < first) {
+      // ponytail: not expected in practice (a newly set archive backfills the whole live log),
+      // but the answer stays right if the archive ever starts above a live event.
+      const live = this.#readEventsAfter(after, {}, 1)[0];
+      if (live && live.sequence < first) return this.#cloned(live);
+    }
+    return this.#cloned(archive.readAfter(Math.max(after, first - 1), this.#readLastEventSequence(), () => true, 1)[0]);
+  }
+
+  #cloned(event: MeshEvent | undefined): MeshEvent | undefined {
+    return event ? jsonClone(event) : undefined;
   }
 
   // A cursor older than the live log reads the archive, which holds every event since it was

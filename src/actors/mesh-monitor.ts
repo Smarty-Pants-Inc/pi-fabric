@@ -2,9 +2,15 @@ import fs, { type FSWatcher } from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig } from "../config.js";
-import type { MeshEvent, MeshStore } from "../mesh/store.js";
+import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
 const MESH_WATCH_RECONCILE_MS = 2_000;
+/**
+ * Work topics (smarty-dev#754 §3.2 step 3): agent-to-agent acks, asks, handoffs. They are
+ * durable work, so they skip the replay window and are read back from the mesh archive.
+ */
+const WORK_TOPIC_PREFIX = "fleet.";
+const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_PREFIX);
 
 /** Owns observation resources and the format-1 cursor, never actor ownership or dispatch policy. */
 export class ActorMeshMonitor {
@@ -19,9 +25,13 @@ export class ActorMeshMonitor {
   #replayFloor: number | undefined;
   /** Resumed from a saved cursor and not yet at the end of the log. */
   #catchingUp = false;
+  /** The last event handed on, so a reset or reread cursor delivers nothing twice. */
+  #last: { sequence: number; id: string } | undefined;
+  /** On resume: the sequence to read work events after, from the archive, before the live log. */
+  #archiveAfter: number | undefined;
 
   constructor(
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail">,
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter">>,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
@@ -36,11 +46,13 @@ export class ActorMeshMonitor {
     },
   ) {
     const saved = this.#readCursor();
-    this.#offset = saved ?? mesh.latestOffset();
+    this.#offset = saved?.cursor ?? mesh.latestOffset();
+    this.#last = saved?.last;
     if (saved !== undefined && callbacks.maxReplayAgeMs !== undefined) {
       this.#replayFloor = Date.now() - callbacks.maxReplayAgeMs;
       this.#catchingUp = true;
     }
+    if (saved?.last !== undefined) this.#archiveAfter = saved.last.sequence;
   }
 
   start(): void {
@@ -102,16 +114,48 @@ export class ActorMeshMonitor {
     if (!this.callbacks.beforePoll()) return;
     this.#polling = true;
     try {
+      if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
       // Live and catch-up both read whole pages. Live advances first, so a failing dispatch
       // never blocks the stream; the cursor file is committed after the page.
       const start = this.#offset;
       const tail = this.mesh.tail(start, this.config.maxReadEvents);
+      // A rewrite restarts the stream at the retained log; the events it cut are in the archive
+      // (it holds each event before it goes live). The generation and the events file are two
+      // reads, and a rewrite renames the file before it bumps the generation, so a page can come
+      // from a new file with an old generation, or from a stale byte offset into it. So trust
+      // the events too: a generation change, or a page that starts past the event after the last
+      // one handed on, re-arms the archive from that event and re-reads the current file from
+      // its start. Nothing is committed past the gap first; events already handed on are skipped.
+      const generation = meshCursorGeneration(tail.nextOffset);
+      const first = tail.events[0];
+      // A gap is unread only if the store holds an event inside it. `nextEventAfter` asks the
+      // archive alone when it holds the range: every event is there before it goes live, so no
+      // rewrite can hide one. A hole the store does not hold (a failed publish's reserved
+      // sequence, or events a store without the archive cut) is passed at once, so it cannot
+      // stall the stream.
+      const gap = first !== undefined && this.#last !== undefined && this.mesh.nextEventAfter !== undefined &&
+        typeof first.sequence === "number" && first.sequence > this.#last.sequence + 1 &&
+        (this.mesh.nextEventAfter(this.#last.sequence)?.sequence ?? Infinity) < first.sequence;
+      if (this.#last && this.mesh.read && (generation !== meshCursorGeneration(start) || gap)) {
+        this.#archiveAfter = this.#last.sequence;
+        this.#offset = meshCursorAtStart(generation);
+        this.#writeCursor();
+        setImmediate(() => this.schedule());
+        return;
+      }
       if (this.#catchingUp && tail.events.length === 0) this.#catchingUp = false;
       const catchingUp = this.#catchingUp;
       if (!catchingUp) this.#offset = tail.nextOffset;
       for (const [index, event] of tail.events.entries()) {
-        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor) continue;
-        if (this.callbacks.onEvent(event) === false && catchingUp) {
+        if (this.#delivered(event)) continue;
+        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event)) {
+          if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
+          continue;
+        }
+        const accepted = this.callbacks.onEvent(event);
+        // A receiver that is full holds the event: while catching up, and for work events always
+        // (smarty-dev#754), so work waits for room instead of being dropped.
+        if (accepted === false && (catchingUp || isWork(event))) {
           // A full actor queue rejected this event while catching up (smarty-dev#472): keep
           // the cursor on it and offer it again later; earlier events are already delivered.
           // The boundary comes from this same read, so a compaction since cannot move it.
@@ -119,6 +163,7 @@ export class ActorMeshMonitor {
           this.#writeCursor();
           return;
         }
+        if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
       }
       if (catchingUp) this.#offset = tail.nextOffset;
       this.#writeCursor();
@@ -130,16 +175,59 @@ export class ActorMeshMonitor {
     }
   }
 
-  #readCursor(): number | undefined {
+  // Events the stream already handed on: sequences only rise in log order, and a sequence two
+  // events share is told apart by id (at least once, never lost).
+  #delivered(event: MeshEvent): boolean {
+    const last = this.#last;
+    if (!last || typeof event.sequence !== "number") return false;
+    return event.sequence < last.sequence || (event.sequence === last.sequence && event.id === last.id);
+  }
+
+  // Work events that left the live log while this host was away, or during a rewrite, come
+  // from the archive, oldest first, one page per poll: it yields between pages as the live
+  // catch-up does. Returns true when the archive is caught up to the live log's oldest event;
+  // false while a page remains, or while a full receiver holds a work event back.
+  #catchUpArchive(): boolean {
+    const oldest = this.mesh.oldestSequence?.();
+    if (!this.mesh.read || oldest === undefined || this.#archiveAfter === undefined || this.#archiveAfter + 1 >= oldest) {
+      this.#archiveAfter = undefined;
+      return true;
+    }
+    const page = this.mesh.read({ after: this.#archiveAfter, limit: this.config.maxReadEvents });
+    const older = page.filter((event) => event.sequence < oldest);
+    for (const event of older) {
+      if (isWork(event) && !this.#delivered(event) && this.callbacks.onEvent(event) === false) {
+        this.#writeCursor();
+        return false;
+      }
+      // Every event older than the live log counts as handed on, work or not, so the live log's
+      // first event follows it with no gap.
+      this.#archiveAfter = event.sequence;
+      this.#last = { sequence: event.sequence, id: event.id };
+    }
+    if (older.length === page.length && page.length === this.config.maxReadEvents) {
+      this.#writeCursor();
+      setImmediate(() => this.schedule());
+      return false;
+    }
+    this.#archiveAfter = undefined;
+    this.#writeCursor();
+    return true;
+  }
+
+  #readCursor(): { cursor: number; last?: { sequence: number; id: string } } | undefined {
     if (!this.callbacks.cursorPath) return undefined;
     try {
       const value = JSON.parse(fs.readFileSync(this.callbacks.cursorPath, "utf8")) as {
         format?: unknown;
         cursor?: unknown;
+        last?: { sequence?: unknown; id?: unknown };
       };
-      return value.format === 1 && typeof value.cursor === "number" && value.cursor >= 0
-        ? value.cursor
+      if (value.format !== 1 || typeof value.cursor !== "number" || value.cursor < 0) return undefined;
+      const last = value.last && typeof value.last.sequence === "number" && typeof value.last.id === "string"
+        ? { sequence: value.last.sequence, id: value.last.id }
         : undefined;
+      return { cursor: value.cursor, ...(last ? { last } : {}) };
     } catch {
       return undefined;
     }
@@ -148,7 +236,7 @@ export class ActorMeshMonitor {
   #writeCursor(): void {
     if (!this.callbacks.cursorPath) return;
     try {
-      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, cursor: this.#offset }, { space: 2 });
+      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) }, { space: 2 });
     } catch {
       // Cursor persistence is best-effort; replay resumes from the latest safe cursor.
     }

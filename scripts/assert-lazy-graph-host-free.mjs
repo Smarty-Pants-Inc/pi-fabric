@@ -7,7 +7,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
 const hostPackage = "@earendil-works/pi-coding-agent";
 const entries = [
-  "ui/dashboard.js", "ui/model-picker.js", "ui/settings.js",
+  "ui/dashboard.js", "ui/model-picker.js", "ui/settings.js", "ui/shell-tasks.js",
   "ui/conversation.js", "ui/conversation-host.js", "ui/conversation-targets.js",
   "ui/conversation-chrome.js", "ui/conversation-native-reader.js",
 ].map((file) => join(dist, file));

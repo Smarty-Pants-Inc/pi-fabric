@@ -16,7 +16,20 @@ const schema = schemaFile ? JSON.parse(fs.readFileSync(schemaFile, "utf8")) : un
 const images = imagesFile ? JSON.parse(fs.readFileSync(imagesFile, "utf8")) : [];
 const task = fs.readFileSync(taskFile, "utf8");
 
-if (task.includes("HANG")) {
+if (task.includes("HANG_WITH_PROGRESS")) {
+  // A run that has done work (so an abort detaches it) and never finishes on its own:
+  // only a stop or a kill ends it (smarty-dev#1113).
+  fs.mkdirSync(path.dirname(statusFile), { recursive: true });
+  fs.writeFileSync(statusFile, JSON.stringify({
+    id: args.get("id"), name: args.get("name"), task, status: "running", runner: args.get("runner") ?? "pi",
+    transport: args.get("transport"), cwd: args.get("cwd"), startedAt: Date.now(), updatedAt: Date.now(),
+    turns: 3, toolCalls: 1, text: "", exitCode: null, usage: { input: 30, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.001 },
+  }));
+  const stay = () => setTimeout(stay, 1_000);
+  stay();
+  process.on("SIGTERM", () => process.exit(0));
+  process.on("SIGINT", () => process.exit(0));
+} else if (task.includes("HANG")) {
   // Write a non-terminal "running" status so the AgentManager monitor keeps
   // waiting, then stay alive until the transport kills this process (abort/stop).
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });

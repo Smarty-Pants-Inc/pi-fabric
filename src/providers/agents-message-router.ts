@@ -8,6 +8,13 @@ import type { FabricControlPlane, FabricControlCommand, FabricControlAcceptance 
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { FabricAgentRunner } from "../config.js";
 
+// A quiesced root keeps heartbeating with no capabilities while it shuts down; "does not support"
+// read as a broken session (smarty-dev#1113).
+const unsupported = (participant: { id: string; status?: string }, kind: string): Error =>
+  participant.status === "stopping"
+    ? new Error(`Fabric participant ${participant.id} is shutting down; its session will relaunch or end. Retry after it restarts.`)
+    : new Error(`Fabric participant ${participant.id} does not support ${kind}`);
+
 // A root whose lease lapsed this recently may still be live: its heartbeat can be late
 // under mesh lock contention or a busy event loop (smarty-dev#447). A reply still goes to
 // its owner host, which acknowledges it when alive; a gone host leaves the outcome unknown.
@@ -89,9 +96,7 @@ export class AgentMessageRouter {
       if (!participant) {
         throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");
       }
-      if (!participant.capabilities.includes(kind)) {
-        throw new Error(`Fabric participant ${participant.id} does not support ${kind}`);
-      }
+      if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       if (!this.control || participant.controlProtocol === "legacy") {
         return this.actorManager.steerRemote(participant.id, message, kind, data);
       }
@@ -124,6 +129,22 @@ export class AgentMessageRouter {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
     }
 
+    // An agent another host owns (a durable child in its spawner's resident host, or a peer's
+    // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
+    const remoteAgent = this.participants.get(id);
+    if (remoteAgent?.kind === "agent" && !remoteAgent.local) {
+      if (!remoteAgent.capabilities.includes(kind)) throw new Error(`Fabric participant ${remoteAgent.id} does not support ${kind}`);
+      if (!this.control) throw new Error("Fabric control plane is unavailable");
+      context?.activity?.({ type: "entity", id: remoteAgent.id, kind: "agent", name: remoteAgent.name });
+      return this.control.request(
+        remoteAgent.ownerHostId,
+        remoteAgent.id,
+        kind,
+        { message, data },
+        remoteAgent.ownerIdentityId,
+      );
+    }
+
     // Persistent actors consume both delivery modes through their serial mailbox.
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
@@ -148,9 +169,7 @@ export class AgentMessageRouter {
       return { queued: true, messageId: result.messageId, routed: "local" };
     }
     if (!participant) throw new Error(`Fabric actor ${actor!.id} has no live execution owner`);
-    if (!participant.capabilities.includes(kind)) {
-      throw new Error(`Fabric participant ${participant.id} does not support ${kind}`);
-    }
+    if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
     const sessionBinding = actor?.binding;
     const resolvedBinding = actor
       ? this.actorManager.resolveBinding(actor.id, binding)

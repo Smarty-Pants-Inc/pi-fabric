@@ -9,7 +9,7 @@ const CTRL_K = "\x0b";
 function harness() {
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-  let input: ((data: string) => unknown) | undefined;
+  const inputs = new Set<(data: string) => unknown>();
   const jobs = new FabricShellJobStore();
   const job = jobs.begin("bash", "sleep 30");
   const notify = vi.fn();
@@ -18,8 +18,8 @@ function harness() {
     ui: {
       notify,
       onTerminalInput: (handler: (data: string) => unknown) => {
-        input = handler;
-        return () => undefined;
+        inputs.add(handler);
+        return () => { inputs.delete(handler); };
       },
     },
   } as unknown as ExtensionContext;
@@ -33,7 +33,7 @@ function harness() {
     notify,
     jobs,
     job,
-    input: (data: string) => input?.(data),
+    input: (data: string) => [...inputs].map(input => input(data)).find(result => result !== undefined),
   };
 }
 
@@ -42,6 +42,18 @@ afterEach(async () => {
 });
 
 describe("shell hang keys", () => {
+  it("cancels monitors on lone Escape but not arrow sequences or ordinary detached shells", async () => {
+    const h = harness();
+    h.job.spill();
+    const watch = h.jobs.begin("bash", "watch", { monitor: { delivery: "ui", timeoutMs: 300000, intervalMs: 1000 } });
+    watch.spill();
+    h.input("\u001b[A"); vi.advanceTimersByTime(100);
+    expect(watch.abort.signal.aborted).toBe(false);
+    expect(h.input("\u001b")).toBeUndefined(); vi.advanceTimersByTime(100);
+    expect(watch.abort.signal.aborted).toBe(true);
+    expect(h.job.abort.signal.aborted).toBe(false);
+    h.dispose(); await h.jobs.close();
+  });
   it("requires ctrl+b twice within 1s to spill", async () => {
     const h = harness();
     expect(h.input(CTRL_B)).toEqual({ consume: true });

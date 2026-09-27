@@ -17,20 +17,20 @@ import {
 } from "./types.js";
 
 const statusGlyph = (status: string): string => {
-  if (status === "completed" || status === "done") return "✓";
+  if (status === "completed" || status === "done" || status === "exited") return "✓";
   if (status === "failed" || status === "timed_out") return "✗";
   if (status === "blocked") return "!";
-  if (status === "stopped" || status === "cancelled") return "■";
+  if (status === "stopped" || status === "cancelled" || status === "killed") return "■";
   if (status === "queued" || status === "pending" || status === "ready") return "○";
   if (status === "idle" || status === "state") return "·";
   return spinnerFrame();
 };
 
 const colorStatus = (theme: Theme, status: string, value: string): string => {
-  if (status === "completed" || status === "done") return theme.fg("success", value);
+  if (status === "completed" || status === "done" || status === "exited") return theme.fg("success", value);
   if (status === "failed" || status === "timed_out") return theme.fg("error", value);
-  if (status === "blocked") return theme.fg("warning", value);
-  if (status === "running" || status === "in_progress") return theme.fg("accent", value);
+  if (status === "blocked" || status === "stopping") return theme.fg("warning", value);
+  if (status === "running" || status === "in_progress" || status === "spilled") return theme.fg("accent", value);
   return theme.fg("dim", value);
 };
 
@@ -108,6 +108,7 @@ export const shouldShowFabricWidget = (
 ): boolean => {
   if (mode === "hidden") return false;
   if (mode === "always") return true;
+  if (snapshot.shells?.some(job => job.finishedAt === undefined || snapshot.now - job.finishedAt < 30000)) return true;
   if (ownAgents(snapshot).some((agent) => isActiveStatus(agent.status))) return true;
   if (snapshot.actors.some((actor) => actor.status !== "stopped")) return true;
   const run = snapshot.runs[0];
@@ -237,9 +238,12 @@ export class FabricWidget implements Component {
     const nestedCalls =
       run?.calls.filter((call) => call.kind !== "agent" && call.kind !== "actor") ?? [];
     const title = run?.name ?? "Fabric session";
+    const shells = snapshot.shells ?? [];
+    const liveShells = shells.filter(job => job.finishedAt === undefined);
+    const recentShells = shells.filter(job => job.finishedAt !== undefined && snapshot.now - job.finishedAt < 30000);
     const headerStatus =
       run?.status ??
-      (activeAgents.length > 0 || activeActorWorkers.length > 0 ? "running" : "idle");
+      (activeAgents.length > 0 || activeActorWorkers.length > 0 || liveShells.length > 0 ? "running" : "idle");
     const parts: string[] = [];
 
     const callTotal = nestedCalls.length;
@@ -261,6 +265,7 @@ export class FabricWidget implements Component {
         );
       }
     }
+    if (liveShells.length > 0) parts.push(`${liveShells.length} shell${liveShells.length === 1 ? "" : "s"}`);
     if (activeAgents.length > 0) parts.push(`${activeAgents.length} running`);
     if (visibleActors.length > 0) parts.push(`${visibleActors.length} actor${visibleActors.length === 1 ? "" : "s"}`);
     const tokens = totalTokens(snapshot, run);
@@ -277,7 +282,20 @@ export class FabricWidget implements Component {
     )}${parts.length > 0 ? this.theme.fg("dim", ` · ${parts.join(" · ")}`) : ""}`;
     const hasActiveConversations = activeAgents.some((agent) => !agent.stale) ||
       activeActorWorkers.length > 0 || visibleActors.some((actor) => isActiveStatus(actor.status));
-    const lines = [hasActiveConversations ? `${header} · ${this.theme.fg("dim", FABRIC_CONVERSATION_HINT)}` : header];
+    const taskHint = liveShells.length || recentShells.length ? this.theme.fg("dim", " · /fabric tasks · ctrl+alt+t") : "";
+    const taskHeader = taskHint ? `${glyph} ${this.theme.fg("accent", "Fabric")}${taskHint}${parts.length ? this.theme.fg("dim", ` · ${parts.join(" · ")}`) : ""}` : header;
+    const lines = [hasActiveConversations ? `${taskHeader} · ${this.theme.fg("dim", FABRIC_CONVERSATION_HINT)}` : taskHeader];
+    for (const job of [...liveShells, ...recentShells].slice(0, 3)) {
+      const elapsed = formatDuration((job.finishedAt ?? snapshot.now) - job.startedAt) || "0s";
+      const status = job.stopping ? "stopping" : job.status;
+      const label = job.monitor && job.finishedAt === undefined && !job.stopping ? `monitor:${job.monitor.delivery}` : status;
+      const glyph = colorStatus(this.theme, status, statusGlyph(status));
+      lines.push(
+        `  ${glyph} ${this.theme.fg("muted", job.id.slice(0, 8))} ${this.theme.fg("muted", label)}` +
+        `${this.theme.fg("dim", ` · ${elapsed} · `)}${this.theme.fg("muted", safeText(job.description ?? job.command))}`,
+      );
+    }
+    if (liveShells.length + recentShells.length > 3) lines.push(this.theme.fg("dim", `  +${liveShells.length + recentShells.length - 3} more shell tasks`));
 
     lines.push(
       ...activeAgents.flatMap((agent) => agentLines(this.theme, agent, snapshot.now)),

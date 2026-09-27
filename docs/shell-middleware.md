@@ -34,7 +34,7 @@ schemas, guest payloads, or discovery metadata.
   executes it normally, so it must still include the same protections itself.
 - Opt-in explicitly replaces the override's `execute` and argument preparation
   for nested `pi.bash` calls with Fabric's standard local-shell semantics. The
-  schema gains `cwd` and `background`; aliases, lifecycle hooks, policy blocking,
+  schema gains `cwd`, `background`, `description`, and opt-in `monitor`; aliases, lifecycle hooks, policy blocking,
   hard timeouts, cancellation, and session-owned job cleanup remain active.
 - `options` accepts `shellPath`, `commandPrefix`, `spawnHook`, and
   `exposeSessionEnvironment` (Pi's `BashToolOptions` except `operations`). The spawn
@@ -46,7 +46,7 @@ schemas, guest payloads, or discovery metadata.
   truncation file see only these filtered bytes. Handle split UTF-8/secret chunks
   and flush safely on exit, errors, and cancellation.
 - A handoff never disables an explicit `timeout`: it can still kill an already
-  backgrounded child. `executor.shellHangMs: 0` disables automatic handoff, not
+  backgrounded child. Monitor events consume only the middleware-filtered bytes, like retained logs; see [background tasks](background-tasks.md). `executor.shellHangMs: 0` disables automatic handoff, not
   explicit `background: true`.
 - Middleware factories and hooks may close over current policy. Fabric reads the
   active captured definition for each invocation without caching a prior

@@ -142,7 +142,7 @@ A definition may arrive after the configuration that references it. The unresolv
 
 ### External connectors
 
-Connector packages own their component definitions, provider schemas, transports, credentials, and model-facing guidance. Fabric has no connector-specific registration table or required UI action vocabulary. Install the connector's ordinary Pi extension: it registers through `FABRIC_COMPONENT_REGISTER_EVENT` and answers `FABRIC_COMPONENT_DISCOVER_EVENT`. Configure it with the same generic `components.describe` / `plan` / `apply` surface used by every other component. A configured but undiscovered definition remains `waiting`; configuration never imports arbitrary modules on its own. See [the external harness example and migration](harnesses.md).
+Connector packages own their component definitions, provider schemas, transports, credentials, and model-facing guidance. Fabric has no connector-specific registration table or required UI action vocabulary. Install the connector's ordinary Pi extension: it registers through `FABRIC_COMPONENT_REGISTER_EVENT` and answers `FABRIC_COMPONENT_DISCOVER_EVENT`. Configure it with the same generic `components.describe` / `plan` / `apply` surface used by every other component. A configured but undiscovered definition remains `waiting`; configuration never imports arbitrary modules on its own. These generic extension contracts remain available, but existing browser/macOS CLIs do not require a component bridge; see [harness CLI composition and migration](harnesses.md).
 
 ### Live configuration control
 

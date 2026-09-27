@@ -805,6 +805,20 @@ describe("AgentsProvider runner support", () => {
     );
   });
 
+  it("tells a sender that a quiesced Main is shutting down (smarty-dev#1113)", async () => {
+    const stopping: FabricParticipantInfo = {
+      format: 1, id: "session:test", kind: "root", rootId: "session:test", ownerHostId: "session:test",
+      ownerIdentityId: "session:test", name: "main", status: "stopping", runner: "pi", transport: "host",
+      capabilities: [], cwd: process.cwd(), sessionId: "test", startedAt: 1, updatedAt: 2, controlProtocol: "v1",
+      local: false, stale: false,
+    };
+    const { provider } = setup([], [stopping]);
+    (provider.mainAgent as { local: boolean }).local = false;
+    await expect(provider.routeMessage("main", "hello", undefined, "steer")).rejects.toThrow(
+      "is shutting down; its session will relaunch or end. Retry after it restarts.",
+    );
+  });
+
   it("projects remote agents through members, scoped list, and status", async () => {
     const remote: FabricParticipantInfo = {
       format: 1,
@@ -1578,6 +1592,24 @@ describe("AgentsProvider shared actor definitions", () => {
       }),
       "identity:owner",
     );
+  });
+
+  // smarty-dev#1323: a spawner could not steer its durable child ("Unknown Fabric participant").
+  it("routes steer and followUp to a remote agent through its owner", async () => {
+    const child: FabricParticipantInfo = {
+      format: 1, id: "4d7629e5a6e54f8aa913fa099d379593", kind: "agent", rootId: "session:test",
+      ownerHostId: "resident:5c7d5dcf0ec46f0d40d91176", ownerIdentityId: "identity:resident", parentId: "session:test",
+      name: "handoff", status: "running", residency: "durable", runner: "pi", transport: "process",
+      capabilities: ["steer", "followUp", "stop"], startedAt: 1, updatedAt: 1, controlProtocol: "v1", local: false, stale: false,
+    };
+    const request = vi.fn().mockResolvedValue({ queued: true, messageId: "m", routed: "mesh", acknowledged: true });
+    const { provider } = setup([], [child], { request } as unknown as FabricControlPlane);
+    for (const kind of ["steer", "followUp"] as const) {
+      await expect(provider.routeMessage(child.id, `correct it (${kind})`, { key: "k" }, kind)).resolves.toMatchObject({ acknowledged: true });
+      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId);
+    }
+    const unsteerable = setup([], [{ ...child, capabilities: ["stop"] }], { request } as unknown as FabricControlPlane).provider;
+    await expect(unsteerable.routeMessage(child.id, "no", undefined, "steer")).rejects.toThrow("does not support steer");
   });
 
   it("routes ask and tell for a remote actor absent from the local registry", async () => {

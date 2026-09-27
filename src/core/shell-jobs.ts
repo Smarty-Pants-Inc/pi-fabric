@@ -6,9 +6,9 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import type { PiShellToolName } from "./pi-tools.js";
+import { ShellMonitor, type ShellMonitorOptions, type ShellMonitorBatch } from "./shell-monitor.js";
 
-export const DEFAULT_SHELL_HANG_MS = 120_000;
-export const SHELL_HANG_MAX_MS = 600_000;
+export { DEFAULT_SHELL_HANG_MS, SHELL_HANG_MAX_MS } from "./shell-limits.js";
 const SHELL_HANG_SNAPSHOT_BYTES = 8_000;
 export const SHELL_TAIL_BYTES = 1024 * 1024;
 export const SHELL_LOG_BYTES = 8 * 1024 * 1024;
@@ -51,7 +51,21 @@ export const parseShellPid = (text: string): number | undefined => {
   return Number.isSafeInteger(pid) && pid > 1 ? pid : undefined;
 };
 
-type FabricShellJobStatus = "running" | "spilled" | "exited" | "killed";
+type FabricShellJobStatus = "running" | "spilled" | "exited" | "failed" | "killed" | "timed_out";
+
+export interface FabricShellJobOptions {
+  cwd?: string;
+  ownerId?: string;
+  description?: string;
+  monitor?: ShellMonitorOptions;
+}
+
+export interface FabricShellJobEvent {
+  type: "started" | "spilled" | "monitor" | "finished" | "acknowledged" | "stopping";
+  job: FabricShellJobInfo;
+  output?: string;
+}
+
 
 export interface FabricShellJobInfo {
   id: string;
@@ -64,6 +78,15 @@ export interface FabricShellJobInfo {
   finishedAt?: number;
   status: FabricShellJobStatus;
   exitCode?: number | null;
+  cwd?: string;
+  ownerId?: string;
+  description?: string;
+  lastOutputAt?: number;
+  monitor?: ShellMonitorOptions;
+  lastEvent?: ShellMonitorBatch & { at: number };
+  eventCount: number;
+  unread: boolean;
+  stopping: boolean;
 }
 
 export interface FabricShellJobHandle {
@@ -75,6 +98,7 @@ export interface FabricShellJobHandle {
   readonly pidPath: string;
   pid?: number;
   logPath?: string;
+  exitCode?: number | null;
   spilled: boolean;
   finished: boolean;
   append(data: Buffer): void;
@@ -109,17 +133,55 @@ class FabricShellJob implements FabricShellJobHandle {
   #logTruncated = false;
   #spill = new AbortController();
   #pidRead: Promise<number | undefined> | undefined;
+  #monitor: ShellMonitor | undefined;
+  #deadline: ReturnType<typeof setTimeout> | undefined;
+  #timedOut = false;
+  lastOutputAt?: number;
+  lastEvent?: ShellMonitorBatch & { at: number };
+  eventCount = 0;
+  unread = false;
 
-  constructor(tool: PiShellToolName, command: string, readonly onFinish: () => void, tempRoot: string) {
+  constructor(tool: PiShellToolName, command: string, readonly onChange: (type: FabricShellJobEvent["type"], output?: string) => void, tempRoot: string, readonly options: FabricShellJobOptions = {}) {
     this.id = randomUUID();
     this.tool = tool;
     this.command = command;
     this.#directory = createScratch("shell", tempRoot);
     this.pidPath = path.join(this.#directory, "child.pid");
+    if (options.monitor) {
+      this.#monitor = new ShellMonitor(options.monitor, (batch) => {
+        this.lastEvent = { ...batch, at: Date.now() };
+        this.eventCount += batch.lines.length + batch.omitted;
+        this.unread = true;
+        // The terminal event includes final output; do not race a second wakeup.
+        if (!this.finished) this.onChange("monitor");
+      });
+      this.#deadline = setTimeout(() => {
+        this.#timedOut = true;
+        this.stop("Monitor deadline reached");
+      }, options.monitor.timeoutMs);
+      this.#deadline.unref?.();
+    }
+  }
+
+  stop(reason = "Stopped by user or agent"): boolean {
+    if (this.finished || this.abort.signal.aborted) return false;
+    if (this.#deadline) clearTimeout(this.#deadline);
+    this.#deadline = undefined;
+    this.#monitor?.close(false);
+    this.abort.abort(new Error(reason));
+    this.onChange("stopping");
+    return true;
+  }
+
+  acknowledge(): void {
+    this.unread = false;
+    this.onChange("acknowledged");
   }
 
   append(data: Buffer): void {
     if (this.finished) return;
+    if (data.length > 0) this.lastOutputAt = Date.now();
+    this.#monitor?.append(data);
     const keep = Math.max(0, SHELL_TAIL_BYTES - data.length);
     if (this.#tail.length + data.length > SHELL_TAIL_BYTES) this.#omitted = true;
     // Copy slices: a tiny view must not pin an arbitrarily large input buffer.
@@ -230,6 +292,7 @@ class FabricShellJob implements FabricShellJobHandle {
     this.spilled = true;
     this.spilledAt = Date.now();
     this.status = "spilled";
+    this.onChange("spilled");
     if (!this.#spill.signal.aborted) this.#spill.abort();
   }
 
@@ -244,15 +307,16 @@ class FabricShellJob implements FabricShellJobHandle {
     if (this.finished) return;
     // A fast exit can beat the provider's persistLog continuation after spill.
     const persistence = this.spilled && !this.logPath ? this.persistLog() : undefined;
+    const output = this.snapshotText(2000);
     this.finished = true;
+    if (this.#deadline) clearTimeout(this.#deadline);
+    this.#deadline = undefined;
+    this.#monitor?.close(!this.abort.signal.aborted);
     await persistence?.catch(() => undefined);
     this.finishedAt = Date.now();
-    if (exitCode !== undefined) this.exitCode = exitCode;
-    if (this.status === "running") {
-      this.status = this.abort.signal.aborted ? "killed" : "exited";
-    } else if (this.abort.signal.aborted && this.status === "spilled") {
-      this.status = "killed";
-    }
+    if (this.exitCode === undefined && exitCode !== undefined) this.exitCode = exitCode;
+    this.status = this.#timedOut ? "timed_out" : this.abort.signal.aborted ? "killed" : this.exitCode === 0 ? "exited" : "failed";
+    this.unread = this.spilled;
     if (footer) this.#writeLog(Buffer.from(footer.endsWith("\n") ? footer : `${footer}\n`));
     if (this.#descriptor !== undefined) { try { fs.closeSync(this.#descriptor); } catch {} }
     this.#descriptor = undefined;
@@ -262,7 +326,20 @@ class FabricShellJob implements FabricShellJobHandle {
     await unlink(this.pidPath).catch(() => undefined);
     if (this.logPath) closeScratch(this.#directory);
     else { try { fs.rmSync(this.#directory, { recursive: true, force: true }); } catch {} }
-    this.onFinish();
+    this.onChange("finished", [output, footer?.slice(-1000)].filter(Boolean).join("\n"));
+  }
+
+  async outputText(maxBytes = 8000): Promise<string> {
+    if (!this.finished) return this.snapshotText(maxBytes);
+    if (!this.logPath) return "No retained output log.";
+    const file = await fs.promises.open(this.logPath, "r");
+    try {
+      const size = (await file.stat()).size;
+      const length = Math.min(size, Math.max(1, Math.min(32000, maxBytes)));
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await file.read(buffer, 0, length, size - length);
+      return `${size > length ? "[Bounded output tail]\n" : ""}${buffer.subarray(0, bytesRead).toString("utf8")}`;
+    } finally { await file.close(); }
   }
 
   info(): FabricShellJobInfo {
@@ -270,6 +347,13 @@ class FabricShellJob implements FabricShellJobHandle {
       id: this.id,
       tool: this.tool,
       command: this.command,
+      ...this.options,
+      ...(this.options.monitor ? { monitor: { ...this.options.monitor } } : {}),
+      ...(this.lastOutputAt !== undefined ? { lastOutputAt: this.lastOutputAt } : {}),
+      ...(this.lastEvent ? { lastEvent: { ...this.lastEvent, lines: [...this.lastEvent.lines] } } : {}),
+      eventCount: this.eventCount,
+      unread: this.unread,
+      stopping: !this.finished && this.abort.signal.aborted,
       ...(this.pid !== undefined ? { pid: this.pid } : {}),
       ...(this.logPath ? { logPath: this.logPath } : {}),
       startedAt: this.startedAt,
@@ -293,28 +377,90 @@ export const trackShellOperations = (
         job.append(data);
         options.onData(data);
       },
-    }),
+    }).then(result => { job.exitCode = result.exitCode; return result; }),
 });
 
 export class FabricShellJobStore {
   readonly #jobs = new Map<string, FabricShellJob>();
+  readonly #listeners = new Set<(event: FabricShellJobEvent) => void>();
+  #closed = false;
+  readonly #closing = new AbortController();
+
+  subscribe(listener: (event: FabricShellJobEvent) => void): () => void {
+    this.#listeners.add(listener);
+    return () => { this.#listeners.delete(listener); };
+  }
+
+  #emit(event: FabricShellJobEvent): void {
+    if (this.#closed) return;
+    for (const listener of this.#listeners) {
+      try { listener(event); } catch { /* Observers cannot break shell execution. */ }
+    }
+  }
 
   constructor(readonly tempRoot = tmpdir()) {}
 
   #prune(): void {
-    const completed = [...this.#jobs.values()].filter((job) => job.finished);
+    const completed = [...this.#jobs.values()].filter((job) => job.finishedAt !== undefined);
     completed.sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
     for (const [index, job] of completed.entries()) {
       if (index < completed.length - SHELL_COMPLETED_HANDLES || Date.now() - (job.finishedAt ?? 0) >= SHELL_COMPLETED_MAX_AGE_MS) this.#jobs.delete(job.id);
     }
   }
 
-  begin(tool: PiShellToolName, command: string): FabricShellJob {
+  begin(tool: PiShellToolName, command: string, options: FabricShellJobOptions = {}): FabricShellJob {
+    if (this.#closed) throw new Error("Shell job store is closed");
     this.#prune();
-    const job = new FabricShellJob(tool, command, () => this.#prune(), this.tempRoot);
+    const job = new FabricShellJob(tool, command, (type, output) => {
+      this.#emit({ type, job: job.info(), ...(output ? { output } : {}) });
+      if (type === "finished") this.#prune();
+    }, this.tempRoot, options);
     this.#jobs.set(job.id, job);
+    this.#emit({ type: "started", job: job.info() });
     return job;
   }
+
+  /** Event-driven, bounded observation. Timeout/cancellation never stops the job. */
+  waitFor(id: string, options: { after?: number; timeoutMs: number; signal?: AbortSignal | undefined }): Promise<{ task: FabricShellJobInfo; timedOut: boolean }> {
+    options.signal?.throwIfAborted();
+    this.#closing.signal.throwIfAborted();
+    const job = this.get(id);
+    if (!job) throw new Error(`Unknown shell task: ${id}`);
+    if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > 300_000)
+      throw new Error("Task observation timeoutMs must be an integer from 1 to 300000");
+    if (options.after !== undefined && (!Number.isSafeInteger(options.after) || options.after < 0 || options.after > job.eventCount))
+      throw new Error("Task observation after must be an existing event cursor");
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let unsubscribe = () => {};
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        unsubscribe();
+        options.signal?.removeEventListener("abort", abort);
+        this.#closing.signal.removeEventListener("abort", closing);
+      };
+      const abort = () => { cleanup(); reject(options.signal?.reason ?? new Error("Task observation cancelled")); };
+      const closing = () => { cleanup(); reject(new Error("Shell job store is closed")); };
+      const complete = (timedOut: boolean) => { cleanup(); resolve({ task: job.info(), timedOut }); };
+      const check = () => {
+        if (job.info().finishedAt !== undefined || (options.after !== undefined && job.eventCount > options.after)) complete(false);
+      };
+      unsubscribe = this.subscribe(event => { if (event.job.id === id) check(); });
+      options.signal?.addEventListener("abort", abort, { once: true });
+      this.#closing.signal.addEventListener("abort", closing, { once: true });
+      timer = setTimeout(() => complete(true), options.timeoutMs);
+      // Subscribe before inspecting: an exit or monitor batch cannot fall into a gap.
+      check();
+    });
+  }
+
+  stop(id: string): boolean {
+    const job = this.get(id);
+    if (!job) throw new Error(`Unknown shell task: ${id}`);
+    return job.stop();
+  }
+
+  acknowledge(id: string): void { this.get(id)?.acknowledge(); }
 
   get(id: string): FabricShellJob | undefined {
     this.#prune();
@@ -349,6 +495,9 @@ export class FabricShellJobStore {
   }
 
   async close(): Promise<void> {
+    this.#closed = true;
+    this.#closing.abort(new Error("Shell job store is closed"));
+    this.#listeners.clear();
     const live = this.live();
     for (const job of live) {
       if (!job.abort.signal.aborted) job.abort.abort(new Error("Fabric session ended"));
@@ -410,7 +559,7 @@ export const raceShellHang = async <T>(options: {
       void execute.then(async (result) => {
         if (job.finished) return;
         if (result.status === "done") {
-          await job.finish(0, "\n\n[Process exited with code 0]\n");
+          await job.finish(0, `\n\n[Process exited with code ${job.exitCode ?? 0}]\n`);
           return;
         }
         const message = result.error instanceof Error ? result.error.message : String(result.error);

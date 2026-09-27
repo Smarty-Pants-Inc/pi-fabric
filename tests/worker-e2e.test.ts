@@ -225,6 +225,37 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       },
     },
     {
+      behavior: "retry-exhausted",
+      check: (r) => {
+        expect(r.status).toBe("failed");
+        expect(r.error).toContain("Error: Terminated (retries exhausted)");
+      },
+    },
+    {
+      behavior: "terminated-restart-exit",
+      check: (r) => {
+        expect(r.status).toBe("failed");
+        expect(r.error).toContain("Error: Terminated");
+      },
+    },
+    {
+      behavior: "terminated-recover",
+      check: (r) => {
+        expect(r.status).toBe("completed");
+        expect(r.error).toBeUndefined();
+        expect(r.text).toBe("recovered");
+      },
+    },
+    {
+      behavior: "retry-exhausted-stubborn",
+      timeoutMs: 30_000,
+      check: (r) => {
+        expect(r.status).toBe("failed");
+        expect(r.error).toContain("Error: Terminated (retries exhausted)");
+        expect(r.error).toContain("did not exit after stdin closed");
+      },
+    },
+    {
       behavior: "kill-worker",
       // Room for attribution: on a slow CI box the spawned worker + fake-pi
       // chain plus the retry consult can brush a 2s wall, letting the generic
@@ -252,6 +283,24 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       );
     }
   }, 30_000);
+
+  it.each(["terminated-hang", "retry-hang"])(
+    "kills a stalled %s despite lifecycle chatter, EOF and SIGTERM refusal", async (behavior) => {
+      process.env.FAKE_PI_BEHAVIOR = behavior;
+      // Deliberately much longer than the recovery deadline: generic run timeout
+      // must not be what releases wait() or the concurrency slot.
+      const result = await run("recover or fail", 120_000);
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("Error: Terminated");
+      expect(result.error).toContain("no recovery progress for 60000ms");
+      const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const pid = events.find((event) => event.type === "fake_child_pid").pid;
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(events.filter((event) => event.type === "fabric_recovery_error")).toHaveLength(1);
+      process.env.FAKE_PI_BEHAVIOR = "success";
+      expect((await managers.at(-1)!.run({ task: "slot released", transport: "process" })).status).toBe("completed");
+    }, 90_000,
+  );
 
   it.each(["large-lifecycle", "large-lifecycle-retry"])(
     "preserves progress through oversized lifecycle history (%s)", async (behavior) => {

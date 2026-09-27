@@ -8,7 +8,7 @@ import { renameAtomic } from "./core/atomic-write.js";
 import { quarantineDamagedFile } from "./core/damaged-file.js";
 import { normalizeModelAliases, type FabricModelAliases } from "./core/model-resolution.js";
 import { PI_CORE_TOOL_NAME_SET } from "./core/pi-tools.js";
-import { DEFAULT_SHELL_HANG_MS, SHELL_HANG_MAX_MS } from "./core/shell-jobs.js";
+import { DEFAULT_SHELL_HANG_MS, SHELL_HANG_MAX_MS } from "./core/shell-limits.js";
 import {
   CURRENT_FABRIC_CONFIG_VERSION,
   migrateFabricConfigDocument,

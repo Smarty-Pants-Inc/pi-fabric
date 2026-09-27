@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
 // whole shared state under the one mesh lock, and heartbeats were 78% of all locked writes. Each
@@ -38,9 +38,21 @@ export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });
 
-const parseLease = (file: string, name: string): FabricHostLease | undefined => {
+// A file that could not be read gives no answer to cache (`read: false`): the next lookup reads it
+// again. Only a file that was read, valid or not, is cached by its mtime and size.
+const parseLease = (file: string, name: string): { read: boolean; lease?: FabricHostLease | undefined } => {
+  let text: string;
   try {
-    const value = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    text = readFileRetrying(file);
+  } catch {
+    return { read: false };
+  }
+  return { read: true, lease: leaseOf(text, name) };
+};
+
+const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
+  try {
+    const value = JSON.parse(text) as Record<string, unknown>;
     if (
       value?.format !== 1 ||
       typeof value.id !== "string" ||
@@ -60,7 +72,7 @@ const parseLease = (file: string, name: string): FabricHostLease | undefined => 
 };
 
 // Parsed files by directory and name, reused while a file's mtime is unchanged.
-const cache = new Map<string, Map<string, { mtimeMs: number; size: number; lease: FabricHostLease | undefined }>>();
+const cache = new Map<string, LeaseSlots>();
 
 /** Every host's file lease, by host id. Unreadable or misnamed files are skipped. */
 export const readHostLeases = (meshRoot: string): Map<string, FabricHostLease> => {
@@ -84,12 +96,8 @@ export const readHostLeases = (meshRoot: string): Map<string, FabricHostLease> =
     } catch {
       continue;
     }
-    let slot = known.get(name);
-    if (!slot || slot.mtimeMs !== stat.mtimeMs || slot.size !== stat.size) {
-      slot = { mtimeMs: stat.mtimeMs, size: stat.size, lease: parseLease(path.join(dir, name), name) };
-      known.set(name, slot);
-    }
-    if (slot.lease) leases.set(slot.lease.id, slot.lease);
+    const lease = cachedLease(known, dir, name, stat);
+    if (lease) leases.set(lease.id, lease);
   }
   for (const name of known.keys()) if (!present.has(name)) known.delete(name);
   return leases;
@@ -107,12 +115,18 @@ export const readHostLease = (meshRoot: string, hostId: string): FabricHostLease
   }
   const known = cache.get(dir) ?? new Map();
   cache.set(dir, known);
-  let slot = known.get(name);
-  if (!slot || slot.mtimeMs !== stat.mtimeMs || slot.size !== stat.size) {
-    slot = { mtimeMs: stat.mtimeMs, size: stat.size, lease: parseLease(path.join(dir, name), name) };
-    known.set(name, slot);
-  }
-  return slot.lease;
+  return cachedLease(known, dir, name, stat);
+};
+
+type LeaseSlots = Map<string, { mtimeMs: number; size: number; lease: FabricHostLease | undefined }>;
+
+const cachedLease = (known: LeaseSlots, dir: string, name: string, stat: fs.Stats): FabricHostLease | undefined => {
+  const slot = known.get(name);
+  if (slot && slot.mtimeMs === stat.mtimeMs && slot.size === stat.size) return slot.lease;
+  const parsed = parseLease(path.join(dir, name), name);
+  if (!parsed.read) return slot?.lease;                     // unreadable for now: keep the last answer
+  known.set(name, { mtimeMs: stat.mtimeMs, size: stat.size, lease: parsed.lease });
+  return parsed.lease;
 };
 
 /** A host lease's effective expiry: the later of its shared-state lease and its file lease. */

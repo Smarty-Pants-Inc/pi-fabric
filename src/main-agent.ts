@@ -318,10 +318,11 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Pi leaves its busy state only after every handler of the event has finished, which can
     // take any time (review/astra F2 on pi-fabric#102): wait for idle, not one tick. A release
     // or a new run ends the wait; a cancelled or failed operation releases without a run.
-    if (this.#wake || !this.#held.length) return;
+    // Armed with nothing held too: a followUp can arrive while a later handler still runs.
+    if (this.#wake) return;
     this.#wake = setInterval(() => {
-      if (this.#closed || !this.#held.length) this.#stopWake();
-      else if (this.#context?.isIdle()) this.#release(true);
+      if (this.#closed) this.#stopWake();
+      else if (this.#context?.isIdle()) this.#held.length ? this.#release(true) : this.#stopWake();
     }, 25);
     this.#wake.unref?.();
   }

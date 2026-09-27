@@ -186,6 +186,27 @@ describe("Main followUp drain (unit)", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("after a completed compaction, also wakes Main for a followUp that arrives before it is idle", () => {
+    const { main, sent, emit, ctx, state } = setup();
+    emit("session_compact", { reason: "manual" }, ctx);   // nothing held yet
+    vi.advanceTimersByTime(1_000);
+    main.deliverAgent({ from: from("a"), message: "one", delivery: "followUp" });   // still busy
+    expect(sent).toHaveLength(0);
+    state.idle = true;
+    vi.advanceTimersByTime(25);
+    expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("ends the wait at idle when nothing arrived", () => {
+    const { sent, emit, ctx, state } = setup();
+    emit("session_compact", { reason: "manual" }, ctx);
+    state.idle = true;
+    vi.advanceTimersByTime(25);
+    expect(sent).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("drops the pending wake when a later compaction is cancelled, a run starts, or the drain closes", () => {
     for (const end of ["cancelled", "run", "closed"] as const) {
       const { main, sent, emit, ctx, state } = setup();
@@ -482,7 +503,7 @@ describe("Main followUp drain at a cancelled settle in a real Pi session", () =>
 // review/astra round 3 on pi-fabric#102: manual /compact makes an idle Main busy without a run;
 // the user cancels it. No turn_end and no settle follows, so nothing may start a run then.
 describe("Main followUp drain around a manual compaction in a real Pi session", () => {
-  const run = async (cancel: boolean, slowHandler = false) => {
+  const run = async (cancel: boolean, slowHandler = false, arriveLate = false) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-drain-compact-"));
     roots.push(root);
     const faux = fauxProvider();
@@ -529,14 +550,16 @@ describe("Main followUp drain around a manual compaction in a real Pi session", 
     const compacting = session.compact().catch(() => undefined);   // the cancel rejects
     await waitFor(() => releaseCompaction !== undefined);
     expect(session.isIdle).toBe(false);
-    expect(main!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" }, message: "during compaction", delivery: "followUp" }))
+    const send = () => expect(main!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" }, message: "during compaction", delivery: "followUp" }))
       .toMatchObject({ pendingFollowUps: 1 });
+    if (!arriveLate) send();
     if (cancel) session.abortCompaction();
     releaseCompaction!();
     if (slowHandler) {
       await waitFor(() => releaseSlow !== undefined);
       await new Promise((resolve) => setTimeout(resolve, 200));   // the drain's handler is long done
       expect(session.isIdle).toBe(false);
+      if (arriveLate) send();                            // the first followUp, after the drain's handler
       releaseSlow!();
     }
     await compacting;
@@ -560,6 +583,14 @@ describe("Main followUp drain around a manual compaction in a real Pi session", 
     expect(newRuns).toBe(1);
     expect(newRequests).toBe(1);
     expect(delivered).toHaveLength(1);
+  });
+
+  it("a first followUp arriving while a later completion handler still runs also wakes Main once", async () => {
+    const { newRuns, newRequests, delivered, main } = await run(false, true, true);
+    expect(newRuns).toBe(1);
+    expect(newRequests).toBe(1);
+    expect(delivered).toHaveLength(1);
+    expect(main.queueDepth().pendingFollowUps).toBe(0);
   });
 
   it("counterexample: after a completed compaction the followUp wakes Main", async () => {

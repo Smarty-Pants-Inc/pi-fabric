@@ -388,6 +388,37 @@ describe("FabricState lazy bootstrap", () => {
     expect(state.initialized).toBe(false);
   });
 
+  // P1 2026-09-27: a /reload that lands mid-run ran fabric_exec's ensure() during Fabric's own
+  // session_shutdown. It built a runtime nothing shut down, which later read the stale ctx.
+  it("refuses activation from shutdown until the next session start", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    const context = contextAt(cwd);
+    await state.bootstrap(context);
+    await state.ensure(context);
+    let releaseShutdown: (() => void) | undefined;
+    harness.instances[0]!.shutdown.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { releaseShutdown = resolve; });
+    });
+
+    const shutdown = state.shutdown();
+    await vi.waitFor(() => expect(releaseShutdown).toBeDefined());
+    await expect(state.ensure(context)).rejects.toThrow("shut down");
+    releaseShutdown?.();
+    await shutdown;
+    await expect(state.ensure(context)).rejects.toThrow("shut down");
+    await expect(state.initialize(context)).rejects.toThrow("shut down");
+    expect(harness.instances).toHaveLength(1);
+    expect(state.initialized).toBe(false);
+
+    await state.bootstrap(context);                               // session_start reopens it
+    await state.ensure(context);
+    expect(harness.instances).toHaveLength(2);
+    expect(state.initialized).toBe(true);
+    await state.shutdown();
+  });
+
   it("closes stale activation during shutdown and reinitializes on session switch", async () => {
     const firstCwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
     const secondCwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });

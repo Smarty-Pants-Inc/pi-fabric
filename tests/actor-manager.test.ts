@@ -336,6 +336,32 @@ describe("ActorManager across a session reload", () => {
     await waitFor(() => after.messages(actor.id).filter((message) => message.direction === "out" && !message.error).length === 2, 15_000);
   }, 30_000);
 
+  // smarty-dev#1113: a detached run could hold a session's exit for a whole actor turn.
+  it("stops a running turn after the close grace and keeps its event for the next session", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-close-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const manager = new ActorManager(
+      "close", { id: "session:close", name: "main", kind: "main", sessionId: "close" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs: 300 },
+    );
+    actorManagers.push(manager);
+    const actor = await manager.create({ name: "slow", instructions: "Work.", topics: ["team.pulls"], responseMode: "text" });
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "HANG_WITH_PROGRESS job" });
+    await waitFor(() => manager.status(actor.id).status === "running", 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));   // the worker has reported progress
+
+    const started = Date.now();
+    await manager.close();
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(queueFiles(root, actor.id).some(({ text }) => text.includes("HANG_WITH_PROGRESS job"))).toBe(true);
+  }, 30_000);
+
   // review/astra on #45: catch-up must not overflow a 32-item queue silently.
   it("replays 34 missed events into a resumed idle actor, all of them, each once", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));

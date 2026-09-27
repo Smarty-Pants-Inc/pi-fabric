@@ -805,6 +805,20 @@ describe("AgentsProvider runner support", () => {
     );
   });
 
+  it("tells a sender that a quiesced Main is shutting down (smarty-dev#1113)", async () => {
+    const stopping: FabricParticipantInfo = {
+      format: 1, id: "session:test", kind: "root", rootId: "session:test", ownerHostId: "session:test",
+      ownerIdentityId: "session:test", name: "main", status: "stopping", runner: "pi", transport: "host",
+      capabilities: [], cwd: process.cwd(), sessionId: "test", startedAt: 1, updatedAt: 2, controlProtocol: "v1",
+      local: false, stale: false,
+    };
+    const { provider } = setup([], [stopping]);
+    (provider.mainAgent as { local: boolean }).local = false;
+    await expect(provider.routeMessage("main", "hello", undefined, "steer")).rejects.toThrow(
+      "is shutting down; its session will relaunch or end. Retry after it restarts.",
+    );
+  });
+
   it("projects remote agents through members, scoped list, and status", async () => {
     const remote: FabricParticipantInfo = {
       format: 1,

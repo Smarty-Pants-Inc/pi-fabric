@@ -27,6 +27,12 @@ const cuts: Array<[string, string]> = [
   ["piped into jq '.[-2:]'", `${LIST} | jq '.[-2:]'`],
   ["sed -n on the list", `${LIST} ${LISTING} | sed -n '1,5p'`],
   ["tail -n +2 drops the first", `${LIST} ${LISTING} | tail -n +2`],
+  // review/astra F1 on #104: options before the endpoint, and a pipeline wrapped over lines.
+  ["--jq before the endpoint", `${GHR} gh api --paginate --jq '.[-1].body' repos/o/r/issues/1201/comments`],
+  ["a newline after the pipe", `${LIST} ${LISTING} |\n  tail -n 15`],
+  ["a backslash continuation before | tail", `${LIST} ${LISTING} \\\n  | tail -n 15`],
+  ["a backslash continuation before --jq", `${LIST} \\\n  --jq '.[-3:]'`],
+  ["a curl read | tail", `curl -s https://api.github.com/repos/o/r/issues/7/comments | jq -c '.[]' | tail -n 5`],
   ["a cut read after an allowed one", `${GHR} gh api repos/o/r/issues/1/comments/77 --jq .body; ${LIST} ${LISTING} | tail -3`],
 ];
 
@@ -44,6 +50,14 @@ const allowed: Array<[string, string]> = [
   ["an issue list | head", `${GHR} gh api "repos/o/r/issues?state=open" --jq '.[].number' | head -5`],
   ["a slice inside the object", `${LIST} --jq '.[] | {id, first: (.body | split("\\n")[0] | .[0:200])}'`],
   ["a quoted first key", `${LIST} --jq '.[] | {id, "first": (.body | split("\\n")[0])}'`],
+  ["a single comment, options first", `${GHR} gh api --jq .body repos/o/r/issues/comments/5 | head -30`],
+  ["a tail on a log before ;", `grep -n error app.log | tail -3; ${LIST} ${LISTING}`],
+  ["a tail on a log before &&", `tail -n 5 build.log && ${LIST} ${LISTING}`],
+  ["a tail on the previous line", `grep -n x notes.txt | tail -n 3\n${LIST} ${LISTING}`],
+  ["a head in the previous gh api", `${GHR} gh api repos/o/r/pulls/5 --jq .body | head -3 > b.txt || ${LIST} ${LISTING}`],
+  ["options first, then a log tail after &&", `${GHR} gh api --paginate ${LISTING} repos/o/r/issues/7/comments && tail -n 5 build.log`],
+  ["a log tail before ; and a curl read", `grep -n error app.log | tail -3; curl -s https://api.github.com/repos/o/r/issues/7/comments`],
+  ["a log tail on the line before a curl read", `grep -n error app.log | tail -3\ncurl -s https://api.github.com/repos/o/r/issues/7/comments`],
   ["a tail on the next line", `${LIST} ${LISTING}\ngrep -n x notes.txt | tail -n 3`],
   ["a tail in the next gh api", `${LIST} ${LISTING} > c.json || gh api repos/o/r/pulls/5 --jq .body | tail -3`],
 ];

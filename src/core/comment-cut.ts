@@ -6,9 +6,11 @@
 // A comment LIST of one issue or PR; `/comments/<id>` is one comment and is not a list.
 const COMMENT_LIST = /\/(?:issues|pulls)\/[^/\s'"]+\/comments/g;
 
-// The read runs from its URL to the end of that line, the next `gh api`, or the next shell command
+// The read is its own logical command: from its `gh api` (options can precede the endpoint) or the
+// previous shell command, to the end of the line, the next `gh api`, or the next shell command
 // (`; cmd`, `&& cmd`). A ';' inside a jq string has no space and letter after it.
 const NEXT_COMMAND = /;\s+(?=[A-Za-z$(])|&&/;
+const NEXT_COMMAND_ALL = new RegExp(NEXT_COMMAND.source, "g");
 
 const CUT = new RegExp([
   // `| tail`, `| head`, `| sed -n`; `tail -n +1` and `tail +1` keep every line.
@@ -26,11 +28,19 @@ const CUT = new RegExp([
 /** The parts of a shell command that read an issue or PR comment list. */
 export function commentListReads(command: string): string[] {
   const reads: string[] = [];
-  for (const match of command.matchAll(COMMENT_LIST)) {
-    const rest = command.slice(match.index! + match[0].length);
+  // review/astra F1 on #104: a backslash-newline or a newline after `|` continues the same pipeline.
+  const text = command.replace(/\\\r?\n/g, " ").replace(/\|[ \t]*\r?\n/g, "| ");
+  for (const match of text.matchAll(COMMENT_LIST)) {
+    const before = text.slice(0, match.index!);
+    const previous = [...before.matchAll(NEXT_COMMAND_ALL)].at(-1);
+    const start = Math.max(
+      before.lastIndexOf("\n") + 1, before.lastIndexOf("gh api"), previous ? previous.index + previous[0].length : 0,
+    );
+    const rest = text.slice(match.index! + match[0].length);
     const next = NEXT_COMMAND.exec(rest);
     const stops = [rest.indexOf("\n"), rest.indexOf("gh api"), next ? next.index : -1].filter((index) => index >= 0);
-    reads.push(rest.slice(0, stops.length > 0 ? Math.min(...stops) : rest.length));
+    const end = match.index! + match[0].length + (stops.length > 0 ? Math.min(...stops) : rest.length);
+    reads.push(text.slice(start, end));
   }
   return reads;
 }

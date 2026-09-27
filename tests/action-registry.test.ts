@@ -486,7 +486,7 @@ describe("ActionRegistry", () => {
     });
     const startedAt = Date.now();
 
-    await registry.endInvocation("parent", 20);
+    await registry.endInvocation("parent", "failed", 20);
 
     expect(Date.now() - startedAt).toBeLessThan(500);
   });

@@ -43,7 +43,7 @@ import {
   codeUsesOrchestration,
   isBlockingOrchestrationRef,
 } from "./runtime/orchestration.js";
-import type { FabricCommittedCapabilityView, FabricMediaBlock } from "./protocol.js";
+import type { FabricCommittedCapabilityView, FabricInvocationOutcome, FabricMediaBlock } from "./protocol.js";
 import {
   sanitizeFabricMediaText,
   sanitizeFabricMediaValue,
@@ -518,6 +518,7 @@ export class FabricExecutionService {
       });
     };
     let sandboxResult: FabricSandboxResult;
+    let invocationOutcome: FabricInvocationOutcome = "failed";
     try {
       sandboxResult = await runtime.execute(
         code,
@@ -861,12 +862,13 @@ export class FabricExecutionService {
           ...(options.signal ? { signal: options.signal } : {}),
         },
       );
+      if (executionOutcomeFromTermination(sandboxResult.terminationReason) === "succeeded") invocationOutcome = "succeeded";
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.activity?.finish(options.parentToolCallId, false, message);
       throw error;
     } finally {
-      await this.registry.endInvocation(options.parentToolCallId);
+      await this.registry.endInvocation(options.parentToolCallId, invocationOutcome);
       flushEmit();
     }
 

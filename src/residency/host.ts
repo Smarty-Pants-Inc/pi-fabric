@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
+import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -376,9 +377,8 @@ class ResidentHost {
     while (this.#pollingRequests) await delay(10);
     await this.participants.quiesce().catch(() => undefined);
     await this.lifecycle.close().catch(() => undefined);
-    await this.control.close().catch(() => undefined);
     try {
-      await this.actors.close();
+      await closeWithActors(this.actors, () => this.control.close().catch(() => undefined));
     } finally {
       await this.agents.close();
       await this.participants.close().catch(() => undefined);

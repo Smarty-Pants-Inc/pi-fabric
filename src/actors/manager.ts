@@ -293,6 +293,7 @@ export class ActorManager {
   #presenceRetryMs = PRESENCE_RETRY_MS;
   readonly #delivered = new Set<string>();
   #closing = false;
+  readonly #closeGraceMs: number;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
   // mesh dispatch are frozen so interrupted actors are not re-armed by the
   // interrupt's own turn_end / agent_settled events. Lifted when the user
@@ -337,6 +338,8 @@ export class ActorManager {
        */
       reapDeadSessionPresence?: boolean | { deadAfterMs: number };
       retention?: FabricRetentionConfig;
+      /** How long close() waits for running actor turns before it stops them (smarty-dev#1113). */
+      closeGraceMs?: number;
       acquireCapabilityView?(
         requirements: readonly FabricCapabilityRequirement[],
         signal: AbortSignal,
@@ -347,6 +350,7 @@ export class ActorManager {
       options.actorRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actors-"));
     this.#actorScope = options.actorScope ?? meshConfig.actorScope;
     this.#persistent = options.persistent ?? false;
+    this.#closeGraceMs = Math.max(0, options.closeGraceMs ?? 30_000);
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
     this.#resolvePiModel = options.resolvePiModel;
@@ -1266,9 +1270,15 @@ export class ActorManager {
           );
         }
       }
-      await Promise.allSettled(
-        owned.map((actor) => actor.drain ?? Promise.resolve()),
-      );
+      // A run that has made progress survives its abort (it is detached) and can take a whole
+      // turn, keeping the session from exiting. Past the grace, stop it: while closing, no queue
+      // file is written, so its item stays there and the next session runs it again (#79).
+      const drains = Promise.allSettled(owned.map((actor) => actor.drain ?? Promise.resolve()));
+      const timer = (ms: number) => new Promise<"late">((resolve) => setTimeout(resolve, ms, "late").unref?.());
+      if (await Promise.race([drains.then(() => "done" as const), timer(this.#closeGraceMs)]) === "late") {
+        await this.agents.close();
+        await Promise.race([drains, timer(this.#closeGraceMs)]);
+      }
       for (const actor of owned) {
         if (actor.status !== "stopped") actor.status = "idle";
         actor.updatedAt = Date.now();

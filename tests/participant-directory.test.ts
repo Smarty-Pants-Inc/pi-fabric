@@ -439,6 +439,16 @@ describe("ParticipantDirectory", () => {
       local: true,
       stale: false,
     });
+    // A root that is shutting down says so, for a clear steer error (smarty-dev#1113).
+    expect(directory.get(identity.id)).toMatchObject({ capabilities: [], status: "stopping" });
+    // Other roots still list it as a peer while it shuts down.
+    const observerIdentity: MeshIdentity = { id: "session:observer", name: "main", kind: "main", sessionId: "observer" };
+    const observer = createDirectory(path.join(root, "mesh"), observerIdentity, observerIdentity.id, () => [
+      rootRecord(observerIdentity.id, observerIdentity.id, "observer"),
+    ]);
+    await observer.start();
+    expect(observer.peers().map((peer) => peer.id)).toContain(identity.id);
+    await observer.close();
     expect(directory.mesh.get("sessions/quiesce")).toBeUndefined();
   });
 

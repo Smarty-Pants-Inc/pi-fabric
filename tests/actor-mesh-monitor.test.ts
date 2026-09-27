@@ -209,3 +209,89 @@ describe("ActorMeshMonitor", () => {
     expect(s.onEvent).toHaveBeenCalledTimes(2);
   });
 });
+
+// smarty-dev#754 §3.2 step 3 (actors): work events are durable work. They skip the replay window,
+// and ones a live-log rewrite dropped while the host was away come back from the archive.
+describe("ActorMeshMonitor work-topic reconciliation", () => {
+  const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+  const store = (options: { archive?: boolean; maxEventLogBytes?: number; retainedEventLogBytes?: number } = {}) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-work-"));
+    roots.push(base);
+    const root = path.join(base, "mesh");
+    fs.mkdirSync(root, { recursive: true });
+    if (options.archive) {
+      const dir = path.join(base, "archive");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir }));
+    }
+    const mesh = new MeshStore(root, 4_096, 500, {
+      ...(options.maxEventLogBytes ? { maxEventLogBytes: options.maxEventLogBytes, retainedEventLogBytes: options.retainedEventLogBytes! } : {}),
+    });
+    return { mesh, cursorPath: path.join(base, "cursor.json") };
+  };
+  const monitor = (mesh: MeshStore, cursorPath: string, seen: MeshEvent[], maxReplayAgeMs?: number) => {
+    const value = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 50 }, {
+      cursorPath, beforePoll: () => true, onEvent: (event) => { seen.push(event); },
+      ...(maxReplayAgeMs !== undefined ? { maxReplayAgeMs } : {}),
+    });
+    monitors.push(value);
+    return value;
+  };
+  const drain = async (value: ActorMeshMonitor) => {
+    for (let index = 0; index < 20; index++) { value.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
+  };
+
+  it("delivers a work event older than the replay window, and still skips an old ordinary one", async () => {
+    const { mesh, cursorPath } = store();
+    const first: MeshEvent[] = [];
+    const before = monitor(mesh, cursorPath, first);
+    await mesh.publish({ topic: "team.x", from, text: "seen" });
+    await drain(before);
+    before.close();
+    await mesh.publish({ topic: "team.x", from, text: "old ordinary" });
+    await mesh.publish({ topic: "fleet.work.pi-fabric.1", to: "actor:a", from, text: "old work" });
+    const seen: MeshEvent[] = [];
+    await drain(monitor(mesh, cursorPath, seen, -60_000));   // every event is older than the window
+    expect(seen.map((event) => event.text)).toEqual(["old work"]);
+  });
+
+  it("delivers nothing twice when a rewrite restarts the stream on events already handed on", async () => {
+    const { mesh, cursorPath } = store({ archive: true, maxEventLogBytes: 6_000, retainedEventLogBytes: 1_500 });
+    const first: MeshEvent[] = [];
+    const before = monitor(mesh, cursorPath, first);
+    for (let index = 1; index <= 24; index++) await mesh.publish({ topic: "fleet.work.pi-fabric.1", to: "actor:a", from, text: `a${index}` });
+    await drain(before);
+    expect(first).toHaveLength(24);
+    before.close();
+    const generation = () => { try { return fs.readFileSync(path.join(mesh.root, "generation"), "utf8"); } catch { return ""; } };
+    const was = generation();
+    for (let index = 1; generation() === was && index <= 20; index++) await mesh.publish({ topic: "fleet.work.pi-fabric.1", to: "actor:a", from, text: `b${index}` });
+    const retained = mesh.read({ limit: 50 }).map((event) => event.text);
+    expect(retained.some((text) => text?.startsWith("a"))).toBe(true);          // the rewrite kept some delivered ones
+    const seen: MeshEvent[] = [];
+    await drain(monitor(mesh, cursorPath, seen, 10 * 60_000));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((event) => event.text?.startsWith("b"))).toBe(true);
+  });
+
+  it("reads work events a live-log rewrite dropped from the archive, each once, with nothing repeated", async () => {
+    const { mesh, cursorPath } = store({ archive: true, maxEventLogBytes: 6_000, retainedEventLogBytes: 1_500 });
+    const first: MeshEvent[] = [];
+    const before = monitor(mesh, cursorPath, first);
+    await mesh.publish({ topic: "fleet.work.pi-fabric.1", to: "actor:a", from, text: "work 0" });
+    await drain(before);
+    expect(first.map((event) => event.text)).toEqual(["work 0"]);
+    before.close();
+    // The host is away while the live log is rewritten several times.
+    for (let index = 1; index <= 40; index++) {
+      await mesh.publish({ topic: index % 5 === 0 ? "fleet.work.pi-fabric.1" : "team.noise", to: "actor:a", from, text: `${index % 5 === 0 ? "work" : "noise"} ${index}` });
+    }
+    expect(mesh.oldestSequence()).toBeGreaterThan(10);
+    const seen: MeshEvent[] = [];
+    await drain(monitor(mesh, cursorPath, seen, 10 * 60_000));
+    const work = seen.filter((event) => event.topic.startsWith("fleet.")).map((event) => event.text);
+    expect(work).toEqual(["work 5", "work 10", "work 15", "work 20", "work 25", "work 30", "work 35", "work 40"]);
+    expect(new Set(seen.map((event) => event.id)).size).toBe(seen.length);
+    expect(seen.some((event) => event.text === "work 0")).toBe(false);
+  });
+});

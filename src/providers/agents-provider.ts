@@ -487,7 +487,13 @@ export class AgentsProvider implements FabricProvider {
     actionName: string,
     args: Record<string, unknown>,
   ): Record<string, unknown> {
-    return normalizeAgentsArgs(actionName, messageTargetArgs(actionName, args));
+    return normalizeAgentsArgs(actionName, args);
+  }
+
+  // Before generic repair: a learned sessionId -> id row would otherwise drop
+  // the "session:" prefix, and a to/id conflict must be seen as the caller wrote it.
+  guardArguments(actionName: string, args: Record<string, unknown>): Record<string, unknown> {
+    return messageTargetArgs(actionName, args);
   }
 
   async handoff(

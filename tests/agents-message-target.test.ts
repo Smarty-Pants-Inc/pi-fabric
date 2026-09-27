@@ -1,14 +1,20 @@
 import fs from "node:fs";
-import { describe, expect, it } from "vitest";
-import { validateCatalogArgs } from "../src/core/action-arguments.js";
+import os from "node:os";
+import path from "node:path";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ActionRegistry, type FabricCallAudit } from "../src/core/action-registry.js";
+import type { FabricProvider } from "../src/protocol.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { setActiveRepairCompiler } from "../src/repairs/active.js";
+import { RepairCompiler } from "../src/repairs/compiler.js";
 import { TypeScriptKernelRuntime } from "../src/runtime/typescript-kernel.js";
 
 // smarty-dev#459: agents called the messaging verbs with `to`, positionally,
-// or with `sessionId`. These tests pin the accepted shapes and the rejections,
-// and run every documented messaging snippet against the real guest types and
-// the provider's argument preparation and schema validation.
+// or with `sessionId`. These tests pin the accepted shapes and the rejections
+// through the real ActionRegistry (with the repair compiler attached), and run
+// every documented messaging snippet against the real guest types.
 
 const MESSAGING = ["ask", "tell", "steer", "followUp"] as const;
 const SKILL_FILES = [
@@ -16,17 +22,60 @@ const SKILL_FILES = [
   "skillsets/typescript/fabric-exec/references/agents.md",
 ];
 
-// prepareArguments reads no instance state; exercise the real provider method.
-const provider = Object.create(AgentsProvider.prototype) as AgentsProvider;
+// The argument hooks, list and describe read no instance state; use the real
+// provider methods and record what would reach invoke.
+const real = Object.create(AgentsProvider.prototype) as AgentsProvider;
 const schemaOf = (action: string) =>
   AGENTS_ACTION_DESCRIPTORS.find((descriptor) => descriptor.name === action)!.inputSchema as Record<string, unknown>;
+const invoked: Array<{ action: string; args: Record<string, unknown> }> = [];
+const agentsProvider: FabricProvider = {
+  name: "agents",
+  description: "agents",
+  list: (request, context) => real.list(request, context),
+  describe: (name, context) => real.describe(name, context),
+  guardArguments: (name, args) => real.guardArguments(name, args),
+  prepareArguments: (name, args) => real.prepareArguments(name, args),
+  async invoke(action, args) {
+    invoked.push({ action, args });
+    return { queued: true, messageId: "m-1" };
+  },
+};
+const context = {
+  cwd: process.cwd(),
+  signal: undefined,
+  parentToolCallId: "parent",
+  nestedToolCallId: "nested",
+  extensionContext: {} as ExtensionContext,
+  update() {},
+  approve: async () => {},
+  audits: [] as FabricCallAudit[],
+  maxResultChars: 10_000,
+};
 
-/** The registry path for one agents.* call: provider preparation, then schema validation. */
-const admit = (action: string, args: Record<string, unknown>): Record<string, unknown> => {
-  const prepared = provider.prepareArguments(action, args) as Record<string, unknown>;
-  const checked = validateCatalogArgs(`agents.${action}`, schemaOf(action), prepared, undefined);
-  if (checked.invalid) throw new Error(`agents.${action}: ${checked.invalid}`);
-  return checked.args;
+let registry: ActionRegistry;
+let compiler: RepairCompiler;
+const tmp: string[] = [];
+beforeEach(() => {
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-msg-target-"));
+  tmp.push(agentDir);
+  compiler = new RepairCompiler({ agentDir });
+  compiler.setCatalogSurface({ providers: ["agents"], capturedTools: [] });
+  setActiveRepairCompiler(compiler);
+  registry = new ActionRegistry();
+  registry.register(agentsProvider);
+  invoked.length = 0;
+});
+afterEach(() => {
+  setActiveRepairCompiler(undefined);
+  for (const dir of tmp.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/** One agents.* call through the registry; returns the arguments that reached invoke. */
+const admit = async (action: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+  const before = invoked.length;
+  await registry.invoke(`agents.${action}`, args, context);
+  expect(invoked.length).toBe(before + 1);
+  return invoked.at(-1)!.args;
 };
 
 const kernel = new TypeScriptKernelRuntime("quickjs");
@@ -52,7 +101,7 @@ const run = async (source: string, fullCodeMode = false) => {
   const result = await kernel.execute(code, async (ref, rawArgs) => {
     const action = ref.replace(/^agents\./, "");
     const args = (rawArgs ?? {}) as Record<string, unknown>;
-    const admitted = (MESSAGING as readonly string[]).includes(action) ? admit(action, args) : args;
+    const admitted = (MESSAGING as readonly string[]).includes(action) ? await admit(action, args) : args;
     calls.push({ ref, args: admitted });
     return stub(action);
   }, { timeoutMs: 10_000, memoryLimitBytes: 64 * 1024 * 1024 });
@@ -67,40 +116,60 @@ const fencedBlocks = (markdown: string) =>
 const messagingCall = /agents\.(ask|tell|steer|followUp)\(/g;
 
 describe("agents messaging target shapes (#459)", () => {
-  it("maps `to` onto id for every messaging verb, and keeps id as is", () => {
+  it("maps `to` onto id for every messaging verb, and keeps id as is", async () => {
     for (const action of MESSAGING) {
-      expect(admit(action, { to: "session:a", message: "m" })).toEqual({ id: "session:a", message: "m" });
-      expect(admit(action, { id: "session:a", message: "m" })).toEqual({ id: "session:a", message: "m" });
-      expect(admit(action, { id: "session:a", to: "session:a", message: "m" })).toEqual({ id: "session:a", message: "m" });
+      expect(await admit(action, { to: "session:a", message: "m" })).toEqual({ id: "session:a", message: "m" });
+      expect(await admit(action, { id: "session:a", message: "m" })).toEqual({ id: "session:a", message: "m" });
+      expect(await admit(action, { id: "session:a", to: "session:a", message: "m" })).toEqual({ id: "session:a", message: "m" });
     }
   });
 
-  it("rejects two different targets", () => {
+  it("rejects two different targets before invoke", async () => {
     for (const action of MESSAGING) {
-      expect(() => admit(action, { id: "session:a", to: "session:b", message: "m" }))
-        .toThrow(`agents.${action} got two targets, id "session:a" and to "session:b"`);
+      await expect(admit(action, { id: "session:a", to: "session:b", message: "m" }))
+        .rejects.toThrow(`agents.${action} got two targets, id "session:a" and to "session:b"`);
     }
+    expect(invoked).toEqual([]);
   });
 
-  it("rejects sessionId with the exact fix, with or without another target", () => {
+  it("rejects sessionId with the exact fix, before repair and invoke", async () => {
     for (const action of MESSAGING) {
-      expect(() => admit(action, { sessionId: "01a0", message: "m" }))
-        .toThrow(`agents.${action} has no sessionId field: use id: 'session:01a0'`);
-      expect(() => admit(action, { sessionId: "session:01a0", message: "m" }))
-        .toThrow("use id: 'session:01a0'");
-      expect(() => admit(action, { id: "session:01a0", sessionId: "01a0", message: "m" }))
-        .toThrow("has no sessionId field");
+      await expect(admit(action, { sessionId: "01a0", message: "m" }))
+        .rejects.toThrow(`agents.${action} has no sessionId field: use id: 'session:01a0'`);
+      await expect(admit(action, { sessionId: "session:01a0", message: "m" }))
+        .rejects.toThrow("use id: 'session:01a0'");
+      await expect(admit(action, { id: "session:01a0", sessionId: "01a0", message: "m" }))
+        .rejects.toThrow("has no sessionId field");
     }
+    expect(invoked).toEqual([]);
+    // The rejection ran before generic repair, so nothing learned sessionId -> id.
+    expect(compiler.repairs).toEqual([]);
   });
 
-  it("still rejects unknown fields and a missing target", () => {
-    expect(() => admit("followUp", { to: "session:a", message: "m", foo: 1 })).toThrow("/foo");
-    expect(() => admit("steer", { message: "m" })).toThrow("agents.steer:");
-    expect(() => admit("steer", { id: "session:a", message: "m", model: "x" })).toThrow("/model");
+  it("rejects sessionId even when a sessionId -> id repair is already promoted (astra F1)", async () => {
+    for (const action of MESSAGING) {
+      const ref = `agents.${action}`;
+      const declared = Object.keys(schemaOf(action).properties as Record<string, unknown>);
+      compiler.observeInvalidArgs(ref, { sessionId: "01a0", message: "m" }, declared, "extra", { extraKeys: ["sessionId"] });
+      expect(compiler.repairs).toContainEqual({ kind: "keyAlias", ref, from: "sessionId", to: "id" });
+      await expect(admit(action, { sessionId: "01a0", message: "m" }))
+        .rejects.toThrow(`agents.${action} has no sessionId field: use id: 'session:01a0'`);
+      // Counterexample: the documented id form and the to alias still reach invoke.
+      expect(await admit(action, { id: "session:01a0", message: "m" })).toEqual({ id: "session:01a0", message: "m" });
+      expect(await admit(action, { to: "session:01a0", message: "m" })).toEqual({ id: "session:01a0", message: "m" });
+    }
+    expect(invoked.map((call) => call.action)).toEqual(MESSAGING.flatMap((action) => [action, action]));
+  });
+
+  it("still rejects unknown fields and a missing target", async () => {
+    await expect(admit("followUp", { to: "session:a", message: "m", foo: 1 })).rejects.toThrow("/foo");
+    await expect(admit("steer", { message: "m" })).rejects.toThrow("Invalid arguments for agents.steer");
+    await expect(admit("steer", { id: "session:a", message: "m", model: "x" })).rejects.toThrow("/model");
+    expect(invoked).toEqual([]);
   });
 
   it("leaves non-messaging actions alone", () => {
-    expect(provider.prepareArguments("status", { to: "x" })).not.toHaveProperty("id", "x");
+    expect(real.guardArguments("status", { sessionId: "x", to: "y" })).toEqual({ sessionId: "x", to: "y" });
   });
 
   it("type-checks and runs the positional and `to` forms in the guest", async () => {

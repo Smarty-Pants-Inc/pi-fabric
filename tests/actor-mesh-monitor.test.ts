@@ -518,6 +518,38 @@ describe("ActorMeshMonitor archive/live handoff across a rewrite's two writes", 
     expect(opensAfterTail).toBeGreaterThanOrEqual(2);
     expect(workTexts()).toEqual(odd(1, 13));                   // 5 and 7 before 9
   });
+
+  // review/astra round 7 on pi-fabric#97: the archive was enabled after a retention cut, so it
+  // starts after the monitor's last event. Its events must still count in the gap lookup.
+  it("fills the archived part of a gap that starts before the archive", async () => {
+    const { mesh, poll, publish, bumpGeneration, workTexts, events } = await setup(false);
+    await publish(1, 4);
+    await poll(5);
+    await publish(5, 12);
+    const renameKeeping = (low: number) => {
+      const lines = fs.readFileSync(events, "utf8").split("\n").filter((line) => line && (JSON.parse(line) as MeshEvent).sequence >= low);
+      fs.writeFileSync(`${events}.tmp`, lines.map((line) => `${line}\n`).join(""));
+      fs.renameSync(`${events}.tmp`, events);
+    };
+    renameKeeping(9);                                         // a retention cut while no archive was set:
+    bumpGeneration();                                         // 5–8 are gone for good
+    const archiveDir = path.join(path.dirname(events), "..", "archive");
+    fs.writeFileSync(path.join(path.dirname(events), "event-archive.json"), JSON.stringify({ version: 1, dir: path.resolve(archiveDir) }));
+    await publish(13, 17);                                    // the archive backfills from 9
+    expect(mesh.nextEventAfter(4)?.sequence).toBe(9);
+    const tail = mesh.tail.bind(mesh);
+    let calls = 0;
+    vi.spyOn(mesh, "tail").mockImplementation((cursor, limit) => {
+      // Call 1 sees the generation change; the archive catch-up then finds nothing below 9.
+      // Call 2 reads a log renamed to keep 13–17, before its generation bump.
+      if (++calls === 2) renameKeeping(13);
+      return tail(cursor, limit);
+    });
+    await poll(15);
+    vi.mocked(mesh.tail).mockRestore();
+    expect(calls).toBeGreaterThan(2);
+    expect(workTexts()).toEqual([...odd(1, 4), ...odd(9, 17)]);   // 9 and 11 once, before 13
+  });
 });
 
 describe("ActorMeshMonitor without an archive", () => {

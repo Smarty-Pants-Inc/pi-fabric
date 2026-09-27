@@ -488,16 +488,26 @@ export class MeshStore {
   }
 
   /**
-   * The first committed event after a sequence. When the archive holds that range, only the
+   * The first committed event after a sequence. From the archive's first sequence on, only the
    * archive answers: it holds each event before the event goes live, so it is one coherent
-   * source across a live-log rewrite (smarty-dev#754). Otherwise the live log answers.
+   * source across a live-log rewrite (smarty-dev#754). Below it, and in a store without the
+   * archive, the live log answers: it is the only source there, so an event a rewrite cuts
+   * from that range is gone either way.
    */
   nextEventAfter(after: number): MeshEvent | undefined {
     const archive = MeshArchive.fromRoot(this.root);
     const first = archive?.firstSequence();
-    const event = archive && first !== undefined && first <= after + 1
-      ? archive.readAfter(after, this.#readLastEventSequence(), () => true, 1)[0]
-      : this.#readEventsAfter(after, {}, 1)[0];
+    if (!archive || first === undefined) return this.#cloned(this.#readEventsAfter(after, {}, 1)[0]);
+    if (after + 1 < first) {
+      // ponytail: not expected in practice (a newly set archive backfills the whole live log),
+      // but the answer stays right if the archive ever starts above a live event.
+      const live = this.#readEventsAfter(after, {}, 1)[0];
+      if (live && live.sequence < first) return this.#cloned(live);
+    }
+    return this.#cloned(archive.readAfter(Math.max(after, first - 1), this.#readLastEventSequence(), () => true, 1)[0]);
+  }
+
+  #cloned(event: MeshEvent | undefined): MeshEvent | undefined {
     return event ? jsonClone(event) : undefined;
   }
 

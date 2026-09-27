@@ -740,6 +740,24 @@ interface FabricActorMessage {
 }
 // agentId/agent_id spellings repair to id during agent arg normalization.
 type FabricAgentTargetArgs = { id: string; agentId?: string; agent_id?: string };
+/**
+ * Message target for agents.ask/tell/steer/followUp: id (documented) or its
+ * alias to, the mesh.publish spelling. Give one target; a session id takes
+ * the form id: "session:<sessionId>".
+ */
+type FabricMessageTarget =
+  | { id: string; to?: string; sessionId?: FabricSessionIdHint }
+  | { to: string; id?: string; sessionId?: FabricSessionIdHint };
+/** sessionId is not a field: write id: "session:<sessionId>". */
+type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionId>'";
+type FabricMessageArgs = FabricMessageTarget & { message: string; data?: unknown };
+type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
+interface FabricMessageDelivery {
+  queued: true;
+  messageId: string;
+  routed?: "local" | "main" | "mesh";
+  acknowledged?: boolean;
+}
 interface FabricAgentsApi {
   run(args: FabricAgentRequest): Promise<FabricAgentResult>;
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
@@ -791,10 +809,14 @@ interface FabricAgentsApi {
     instructions: string;
     scope?: "project" | "global";
   }): Promise<FabricActorInfo>;
-  ask(args: { id: string; message: string; data?: unknown; model?: string; thinking?: FabricThinking }): Promise<FabricActorMessage>;
-  tell(args: { id: string; message: string; data?: unknown; model?: string; thinking?: FabricThinking }): Promise<{ queued: true; messageId: string }>;
-  steer(args: { id: string; message: string; data?: unknown }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
-  followUp(args: { id: string; message: string; data?: unknown }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
+  ask(args: FabricActorMessageArgs): Promise<FabricActorMessage>;
+  ask(id: string, message: string): Promise<FabricActorMessage>;
+  tell(args: FabricActorMessageArgs): Promise<{ queued: true; messageId: string }>;
+  tell(id: string, message: string): Promise<{ queued: true; messageId: string }>;
+  steer(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
+  steer(id: string, message: string): Promise<FabricMessageDelivery>;
+  followUp(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
+  followUp(id: string, message: string): Promise<FabricMessageDelivery>;
   setSteeringMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */

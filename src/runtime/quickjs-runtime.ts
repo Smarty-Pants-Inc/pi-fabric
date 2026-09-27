@@ -476,6 +476,9 @@ const __handoff = async (args = {}) => {
   }
   return __call("agents.handoff", request);
 };
+// The messaging verbs also take (target, message); the object form stays canonical.
+const __messageArgs = (target, message) =>
+  typeof target === "string" ? { id: target, message } : target;
 globalThis.agents = Object.freeze({
   run: (args) => __call("agents.run", args),
   handoff: __handoff,
@@ -497,10 +500,10 @@ globalThis.agents = Object.freeze({
   stop: (args) => __call("agents.stop", args),
   cleanup: (args) => __call("agents.cleanup", args),
   create: __createActor,
-  ask: (args) => __call("agents.ask", args),
-  tell: (args) => __call("agents.tell", args),
-  steer: (args) => __call("agents.steer", args),
-  followUp: (args) => __call("agents.followUp", args),
+  ask: (target, message) => __call("agents.ask", __messageArgs(target, message)),
+  tell: (target, message) => __call("agents.tell", __messageArgs(target, message)),
+  steer: (target, message) => __call("agents.steer", __messageArgs(target, message)),
+  followUp: (target, message) => __call("agents.followUp", __messageArgs(target, message)),
   setSteeringMode: (args) => __call("agents.setSteeringMode", args),
   setFollowUpMode: (args) => __call("agents.setFollowUpMode", args),
   compact: (args) => __call("agents.compact", args),

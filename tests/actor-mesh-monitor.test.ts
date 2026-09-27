@@ -450,6 +450,35 @@ describe("ActorMeshMonitor archive/live handoff across a rewrite's two writes", 
     await poll(10);
     expect(workTexts()).toEqual(odd(1, 16));
   });
+
+  // review/astra round 4: a second rewrite lands during the retry read, after the first gap was
+  // seen but before the archive covered it. The generation file stays behind throughout.
+  it("fills a gap that a second rewrite moves during the retry read", async () => {
+    const { mesh, poll, publish, bumpGeneration, workTexts, events } = await setup();
+    await publish(1, 4);
+    await poll(5);
+    await publish(5, 13);
+    const all = fs.readFileSync(events, "utf8").split("\n").filter(Boolean);
+    const write = (low: number, high: number) => fs.writeFileSync(events, all
+      .filter((line) => { const sequence = (JSON.parse(line) as MeshEvent).sequence; return sequence >= low && sequence <= high; })
+      .map((line) => `${line}\n`).join(""));
+    const tail = mesh.tail.bind(mesh);
+    let call = 0;
+    vi.spyOn(mesh, "tail").mockImplementation((cursor, limit) => {
+      call++;
+      if (call === 1) write(5, 9);       // the old offset (four lines) now points at event 9
+      if (call === 2) write(9, 13);      // the second rewrite, during the retry read
+      return tail(cursor, limit);
+    });
+    await poll(12);
+    expect(call).toBeGreaterThan(2);
+    expect(workTexts()).toEqual(odd(1, 13));                 // 5 and 7 before 9–13
+    vi.mocked(mesh.tail).mockRestore();
+    bumpGeneration();
+    await publish(14, 16);
+    await poll(10);
+    expect(workTexts()).toEqual(odd(1, 16));
+  });
 });
 
 describe("ActorMeshMonitor without an archive", () => {

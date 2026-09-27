@@ -83,7 +83,7 @@ Remove unneeded `browser-harness` / `macos-harness` entries from your Fabric
 configuration and stop loading their optional `pi/` extensions when switching
 to CLI composition. Do this deliberately after stopping their work: no automatic
 configuration rewrite or cleanup is performed. Replace `browser.*` / `macos.*`
-program grants with only the shell/task actions actually needed.
+program grants with only the shell and task actions the program needs.
 
 There are no concrete harness exports in `pi-fabric/jev` and no compatibility
 bridge to maintain. The generic [component protocol](components.md) remains

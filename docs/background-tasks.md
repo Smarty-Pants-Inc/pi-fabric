@@ -60,9 +60,11 @@ works without a terminal and does not restore processes across Pi restarts.
 Tasks are a discoverable provider, **not a new sandbox global**:
 
 ```ts
-return await tools.call({ref: "tasks.list", args: {}});
-return await tools.call({ref: "tasks.get", args: {id: taskId}});
-return await tools.call({ref: "tasks.stop", args: {id: taskId}});
+const tasks = await tools.call({ ref: "tasks.list", args: {} }) as Array<{ id: string }>;
+const taskId = tasks[0]!.id;
+const task = await tools.call({ ref: "tasks.get", args: { id: taskId } });
+await tools.call({ ref: "tasks.stop", args: { id: taskId } });
+return task;
 ```
 
 `get` returns metadata and an 8KB output tail and acknowledges pending agent delivery.
@@ -78,6 +80,7 @@ full-output archive**, and truncation is disclosed.
 For a bounded controller such as `jev.run`/`spawn`, use event-driven task calls:
 
 ```ts
+const taskId = "task-id-from-tasks.list";
 const receipt = await tools.call({ref:"tasks.wait",args:{id:taskId,timeoutMs:30000}});
 // For tasks started with monitor (prefer delivery:"ui" for code-owned supervision):
 const batch = await tools.call({ref:"tasks.watch",args:{id:taskId,after:0,timeoutMs:5000}});

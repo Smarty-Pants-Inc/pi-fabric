@@ -30,5 +30,11 @@ const receipt = await records.append({
 - `records.list({ repo?, open?, owner?, hasOpenAsk?, updatedSince? })` is a view query, never a delivery path.
 - `records.status()` shows the frontier, unpublished nudges and archive admission.
 
+## Trust boundary
+
+The writer runs in your own Fabric process, so it is not a boundary against a caller with the same OS user: within
+one org, authorship is attribution, not authentication. Records are off by default, and fleet use waits for the C10
+records service (smarty-dev#1546).
+
 Records addressed to your session (`data.to` is your participant id or session name) arrive by themselves at your
 next turn start, at least once.

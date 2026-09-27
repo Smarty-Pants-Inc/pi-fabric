@@ -172,13 +172,17 @@ names the root of its `supersedes` chain, so the mirror edits one GitHub object.
 only the fields it carries (title, labels, body); one that changes nothing the forge shows (a stage command) gets a
 `skipped` row. Creating an issue (`repo`, no `ref`) POSTs the whole issue.
 
-## The trust boundary
+## Trust boundary
 
-The service runs inside each Fabric process, as the org's OS user. Across orgs, #820's per-org OS user and 0700
-socket directory are the boundary. Within one org, a caller with that user's shell can reach the database directly
-or edit its configuration, so same-org authorship (C13) is enforced at the API only. Closing it needs the records
-service under its own OS identity and credential, with authenticated principals (C10). Until then, keep records off
-for real org data.
+The in-process writer is **not** a boundary against a caller that runs as the same OS user. Every agent in an org
+runs as the org's OS user, so it can reach the database directly, set any `author`, or give itself the importer or
+mirror role in its project configuration. Within one org, authorship is **attribution, not authentication**. Across
+orgs, #820's per-org OS user and 0700 socket directory are the boundary.
+
+Records are off by default, and fleet use waits for the C10 records service
+([smarty-dev#1546](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/1546)). That service runs under its own OS
+user, authenticates each caller, and keeps migration authority separate. Do not enable records for real org data
+before it lands.
 
 ## The remote endpoint (C10)
 

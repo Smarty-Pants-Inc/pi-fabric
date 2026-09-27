@@ -19,6 +19,8 @@ The directory stores participant records separately from short-lived execution-h
 
 Topics provide durable channel and direct-message semantics with sequence cursors.
 
+The live log keeps its newest events only. A mesh root whose `event-archive.json` names an archive directory also writes every event to plain append-only files there, one per topic and UTC day (`<yyyy>/<mm>/<dd>/<topic>.jsonl`), before any reader sees it. A publish fails if the archive cannot take the event. `mesh.read({ after })` with a cursor older than the live log reads the archive.
+
 ```ts
 await mesh.publish({ topic: "team.auth", kind: "finding", text: "Refresh-token rotation is not atomic", data: { path: "src/auth/refresh.ts" } });
 const events = await mesh.read({ topic: "team.auth", limit: 50 });

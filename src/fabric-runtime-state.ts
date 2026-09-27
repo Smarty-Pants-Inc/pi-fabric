@@ -525,7 +525,7 @@ export class FabricRuntimeState {
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
       : undefined;
     const rootInbox = this.#rootInbox;
-    mainAgent.deliveryObserver = rootInbox ? (fromId, text) => rootInbox.noteDelivered(fromId, text) : undefined;
+    mainAgent.deliveryObserver = rootInbox ? (fromId, data) => rootInbox.noteDelivered(fromId, data) : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       enabled: this.#config.mesh.enabled,

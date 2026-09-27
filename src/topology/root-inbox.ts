@@ -17,8 +17,6 @@ export const WORK_TOPIC_PREFIX = "fleet.";
 export const ROOT_INBOX_CUSTOM_TYPE = "pi-fabric-inbox";
 /** A shadow record newer than this waits a reconcile, so its steer can arrive first and win. */
 const STEER_GRACE_MS = 60_000;
-/** A steer receipt matches a shadow record published this close to it, and one only. */
-const RECEIPT_WINDOW_MS = 10 * 60_000;
 /** Receipts are kept this long, and dropped at every reconcile after. */
 const RECEIPT_TTL_MS = 60 * 60_000;
 /** The cursor is saved when it moves past a delivered batch, and otherwise at most this often. */
@@ -27,8 +25,6 @@ const SAVE_INTERVAL_MS = 10 * 60_000;
 const MAX_BATCH_EVENTS = 20;
 const MAX_BATCH_TEXT_BYTES = 32 * 1024;
 const MAX_EVENT_TEXT_BYTES = 8 * 1024;
-/** A pending batch the session never records is committed after this many deliveries. */
-const MAX_PENDING_ATTEMPTS = 5;
 
 export interface RootInboxBatch {
   events: MeshEvent[];
@@ -38,11 +34,15 @@ export interface RootInboxBatch {
 
 interface RootInboxState {
   after: number;
-  pending?: { through: number; ids: string[]; attempts: number };
+  pending?: { through: number; ids: string[] };
 }
 
-const fingerprint = (fromId: string, text: string): string =>
-  createHash("sha256").update(`${fromId}\0${text.trim()}`).digest("hex");
+// A receipt names the exact work it delivered: the sender and the work key it passed as
+// data.key, the same key as its shadow record. Without a key there is no receipt.
+const receiptKey = (fromId: string, data: unknown): string | undefined => {
+  const key = data && typeof data === "object" ? (data as { key?: unknown }).key : undefined;
+  return typeof key === "string" && key.trim() ? `${fromId}\0${key.trim()}` : undefined;
+};
 
 export class RootInbox {
   #state: RootInboxState | undefined;
@@ -62,9 +62,14 @@ export class RootInbox {
     return ROOT_INBOX_PREFIX + createHash("sha256").update(this.identity.id).digest("hex").slice(0, 32);
   }
 
-  /** A steer or follow-up reached this root: one shadow record of it, published near now, is not news. */
-  noteDelivered(fromId: string, text: string): void {
-    this.#receipts.push({ key: fingerprint(fromId, text), at: this.#now() });
+  /**
+   * A steer or follow-up reached this root. When it carried its work key (data.key), the shadow
+   * record with that sender and key is not news. Without a key nothing is skipped: the shadow
+   * copy comes too, so delivery stays at least once.
+   */
+  noteDelivered(fromId: string, data: unknown): void {
+    const key = receiptKey(fromId, data);
+    if (key) this.#receipts.push({ key, at: this.#now() });
   }
 
   /**
@@ -75,15 +80,12 @@ export class RootInbox {
   async next(sessionHolds: (ids: readonly string[]) => boolean): Promise<RootInboxBatch> {
     const state = this.#load();
     if (state.pending) {
-      if (sessionHolds(state.pending.ids) || state.pending.attempts >= MAX_PENDING_ATTEMPTS) {
-        state.after = Math.max(state.after, state.pending.through);
-        delete state.pending;
-        await this.#save(true);
-      } else {
-        state.pending.attempts++;
-        await this.#save(true);
-        return { events: this.#reread(state.after, state.pending), through: state.pending.through };
-      }
+      // Only the session's own record of the message moves the cursor; a pending batch is
+      // delivered again, however many times, until then.
+      if (!sessionHolds(state.pending.ids)) return { events: this.#reread(state.after, state.pending), through: state.pending.through };
+      state.after = Math.max(state.after, state.pending.through);
+      delete state.pending;
+      await this.#save(true);
     }
     const batch = this.#scan(state.after);
     if (batch.events.length === 0) {
@@ -91,7 +93,7 @@ export class RootInbox {
       await this.#save(false);
       return batch;
     }
-    state.pending = { through: batch.through, ids: batch.events.map((event) => event.id), attempts: 1 };
+    state.pending = { through: batch.through, ids: batch.events.map((event) => event.id) };
     await this.#save(true);
     return batch;
   }
@@ -125,11 +127,10 @@ export class RootInbox {
     }
   }
 
-  // A receipt stands for the one shadow record its steer copied: same sender and text, published
-  // within the window of the steer. It is used up by that record.
+  // A receipt stands for the one shadow record with its sender and work key, and is used up by it.
   #takeReceipt(event: MeshEvent): boolean {
-    const key = fingerprint(event.from.id, event.text ?? "");
-    const index = this.#receipts.findIndex((receipt) => receipt.key === key && Math.abs(receipt.at - event.createdAt) <= RECEIPT_WINDOW_MS);
+    const key = receiptKey(event.from.id, event.data);
+    const index = key ? this.#receipts.findIndex((receipt) => receipt.key === key) : -1;
     if (index < 0) return false;
     this.#receipts.splice(index, 1);
     return true;
@@ -161,7 +162,7 @@ export class RootInbox {
     this.#state = {
       after: saved ? value!.after! : this.mesh.latestSequence(),
       ...(pending && Array.isArray(pending.ids) && typeof pending.through === "number"
-        ? { pending: { through: pending.through, ids: pending.ids.filter((id): id is string => typeof id === "string"), attempts: Number(pending.attempts) || 1 } }
+        ? { pending: { through: pending.through, ids: pending.ids.filter((id): id is string => typeof id === "string") } }
         : {}),
     };
     this.#saved = saved ? JSON.stringify(this.#state) : undefined;

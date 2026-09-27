@@ -75,35 +75,37 @@ describe("RootInbox", () => {
     expect((await inbox().next(held)).events).toEqual([]);
   });
 
-  it("stops delivering a batch the session never records after five attempts", async () => {
-    const { clock, inbox, work } = setup();
-    const box = inbox();
-    await box.next(held);
+  it("keeps a batch pending through any number of undelivered attempts, until the session holds it (review F1)", async () => {
+    const { clock, inbox, work, texts } = setup();
+    await inbox().next(held);
     await work("stuck");
     clock.advance(1);
-    for (let attempt = 1; attempt <= 5; attempt++) expect((await box.next(notHeld)).events).toHaveLength(1);
-    expect((await box.next(notHeld)).events).toEqual([]);
+    // Each attempt is a stop between the pending save and the session's write: a fresh process.
+    for (let attempt = 1; attempt <= 8; attempt++) expect(texts((await inbox().next(notHeld)).events)).toEqual(["stuck"]);
+    expect((await inbox().next(held)).events).toEqual([]);
+    expect((await inbox().next(notHeld)).events).toEqual([]);
   });
 
-  it("lets a steer receipt stand only for the one shadow record it copied, near its time (review F2)", async () => {
+  it("skips only the shadow record whose own work key a steer delivered (review F2)", async () => {
     const { clock, inbox, work, texts } = setup();
     const box = inbox();
     await box.next(held);
-    box.noteDelivered(peer.id, "  ack ");
-    await work("ack", me.id, "fleet.work.pi-fabric.1", "ack:1");
-    await work("ack", me.id, "fleet.work.pi-fabric.2", "ack:2");      // same text, other work, no steer
+    const keys = async () => (await box.next(held)).events.map((event) => (event.data as { key: string }).key);
+    // The first steer failed and the second succeeded, both with the text "ack": only B's key has a receipt.
+    await work("ack", me.id, "fleet.work.pi-fabric.1", "ack:A");
+    await work("ack", me.id, "fleet.work.pi-fabric.2", "ack:B");
+    box.noteDelivered(peer.id, { key: "ack:B" });
     clock.advance(1);
-    expect((await box.next(held)).events.map((event) => (event.data as { key: string }).key)).toEqual(["ack:2"]);
-    // Twenty minutes later, still within the receipt's life: the window keeps it from matching.
-    clock.advance(-20 * 60_000);
-    box.noteDelivered(peer.id, "mid");
-    clock.advance(20 * 60_000);
-    await work("mid");
+    expect(await keys()).toEqual(["ack:A"]);
+    // A steer that passed no key suppresses nothing: its shadow copy comes too.
+    await work("no key", me.id, "fleet.work.pi-fabric.3", "plain");
+    box.noteDelivered(peer.id, { ref: "Smarty-Pants-Inc/pi-fabric#3" });
     clock.advance(1);
-    expect(texts((await box.next(held)).events)).toEqual(["mid"]);
-    // Hours later, the same text again with no new steer: an old receipt must not hide it.
-    box.noteDelivered(peer.id, "late");
-    clock.advance(7 * 60 * 60_000);
+    expect(await keys()).toEqual(["plain"]);
+    // A receipt past its hour is gone: the same key published later comes.
+    clock.advance(-2 * 60 * 60_000);
+    box.noteDelivered(peer.id, { key: "late" });
+    clock.advance(2 * 60 * 60_000);
     await work("late");
     clock.advance(1);
     expect(texts((await box.next(held)).events)).toEqual(["late"]);
@@ -149,12 +151,12 @@ describe("RootInbox", () => {
 });
 
 describe("MainAgentController delivery observer", () => {
-  it("reports each agent message it delivers, for the inbox to skip its shadow record", () => {
+  it("reports each agent message's sender and data, for the inbox to skip its shadow record", () => {
     const pi = { sendMessage: vi.fn(), getThinkingLevel: vi.fn() } as unknown as ExtensionAPI;
     const main = new MainAgentController(pi, "session:me", true, process.cwd(), "me");
-    const seen: Array<[string, string]> = [];
-    main.deliveryObserver = (fromId, text) => seen.push([fromId, text]);
-    main.deliverAgent({ from: { id: "session:peer", name: "main", kind: "main" }, message: "hello", delivery: "followUp" } as never);
-    expect(seen).toEqual([["session:peer", "hello"]]);
+    const seen: Array<[string, unknown]> = [];
+    main.deliveryObserver = (fromId, data) => seen.push([fromId, data]);
+    main.deliverAgent({ from: { id: "session:peer", name: "main", kind: "main" }, message: "hello", delivery: "followUp", data: { key: "k1" } } as never);
+    expect(seen).toEqual([["session:peer", { key: "k1" }]]);
   });
 });

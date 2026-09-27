@@ -133,6 +133,7 @@ Fabric includes a live activity surface in Pi:
 - A compact widget above the chat (like `pi-supervisor`) whose header follows the current phase while its rows show active/completed agents, active actors, and their recent nested tool or code-change activity.
 - `/fabric` (or `/fabric dashboard`): opens the **Activity** and **Topology** views. The user-facing Pi session appears as **Main**. You can queue or steer participants and inspect the project topology.
 - `/fabric settings`: mirrors Pi's `/settings` and writes changes to `fabric.json`. TUI hosts get the searchable settings component; RPC hosts get the same nested sections, value/input/model pickers, list editors, and project/global save scopes through native dialog primitives.
+- Code previews automatically highlight `.bend` files using Bend 2 syntax, including laws and proof terms. The grammar loads only when needed, with no Bend installation required.
 - `Tool display` (`compact` by default, or `full`) is configured under `/fabric settings` → **UI**; compact elevates the declared display intent, hides the outer program, and applies to the current transcript immediately. Pi's tool-expand keybinding (`ctrl+o` by default) expands a compact card to the full transcript.
 
 See the [interface & commands reference](docs/interface.md) for every view, keybinding, and slash command.
@@ -145,8 +146,8 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 - [Interface & commands](docs/interface.md): dashboard, settings, keybindings, slash commands, and headless runs.
 - [Agents, actors & mesh](docs/agents.md): model handoff, `/fabric prewalk`, runners, transports, actors, councils, recursive queries, and durable coordination.
 - [Durable residency through Pi](docs/residency-runtime.md): background host lifecycle and the Pi-runtime launcher boundary.
-- [External connector components](docs/harnesses.md): connector-owned browser/macOS extensions using the generic component lifecycle. No connector-specific runtime registration; works with ordinary models, deterministic code, or Jev.
-- [Jev System One programs](docs/jev.md): typed judgments, `/login jev`, `openrouter`, or `vercel-ai-gateway` credentials, foreground/background loops, and budgets.
+- [Harness CLI composition](docs/harnesses.md): use browser/macOS tools through their existing CLIs, without Fabric-specific bridges or component configuration.
+- [Jev shell orchestration](docs/jev.md): bounded process supervision, event-driven task wait/watch, optional explicit typed judgments, and foreground/background budgets.
 - [Components & committed capabilities](docs/components.md): supervised effects, exact requirements, external per-model guidance and execution-profile replacement, rolling provider generations, actor commitments, and both formal calculi.
 - [External providers](docs/providers.md): the versioned provider protocol for extensions.
 - [Architecture & security](docs/architecture.md): the host bridge, sandboxing, tool-call robustness, and limits.

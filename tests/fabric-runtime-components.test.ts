@@ -135,6 +135,7 @@ describe("Fabric runtime provider components", () => {
           "fabric.provider.prewalk",
           "fabric.provider.schema",
           "fabric.provider.state",
+          "fabric.provider.tasks",
         ],
       }]);
       const discovery = componentDiscovery;
@@ -162,6 +163,7 @@ describe("Fabric runtime provider components", () => {
             "agents",
             "memory",
             "jev",
+            "tasks",
           ].map((name) => expect.objectContaining({
             id: `fabric.provider.${name}`,
             state: "active",
@@ -193,6 +195,12 @@ describe("Fabric runtime provider components", () => {
         cwd, signal: undefined, parentToolCallId: "jev-reload-test", nestedToolCallId: "jev-reload-test",
         extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 32_768,
       };
+      for (const ref of ["tasks.wait", "tasks.watch"]) {
+        expect(await runtime.registry.describe(ref, invocation)).toMatchObject({ ref, risk: "read" });
+      }
+      expect(runtime.modelGuidance()).toContainEqual(expect.objectContaining({
+        label: "jev-programs", content: expect.stringContaining("tasks.wait/watch"),
+      }));
       // Configuration can precede extension discovery. The host knows no device API.
       expect(runtime.components.status("optional-device").state).toBe("waiting");
       expect(runtime.registry.has("devicefixture")).toBe(false);

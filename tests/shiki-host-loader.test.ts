@@ -13,6 +13,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 // when it receives a resolved theme object.
 
 const createHighlighterMock = vi.fn();
+const loadLanguageMock = vi.fn();
 
 vi.mock("shiki", () => ({
   createHighlighter: (options: unknown) => createHighlighterMock(options),
@@ -31,6 +32,12 @@ import { resolveShikiThemeObject } from "../src/ui/shiki-theme.js";
 
 beforeEach(() => {
   createHighlighterMock.mockReset();
+  loadLanguageMock.mockReset();
+  loadLanguageMock.mockImplementation(async loader => {
+    if (typeof loader !== "function") throw new Error("Expected a catalog loader, not a language id");
+    const module = await loader();
+    expect(module.default).toEqual(expect.arrayContaining([expect.objectContaining({ name: "bend" })]));
+  });
   createHighlighterMock.mockImplementation(async (options: {
     themes: unknown[];
     langs: unknown[];
@@ -45,6 +52,7 @@ beforeEach(() => {
     }
     return {
       dispose: () => {},
+      loadLanguage: loadLanguageMock,
       codeToHtml: () => "<span>highlighted</span>",
       codeToTokens: () => ({ tokens: [] }),
       // highlightCode calls codeToTokensBase directly; without it the mock
@@ -81,6 +89,17 @@ describe("shiki host-loader theme resolution (#46)", () => {
     // the plain-text catch path, so previews render.
     const lines = highlightCode("const x = 1;", "typescript");
     expect(lines).not.toBeNull();
+  });
+
+  it("loads Bend through the local catalog instead of Shiki's built-in ids", async () => {
+    await initHighlighting("dark-plus", true);
+    expect(loadLanguageMock).not.toHaveBeenCalled();
+    const invalidate = vi.fn();
+    expect(highlightCode("law add_zero:", "bend", invalidate)).toBeNull();
+    await vi.waitFor(() => expect(invalidate).toHaveBeenCalled(), { timeout: 15_000 });
+    expect(loadLanguageMock).toHaveBeenCalledTimes(1);
+    expect(typeof loadLanguageMock.mock.calls[0]?.[0]).toBe("function");
+    expect(highlightCode("law add_zero:", "bend")).not.toBeNull();
   });
 
   it("resolves a bundled theme id to its object from pi-fabric's module graph", async () => {

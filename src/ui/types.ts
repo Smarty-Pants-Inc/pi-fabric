@@ -75,6 +75,7 @@ export interface FabricUiStateEntry {
 }
 
 export interface FabricDashboardSnapshot {
+  shells?: import("../core/shell-jobs.js").FabricShellJobInfo[];
   now: number;
   widgetDismissedAt?: number;
   runs: FabricActivityRun[];

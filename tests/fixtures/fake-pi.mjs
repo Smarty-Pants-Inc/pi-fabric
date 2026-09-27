@@ -71,7 +71,61 @@ const runCompactionLifecycle = (fail) => {
   });
 };
 
+const terminated = () => {
+  emit({ type: "agent_start" });
+  emit({ type: "message_end", message: {
+    role: "assistant", content: [], stopReason: "error", errorMessage: "Error: Terminated",
+  } });
+};
+
 switch (behavior) {
+  case "terminated-hang":
+  case "retry-hang": {
+    terminated();
+    if (behavior === "retry-hang") {
+      emit({ type: "agent_end", willRetry: true });
+      emit({ type: "agent_settled" });
+    }
+    // Ignore both EOF and SIGTERM so the real worker must escalate to SIGKILL.
+    process.on("SIGTERM", () => {});
+    emit({ type: "fake_child_pid", pid: process.pid });
+    setInterval(() => {
+      emit({ type: "queue_update", steering: [], followUp: [] });
+      if (behavior === "retry-hang") emit({ type: "auto_retry_start", errorMessage: "Error: Terminated" });
+    }, 1_000);
+    break;
+  }
+  case "retry-exhausted":
+  case "retry-exhausted-stubborn":
+    terminated();
+    emit({ type: "agent_end", willRetry: true });
+    emit({ type: "auto_retry_start", errorMessage: "Error: Terminated" });
+    emit({ type: "auto_retry_end", success: false, finalError: "Error: Terminated (retries exhausted)" });
+    emit({ type: "agent_settled" });
+    if (behavior === "retry-exhausted-stubborn") {
+      process.on("SIGTERM", () => {});
+      setInterval(() => {}, 60_000);
+    }
+    break;
+  case "terminated-restart-exit":
+    terminated();
+    emit({ type: "agent_start" });
+    process.exit(0);
+    break;
+  case "terminated-recover":
+    terminated();
+    emit({ type: "agent_end", willRetry: true });
+    emit({ type: "agent_settled" });
+    emit({ type: "auto_retry_start", errorMessage: "Error: Terminated" });
+    setTimeout(() => {
+      emit({ type: "agent_start" });
+      emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "recovered" } });
+      emit({ type: "message_end", message: { role: "assistant", content: "recovered", stopReason: "stop" } });
+      emit({ type: "agent_end", willRetry: false });
+      emit({ type: "auto_retry_end", success: true });
+      emit({ type: "agent_settled" });
+    }, 25);
+    break;
   case "capture-prompt":
     capturePrompt();
     break;

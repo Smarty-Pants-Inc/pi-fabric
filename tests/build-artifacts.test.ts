@@ -35,6 +35,11 @@ describe("published build artifact guards", () => {
     fs.writeFileSync(file, JSON.stringify(manifest));
     rejected(dir, "Missing or unpackaged public entrypoint: ./dist/missing.js");
   });
+  it("rejects a missing lazy Bend grammar entry", () => {
+    const dir = fixture();
+    fs.rmSync(path.join(dir, "dist/ui/languages/bend.js"));
+    rejected(dir, "ui/languages/bend.js");
+  });
   it("rejects a missing generated ABI declaration", () => {
     const dir = fixture();
     fs.rmSync(path.join(dir, "dist/verified/generated/storage-kernel.d.ts"));

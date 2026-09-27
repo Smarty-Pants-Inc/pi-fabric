@@ -120,7 +120,8 @@ export const createDashboardSnapshot = (
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };
   const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200) : [];
-  const inputs = { runs, agentRecords, actorRecords, participants, main, peers,
+  const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
+  const inputs = { runs, agentRecords, actorRecords, participants, main, peers, shells,
     globalActors, componentGraph, meshEntries, events, widgetDismissedAt: state.widgetDismissedAt };
   const previous = cache?.get(inputs);
   if (previous) return previous;
@@ -312,6 +313,7 @@ export const createDashboardSnapshot = (
 
   const snapshot: FabricDashboardSnapshot = {
     now: Date.now(),
+    shells,
     runs: orderedRuns,
     main,
     peers,

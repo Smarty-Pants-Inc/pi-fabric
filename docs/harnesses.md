@@ -1,122 +1,95 @@
-# External connector components
+# Harness CLI composition
 
-Fabric is connector-agnostic. A browser, desktop, database, or application connector is an independently installed component package, not a special case in Fabric's runtime. Jev is one possible decision-maker; ordinary models and deterministic programs use the same discovered capabilities.
+Fabric follows `jev-fabric`'s shell-first boundary: compose existing programs,
+not application-specific tool bridges. Browser Harness JS and macOS Harness own
+their connections, persistent state, native APIs, permission checks, and guarded
+interaction. Fabric supplies its existing shell and task supervision; Jev is an
+optional typed decision-maker. No harness-specific Fabric extension, SDK module
+path, component entry, or provider registration is required.
 
-## Ownership boundary
+## Browser Harness JS
 
-| Fabric owns | Connector package owns |
-| --- | --- |
-| Component registration/discovery and configuration | Component definition and config schema |
-| Provider catalog, validation, approvals, audit | Action vocabulary, arguments, and results |
-| Exact capability commitments and generation pinning | Target identity, scope, freshness, and execution guards |
-| Activation, replacement, draining, provider close | SDK loading, connections, subprocesses, and cleanup implementation |
-| Generic model-guidance projection | Connector-specific usage guidance |
-
-Fabric does not require every connector to implement `observe`, `act`, or a shared receipt schema. The two harnesses below choose that interface because it fits UI automation. Discover and describe the installed package's actual capabilities before use. Adding a third connector requires no Fabric runtime branch, export, or rebuild.
-
-See [components](components.md) for the authoritative lifecycle, trust, and capability contracts. Extensions are trusted host code; neither a component label nor a model confidence score makes a connector a security sandbox.
-
-## Load the harness-owned extension
-
-Each harness repository supplies an optional `pi/` package:
-
-- `browser-harness-js/pi/extension.ts`: registers `browser-harness`, providing `browser`.
-- `macos-harness/pi/extension.ts`: registers `macos-harness`, providing `macos`.
-
-From a sibling `pi-fabric` checkout, try them for one Pi invocation:
-
-```sh
-pi -e ../browser-harness-js/pi/extension.ts -e ../macos-harness/pi/extension.ts
-```
-
-Or install either local package through Pi's normal package manager:
-
-```sh
-pi install ../browser-harness-js/pi
-pi install ../macos-harness/pi
-```
-
-These are instructions, not actions taken automatically by Fabric. Review/trust the extensions first. Follow each package's README for its host peers and standalone test setup. The adapters do not install the Browser Harness SDK or native Python harness for you.
-
-The extension emits `FABRIC_COMPONENT_REGISTER_EVENT` and answers `FABRIC_COMPONENT_DISCOVER_EVENT`, using the existing v1 protocol. Registration publishes a cheap definition and config schema; it does not connect to an app/browser or start a subprocess. Fabric does not load an extension merely because its name appears in `fabric.json`. Configuration may precede discovery: the instance stays `waiting` until its definition is supplied.
-
-## Configure through the generic component plane
-
-Inspect the installed definition before constructing config:
+Load the harness-owned `cdp` skill. After the user authorizes a browser scope,
+use its normal CLI through `pi.bash`, with `--no-auto-allow` so Fabric does not
+silently approve a browser debugging prompt. For a reviewed snippet saved by
+`pi.write`, the command shape is:
 
 ```ts
-return await components.describe({component:"browser-harness"});
+return await pi.bash({cmd:"browser-harness-js --no-auto-allow < ./observe-browser.js",timeout:15,settle:true});
 ```
 
-Use the returned config schema. For example, the Browser Harness adapter accepts an explicit debug endpoint and separate raw/guarded grants:
+This is a composition pattern, not permission to connect or scan. The CLI owns a
+persistent daemon, session, and explicit target routing; Fabric does not import
+the SDK or create a second connection. Use the harness's authorized connection
+setup and guarded controller at unknown UI boundaries. Preserve explicit target
+scope and fresh observation handles. The CLI prints raw results, not a Fabric
+provider envelope: validate the documented result, exit status, and size before
+parsing. Empty output is not automatically valid JSON or proof of success.
 
-```ts
-const plan = await components.plan({
-  entries: [{
-    id: "browser",
-    component: "browser-harness",
-    config: {
-      modulePath: "../browser-harness-js/skills/cdp/sdk/session.ts",
-      interactionModulePath: "../browser-harness-js/skills/cdp/sdk/interaction.ts",
-      wsUrl: "ws://127.0.0.1:9222/devtools/browser/REPLACE_WITH_AUTHORIZED_DEBUG_ID",
-      allowedOrigins: ["https://example.com"],
-      allowedMethods: ["Target.getTargets", "Target.attachToTarget"],
-      callTimeoutMs: 10000,
-    },
-  }],
-});
-return plan; // Inspect the change; then apply the exact request/revision under normal approvals.
+A short CLI process exiting does not stop its daemon. Follow the harness's own
+cleanup contract; stopping a Fabric task is not rollback or daemon shutdown.
+Do not stop a shared daemon owned by another workflow.
+
+## macOS Harness
+
+Load the harness-owned `macos-harness` skill. Native access needs separately
+approved OS permissions and explicit already-running app scope. The guarded
+server is an ordinary command:
+
+```sh
+macos-harness serve --app com.apple.TextEdit
 ```
 
-Apply with `components.apply({...plan.request,expectedRevision:plan.revision})`. The default session scope does not write files; use explicit global/project scope for persistence. Alternatively put the same component entry in trusted `fabric.json`. Neither path requests native permissions or implicitly calls `browser.connect`.
+Keep **one** process alive for a multi-step workflow. Its stdin/stdout protocol
+is newline-terminated UTF-8 JSON, `{id,method,args}` to `{id,result}` or
+`{id,error}`; stderr contains diagnostics. A reviewed task-specific native script
+can own the child, serialize requests, validate response IDs/errors, enforce
+bounds/deadlines, and close stdin/terminate it during cleanup. Run that script
+through the authorized shell, e.g. `pi.bash({cmd:"node ./desktop-task.mjs"})`.
+This does not change Fabric's configured kernel or grant an unrestricted fallback.
 
-The macOS package accepts a trusted argv prefix and exact app grants:
+`pi.bash` is not an interactive stdin handle. Do not launch `serve` as an isolated
+background command and expect `tasks.watch` to become RPC. Monitors and log tails
+are bounded observations and may omit/truncate data. Do not restart the server
+between observe and act: native controller handles do not survive process exit.
+For one-shot deterministic work, the harness's ordinary CLI/library can keep the
+whole observe/act/check sequence in one invocation.
 
-```json
-{
-  "id": "desktop",
-  "component": "macos-harness",
-  "config": {
-    "command": ["uv", "run", "--project", "../macos-harness", "macos-harness"],
-    "allowedApps": ["com.apple.TextEdit"],
-    "callTimeoutMs": 10000
-  }
-}
-```
+## Supervision and decisions
 
-That adapter owns the persistent JSON-lines child process and appends its `serve --app` arguments without a shell. It starts only on explicit `macos.connect`. Its package, not Fabric core, defines subprocess bounds, cancellation behavior, receipts, and native limitations.
+Use [background tasks](background-tasks.md) for finite shell deadlines,
+`tasks.wait`, literal-filtered `tasks.watch`, and `tasks.stop`. UI-only monitors
+never wake Main or invoke Jev. A program may explicitly evaluate a remaining
+semantic question over minimized output; see [Jev](jev.md). Validate exact status
+and protocol facts first, map typed answers to code-owned branches, and verify
+postconditions after effects. Never run a model answer as shell code.
 
-Use `tools.call({ref,args})` for newly discovered actions; do not assume a static guest proxy exists. The browser package requires an explicitly attached session ID and an authorized origin. It does not borrow the separate extension-relay daemon's process-local connection. Raw CDP method grants are separate, more powerful capabilities, not origin restrictions.
+Preserve the harness's guards:
 
-## Harness workflow, not a core protocol
+- `executed` means dispatched, not goal success; check fresh authoritative state.
+- `stale` means re-observe; never reuse stale handles.
+- `blocked` means resolve permission/scope or stop; raw APIs cannot bypass it.
+- `outcome_unknown` means inspect, never blindly replay.
+- Never approve permission dialogs, activate apps, or move the physical cursor
+  as a workaround. Keep secrets and unrelated private data out of model state.
 
-These harness packages support:
+Shell execution runs with host privileges. QuickJS program isolation is not a
+sandbox around the shell or a substitute for the harness's authorization rules.
+Cancellation is not rollback; detached processes/daemons have separate lifetimes.
 
-1. **Known deterministic route:** use an exact supported API/shortcut, batch safe deterministic steps, and verify the goal.
-2. **Unknown UI decision:** observe bounded state, select an observed target and advertised operation, call guarded `act`, then inspect fresh evidence.
-3. **Unsupported mechanic:** use separately authorized raw CDP/AX/vision/script paths, then re-observe. Never use an escape hatch to bypass a denied action.
+## Migration
 
-The browser scope is `{sessionId}`; native scope is `{app}`. Observations carry temporary handles. Read-only context rows may have no supported operations. The packages perform freshness validation inside `act`; they do not trust an earlier model-visible validation step. Their receipts distinguish `executed`, `stale`, `blocked`, and `outcome_unknown`:
+Remove unneeded `browser-harness` / `macos-harness` entries from your Fabric
+configuration and stop loading their optional `pi/` extensions when switching
+to CLI composition. Do this deliberately after stopping their work: no automatic
+configuration rewrite or cleanup is performed. Replace `browser.*` / `macos.*`
+program grants with only the shell/task actions actually needed.
 
-- Executed means dispatched, not goal success.
-- Stale means re-observe and select again.
-- Blocked means resolve the prerequisite/approval or stop, not bypass.
-- Unknown means inspect; never blindly replay.
+There are no concrete harness exports in `pi-fabric/jev` and no compatibility
+bridge to maintain. The generic [component protocol](components.md) remains
+available for independently installed providers; this change does not remove it
+or modify the sibling harness repositories. Harness-specific docs/skills in those
+packages remain authoritative for their standalone CLIs.
 
-Cancellation is not rollback, and GUI effects cannot be made completely atomic against user/application changes. A model's `DONE` is not independent verification. Exact postconditions belong in code where possible. See the harness-owned skills for supported controls, limits, privacy behavior, and operation names.
-
-The browser controller currently uses bounded light-DOM observation and synthetic DOM input, not a complete accessibility implementation or trusted mouse/keyboard events. The native controller conservatively blocks background AX effects to preserve focus guarantees. These are connector capabilities, not assumptions built into Fabric.
-
-## Jev composition
-
-Jev programs declare only the exact installed refs they need. For these harnesses that may be `jev.evaluate`, `browser.observe`, and `browser.act`, or the corresponding native refs. Connect/attach explicitly before launching a loop; pass the authorized scope as input. Batch independent selection questions and execute only the branch selected by code. Keep the no-match/escalation path and finite budgets.
-
-Other connectors may use entirely different verbs and result shapes. Read their descriptors and guidance. Do not infer a universal UI interface. Keep deterministic rules, permission decisions, and execution outside model confidence. Send only consented, bounded, redacted state to a model; generated prose requires Main or an authorized text helper, not Jev. See [Jev](jev.md) for program/auth contracts.
-
-## Migration and verification
-
-Existing `browser-harness` configuration now requires loading the Browser Harness-owned extension. The component name and raw `modulePath` / `wsUrl` / `allowedMethods` configuration are retained by that package. New guarded features belong there.
-
-The former `BrowserHarnessProvider`, `browserHarnessComponent`, and browser adapter type exports have been removed from `pi-fabric/jev`, along with the core implementation. Code importing them must migrate to the Browser Harness-owned package. There is no compatibility shim or connector-specific `pi-fabric/harness` API; Fabric and Jev expose only generic integration contracts.
-
-Fabric's `tests/fabric-runtime-components.test.ts` checks an arbitrary externally registered device, including configuration before discovery, dynamic invocation, and cleanup. Concrete browser/native adapter tests live with their owning `pi/` packages. Those tests and the native fixture use synthetic/offline backends; live model probes are separate from live-UI reliability tests. No personal browser/app control is required to verify the registration boundary.
+Offline checks use local fixture processes and mocked judgments. They do not
+connect to a personal browser, control apps, install tools, or spend API credits.

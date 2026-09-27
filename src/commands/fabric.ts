@@ -301,12 +301,22 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
     },
   });
 
+  pi.registerShortcut?.("ctrl+alt+t", {
+    description: "Inspect Fabric background shell tasks",
+    handler: async (context) => {
+      if (context.mode !== "tui") return;
+      try { await state.ensure(context); await fabricUi.openTasks(context); }
+      catch (error) { context.ui.notify(safeText(error instanceof Error ? error.message : String(error)), "error"); }
+    },
+  });
+
   pi.registerCommand("fabric", {
-    description: "Open Fabric dashboard or chat, arm prewalk, reload, or manage agents and actors",
+    description: "Open Fabric dashboard, chat or tasks, arm prewalk, reload, or manage agents and actors",
     getArgumentCompletions: (argumentPrefix: string): AutocompleteItem[] | null => {
       const subcommands = [
         "status",
         "dashboard",
+        "tasks",
         "chat",
         "settings",
         "schema",
@@ -349,6 +359,10 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       const subcommand = argumentPrefix.slice(0, firstSpace);
       const idPrefix = argumentPrefix.slice(firstSpace + 1);
       if (!state.initialized) return null;
+      if (subcommand === "tasks") {
+        const matches = state.shellJobs?.list().filter(job => job.id.startsWith(idPrefix)) ?? [];
+        return matches.map(job => ({ value: `tasks ${job.id}`, label: job.id.slice(0, 8), description: safeText(job.description ?? job.command).slice(0, 120) }));
+      }
       if (subcommand === "chat") {
         const snapshot = fabricUi.snapshot();
         const seen = new Set<string>();
@@ -565,6 +579,10 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         }
         const task = argumentsText.trim().slice(command.length).trim();
         await armPrewalk(state, context, pi, task);
+        return;
+      }
+      if (command === "tasks") {
+        await fabricUi.openTasks(context, argumentsList[0]);
         return;
       }
       if (command === "chat") {

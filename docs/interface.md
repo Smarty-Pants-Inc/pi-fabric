@@ -10,6 +10,12 @@ Nested `pi.read`, `pi.bash`, `pi.powershell`, `pi.grep`, `pi.find`, `pi.ls`, `pi
 
 Fabric keeps its orchestration-specific behavior around those previews. Multi-call rows stay compact, and live write composition with phase/call progress stays visible during the run. Agent and actor audits can expose their current child tools directly in the parent card, with owner, runner, and run metadata. One execution-wide throttle coalesces parallel nested-call updates before they reach Pi, and continuous streams are not starved. Long ANSI rows are bounded without clearing the enclosing tool background. The widget lease plus result-to-source row transfer keep completion height stable. The highlighter initializes lazily and falls back to plain text until it is ready. When Pi switches between its light and dark variants, the highlighter swaps themes live. Collapsed previews use the configured expand keybinding, for example `Ctrl-O`.
 
+## Background shell tasks
+
+`/fabric tasks` or **Ctrl+Alt+T** opens a live task inspector without interrupting Main. The widget keeps detached commands visible with their ID, purpose/command, elapsed time and access hint. A single task opens directly; Enter inspects a selected task, arrows scroll its bounded output tail, **x twice** stops it, and Esc returns to the list or closes. The detail shows cwd, PID, exit status, output path, elapsed time separately from time since last output, and monitor delivery/deadline. Completion hints last 30 seconds; retained jobs remain inspectable.
+
+See [Background tasks and monitors](background-tasks.md) for completion delivery, task controls, opt-in UI-only versus agent-waking monitors, limits, and cancellation.
+
 ## Focused conversations
 
 Press **ctrl+shift+a** or run **`/fabric chat`** to open a full-screen conversation without going through the dashboard. `/fabric chat <id-or-name>` opens a specific agent or actor; Tab completes exact participant IDs, including nested agents. Ambiguous names or ID prefixes are rejected; use an exact participant ID to select the intended target. In the dashboard, **Shift+C** opens the selected participant.
@@ -184,6 +190,7 @@ async invoke(actionName, args, context) {
 /fabric status
 /fabric dashboard
 /fabric chat [participant-id-or-name]
+/fabric tasks [task-id]
 /fabric settings
 /fabric reload
 /fabric providers

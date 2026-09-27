@@ -547,6 +547,32 @@ describe("Fabric core tool parity rendering", () => {
     expect(previews.map((render) => render()).every((text) => text.includes("\x1b[38;2;"))).toBe(true);
   }, 20_000);
 
+  it("highlights Bend read, write, edit, and grep previews on demand", async () => {
+    configureHighlighting("dark-plus", false);
+    await initHighlighting("dark-plus", true);
+    const invalidate = vi.fn();
+    const code = "law add_zero: # Bend proof";
+    const previews = [
+      audit("read", { args: { path: "missing/LAWS.bend" }, result: code, success: true }),
+      audit("write", {
+        args: { path: "missing/new.bend", content: code },
+        preview: { writeBeforeCaptured: true }, success: true,
+      }),
+      audit("edit", {
+        args: { path: "missing/PROOF.bend" },
+        result: { details: { diff: "-1 law old:\n+1 law add_zero:" } }, success: true,
+      }),
+      audit("grep", {
+        args: { path: "missing", pattern: "law", literal: true },
+        result: `missing/LAWS.bend:1: ${code}`, success: true,
+      }),
+    ];
+    const render = () => previews.map(call => renderCoreToolBody(call, theme, options({ invalidate }))!.lines.join("\n"));
+    expect(render().every(text => !text.includes("\x1b[38;2;"))).toBe(true);
+    await vi.waitFor(() => expect(invalidate).toHaveBeenCalled(), { timeout: 15_000 });
+    expect(render().every(text => text.includes("\x1b[38;2;"))).toBe(true);
+  }, 20_000);
+
   it("does not apply core rendering to another provider with a colliding action name", () => {
     const other = {
       ref: "mcp.files.read",

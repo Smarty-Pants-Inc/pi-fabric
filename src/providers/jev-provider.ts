@@ -27,7 +27,7 @@ export const jevLaunchSchema = Type.Object({
     requires: Type.Array(Type.String({ minLength: 3, maxLength: 256 }), { maxItems: 64, uniqueItems: true }),
     limits: Type.Optional(Type.Object({
       timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
-      maxEvaluations: Type.Optional(Type.Integer({ minimum: 1 })),
+      maxEvaluations: Type.Optional(Type.Integer({ minimum: 0 })),
       maxToolCalls: Type.Optional(Type.Integer({ minimum: 1 })),
       maxTokens: Type.Optional(Type.Integer({ minimum: 1 })),
     }, { additionalProperties: false })),
@@ -47,7 +47,7 @@ export const jevAdviceSchema = Type.Object({
 }, { additionalProperties: false });
 export const JEV_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   { name: "evaluate", description: "Ask Jev typed Choice, Noul (probability of yes), and Score questions over shared state. No generated text. Batch independent questions. Sends state to TypeSafe and consumes API credits; no automatic retries.", inputSchema: jevRequestSchema as unknown as Record<string, unknown>, risk: "network", effect: { kind: "emission", resources: ["typesafe:inference"], ordering: "unknown" } },
-  { name: "run", description: "Run an isolated TypeScript System One program in the foreground. Returns a terminal run envelope with schema-validated result or error. Globals: input, jev.evaluate, program.sleep(ms), program.emit(value), and Fabric tools restricted to exact requires. Loops are supported; no host imports or secrets.", inputSchema: jevLaunchSchema as unknown as Record<string, unknown>, risk: "execute" },
+  { name: "run", description: "Run a bounded TypeScript shell orchestrator or typed-decision program in the foreground. Returns a terminal run envelope with schema-validated result or error. Globals: input, jev.evaluate, program.sleep(ms), program.emit(value), and Fabric tools restricted to exact requires. Use granted pi.bash and tasks.wait/watch for shell orchestration; maxEvaluations:0 disables program inference. No automatic judgments, host imports or secrets.", inputSchema: jevLaunchSchema as unknown as Record<string, unknown>, risk: "execute" },
   { name: "spawn", description: "Launch a session-owned background Jev program. Optional observe requires read approval and subscribes to Main lifecycle events; program.nextEvent waits without polling and shares only explicitly selected bounded context. program.advise needs observe.delivery and requires jev.advise. Use status, wait/join, and stop; not restart-durable.", inputSchema: jevLaunchSchema as unknown as Record<string, unknown>, risk: "execute" },
   { name: "status", description: "Without id: credential configuration status (never retrieves secrets) and run summaries. With id: state, usage, bounded events after sequence, logs, result/error. Retains at most 64 events; nextSequence allows detecting gaps.", inputSchema: statusSchema as unknown as Record<string, unknown>, risk: "read" },
   { name: "wait", description: "Wait for a background Jev program's terminal run envelope. Cancelling the wait does not cancel the program.", inputSchema: idSchema as unknown as Record<string, unknown>, risk: "read" },
@@ -58,7 +58,7 @@ export const JEV_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
 
 export class JevProvider implements FabricProvider {
   readonly name = "jev";
-  readonly description = "TypeSafe System One judgments and foreground/background reactive TypeScript programs";
+  readonly description = "Shell-first TypeScript orchestration with explicit typed Jev decisions";
   readonly manager: JevProgramManager;
   readonly client: JevClient;
   readonly route: JevRoute;

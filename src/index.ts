@@ -1,4 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
@@ -173,6 +174,25 @@ const SKILL_REFERENCE_CUSTOM_TYPE = "pi-fabric-skill-reference";
 export const FABRIC_MANAGED_HOST_VERSION = 1;
 export type { FabricManagedHostOptions } from "./managed-host.js";
 import type { FabricManagedHostOptions } from "./managed-host.js";
+
+// A run the user aborted, or one that failed, must not start another turn by itself. Newer Pi
+// names the outcome; for older Pi, the last assistant message's stop reason says it.
+const settledCompleted = (event: unknown, context: ExtensionContext): boolean => {
+  const outcome = (event as { outcome?: unknown }).outcome;
+  if (typeof outcome === "string") return outcome === "completed";
+  if (context.signal?.aborted) return false;
+  const entries = context.sessionManager.getEntries();
+  for (let index = entries.length - 1; index >= Math.max(0, entries.length - 50); index--) {
+    const entry = entries[index] as { type?: string; message?: { role?: string; stopReason?: string } };
+    if (entry.type === "message" && entry.message?.role === "assistant") {
+      return entry.message.stopReason !== "aborted" && entry.message.stopReason !== "error";
+    }
+  }
+  return true;
+};
+
+// Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
+const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sessionManager.getEntries());
 
 export default async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
@@ -618,7 +638,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     await state.compact.maybeCommit(context);
     await compactAtConfiguredThreshold(context, state.config);
     await state.publishHostLifecycle("pi.agent_settled", event);
+    // A Main whose run completed takes the work events a steer missed as its next turn
+    // (smarty-dev#754). An aborted or failed run starts nothing: the batch waits for a turn.
+    if (settledCompleted(event, context)) {
+      const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
+      if (inbox?.events.length) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+    }
   });
+
 
   // Speculative PTC: follow fabric_exec argument streaming and pre-launch
   // literal-argument read calls so their latency hides behind generation.
@@ -917,6 +944,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         details: { names: fresh, origin: "skill" },
       },
     };
+  });
+
+  // Work events a steer missed reach the Main with its next turn (smarty-dev#754).
+  pi.on("before_agent_start", async (_event, context) => {
+    if (!state.initialized) return;
+    const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
+    if (!inbox?.events.length) return;
+    return { message: rootInboxMessage(inbox.events) };
   });
 
   registerFabricActorHostEventObservers(pi, (eventName, event, context) => {

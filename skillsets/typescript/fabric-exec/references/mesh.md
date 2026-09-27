@@ -19,6 +19,8 @@ The directory stores participant records separately from short-lived execution-h
 
 Topics provide durable channel and direct-message semantics with sequence cursors.
 
+A Main reconciles its inbox at every turn start and when it settles: a `fleet.*` event addressed to it (`to` is its participant id, `session:<id>`, or its Pi session name) that no steer or follow-up delivered reaches it as one message, once, about a minute after it was published. A shadow record is skipped only when the session already holds the steer or follow-up that carried the same work key (`data: { key }`) from the same sender; otherwise the copy comes too.
+
 The live log keeps its newest events only. A mesh root whose `event-archive.json` names an archive directory also writes every event to plain append-only files there, one per topic and UTC day (`<yyyy>/<mm>/<dd>/<topic>.jsonl`), before any reader sees it. A publish fails if the archive cannot take the event. `mesh.read({ after })` with a cursor older than the live log reads the archive.
 
 ```ts

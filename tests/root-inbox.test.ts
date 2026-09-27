@@ -1,0 +1,152 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { RootInbox, rootInboxMessage, rootInboxSession, sessionHoldsInboxBatch, type RootInboxSession } from "../src/topology/root-inbox.js";
+
+// smarty-dev#754 §3.2 step 3: a Main reconciles the work events addressed to it that no steer
+// delivered. A batch stays pending until the session holds it; the cursor moves only then.
+const roots: string[] = [];
+const me: MeshIdentity = { id: "session:me", name: "main", kind: "main", sessionId: "me" };
+const peer: MeshIdentity = { id: "session:peer", name: "main", kind: "main", sessionId: "peer" };
+const held: RootInboxSession = { holdsBatch: () => true, holdsSteer: () => false };
+const notHeld: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => false };
+// A session whose entries hold the steers delivered so far (the pi-fabric-agent-message entries).
+const withSteers = (steers: Array<{ from: string; data: unknown }>): RootInboxSession => ({
+  holdsBatch: () => true,
+  holdsSteer: rootInboxSession(steers.map(({ from, data }) => ({
+    type: "custom_message", customType: "pi-fabric-agent-message", details: { from: { id: from }, data },
+  }))).holdsSteer,
+});
+
+const setup = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-root-inbox-"));
+  roots.push(root);
+  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 500);
+  let offset = 0;
+  const clock = { now: () => Date.now() + offset, advance: (ms: number) => { offset += ms; } };
+  const inbox = (steerGraceMs = 0) =>
+    new RootInbox(mesh, me, () => [me.id, "fabric-v2"], { now: clock.now, steerGraceMs });
+  const work = (text: string, to = me.id, topic = "fleet.work.pi-fabric.1", key = text) =>
+    mesh.publish({ topic, to, kind: "ack", from: peer, text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key } });
+  const texts = (events: MeshEvent[]) => events.map((event) => event.text);
+  return { mesh, clock, inbox, work, texts };
+};
+
+afterEach(() => {
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("RootInbox", () => {
+  it("starts at the present, then brings work events addressed to this root by id or name", async () => {
+    const { clock, inbox, work, texts } = setup();
+    await work("before the inbox existed");
+    const box = inbox();
+    expect((await box.next(held)).events).toEqual([]);
+    await work("by id");
+    await work("by name", "fabric-v2");
+    await work("to someone else", "session:other");
+    await work("not a work topic", me.id, "ops.owner");
+    clock.advance(1);
+    expect(texts((await box.next(held)).events)).toEqual(["by id", "by name"]);
+    expect((await box.next(held)).events).toEqual([]);
+  });
+
+  it("leaves a young event for a later reconcile, and never moves past it", async () => {
+    const { clock, inbox, work, texts } = setup();
+    const box = inbox(60_000);
+    await box.next(held);
+    await work("young");
+    expect((await box.next(held)).events).toEqual([]);
+    clock.advance(61_000);
+    expect(texts((await box.next(held)).events)).toEqual(["young"]);
+  });
+
+  it("delivers a batch again until the session holds it, also after a restart (review F1)", async () => {
+    const { clock, inbox, work, texts } = setup();
+    const first = inbox();
+    await first.next(held);
+    await work("must arrive");
+    clock.advance(1);
+    const batch = await first.next(held);
+    expect(texts(batch.events)).toEqual(["must arrive"]);
+    // A stop before the session wrote the message: the restarted inbox delivers it again.
+    const second = inbox();
+    expect(texts((await second.next(notHeld)).events)).toEqual(["must arrive"]);
+    expect(texts((await second.next(notHeld)).events)).toEqual(["must arrive"]);
+    // Once the session holds it, the cursor moves and it does not come again.
+    expect((await second.next(held)).events).toEqual([]);
+    expect((await inbox().next(held)).events).toEqual([]);
+  });
+
+  it("keeps a batch pending through any number of undelivered attempts, until the session holds it (review F1)", async () => {
+    const { clock, inbox, work, texts } = setup();
+    await inbox().next(held);
+    await work("stuck");
+    clock.advance(1);
+    // Each attempt is a stop between the pending save and the session's write: a fresh process.
+    for (let attempt = 1; attempt <= 8; attempt++) expect(texts((await inbox().next(notHeld)).events)).toEqual(["stuck"]);
+    expect((await inbox().next(held)).events).toEqual([]);
+    expect((await inbox().next(notHeld)).events).toEqual([]);
+  });
+
+  it("skips a shadow record only when the session holds the steer with its sender and work key (review F2, round 3 F1)", async () => {
+    const { clock, inbox, work } = setup();
+    const box = inbox();
+    await box.next(held);
+    const keys = async (session: RootInboxSession) => (await box.next(session)).events.map((event) => (event.data as { key: string }).key);
+    // The first steer failed and the second reached the session, both with the text "ack".
+    await work("ack", me.id, "fleet.work.pi-fabric.1", "ack:A");
+    await work("ack", me.id, "fleet.work.pi-fabric.2", "ack:B");
+    clock.advance(1);
+    expect(await keys(withSteers([{ from: peer.id, data: { key: "ack:B" } }]))).toEqual(["ack:A"]);
+    // A steer that was only enqueued (Pi has not recorded it) suppresses nothing.
+    await work("queued", me.id, "fleet.work.pi-fabric.3", "queued:C");
+    clock.advance(1);
+    expect(await keys(withSteers([]))).toEqual(["queued:C"]);
+    // Another sender's steer with the same key is not this work; a steer without a key is none.
+    await work("other", me.id, "fleet.work.pi-fabric.4", "shared");
+    await work("plain", me.id, "fleet.work.pi-fabric.5", "plain");
+    clock.advance(1);
+    expect(await keys(withSteers([{ from: "session:else", data: { key: "shared" } }, { from: peer.id, data: {} }]))).toEqual(["shared", "plain"]);
+  });
+
+  it("bounds a batch by count and text, and loses none of a longer backlog (review F4)", async () => {
+    const { clock, inbox, work } = setup();
+    const box = inbox();
+    await box.next(held);
+    for (let index = 1; index <= 25; index++) await work(`item ${index}`);
+    clock.advance(1);
+    const first = await box.next(held);
+    expect(first.events).toHaveLength(20);
+    const second = await box.next(held);
+    expect(second.events.map((event) => event.text)).toEqual(["item 21", "item 22", "item 23", "item 24", "item 25"]);
+    for (let index = 1; index <= 6; index++) await work(`${index}${"x".repeat(10_000)}`);
+    clock.advance(1);
+    expect((await box.next(held)).events).toHaveLength(4);         // 4 x 8 KiB of text fills a batch
+    expect((await box.next(held)).events).toHaveLength(2);
+  });
+
+  it("formats one message with each event's sender, ref and key, and cuts a long text", async () => {
+    const { clock, inbox, work } = setup();
+    const box = inbox();
+    await box.next(held);
+    await work("ETA ~09:30Z <PR>");
+    await work(`long ${"y".repeat(20_000)}`);
+    clock.advance(1);
+    const message = rootInboxMessage((await box.next(held)).events);
+    expect(message.customType).toBe("pi-fabric-inbox");
+    expect(message.content).toContain('ref="Smarty-Pants-Inc/pi-fabric#1"');
+    expect(message.content).toContain("ETA ~09:30Z &lt;PR&gt;");
+    expect(message.content).toContain("[cut at 8192 bytes; read the whole event with mesh.read(");
+    expect(message.content.length).toBeLessThan(12_000);
+  });
+
+  it("finds the batch message among a session's recent entries", () => {
+    const entry = { type: "custom_message", customType: "pi-fabric-inbox", details: { ids: ["a", "b"] } };
+    expect(sessionHoldsInboxBatch([{ type: "message" }, entry], ["a", "b"])).toBe(true);
+    expect(sessionHoldsInboxBatch([entry], ["a", "c"])).toBe(false);
+    expect(sessionHoldsInboxBatch([], ["a"])).toBe(false);
+  });
+});

@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { closeWithActors } from "./actors/close-order.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import {
   resolveAvailablePiModel,
@@ -1353,9 +1354,7 @@ export class FabricRuntimeState {
     await this.#sessionCapabilityLease?.release().catch(() => undefined);
     this.#sessionCapabilityLease = undefined;
     await this.#lifecycle?.close();
-    await this.#control?.close();
-    await this.#residency?.close();
-    await this.#actors?.close();
+    await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
     await this.#agents?.close();
     await this.shellJobs.close();
     try {
@@ -1454,9 +1453,7 @@ export class FabricRuntimeState {
     await this.#sessionCapabilityLease?.release().catch(() => undefined);
     this.#sessionCapabilityLease = undefined;
     await this.#lifecycle?.close();
-    await this.#control?.close();
-    await this.#residency?.close();
-    await this.#actors?.close();
+    await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
     await this.#agents?.close();
     const externalNames = new Set(this.#externalProviders.keys());
     try {

@@ -134,7 +134,7 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
     participant.kind !== "root" ||
     !participant.cwd ||
     !participant.sessionId ||
-    (participant.status !== "idle" && participant.status !== "running")
+    (participant.status !== "idle" && participant.status !== "running" && participant.status !== "stopping")
   ) {
     return undefined;
   }
@@ -145,7 +145,8 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
     ...(typeof participant.role === "string" ? { role: participant.role } : {}),
     ...(typeof participant.project === "string" ? { project: participant.project } : {}),
     kind: "peer",
-    status: participant.status,
+    // A shutting-down root stays listed as a peer (its steer fails with a clear error).
+    status: participant.status === "running" ? "running" : "idle",
     runner: "pi",
     transport: "host",
     cwd: participant.cwd,
@@ -715,7 +716,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
           format: 1,
           ownerHostId: this.options.hostId,
           ownerIdentityId: this.options.identity.id,
-          ...(this.#quiescing ? { capabilities: [] } : {}),
+          // A root that is shutting down takes no new steer, and says why (smarty-dev#1113).
+          ...(this.#quiescing ? { capabilities: [], status: "stopping" } : {}),
           controlProtocol: "v1",
         };
         desired.set(record.id, record);

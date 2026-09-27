@@ -165,7 +165,7 @@ export class RecordStore implements RecordsBackend {
   /** One transaction as the writer role; rolled back on any error. */
   async transaction<T>(work: (client: SqlClient) => Promise<T>, mode = ""): Promise<T> {
     const client = await this.pool.connect();
-    let failed: Error | undefined;
+    let broken = false;
     try {
       await client.query(`BEGIN${mode ? ` ${mode}` : ""}`);
       await client.query(`SET LOCAL ROLE ${this.#role}`);
@@ -173,12 +173,11 @@ export class RecordStore implements RecordsBackend {
       await client.query("COMMIT");
       return result;
     } catch (error) {
-      failed = error instanceof Error ? error : new Error(String(error));
-      await client.query("ROLLBACK").catch(() => undefined);
+      await client.query("ROLLBACK").catch(() => { broken = true; });
       throw error;
     } finally {
       // A connection whose rollback failed is discarded, never reused mid-transaction.
-      client.release(failed && /terminat|connection/i.test(failed.message) ? failed : undefined);
+      client.release(broken);
     }
   }
 

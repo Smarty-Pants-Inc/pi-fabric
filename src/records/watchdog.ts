@@ -14,7 +14,6 @@ export interface ConsumerLag { consumer: string; after: number; oldestAt: number
 export class RecordsWatchdog {
   #timer: ReturnType<typeof setInterval> | undefined;
   #ticking: Promise<unknown> | undefined;
-  readonly #alarmed = new Map<string, number>();
 
   constructor(readonly options: {
     store: RecordStore;
@@ -68,13 +67,23 @@ export class RecordsWatchdog {
         woke = true;
         continue;
       }
-      const last = this.#alarmed.get(lag.consumer) ?? 0;
-      if (!this.options.alarm || now - last < (this.options.realarmMs ?? 10 * 60_000)) continue;
-      this.#alarmed.set(lag.consumer, now);
+      if (!this.options.alarm || !await this.#claimAlarm(lag.consumer, now)) continue;
       await this.options.alarm(lag).catch(() => undefined);
       alarmed.push(lag.consumer);
     }
     return { lagging, woke, alarmed };
+  }
+
+  /** One alarm per consumer per re-alarm window across every process on the database. */
+  async #claimAlarm(consumer: string, now: number): Promise<boolean> {
+    const realarmMs = this.options.realarmMs ?? 10 * 60_000;
+    return this.options.store.transaction(async (client) => {
+      const { rowCount } = await client.query(
+        "UPDATE consumers SET alarmed_at = to_timestamp($2) WHERE consumer = $1 AND (alarmed_at IS NULL OR alarmed_at <= to_timestamp($3))",
+        [consumer, now / 1000, (now - realarmMs) / 1000],
+      );
+      return rowCount === 1;
+    });
   }
 
   /** Consumers with an addressed record past their cursor older than the lag bound. */

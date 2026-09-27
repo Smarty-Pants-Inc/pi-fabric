@@ -55,6 +55,7 @@ const receipt = await records.append({
 });
 // { id, sequence, origin, topic: "record/Smarty-Pants-Inc/smarty-dev/754", ref, key, createdAt }
 
+let cursor = 0; // your saved processing cursor
 const page = await records.read({ after: cursor, limit: 100 });   // { records, next, frontier, origin }
 const { state, history, next } = await records.get({ ref: "Smarty-Pants-Inc/smarty-dev#754" });
 const board = await records.list({ repo: "Smarty-Pants-Inc/smarty-dev", open: true });
@@ -117,7 +118,8 @@ its message, so delivery is at least once and a stop before the write loses noth
 The watchdog runs every `watchdogMs` (and `admission.refreshMs`). It republishes unpublished nudges, refreshes the
 archive frontier, and compares each consumer's cursor with the records addressed to it. A consumer that lags more
 than `consumerLagSeconds` (2 min) is woken when it is this process's root, and otherwise gets an `ops.records` event
-of kind `records.consumer-lag`, at most once per 10 minutes per consumer.
+of kind `records.consumer-lag`, at most once per 10 minutes per consumer across every process (claimed in the
+`consumers` row).
 
 ## C2 admission: the off-host recoverable frontier
 
@@ -126,6 +128,10 @@ it. The guarantee is the **gap-free off-host recoverable frontier**: the end of 
 `wal-g wal-verify integrity --json` reports. A `MISSING_*` range stops it, even when newer segments are present.
 pgBackRest's `check` does not verify that live chain, so only WAL-G is implemented, behind the
 `ArchiveFrontierProvider` interface.
+
+Each target's check runs in one process per refresh interval for the whole database: the process that claims the
+target's `archive_checks` row runs `wal-g`, and every other process reads the stored frontier. A failed check keeps the
+last good frontier and records the error.
 
 The lag is how long the oldest record (or insert-position sample) past the frontier has waited. With two targets,
 the fresher frontier counts, so one network cut does not stop records. A provider that stops answering keeps its last
@@ -145,6 +151,7 @@ good frontier, so the lag grows: the gate fails closed.
 | `outbox` | dev-lead's #1481 row plus record_id, edit_of, request_key; unique (record_id, owner, repo, target_thread) and (owner, request_key); states pending, posted, refused, skipped, unknown | INSERT, SELECT (the mirror role also UPDATE) |
 | `publication` | the mesh nudge per record | INSERT, SELECT, UPDATE |
 | `consumers` | processing cursors | INSERT, SELECT, UPDATE |
+| `archive_checks` | the last archive frontier per target, and who checks it now | INSERT, SELECT, UPDATE |
 
 Views: `current_issue`, `current_statuses`, `open_asks`, `current_links`, `current_decisions`, `mirror_state`,
 `live_records`. Every service transaction runs as `fabric_records_writer` (`SET LOCAL ROLE`).

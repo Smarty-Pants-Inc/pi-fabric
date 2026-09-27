@@ -104,7 +104,17 @@ CREATE TABLE consumers (
   names jsonb NOT NULL DEFAULT '[]'::jsonb,
   pending jsonb,
   advanced_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  seen_at timestamptz NOT NULL DEFAULT clock_timestamp()
+  seen_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  alarmed_at timestamptz
+);
+
+-- C2: one process per refresh interval runs each archive check; every process reads the result.
+CREATE TABLE archive_checks (
+  target text PRIMARY KEY,
+  frontier pg_lsn,
+  checked_at timestamptz,
+  error text,
+  claimed_at timestamptz
 );
 
 -- Fold views (§2). A record another record supersedes is out of every list fold.
@@ -154,7 +164,8 @@ CREATE VIEW mirror_state AS
   SELECT DISTINCT ON (data->>'mirrorOf') (data->>'mirrorOf')::uuid AS record_id, ref, id, seq, created_at, data
   FROM records WHERE kind = 'mirror' ORDER BY data->>'mirrorOf', seq DESC;
 
-REVOKE ALL ON records, outbox, publication, consumers FROM PUBLIC;
+REVOKE ALL ON records, outbox, publication, consumers, archive_checks FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE ON archive_checks TO ${WRITER_ROLE};
 GRANT SELECT, INSERT ON records TO ${WRITER_ROLE};
 GRANT SELECT, INSERT ON outbox TO ${WRITER_ROLE};
 GRANT USAGE ON SEQUENCE outbox_seq_seq TO ${WRITER_ROLE};

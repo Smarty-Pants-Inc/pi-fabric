@@ -6,6 +6,7 @@ import { PublicationRelay, type NudgePublisher } from "../src/records/relay.js";
 import { migrate, WRITER_ROLE } from "../src/records/schema.js";
 import { RecordKeyConflictError, RecordStore, type ClientPool, type RecordsPrincipal, type RecordStoreOptions } from "../src/records/store.js";
 import { RecordsWatchdog } from "../src/records/watchdog.js";
+import { SharedFrontierProvider } from "../src/records/shared-frontier.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
 
 const alice: RecordsPrincipal = { id: "session:alice", name: "alice" };
@@ -304,6 +305,25 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
       expect((await pool.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(3);
     });
 
+    it("runs each archive check once per interval across processes, and a failed check keeps the last good frontier", async () => {
+      const { store, pool } = await storeFor();
+      let calls = 0;
+      let answer: string | Error = await insertLsn(pool);
+      const inner: ArchiveFrontierProvider = { name: "m4max", frontier: async () => { calls++; if (answer instanceof Error) throw answer; return answer; } };
+      const processA = new SharedFrontierProvider(inner, () => store, 60_000);
+      const processB = new SharedFrontierProvider(inner, () => store, 60_000);
+      const first = await processA.frontier();
+      expect(await processB.frontier()).toBe(first);
+      expect(calls).toBe(1);
+      // The claim expires; the next claimer's check fails: the stored frontier stays the last good one.
+      await pool.query("UPDATE archive_checks SET claimed_at = now() - interval '2 minutes'");
+      answer = new Error("archive unreachable");
+      await expect(processB.frontier()).rejects.toThrow(/unreachable/);
+      expect(calls).toBe(2);
+      expect(await processA.frontier()).toBe(first);
+      expect((await pool.query("SELECT error FROM archive_checks")).rows[0].error).toBe("archive unreachable");
+    });
+
     it("refuses when no target ever answered and records are old (fail closed)", async () => {
       let offset = 0;
       const gate = new AdmissionGate({ providers: [fake("m4max")], now: () => Date.now() + offset });
@@ -360,9 +380,15 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
       expect(late.lagging.map((lag) => lag.consumer).sort()).toEqual([bob.id, "session:carol"]);
       expect(woke).toEqual([bob.id]);
       expect(alarms).toEqual(["session:carol"]);
-      // Re-alarms are bounded; a consumer that caught up is no longer lagging.
+      // Re-alarms are bounded, across processes too: another process's watchdog does not repeat it.
       await watchdog.tick();
+      const otherAlarms: string[] = [];
+      await new RecordsWatchdog({ store, now: () => Date.now() + offset, alarm: async (lag) => { otherAlarms.push(lag.consumer); } }).tick();
       expect(alarms).toEqual(["session:carol"]);
+      expect(otherAlarms).toEqual([bob.id]); // bob lags for it too; carol is not repeated
+      offset = 121_000 + 11 * 60_000;
+      await watchdog.tick();
+      expect(alarms).toEqual(["session:carol", "session:carol"]);
       const batch = await mine.next(recordsInboxSession([]));
       await mine.next(recordsInboxSession([{ type: "custom_message", ...recordsInboxMessage(batch.records) }]));
       expect((await watchdog.lagging()).map((lag) => lag.consumer)).toEqual(["session:carol"]);

@@ -5,6 +5,7 @@ import { writeJsonAtomicAsync } from "../core/atomic-write.js";
 import { AdmissionGate, WalGFrontierProvider, type AdmissionStatus } from "./admission.js";
 import type { FabricRecordsConfig } from "./config.js";
 import { RecordsInbox } from "./inbox.js";
+import { SharedFrontierProvider } from "./shared-frontier.js";
 import { PublicationRelay, type NudgePublisher } from "./relay.js";
 import { migrate } from "./schema.js";
 import { RecordStore, type ClientPool, type RecordsPrincipal } from "./store.js";
@@ -32,7 +33,7 @@ export interface RecordsServiceOptions {
 /** The pg pool, loaded at first use so an idle session never imports the driver. */
 const openPool = async (config: FabricRecordsConfig): Promise<ClientPool> => {
   const { default: pg } = await import("pg");
-  const pool = new pg.Pool({ ...config.connection, max: 4, idleTimeoutMillis: 30_000, application_name: "pi-fabric-records" });
+  const pool = new pg.Pool({ ...config.connection, max: 2, idleTimeoutMillis: 30_000, application_name: "pi-fabric-records" });
   // An idle client's error (a server restart) must not crash the host; the next query reconnects.
   pool.on("error", () => undefined);
   return pool as unknown as ClientPool;
@@ -54,10 +55,10 @@ export class RecordsService {
     const org = config.org!;
     this.statusFile = config.statusFile ?? path.join(options.meshRoot, "records", `${org}.status.json`);
     this.gate = new AdmissionGate({
-      providers: config.admission.targets.map((target) => new WalGFrontierProvider(target.name, target.command, {
+      providers: config.admission.targets.map((target) => new SharedFrontierProvider(new WalGFrontierProvider(target.name, target.command, {
         ...(target.env ? { env: target.env } : {}), ...(target.timeoutMs ? { timeoutMs: target.timeoutMs } : {}),
         ...(config.admission.segmentSize ? { segmentSize: config.admission.segmentSize } : {}),
-      })),
+      }), () => this.store, config.admission.refreshMs)),
       alarmSeconds: config.admission.alarmSeconds,
       refuseSeconds: config.admission.refuseSeconds,
       ...(options.now ? { now: options.now } : {}),

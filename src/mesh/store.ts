@@ -507,7 +507,23 @@ export class MeshStore {
   // live, the catch-up below archives it again from the live log. So do events that a store
   // without the archive appended (an older Fabric, or before the archive was set).
   #recoverArchive(archive: MeshArchive): void {
-    archive.recover();
+    const recovery = archive.recover(this.#readLastEventSequence());
+    if (recovery.rebooted) {
+      // A power loss took live appends whose archive lines were synced: they go live again,
+      // synced this time, before anything else can take their sequences.
+      const last = recovery.promote.at(-1);
+      if (last) {
+        fs.appendFileSync(this.#eventsPath, recovery.promote.map(({ line }) => `${line}\n`).join(""), { encoding: "utf8", mode: 0o600 });
+        const descriptor = fs.openSync(this.#eventsPath, "r+");
+        try {
+          fs.fdatasyncSync(descriptor);
+        } finally {
+          fs.closeSync(descriptor);
+        }
+        atomicWrite(this.#counterPath, Math.max(this.#readSequence(), last.event.sequence));
+      }
+      archive.recovered(last);
+    }
     const archived = archive.head()?.sequence ?? 0;
     if (archived < this.#readLastEventSequence()) archive.catchUp(this.#liveEntriesAfter(archived));
   }

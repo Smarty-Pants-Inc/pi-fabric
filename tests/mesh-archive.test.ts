@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MESH_ARCHIVE_CONFIG, MeshArchive, archiveFileName } from "../src/mesh/archive.js";
+import { MESH_ARCHIVE_CONFIG, MeshArchive, archiveFileName, currentBoot } from "../src/mesh/archive.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#754 (Paul's decision 2): every mesh event goes into plain append-only files, one per
@@ -224,6 +224,62 @@ describe("mesh event archive", () => {
     expect(new Set(ids).size).toBe(8);
     expect(store.oldestSequence()).toBeGreaterThan(1);
     expect(store.read({ after: 0, limit: 10 }).map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+  });
+
+  // review F8: after a power loss only synced data is sure. The archive line of an acknowledged
+  // publish was synced; its live append, HEAD and PENDING's removal may all be gone.
+  it("puts back an acknowledged event whose live append a power loss took (review F8)", async () => {
+    const { store, dir, root, file, live, sequences } = setup();
+    await store.publish({ topic: "ops.owner", from, text: "one" });
+    await store.publish({ topic: "ops.owner", from, text: "two" });
+    const target = file(today(), "ops.owner");
+    const [first, second] = live();
+    const relative = path.relative(dir, target).split(path.sep).join("/");
+    fs.writeFileSync(path.join(dir, "PENDING.json"), JSON.stringify({ sequence: 2, id: JSON.parse(second!).id, file: relative, size: Buffer.byteLength(`${first}\n`) }));
+    fs.writeFileSync(path.join(dir, "HEAD.json"), JSON.stringify({ sequence: 1, id: JSON.parse(first!).id, file: relative, boot: "an earlier boot" }));
+    fs.writeFileSync(path.join(root, "events.jsonl"), `${first}\n`);
+    fs.writeFileSync(path.join(root, "sequence"), "1");
+
+    await store.publish({ topic: "ops.owner", from, text: "three" });
+    expect(live().map((line) => JSON.parse(line).sequence)).toEqual([1, 2, 3]);
+    expect(live()[1]).toBe(second);
+    expect(sequences(target)).toEqual([1, 2, 3]);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "HEAD.json"), "utf8")).boot).toBe(currentBoot());
+  });
+
+  it("cuts a torn pending line after a reboot, and keeps its sequence unused", async () => {
+    const { store, dir, root, file, live, sequences } = setup();
+    await store.publish({ topic: "ops.owner", from, text: "one" });
+    const target = file(today(), "ops.owner");
+    const [first] = live();
+    const relative = path.relative(dir, target).split(path.sep).join("/");
+    fs.appendFileSync(target, '{"id":"22222222-2222-4222-8222-222222222222","sequence":2,"top');
+    fs.writeFileSync(path.join(dir, "PENDING.json"), JSON.stringify({ sequence: 2, id: "22222222-2222-4222-8222-222222222222", file: relative, size: Buffer.byteLength(`${first}\n`) }));
+    fs.writeFileSync(path.join(dir, "HEAD.json"), JSON.stringify({ sequence: 1, id: JSON.parse(first!).id, file: relative, boot: "an earlier boot" }));
+    fs.writeFileSync(path.join(root, "sequence"), "2");
+    await store.publish({ topic: "ops.owner", from, text: "three" });
+    expect(live().map((line) => JSON.parse(line).sequence)).toEqual([1, 3]);
+    expect(sequences(target)).toEqual([1, 3]);
+  });
+
+  it("syncs the archive line before the event goes live", async () => {
+    const { store, root } = setup();
+    const sync = vi.spyOn(fs, "fdatasyncSync");
+    const append = vi.spyOn(fs, "appendFileSync");
+    await store.publish({ topic: "ops.owner", from, text: "one" });
+    const liveAppend = append.mock.calls.findIndex(([target]) => target === path.join(root, "events.jsonl"));
+    expect(liveAppend).toBeGreaterThanOrEqual(0);
+    expect(sync.mock.invocationCallOrder[0]).toBeLessThan(append.mock.invocationCallOrder[liveAppend]!);
+  });
+
+  it.skipIf(process.platform === "win32")("syncs the directories of a new archive file, and only then", async () => {
+    const { store } = setup();
+    const directorySync = vi.spyOn(fs, "fsyncSync");
+    await store.publish({ topic: "ops.owner", from, text: "one" });
+    expect(directorySync.mock.calls.length).toBeGreaterThanOrEqual(2);
+    directorySync.mockClear();
+    await store.publish({ topic: "ops.owner", from, text: "two" });
+    expect(directorySync).not.toHaveBeenCalled();
   });
 
   it("archives events that a store without the archive appended, without duplicates", async () => {

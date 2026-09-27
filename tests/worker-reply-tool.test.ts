@@ -4,6 +4,7 @@ import path from "node:path";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { directiveSchema } from "../src/actors/manager.js";
+import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { ownsRunReplyTool } from "../src/core/reply-tool-identity.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -28,14 +29,44 @@ describe("fabric_reply worker hook", () => {
     process.env.PI_FABRIC_REPLY_SCHEMA_FILE = schemaFile;
     process.env.PI_FABRIC_REPLY_FILE = replyFile;
     const tools: Array<Record<string, any>> = [];
-    replyTool({ registerTool: (tool: Record<string, any>) => tools.push(tool) } as never);
-    return { tool: tools[0]!, count: tools.length, replyFile };
+    const handlers: Array<[string, (event: any) => any]> = [];
+    replyTool({
+      registerTool: (tool: Record<string, any>) => tools.push(tool),
+      on: (name: string, handler: (event: any) => any) => handlers.push([name, handler]),
+    } as never);
+    return { tool: tools[0]!, count: tools.length, replyFile, handlers };
   };
 
+  // smarty-dev#1469: Mains and task agents never load this hook with its env, so they get no guard.
   it("adds nothing outside a reply run", () => {
     const tools: unknown[] = [];
-    replyTool({ registerTool: (tool: unknown) => tools.push(tool) } as never);
+    const handlers: unknown[] = [];
+    replyTool({ registerTool: (tool: unknown) => tools.push(tool), on: (name: string) => handlers.push(name) } as never);
     expect(tools).toEqual([]);
+    expect(handlers).toEqual([]);
+  });
+
+  // smarty-dev#1469: a directive actor's bash call that cuts an issue or PR comment list is blocked
+  // with the fix; the full list, a single comment and other tools pass.
+  it("blocks a cut comment-list read in a directive run and names the fix", () => {
+    const { handlers } = load();
+    expect(handlers.map(([name]) => name)).toEqual(["tool_call"]);
+    const guard = handlers[0]![1];
+    const list = "gh api repos/o/r/issues/1201/comments --jq '.[] | {id, user: .user.login, created_at, first: (.body | split(\"\\n\")[0])}'";
+    const blocked = guard({ toolName: "bash", toolCallId: "t1", input: { command: `${list} | tail -n 3` } });
+    expect(blocked).toMatchObject({ block: true });
+    expect(blocked.reason).toContain("--jq '.[] | {id, user: .user.login, created_at, first: (.body | split(\"\\n\")[0])}'");
+    expect(blocked.reason).toMatch(/owner's answer can be any comment/);
+    expect(guard({ toolName: "bash", toolCallId: "t2", input: { command: list } })).toBeUndefined();
+    expect(guard({ toolName: "bash", toolCallId: "t3", input: { command: "gh api repos/o/r/issues/comments/5 --jq .body | head -30" } })).toBeUndefined();
+    expect(guard({ toolName: "read", toolCallId: "t4", input: { path: "x/issues/1/comments | tail -3" } })).toBeUndefined();
+  });
+
+  it("never lets a task agent's run request ask for the directive hook", () => {
+    const request = normalizeAgentRunRequest(
+      { task: "t", schema: directiveSchema, replyTool: true }, { runner: "pi", timeoutMs: 1 },
+    );
+    expect(request).not.toHaveProperty("replyTool");
   });
 
   it("delivers one reply, ends the run, and refuses a second call", async () => {

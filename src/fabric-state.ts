@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { RootInboxBatch } from "./topology/root-inbox.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
@@ -255,6 +256,8 @@ export class FabricState {
 
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
   peerInfos(): FabricPeerInfo[] { return this.#current()?.peerInfos() ?? []; }
+  rootInboxBatch(): RootInboxBatch | undefined { return this.#current()?.rootInboxBatch(); }
+  async advanceRootInbox(batch: RootInboxBatch): Promise<void> { await this.#current()?.advanceRootInbox(batch); }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }
   participantsConfirmedAt(): number | undefined { return this.#current()?.participantsConfirmedAt(); }
   componentGraph(): FabricComponentGraph {

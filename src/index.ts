@@ -1,4 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import { rootInboxMessage } from "./topology/root-inbox.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
@@ -618,7 +619,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     await state.compact.maybeCommit(context);
     await compactAtConfiguredThreshold(context, state.config);
     await state.publishHostLifecycle("pi.agent_settled", event);
+    // A settled Main takes the work events a steer missed as its next turn (smarty-dev#754).
+    const inbox = state.rootInboxBatch();
+    if (inbox) {
+      await state.advanceRootInbox(inbox).catch(() => undefined);
+      if (inbox.events.length > 0) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+    }
   });
+
 
   // Speculative PTC: follow fabric_exec argument streaming and pre-launch
   // literal-argument read calls so their latency hides behind generation.
@@ -917,6 +925,16 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         details: { names: fresh, origin: "skill" },
       },
     };
+  });
+
+  // Work events a steer missed reach the Main with its next turn (smarty-dev#754).
+  pi.on("before_agent_start", async () => {
+    if (!state.initialized) return;
+    const inbox = state.rootInboxBatch();
+    if (!inbox) return;
+    await state.advanceRootInbox(inbox).catch(() => undefined);
+    if (inbox.events.length === 0) return;
+    return { message: rootInboxMessage(inbox.events) };
   });
 
   registerFabricActorHostEventObservers(pi, (eventName, event, context) => {

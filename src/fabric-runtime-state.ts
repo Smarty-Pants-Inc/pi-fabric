@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { RootInbox, type RootInboxBatch } from "./topology/root-inbox.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import {
   resolveAvailablePiModel,
@@ -188,6 +189,7 @@ export class FabricRuntimeState {
   #actors: ActorDirectory | undefined;
   #jevObservationHost: JevObservationHost | undefined;
   #globalActors: GlobalActorRegistry | undefined;
+  #rootInbox: RootInbox | undefined;
   #mesh: MeshStore | undefined;
   #identity: MeshIdentity | undefined;
   #mainAgent: MainAgentController | undefined;
@@ -309,6 +311,15 @@ export class FabricRuntimeState {
 
   peerInfos(): FabricPeerInfo[] {
     return this.#participants?.peers() ?? [];
+  }
+
+  /** The work events this Main has not seen (smarty-dev#754); undefined when it has no inbox. */
+  rootInboxBatch(): RootInboxBatch | undefined {
+    return this.#rootInbox?.unseen();
+  }
+
+  async advanceRootInbox(batch: RootInboxBatch): Promise<void> {
+    await this.#rootInbox?.advance(batch);
   }
 
   /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
@@ -513,6 +524,12 @@ export class FabricRuntimeState {
       this.#config.mesh.maxReadEvents,
       { readCacheMs: RUNTIME_MESH_READ_CACHE_MS },
     );
+    // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
+    this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
+      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
+      : undefined;
+    const rootInbox = this.#rootInbox;
+    mainAgent.deliveryObserver = rootInbox ? (fromId, text) => rootInbox.noteDelivered(fromId, text) : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       enabled: this.#config.mesh.enabled,

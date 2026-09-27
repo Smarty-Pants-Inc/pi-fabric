@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { RootInbox, type RootInboxBatch } from "./topology/root-inbox.js";
+import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import {
   resolveAvailablePiModel,
@@ -314,8 +314,8 @@ export class FabricRuntimeState {
   }
 
   /** The inbox batch this Main should see now (smarty-dev#754); undefined when it has no inbox. */
-  async nextRootInbox(sessionHolds: (ids: readonly string[]) => boolean): Promise<RootInboxBatch | undefined> {
-    return this.#rootInbox?.next(sessionHolds);
+  async nextRootInbox(session: RootInboxSession): Promise<RootInboxBatch | undefined> {
+    return this.#rootInbox?.next(session);
   }
 
   /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
@@ -524,8 +524,6 @@ export class FabricRuntimeState {
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
       : undefined;
-    const rootInbox = this.#rootInbox;
-    mainAgent.deliveryObserver = rootInbox ? (fromId, data) => rootInbox.noteDelivered(fromId, data) : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       enabled: this.#config.mesh.enabled,

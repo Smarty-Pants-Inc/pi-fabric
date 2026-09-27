@@ -1,5 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import { rootInboxMessage, sessionHoldsInboxBatch } from "./topology/root-inbox.js";
+import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
@@ -192,8 +192,7 @@ const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
 };
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
-const inboxHeldBy = (context: ExtensionContext) => (ids: readonly string[]): boolean =>
-  sessionHoldsInboxBatch(context.sessionManager.getEntries(), ids);
+const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sessionManager.getEntries());
 
 export default async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over

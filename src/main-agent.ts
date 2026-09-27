@@ -104,8 +104,6 @@ const serializableData = (value: unknown): unknown => {
 
 export class MainAgentController implements FabricMainAgentTarget {
   readonly startedAt = Date.now();
-  /** Sees every agent message this Main receives (the root inbox skips their shadow records). */
-  deliveryObserver: ((fromId: string, data: unknown) => void) | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -195,7 +193,6 @@ export class MainAgentController implements FabricMainAgentTarget {
       },
       { deliverAs: request.delivery, triggerTurn: request.triggerTurn ?? true },
     );
-    this.deliveryObserver?.(request.from.id, data);
     return { queued: true, messageId, routed: "main" };
   }
 }

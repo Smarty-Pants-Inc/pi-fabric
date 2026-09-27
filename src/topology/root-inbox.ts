@@ -10,15 +10,17 @@ import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
  *
  * A batch is saved as pending before it is delivered, and the cursor moves past it only once the
  * session's own entries hold its message. Until then every reconcile delivers it again, so work
- * survives a stop between the save and the session's write: delivery is at least once.
+ * survives a stop between the save and the session's write: delivery is at least once. A work
+ * event is skipped only when the session's entries already hold the steer that carried it (the
+ * same sender and work key): an enqueued steer is not yet a delivered one.
  */
 export const ROOT_INBOX_PREFIX = "topology/inbox/";
 export const WORK_TOPIC_PREFIX = "fleet.";
 export const ROOT_INBOX_CUSTOM_TYPE = "pi-fabric-inbox";
+/** The custom type Main gives a delivered steer or follow-up (src/main-agent.ts deliverAgent). */
+const AGENT_MESSAGE_CUSTOM_TYPE = "pi-fabric-agent-message";
 /** A shadow record newer than this waits a reconcile, so its steer can arrive first and win. */
 const STEER_GRACE_MS = 60_000;
-/** Receipts are kept this long, and dropped at every reconcile after. */
-const RECEIPT_TTL_MS = 60 * 60_000;
 /** The cursor is saved when it moves past a delivered batch, and otherwise at most this often. */
 const SAVE_INTERVAL_MS = 10 * 60_000;
 /** One batch holds at most this many events and this much text; a longer text is cut. */
@@ -37,18 +39,23 @@ interface RootInboxState {
   pending?: { through: number; ids: string[] };
 }
 
-// A receipt names the exact work it delivered: the sender and the work key it passed as
-// data.key, the same key as its shadow record. Without a key there is no receipt.
-const receiptKey = (fromId: string, data: unknown): string | undefined => {
+const workKey = (data: unknown): string | undefined => {
   const key = data && typeof data === "object" ? (data as { key?: unknown }).key : undefined;
-  return typeof key === "string" && key.trim() ? `${fromId}\0${key.trim()}` : undefined;
+  return typeof key === "string" && key.trim() ? key.trim() : undefined;
 };
+
+/** What the session's own entries say it holds. */
+export interface RootInboxSession {
+  /** An inbox message with all of these event ids. */
+  holdsBatch(ids: readonly string[]): boolean;
+  /** An agent message (a steer or follow-up) from this sender that carried this work key. */
+  holdsSteer(fromId: string, key: string): boolean;
+}
 
 export class RootInbox {
   #state: RootInboxState | undefined;
   #saved: string | undefined;
   #savedAt = 0;
-  readonly #receipts: Array<{ key: string; at: number }> = [];
 
   constructor(
     readonly mesh: MeshStore,
@@ -63,31 +70,21 @@ export class RootInbox {
   }
 
   /**
-   * A steer or follow-up reached this root. When it carried its work key (data.key), the shadow
-   * record with that sender and key is not news. Without a key nothing is skipped: the shadow
-   * copy comes too, so delivery stays at least once.
-   */
-  noteDelivered(fromId: string, data: unknown): void {
-    const key = receiptKey(fromId, data);
-    if (key) this.#receipts.push({ key, at: this.#now() });
-  }
-
-  /**
    * The batch to deliver now. A pending batch the session holds is committed first; one it does
    * not hold is delivered again. A new batch stops at the first event younger than the steer
    * grace and at the batch bounds, so the cursor never passes an event it has not admitted.
    */
-  async next(sessionHolds: (ids: readonly string[]) => boolean): Promise<RootInboxBatch> {
+  async next(session: RootInboxSession): Promise<RootInboxBatch> {
     const state = this.#load();
     if (state.pending) {
       // Only the session's own record of the message moves the cursor; a pending batch is
       // delivered again, however many times, until then.
-      if (!sessionHolds(state.pending.ids)) return { events: this.#reread(state.after, state.pending), through: state.pending.through };
+      if (!session.holdsBatch(state.pending.ids)) return { events: this.#reread(state.after, state.pending), through: state.pending.through };
       state.after = Math.max(state.after, state.pending.through);
       delete state.pending;
       await this.#save(true);
     }
-    const batch = this.#scan(state.after);
+    const batch = this.#scan(state.after, session);
     if (batch.events.length === 0) {
       state.after = batch.through;
       await this.#save(false);
@@ -98,11 +95,8 @@ export class RootInbox {
     return batch;
   }
 
-  #scan(after: number): RootInboxBatch {
+  #scan(after: number, session: RootInboxSession): RootInboxBatch {
     const now = this.#now();
-    for (let index = this.#receipts.length - 1; index >= 0; index--) {
-      if (now - this.#receipts[index]!.at > RECEIPT_TTL_MS) this.#receipts.splice(index, 1);
-    }
     const names = new Set(this.names().filter((name) => name.trim()));
     const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
     const pageSize = this.options.pageSize ?? 500;
@@ -113,7 +107,7 @@ export class RootInbox {
       const page = this.mesh.read({ after: through, limit: pageSize });
       for (const event of page) {
         if (event.createdAt > cutoff) return { events, through };
-        if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to) && !this.#takeReceipt(event)) {
+        if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to) && !this.#steered(event, session)) {
           const size = Math.min(Buffer.byteLength(event.text ?? ""), MAX_EVENT_TEXT_BYTES);
           if (events.length >= MAX_BATCH_EVENTS || (events.length > 0 && bytes + size > MAX_BATCH_TEXT_BYTES)) {
             return { events, through };
@@ -127,13 +121,11 @@ export class RootInbox {
     }
   }
 
-  // A receipt stands for the one shadow record with its sender and work key, and is used up by it.
-  #takeReceipt(event: MeshEvent): boolean {
-    const key = receiptKey(event.from.id, event.data);
-    const index = key ? this.#receipts.findIndex((receipt) => receipt.key === key) : -1;
-    if (index < 0) return false;
-    this.#receipts.splice(index, 1);
-    return true;
+  // The session already holds the steer that carried this work: same sender, same work key.
+  // Without a key, or before Pi records the steer, the shadow copy comes (at least once).
+  #steered(event: MeshEvent, session: RootInboxSession): boolean {
+    const key = workKey(event.data);
+    return key !== undefined && session.holdsSteer(event.from.id, key);
   }
 
   #reread(after: number, pending: NonNullable<RootInboxState["pending"]>): MeshEvent[] {
@@ -183,6 +175,19 @@ export class RootInbox {
     return this.options.now?.() ?? Date.now();
   }
 }
+
+/** The inbox's view of a session's recent entries. */
+export const rootInboxSession = (entries: readonly unknown[], lookback = 500): RootInboxSession => ({
+  holdsBatch: (ids) => sessionHoldsInboxBatch(entries, ids, lookback),
+  holdsSteer: (fromId, key) => {
+    for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
+      const entry = entries[index] as { type?: string; customType?: string; details?: { from?: { id?: unknown }; data?: unknown } } | undefined;
+      if (entry?.type !== "custom_message" || entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
+      if (entry.details?.from?.id === fromId && workKey(entry.details.data) === key) return true;
+    }
+    return false;
+  },
+});
 
 /** Whether a session's recent entries hold the inbox message for these event ids. */
 export const sessionHoldsInboxBatch = (entries: readonly unknown[], ids: readonly string[], lookback = 500): boolean => {

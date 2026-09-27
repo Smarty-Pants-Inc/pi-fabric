@@ -1,19 +1,24 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { MainAgentController } from "../src/main-agent.js";
+import { afterEach, describe, expect, it } from "vitest";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
-import { RootInbox, rootInboxMessage, sessionHoldsInboxBatch } from "../src/topology/root-inbox.js";
+import { RootInbox, rootInboxMessage, rootInboxSession, sessionHoldsInboxBatch, type RootInboxSession } from "../src/topology/root-inbox.js";
 
 // smarty-dev#754 §3.2 step 3: a Main reconciles the work events addressed to it that no steer
 // delivered. A batch stays pending until the session holds it; the cursor moves only then.
 const roots: string[] = [];
 const me: MeshIdentity = { id: "session:me", name: "main", kind: "main", sessionId: "me" };
 const peer: MeshIdentity = { id: "session:peer", name: "main", kind: "main", sessionId: "peer" };
-const held = () => true;
-const notHeld = () => false;
+const held: RootInboxSession = { holdsBatch: () => true, holdsSteer: () => false };
+const notHeld: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => false };
+// A session whose entries hold the steers delivered so far (the pi-fabric-agent-message entries).
+const withSteers = (steers: Array<{ from: string; data: unknown }>): RootInboxSession => ({
+  holdsBatch: () => true,
+  holdsSteer: rootInboxSession(steers.map(({ from, data }) => ({
+    type: "custom_message", customType: "pi-fabric-agent-message", details: { from: { id: from }, data },
+  }))).holdsSteer,
+});
 
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-root-inbox-"));
@@ -86,29 +91,25 @@ describe("RootInbox", () => {
     expect((await inbox().next(notHeld)).events).toEqual([]);
   });
 
-  it("skips only the shadow record whose own work key a steer delivered (review F2)", async () => {
-    const { clock, inbox, work, texts } = setup();
+  it("skips a shadow record only when the session holds the steer with its sender and work key (review F2, round 3 F1)", async () => {
+    const { clock, inbox, work } = setup();
     const box = inbox();
     await box.next(held);
-    const keys = async () => (await box.next(held)).events.map((event) => (event.data as { key: string }).key);
-    // The first steer failed and the second succeeded, both with the text "ack": only B's key has a receipt.
+    const keys = async (session: RootInboxSession) => (await box.next(session)).events.map((event) => (event.data as { key: string }).key);
+    // The first steer failed and the second reached the session, both with the text "ack".
     await work("ack", me.id, "fleet.work.pi-fabric.1", "ack:A");
     await work("ack", me.id, "fleet.work.pi-fabric.2", "ack:B");
-    box.noteDelivered(peer.id, { key: "ack:B" });
     clock.advance(1);
-    expect(await keys()).toEqual(["ack:A"]);
-    // A steer that passed no key suppresses nothing: its shadow copy comes too.
-    await work("no key", me.id, "fleet.work.pi-fabric.3", "plain");
-    box.noteDelivered(peer.id, { ref: "Smarty-Pants-Inc/pi-fabric#3" });
+    expect(await keys(withSteers([{ from: peer.id, data: { key: "ack:B" } }]))).toEqual(["ack:A"]);
+    // A steer that was only enqueued (Pi has not recorded it) suppresses nothing.
+    await work("queued", me.id, "fleet.work.pi-fabric.3", "queued:C");
     clock.advance(1);
-    expect(await keys()).toEqual(["plain"]);
-    // A receipt past its hour is gone: the same key published later comes.
-    clock.advance(-2 * 60 * 60_000);
-    box.noteDelivered(peer.id, { key: "late" });
-    clock.advance(2 * 60 * 60_000);
-    await work("late");
+    expect(await keys(withSteers([]))).toEqual(["queued:C"]);
+    // Another sender's steer with the same key is not this work; a steer without a key is none.
+    await work("other", me.id, "fleet.work.pi-fabric.4", "shared");
+    await work("plain", me.id, "fleet.work.pi-fabric.5", "plain");
     clock.advance(1);
-    expect(texts((await box.next(held)).events)).toEqual(["late"]);
+    expect(await keys(withSteers([{ from: "session:else", data: { key: "shared" } }, { from: peer.id, data: {} }]))).toEqual(["shared", "plain"]);
   });
 
   it("bounds a batch by count and text, and loses none of a longer backlog (review F4)", async () => {
@@ -147,16 +148,5 @@ describe("RootInbox", () => {
     expect(sessionHoldsInboxBatch([{ type: "message" }, entry], ["a", "b"])).toBe(true);
     expect(sessionHoldsInboxBatch([entry], ["a", "c"])).toBe(false);
     expect(sessionHoldsInboxBatch([], ["a"])).toBe(false);
-  });
-});
-
-describe("MainAgentController delivery observer", () => {
-  it("reports each agent message's sender and data, for the inbox to skip its shadow record", () => {
-    const pi = { sendMessage: vi.fn(), getThinkingLevel: vi.fn() } as unknown as ExtensionAPI;
-    const main = new MainAgentController(pi, "session:me", true, process.cwd(), "me");
-    const seen: Array<[string, unknown]> = [];
-    main.deliveryObserver = (fromId, data) => seen.push([fromId, data]);
-    main.deliverAgent({ from: { id: "session:peer", name: "main", kind: "main" }, message: "hello", delivery: "followUp", data: { key: "k1" } } as never);
-    expect(seen).toEqual([["session:peer", { key: "k1" }]]);
   });
 });

@@ -110,6 +110,23 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(JSON.stringify(inboxMessages()[0])).toContain("Waiting while you were stopped.");
   }, 60_000);
 
+  it("skips a shadow record whose steer the session recorded, and brings one whose steer it did not", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start();
+    // The steer that carried work key "steered" reached the session, as Main's deliverAgent writes it.
+    await session.sendCustomMessage({
+      customType: "pi-fabric-agent-message", content: "Steered text.", display: true,
+      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text." } },
+    }, { triggerTurn: false });
+    missedWork("Steered text.");
+    missedWork("Only published.");
+    faux.setResponses([fauxAssistantMessage("noted")]);
+    await session.prompt("next");
+    expect(inboxMessages()).toHaveLength(1);
+    const content = JSON.stringify(inboxMessages()[0]);
+    expect(content).toContain("Only published.");
+    expect(content).not.toContain("Steered text.");
+  }, 60_000);
+
   it("starts a turn for a work event that arrived during a run, when the run settles", async () => {
     const { session, faux, inboxMessages, missedWork } = await start();
     faux.setResponses([

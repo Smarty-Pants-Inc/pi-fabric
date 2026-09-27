@@ -599,6 +599,22 @@ await agents.setDeliveryPolicy({
 
 Set `scope: "global"` to update a reusable template. In the dashboard, press `y` on an actor or template, then choose mailbox, steer, follow-up, or next-turn delivery. Lowercase `m` and `e` change this Pi session. Uppercase `M` and `E` change the owner-gated project defaults. These changes keep the Pi or Claude runner session. Use `agents.ask()` for a blocking exchange and `agents.tell()` for fire-and-forget mail. Both accept one-activation `model` and `thinking` overrides. Read shared history with `agents.messages()`. `agents.remove()` is local-owner-only for session actors and routes durable actors to the resident owner.
 
+### Fresh actor sessions
+
+A persistent actor keeps one Pi session across activations. The session can grow too large to compact, for example when compaction fails with `Summarization failed`. Call `agents.resetSession({ id })` to start the actor on a fresh session:
+
+```ts
+const actor = await agents.resetSession({ id: "release-reviewer" });
+```
+
+The call works only on an actor that this session or host owns. On an actor that another host owns, it throws `Fabric actor is owned by another host: <id>`. When a run is in progress, the call waits until the run settles. It does not interrupt the run. Fabric then moves `<actor dir>/session.jsonl` to `session.jsonl.<UTC stamp>.bak` in the same directory, for example `session.jsonl.20260927T145012345Z.bak`. Fabric keeps the two newest backups and deletes older ones. The next run starts a fresh Pi session. A Claude actor also drops its stored runner session ID. The call returns the new `FabricActorInfo` and publishes presence.
+
+The reset keeps instructions, topics, bindings, events, the queue, the overflow, and the message log. Queued work goes to the fresh session. The message log records the reset as an `out` message from source `fabric-host`, with reason `session reset (requested)` or `session reset (size limit)` and data `{ sessionReset: { trigger: "requested" | "size", bytes, archived } }`. `archived` is the backup path, or `null` when there was no session file.
+
+Fabric also resets a session automatically. Before a run starts, it checks the session file against `actors.maxSessionBytes` (default 20 MiB, `0` disables). A larger file gets the same reset with trigger `size`, so Fabric never starts a run that must compact a session past the limit. Durable actors use the same setting. See [configuration](configuration.md#actors).
+
+`agents.compact()` compacts a running task agent only. With an actor ID, it throws `<name> (<id>) is a Fabric actor, not a task agent: ...` and points to `agents.resetSession()`.
+
 ## Paged agent logs
 
 `agents.log()` reads bounded pages from JSONL logs. It does not load the full file. The first call returns the newest entries. If `hasMore` is true, pass the returned `before` cursor to load the next older page. For an actor session, use `sessionHasMore` and `sessionBefore`:

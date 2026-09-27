@@ -233,6 +233,9 @@ export class ActorManager {
   readonly #parked = new Map<string, ActorQueueItem[]>();
   // smarty-dev#878: the item each actor is running, persisted with its queue until the run ends.
   readonly #inFlight = new Map<string, ActorQueueItem>();
+  // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
+  readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
+  readonly #maxSessionBytes: number;
   // Actors whose queue file this manager has loaded as their owner. Only these may write it: a
   // snapshot taken before the load (a passive view, or the empty queue a new owner parks before
   // it reloads) would replace or delete the owner's accepted work (review/astra F1 on #79).
@@ -338,6 +341,8 @@ export class ActorManager {
        */
       reapDeadSessionPresence?: boolean | { deadAfterMs: number };
       retention?: FabricRetentionConfig;
+      /** Reset an actor's session at a run boundary past this size; 0 disables (smarty-dev#1439). */
+      maxSessionBytes?: number;
       /** How long close() waits for running actor turns before it stops them (smarty-dev#1113). */
       closeGraceMs?: number;
       acquireCapabilityView?(
@@ -351,6 +356,7 @@ export class ActorManager {
     this.#actorScope = options.actorScope ?? meshConfig.actorScope;
     this.#persistent = options.persistent ?? false;
     this.#closeGraceMs = Math.max(0, options.closeGraceMs ?? 30_000);
+    this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
     this.#resolvePiModel = options.resolvePiModel;
@@ -742,6 +748,108 @@ export class ActorManager {
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
+  }
+
+  /**
+   * Start an actor's next run on a fresh Pi session (smarty-dev#1439). A run in flight
+   * finishes on the old session first; it is not interrupted. The session file is archived
+   * beside it; instructions, topics, bindings, the queue and the message log are kept.
+   */
+  async resetSession(id: string): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    const running = this.#draining.get(actor.id);
+    if (actor.abortController || running?.abortController) {
+      return new Promise((resolve, reject) => {
+        const waiters = this.#pendingResets.get(actor.id) ?? [];
+        waiters.push({ resolve, reject });
+        this.#pendingResets.set(actor.id, waiters);
+      });
+    }
+    this.#archiveSession(actor, "requested");
+    await this.#publishPresence(actor);
+    return this.#publicInfo(actor);
+  }
+
+  // At a run boundary: apply a requested reset, or reset a session past the size limit, so a
+  // run never starts that would compact it. The archive is synchronous, so no run starts
+  // between the check and the move.
+  #resetAtBoundary(actor: ManagedActor): Promise<void> | undefined {
+    const live = this.#liveActor(actor);
+    const waiters = this.#pendingResets.get(actor.id);
+    this.#pendingResets.delete(actor.id);
+    if (waiters && (!this.#actors.has(actor.id) || !this.#canManage(actor.id))) {
+      const error = new Error(`Fabric actor ${actor.name} (${actor.id}) was removed or moved before its session reset`);
+      waiters.forEach((waiter) => waiter.reject(error));
+      return undefined;
+    }
+    let trigger: "requested" | "size" | undefined = waiters ? "requested" : undefined;
+    if (!trigger && this.#maxSessionBytes > 0) {
+      try {
+        if (fs.statSync(live.sessionFile).size > this.#maxSessionBytes) trigger = "size";
+      } catch { /* no session file yet */ }
+    }
+    if (!trigger) return undefined;
+    try {
+      this.#archiveSession(live, trigger);
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      waiters?.forEach((waiter) => waiter.reject(failure));
+      return undefined;
+    }
+    return this.#publishPresence(live).then(
+      () => waiters?.forEach((waiter) => waiter.resolve(this.#publicInfo(this.#liveActor(live)))),
+      (error: unknown) => waiters?.forEach((waiter) => waiter.reject(error instanceof Error ? error : new Error(String(error)))),
+    );
+  }
+
+  // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the 2 newest backups and logs it.
+  #archiveSession(actor: ManagedActor, trigger: "requested" | "size"): void {
+    const file = actor.sessionFile;
+    const dir = path.dirname(file);
+    // Oldest first: by stamp, then by the -n suffix a same-millisecond archive gets.
+    const prefix = `${path.basename(file)}.`;
+    const order = (name: string): [string, number] => {
+      const [stamp = "", n = "0"] = name.slice(prefix.length, -".bak".length).split("-");
+      return [stamp, Number(n) || 0];
+    };
+    const listBackups = (): string[] => fs.readdirSync(dir)
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".bak"));
+    let bytes = 0;
+    let archived: string | null = null;
+    try {
+      bytes = fs.statSync(file).size;
+      const stamp = new Date().toISOString().replace(/[-:.]/g, "");
+      // A same-millisecond archive takes a suffix above every one kept for its stamp. A gap
+      // that pruning left must not be reused: the new name would sort oldest and be pruned.
+      const taken = listBackups().map(order).filter(([other]) => other === stamp).map(([, n]) => n);
+      archived = taken.length === 0 ? `${file}.${stamp}.bak` : `${file}.${stamp}-${Math.max(...taken) + 1}.bak`;
+      fs.renameSync(file, archived);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      archived = null;
+    }
+    const backups = listBackups()
+      .sort((left, right) => {
+        const [a, m] = order(left);
+        const [b, n] = order(right);
+        return a < b ? -1 : a > b ? 1 : m - n;
+      });
+    for (const name of backups.slice(0, -2)) fs.rmSync(path.join(dir, name), { force: true });
+    // A Claude-runner actor resumes by runner session id: drop it, too.
+    delete actor.runnerSessionId;
+    actor.updatedAt = Date.now();
+    this.#recordMessage(actor, {
+      id: randomUUID(),
+      actorId: actor.id,
+      actorName: actor.name,
+      direction: "out",
+      source: "fabric-host",
+      createdAt: Date.now(),
+      reason: trigger === "size"
+        ? `session reset (size limit): ${bytes} bytes > ${this.#maxSessionBytes}`
+        : "session reset (requested)",
+      data: { sessionReset: { trigger, bytes, archived } },
+    });
   }
 
   /**
@@ -1438,6 +1546,9 @@ export class ActorManager {
         !this.#closing &&
         this.#canManage(actor.id)
       ) {
+        const reset = this.#resetAtBoundary(actor);
+        if (reset) await reset;
+        if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing) break;
         const item = actor.queue.shift();
         this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
@@ -1664,11 +1775,15 @@ export class ActorManager {
       // Mark the drain inactive the moment its loop exits (or throws) so a
       // concurrent #ensureDrain observes `draining === false` and starts a
       // fresh drain instead of stranding a just-enqueued item.
+      // A reset requested during the last run is applied before a new drain can start one.
+      // Its caller may queue work at once, which the drain after this one runs.
+      const resetAtExit = this.#pendingResets.has(actor.id);
+      if (resetAtExit) await this.#resetAtBoundary(actor)?.catch(() => undefined);
       actor.draining = false;
       if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
       // A reload may have moved this actor's queue to a new object while this drain ran.
       const live = this.#actors.get(actor.id);
-      if (live && live !== actor && live.queue.length > 0) queueMicrotask(() => this.#ensureDrain(live));
+      if (live && (live !== actor || resetAtExit) && live.queue.length > 0) queueMicrotask(() => this.#ensureDrain(live));
     }
   }
 

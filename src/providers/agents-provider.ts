@@ -1019,7 +1019,20 @@ export class AgentsProvider implements FabricProvider {
         return this.manager.setFollowUpMode(String(args.id), this.#steeringMode(args.mode));
       case "compact": {
         const id = String(args.id);
-        const status = this.manager.status(id);
+        let status: ReturnType<typeof this.manager.status>;
+        try {
+          status = this.manager.status(id);
+        } catch (error) {
+          // An actor is not a task agent (smarty-dev#1439): point at the call that helps.
+          if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
+          let actor: FabricActorInfo | undefined;
+          try { actor = this.actorManager.status(id); } catch { /* not an actor either */ }
+          if (!actor) throw error;
+          throw new Error(
+            `${actor.name} (${actor.id}) is a Fabric actor, not a task agent: agents.compact compacts a running task agent. ` +
+            "To start an actor on a fresh session, use agents.resetSession({ id }).",
+          );
+        }
         context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
         const instructions = typeof args.instructions === "string" ? args.instructions : undefined;
         const result = this.manager.compact(id, instructions);
@@ -1106,6 +1119,8 @@ export class AgentsProvider implements FabricProvider {
       }
       case "clearMessages":
         return this.actorManager.clearMessages(String(args.id));
+      case "resetSession":
+        return this.actorManager.resetSession(String(args.id));
       case "remove": {
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
         let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };

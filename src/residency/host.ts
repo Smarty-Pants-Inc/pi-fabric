@@ -298,6 +298,7 @@ class ResidentHost {
         role: typeof config.role === "string" ? config.role : undefined,
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: config.retention,
+        ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
         resolvePiModel: resolveResidentPiModel,
       },
     ], actorRoots, config.mesh.actorScope);

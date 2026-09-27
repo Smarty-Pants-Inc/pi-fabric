@@ -749,6 +749,7 @@ export class FabricRuntimeState {
             project: participantProject(context.cwd),
             role: participantRole(),
             retention: this.#config.retention,
+            maxSessionBytes: this.#config.actors.maxSessionBytes,
             resolvePiModel: (model) => resolveParticipantPiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
             // A /reload or restart of this session resumes its actors' mesh stream where the
@@ -767,6 +768,7 @@ export class FabricRuntimeState {
             project: participantProject(context.cwd),
             role: participantRole(),
             retention: this.#config.retention,
+            maxSessionBytes: this.#config.actors.maxSessionBytes,
             resolvePiModel: (model) => resolveParticipantPiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
           },
@@ -810,6 +812,7 @@ export class FabricRuntimeState {
             agents: structuredClone(this.#config.agents),
             mesh: structuredClone(this.#config.mesh),
             retention: structuredClone(this.#config.retention),
+            actors: structuredClone(this.#config.actors),
             workerPath: this.#paths?.worker ?? fileURLToPath(new URL("./worker.js", import.meta.url)),
             fabricExtensionPath: this.#paths?.extension ?? fileURLToPath(new URL("./index.js", import.meta.url)),
             piBinary: resolvePiBinary(),

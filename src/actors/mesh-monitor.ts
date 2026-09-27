@@ -29,8 +29,6 @@ export class ActorMeshMonitor {
   #last: { sequence: number; id: string } | undefined;
   /** On resume: the sequence to read work events after, from the archive, before the live log. */
   #archiveAfter: number | undefined;
-  /** The archive holds nothing more below this sequence: a completed catch-up scanned up to it. */
-  #archiveCheckedTo: number | undefined;
 
   constructor(
     readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence">>,
@@ -130,11 +128,14 @@ export class ActorMeshMonitor {
       // its start. Nothing is committed past the gap first; events already handed on are skipped.
       const generation = meshCursorGeneration(tail.nextOffset);
       const first = tail.events[0];
-      // A gap the last completed archive scan already covered is a real hole (a store without
-      // the archive has one after each rewrite): pass it, so it cannot stall the stream.
-      const gap = first !== undefined && this.#last !== undefined && typeof first.sequence === "number" &&
-        first.sequence > this.#last.sequence + 1 &&
-        !(this.#archiveCheckedTo !== undefined && first.sequence <= this.#archiveCheckedTo);
+      // A gap is unread only if the store holds an event inside it. `read({after})` answers from
+      // one coherent source: the archive, which holds every event, when the last event handed on
+      // is older than the live log; otherwise the live log, which then holds everything after it.
+      // A hole the store does not hold (a failed publish's reserved sequence, or events a store
+      // without the archive cut) is passed at once, so it cannot stall the stream.
+      const gap = first !== undefined && this.#last !== undefined && this.mesh.read !== undefined &&
+        typeof first.sequence === "number" && first.sequence > this.#last.sequence + 1 &&
+        (this.mesh.read({ after: this.#last.sequence, limit: 1 })[0]?.sequence ?? Infinity) < first.sequence;
       if (this.#last && this.mesh.read && (generation !== meshCursorGeneration(start) || gap)) {
         this.#archiveAfter = this.#last.sequence;
         this.#offset = meshCursorAtStart(generation);
@@ -190,7 +191,6 @@ export class ActorMeshMonitor {
     const oldest = this.mesh.oldestSequence?.();
     if (!this.mesh.read || oldest === undefined || this.#archiveAfter === undefined || this.#archiveAfter + 1 >= oldest) {
       this.#archiveAfter = undefined;
-      this.#archiveCheckedTo = oldest;
       return true;
     }
     const page = this.mesh.read({ after: this.#archiveAfter, limit: this.config.maxReadEvents });
@@ -210,9 +210,7 @@ export class ActorMeshMonitor {
       setImmediate(() => this.schedule());
       return false;
     }
-    // This page reached the live log's oldest event: the archive below it is scanned.
     this.#archiveAfter = undefined;
-    this.#archiveCheckedTo = oldest;
     this.#writeCursor();
     return true;
   }

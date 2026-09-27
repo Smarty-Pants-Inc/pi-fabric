@@ -459,9 +459,13 @@ describe("ActorMeshMonitor archive/live handoff across a rewrite's two writes", 
     await poll(5);
     await publish(5, 13);
     const all = fs.readFileSync(events, "utf8").split("\n").filter(Boolean);
-    const write = (low: number, high: number) => fs.writeFileSync(events, all
-      .filter((line) => { const sequence = (JSON.parse(line) as MeshEvent).sequence; return sequence >= low && sequence <= high; })
-      .map((line) => `${line}\n`).join(""));
+    // A rewrite renames a new file into place, as the store's compaction does.
+    const write = (low: number, high: number) => {
+      fs.writeFileSync(`${events}.tmp`, all
+        .filter((line) => { const sequence = (JSON.parse(line) as MeshEvent).sequence; return sequence >= low && sequence <= high; })
+        .map((line) => `${line}\n`).join(""));
+      fs.renameSync(`${events}.tmp`, events);
+    };
     const tail = mesh.tail.bind(mesh);
     let call = 0;
     vi.spyOn(mesh, "tail").mockImplementation((cursor, limit) => {
@@ -498,8 +502,50 @@ describe("ActorMeshMonitor without an archive", () => {
     for (let n = 5; n <= 14; n++) await mesh.publish({ topic: "fleet.work.a", from, text: `e${n}` });
     const events = path.join(root, "events.jsonl");
     const kept = fs.readFileSync(events, "utf8").split("\n").filter((line) => line && (JSON.parse(line) as MeshEvent).sequence >= 9);
-    fs.writeFileSync(events, kept.map((line) => `${line}\n`).join(""));   // 5–8 are gone for good
+    fs.writeFileSync(`${events}.tmp`, kept.map((line) => `${line}\n`).join(""));
+    fs.renameSync(`${events}.tmp`, events);                                  // 5–8 are gone for good
     await poll(12);
     expect(seen).toEqual(["e1", "e2", "e3", "e4", "e9", "e10", "e11", "e12", "e13", "e14"]);
   });
+});
+
+// review/astra round 5 (F4) on pi-fabric#97: a failed publish leaves its reserved sequence as a
+// hole inside the live log. The stream passes it, with no rewrite, publish or restart after it.
+describe("ActorMeshMonitor and a failed publish's sequence hole", () => {
+  for (const archived of [true, false]) {
+    it(`delivers the events after a hole at a page boundary (${archived ? "with" : "without"} the archive)`, async () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-f4-"));
+      roots.push(base);
+      const root = path.join(base, "mesh");
+      fs.mkdirSync(root, { recursive: true });
+      if (archived) {
+        fs.mkdirSync(path.join(base, "archive"));
+        fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir: path.join(base, "archive") }));
+      }
+      const mesh = new MeshStore(root, 4_096, 500);
+      const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+      const seen: string[] = [];
+      const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 3 },
+        { cursorPath: path.join(base, "cursor.json"), beforePoll: () => true, onEvent: (event) => { seen.push(event.text ?? ""); } });
+      monitors.push(monitor);
+      const poll = async (times: number) => { for (let index = 0; index < times; index++) { monitor.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); } };
+      for (const text of ["e1", "e2", "e3"]) await mesh.publish({ topic: "fleet.work.a", from, text });
+      await poll(5);
+      expect(seen).toEqual(["e1", "e2", "e3"]);
+      const events = path.join(root, "events.jsonl");
+      const append = fs.appendFileSync.bind(fs);
+      let fail = true;
+      const spy = vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        if (fail && String(file) === events) { fail = false; throw new Error("disk full"); }
+        return (append as (...args: unknown[]) => void)(file, ...rest);
+      }) as typeof fs.appendFileSync);
+      await expect(mesh.publish({ topic: "fleet.work.a", from, text: "e4" })).rejects.toThrow("disk full");
+      spy.mockRestore();
+      await mesh.publish({ topic: "fleet.work.a", from, text: "e5" });
+      await mesh.publish({ topic: "fleet.work.a", from, text: "e6" });
+      expect(mesh.read({ after: 0 }).map((event) => event.sequence)).toEqual([1, 2, 3, 5, 6]);
+      await poll(10);
+      expect(seen).toEqual(["e1", "e2", "e3", "e5", "e6"]);
+    });
+  }
 });

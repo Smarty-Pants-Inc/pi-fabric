@@ -174,6 +174,34 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).toHaveBeenCalledOnce();
   });
+  // review/security on pi-fabric#95: a session's tool_result redaction applies to a shell tool's
+  // returned result; an automatic message must not quote output it never saw.
+  it("quotes no shell output in automatic messages: before and after spill, and a monitor match", async () => {
+    const MARK = "REDACTED-BY-TOOL-RESULT-7731";
+    const h = harness(); h.idle();
+    const job = h.jobs.begin("bash", "build");
+    job.append(Buffer.from(`printed before the spill ${MARK}\n`));
+    job.spill();
+    job.append(Buffer.from(`printed after detaching ${MARK}\n`));
+    await job.finish(0);
+    const watch = h.begin("wake");
+    watch.append(Buffer.from(`CI: ${MARK}\n`));
+    await vi.advanceTimersByTimeAsync(1000);
+    h.emit("turn_end");
+    await vi.advanceTimersByTimeAsync(100);
+    h.pending(true);
+    const other = h.begin(); other.append(Buffer.from(`${MARK}\n`)); await other.finish(1);
+    await vi.advanceTimersByTimeAsync(100);
+    h.pending(false);
+    const atStart = h.emit("before_agent_start");
+    const messages = [...h.sendMessage.mock.calls.map((call) => call[0]), atStart?.message].filter(Boolean);
+    expect(messages.length).toBeGreaterThan(1);
+    for (const message of messages) {
+      expect(JSON.stringify(message)).not.toContain(MARK);
+      expect(message.content).toContain("tasks.get");
+    }
+  });
+
   it("never wakes for ui-only monitors, even on completion", async () => {
     const h = harness(); h.idle(); const job = h.begin("ui");
     job.append(Buffer.from("CI: failed\n"));
@@ -187,8 +215,9 @@ describe("shell event delivery", () => {
     const h = harness(); const job = h.begin("wake");
     for (let i = 0; i < 4; i++) { job.append(Buffer.from(`state ${i}\n`)); await vi.advanceTimersByTimeAsync(1000); }
     h.emit("turn_end");
-    expect(h.sendMessage.mock.calls[0]![0].content).toContain("state 3");
-    expect(h.sendMessage.mock.calls[0]![0].content).not.toContain("state 0");
+    // Coalesced into one event of the latest batch; its lines are read with tasks.watch.
+    expect(h.sendMessage.mock.calls[0]![0].content).toContain("1 new matching line");
+    expect(h.sendMessage.mock.calls[0]![0].content).not.toContain("state 3");
     job.append(Buffer.from("state 4\n")); await vi.advanceTimersByTimeAsync(1000);
     h.jobs.acknowledge(job.id); h.emit("turn_end");
     job.append(Buffer.from("state 5\n")); await vi.advanceTimersByTimeAsync(1000);

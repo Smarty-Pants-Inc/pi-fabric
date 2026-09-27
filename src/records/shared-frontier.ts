@@ -26,7 +26,7 @@ export class SharedFrontierProvider implements ArchiveFrontierProvider {
         [this.name, windowSeconds],
       );
       return rowCount === 1;
-    });
+    }, "", signal);
     if (claimed) {
       let frontier: string | undefined;
       try {
@@ -41,7 +41,7 @@ export class SharedFrontierProvider implements ArchiveFrontierProvider {
     return store.transaction(async (client) => {
       const { rows } = await client.query<{ frontier: string | null }>("SELECT frontier::text AS frontier FROM archive_checks WHERE target = $1", [this.name]);
       return rows[0]?.frontier ?? undefined;
-    });
+    }, "", signal);
   }
 
   /** A failed check keeps the last good frontier and records why. */

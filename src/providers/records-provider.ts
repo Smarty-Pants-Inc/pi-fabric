@@ -59,6 +59,17 @@ const descriptors: FabricActionDescriptor[] = [
   },
 ];
 
+/** Stop waiting for a shared promise (the service opening) when the caller is gone; it keeps opening. */
+const untilAborted = <T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> => {
+  if (!signal) return promise;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+};
+
 export class RecordsProvider implements FabricProvider {
   readonly name = "records";
   readonly description = "The org's durable record on its Node (PostgreSQL): append, read by cursor, get a ref's fold, list views";
@@ -74,16 +85,20 @@ export class RecordsProvider implements FabricProvider {
     return descriptors.find((action) => action.name === name);
   }
 
-  async invoke(name: string, args: Record<string, unknown>, _context: FabricInvocationContext): Promise<unknown> {
+  async invoke(name: string, args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
     if (!descriptors.some((action) => action.name === name)) throw new Error(`Unknown records action: ${name}`);
-    const service = await this.service();
+    // The call's lifetime reaches the store: a cancelled or revoked call starts no later step and commits nothing.
+    const signal = context.signal;
+    const service = await untilAborted(this.service(), signal);
+    signal?.throwIfAborted();
     if (name === "status") return service.status();
     const principal = service.principal();
+    const options = signal ? { signal } : {};
     switch (name) {
-      case "append": return service.store.append(principal, args);
-      case "read": return service.store.read(principal, args);
-      case "get": return service.store.get(principal, args);
-      default: return service.store.list(principal, args);
+      case "append": return service.store.append(principal, args, options);
+      case "read": return service.store.read(principal, args, options);
+      case "get": return service.store.get(principal, args, options);
+      default: return service.store.list(principal, args, options);
     }
   }
 }

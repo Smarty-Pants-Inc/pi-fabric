@@ -6,6 +6,8 @@ import { PublicationRelay, type NudgePublisher } from "../src/records/relay.js";
 import { migrate, WRITER_ROLE } from "../src/records/schema.js";
 import { RecordKeyConflictError, RecordStore, type ClientPool, type RecordsPrincipal, type RecordStoreOptions } from "../src/records/store.js";
 import { RecordsWatchdog } from "../src/records/watchdog.js";
+import { RecordsService } from "../src/records/service.js";
+import { normalizeRecordsConfig } from "../src/records/config.js";
 import { SharedFrontierProvider } from "../src/records/shared-frontier.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
 
@@ -17,12 +19,12 @@ const REF = "Smarty-Pants-Inc/smarty-dev#754";
 let server: TestPostgres;
 let databases = 0;
 
-const freshDatabase = async (): Promise<{ pool: pg.Pool; admin: pg.Pool }> => {
+const freshDatabase = async (max = 10): Promise<{ pool: pg.Pool; admin: pg.Pool }> => {
   const name = `records_${++databases}`;
   const root = server.pool({ max: 1 });
   await root.query(`CREATE DATABASE ${name}`);
   await root.end();
-  const pool = new pg.Pool({ ...server.connection, database: name, max: 10 });
+  const pool = new pg.Pool({ ...server.connection, database: name, max });
   pool.on("error", () => undefined);
   const client = await pool.connect();
   try { await migrate(client); } finally { client.release(); }
@@ -30,8 +32,8 @@ const freshDatabase = async (): Promise<{ pool: pg.Pool; admin: pg.Pool }> => {
 };
 
 const open: pg.Pool[] = [];
-const storeFor = async (options: Partial<RecordStoreOptions> = {}): Promise<{ store: RecordStore; pool: pg.Pool }> => {
-  const { pool } = await freshDatabase();
+const storeFor = async (options: Partial<RecordStoreOptions> = {}, max = 10): Promise<{ store: RecordStore; pool: pg.Pool }> => {
+  const { pool } = await freshDatabase(max);
   open.push(pool);
   return { store: new RecordStore(pool as unknown as ClientPool, { org: "smarty-pants", origin: "dev1", ...options }), pool };
 };
@@ -210,6 +212,75 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
     // A failed append writes neither the record nor its outbox row.
     await expect(store.append(alice, { ref: REF, kind: "status", key: "s1", text: "changed" })).rejects.toBeInstanceOf(RecordKeyConflictError);
     expect((await pool.query("SELECT count(*)::int AS n FROM outbox")).rows[0].n).toBe(6);
+  });
+
+  it("refuses superseding another author's record and writes nothing; own edits and shared issue edits still work", async () => {
+    const { store, pool } = await storeFor({ mirror: { enabled: true } });
+    const counts = async () => (await pool.query("SELECT (SELECT count(*) FROM records)::int AS r, (SELECT count(*) FROM outbox)::int AS o, (SELECT count(*) FROM publication)::int AS p")).rows[0];
+    const aliceStatus = await store.append(alice, { ref: REF, kind: "status", key: "s1", text: "alice's" });
+    const imported = await store.append(importer, { ref: REF, kind: "comment", key: "gh-1", text: "from GitHub", author: "github:paul", data: { via: "github:paul" } });
+    const before = await counts();
+    // The reported sequence: bob's status supersedes alice's, which would PATCH alice's comment.
+    await expect(store.append(bob, { ref: REF, kind: "status", key: "b1", text: "bob's", supersedes: aliceStatus.id })).rejects.toThrow(/by another author; only its author replaces it/);
+    await expect(store.append(alice, { ref: REF, kind: "comment", key: "c", text: "rewrite", supersedes: imported.id })).rejects.toThrow(/by another author/);
+    expect(await counts()).toEqual(before);
+    // Counterexamples that must still work: the same author's edit, an imported author's edit, a shared issue.
+    const edit = await store.append(alice, { ref: REF, kind: "status", key: "s2", text: "alice's, updated", supersedes: aliceStatus.id });
+    expect((await pool.query("SELECT edit_of FROM outbox WHERE record_id = $1", [edit.id])).rows[0].edit_of).toBe(aliceStatus.id);
+    await store.append(importer, { ref: REF, kind: "comment", key: "gh-1-edit", text: "edited on GitHub", author: "github:paul", supersedes: imported.id, data: { via: "github:paul" } });
+    const issue = await store.append(alice, { ref: REF, kind: "issue", key: "i", data: { title: "Record", stage: "build" } });
+    await store.append(bob, { ref: REF, kind: "issue", key: "stage", supersedes: issue.id, data: { stage: "review" } });
+    expect((await store.get(bob, { ref: REF })).state).toMatchObject({ title: "Record", stage: "review" });
+  });
+
+  it("commits nothing for an append aborted while it waits for the org lock or a connection", async () => {
+    const { store, pool } = await storeFor({}, 2);
+    const count = async () => (await pool.query("SELECT (SELECT count(*) FROM records)::int + (SELECT count(*) FROM outbox)::int + (SELECT count(*) FROM publication)::int AS n")).rows[0].n;
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    // The reported sequence: blocked on the per-org lock, cancelled, then the lock frees.
+    const blocker = await pool.connect();
+    await blocker.query("BEGIN");
+    await blocker.query("SELECT pg_advisory_xact_lock(hashtextextended('fabric-records:smarty-pants', 0))");
+    const locked = new AbortController();
+    const waiting = store.append(alice, { ref: REF, kind: "status", key: "late", text: "must not land" }, { signal: locked.signal });
+    await sleep(300);
+    locked.abort(new Error("call cancelled"));
+    await expect(waiting).rejects.toThrow(/call cancelled/);
+    await blocker.query("COMMIT");
+    // Blocked on the pool (both connections busy), cancelled, then a connection frees.
+    const busy = await pool.connect();
+    const queued = new AbortController();
+    const waitingForConnection = store.append(alice, { ref: REF, kind: "status", key: "late-2", text: "must not land" }, { signal: queued.signal });
+    await sleep(100);
+    queued.abort(new Error("call cancelled"));
+    await expect(waitingForConnection).rejects.toThrow(/call cancelled/);
+    busy.release();
+    blocker.release();
+    await sleep(500);
+    expect(await count()).toBe(0);
+    // Already cancelled: nothing starts.
+    const gone = new AbortController();
+    gone.abort(new Error("gone"));
+    await expect(store.append(alice, { ref: REF, kind: "status", key: "late-3", text: "x" }, { signal: gone.signal })).rejects.toThrow(/gone/);
+    // The counterexample: the pool still works, and an uncancelled append lands.
+    expect((await store.append(alice, { ref: REF, kind: "status", key: "late", text: "must not land" })).sequence).toBe(1);
+    expect(await count()).toBe(2);
+  });
+
+  it("closes promptly while an archive check is running, and stops the checker", async () => {
+    const { pool } = await freshDatabase();
+    const config = normalizeRecordsConfig({
+      enabled: true, org: "smarty-pants", origin: "dev1",
+      admission: { targets: [{ name: "stuck", command: [process.execPath, "-e", "setTimeout(() => {}, 60000)"] }] },
+    });
+    const service = await RecordsService.open({ config, meshRoot: server.dir, publisher: recorder(), identity: { id: "session:alice" }, pool: pool as unknown as ClientPool });
+    const tick = service.watchdog.tick().catch((error: unknown) => error);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const started = Date.now();
+    await service.close(3_000);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(await tick).toBeDefined();
+    expect((pool as unknown as { ending: boolean }).ending).toBe(true);
   });
 
   it("writes no outbox rows with the mirror off", async () => {

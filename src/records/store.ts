@@ -84,11 +84,20 @@ export interface RecordsListResult { items: RecordsListItem[]; next?: string }
  * principal from it, and calls the same backend. A payload never names its principal.
  */
 export interface RecordsBackend {
-  append(principal: RecordsPrincipal, args: unknown): Promise<RecordReceipt>;
-  read(principal: RecordsPrincipal, args: unknown): Promise<RecordsPage>;
-  get(principal: RecordsPrincipal, args: unknown): Promise<RecordsGetResult>;
-  list(principal: RecordsPrincipal, args: unknown): Promise<RecordsListResult>;
+  append(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordReceipt>;
+  read(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsPage>;
+  get(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsGetResult>;
+  list(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsListResult>;
 }
+
+/** The caller's lifetime: once aborted, no further step of its call runs and nothing it started commits. */
+export interface RecordsCallOptions { signal?: AbortSignal }
+
+/**
+ * Kinds whose records belong to their author: only the same author may supersede one. An issue is
+ * shared (a stage command by the owner or a person supersedes it, C14).
+ */
+const AUTHOR_OWNED_SUPERSEDE = new Set<RecordKind>(["status", "comment", "decision", "ask", "answer", "handoff", "link", "close", "reopen", "mirror"]);
 
 export class RecordKeyConflictError extends Error {
   readonly code = "RECORD_KEY_CONFLICT";
@@ -99,6 +108,30 @@ export class RecordKeyConflictError extends Error {
 }
 
 export interface PooledClient extends SqlClient { release(error?: Error | boolean): void }
+
+/** A pool connection that an abort gives back as soon as it arrives, instead of to a dead caller. */
+const connect = (pool: ClientPool, signal: AbortSignal | undefined): Promise<PooledClient> => {
+  if (!signal) return pool.connect();
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const pending = pool.connect();
+    // The connection, when it comes, goes straight back (below): the caller is gone.
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    pending.then((client) => {
+      signal.removeEventListener("abort", onAbort);
+      if (signal.aborted) client.release();
+      else resolve(client);
+    }, (error: unknown) => {
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+  });
+};
+
+/** Bounds on one transaction's waits (the advisory lock included), so no call waits forever. */
+const LOCK_TIMEOUT = "30s";
+const STATEMENT_TIMEOUT = "60s";
 export interface ClientPool { connect(): Promise<PooledClient>; end?(): Promise<void> }
 
 export interface RecordStoreOptions {
@@ -162,26 +195,45 @@ export class RecordStore implements RecordsBackend {
     if (!ROLE_NAME.test(this.#role)) throw new Error(`records: invalid role name ${JSON.stringify(this.#role)}`);
   }
 
-  /** One transaction as the writer role; rolled back on any error. */
-  async transaction<T>(work: (client: SqlClient) => Promise<T>, mode = ""): Promise<T> {
-    const client = await this.pool.connect();
-    let broken = false;
+  /**
+   * One transaction as the writer role; rolled back on any error. An abort before COMMIT is sent
+   * destroys the connection (the server rolls back and drops any lock wait), so nothing the
+   * aborted caller started commits later. Only an abort during COMMIT itself leaves the outcome
+   * unknown, which a retry with the same key resolves (C3).
+   */
+  async transaction<T>(work: (client: SqlClient) => Promise<T>, mode = "", signal?: AbortSignal): Promise<T> {
+    const client = await connect(this.pool, signal);
+    let released = false;
+    const release = (destroy: boolean) => {
+      if (released) return;
+      released = true;
+      client.release(destroy);
+    };
+    let committing = false;
+    const onAbort = () => { if (!committing) release(true); };
+    signal?.addEventListener("abort", onAbort, { once: true });
     try {
       await client.query(`BEGIN${mode ? ` ${mode}` : ""}`);
       await client.query(`SET LOCAL ROLE ${this.#role}`);
+      await client.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
+      await client.query(`SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT}'`);
       const result = await work(client);
+      committing = true;
       await client.query("COMMIT");
       return result;
     } catch (error) {
-      await client.query("ROLLBACK").catch(() => { broken = true; });
+      if (!released) await client.query("ROLLBACK").catch(() => release(true));
+      signal?.throwIfAborted();
       throw error;
     } finally {
-      // A connection whose rollback failed is discarded, never reused mid-transaction.
-      client.release(broken);
+      signal?.removeEventListener("abort", onAbort);
+      release(false);
     }
   }
 
-  async append(principal: RecordsPrincipal, input: unknown): Promise<RecordReceipt> {
+  async append(principal: RecordsPrincipal, input: unknown, options: RecordsCallOptions = {}): Promise<RecordReceipt> {
+    const { signal } = options;
+    signal?.throwIfAborted();
     if (!principal.id?.trim()) throw new Error("records.append needs an authenticated caller");
     const args = validateAppend(input, { importer: principal.importer === true, mirror: principal.mirror === true });
     const author = args.author ?? principal.id;
@@ -189,7 +241,7 @@ export class RecordStore implements RecordsBackend {
     const hash = payloadHash(args);
     // The archive frontier is read before the lock, never inside it (a wal-g run takes seconds).
     const gate = this.options.admission;
-    if (gate?.enabled && !gate.refreshed) await gate.refresh();
+    if (gate?.enabled && !gate.refreshed) await gate.refresh(signal);
     const result = await this.transaction(async (client) => {
       // The per-org lock: commit order equals seq, and the key check below cannot race (C3, C4).
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`fabric-records:${this.org}`]);
@@ -204,7 +256,7 @@ export class RecordStore implements RecordsBackend {
       await this.#admit(client);
       const ref = args.ref ?? await this.#allocateRef(client, args.repo!);
       const parsed = parseRef(ref);
-      await this.#checkReferences(client, args, ref);
+      await this.#checkReferences(client, args, ref, author);
       const next = await client.query<{ seq: string }>("SELECT coalesce(max(seq), 0) + 1 AS seq FROM records WHERE origin = $1", [this.origin]);
       const seq = next.rows[0]!.seq;
       const inserted = await client.query<RecordRow>(
@@ -220,7 +272,7 @@ export class RecordStore implements RecordsBackend {
         [row.id, this.origin, seq, recordTopic(parsed), typeof args.data?.to === "string" ? args.data.to : null],
       );
       return { receipt: receipt(row), committed: true };
-    });
+    }, "", signal);
     if (result.committed) this.options.onCommitted?.();
     return result.receipt;
   }
@@ -255,12 +307,16 @@ export class RecordStore implements RecordsBackend {
     return `${prefix}${rows[0]!.n}`;
   }
 
-  async #checkReferences(client: SqlClient, args: AppendArgs, ref: string): Promise<void> {
+  async #checkReferences(client: SqlClient, args: AppendArgs, ref: string, author: string): Promise<void> {
     if (args.supersedes) {
-      const { rows } = await client.query<{ ref: string; kind: string }>("SELECT ref, kind FROM records WHERE id = $1", [args.supersedes]);
+      const { rows } = await client.query<{ ref: string; kind: string; author: string }>("SELECT ref, kind, author FROM records WHERE id = $1", [args.supersedes]);
       const target = rows[0];
       if (!target) throw new RecordsArgumentError(`supersedes names no record: ${args.supersedes}`);
       if (target.ref !== ref || target.kind !== args.kind) throw new RecordsArgumentError(`supersedes must name a ${args.kind} record on ${ref}`);
+      // Replacing is an edit of the author's own record (and of its forge object); never another's.
+      if (AUTHOR_OWNED_SUPERSEDE.has(args.kind) && target.author !== author) {
+        throw new RecordsArgumentError(`supersedes names a ${args.kind} record by another author; only its author replaces it`);
+      }
     }
     const named = args.kind === "answer" ? args.data?.ask : args.kind === "mirror" ? args.data?.mirrorOf : undefined;
     if (typeof named === "string") {
@@ -324,7 +380,7 @@ export class RecordStore implements RecordsBackend {
     return rows[0]?.root;
   }
 
-  async read(_principal: RecordsPrincipal, input: unknown = {}): Promise<RecordsPage> {
+  async read(_principal: RecordsPrincipal, input: unknown = {}, options: RecordsCallOptions = {}): Promise<RecordsPage> {
     const args = (input ?? {}) as Record<string, unknown>;
     if (!isObject(args)) throw new RecordsArgumentError("records.read takes {after?, limit?, origin?, ref?, kind?, to?}");
     checkKeys("read", args, ["after", "limit", "origin", "ref", "kind", "to"]);
@@ -335,14 +391,14 @@ export class RecordStore implements RecordsBackend {
     if (ref) parseRef(ref);
     const kind = optionalString("kind", args.kind);
     const to = optionalString("to", args.to);
-    return this.page({ after, limit, origin, ...(ref ? { ref } : {}), ...(kind ? { kind: kind as RecordKind } : {}), ...(to ? { to: [to] } : {}) });
+    return this.page({ after, limit, origin, ...(ref ? { ref } : {}), ...(kind ? { kind: kind as RecordKind } : {}), ...(to ? { to: [to] } : {}) }, options.signal);
   }
 
   /**
    * Records after a cursor, up to the committed frontier, from one snapshot. Commit order is seq
    * order (the append lock), so no record below the frontier can still appear later.
    */
-  async page(args: { after: number; limit: number; origin: string; ref?: string; kind?: RecordKind; to?: readonly string[]; exceptAuthor?: string }): Promise<RecordsPage> {
+  async page(args: { after: number; limit: number; origin: string; ref?: string; kind?: RecordKind; to?: readonly string[]; exceptAuthor?: string }, signal?: AbortSignal): Promise<RecordsPage> {
     return this.transaction(async (client) => {
       const frontier = await client.query<{ seq: string }>("SELECT coalesce(max(seq), 0) AS seq FROM records WHERE origin = $1", [args.origin]);
       const values: unknown[] = [args.origin, args.after, args.limit];
@@ -357,10 +413,10 @@ export class RecordStore implements RecordsBackend {
       // A full page ends at its last record; a short page has read everything up to the frontier.
       const next = records.length === args.limit ? records.at(-1)!.sequence : Math.max(args.after, top);
       return { records, next, frontier: top, origin: args.origin };
-    }, "ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", signal);
   }
 
-  async get(_principal: RecordsPrincipal, input: unknown): Promise<RecordsGetResult> {
+  async get(_principal: RecordsPrincipal, input: unknown, options: RecordsCallOptions = {}): Promise<RecordsGetResult> {
     if (!isObject(input)) throw new RecordsArgumentError("records.get takes {ref, after?, limit?}");
     checkKeys("get", input, ["ref", "after", "limit"]);
     const ref = optionalString("ref", input.ref);
@@ -391,11 +447,11 @@ export class RecordStore implements RecordsBackend {
       };
       const rows = history.rows.slice(0, limit).map(envelope);
       return { ref, state, history: rows, ...(history.rows.length > limit ? { next: rows.at(-1)!.sequence } : {}) };
-    }, "ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
   }
 
   /** A query for views (the ETA alarm, the board, `smarty log --open`); never a delivery path (C4). */
-  async list(_principal: RecordsPrincipal, input: unknown = {}): Promise<RecordsListResult> {
+  async list(_principal: RecordsPrincipal, input: unknown = {}, options: RecordsCallOptions = {}): Promise<RecordsListResult> {
     const args = (input ?? {}) as Record<string, unknown>;
     if (!isObject(args)) throw new RecordsArgumentError("records.list takes one filter object");
     checkKeys("list", args, ["org", "repo", "open", "owner", "hasOpenAsk", "updatedSince", "limit", "after"]);
@@ -443,7 +499,7 @@ export class RecordStore implements RecordsBackend {
       }) as RecordsListItem);
       const last = rows[limit - 1];
       return { items, ...(rows.length > limit && last ? { next: Buffer.from(JSON.stringify({ u: String(last.updated_us), r: last.ref })).toString("base64url") } : {}) };
-    }, "ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
   }
 
   async close(): Promise<void> { await this.pool.end?.(); }

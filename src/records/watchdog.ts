@@ -29,6 +29,8 @@ export class RecordsWatchdog {
     /** Minimum time between two alarms for one consumer. */
     realarmMs?: number;
     now?: () => number;
+    /** The service's lifetime: aborting it stops a running tick's archive check and queries. */
+    signal?: AbortSignal;
   }) {}
 
   start(): void {
@@ -42,6 +44,11 @@ export class RecordsWatchdog {
     this.#timer = undefined;
   }
 
+  /** Wait for a running tick to end (it ends promptly once the lifetime signal aborts). */
+  async idle(): Promise<void> {
+    await this.#ticking?.catch(() => undefined);
+  }
+
   async tick(): Promise<{ lagging: ConsumerLag[]; woke: boolean; alarmed: string[] }> {
     if (this.#ticking) await this.#ticking.catch(() => undefined);
     const run = this.#tick();
@@ -50,11 +57,13 @@ export class RecordsWatchdog {
   }
 
   async #tick(): Promise<{ lagging: ConsumerLag[]; woke: boolean; alarmed: string[] }> {
-    const { store, relay, gate } = this.options;
-    await relay?.flush().catch(() => undefined);
+    const { store, relay, gate, signal } = this.options;
+    signal?.throwIfAborted();
+    await relay?.flush(signal).catch(() => undefined);
     if (gate?.enabled) {
-      await gate.refresh();
-      const input = await store.transaction((client) => store.admissionInput(client, gate.frontier()));
+      await gate.refresh(signal);
+      signal?.throwIfAborted();
+      const input = await store.transaction((client) => store.admissionInput(client, gate.frontier()), "", signal);
       gate.evaluate(input);
     }
     const lagging = await this.lagging();
@@ -83,7 +92,7 @@ export class RecordsWatchdog {
         [consumer, now / 1000, (now - realarmMs) / 1000],
       );
       return rowCount === 1;
-    });
+    }, "", this.options.signal);
   }
 
   /** Consumers with an addressed record past their cursor older than the lag bound. */
@@ -102,6 +111,6 @@ export class RecordsWatchdog {
         [store.origin, (now - lagMs) / 1000],
       );
       return rows.map((row) => ({ consumer: row.consumer, after: Number(row.after), oldestAt: row.oldest.getTime(), count: Number(row.n) }));
-    });
+    }, "", this.options.signal);
   }
 }

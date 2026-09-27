@@ -25,7 +25,7 @@ export class PublicationRelay {
   constructor(readonly store: RecordStore, readonly publisher: NudgePublisher, readonly options: { batch?: number } = {}) {}
 
   /** Publish every unpublished row; concurrent calls share one run and repeat once if asked. */
-  flush(): Promise<{ published: number; failed: number }> {
+  flush(signal?: AbortSignal): Promise<{ published: number; failed: number }> {
     if (this.#running) {
       this.#again = true;
       return this.#running;
@@ -34,7 +34,7 @@ export class PublicationRelay {
       let total = { published: 0, failed: 0 };
       do {
         this.#again = false;
-        const round = await this.#round();
+        const round = await this.#round(signal);
         total = { published: total.published + round.published, failed: total.failed + round.failed };
         if (round.failed) break;
       } while (this.#again);
@@ -44,7 +44,7 @@ export class PublicationRelay {
     return run;
   }
 
-  async #round(): Promise<{ published: number; failed: number }> {
+  async #round(signal: AbortSignal | undefined): Promise<{ published: number; failed: number }> {
     let published = 0;
     const limit = this.options.batch ?? 50;
     for (;;) {
@@ -78,7 +78,7 @@ export class PublicationRelay {
           }
         }
         return { done, failed: 0, more: rows.length === limit };
-      });
+      }, "", signal);
       published += result.done;
       if (result.failed || !result.more) return { published, failed: result.failed };
     }

@@ -48,6 +48,8 @@ export class RecordsService {
   readonly watchdog: RecordsWatchdog;
   readonly statusFile: string;
   #lastAlarm = 0;
+  /** The service's lifetime: close() aborts it, which stops archive checks, relay runs and queries. */
+  readonly #life = new AbortController();
   #statusWrite: Promise<void> = Promise.resolve();
 
   private constructor(readonly options: RecordsServiceOptions, pool: ClientPool) {
@@ -70,7 +72,7 @@ export class RecordsService {
       origin: config.origin ?? os.hostname().split(".")[0]!,
       mirror: config.mirror,
       admission: this.gate,
-      onCommitted: () => { void relay?.flush().catch(() => undefined); },
+      onCommitted: () => { if (!this.#life.signal.aborted) void relay?.flush(this.#life.signal).catch(() => undefined); },
     });
     this.relay = relay = new PublicationRelay(this.store, options.publisher);
     this.inbox = options.names ? new RecordsInbox(this.store, options.identity.id, options.names) : undefined;
@@ -82,6 +84,7 @@ export class RecordsService {
       lagMs: config.consumerLagSeconds * 1000,
       intervalMs: Math.min(config.watchdogMs, config.admission.refreshMs),
       ...(options.now ? { now: options.now } : {}),
+      signal: this.#life.signal,
     });
   }
 
@@ -101,7 +104,7 @@ export class RecordsService {
     }
     const service = new RecordsService(options, pool);
     // Republish what a crash left unpublished, then keep the watchdog running.
-    void service.relay.flush().catch(() => undefined);
+    void service.relay.flush(service.#life.signal).catch(() => undefined);
     service.watchdog.start();
     return service;
   }
@@ -157,9 +160,17 @@ export class RecordsService {
   /** Wait for the pending status write (tests and shutdown). */
   async settled(): Promise<void> { await this.#statusWrite; }
 
-  async close(): Promise<void> {
+  /**
+   * Stop the watchdog, abort running work (a wal-g child, relay runs, queries: their connections
+   * are destroyed, so the server rolls back), and end the pool. Bounded: close never hangs a
+   * shutdown on a stuck archive check or connection.
+   */
+  async close(timeoutMs = 5_000): Promise<void> {
     this.watchdog.stop();
-    await this.#statusWrite;
-    await this.store.close();
+    this.#life.abort(new Error("records service closed"));
+    const bounded = (work: Promise<unknown>) => Promise.race([work.catch(() => undefined), new Promise((resolve) => setTimeout(resolve, timeoutMs).unref?.())]);
+    await bounded(this.watchdog.idle());
+    await bounded(this.#statusWrite);
+    await bounded(this.store.close());
   }
 }

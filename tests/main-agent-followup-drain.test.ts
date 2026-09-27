@@ -7,6 +7,7 @@ import {
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
   type AgentSession,
   type ExtensionAPI,
   type ExtensionContext,
@@ -153,14 +154,32 @@ describe("Main followUp drain (unit)", () => {
     expect(sent[0]!.message.content.indexOf("one")).toBeLessThan(sent[0]!.message.content.indexOf("two"));
   });
 
-  it("the fallback timer releases to a Main that went idle, and never flushes into a busy one", () => {
-    const { main, sent, state } = setup();
+  it("after a manual compaction or a branch summary: wakes Main when it completed, appends when it was cancelled or failed", () => {
+    for (const [event, payload, triggerTurn] of [
+      ["session_compact", { reason: "manual" }, true],
+      ["session_tree", {}, true],
+      ["session_compact_failed", { reason: "manual", aborted: true }, false],
+      ["session_compact_failed", { reason: "manual", aborted: false, errorMessage: "x" }, false],
+    ] as const) {
+      const { main, sent, emit, ctx, state } = setup();
+      main.deliverAgent({ from: from("a"), message: "one", delivery: "followUp" });   // held: compacting
+      vi.advanceTimersByTime(10 * 60_000);
+      expect(sent).toHaveLength(0);                     // no timer releases it
+      state.idle = true;
+      emit(event, payload, ctx);
+      vi.advanceTimersByTime(1);
+      expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
+    }
+  });
+
+  it("leaves a compaction inside a run to that run's boundaries", () => {
+    const { main, sent, emit, ctx, state } = setup();
     main.deliverAgent({ from: from("a"), message: "one", delivery: "followUp" });
-    vi.advanceTimersByTime(120_000);
-    expect(sent).toHaveLength(0);                         // busy: waits for a boundary
     state.idle = true;
-    vi.advanceTimersByTime(120_000);
-    expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+    emit("session_compact", { reason: "threshold" }, ctx);
+    emit("session_compact_failed", { reason: "overflow", aborted: true }, ctx);
+    vi.advanceTimersByTime(1);
+    expect(sent).toHaveLength(0);
   });
 
   it("does not flush after an aborted turn, and after Escape appends without starting a run", () => {
@@ -425,6 +444,82 @@ describe("Main followUp drain at a cancelled settle in a real Pi session", () =>
     const { agentStarts, calls, delivered } = await run(false);
     expect(calls).toBe(3);                               // Pi continued the run for it
     expect(agentStarts).toBeLessThanOrEqual(2);
+    expect(delivered).toHaveLength(1);
+    expect((delivered[0] as { details?: { triggerTurn?: boolean } }).details?.triggerTurn).toBe(true);
+  });
+});
+
+// review/astra round 3 on pi-fabric#102: manual /compact makes an idle Main busy without a run;
+// the user cancels it. No turn_end and no settle follows, so nothing may start a run then.
+describe("Main followUp drain around a manual compaction in a real Pi session", () => {
+  const run = async (cancel: boolean) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-drain-compact-"));
+    roots.push(root);
+    const faux = fauxProvider();
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+    modelRuntime.registerNativeProvider(faux.provider);
+    let main: MainAgentController | undefined;
+    let releaseCompaction: (() => void) | undefined;
+    let agentStarts = 0;
+    const loader = new DefaultResourceLoader({
+      cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [{
+        name: "drain",
+        factory: (pi: ExtensionAPI) => {
+          pi.on("agent_start", () => { agentStarts++; });
+          pi.on("session_before_compact", async (event) => {
+            await new Promise<void>((resolve) => { releaseCompaction = resolve; });
+            return { compaction: { summary: "summary", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
+          });
+          pi.on("session_start", (_event, ctx) => {
+            main = new MainAgentController(pi, "session:root", true, root, "root");
+            main.attachFollowUpDrain(ctx, 100);   // the wait below passes the flush deadline
+          });
+        },
+      }],
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({
+      cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+      sessionManager: SessionManager.inMemory(root), noTools: "all",
+      settingsManager: SettingsManager.inMemory({ compaction: { keepRecentTokens: 1 } }),
+    });
+    sessions.push(session);
+    await session.bindExtensions({});
+    await waitFor(() => main !== undefined);
+    faux.setResponses([fauxAssistantMessage("first answer"), fauxAssistantMessage("second answer")]);
+    await session.prompt("first question");
+    await session.prompt("second question");
+    const startsBefore = agentStarts;
+    const callsBefore = faux.state.callCount;
+    faux.appendResponses([fauxAssistantMessage("read it")]);
+    const compacting = session.compact().catch(() => undefined);   // the cancel rejects
+    await waitFor(() => releaseCompaction !== undefined);
+    expect(session.isIdle).toBe(false);
+    expect(main!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" }, message: "during compaction", delivery: "followUp" }))
+      .toMatchObject({ pendingFollowUps: 1 });
+    if (cancel) session.abortCompaction();
+    releaseCompaction!();
+    await compacting;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitFor(() => session.isIdle);
+    const delivered = session.messages.filter((message) => message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-agent-message");
+    return { newRuns: agentStarts - startsBefore, newRequests: faux.state.callCount - callsBefore, delivered, main: main! };
+  };
+
+  it("keeps the followUp for the next run, without a new run, when the user cancels the compaction", async () => {
+    const { newRuns, newRequests, delivered, main } = await run(true);
+    expect(newRuns).toBe(0);
+    expect(newRequests).toBe(0);
+    expect(delivered).toHaveLength(1);
+    expect((delivered[0] as { details?: { triggerTurn?: boolean } }).details?.triggerTurn).toBe(false);
+    expect(main.queueDepth().pendingFollowUps).toBe(0);
+  });
+
+  it("counterexample: after a completed compaction the followUp wakes Main", async () => {
+    const { newRuns, newRequests, delivered } = await run(false);
+    expect(newRuns).toBe(1);
+    expect(newRequests).toBe(1);
     expect(delivered).toHaveLength(1);
     expect((delivered[0] as { details?: { triggerTurn?: boolean } }).details?.triggerTurn).toBe(true);
   });

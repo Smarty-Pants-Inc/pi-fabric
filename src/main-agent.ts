@@ -124,7 +124,6 @@ export class MainAgentController implements FabricMainAgentTarget {
   #flushMs = 0;
   #suspended = false;
   #closed = false;
-  #timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -205,7 +204,6 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (request.delivery === "followUp" && triggerTurn && this.#drainActive()) {
       this.#held.push(item);
       if (this.#context!.isIdle()) this.#release(true);
-      else this.#arm();
     } else {
       this.#send([item], request.delivery, triggerTurn, false);
     }
@@ -263,6 +261,24 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#suspended = false;
       this.#release(completed);
     });
+    // Manual /compact makes Main busy without a run, so no settle follows it. After a compaction
+    // that completed, wake Main for what it held; after one that was cancelled or failed, append
+    // them for the next run instead (review/astra on pi-fabric#102). A compaction inside a run
+    // leaves them to that run's boundaries.
+    on("session_compact", (event: { reason?: string }, ctx) => {
+      this.#context = ctx;
+      if (event.reason === "manual") this.#wakeWhenIdle();
+    });
+    // A branch summary on /tree navigation is the same: busy without a run. A cancelled one
+    // emits nothing, so its followUps wait for the next run.
+    on("session_tree", (_event, ctx) => {
+      this.#context = ctx;
+      this.#wakeWhenIdle();
+    });
+    on("session_compact_failed", (event: { reason?: string }, ctx) => {
+      this.#context = ctx;
+      if (event.reason === "manual" && ctx.isIdle()) this.#release(false);
+    });
     on("agent_start", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
     on("input", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
   }
@@ -270,8 +286,6 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** Stop holding; any held followUps go to Pi's own followUp queue, as before the drain. */
   closeFollowUpDrain(): void {
     for (const off of this.#unsubscribe.splice(0)) off();
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
     const held = this.#held.splice(0);
     this.#closed = true;
     this.#context = undefined;
@@ -297,24 +311,16 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#send(this.#held.splice(0, due), "steer", true, true);
   }
 
-  #release(triggerTurn: boolean): void {
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
-    if (!this.#held.length) return;
-    this.#send(this.#held.splice(0), "followUp", triggerTurn, false);
+  #wakeWhenIdle(): void {
+    // Pi clears its busy state after the event's handlers run; release once Main is idle.
+    setTimeout(() => {
+      if (!this.#closed && this.#context?.isIdle()) this.#release(true);
+    }, 0);
   }
 
-  #arm(): void {
-    if (this.#timer || !this.#held.length) return;
-    // A fallback for a Main busy without turns (compaction) or a missed settle.
-    const wait = Math.max(0, this.#held[0]!.sentAt + this.#flushMs - Date.now());
-    this.#timer = setTimeout(() => {
-      this.#timer = undefined;
-      if (this.#closed) return;
-      if (this.#context?.isIdle()) this.#release(!this.#suspended);
-      else this.#arm();
-    }, wait || this.#flushMs);
-    this.#timer.unref?.();
+  #release(triggerTurn: boolean): void {
+    if (!this.#held.length) return;
+    this.#send(this.#held.splice(0), "followUp", triggerTurn, false);
   }
 
   #send(

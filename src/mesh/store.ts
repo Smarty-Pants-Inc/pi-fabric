@@ -487,6 +487,20 @@ export class MeshStore {
     return events.map((event) => jsonClone(event));
   }
 
+  /**
+   * The first committed event after a sequence. When the archive holds that range, only the
+   * archive answers: it holds each event before the event goes live, so it is one coherent
+   * source across a live-log rewrite (smarty-dev#754). Otherwise the live log answers.
+   */
+  nextEventAfter(after: number): MeshEvent | undefined {
+    const archive = MeshArchive.fromRoot(this.root);
+    const first = archive?.firstSequence();
+    const event = archive && first !== undefined && first <= after + 1
+      ? archive.readAfter(after, this.#readLastEventSequence(), () => true, 1)[0]
+      : this.#readEventsAfter(after, {}, 1)[0];
+    return event ? jsonClone(event) : undefined;
+  }
+
   // A cursor older than the live log reads the archive, which holds every event since it was
   // set (smarty-dev#754). The oldest live sequence changes only when the log is rewritten.
   #readArchivedAfter(after: number, input: { topic?: string; to?: string }, limit: number): MeshEvent[] | undefined {

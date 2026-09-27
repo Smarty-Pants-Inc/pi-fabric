@@ -31,7 +31,7 @@ export class ActorMeshMonitor {
   #archiveAfter: number | undefined;
 
   constructor(
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence">>,
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter">>,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
@@ -128,14 +128,14 @@ export class ActorMeshMonitor {
       // its start. Nothing is committed past the gap first; events already handed on are skipped.
       const generation = meshCursorGeneration(tail.nextOffset);
       const first = tail.events[0];
-      // A gap is unread only if the store holds an event inside it. `read({after})` answers from
-      // one coherent source: the archive, which holds every event, when the last event handed on
-      // is older than the live log; otherwise the live log, which then holds everything after it.
-      // A hole the store does not hold (a failed publish's reserved sequence, or events a store
-      // without the archive cut) is passed at once, so it cannot stall the stream.
-      const gap = first !== undefined && this.#last !== undefined && this.mesh.read !== undefined &&
+      // A gap is unread only if the store holds an event inside it. `nextEventAfter` asks the
+      // archive alone when it holds the range: every event is there before it goes live, so no
+      // rewrite can hide one. A hole the store does not hold (a failed publish's reserved
+      // sequence, or events a store without the archive cut) is passed at once, so it cannot
+      // stall the stream.
+      const gap = first !== undefined && this.#last !== undefined && this.mesh.nextEventAfter !== undefined &&
         typeof first.sequence === "number" && first.sequence > this.#last.sequence + 1 &&
-        (this.mesh.read({ after: this.#last.sequence, limit: 1 })[0]?.sequence ?? Infinity) < first.sequence;
+        (this.mesh.nextEventAfter(this.#last.sequence)?.sequence ?? Infinity) < first.sequence;
       if (this.#last && this.mesh.read && (generation !== meshCursorGeneration(start) || gap)) {
         this.#archiveAfter = this.#last.sequence;
         this.#offset = meshCursorAtStart(generation);

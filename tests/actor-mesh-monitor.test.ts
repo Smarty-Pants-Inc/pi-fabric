@@ -483,6 +483,41 @@ describe("ActorMeshMonitor archive/live handoff across a rewrite's two writes", 
     await poll(10);
     expect(workTexts()).toEqual(odd(1, 16));
   });
+
+  // review/astra round 6 on pi-fabric#97: the gap lookup itself must not be fooled by a rewrite
+  // that lands after it chose where to look and before it opened the live log.
+  it("fills the gap when a rewrite lands inside the gap lookup", async () => {
+    const { mesh, poll, publish, workTexts, events } = await setup();
+    await publish(1, 4);
+    await poll(5);
+    await publish(5, 13);
+    const all = fs.readFileSync(events, "utf8").split("\n").filter(Boolean);
+    const write = (low: number, high: number) => {
+      fs.writeFileSync(`${events}.tmp`, all
+        .filter((line) => { const sequence = (JSON.parse(line) as MeshEvent).sequence; return sequence >= low && sequence <= high; })
+        .map((line) => `${line}\n`).join(""));
+      fs.renameSync(`${events}.tmp`, events);
+    };
+    const open = fs.openSync.bind(fs);
+    let opensAfterTail = -1;                                   // armed once the stale page is read
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (opensAfterTail >= 0 && String(file) === events && ++opensAfterTail === 2) write(9, 13);
+      return (open as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    const tail = mesh.tail.bind(mesh);
+    let calls = 0;
+    vi.spyOn(mesh, "tail").mockImplementation((cursor, limit) => {
+      if (++calls === 1) write(5, 9);                          // the old offset now points at event 9
+      const page = tail(cursor, limit);
+      if (calls === 1) opensAfterTail = 0;
+      return page;
+    });
+    await poll(12);
+    vi.mocked(fs.openSync).mockRestore();
+    vi.mocked(mesh.tail).mockRestore();
+    expect(opensAfterTail).toBeGreaterThanOrEqual(2);
+    expect(workTexts()).toEqual(odd(1, 13));                   // 5 and 7 before 9
+  });
 });
 
 describe("ActorMeshMonitor without an archive", () => {

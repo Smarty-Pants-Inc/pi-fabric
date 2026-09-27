@@ -176,6 +176,12 @@ export class MeshArchive {
     return this.#readJson<ArchiveHead>("HEAD.json");
   }
 
+  /** The first sequence the archive holds; it holds every committed event from there on. */
+  firstSequence(): number | undefined {
+    const first = this.#readJson<{ firstSequence?: unknown }>("MESH.json")?.firstSequence;
+    return typeof first === "number" && Number.isSafeInteger(first) ? first : undefined;
+  }
+
   pending(): MeshArchivePending | undefined {
     return this.#readJson<MeshArchivePending>("PENDING.json");
   }

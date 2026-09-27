@@ -306,6 +306,31 @@ describe("mesh event archive", () => {
     expect(new Set(synced())).toEqual(new Set([path.join(dir, year!, month!, day!), path.join(dir, year!, month!), path.join(dir, year!), dir]));
   });
 
+  it.skipIf(process.platform === "win32")("finishes a stopped catch-up's directory syncs before any publish succeeds (review F8)", async () => {
+    const { store, enable, dir, file, lines } = setup({ archive: false });
+    await store.publish({ topic: "ops.owner", from, text: "one" });
+    await store.publish({ topic: "ops.owner", from, text: "two" });
+    enable();
+    const [year, month, day] = today().split("/");
+    const dayDirectory = path.join(dir, year!, month!, day!);
+    // The catch-up writes and syncs its lines, then its first directory sync fails.
+    const open = fs.openSync;
+    const failing = vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) === dayDirectory && rest[0] === "r") {
+        failing.mockRestore();
+        throw Object.assign(new Error("EIO"), { code: "EIO" });
+      }
+      return (open as (...args: unknown[]) => number)(target, ...rest);
+    }) as typeof fs.openSync);
+    await expect(store.publish({ topic: "ops.owner", from, text: "three" })).rejects.toThrow("EIO");
+    expect(lines(file(today(), "ops.owner"))).toHaveLength(2);
+    // The retry finds the lines already there, and still syncs the day's directories first.
+    const synced = syncedDirectories();
+    await store.publish({ topic: "ops.owner", from, text: "three" });
+    expect(synced()).toEqual(expect.arrayContaining([dayDirectory, path.join(dir, year!, month!), path.join(dir, year!), dir]));
+    expect(lines(file(today(), "ops.owner"))).toHaveLength(3);
+  });
+
   it("fails every publish when the archive root is missing, instead of starting a new archive", async () => {
     const { store, dir, live } = setup();
     fs.rmSync(dir, { recursive: true, force: true });

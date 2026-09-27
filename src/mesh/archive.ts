@@ -294,7 +294,6 @@ export class MeshArchive {
       descriptor: number;
       last: { sequence: number; id: string } | undefined;
       relative: string;
-      fresh: boolean;
     }>();
     let last: ArchiveHead | undefined;
     try {
@@ -306,10 +305,9 @@ export class MeshArchive {
           const absolute = path.join(this.dir, relative);
           fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 });
           const descriptor = fs.openSync(absolute, "a+", 0o600);
-          file = { descriptor, last: undefined, relative, fresh: false };
+          file = { descriptor, last: undefined, relative };
           open.set(relative, file);
           file.last = this.#repairAndReadLast(descriptor, absolute);
-          file.fresh = fs.fstatSync(descriptor).size === 0;
         }
         const previous = file.last;
         last = { sequence: event.sequence, id: event.id, file: relative };
@@ -319,10 +317,12 @@ export class MeshArchive {
         writeAll(file.descriptor, Buffer.from(`${line}\n`, "utf8"));
         file.last = { sequence: event.sequence, id: event.id };
       }
-      for (const { descriptor, relative, fresh } of open.values()) {
-        fs.fdatasyncSync(descriptor);
-        if (fresh) this.#syncDays(relative);
-      }
+      for (const { descriptor } of open.values()) fs.fdatasyncSync(descriptor);
+      // Before the head moves, sync the directories of every day this catch-up touched, even
+      // for files that already held lines: a stopped catch-up leaves complete lines whose
+      // names may never have been synced, and only a retry that finishes the syncs moves on.
+      const days = new Map([...open.values()].map(({ relative }) => [relative.split("/").slice(0, 3).join("/"), relative]));
+      for (const relative of days.values()) this.#syncDays(relative);
     } finally {
       for (const { descriptor } of open.values()) fs.closeSync(descriptor);
     }

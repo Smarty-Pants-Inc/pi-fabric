@@ -3,7 +3,7 @@ import { validationMessage } from "../core/action-arguments.js";
 import { CacheLeases, MAX_CACHE_LEASE_MS } from "../cache/leases.js";
 import { observePromptCache } from "../cache/observations.js";
 import type { FabricCacheHoldOptions, FabricCacheHoldResult, FabricCacheStatus } from "../cache/types.js";
-import type { FabricActionDescriptor, FabricInvocationContext, FabricProvider, FabricProviderListRequest, FabricScopedProviderResult } from "../protocol.js";
+import type { FabricActionDescriptor, FabricInvocationContext, FabricInvocationOutcome, FabricProvider, FabricProviderListRequest, FabricScopedProviderResult } from "../protocol.js";
 
 const target = { type: "string", enum: ["self", "main"], description: "Local session only. main is accepted only in the root Pi runtime; never routes to another process." };
 const statusSchema = { type: "object", properties: { target }, additionalProperties: false };
@@ -85,6 +85,6 @@ export class CacheProvider implements FabricProvider {
     const result = this.#hold(args, context, "component");
     return { value: result, dispose: () => { if (result.status === "held") this.#leases.dispose(result.id); } };
   }
-  async invocationEnded(id: string): Promise<void> { this.#leases.invocationEnded(id); }
+  async invocationEnded(id: string, outcome: FabricInvocationOutcome): Promise<void> { this.#leases.invocationEnded(id, outcome === "succeeded"); }
   async close(): Promise<void> { this.#leases.close(); }
 }

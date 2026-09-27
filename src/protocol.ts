@@ -370,6 +370,9 @@ export interface FabricScopedProviderResult {
   dispose(): void | Promise<void>;
 }
 
+/** How a fabric_exec invocation ended, as seen by provider finalizers. */
+export type FabricInvocationOutcome = "succeeded" | "failed";
+
 export interface FabricProvider {
   name: string;
   description: string;
@@ -396,7 +399,8 @@ export interface FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<FabricScopedProviderResult>;
-  invocationEnded?(parentToolCallId: string): Promise<void>;
+  /** `outcome` is "succeeded" only for a completed fabric_exec; anything else is "failed". */
+  invocationEnded?(parentToolCallId: string, outcome: FabricInvocationOutcome): Promise<void>;
   subscribeCatalog?(listener: () => void): () => void;
   close?(): Promise<void>;
 }

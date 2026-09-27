@@ -114,10 +114,14 @@ export class CacheLeases {
     this.#drop(id);
     if (this.#cleanupError) throw new Error(this.#cleanupError);
   }
-  invocationEnded(id: string): void {
-    // Successful holds survive the allocating fabric_exec, not its operation signal.
-    for (const lease of this.#leases.values()) {
-      if (lease.value.scope === "session" && lease.invocationId === id) lease.detach();
+  invocationEnded(id: string, succeeded: boolean): void {
+    // Only a successful fabric_exec transfers its session holds to the session.
+    // Any other end releases them: an executor need not abort the operation
+    // signal once no host call is pending. Component leases stay scope-owned.
+    for (const [leaseId, lease] of [...this.#leases]) {
+      if (lease.value.scope !== "session" || lease.invocationId !== id) continue;
+      if (succeeded) lease.detach();
+      else this.#drop(leaseId);
     }
   }
   #drop(id: string): boolean {

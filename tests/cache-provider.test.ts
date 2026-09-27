@@ -132,8 +132,22 @@ describe("CacheProvider", () => {
     expect((await f.status()).leases).toEqual([]);
     await expect(f.hold()).rejects.toThrow();
     const later = new AbortController(); f.ctx.signal = later.signal;
-    held(await f.hold()); await f.provider.invocationEnded("outer"); later.abort();
+    held(await f.hold()); await f.provider.invocationEnded("outer", "succeeded"); later.abort();
     expect((await f.status()).leases).toHaveLength(1);
+    await f.provider.close();
+  });
+  it("releases a failed invocation's session holds and keeps other invocations' and component leases", async () => {
+    const f = fixture();
+    const other = held(await f.hold());
+    f.ctx.parentToolCallId = "failed";
+    const scoped = await f.provider.acquire("lease", { durationMs: 10_000 }, f.ctx);
+    held(await f.hold());
+    await f.provider.invocationEnded("failed", "failed");
+    expect((await f.status()).leases.map(lease => [lease.id === other.id, lease.scope])).toEqual([[true, "session"], [false, "component"]]);
+    expect(f.releaseNative).not.toHaveBeenCalled();
+    await scoped.dispose();
+    await f.provider.invoke("release", { id: other.id }, f.ctx);
+    expect(f.releaseNative).toHaveBeenCalledTimes(1);
     await f.provider.close();
   });
   it("does not retry failed native acquisition on the same binding", async () => {

@@ -426,7 +426,7 @@ export class MeshStore {
     return this.#withLock(() => {
       this.#repairEventLog();
       const archive = MeshArchive.fromRoot(this.root);
-      if (archive) this.#catchUpArchive(archive);
+      if (archive) this.#recoverArchive(archive);
       const createdAt = Date.now();
       const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
       const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
@@ -446,13 +446,20 @@ export class MeshStore {
         throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
       }
       // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
-      // The archive commits first (smarty-dev#754): if it fails, no reader ever sees the event.
-      // ponytail: its fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a burst of 160
-      // publishes held other writers up to 1.3 s at 5x the fleet rate. If the lock's held share
-      // matters (#816), sync after unlocking and let concurrent syncs share a journal commit.
+      // The archive holds the event durably before it goes live (smarty-dev#754); the live
+      // append commits it. If either step fails, the event is cut back out of the archive.
+      // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
+      // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
+      // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
       atomicWrite(this.#counterPath, sequence);
-      archive?.append([{ event, line }], { intent: true });
-      fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+      const pending = archive?.begin({ event, line });
+      try {
+        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+      } catch (error) {
+        if (pending) archive!.rollback(pending);
+        throw error;
+      }
+      if (pending) archive!.commit(pending);
       this.#compactEventLog();
       return event;
     });
@@ -491,24 +498,19 @@ export class MeshStore {
     const oldest = this.#oldestLive.sequence;
     if (oldest === undefined || after + 1 >= oldest) return undefined;
     const archived = MeshArchive.fromRoot(this.root)
-      ?.readAfter(after, (event) => this.#eventMatches(event, input), limit, input.topic);
+      ?.readAfter(after, this.#readLastEventSequence(), (event) => this.#eventMatches(event, input), limit, input.topic);
     return archived?.length ? archived : undefined;
   }
 
-  // Before a publish, under the lock, bring the live log and the archive level. The event of a
-  // publish that crashed after its archive append goes live now. Events that a store without
-  // the archive appended (an older Fabric, or before the archive was set) go into the archive.
-  #catchUpArchive(archive: MeshArchive): void {
-    const head = archive.head();
-    let lastLive = this.#readLastEventSequence();
-    if (head && head.sequence > lastLive && head.sequence === this.#readSequence()) {
-      const line = archive.headLine(head);
-      if (line !== undefined) {
-        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
-        lastLive = head.sequence;
-      }
-    }
-    if ((head?.sequence ?? 0) < lastLive) archive.append(this.#liveEntriesAfter(head?.sequence ?? 0));
+  // Before a publish, under the lock, bring the live log and the archive level. A publish that
+  // stopped between its archive append and its commit is cut back out; if its event did go
+  // live, the catch-up below archives it again from the live log. So do events that a store
+  // without the archive appended (an older Fabric, or before the archive was set).
+  #recoverArchive(archive: MeshArchive): void {
+    const pending = archive.pending();
+    if (pending) archive.rollback(pending);
+    const archived = archive.head()?.sequence ?? 0;
+    if (archived < this.#readLastEventSequence()) archive.catchUp(this.#liveEntriesAfter(archived));
   }
 
   // Live lines after a sequence, oldest first. It reads back from the end, so the usual one or

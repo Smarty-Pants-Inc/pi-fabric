@@ -10,19 +10,29 @@ import type { MeshEvent } from "./store.js";
  * append-only files, one per topic and UTC day, in the node's file tree (smarty-dev#1120):
  *
  *   <dir>/MESH.json                      the mesh root this archive belongs to
- *   <dir>/HEAD.json                      the last archived event, written around each append
+ *   <dir>/HEAD.json                      the last event known to be archived and live
+ *   <dir>/PENDING.json                   a publish between its archive append and its commit
  *   <dir>/<yyyy>/<mm>/<dd>/<topic>.jsonl  one line per event, the same bytes as the live log
  *   <dir>/<yyyy>/<mm>/<dd>/SEAL.json     per file line count, sequence range and sha256
  *
- * The mesh root enables it with `event-archive.json` ({ "version": 1, "dir": "/abs" }), so every
- * store of that root archives, whatever its process's configuration. The store calls this under
- * its publish lock; nothing here locks.
+ * A publish commits when its event reaches the live log. Before that, the archive holds it
+ * durably but no reader sees it; a publish that fails or crashes first is cut back out.
+ * The mesh root enables the archive with `event-archive.json` ({ "version": 1, "dir": "/abs" }),
+ * so every store of that root archives, whatever its process's configuration. The store calls
+ * this under its publish lock; nothing here locks.
  */
 export const MESH_ARCHIVE_CONFIG = "event-archive.json";
 
 export interface MeshArchiveEntry {
   event: MeshEvent;
   line: string;
+}
+
+export interface MeshArchivePending {
+  sequence: number;
+  id: string;
+  file: string;
+  size: number;
 }
 
 interface ArchiveHead {
@@ -52,14 +62,28 @@ const dayOf = (createdAt: number): string => {
   return `${date.getUTCFullYear()}/${pad(date.getUTCMonth() + 1)}/${pad(date.getUTCDate())}`;
 };
 
-const relativeFile = (event: MeshEvent): string => `${dayOf(event.createdAt)}/${archiveFileName(event.topic)}`;
-
 const parseEvent = (line: string): MeshEvent | undefined => {
   try {
     const parsed = JSON.parse(line) as MeshEvent;
     return typeof parsed.sequence === "number" && typeof parsed.id === "string" ? parsed : undefined;
   } catch {
     return undefined;
+  }
+};
+
+// Complete lines only: a last line without its newline is an append that never finished.
+const completeLines = (text: string): string[] => {
+  const lines = text.split("\n");
+  lines.pop();
+  return lines.filter(Boolean);
+};
+
+// fs.writeSync may write part of a buffer; an archived line must be whole before it counts.
+const writeAll = (descriptor: number, bytes: Buffer): void => {
+  for (let offset = 0; offset < bytes.length;) {
+    const written = fs.writeSync(descriptor, bytes, offset, bytes.length - offset);
+    if (written <= 0) throw new Error("Mesh event archive write made no progress");
+    offset += written;
   }
 };
 
@@ -83,52 +107,77 @@ export class MeshArchive {
   }
 
   head(): ArchiveHead | undefined {
-    let text: string;
-    try {
-      text = fs.readFileSync(path.join(this.dir, "HEAD.json"), "utf8");
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return undefined;
-      throw error;
-    }
-    const head = JSON.parse(text) as ArchiveHead;
-    if (typeof head.sequence !== "number" || typeof head.id !== "string" || typeof head.file !== "string") {
-      throw new Error(`Invalid mesh event archive head in ${this.dir}`);
-    }
-    return head;
+    return this.#readJson<ArchiveHead>("HEAD.json");
   }
 
-  /** The line of the head event, when its append reached the file (crash recovery). */
-  headLine(head: ArchiveHead): string | undefined {
-    const file = path.join(this.dir, head.file);
-    let text: string;
-    try {
-      text = this.#tail(file);
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return undefined;
-      throw error;
-    }
-    const line = text.split("\n").filter(Boolean).at(-1);
-    const event = line === undefined ? undefined : parseEvent(line);
-    return event?.id === head.id && event.sequence === head.sequence ? line : undefined;
+  pending(): MeshArchivePending | undefined {
+    return this.#readJson<MeshArchivePending>("PENDING.json");
   }
 
   /**
-   * Appends events in order and syncs every file it wrote before it returns. An event already
-   * at the end of its file is skipped, so a repeated catch-up adds nothing. `intent` writes the
-   * head before the append (a publish, whose event is not live yet); otherwise it follows it.
+   * Archives a publish's event before it goes live: records where it goes, writes the whole
+   * line and syncs it. On any failure it cuts the line back out and throws.
    */
-  append(entries: MeshArchiveEntry[], options: { intent?: boolean } = {}): void {
+  begin(entry: MeshArchiveEntry): MeshArchivePending {
+    const days = this.#days();
+    const relative = this.#fileFor(entry.event, days);
+    const absolute = path.join(this.dir, relative);
+    this.#describeMesh(entry.event.sequence);
+    fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 });
+    const descriptor = fs.openSync(absolute, "a+", 0o600);
+    let pending: MeshArchivePending | undefined;
+    try {
+      this.#repairAndReadLast(descriptor);
+      pending = { sequence: entry.event.sequence, id: entry.event.id, file: relative, size: fs.fstatSync(descriptor).size };
+      writeFileAtomic(path.join(this.dir, "PENDING.json"), `${JSON.stringify(pending)}\n`);
+      writeAll(descriptor, Buffer.from(`${entry.line}\n`, "utf8"));
+      fs.fdatasyncSync(descriptor);
+    } catch (error) {
+      if (pending) this.#cutBack(descriptor, pending);
+      throw error;
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    return pending;
+  }
+
+  /** The event is live: it is committed. Moves the head and seals any closed day. */
+  commit(pending: MeshArchivePending): void {
+    this.#writeHead({ sequence: pending.sequence, id: pending.id, file: pending.file });
+    fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
+    this.#sealClosedDays(pending.file);
+  }
+
+  /** The event never went live: cut it back out of its file. */
+  rollback(pending: MeshArchivePending): void {
+    let descriptor: number;
+    try {
+      descriptor = fs.openSync(path.join(this.dir, pending.file), "r+");
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+      fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
+      return;
+    }
+    try {
+      this.#cutBack(descriptor, pending);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  }
+
+  /**
+   * Archives events that are already live (appended by a store without the archive). An event
+   * already at the end of its file is skipped, so a repeated catch-up adds nothing.
+   */
+  catchUp(entries: MeshArchiveEntry[]): void {
     if (entries.length === 0) return;
-    const last = entries.at(-1)!.event;
-    const head = { sequence: last.sequence, id: last.id, file: relativeFile(last) };
-    const previousDay = this.head()?.file.split("/").slice(0, 3).join("/");
     this.#describeMesh(entries[0]!.event.sequence);
-    if (options.intent) this.#writeHead(head);
+    const days = this.#days();
     const open = new Map<string, { descriptor: number; last: { sequence: number; id: string } | undefined }>();
-    const days: string[] = previousDay ? [previousDay] : [];
+    let last: ArchiveHead | undefined;
     try {
       for (const { event, line } of entries) {
-        const relative = relativeFile(event);
+        const relative = this.#fileFor(event, days);
         const day = relative.split("/").slice(0, 3).join("/");
         if (days.at(-1) !== day) days.push(day);
         let file = open.get(relative);
@@ -136,32 +185,39 @@ export class MeshArchive {
           const absolute = path.join(this.dir, relative);
           fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 });
           const descriptor = fs.openSync(absolute, "a+", 0o600);
-          file = { descriptor, last: this.#repairAndReadLast(descriptor) };
+          file = { descriptor, last: undefined };
           open.set(relative, file);
+          file.last = this.#repairAndReadLast(descriptor);
         }
         const previous = file.last;
+        last = { sequence: event.sequence, id: event.id, file: relative };
         if (previous && (previous.sequence > event.sequence || (previous.sequence === event.sequence && previous.id === event.id))) {
           continue;
         }
-        fs.writeSync(file.descriptor, `${line}\n`);
+        writeAll(file.descriptor, Buffer.from(`${line}\n`, "utf8"));
         file.last = { sequence: event.sequence, id: event.id };
       }
       for (const { descriptor } of open.values()) fs.fdatasyncSync(descriptor);
     } finally {
       for (const { descriptor } of open.values()) fs.closeSync(descriptor);
     }
-    if (!options.intent) this.#writeHead(head);
-    // A day is closed once a later day has an event; seal each closed day once.
-    for (const day of days.slice(0, -1)) this.#seal(day);
+    if (last) {
+      this.#writeHead(last);
+      this.#sealClosedDays(last.file);
+    }
   }
 
-  /** Events after a sequence, in sequence order, for reads older than the live log. */
-  readAfter(after: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string): MeshEvent[] {
+  /**
+   * Committed events after a sequence, in sequence order, for reads older than the live log.
+   * `through` is the newest live sequence: nothing past it, and no pending event, is committed.
+   */
+  readAfter(after: number, through: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string): MeshEvent[] {
+    const pendingId = this.pending()?.id;
     const found: MeshEvent[] = [];
     for (const day of this.#days()) {
       const directory = path.join(this.dir, day);
-      const seal = this.#readSeal(directory);
-      if (seal && Math.max(...Object.values(seal.files).map((file) => file.lastSequence)) <= after) continue;
+      const seal = this.#readJson<{ files: Record<string, SealFile> }>(`${day}/SEAL.json`);
+      if (seal && Math.max(0, ...Object.values(seal.files).map((file) => file.lastSequence)) <= after) continue;
       const names = topic !== undefined
         ? [archiveFileName(topic)]
         : fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl"));
@@ -175,15 +231,25 @@ export class MeshArchive {
           if (errorCode(error) === "ENOENT") continue;
           throw error;
         }
-        for (const line of text.split("\n")) {
-          const event = line ? parseEvent(line) : undefined;
-          if (event && event.sequence > after && matches(event)) dayEvents.push(event);
+        for (const line of completeLines(text)) {
+          const event = parseEvent(line);
+          if (event && event.sequence > after && event.sequence <= through && event.id !== pendingId && matches(event)) {
+            dayEvents.push(event);
+          }
         }
       }
       found.push(...dayEvents.sort((left, right) => left.sequence - right.sequence));
       if (found.length >= limit) break;
     }
     return found.slice(0, limit);
+  }
+
+  // The event's day, but never a day older than the newest one: a clock set back must not
+  // write into a sealed day or out of sequence order.
+  #fileFor(event: MeshEvent, days: string[]): string {
+    const newest = days.at(-1);
+    const day = newest !== undefined && newest > dayOf(event.createdAt) ? newest : dayOf(event.createdAt);
+    return `${day}/${archiveFileName(event.topic)}`;
   }
 
   #days(): string[] {
@@ -198,6 +264,36 @@ export class MeshArchive {
     return numeric(this.dir).flatMap((year) =>
       numeric(path.join(this.dir, year)).flatMap((month) =>
         numeric(path.join(this.dir, year, month)).map((day) => `${year}/${month}/${day}`)));
+  }
+
+  // Every day before the current one is closed. Sealed days form a prefix, because days are
+  // sealed oldest first, so the scan back stops at the first sealed day.
+  #sealClosedDays(currentFile: string): void {
+    const current = currentFile.split("/").slice(0, 3).join("/");
+    const unsealed: string[] = [];
+    for (const day of this.#days().reverse()) {
+      if (day >= current) continue;
+      if (fs.existsSync(path.join(this.dir, day, "SEAL.json"))) break;
+      unsealed.unshift(day);
+    }
+    for (const day of unsealed) this.#seal(day);
+  }
+
+  #cutBack(descriptor: number, pending: MeshArchivePending): void {
+    if (fs.fstatSync(descriptor).size > pending.size) {
+      fs.ftruncateSync(descriptor, pending.size);
+      fs.fdatasyncSync(descriptor);
+    }
+    fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
+  }
+
+  #readJson<T>(relative: string): T | undefined {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(this.dir, relative), "utf8")) as T;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw error;
+    }
   }
 
   #writeHead(head: ArchiveHead): void {
@@ -222,7 +318,7 @@ export class MeshArchive {
       size = size - tail.length + cut;
       tail = this.#lastLines(descriptor, size);
     }
-    const line = tail.toString("utf8").split("\n").filter(Boolean).at(-1);
+    const line = completeLines(tail.toString("utf8")).at(-1);
     const event = line === undefined ? undefined : parseEvent(line);
     return event ? { sequence: event.sequence, id: event.id } : undefined;
   }
@@ -237,43 +333,16 @@ export class MeshArchive {
     }
   }
 
-  #tail(file: string): string {
-    const descriptor = fs.openSync(file, "r");
-    try {
-      return this.#lastLines(descriptor, fs.fstatSync(descriptor).size).toString("utf8");
-    } finally {
-      fs.closeSync(descriptor);
-    }
-  }
-
-  #readSeal(directory: string): { files: Record<string, SealFile> } | undefined {
-    try {
-      return JSON.parse(fs.readFileSync(path.join(directory, "SEAL.json"), "utf8")) as { files: Record<string, SealFile> };
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return undefined;
-      throw error;
-    }
-  }
-
   #seal(day: string): void {
     const directory = path.join(this.dir, day);
-    const sealPath = path.join(directory, "SEAL.json");
-    if (fs.existsSync(sealPath)) return;
     const files: Record<string, SealFile> = {};
-    let names: string[];
-    try {
-      names = fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl")).sort();
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return;
-      throw error;
-    }
-    for (const name of names) {
+    for (const name of fs.readdirSync(directory).filter((entry) => entry.endsWith(".jsonl")).sort()) {
       const bytes = fs.readFileSync(path.join(directory, name));
       let lines = 0;
       let firstSequence = Number.POSITIVE_INFINITY;
       let lastSequence = 0;
-      for (const line of bytes.toString("utf8").split("\n")) {
-        const event = line ? parseEvent(line) : undefined;
+      for (const line of completeLines(bytes.toString("utf8"))) {
+        const event = parseEvent(line);
         if (!event) continue;
         lines++;
         firstSequence = Math.min(firstSequence, event.sequence);
@@ -282,6 +351,6 @@ export class MeshArchive {
       if (lines === 0) continue;
       files[name] = { lines, firstSequence, lastSequence, sha256: createHash("sha256").update(bytes).digest("hex") };
     }
-    writeFileAtomic(sealPath, `${JSON.stringify({ version: 1, day, files })}\n`);
+    writeFileAtomic(path.join(directory, "SEAL.json"), `${JSON.stringify({ version: 1, day, files })}\n`);
   }
 }

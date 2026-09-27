@@ -36,8 +36,6 @@ CREATE TABLE records (
   supersedes uuid REFERENCES records(id),
   key text NOT NULL,
   payload_hash text NOT NULL,
-  -- The local WAL insert position when the record was written (C2 admission); not replicated meaning.
-  origin_lsn pg_lsn,
   UNIQUE (origin, seq),
   UNIQUE (org, author, key)
 );
@@ -45,7 +43,6 @@ CREATE INDEX records_ref_seq ON records (ref, seq);
 CREATE INDEX records_kind_ref ON records (kind, ref, seq);
 CREATE INDEX records_supersedes ON records (supersedes) WHERE supersedes IS NOT NULL;
 CREATE INDEX records_to ON records ((data->>'to'), seq) WHERE data ? 'to';
-CREATE INDEX records_origin_lsn ON records (origin_lsn);
 
 CREATE FUNCTION records_append_only() RETURNS trigger LANGUAGE plpgsql AS $f$
 BEGIN
@@ -55,6 +52,18 @@ CREATE TRIGGER records_no_update_delete BEFORE UPDATE OR DELETE ON records
   FOR EACH ROW EXECUTE FUNCTION records_append_only();
 CREATE TRIGGER records_no_truncate BEFORE TRUNCATE ON records
   FOR EACH STATEMENT EXECUTE FUNCTION records_append_only();
+
+-- C2: an upper bound on the WAL a record's recovery needs, through its COMMIT: the insert
+-- position read after the commit (by the appender, or by any later reader, since a committed
+-- record's commit precedes every later insert position). Never the pre-insert position.
+CREATE TABLE record_bounds (
+  record_id uuid PRIMARY KEY REFERENCES records(id),
+  origin text NOT NULL,
+  seq bigint NOT NULL,
+  bound pg_lsn NOT NULL
+);
+CREATE INDEX record_bounds_origin_bound ON record_bounds (origin, bound);
+CREATE INDEX record_bounds_origin_seq ON record_bounds (origin, seq);
 
 -- dev-lead's #1481 outbox row with the v1.3 additions (record_id, edit_of, request_key, skipped).
 CREATE TABLE outbox (
@@ -164,7 +173,8 @@ CREATE VIEW mirror_state AS
   SELECT DISTINCT ON (data->>'mirrorOf') (data->>'mirrorOf')::uuid AS record_id, ref, id, seq, created_at, data
   FROM records WHERE kind = 'mirror' ORDER BY data->>'mirrorOf', seq DESC;
 
-REVOKE ALL ON records, outbox, publication, consumers, archive_checks FROM PUBLIC;
+REVOKE ALL ON records, record_bounds, outbox, publication, consumers, archive_checks FROM PUBLIC;
+GRANT SELECT, INSERT ON record_bounds TO ${WRITER_ROLE};
 GRANT SELECT, INSERT, UPDATE ON archive_checks TO ${WRITER_ROLE};
 GRANT SELECT, INSERT ON records TO ${WRITER_ROLE};
 GRANT SELECT, INSERT ON outbox TO ${WRITER_ROLE};

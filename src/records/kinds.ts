@@ -166,13 +166,17 @@ export const validateAppend = (input: unknown, options: { importer: boolean; mir
     if (typeof author !== "string" || !author.trim() || author.length > 256) throw new RecordsArgumentError("author must be a non-empty string");
     if (typeof fields.via !== "string") throw new RecordsArgumentError("an imported record (author set) needs data.via");
   }
+  // A record id is stored in one canonical (lowercase) form, so the folds that compare and group
+  // by it (an answer closing its ask, the newest mirror per record) see one id, not two spellings.
+  const canonicalData = Object.fromEntries(Object.entries(fields).map(([name, value]) =>
+    [name, specs[name]?.type === "uuid" && typeof value === "string" ? value.toLowerCase() : value]));
   return {
     ...(ref !== undefined ? { ref: ref as string } : {}),
     ...(repo !== undefined ? { repo: repo as string } : {}),
     kind: recordKind,
     key: key as string,
     ...(text !== undefined ? { text: text as string } : {}),
-    data: fields,
+    data: canonicalData,
     ...(supersedes !== undefined ? { supersedes: (supersedes as string).toLowerCase() } : {}),
     ...(author !== undefined ? { author: (author as string).trim() } : {}),
   };

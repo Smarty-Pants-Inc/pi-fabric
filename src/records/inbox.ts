@@ -24,7 +24,7 @@ export class RecordsInbox {
     readonly consumer: string,
     /** The names a sender may address this root by (its id first). */
     readonly names: () => readonly string[],
-    readonly options: { batch?: number } = {},
+    readonly options: { batch?: number; signal?: AbortSignal } = {},
   ) {}
 
   #names(): string[] {
@@ -42,7 +42,7 @@ export class RecordsInbox {
       );
       const { rows } = await client.query<ConsumerRow>("SELECT after, pending FROM consumers WHERE consumer = $1", [this.consumer]);
       return rows[0]!;
-    });
+    }, "", this.options.signal);
   }
 
   async #save(after: number, pending: ConsumerRow["pending"]): Promise<void> {
@@ -51,7 +51,7 @@ export class RecordsInbox {
         "UPDATE consumers SET after = greatest(after, $2), pending = $3::jsonb, advanced_at = CASE WHEN $2 > after THEN clock_timestamp() ELSE advanced_at END WHERE consumer = $1",
         [this.consumer, after, pending ? JSON.stringify(pending) : null],
       );
-    });
+    }, "", this.options.signal);
   }
 
   /** The batch to deliver now; empty when nothing addressed to this root is past its cursor. */
@@ -60,15 +60,14 @@ export class RecordsInbox {
     let after = Number(state.after);
     if (state.pending) {
       if (!session.holdsBatch(state.pending.ids)) {
-        // Delivered again, however many times, until the session holds it.
-        const page = await this.store.page({ after, limit: MAX_BATCH, origin: this.store.origin, to: this.#names(), exceptAuthor: this.consumer });
-        const ids = new Set(state.pending.ids);
-        return { records: page.records.filter((record) => ids.has(record.id)), through: state.pending.through };
+        // Delivered again, however many times, until the session holds it: by its saved ids, so a
+        // rename of this root (a new alias filter) cannot strand it.
+        return { records: await this.store.byIds(state.pending.ids, this.options.signal), through: state.pending.through };
       }
       after = Math.max(after, state.pending.through);
       await this.#save(after, null);
     }
-    const page = await this.store.page({ after, limit: this.options.batch ?? MAX_BATCH, origin: this.store.origin, to: this.#names(), exceptAuthor: this.consumer });
+    const page = await this.store.page({ after, limit: this.options.batch ?? MAX_BATCH, origin: this.store.origin, to: this.#names(), exceptAuthor: this.consumer }, this.options.signal);
     if (page.records.length === 0) {
       if (page.next > after) await this.#save(page.next, null);
       return { records: [], through: page.next };

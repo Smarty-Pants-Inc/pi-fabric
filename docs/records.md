@@ -75,7 +75,12 @@ const health = await records.status();
   and `data.githubId` are refused from anyone else. Only the **mirror** role may append `mirror` records.
 - `repo` without `ref` creates an issue (`kind: "issue"`, `data.title` required) and allocates its immutable
   Node-native ref, `Owner/repo#L<n>` (C11).
-- `supersedes` names a record of the same kind on the same ref.
+- `supersedes` names a record of the same kind on the same ref. Only its author may supersede an author-owned record
+  (every kind except `issue`, which is shared: a stage command supersedes it).
+- Record ids in `data` (`ask`, `mirrorOf`) are stored lowercase.
+- A cancelled call (its `fabric_exec` aborted or timed out, or the service closing) starts no further step, and an
+  abort before COMMIT destroys its connection, so nothing it started commits later. Only an abort during COMMIT itself
+  leaves the outcome unknown: retry with the same key. Every transaction has a 30 s lock and 60 s statement bound.
 - Unknown kinds and fields are refused. Text is at most 64 KiB, data at most 64 KiB.
 
 | Kind | data | Fold |
@@ -133,7 +138,11 @@ Each target's check runs in one process per refresh interval for the whole datab
 target's `archive_checks` row runs `wal-g`, and every other process reads the stored frontier. A failed check keeps the
 last good frontier and records the error.
 
-The lag is how long the oldest record (or insert-position sample) past the frontier has waited. With two targets,
+A record is covered only when the frontier passes its **recovery bound**: the WAL insert position read after its
+COMMIT, stored in `record_bounds` (never the position before the insert, since a transaction can begin in one segment
+and commit in the next). A crash between a commit and its bound leaves one record unbounded; the next append, check or
+service start bounds it with the current insert position, which is past its commit. The lag is how long the oldest
+uncovered record (or insert-position sample) has waited; the bounds persist, so a restarted gate still sees it. With two targets,
 the fresher frontier counts, so one network cut does not stop records. A provider that stops answering keeps its last
 good frontier, so the lag grows: the gate fails closed.
 
@@ -150,6 +159,7 @@ good frontier, so the lag grows: the gate fails closed.
 | `records` | the envelope: id, org, origin, seq, ref, kind, author, created_at, text, data, supersedes, key, payload_hash | INSERT, SELECT only; a trigger refuses UPDATE, DELETE and TRUNCATE for every role |
 | `outbox` | dev-lead's #1481 row plus record_id, edit_of, request_key; unique (record_id, owner, repo, target_thread) and (owner, request_key); states pending, posted, refused, skipped, unknown | INSERT, SELECT (the mirror role also UPDATE) |
 | `publication` | the mesh nudge per record | INSERT, SELECT, UPDATE |
+| `record_bounds` | each record's recovery bound (C2) | INSERT, SELECT |
 | `consumers` | processing cursors | INSERT, SELECT, UPDATE |
 | `archive_checks` | the last archive frontier per target, and who checks it now | INSERT, SELECT, UPDATE |
 
@@ -158,7 +168,17 @@ Views: `current_issue`, `current_statuses`, `open_asks`, `current_links`, `curre
 
 The outbox row of a status names the author's first status record on the ref in `edit_of`, and a superseding record
 names the root of its `supersedes` chain, so the mirror edits one GitHub object. Each mirrored body ends with
-`<!-- smarty-record:<id> -->`. An imported record (with `data.via`) is never mirrored back.
+`<!-- smarty-record:<id> -->`. An imported record (with `data.via`) is never mirrored back. An issue update PATCHes
+only the fields it carries (title, labels, body); one that changes nothing the forge shows (a stage command) gets a
+`skipped` row. Creating an issue (`repo`, no `ref`) POSTs the whole issue.
+
+## The trust boundary
+
+The service runs inside each Fabric process, as the org's OS user. Across orgs, #820's per-org OS user and 0700
+socket directory are the boundary. Within one org, a caller with that user's shell can reach the database directly
+or edit its configuration, so same-org authorship (C13) is enforced at the API only. Closing it needs the records
+service under its own OS identity and credential, with authenticated principals (C10). Until then, keep records off
+for real org data.
 
 ## The remote endpoint (C10)
 

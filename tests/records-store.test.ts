@@ -8,6 +8,8 @@ import { RecordKeyConflictError, RecordStore, type ClientPool, type RecordsPrinc
 import { RecordsWatchdog } from "../src/records/watchdog.js";
 import { RecordsService } from "../src/records/service.js";
 import { normalizeRecordsConfig } from "../src/records/config.js";
+import { RecordsProvider } from "../src/providers/records-provider.js";
+import { bigIntToLsn, lsnToBigInt } from "../src/records/admission.js";
 import { SharedFrontierProvider } from "../src/records/shared-frontier.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
 
@@ -267,6 +269,54 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
     expect(await count()).toBe(2);
   });
 
+  it("commits nothing when the call is cancelled between the connection's arrival and the transaction", async () => {
+    const { store: _unused, pool } = await storeFor();
+    const cancelled = new AbortController();
+    let queries = 0;
+    // The store registers on the connection promise first; this cancel runs right after it,
+    // before the transaction resumes: the handoff interval, where no abort listener exists.
+    const handoffPool: ClientPool = {
+      connect: () => {
+        const pending = pool.connect() as unknown as Promise<import("../src/records/store.js").PooledClient>;
+        void pending.then((client) => {
+          const query = client.query.bind(client);
+          client.query = ((...args: Parameters<typeof query>) => { queries++; return query(...args); }) as typeof client.query;
+        });
+        queueMicrotask(() => { void pending.then(() => cancelled.abort(new Error("cancelled in the handoff"))); });
+        return pending;
+      },
+    };
+    const store = new RecordStore(handoffPool, { org: "smarty-pants", origin: "dev1" });
+    await expect(store.append(alice, { ref: REF, kind: "status", key: "handoff", text: "must not land" }, { signal: cancelled.signal })).rejects.toThrow(/cancelled in the handoff/);
+    expect(queries).toBe(0); // not even BEGIN: the cancelled call starts no work
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect((await pool.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
+    // Counterexample: with no cancel, the same pool and store commit.
+    const live = new RecordStore(pool as unknown as ClientPool, { org: "smarty-pants", origin: "dev1" });
+    expect((await live.append(alice, { ref: REF, kind: "status", key: "handoff", text: "must not land" })).sequence).toBe(1);
+  });
+
+  it("closing the service cancels a foreground append blocked on the org lock", async () => {
+    const { pool } = await freshDatabase();
+    const config = normalizeRecordsConfig({ enabled: true, org: "smarty-pants", origin: "dev1" });
+    const service = await RecordsService.open({ config, meshRoot: server.dir, publisher: recorder(), identity: { id: "session:alice" }, pool: pool as unknown as ClientPool });
+    const provider = new RecordsProvider(async () => service);
+    const blocker = new pg.Client({ ...server.connection, database: (pool as unknown as { options: { database: string } }).options.database });
+    await blocker.connect();
+    await blocker.query("BEGIN");
+    await blocker.query("SELECT pg_advisory_xact_lock(hashtextextended('fabric-records:smarty-pants', 0))");
+    const caller = new AbortController(); // the caller stays alive: only the service closes
+    const context = { signal: caller.signal } as never;
+    const blocked = provider.invoke("append", { ref: REF, kind: "status", key: "during-close", text: "must not land" }, context);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await service.close(3_000);
+    await expect(blocked).rejects.toThrow(/records service closed/);
+    await blocker.query("COMMIT");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect((await blocker.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
+    await blocker.end();
+  });
+
   it("closes promptly while an archive check is running, and stops the checker", async () => {
     const { pool } = await freshDatabase();
     const config = normalizeRecordsConfig({
@@ -281,6 +331,37 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(await tick).toBeDefined();
     expect((pool as unknown as { ending: boolean }).ending).toBe(true);
+  });
+
+  it("PATCHes only the issue fields an update carries; creation sends the whole issue", async () => {
+    const { store, pool } = await storeFor({ mirror: { enabled: true } });
+    const outbox = async (id: string) => (await pool.query("SELECT method, endpoint, body, state FROM outbox WHERE record_id = $1", [id])).rows[0];
+    const created = await store.append(alice, { repo: "Smarty-Pants-Inc/smarty-dev", kind: "issue", key: "new", data: { title: "Board", body: "The board" } });
+    expect(await outbox(created.id)).toMatchObject({ method: "POST", endpoint: "/repos/Smarty-Pants-Inc/smarty-dev/issues", body: { title: "Board", body: `The board\n\n<!-- smarty-record:${created.id} -->` } });
+    // The reported sequence: a title-only update without supersedes must not erase the forge body.
+    const titleOnly = await store.append(alice, { ref: REF, kind: "issue", key: "title", data: { title: "Renamed" } });
+    expect(await outbox(titleOnly.id)).toEqual({ method: "PATCH", endpoint: "/repos/Smarty-Pants-Inc/smarty-dev/issues/754", body: { title: "Renamed" }, state: "pending" });
+    const labels = await store.append(alice, { ref: REF, kind: "issue", key: "labels", supersedes: titleOnly.id, data: { labels: ["p1"] } });
+    expect((await outbox(labels.id)).body).toEqual({ labels: ["p1"] });
+    const stage = await store.append(alice, { ref: REF, kind: "issue", key: "stage", data: { stage: "review" } });
+    expect(await outbox(stage.id)).toMatchObject({ method: "PATCH", body: {}, state: "skipped" });
+    // Counterexample: an update that carries a body sends it, with the marker.
+    const body = await store.append(alice, { ref: REF, kind: "issue", key: "body", data: { body: "New body" } });
+    expect((await outbox(body.id)).body).toEqual({ body: `New body\n\n<!-- smarty-record:${body.id} -->` });
+  });
+
+  it("stores record ids in one form, so mixed-case references still fold", async () => {
+    const { store } = await storeFor();
+    const mirrorer: RecordsPrincipal = { id: "mirror", mirror: true };
+    const ask = await store.append(bob, { ref: REF, kind: "ask", key: "a", text: "host?", data: { to: "paul" } });
+    await store.append(alice, { ref: REF, kind: "answer", key: "ans", text: "m4max", data: { ask: ask.id.toUpperCase(), outcome: "answered" } });
+    expect((await store.get(alice, { ref: REF })).state.openAsks).toEqual([]);
+    await store.append(mirrorer, { ref: REF, kind: "mirror", key: "m1", data: { mirrorOf: ask.id.toUpperCase(), target: "github", state: "pending" } });
+    await store.append(mirrorer, { ref: REF, kind: "mirror", key: "m2", data: { mirrorOf: ask.id, target: "github", state: "mirrored", githubId: "5858" } });
+    expect((await store.get(alice, { ref: REF })).state.mirror).toEqual({ [ask.id]: expect.objectContaining({ state: "mirrored", mirrorOf: ask.id }) });
+    // The same payload spelled either way is one idempotent retry.
+    const again = await store.append(alice, { ref: REF, kind: "answer", key: "ans", text: "m4max", data: { ask: ask.id, outcome: "answered" } });
+    expect(again.sequence).toBe(2);
   });
 
   it("writes no outbox rows with the mirror off", async () => {
@@ -395,6 +476,41 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
       expect((await pool.query("SELECT error FROM archive_checks")).rows[0].error).toBe("archive unreachable");
     });
 
+    it("counts a record uncovered until its commit is archived, across a gate restart", async () => {
+      let offset = 0;
+      const target = fake("m4max");
+      const now = () => Date.now() + offset;
+      const { store, pool } = await storeFor();
+      // Before the record, the WAL position; the record's own writes and COMMIT lie past it.
+      const before = lsnToBigInt(await insertLsn(pool));
+      await store.append(alice, { ref: REF, kind: "status", key: "s1", text: "acknowledged" });
+      const bound = (await pool.query("SELECT bound::text AS bound FROM record_bounds")).rows[0].bound as string;
+      expect(lsnToBigInt(bound)).toBeGreaterThan(before);
+      // The reported sequence: only the WAL before the COMMIT is archived (the earlier segment).
+      target.value = bigIntToLsn(before + 1n);
+      offset = 302_000;
+      // A new gate: a restarted process, with no in-memory samples.
+      const restarted = new AdmissionGate({ providers: [target], now });
+      const afterRestart = new RecordStore(pool as unknown as ClientPool, { org: "smarty-pants", origin: "dev1", admission: restarted });
+      await expect(afterRestart.append(alice, { ref: REF, kind: "status", key: "s2", text: "next" })).rejects.toThrow(/record archive lagging 30\d s/);
+      // Counterexample: once the archive holds the COMMIT, the old record is covered and appends land.
+      target.value = bound;
+      await restarted.refresh();
+      expect((await afterRestart.append(alice, { ref: REF, kind: "status", key: "s2", text: "next" })).sequence).toBe(2);
+    });
+
+    it("bounds a record a crash left without one, at the next service start", async () => {
+      const { store, pool } = await storeFor();
+      await store.append(alice, { ref: REF, kind: "status", key: "s1", text: "one" });
+      await store.append(alice, { ref: REF, kind: "status", key: "s2", text: "two" });
+      // The crash window: s1 committed but was never bounded, and a newer record was.
+      await pool.query("DELETE FROM record_bounds WHERE seq = 1");
+      await store.transaction((client) => store.fillBounds(client, "recent"));
+      expect((await pool.query("SELECT count(*)::int AS n FROM record_bounds")).rows[0].n).toBe(1);
+      await store.transaction((client) => store.fillBounds(client, "all"));
+      expect((await pool.query("SELECT count(*)::int AS n FROM record_bounds")).rows[0].n).toBe(2);
+    });
+
     it("refuses when no target ever answered and records are old (fail closed)", async () => {
       let offset = 0;
       const gate = new AdmissionGate({ providers: [fake("m4max")], now: () => Date.now() + offset });
@@ -425,6 +541,22 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
       const entries = [{ type: "custom_message", ...recordsInboxMessage(batch.records) }];
       expect((await inbox.next(recordsInboxSession(entries))).records).toEqual([]);
       expect(Number((await pool.query("SELECT after FROM consumers WHERE consumer = $1", [bob.id])).rows[0].after)).toBe(5);
+    });
+
+    it("replays a pending batch by its ids after the root is renamed", async () => {
+      const { store } = await storeFor();
+      let names = ["bob"];
+      const inbox = new RecordsInbox(store, bob.id, () => names);
+      await inbox.next(recordsInboxSession([]));
+      const old = await store.append(alice, { ref: REF, kind: "ask", key: "old", text: "to the old name", data: { to: "bob" } });
+      expect((await inbox.next(recordsInboxSession([]))).records.map((record) => record.id)).toEqual([old.id]);
+      // Interrupted before the session held it; then the root is renamed; then a newer record comes.
+      names = ["robert"];
+      const newer = await store.append(alice, { ref: REF, kind: "handoff", key: "new", data: { to: bob.id } });
+      const replay = await inbox.next(recordsInboxSession([]));
+      expect(replay.records.map((record) => record.id)).toEqual([old.id]);
+      const held = [{ type: "custom_message", ...recordsInboxMessage(replay.records) }];
+      expect((await inbox.next(recordsInboxSession(held))).records.map((record) => record.id)).toEqual([newer.id]);
     });
 
     it("wakes its own lagging root, alarms for another, and republishes unpublished nudges", async () => {

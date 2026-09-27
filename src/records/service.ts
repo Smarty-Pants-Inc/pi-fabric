@@ -50,6 +50,9 @@ export class RecordsService {
   #lastAlarm = 0;
   /** The service's lifetime: close() aborts it, which stops archive checks, relay runs and queries. */
   readonly #life = new AbortController();
+
+  /** The service's lifetime; aborted by close(). */
+  get signal(): AbortSignal { return this.#life.signal; }
   #statusWrite: Promise<void> = Promise.resolve();
 
   private constructor(readonly options: RecordsServiceOptions, pool: ClientPool) {
@@ -75,7 +78,7 @@ export class RecordsService {
       onCommitted: () => { if (!this.#life.signal.aborted) void relay?.flush(this.#life.signal).catch(() => undefined); },
     });
     this.relay = relay = new PublicationRelay(this.store, options.publisher);
-    this.inbox = options.names ? new RecordsInbox(this.store, options.identity.id, options.names) : undefined;
+    this.inbox = options.names ? new RecordsInbox(this.store, options.identity.id, options.names, { signal: this.#life.signal }) : undefined;
     this.watchdog = new RecordsWatchdog({
       store: this.store, relay: this.relay, gate: this.gate,
       ...(this.inbox ? { self: options.identity.id } : {}),
@@ -103,6 +106,8 @@ export class RecordsService {
       throw error;
     }
     const service = new RecordsService(options, pool);
+    // A crash between a commit and its recovery bound leaves one unbounded record: bound it now.
+    await service.store.transaction((client) => service.store.fillBounds(client, "all"));
     // Republish what a crash left unpublished, then keep the watchdog running.
     void service.relay.flush(service.#life.signal).catch(() => undefined);
     service.watchdog.start();

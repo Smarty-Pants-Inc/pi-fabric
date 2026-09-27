@@ -212,12 +212,19 @@ export class RecordStore implements RecordsBackend {
     let committing = false;
     const onAbort = () => { if (!committing) release(true); };
     signal?.addEventListener("abort", onAbort, { once: true });
+    // An abort between the connection's arrival and here fired before the listener existed.
+    if (signal?.aborted) {
+      signal.removeEventListener("abort", onAbort);
+      release(false);
+      signal.throwIfAborted();
+    }
     try {
       await client.query(`BEGIN${mode ? ` ${mode}` : ""}`);
       await client.query(`SET LOCAL ROLE ${this.#role}`);
       await client.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
       await client.query(`SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT}'`);
       const result = await work(client);
+      // An abort before this point destroyed the connection (onAbort), so COMMIT cannot run.
       committing = true;
       await client.query("COMMIT");
       return result;
@@ -260,8 +267,8 @@ export class RecordStore implements RecordsBackend {
       const next = await client.query<{ seq: string }>("SELECT coalesce(max(seq), 0) + 1 AS seq FROM records WHERE origin = $1", [this.origin]);
       const seq = next.rows[0]!.seq;
       const inserted = await client.query<RecordRow>(
-        `INSERT INTO records (org, origin, seq, ref, kind, author, author_name, text, data, supersedes, key, payload_hash, origin_lsn)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, pg_current_wal_insert_lsn())
+        `INSERT INTO records (org, origin, seq, ref, kind, author, author_name, text, data, supersedes, key, payload_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          RETURNING ${RECORD_COLUMNS}`,
         [this.org, this.origin, seq, ref, args.kind, author, authorName, args.text ?? null, JSON.stringify(args.data ?? {}), args.supersedes ?? null, args.key, hash],
       );
@@ -273,8 +280,29 @@ export class RecordStore implements RecordsBackend {
       );
       return { receipt: receipt(row), committed: true };
     }, "", signal);
-    if (result.committed) this.options.onCommitted?.();
+    if (result.committed) {
+      // The recovery bound, read after COMMIT (C2). A crash before it is filled by the next check.
+      await this.transaction((client) => this.fillBounds(client, "recent")).catch(() => undefined);
+      this.options.onCommitted?.();
+    }
     return result.receipt;
+  }
+
+  /**
+   * Give committed local records without a recovery bound the insert position now, which is past
+   * their commits. `recent` looks only past the newest bounded record (every append and check);
+   * `all` also finds a record a crash left unbounded below it (at service start).
+   */
+  async fillBounds(client: SqlClient, scope: "recent" | "all"): Promise<void> {
+    await client.query(
+      `INSERT INTO record_bounds (record_id, origin, seq, bound)
+       SELECT r.id, r.origin, r.seq, pg_current_wal_insert_lsn() FROM records r
+       WHERE r.origin = $1 AND ${scope === "all"
+        ? "NOT EXISTS (SELECT 1 FROM record_bounds b WHERE b.record_id = r.id)"
+        : "r.seq > coalesce((SELECT max(seq) FROM record_bounds WHERE origin = $1), 0)"}
+       ON CONFLICT (record_id) DO NOTHING`,
+      [this.origin],
+    );
   }
 
   /** C2: refuse while the off-host recoverable frontier lags the insert position too far. */
@@ -285,11 +313,17 @@ export class RecordStore implements RecordsBackend {
     gate.check(input);
   }
 
-  /** The insert position and the oldest local record the frontier does not cover. */
+  /**
+   * The insert position and the oldest local record the frontier does not cover: one whose
+   * recovery bound (through its COMMIT) lies past the frontier. Persisted, so a restart that
+   * loses the gate's in-memory samples still sees an old uncovered record.
+   */
   async admissionInput(client: SqlClient, frontier: string | undefined): Promise<{ insertLsn: string; oldestUncoveredAt?: number }> {
+    await this.fillBounds(client, "recent");
     const { rows } = await client.query<{ insert_lsn: string; oldest: Date | null }>(
       `SELECT pg_current_wal_insert_lsn()::text AS insert_lsn,
-        (SELECT min(created_at) FROM records WHERE origin = $1 AND origin_lsn >= coalesce($2::pg_lsn, '0/0'::pg_lsn)) AS oldest`,
+        (SELECT min(r.created_at) FROM record_bounds b JOIN records r ON r.id = b.record_id
+          WHERE b.origin = $1 AND b.bound > coalesce($2::pg_lsn, '0/0'::pg_lsn)) AS oldest`,
       [this.origin, frontier ?? null],
     );
     const row = rows[0]!;
@@ -334,7 +368,7 @@ export class RecordStore implements RecordsBackend {
     // An imported record is already on GitHub; mirroring it back would echo.
     if (!mirror?.enabled || !MIRRORED_KINDS.has(args.kind) || args.data?.via !== undefined) return;
     const repo = `${parsed.owner}/${parsed.repo}`;
-    const skipped = mirror.repos !== undefined && !mirror.repos.includes(repo);
+    let skipped = mirror.repos !== undefined && !mirror.repos.includes(repo);
     const editOf = await this.#editOf(client, row, args);
     const issue = parsed.native ? "{number}" : String(parsed.number);
     const marker = `\n\n<!-- smarty-record:${row.id} -->`;
@@ -343,9 +377,18 @@ export class RecordStore implements RecordsBackend {
     let body: Record<string, unknown>;
     if (args.kind === "issue") {
       const fields = Object.fromEntries(Object.entries(args.data ?? {}).filter(([name]) => name === "title" || name === "labels"));
-      const text = typeof args.data?.body === "string" ? args.data.body : args.text;
-      body = { ...fields, ...(text !== undefined || !editOf ? { body: `${text ?? ""}${marker}` } : {}) };
-      [method, endpoint] = editOf || !args.repo ? ["PATCH", `/repos/${repo}/issues/${issue}`] : ["POST", `/repos/${repo}/issues`];
+      const text = typeof args.data?.body === "string" ? args.data.body : undefined;
+      if (args.repo !== undefined) {
+        // Creation (a new Node-native ref): the whole issue.
+        body = { ...fields, body: `${text ?? args.text ?? ""}${marker}` };
+        [method, endpoint] = ["POST", `/repos/${repo}/issues`];
+      } else {
+        // An update PATCHes only the fields it carries: an absent body stays as it is on the forge.
+        body = { ...fields, ...(text !== undefined ? { body: `${text}${marker}` } : {}) };
+        [method, endpoint] = ["PATCH", `/repos/${repo}/issues/${issue}`];
+        // Nothing the forge shows changed (a stage command): recorded as skipped, never an empty PATCH.
+        if (Object.keys(body).length === 0) skipped = true;
+      }
     } else if (args.kind === "close" || args.kind === "reopen") {
       body = { state: args.kind === "close" ? "closed" : "open" };
       [method, endpoint] = ["PATCH", `/repos/${repo}/issues/${issue}`];
@@ -414,6 +457,15 @@ export class RecordStore implements RecordsBackend {
       const next = records.length === args.limit ? records.at(-1)!.sequence : Math.max(args.after, top);
       return { records, next, frontier: top, origin: args.origin };
     }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", signal);
+  }
+
+  /** Records by id, in seq order (a pending inbox batch's replay). */
+  async byIds(ids: readonly string[], signal?: AbortSignal): Promise<RecordEnvelope[]> {
+    if (ids.length === 0) return [];
+    return this.transaction(async (client) => {
+      const { rows } = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE id = ANY($1::uuid[]) ORDER BY seq`, [[...ids]]);
+      return rows.map(envelope);
+    }, "READ ONLY", signal);
   }
 
   async get(_principal: RecordsPrincipal, input: unknown, options: RecordsCallOptions = {}): Promise<RecordsGetResult> {

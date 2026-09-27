@@ -54,8 +54,15 @@ const errorCode = (error: unknown): string | undefined =>
 const pad = (value: number): string => String(value).padStart(2, "0");
 
 // The topic grammar is file-safe except "/" and ":". "%" is outside it, so this reverses exactly.
-export const archiveFileName = (topic: string): string =>
-  `${topic.replaceAll("/", "%2F").replaceAll(":", "%3A")}.jsonl`;
+// Encoding can make a valid 128-character topic longer than a file name may be (255 bytes):
+// such a name keeps a prefix and ends in "~" and a hash of the topic. "~" is outside the grammar
+// and the encoding, so it never equals another topic's plain name; the events keep the topic.
+const MAX_FILE_NAME_BYTES = 255;
+export const archiveFileName = (topic: string): string => {
+  const encoded = topic.replaceAll("/", "%2F").replaceAll(":", "%3A");
+  if (encoded.length + ".jsonl".length <= MAX_FILE_NAME_BYTES) return `${encoded}.jsonl`;
+  return `${encoded.slice(0, 200)}~${createHash("sha256").update(topic).digest("hex").slice(0, 32)}.jsonl`;
+};
 
 const dayOf = (createdAt: number): string => {
   const date = new Date(createdAt);

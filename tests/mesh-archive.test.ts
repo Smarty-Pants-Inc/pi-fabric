@@ -61,6 +61,40 @@ describe("mesh event archive", () => {
     expect(archiveFileName("team/auth:x.y")).toBe("team%2Fauth%3Ax.y.jsonl");
   });
 
+  // review F7: a valid 128-character topic can encode to more than a file name may hold.
+  const longTopic = (end: string) => `${"a/".repeat(63)}${end}`;
+
+  it("bounds a long topic's file name and keeps distinct topics apart", () => {
+    const first = archiveFileName(longTopic("bc"));
+    const second = archiveFileName(longTopic("bd"));
+    expect(longTopic("bc")).toHaveLength(128);
+    expect(Buffer.byteLength(first)).toBeLessThanOrEqual(255);
+    expect(first).toContain("~");
+    expect(second).not.toBe(first);
+    expect(archiveFileName("a".repeat(128))).toBe(`${"a".repeat(128)}.jsonl`);
+  });
+
+  it("publishes to a long topic and reads it back from the archive", async () => {
+    const { store, file, lines, live } = setup({ maxEventLogBytes: 5_000, retainedEventLogBytes: 600 });
+    await store.publish({ topic: longTopic("bc"), from, text: "long" });
+    for (let index = 0; index < 6; index++) await store.publish({ topic: "ops.owner", from, text: "x".repeat(900) });
+    expect(lines(file(today(), longTopic("bc")))).toHaveLength(1);
+    expect(store.oldestSequence()).toBeGreaterThan(1);
+    expect(store.read({ after: 0, topic: longTopic("bc") }).map((event) => event.text)).toEqual(["long"]);
+    expect(live().length).toBeGreaterThan(0);
+  });
+
+  it("enables the archive over a live log that already holds a long topic's event", async () => {
+    const { store, enable, file, lines } = setup({ archive: false, maxEventLogBytes: 5_000, retainedEventLogBytes: 600 });
+    await store.publish({ topic: longTopic("bc"), from, text: "long" });
+    enable();
+    for (let index = 0; index < 6; index++) await store.publish({ topic: "ops.owner", from, text: "x".repeat(900) });
+    expect(lines(file(today(), longTopic("bc")))).toHaveLength(1);
+    expect(lines(file(today(), "ops.owner"))).toHaveLength(6);
+    expect(store.read({ after: 0, topic: longTopic("bc") }).map((event) => event.text)).toEqual(["long"]);
+    expect(store.read({ after: 0, topic: "ops.owner" }).map((event) => event.sequence)).toEqual([2, 3, 4, 5, 6, 7]);
+  });
+
   it("finishes a short write before the event counts as archived (review F1)", async () => {
     const { store, file, lines, live } = setup();
     const write = fs.writeSync;

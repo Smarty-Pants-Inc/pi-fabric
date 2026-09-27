@@ -295,3 +295,75 @@ describe("ActorMeshMonitor work-topic reconciliation", () => {
     expect(seen.some((event) => event.text === "work 0")).toBe(false);
   });
 });
+
+// review/astra round 2 on pi-fabric#97.
+describe("ActorMeshMonitor work-topic reconciliation, round 2", () => {
+  const from = { id: "session:peer", name: "main", kind: "main" as const, sessionId: "peer" };
+  const archivedStore = (maxEventLogBytes = 6_000, retainedEventLogBytes = 1_500) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-r2-"));
+    roots.push(base);
+    const root = path.join(base, "mesh");
+    const dir = path.join(base, "archive");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir }));
+    return { mesh: new MeshStore(root, 4_096, 500, { maxEventLogBytes, retainedEventLogBytes }), base, cursorPath: path.join(base, "cursor.json") };
+  };
+
+  // F2: a rewrite between the archive read and the tail read left a gap.
+  it("closes a gap that a rewrite opens while it reads the archive", async () => {
+    const { mesh, cursorPath } = archivedStore();
+    const seen: MeshEvent[] = [];
+    const first = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 50 }, { cursorPath, beforePoll: () => true, onEvent: (event) => { seen.push(event); } });
+    monitors.push(first);
+    await mesh.publish({ topic: "fleet.work.a", from, text: "w0" });
+    for (let index = 0; index < 5; index++) { first.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
+    first.close();
+    let n = 1;
+    const burst = async (count: number) => { for (let index = 0; index < count; index++, n++) await mesh.publish({ topic: n % 3 === 0 ? "fleet.work.a" : "team.noise", from, text: `${n % 3 === 0 ? "w" : "x"}${n}` }); };
+    await burst(40);                                             // the first rewrite, while away
+    const read = mesh.read.bind(mesh);
+    let rewrites = 0;
+    vi.spyOn(mesh, "read").mockImplementation((input) => {
+      const page = read(input);
+      if (rewrites++ === 0) void burst(40);                     // another rewrite during the archive read
+      return page;
+    });
+    const later: MeshEvent[] = [];
+    const again = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 50 }, { cursorPath, maxReplayAgeMs: 600_000, beforePoll: () => true, onEvent: (event) => { later.push(event); } });
+    monitors.push(again);
+    for (let index = 0; index < 60; index++) { again.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
+    const expected = Array.from({ length: n - 1 }, (_, index) => index + 1).filter((value) => value % 3 === 0).map((value) => `w${value}`);
+    expect(later.filter((event) => event.topic.startsWith("fleet.")).map((event) => event.text)).toEqual(expected);
+    expect(new Set(later.map((event) => event.id)).size).toBe(later.length);
+  });
+
+  // F3: archive catch-up yields between pages.
+  it("yields to the event loop between archive pages", async () => {
+    const { mesh, cursorPath } = archivedStore(40_000, 4_000);
+    const seen: MeshEvent[] = [];
+    const first = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 20 }, { cursorPath, beforePoll: () => true, onEvent: (event) => { seen.push(event); } });
+    monitors.push(first);
+    await mesh.publish({ topic: "fleet.work.a", from, text: "w0" });
+    for (let index = 0; index < 5; index++) { first.schedule(); await new Promise((resolve) => setTimeout(resolve, 5)); }
+    first.close();
+    for (let index = 1; index <= 400; index++) await mesh.publish({ topic: index % 50 === 0 ? "fleet.work.a" : "team.noise", from, text: `e${index}` });
+    expect(mesh.oldestSequence()).toBeGreaterThan(100);
+    let ticks = 0;
+    const heartbeat = setInterval(() => { ticks++; }, 1);
+    const ticksAtRead: number[] = [];
+    const read = mesh.read.bind(mesh);
+    vi.spyOn(mesh, "read").mockImplementation((input) => { ticksAtRead.push(ticks); return read(input); });
+    const later: MeshEvent[] = [];
+    const again = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 20 }, { cursorPath, maxReplayAgeMs: 600_000, beforePoll: () => true, onEvent: (event) => { later.push(event); } });
+    monitors.push(again);
+    try {
+      again.schedule();
+      await vi.waitFor(() => expect(later.filter((event) => event.topic.startsWith("fleet.")).length).toBe(8), { timeout: 10_000, interval: 5 });
+    } finally {
+      clearInterval(heartbeat);
+    }
+    expect(ticksAtRead.length).toBeGreaterThan(3);
+    expect(ticksAtRead.at(-1)!).toBeGreaterThan(ticksAtRead[0]!);          // timers ran between pages
+  });
+});

@@ -2,7 +2,7 @@ import fs, { type FSWatcher } from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig } from "../config.js";
-import type { MeshEvent, MeshStore } from "../mesh/store.js";
+import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
 const MESH_WATCH_RECONCILE_MS = 2_000;
 /**
@@ -119,6 +119,17 @@ export class ActorMeshMonitor {
       // never blocks the stream; the cursor file is committed after the page.
       const start = this.#offset;
       const tail = this.mesh.tail(start, this.config.maxReadEvents);
+      // A rewrite since this cursor restarts the stream at the retained log. The events in
+      // between are in the archive: read them from the last event handed on, then restart
+      // the stream at the new log's start. A later rewrite is caught the same way.
+      const generation = meshCursorGeneration(tail.nextOffset);
+      if (this.#last && this.mesh.read && generation !== meshCursorGeneration(start)) {
+        this.#archiveAfter = this.#last.sequence;
+        this.#offset = meshCursorAtStart(generation);
+        this.#writeCursor();
+        setImmediate(() => this.schedule());
+        return;
+      }
       if (this.#catchingUp && tail.events.length === 0) this.#catchingUp = false;
       const catchingUp = this.#catchingUp;
       if (!catchingUp) this.#offset = tail.nextOffset;
@@ -126,7 +137,9 @@ export class ActorMeshMonitor {
         if (this.#delivered(event)) continue;
         if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event)) continue;
         const accepted = this.callbacks.onEvent(event);
-        if (accepted === false && catchingUp) {
+        // A receiver that is full holds the event: while catching up, and for work events always
+        // (smarty-dev#754), so work waits for room instead of being dropped.
+        if (accepted === false && (catchingUp || isWork(event))) {
           // A full actor queue rejected this event while catching up (smarty-dev#472): keep
           // the cursor on it and offer it again later; earlier events are already delivered.
           // The boundary comes from this same read, so a compaction since cannot move it.
@@ -154,27 +167,30 @@ export class ActorMeshMonitor {
     return event.sequence < last.sequence || (event.sequence === last.sequence && event.id === last.id);
   }
 
-  // On resume, work events that left the live log while this host was away (a live-log rewrite
-  // restarts the stream at the retained log) come from the archive, oldest first. Returns false
-  // while a full receiver holds the rest back; the next poll continues from there.
+  // Work events that left the live log while this host was away, or during a rewrite, come
+  // from the archive, oldest first, one page per poll: it yields between pages as the live
+  // catch-up does. Returns true when the archive is caught up to the live log's oldest event;
+  // false while a page remains, or while a full receiver holds a work event back.
   #catchUpArchive(): boolean {
     const oldest = this.mesh.oldestSequence?.();
     if (!this.mesh.read || oldest === undefined || this.#archiveAfter === undefined || this.#archiveAfter + 1 >= oldest) {
       this.#archiveAfter = undefined;
       return true;
     }
-    for (;;) {
-      const page = this.mesh.read({ after: this.#archiveAfter, limit: this.config.maxReadEvents });
-      const older = page.filter((event) => event.sequence < oldest);
-      for (const event of older) {
-        if (isWork(event) && !this.#delivered(event) && this.callbacks.onEvent(event) === false) {
-          this.#writeCursor();
-          return false;
-        }
-        this.#archiveAfter = event.sequence;
-        if (isWork(event)) this.#last = { sequence: event.sequence, id: event.id };
+    const page = this.mesh.read({ after: this.#archiveAfter, limit: this.config.maxReadEvents });
+    const older = page.filter((event) => event.sequence < oldest);
+    for (const event of older) {
+      if (isWork(event) && !this.#delivered(event) && this.callbacks.onEvent(event) === false) {
+        this.#writeCursor();
+        return false;
       }
-      if (older.length < page.length || page.length < this.config.maxReadEvents || older.length === 0) break;
+      this.#archiveAfter = event.sequence;
+      if (isWork(event)) this.#last = { sequence: event.sequence, id: event.id };
+    }
+    if (older.length === page.length && page.length === this.config.maxReadEvents) {
+      this.#writeCursor();
+      setImmediate(() => this.schedule());
+      return false;
     }
     this.#archiveAfter = undefined;
     this.#writeCursor();

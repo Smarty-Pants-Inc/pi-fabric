@@ -97,6 +97,10 @@ const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
 const READ_HINT_LINES = 128;
 const CURSOR_OFFSET_BASE = 2 ** 32;
+/** A tail cursor's live-log generation: it changes when the log is rewritten. */
+export const meshCursorGeneration = (cursor: number): number => Math.floor(cursor / CURSOR_OFFSET_BASE);
+/** The cursor at the start of a generation's log. */
+export const meshCursorAtStart = (generation: number): number => generation * CURSOR_OFFSET_BASE;
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));

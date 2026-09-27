@@ -1303,6 +1303,8 @@ export class ActorManager {
       coalesceKey?: string;
       images?: readonly ImageContent[];
       ownershipChecked?: boolean;
+      /** A full queue and overflow reject the item instead of recording it dropped. */
+      holdWhenFull?: boolean;
     } = {},
   ): ActorQueueItem {
     const canManage = options.ownershipChecked
@@ -1370,6 +1372,9 @@ export class ActorManager {
       // actor's overflow, and past its cap it is recorded as dropped, never lost silently.
       const overflow = this.#overflow.get(actor.id) ?? [];
       if (overflow.length >= this.#overflowCap()) {
+        if (options.holdWhenFull) {
+          throw new Error(`Fabric actor queue limit reached for ${actor.name} (${this.meshConfig.actorQueueLimit} and overflow ${this.#overflowCap()})`);
+        }
         this.#recordDropped(actor, item, `its queue (${this.meshConfig.actorQueueLimit}) and overflow (${this.#overflowCap()}) are full`);
         return item;
       }
@@ -1980,6 +1985,8 @@ export class ActorManager {
           // so a joined key could merge two topics' subjects. Keeps the value's type.
           this.#enqueue(actor, `mesh:${event.topic}`, event, {
             ownershipChecked: true,
+            // Work waits for room; the monitor offers it again (smarty-dev#754).
+            ...(event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
             ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
           });
         }

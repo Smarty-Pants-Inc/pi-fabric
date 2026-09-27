@@ -87,6 +87,18 @@ const writeAll = (descriptor: number, bytes: Buffer): void => {
   }
 };
 
+// Truncate through its own read-write handle: Windows refuses to truncate through an append one.
+const truncateTo = (file: string, size: number): void => {
+  const descriptor = fs.openSync(file, "r+");
+  try {
+    if (fs.fstatSync(descriptor).size <= size) return;
+    fs.ftruncateSync(descriptor, size);
+    fs.fdatasyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+};
+
 export class MeshArchive {
   constructor(readonly dir: string, readonly meshRoot: string) {}
 
@@ -124,19 +136,21 @@ export class MeshArchive {
     const absolute = path.join(this.dir, relative);
     this.#describeMesh(entry.event.sequence);
     fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 });
-    const descriptor = fs.openSync(absolute, "a+", 0o600);
+    let descriptor: number | undefined = fs.openSync(absolute, "a+", 0o600);
     let pending: MeshArchivePending | undefined;
     try {
-      this.#repairAndReadLast(descriptor);
+      this.#repairAndReadLast(descriptor, absolute);
       pending = { sequence: entry.event.sequence, id: entry.event.id, file: relative, size: fs.fstatSync(descriptor).size };
       writeFileAtomic(path.join(this.dir, "PENDING.json"), `${JSON.stringify(pending)}\n`);
       writeAll(descriptor, Buffer.from(`${entry.line}\n`, "utf8"));
       fs.fdatasyncSync(descriptor);
     } catch (error) {
-      if (pending) this.#cutBack(descriptor, pending);
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+      if (pending) this.#cutBack(pending);
       throw error;
     } finally {
-      fs.closeSync(descriptor);
+      if (descriptor !== undefined) fs.closeSync(descriptor);
     }
     return pending;
   }
@@ -150,19 +164,7 @@ export class MeshArchive {
 
   /** The event never went live: cut it back out of its file. */
   rollback(pending: MeshArchivePending): void {
-    let descriptor: number;
-    try {
-      descriptor = fs.openSync(path.join(this.dir, pending.file), "r+");
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
-      fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
-      return;
-    }
-    try {
-      this.#cutBack(descriptor, pending);
-    } finally {
-      fs.closeSync(descriptor);
-    }
+    this.#cutBack(pending);
   }
 
   /**
@@ -187,7 +189,7 @@ export class MeshArchive {
           const descriptor = fs.openSync(absolute, "a+", 0o600);
           file = { descriptor, last: undefined };
           open.set(relative, file);
-          file.last = this.#repairAndReadLast(descriptor);
+          file.last = this.#repairAndReadLast(descriptor, absolute);
         }
         const previous = file.last;
         last = { sequence: event.sequence, id: event.id, file: relative };
@@ -279,10 +281,11 @@ export class MeshArchive {
     for (const day of unsealed) this.#seal(day);
   }
 
-  #cutBack(descriptor: number, pending: MeshArchivePending): void {
-    if (fs.fstatSync(descriptor).size > pending.size) {
-      fs.ftruncateSync(descriptor, pending.size);
-      fs.fdatasyncSync(descriptor);
+  #cutBack(pending: MeshArchivePending): void {
+    try {
+      truncateTo(path.join(this.dir, pending.file), pending.size);
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
     }
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
   }
@@ -309,12 +312,12 @@ export class MeshArchive {
   }
 
   // A torn last line belongs to an append that never returned: cut it, as the live log does.
-  #repairAndReadLast(descriptor: number): { sequence: number; id: string } | undefined {
+  #repairAndReadLast(descriptor: number, file: string): { sequence: number; id: string } | undefined {
     let size = fs.fstatSync(descriptor).size;
     let tail = this.#lastLines(descriptor, size);
     if (tail.length && tail[tail.length - 1] !== 0x0a) {
       const cut = tail.lastIndexOf(0x0a) + 1;
-      fs.ftruncateSync(descriptor, size - tail.length + cut);
+      truncateTo(file, size - tail.length + cut);
       size = size - tail.length + cut;
       tail = this.#lastLines(descriptor, size);
     }

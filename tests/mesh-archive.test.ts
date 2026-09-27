@@ -140,6 +140,14 @@ describe("mesh event archive", () => {
     expect(fs.existsSync(path.join(dir, "PENDING.json"))).toBe(false);
   });
 
+  it("cuts a torn line that no pending record names before appending", async () => {
+    const { store, file, lines, live } = setup();
+    await store.publish({ topic: "ops.owner", from, text: "one" });
+    fs.appendFileSync(file(today(), "ops.owner"), '{"id":"torn');
+    await store.publish({ topic: "ops.owner", from, text: "two" });
+    expect(lines(file(today(), "ops.owner"))).toEqual(live());
+  });
+
   it("keeps a pending event that did go live before the crash", async () => {
     const { store, dir, file, live, sequences } = setup();
     await store.publish({ topic: "ops.owner", from, text: "one" });

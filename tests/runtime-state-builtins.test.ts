@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { createProviderComponent, type FabricProviderComponentManifest } from "../src/components/provider-component.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
+import { FabricShellJobStore } from "../src/core/shell-jobs.js";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { TasksProvider } from "../src/providers/tasks-provider.js";
 import { RuntimeStateBuiltins } from "../src/runtime-state-builtins.js";
 import { WorkerMemoryProvider } from "../src/memory/worker-provider.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -19,6 +22,21 @@ const fixture = () => {
 };
 
 describe("runtime built-in installation policy", () => {
+  it("installs tasks over the same session-owned shell store as native tools", async () => {
+    const { builtins, manifest } = fixture();
+    const jobs = new FabricShellJobStore();
+    try {
+      await builtins.tools(process.cwd(), normalizeFabricConfig({ fullCodeMode: true }), new CapturedToolCatalog(), { jobs, getHangMs: () => 0 });
+      const entries = (manifest.install.mock.calls as unknown as Array<[FabricProviderComponent]>).map(([component]) => component);
+      const component = entries.find(entry => entry.definition.name === "fabric.provider.tasks");
+      expect(component).toBeDefined();
+      const provide = vi.fn();
+      await component!.definition.activate({ provide } as unknown as FabricComponentContext, undefined);
+      const provider = provide.mock.calls[0]![0] as TasksProvider;
+      expect(provider).toBeInstanceOf(TasksProvider);
+      expect(provider.jobs).toBe(jobs);
+    } finally { await jobs.close(); }
+  });
   it("installs the worker-backed provider for Pi filesystem memory", async () => {
     const { builtins, manifest } = fixture();
     const context = {
@@ -36,10 +54,10 @@ describe("runtime built-in installation policy", () => {
 
   it.each([
     { fullCodeMode: false, schema: { mode: "off" }, capture: { enabled: true }, expected: [] },
-    { fullCodeMode: true, schema: { mode: "off" }, capture: { enabled: false }, expected: ["pi"] },
-    { fullCodeMode: true, schema: { mode: "off" }, capture: { enabled: true }, expected: ["pi", "extensions"] },
-    { fullCodeMode: false, schema: { mode: "enforce" }, capture: { enabled: false }, expected: ["pi"] },
-    { fullCodeMode: true, schema: { mode: "enforce" }, capture: { enabled: true }, expected: ["pi"] },
+    { fullCodeMode: true, schema: { mode: "off" }, capture: { enabled: false }, expected: ["pi", "tasks"] },
+    { fullCodeMode: true, schema: { mode: "off" }, capture: { enabled: true }, expected: ["pi", "tasks", "extensions"] },
+    { fullCodeMode: false, schema: { mode: "enforce" }, capture: { enabled: false }, expected: ["pi", "tasks"] },
+    { fullCodeMode: true, schema: { mode: "enforce" }, capture: { enabled: true }, expected: ["pi", "tasks"] },
   ])("asserts the protected provider surface for %j", ({ expected, ...options }) => {
     const { builtins, manifest, registry } = fixture();
     builtins.assertActive(normalizeFabricConfig({

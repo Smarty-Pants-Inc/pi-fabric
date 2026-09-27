@@ -99,6 +99,7 @@ const EXTENSION_ALIASES = new Map<string, string>([
   [".html", "html"],
   [".htm", "html"],
   [".py", "python"],
+  [".bend", "bend"],
   [".rs", "rust"],
   [".go", "go"],
   [".rb", "ruby"],
@@ -486,7 +487,9 @@ const requestLanguageLoad = (lang: string, invalidate?: () => void): void => {
   pendingLanguages.add(lang);
   const generation = highlighterGeneration;
   void instance
-    .loadLanguage(lang as never)
+    // Pass the catalog loader, not an id: locally supplied grammars are not
+    // part of Shiki's built-in language registry.
+    .loadLanguage(shikiLanguages()[lang]!)
     .then(() => {
       if (generation !== highlighterGeneration) return;
       loadedLanguages.add(lang);

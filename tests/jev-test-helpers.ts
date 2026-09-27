@@ -8,7 +8,7 @@ import type { JevObservationHost } from "../src/jev/observation.js";
 import type { JevLaunch, JevRunInfo } from "../src/jev/types.js";
 export const jevContext = (signal?: AbortSignal): FabricInvocationContext => ({
   cwd: process.cwd(), signal, parentToolCallId: "jev-test", nestedToolCallId: "jev-nested",
-  extensionContext: { hasUI: false, sessionManager: { getSessionId: () => "jev-test-session" } } as ExtensionContext, update() {},
+  extensionContext: { hasUI: false, sessionManager: { getSessionId: () => "jev-test-session", getSessionFile: () => undefined } } as ExtensionContext, update() {},
 });
 export function setupJev(overrides: Record<string, unknown> = {}, fetcher?: typeof fetch, credentials?: JevCredentials, observationHost?: JevObservationHost) {
   const config = normalizeFabricConfig({

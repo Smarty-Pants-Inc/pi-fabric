@@ -337,8 +337,8 @@ describe("/fabric chat command routing", () => {
     const pi = {
       registerCommand: vi.fn(),
       registerShortcut: vi.fn(
-        (_shortcut: string, definition: { handler: (context: ExtensionContext) => Promise<void> }) => {
-          shortcutHandler = definition.handler;
+        (shortcut: string, definition: { handler: (context: ExtensionContext) => Promise<void> }) => {
+          if (shortcut === FABRIC_CONVERSATION_SHORTCUT) shortcutHandler = definition.handler;
         },
       ),
     } as unknown as ExtensionAPI;

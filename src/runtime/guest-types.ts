@@ -517,6 +517,9 @@ type PiReadOptions = { offset?: number; limit?: number; start?: number; max?: nu
 type PiShellOptions = {
   timeout?: number; timeoutMs?: number; settle?: boolean;
   background?: boolean; run_in_background?: boolean;
+  description?: string;
+  /** Opt-in line events; implies background. ui never wakes the model; wake may start an owning-agent turn. */
+  monitor?: { delivery: "ui" | "wake"; timeoutMs?: number; intervalMs?: number; match?: string };
   cwd?: string; workdir?: string; directory?: string; workingDirectory?: string;
 };
 type PiBashOptions = PiShellOptions;

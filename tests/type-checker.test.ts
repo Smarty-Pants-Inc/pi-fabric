@@ -6,6 +6,15 @@ import {
 } from "../src/runtime/type-checker.js";
 
 describe("Fabric guest type checker", () => {
+  it("types explicit opt-in shell monitors and generic task controls", () => {
+    const result = typeCheckFabricCode(`
+const result = await pi.bash({cmd: "watch", description: "Watch CI", monitor: {delivery: "ui", match: "CI:", intervalMs: 5000, timeoutMs: 300000}});
+return tools.call({ref: "tasks.list", args: {}});
+`, GUEST_TYPE_DECLARATIONS);
+    expect(result.errors).toEqual([]);
+    const missing = typeCheckFabricCode('return pi.bash({cmd: "watch", monitor: {}});', GUEST_TYPE_DECLARATIONS);
+    expect(missing.errors.length).toBeGreaterThan(0);
+  });
   it("normalizes Windows paths for TypeScript compiler host comparisons", () => {
     expect(normalizeTypeScriptPath("C:\\work\\__pi_fabric_guest_1.ts")).toBe(
       "C:/work/__pi_fabric_guest_1.ts",

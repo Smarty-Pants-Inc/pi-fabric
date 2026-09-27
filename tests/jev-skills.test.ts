@@ -24,11 +24,12 @@ const execute = async (kernel: Kernel, host: (ref: string, args: Record<string, 
   return result.value as Pick<JevRunInfo, "id" | "state" | "result" | "error" | "evaluations">;
 };
 
-it.each(["typescript", "python"] as const)("keeps %s Jev auth, policy, loop, and browser guidance discoverable", (kernel) => {
+it.each(["typescript", "python"] as const)("keeps %s Jev auth, policy, loop, and shell-first guidance discoverable", (kernel) => {
   const skill = markdown(kernel);
-  for (const required of ["disable-model-invocation: true", "<skill-dir>/../../../docs/jev.md", "/login jev", "auth.json", "verified: false", "requires", "Schema enforce", "managed hosts", "session-owned, not restart-durable", "allowedMethods", "sessionId", "10 Hz", "64 events", "429/529", "## Completion criterion", "program.nextEvent()", "program.advise", "status.observation", "Do not wait/join an active observer"]) {
+  for (const required of ["disable-model-invocation: true", "<skill-dir>/../../../docs/jev.md", "/login jev", "auth.json", "verified: false", "requires", "Schema enforce", "managed hosts", "session-owned, not restart-durable", "tasks.wait", "tasks.watch", "maxEvaluations: 0", "browser-harness-js", "macos-harness serve", "10 Hz", "64 events", "429/529", "## Completion criterion", "program.nextEvent()", "program.advise", "status.observation", "Do not wait/join an active observer"]) {
     expect(skill, `${kernel}: ${required}`).toContain(required);
   }
+  for (const obsolete of ["components.apply", "interactionModulePath", "allowedMethods", "browser.cdp", "macos.connect"]) expect(skill).not.toContain(obsolete);
   for (const name of ["fabric-guide", "fabric-exec"]) {
     expect(readFileSync(`skillsets/${kernel}/${name}/SKILL.md`, "utf8")).toContain("/skill:fabric-jev");
   }

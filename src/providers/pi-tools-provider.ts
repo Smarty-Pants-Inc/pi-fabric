@@ -32,6 +32,7 @@ import {
   raceShellHang,
   trackShellOperations,
 } from "../core/shell-jobs.js";
+import { parseShellMonitor, shellMonitorSchema } from "../core/shell-monitor.js";
 import { expandSkillDirMarkersForRead } from "../core/skill-dir.js";
 import type {
   FabricActionDescriptor,
@@ -64,10 +65,12 @@ const closedPiInputSchema = (name: PiCoreToolName, source: unknown): Record<stri
   const schema = source as Record<string, unknown>;
   const properties = { ...(schema.properties as Record<string, unknown>) };
   if (name === "bash" || name === "powershell") {
+    properties.description = { type: "string", minLength: 1, maxLength: 120, description: "Short human-readable task purpose shown in the background task hint." };
+    properties.monitor = shellMonitorSchema;
     properties.background = {
       type: "boolean",
       description:
-        "Detach immediately: the await returns ok:true with a still-running notice, pid, and live output path. Do not poll; pi.read the path when you need output.",
+        "Detach immediately: returns ok:true with taskId, pid and a bounded live log. Completion notifies the owning agent. Inspect/stop with tools.call tasks.get/tasks.stop; bounded controllers can await tasks.wait/tasks.watch without polling. monitor also detaches, requires explicit ui/wake delivery and has a finite deadline. Do not poll.",
     };
   }
   if (name === "edit") {
@@ -462,6 +465,7 @@ export class PiToolsProvider implements FabricProvider {
     const create = Reflect.get(PiCodingAgent, "createPowerShellToolDefinition");
     const operationsFactory = Reflect.get(PiCodingAgent, "createLocalPowerShellOperations");
     if (typeof create !== "function" || typeof operationsFactory !== "function") {
+      if (job.options.monitor) throw new Error("PowerShell monitors require host shell operations support");
       return this.#definitionFor(name, args);
     }
     return create(cwd, {
@@ -499,11 +503,17 @@ export class PiToolsProvider implements FabricProvider {
     middleware: FabricBashMiddlewareV1 | undefined,
   ): Promise<PiToolResult> {
     const command = typeof args.command === "string" ? args.command : "";
-    const background = args.background === true;
-    const executeArgs = background || "background" in args
-      ? (({ background: _ignored, ...rest }) => rest)(args)
-      : args;
-    const job = this.#shellJobs.begin(name, command);
+    const monitor = parseShellMonitor(args.monitor);
+    if (monitor && args.background === false) throw new Error("monitor runs in the background; omit background:false");
+    if (monitor && this.#shellJobs.live().filter(job => job.options.monitor).length >= 8) throw new Error("At most 8 monitors may run per session; stop an existing task first");
+    const background = args.background === true || monitor !== undefined;
+    const { background: _background, monitor: _monitor, description: _description, ...executeArgs } = args;
+    const job = this.#shellJobs.begin(name, command, {
+      cwd: typeof args[PI_BASH_CWD_KEY] === "string" ? args[PI_BASH_CWD_KEY] : this.#cwd,
+      ownerId: context.extensionContext.sessionManager?.getSessionId?.(),
+      ...(typeof args.description === "string" ? { description: args.description } : {}),
+      ...(monitor ? { monitor } : {}),
+    });
     let tool: ToolDefinition<any, any, any>;
     try {
       tool = this.#trackedShellDefinition(name, executeArgs, job, middleware);
@@ -531,7 +541,7 @@ export class PiToolsProvider implements FabricProvider {
         ),
     });
     if (outcome.status === "done") {
-      await job.finish(0);
+      await job.finish((outcome.value as PiToolResult & { isError?: boolean }).isError ? null : 0);
       return outcome.value as PiToolResult;
     }
     if (outcome.status === "error") {
@@ -547,12 +557,13 @@ export class PiToolsProvider implements FabricProvider {
       logPath,
       ...(pid !== undefined ? { pid } : {}),
     });
-    const output = appendShellHangNotice(job.snapshotText(), notice);
+    const output = appendShellHangNotice(job.snapshotText(), `${notice}\n[Task ${job.id}; /fabric tasks or tools.call({ref:"tasks.get",args:{id:"${job.id}"}}). ${monitor?.delivery === "ui" ? "UI-only monitor: will not wake the agent." : "Completion will notify this session; do not poll."}]`);
     context.update(`${name}: still running after ${Math.max(1, Math.round(elapsedMs / 1000))}s`);
     return {
       content: [{ type: "text", text: output }],
       details: {
-        running: true,
+        running: !job.finished,
+        taskId: job.id,
         elapsedMs,
         logPath,
         fullOutputPath: logPath,
@@ -582,6 +593,7 @@ export class PiToolsProvider implements FabricProvider {
     // tool) already replays the full event lifecycle itself via
     // CapturedToolsProvider, so delegate to it unchanged.
     if (this.#catalog?.get(name) && !middleware) {
+      if (isPiShellToolName(name) && args.monitor !== undefined) throw new Error("Shell monitors are unavailable for opaque shell overrides; a Fabric-compatible middleware adapter is required");
       const result = await this.#capturedTools!.invoke(name, args, context);
       this.#attachReadMedia(name, result, context);
       this.#attachReadNote(name, result, context);

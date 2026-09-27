@@ -234,14 +234,14 @@ export class MeshProvider implements FabricProvider {
           args.scope === "local" || args.scope === "lineage" || args.scope === "project"
             ? args.scope
             : "project";
-        const limit = Math.max(1, Math.floor(typeof args.limit === "number" ? args.limit : 100));
-        return this.participants
-          .list({
-            scope,
-            ...(kinds ? { kinds } : {}),
-            ...(args.includeStale === true ? { includeStale: true } : {}),
-          })
-          .slice(0, limit);
+        // Every member unless the caller asks for fewer: a silent default cap dropped live roots
+        // once the fleet passed 100 participants (smarty-dev#1241). The list is already in memory.
+        const members = this.participants.list({
+          scope,
+          ...(kinds ? { kinds } : {}),
+          ...(args.includeStale === true ? { includeStale: true } : {}),
+        });
+        return typeof args.limit === "number" ? members.slice(0, Math.max(1, Math.floor(args.limit))) : members;
       }
       case "get": {
         const key = String(args.key);

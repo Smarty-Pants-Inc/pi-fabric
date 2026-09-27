@@ -7,7 +7,7 @@ Every method takes a single options object. Mesh data defaults to `<project>/.pi
 ## Identity and presence
 
 - `mesh.self()` returns the caller's wire identity `{ id, name, kind, sessionId? }`, where the legacy wire `kind` is `main`, `actor`, or `agent`.
-- `mesh.members({ scope?, kinds?, includeStale?, limit? })` returns the same `FabricParticipantInfo[]` as `agents.members`: intrinsic roots, agents, and actors with `rootId`, optional `parentId`, `ownerHostId`, status, capabilities, and `local`/`stale` flags. `scope` defaults to `"project"`.
+- `mesh.members({ scope?, kinds?, includeStale?, limit? })` returns the same `FabricParticipantInfo[]` as `agents.members`, all of them unless `limit` asks for fewer: intrinsic roots, agents, and actors with `rootId`, optional `parentId`, `ownerHostId`, status, capabilities, and `local`/`stale` flags. `scope` defaults to `"project"`.
 - `agents.self()` is the richer intrinsic identity (`kind: "root" | "agent" | "actor"`). `agents.main()` and `agents.peers()` are compatibility views derived from root participants.
 
 The directory stores participant records separately from short-lived execution-host leases. If a host crashes, all records owned by that host become stale atomically from the reader's perspective. Normal discovery excludes them; `includeStale: true` is diagnostic.

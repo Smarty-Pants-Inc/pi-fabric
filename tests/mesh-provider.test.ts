@@ -120,4 +120,21 @@ describe("MeshProvider membership", () => {
     });
     await expect(provider.invoke("self", {}, context)).resolves.toEqual(identity);
   });
+
+  it("returns every member unless the caller asks for fewer (smarty-dev#1241)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-provider-"));
+    roots.push(root);
+    const all = Array.from({ length: 150 }, (_, index) => participant(`actor:${index}`));
+    const source: FabricParticipantSource = {
+      list: () => all,
+      get: () => undefined,
+      self: () => participant("actor:self"),
+      peers: () => [],
+      async refresh() {},
+      scheduleRefresh() {},
+    };
+    const provider = new MeshProvider(new MeshStore(path.join(root, "mesh"), 64 * 1024, 100), identity, source);
+    await expect(provider.invoke("members", {}, context)).resolves.toHaveLength(150);
+    await expect(provider.invoke("members", { limit: 10 }, context)).resolves.toHaveLength(10);
+  });
 });

@@ -805,32 +805,36 @@ export class ActorManager {
   // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the 2 newest backups and logs it.
   #archiveSession(actor: ManagedActor, trigger: "requested" | "size"): void {
     const file = actor.sessionFile;
-    let bytes = 0;
-    let archived: string | null = null;
-    try {
-      bytes = fs.statSync(file).size;
-      const stamp = new Date().toISOString().replace(/[-:.]/g, "");
-      archived = `${file}.${stamp}.bak`;
-      for (let n = 1; fs.existsSync(archived); n += 1) archived = `${file}.${stamp}-${n}.bak`;
-      fs.renameSync(file, archived);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      archived = null;
-    }
+    const dir = path.dirname(file);
     // Oldest first: by stamp, then by the -n suffix a same-millisecond archive gets.
     const prefix = `${path.basename(file)}.`;
     const order = (name: string): [string, number] => {
       const [stamp = "", n = "0"] = name.slice(prefix.length, -".bak".length).split("-");
       return [stamp, Number(n) || 0];
     };
-    const backups = fs.readdirSync(path.dirname(file))
-      .filter((name) => name.startsWith(prefix) && name.endsWith(".bak"))
+    const listBackups = (): string[] => fs.readdirSync(dir)
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".bak"));
+    let bytes = 0;
+    let archived: string | null = null;
+    try {
+      bytes = fs.statSync(file).size;
+      const stamp = new Date().toISOString().replace(/[-:.]/g, "");
+      // A same-millisecond archive takes a suffix above every one kept for its stamp. A gap
+      // that pruning left must not be reused: the new name would sort oldest and be pruned.
+      const taken = listBackups().map(order).filter(([other]) => other === stamp).map(([, n]) => n);
+      archived = taken.length === 0 ? `${file}.${stamp}.bak` : `${file}.${stamp}-${Math.max(...taken) + 1}.bak`;
+      fs.renameSync(file, archived);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      archived = null;
+    }
+    const backups = listBackups()
       .sort((left, right) => {
         const [a, m] = order(left);
         const [b, n] = order(right);
         return a < b ? -1 : a > b ? 1 : m - n;
       });
-    for (const name of backups.slice(0, -2)) fs.rmSync(path.join(path.dirname(file), name), { force: true });
+    for (const name of backups.slice(0, -2)) fs.rmSync(path.join(dir, name), { force: true });
     // A Claude-runner actor resumes by runner session id: drop it, too.
     delete actor.runnerSessionId;
     actor.updatedAt = Date.now();

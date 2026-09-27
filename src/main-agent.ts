@@ -125,6 +125,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #suspended = false;
   #closed = false;
   #wake: ReturnType<typeof setInterval> | undefined;
+  #operation: AbortSignal | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -266,6 +267,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     // that completed, wake Main for what it held; after one that was cancelled or failed, append
     // them for the next run instead (review/astra on pi-fabric#102). A compaction inside a run
     // leaves them to that run's boundaries.
+    // The operation's own abort signal says whether the user cancelled it: Pi can report that
+    // cancel after Main is idle again, or not at all (review/astra on pi-fabric#102).
+    on("session_before_compact", (event: { reason?: string; signal?: AbortSignal }) => {
+      this.#operation = event.reason === "manual" ? event.signal : undefined;
+    });
+    on("session_before_tree", (event: { signal?: AbortSignal }) => { this.#operation = event.signal; });
     on("session_compact", (event: { reason?: string }, ctx) => {
       this.#context = ctx;
       if (event.reason === "manual") this.#wakeWhenIdle();
@@ -319,9 +326,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     // take any time (review/astra F2 on pi-fabric#102): wait for idle, not one tick. A release
     // or a new run ends the wait; a cancelled or failed operation releases without a run.
     // Armed with nothing held too: a followUp can arrive while a later handler still runs.
+    // Only an operation whose abort signal Fabric saw, and that was not aborted, wakes Main: a
+    // cancel stops the wait at once, before Main is idle, and its followUps wait (appended by
+    // session_compact_failed, or held for the next run). Without the signal, success is unknown.
     if (this.#wake) return;
+    const operation = this.#operation;
+    this.#operation = undefined;
     this.#wake = setInterval(() => {
-      if (this.#closed) this.#stopWake();
+      if (this.#closed || !operation || operation.aborted) this.#stopWake();
       else if (this.#context?.isIdle()) this.#held.length ? this.#release(true) : this.#stopWake();
     }, 25);
     this.#wake.unref?.();

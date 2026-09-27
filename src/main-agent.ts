@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
+import { settledCompleted } from "./settled.js";
 
 const MAIN_AGENT_ALIAS = "main";
 export type FabricAgentMessageDelivery = "steer" | "followUp";
@@ -246,8 +247,10 @@ export class MainAgentController implements FabricMainAgentTarget {
       }
       this.#flushDue();
     });
-    on("agent_settled", (_event, ctx) => {
-      const interrupted = this.#suspended || Boolean(ctx.signal?.aborted);
+    on("agent_settled", (event, ctx) => {
+      // A cancel after the last turn (in agent_before_settle, or of post-run compaction) sets
+      // no aborted turn_end: the settle outcome says it (review/astra F1 on pi-fabric#102).
+      const interrupted = this.#suspended || !settledCompleted(event, ctx);
       this.#context = ctx;
       this.#suspended = false;
       // After Escape, do not restart Main: append the held ones for its next run.

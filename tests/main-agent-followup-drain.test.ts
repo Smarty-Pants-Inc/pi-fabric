@@ -7,6 +7,7 @@ import {
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
+  VERSION as PI_VERSION,
   type AgentSession,
   type ExtensionAPI,
   type ExtensionContext,
@@ -135,7 +136,7 @@ describe("Main followUp drain (unit)", () => {
     main.deliverAgent({ from: from("a"), message: "one", delivery: "followUp" });
     main.deliverAgent({ from: from("b"), message: "two", delivery: "followUp" });
     state.idle = true;
-    emit("agent_settled", {}, ctx);
+    emit("agent_settled", { outcome: "completed" }, ctx);
     expect(sent).toHaveLength(1);
     expect(sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(sent[0]!.message.content.indexOf("one")).toBeLessThan(sent[0]!.message.content.indexOf("two"));
@@ -169,9 +170,21 @@ describe("Main followUp drain (unit)", () => {
     emit("turn_end", { message: { role: "assistant", stopReason: "aborted" } }, ctx);
     expect(sent).toHaveLength(0);
     state.idle = true;
-    emit("agent_settled", {}, ctx);
+    emit("agent_settled", { outcome: "aborted" }, ctx);
     expect(sent).toHaveLength(1);
     expect(sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: false });
+  });
+
+  // review/astra F1 on pi-fabric#102: a cancel after the last turn ends normally.
+  it("does not restart Main when the settle outcome is aborted or error after a normal turn", () => {
+    for (const outcome of ["aborted", "error"]) {
+      const { main, sent, emit, ctx, state } = setup();
+      main.deliverAgent({ from: from("a"), message: "one", delivery: "followUp" });
+      emit("turn_end", { message: { role: "assistant", stopReason: "stop" } }, ctx);
+      state.idle = true;
+      emit("agent_settled", { outcome }, ctx);
+      expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: false }]);
+    }
   });
 
   it("with flushMs 0 keeps Pi's own followUp queue", () => {
@@ -293,5 +306,94 @@ describe("Main followUp drain in a real Pi session", () => {
     const flushed = session.messages.find((message) => message.role === "custom" && (message as { details?: { flushed?: boolean } }).details?.flushed) as { content: string };
     expect(flushed.content).toMatch(/delivery="followUp" sent_at="\d{4}-\d\d-\d\dT[\d:.]+Z">\nlate news/);
     expect(main!.queueDepth().pendingFollowUps).toBe(0);
+  });
+});
+
+// review/astra F1 on pi-fabric#102: the user cancels while Pi runs agent_before_settle after a
+// normal last turn. No aborted turn_end happens; only the settle outcome says "aborted".
+// Pi before 0.87.1 emits agent_settled without an outcome and gives extensions no other sign of
+// this cancel; the installed runtime has it. .local/settle-proof runs this case on that runtime.
+const settleOutcome = PI_VERSION.localeCompare("0.87.1", undefined, { numeric: true }) >= 0;
+describe("Main followUp drain at a cancelled settle in a real Pi session", () => {
+  const run = async (cancel: boolean) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-drain-settle-"));
+    roots.push(root);
+    const faux = fauxProvider();
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+    modelRuntime.registerNativeProvider(faux.provider);
+    let main: MainAgentController | undefined;
+    let releaseTool: (() => void) | undefined;
+    let releaseSettle: (() => void) | undefined;
+    let settling = 0;
+    let agentStarts = 0;
+    const loader = new DefaultResourceLoader({
+      cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [{
+        name: "drain",
+        factory: (pi: ExtensionAPI) => {
+          pi.registerTool({
+            name: "work", label: "work", description: "blocks until released", parameters: Type.Object({}),
+            execute: async () => {
+              await new Promise<void>((resolve) => { releaseTool = resolve; });
+              return { content: [{ type: "text", text: "done" }], details: {} };
+            },
+          });
+          pi.on("agent_start", () => { agentStarts++; });
+          pi.on("agent_before_settle", async () => {
+            settling++;
+            if (settling === 1) await new Promise<void>((resolve) => { releaseSettle = resolve; });
+          });
+          pi.on("session_start", (_event, ctx) => {
+            main = new MainAgentController(pi, "session:root", true, root, "root");
+            main.attachFollowUpDrain(ctx, 60_000);
+          });
+        },
+      }],
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({
+      cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+      sessionManager: SessionManager.inMemory(root), tools: ["work"],
+    });
+    sessions.push(session);
+    await session.bindExtensions({});
+    await waitFor(() => main !== undefined);
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("work", {}), { stopReason: "toolUse" }),
+      fauxAssistantMessage("done"),
+      fauxAssistantMessage("second run"),
+    ]);
+    const prompted = session.prompt("go");
+    await waitFor(() => releaseTool !== undefined);
+    expect(main!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" }, message: "later", delivery: "followUp" }))
+      .toMatchObject({ pendingFollowUps: 1 });
+    releaseTool!();
+    await waitFor(() => releaseSettle !== undefined);   // the last turn ended normally
+    const aborting = cancel ? session.abort() : Promise.resolve();
+    releaseSettle!();
+    await aborting;
+    await prompted.catch(() => undefined);
+    await waitFor(() => session.isIdle);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitFor(() => session.isIdle);
+    const delivered = session.messages.filter((message) => message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-agent-message");
+    return { agentStarts, calls: faux.state.callCount, delivered, main: main! };
+  };
+
+  it.skipIf(!settleOutcome)("keeps the held followUp without a new run when the settle is cancelled", async () => {
+    const { agentStarts, calls, delivered, main } = await run(true);
+    expect(agentStarts).toBe(1);
+    expect(calls).toBe(2);
+    expect(delivered).toHaveLength(1);                   // appended for Main's next run
+    expect((delivered[0] as { details?: { triggerTurn?: boolean } }).details?.triggerTurn).toBe(false);
+    expect(main.queueDepth().pendingFollowUps).toBe(0);
+  });
+
+  it("counterexample: a completed settle delivers the held followUp in a new run", async () => {
+    const { agentStarts, calls, delivered } = await run(false);
+    expect(agentStarts).toBe(2);
+    expect(calls).toBe(3);
+    expect(delivered).toHaveLength(1);
+    expect((delivered[0] as { details?: { triggerTurn?: boolean } }).details?.triggerTurn).toBe(true);
   });
 });

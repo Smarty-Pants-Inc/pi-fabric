@@ -131,8 +131,7 @@ export class MeshArchive {
    * line and syncs it. On any failure it cuts the line back out and throws.
    */
   begin(entry: MeshArchiveEntry): MeshArchivePending {
-    const days = this.#days();
-    const relative = this.#fileFor(entry.event, days);
+    const relative = this.#fileFor(entry.event, this.#headDay());
     const absolute = path.join(this.dir, relative);
     this.#describeMesh(entry.event.sequence);
     fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 });
@@ -157,8 +156,10 @@ export class MeshArchive {
 
   /** The event is live: it is committed. Moves the head and seals any closed day. */
   commit(pending: MeshArchivePending): void {
-    this.#writeHead({ sequence: pending.sequence, id: pending.id, file: pending.file });
+    // PENDING goes first: a stop before the head moves leaves a head that is behind, and the
+    // catch-up skips the event it finds already archived.
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
+    this.#writeHead({ sequence: pending.sequence, id: pending.id, file: pending.file });
     this.#sealClosedDays(pending.file);
   }
 
@@ -168,20 +169,31 @@ export class MeshArchive {
   }
 
   /**
+   * Settles a publish that stopped between its archive append and its commit: cut it back
+   * out. If its event did go live, the store's catch-up archives it again. A pending record
+   * at or below the head was committed already (its removal was lost), so it stays.
+   */
+  recover(): void {
+    const pending = this.pending();
+    if (!pending) return;
+    if ((this.head()?.sequence ?? 0) >= pending.sequence) fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
+    else this.#cutBack(pending);
+  }
+
+  /**
    * Archives events that are already live (appended by a store without the archive). An event
    * already at the end of its file is skipped, so a repeated catch-up adds nothing.
    */
   catchUp(entries: MeshArchiveEntry[]): void {
     if (entries.length === 0) return;
     this.#describeMesh(entries[0]!.event.sequence);
-    const days = this.#days();
+    let floor = this.#headDay();
     const open = new Map<string, { descriptor: number; last: { sequence: number; id: string } | undefined }>();
     let last: ArchiveHead | undefined;
     try {
       for (const { event, line } of entries) {
-        const relative = this.#fileFor(event, days);
-        const day = relative.split("/").slice(0, 3).join("/");
-        if (days.at(-1) !== day) days.push(day);
+        const relative = this.#fileFor(event, floor);
+        floor = relative.split("/").slice(0, 3).join("/");
         let file = open.get(relative);
         if (!file) {
           const absolute = path.join(this.dir, relative);
@@ -246,12 +258,17 @@ export class MeshArchive {
     return found.slice(0, limit);
   }
 
-  // The event's day, but never a day older than the newest one: a clock set back must not
-  // write into a sealed day or out of sequence order.
-  #fileFor(event: MeshEvent, days: string[]): string {
-    const newest = days.at(-1);
-    const day = newest !== undefined && newest > dayOf(event.createdAt) ? newest : dayOf(event.createdAt);
+  // The event's day, but never a day before `floor`, the head's day: every sealed day is
+  // older than the head's, so a clock set back cannot write into one or out of sequence order.
+  // The floor depends only on the head and the events, so a retried catch-up places each event
+  // where the interrupted one did, and finds it there.
+  #fileFor(event: MeshEvent, floor: string | undefined): string {
+    const day = floor !== undefined && floor > dayOf(event.createdAt) ? floor : dayOf(event.createdAt);
     return `${day}/${archiveFileName(event.topic)}`;
+  }
+
+  #headDay(): string | undefined {
+    return this.head()?.file.split("/").slice(0, 3).join("/");
   }
 
   #days(): string[] {

@@ -148,17 +148,48 @@ describe("mesh event archive", () => {
     expect(lines(file(today(), "ops.owner"))).toEqual(live());
   });
 
-  it("keeps a pending event that did go live before the crash", async () => {
+  it.each([
+    ["before the head moved", 1],
+    ["after the head moved, before PENDING was removed (review F5)", 2],
+  ])("keeps an event that went live when the commit stopped %s", async (_label, headSequence) => {
     const { store, dir, file, live, sequences } = setup();
     await store.publish({ topic: "ops.owner", from, text: "one" });
-    const target = file(today(), "ops.owner");
-    const [first] = live();
-    const event = JSON.parse(first!);
-    // The crash came after the live append, before the commit.
-    fs.writeFileSync(path.join(dir, "PENDING.json"), JSON.stringify({ sequence: 1, id: event.id, file: path.relative(dir, target), size: 0 }));
-    fs.writeFileSync(path.join(dir, "HEAD.json"), JSON.stringify({ sequence: 0, id: "", file: path.relative(dir, target) }));
     await store.publish({ topic: "ops.owner", from, text: "two" });
-    expect(sequences(target)).toEqual([1, 2]);
+    const target = file(today(), "ops.owner");
+    const [first, second] = live().map((line) => JSON.parse(line));
+    const relative = path.relative(dir, target).split(path.sep).join("/");
+    const head = headSequence === 1 ? first : second;
+    // The stop: event 2 is archived and live, but its commit did not finish.
+    fs.writeFileSync(path.join(dir, "HEAD.json"), JSON.stringify({ sequence: head.sequence, id: head.id, file: relative }));
+    const sizeBefore = fs.readFileSync(target, "utf8").indexOf('\n') + 1;
+    fs.writeFileSync(path.join(dir, "PENDING.json"), JSON.stringify({ sequence: 2, id: second.id, file: relative, size: sizeBefore }));
+    await store.publish({ topic: "ops.owner", from, text: "three" });
+    expect(sequences(target)).toEqual([1, 2, 3]);
+    expect(live().map((line) => JSON.parse(line).sequence)).toEqual([1, 2, 3]);
+  });
+
+  it("places a retried multi-day catch-up where the interrupted one did (review F6)", async () => {
+    const { store, enable, dir, root } = setup({ archive: false, maxEventLogBytes: 5_000, retainedEventLogBytes: 600 });
+    vi.useFakeTimers({ now: Date.parse("2026-09-27T23:59:58.000Z"), toFake: ["Date"] });
+    await store.publish({ topic: "topic.x", from, text: "1" });
+    await store.publish({ topic: "topic.x", from, text: "2" });
+    vi.setSystemTime(Date.parse("2026-09-28T00:00:01.000Z"));
+    await store.publish({ topic: "topic.y", from, text: "3" });
+    enable();
+    // The interrupted catch-up: its files are written and synced, but it stopped before the head.
+    const entries = fs.readFileSync(path.join(root, "events.jsonl"), "utf8").split("\n").filter(Boolean)
+      .map((line) => ({ event: JSON.parse(line), line }));
+    new MeshArchive(dir, root).catchUp(entries);
+    for (const name of ["HEAD.json", "2026/09/27/SEAL.json"]) fs.rmSync(path.join(dir, name), { force: true });
+
+    for (let index = 4; index <= 8; index++) await store.publish({ topic: "topic.y", from, text: "x".repeat(900) });
+    const ids = ["2026/09/27", "2026/09/28"].flatMap((day) => fs.readdirSync(path.join(dir, day))
+      .filter((name) => name.endsWith(".jsonl"))
+      .flatMap((name) => fs.readFileSync(path.join(dir, day, name), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line).id)));
+    expect(ids).toHaveLength(8);
+    expect(new Set(ids).size).toBe(8);
+    expect(store.oldestSequence()).toBeGreaterThan(1);
+    expect(store.read({ after: 0, limit: 10 }).map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
   });
 
   it("archives events that a store without the archive appended, without duplicates", async () => {

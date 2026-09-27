@@ -507,8 +507,7 @@ export class MeshStore {
   // live, the catch-up below archives it again from the live log. So do events that a store
   // without the archive appended (an older Fabric, or before the archive was set).
   #recoverArchive(archive: MeshArchive): void {
-    const pending = archive.pending();
-    if (pending) archive.rollback(pending);
+    archive.recover();
     const archived = archive.head()?.sequence ?? 0;
     if (archived < this.#readLastEventSequence()) archive.catchUp(this.#liveEntriesAfter(archived));
   }

@@ -10,6 +10,8 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { closeWithActors } from "../src/actors/close-order.js";
+import { FabricControlPlane } from "../src/topology/control-plane.js";
 
 const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
@@ -360,6 +362,45 @@ describe("ActorManager across a session reload", () => {
     await manager.close();
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(queueFiles(root, actor.id).some(({ text }) => text.includes("HANG_WITH_PROGRESS job"))).toBe(true);
+  }, 30_000);
+
+  // review/astra F1 on pi-fabric#93: shutdown awaited the control drain before the actors, so a
+  // remote agents.ask waiting on a progressing turn held the exit and the grace never started.
+  it("ends a remote ask's running turn within the grace when the control drain and the actors close together", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-close-ask-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    agentManagers.push(agents);
+    const owner = { id: "session:owner", name: "main", kind: "main" as const, sessionId: "owner" };
+    const manager = new ActorManager(
+      "owner", owner, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs: 300 },
+    );
+    actorManagers.push(manager);
+    const actor = await manager.create({ name: "slow", instructions: "Work.", responseMode: "text" });
+    const plane = (identity: MeshIdentity) => new FabricControlPlane(new MeshStore(meshRoot, 64 * 1024, 1_000), identity,
+      { enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 30_000 });
+    const control = plane(owner);
+    // The owner's control handler answers a remote ask the way the message router does.
+    control.start(async (command, _from, signal) => {
+      const result = await manager.ask(command.targetId, command.message ?? "", command.data, signal);
+      return { accepted: true, messageId: result.id };
+    });
+    const asker = plane({ id: "session:asker", name: "main", kind: "main", sessionId: "asker" });
+    asker.start(() => ({ accepted: false }));
+    const asked = asker.request("session:owner", actor.id, "ask", { message: "HANG_WITH_PROGRESS job" }).catch(() => undefined);
+    await waitFor(() => manager.status(actor.id).status === "running", 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));   // the worker has reported progress
+
+    const started = Date.now();
+    await closeWithActors(manager, () => control.close());
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await asker.close();
+    await asked;
   }, 30_000);
 
   // review/astra on #45: catch-up must not overflow a 32-item queue silently.

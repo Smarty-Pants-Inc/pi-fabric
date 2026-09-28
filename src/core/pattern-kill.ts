@@ -4,12 +4,14 @@
 // shell (09-27). The rule was in every agent's context and did not stop them, so every bash call
 // that kills by pattern is refused.
 //
-// Refused: `pkill` and `killall` in any form, and `kill` of PIDs that came from a name lookup
-// (`pgrep`, `pidof`, or `ps` piped on): `kill $(pgrep …)`, `kill `pgrep …``, `pgrep … | xargs kill`,
-// `P=$(pgrep …); kill $P`, `pgrep … | while read p; do kill $p; done`, also inside `ssh HOST '…'`,
-// `bash -c '…'`, `eval` and a heredoc fed to a shell or ssh. Allowed: `kill <literal PIDs>`,
-// `kill %job`, `kill -0`, `kill "$PID"` of a PID the session recorded, `bin/smarty-reap`, and
-// `pgrep` alone. Quoted text is data: `echo "never use pkill"` and `grep -n pkill` pass.
+// Refused: `pkill` and `killall` in any form, and a `kill` of PIDs that came from a name lookup
+// (pgrep, pidof, ps, grep, awk): `kill $(pgrep …)`, `kill `pgrep …``, `pgrep … | xargs kill`,
+// `P=$(pgrep …); kill $P`, `for p in $(pgrep …)`, `pgrep … | while read p`, also inside
+// `ssh HOST '…'`, `bash -c '…'`, `eval`, `env -S` and a heredoc fed to a shell or ssh, with the
+// lookups the calling shell expands into them. Allowed: `kill <literal PIDs>`, `kill %job`,
+// `kill -0`, a PID file (`kill $(cat run.pid)`), a variable of unknown origin (`kill $PID` after
+// `PID=$!`), `bin/smarty-reap`, and `pgrep` alone. Quoted text is data: `echo "never use pkill"`,
+// `grep -n pkill` and a quoted-delimiter heredoc pass.
 // ponytail: a small shell reader, not a shell. A kill hidden in a script file, an alias or a
 // variable holding a command passes; revisit if agents route around it.
 
@@ -42,8 +44,7 @@ function readDouble(text: string, index: number, word: { subs: string[]; text?: 
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(text, start, "`", "`") : readBalanced(text, start, "(", ")");
       word.subs.push(text.slice(start, end - 1));
-      // review/astra F1 on #105: keep the substitution, so `bash -c "kill $(pgrep x)"` still shows it.
-      word.text = (word.text ?? "") + text.slice(index, end);
+      word.text = (word.text ?? "") + "$";
       word.dynamic = true;
       index = end;
       continue;
@@ -164,7 +165,7 @@ function tokenize(source: string): Token[] {
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(text, start, "`", "`") : readBalanced(text, start, "(", ")");
       w.subs.push(text.slice(start, end - 1));
-      w.text += text.slice(index, end);
+      w.text += "$";
       w.dynamic = true;
       index = end;
     } else if (c === "\\") {
@@ -196,96 +197,136 @@ const PREFIXES: Record<string, string[]> = {
   "!": [], "{": [], then: [], do: [], else: [], if: [], elif: [], while: [], until: [],
 };
 const KILL_BY_NAME = new Set(["pkill", "killall", "killall5"]);
-// A name lookup returns the PIDs of every owner's matching processes.
-const LOOKUPS = new Set(["pgrep", "pidof"]);
-const SEARCHES = new Set(["grep", "egrep", "awk"]);
+// Commands that pick processes by name: their output is not a PID the session recorded.
+const LOOKUPS = new Set(["pgrep", "pidof", "ps", "grep", "egrep", "awk"]);
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 const SSH_VALUE_OPTIONS = new Set(["-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w", "-B"]);
+// A kill argument that names no process by itself: a literal PID or group, a job, a signal.
+const LITERAL = /^(?:-?\d+|%\S*|--|-[A-Za-z][A-Za-z0-9+-]*|-\d+)$/;
+const VARIABLE = /\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
 
-// `blocked`: a kill by pattern. `lookup`: runs pgrep or pidof. `search`: runs `ps … | grep`.
-type Verdict = { blocked: boolean; lookup: boolean; search: boolean };
+// `blocked`: a kill by pattern. `lookup`: runs a name lookup (LOOKUPS) anywhere.
+type Verdict = { blocked: boolean; lookup: boolean };
 type Command = { words: Word[]; redirects: Word[]; heredocs: Array<{ body: string; quoted: boolean }> };
 
-function scan(script: string, depth: number): Verdict {
-  const verdict: Verdict = { blocked: false, lookup: false, search: false };
+/** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
+function unwrap(stageWords: Word[], scripts: string[]): { words: Word[]; fedByXargs: boolean } {
+  let words = stageWords;
+  let fedByXargs = false;
+  for (;;) {
+    while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) words = words.slice(1);
+    const prefix = words[0]?.text.split("/").pop() ?? "";
+    const options = PREFIXES[prefix];
+    if (!options) return { words, fedByXargs };
+    // `command -v pkill` names the command; it does not run it.
+    if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) return { words: [], fedByXargs };
+    if (prefix === "xargs") fedByXargs = true;
+    words = words.slice(1);
+    while (words[0]?.text.startsWith("-") && words[0].text.length > 1) {
+      const flag = words[0].text;
+      if (flag === "--") { words = words.slice(1); break; }
+      let value: string | undefined;
+      let takes = false;
+      if (flag.startsWith("--")) {
+        const [key, inline] = flag.split(/=(.*)/s);
+        takes = inline === undefined && options.includes(key!);
+        value = inline;
+      } else {
+        // review/astra F4 on #105: read a short cluster from its start. The first letter that takes a
+        // value takes the rest of the word (`-uroot`), or the next word when nothing is left (`-Eu paul`).
+        for (let at = 1; at < flag.length; at++) {
+          if (!options.includes(`-${flag[at]}`)) continue;
+          value = flag.slice(at + 1) || undefined;
+          takes = value === undefined;
+          if (prefix === "env" && flag[at] === "S" && value) scripts.push(value);
+          break;
+        }
+      }
+      if (takes) value = words[1]?.text;
+      if (prefix === "env" && (flag === "-S" || flag.startsWith("--split-string")) && value) scripts.push(value);
+      words = words.slice(takes ? 2 : 1);
+    }
+    if (prefix === "timeout" && words[0]) words = words.slice(1);
+  }
+}
+
+/**
+ * Scans a shell script. `names` holds the variables that hold name-lookup output in the calling
+ * script; `fed` is true when the calling script expanded a lookup into this script's text.
+ */
+function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), fed = false): Verdict {
+  const verdict: Verdict = { blocked: false, lookup: false };
   if (depth > 6) return verdict;
-  // A pgrep/pidof PID list captured or piped earlier in this script: a later `kill` of a
-  // non-literal PID uses it (`P=$(pgrep x); kill $P`, `pgrep x | while read p; do kill $p; done`).
-  // ponytail: `ps` is also how agents check a PID they recorded (`ps -o pgid= -p $PID`), so `ps`
-  // counts only as `ps … | grep` fed straight into the kill (its arguments or the same pipeline).
-  let tainted = false;
+  // Variables whose value comes from a name lookup (`P=$(pgrep …)`, `for p in $(pgrep …)`,
+  // `pgrep … | while read p`). A `kill` of one is a kill by pattern; a variable of unknown origin
+  // may be a PID the session recorded (`PID=$!`) and passes.
+  const tainted = new Set(names);
   let stages: Command[] = [];
   let command: Command = { words: [], redirects: [], heredocs: [] };
 
-  const nested = (text: string): Verdict => {
-    const inner = scan(text, depth + 1);
+  const nested = (text: string, feeds = false): Verdict => {
+    const inner = scan(text, depth + 1, tainted, feeds);
     verdict.blocked ||= inner.blocked;
     verdict.lookup ||= inner.lookup;
     return inner;
   };
+  // review/astra F1/F5 on #105: a script run by bash -c, eval or ssh gets the lookups the calling
+  // shell expands into it (then any non-literal PID there is theirs, even quoted), and the
+  // tainted variables it can read.
+  const feedsLookup = (word: Word): boolean => fed || word.subs.some((sub) => scan(sub, depth + 1).lookup);
 
   const runPipeline = (): void => {
     let pipeFeed = false;
-    let sawPs = false;
     stages.forEach((stage, position) => {
       const piped = position < stages.length - 1;
-      let captured = false;
       // Substitutions in words and redirection targets run; so do those of an unquoted heredoc
       // body, where quotes and `#` are literal (review/astra F2 on #105).
       const subs = [...stage.words, ...stage.redirects].flatMap((word) => word.subs);
       for (const heredoc of stage.heredocs) if (!heredoc.quoted) subs.push(...heredocSubs(heredoc.body));
+      let captured = false;
       for (const sub of subs) captured = nested(sub).lookup || captured;
-      const scripts: string[] = [];
-      let words = stage.words;
-      let fedByXargs = false;
-      for (;;) {
-        while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) words = words.slice(1);
-        const prefix = words[0]?.text.split("/").pop() ?? "";
-        const options = PREFIXES[prefix];
-        if (!options) break;
-        // `command -v pkill` names the command; it does not run it.
-        if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) { words = []; break; }
-        if (prefix === "xargs") fedByXargs = true;
-        words = words.slice(1);
-        while (words[0]?.text.startsWith("-") && words[0].text.length > 1) {
-          const flag = words[0].text;
-          if (flag === "--") { words = words.slice(1); break; }
-          const [key, inline] = flag.split(/=(.*)/s);
-          // A short cluster such as `-Eu paul` takes a value when its last letter does.
-          const takes = inline === undefined && (options.includes(key!) || (!key!.startsWith("--") && options.includes(`-${key!.at(-1)}`)));
-          const value = takes ? words[1]?.text : inline;
-          if (prefix === "env" && (key === "-S" || key === "--split-string") && value) scripts.push(value);
-          words = words.slice(takes ? 2 : 1);
-        }
-        if (prefix === "timeout" && words[0]) words = words.slice(1);
-      }
+      const scripts: Array<{ text: string; feeds: boolean }> = [];
+      const envScripts: string[] = [];
+      const { words, fedByXargs } = unwrap(stage.words, envScripts);
+      for (const text of envScripts) scripts.push({ text, feeds: fed });
       const name = words[0]?.text.split("/").pop() ?? "";
       const args = words.slice(1);
       let lookup = LOOKUPS.has(name);
       if (KILL_BY_NAME.has(name)) verdict.blocked = true;
-      if (name === "kill") {
-        const probe = args.some((arg, i) => arg.text === "-0" || (arg.text === "-s" && args[i + 1]?.text === "0"));
-        const variable = fedByXargs || args.some((arg) => arg.dynamic);
-        const ownFeed = args.some((arg) => arg.subs.some((sub) => { const inner = scan(sub, depth + 1); return inner.lookup || inner.search; }));
-        if (!probe && variable && (tainted || pipeFeed || ownFeed)) verdict.blocked = true;
+      // Assignments and loop variables that take lookup output.
+      for (const word of stage.words) {
+        const assigned = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(word.text);
+        if (assigned && word.subs.some((sub) => scan(sub, depth + 1).lookup)) tainted.add(assigned[1]!);
       }
-      if (SHELLS.has(name) || name === "ssh") scripts.push(...stage.heredocs.map((heredoc) => heredoc.body));
+      if (name === "for" && args[0] && captured) tainted.add(args[0].text);
+      if (name === "read" && (pipeFeed || fed)) for (const arg of args) if (!arg.text.startsWith("-")) tainted.add(arg.text);
+      if (name === "kill") {
+        const probe = args.some((arg, i) => arg.text === "-0" || arg.text === "-l" || (arg.text === "-s" && args[i + 1]?.text === "0"));
+        const byLookup = args.some((arg) => {
+          if (LITERAL.test(arg.text) && !arg.dynamic) return false;
+          // A PID file (`$(cat run.pid)`, `$(< run.pid)`) is a recorded PID; a lookup is not.
+          if (arg.subs.some((sub) => scan(sub, depth + 1).lookup)) return true;
+          if ([...arg.text.matchAll(VARIABLE)].some((match) => tainted.has(match[1]!))) return true;
+          return fed;
+        });
+        if (!probe && (byLookup || (fedByXargs && pipeFeed))) verdict.blocked = true;
+      }
+      if (SHELLS.has(name) || name === "ssh") for (const heredoc of stage.heredocs) scripts.push({ text: heredoc.body, feeds: fed });
       if (SHELLS.has(name)) {
         const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg.text));
-        if (flag >= 0 && args[flag + 1]) scripts.push(args[flag + 1]!.text);
+        const payload = flag >= 0 ? args[flag + 1] : undefined;
+        if (payload) scripts.push({ text: payload.text, feeds: feedsLookup(payload) });
       }
-      if (name === "eval") scripts.push(args.map((arg) => arg.text).join(" "));
+      if (name === "eval") scripts.push({ text: args.map((arg) => arg.text).join(" "), feeds: args.some(feedsLookup) });
       if (name === "ssh") {
         let i = 0;
         while (args[i]?.text.startsWith("-")) i += SSH_VALUE_OPTIONS.has(args[i]!.text) ? 2 : 1;
-        scripts.push(args.slice(i + 1).map((arg) => arg.text).join(" "));
+        const remote = args.slice(i + 1);
+        scripts.push({ text: remote.map((arg) => arg.text).join(" "), feeds: remote.some(feedsLookup) });
       }
-      for (const inner of scripts) lookup = nested(inner).lookup || lookup;
+      for (const inner of scripts) lookup = nested(inner.text, inner.feeds).lookup || lookup;
       if (lookup) verdict.lookup = true;
-      if (name === "ps") sawPs = true;
-      if (sawPs && SEARCHES.has(name)) verdict.search = true;
-      if (captured || (lookup && piped)) tainted = true;
-      if (piped && (lookup || (sawPs && SEARCHES.has(name)))) pipeFeed = true;
+      if (piped && lookup) pipeFeed = true;
     });
     stages = [];
   };

@@ -64,6 +64,8 @@ interface FabricAgentRequest {
   thinking?: FabricThinking;
   tools?: string[];
   timeoutMs?: number;
+  /** Unix niceness 0-19 for the child and its tools; only raises agents.nice. */
+  nice?: number;
   extensions?: boolean;
   recursive?: boolean;
   /** Filesystem execution directory; relative paths resolve from the parent agent cwd. */
@@ -659,6 +661,8 @@ interface FabricActorRequestBase {
   transport?: FabricTransport;
   timeoutMs?: number;
   timeout_ms?: number;
+  /** Unix niceness 0-19 for this actor's runs; only raises agents.nice. */
+  nice?: number;
   extensions?: boolean;
   requires?: Array<string | { ref: string; optional?: boolean }>;
   inferenceContext?: "full-history" | "activation";
@@ -717,6 +721,7 @@ interface FabricActorInfo {
   projectDefaults?: FabricActorRunBinding & { scope: "project" };
   tools?: string[];
   timeoutMs?: number;
+  nice?: number;
   extensions?: boolean;
   requirements?: Array<{ ref: string; optional?: boolean }>;
   capabilityDigest?: string;
@@ -833,6 +838,7 @@ interface FabricAgentsApi {
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  setNice(args: { id: string; nice: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;

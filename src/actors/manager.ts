@@ -40,6 +40,7 @@ import type {
   FabricActorValidWhileSource,
 } from "./types.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
+import { parseAgentNice } from "../agents/priority.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
@@ -107,6 +108,7 @@ interface ManagedActor {
   tools?: string[];
   transport?: FabricAgentTransport;
   timeoutMs?: number;
+  nice?: number;
   extensions?: boolean;
   inferenceContext?: FabricActorInferenceContext;
   requirements: FabricCapabilityRequirement[];
@@ -547,6 +549,7 @@ export class ActorManager {
       ...(request.tools ? { tools: [...new Set(request.tools)] } : {}),
       ...(request.transport ? { transport: request.transport } : {}),
       ...(request.timeoutMs ? { timeoutMs: request.timeoutMs } : {}),
+      ...(request.nice !== undefined ? { nice: parseAgentNice(request.nice) } : {}),
       ...(typeof request.extensions === "boolean" ? { extensions: request.extensions } : {}),
       ...(request.inferenceContext !== undefined ? { inferenceContext: request.inferenceContext } : {}),
       requirements,
@@ -716,6 +719,16 @@ export class ActorManager {
     validateActorInferenceContext(inferenceContext, actor.runner);
     if (inferenceContext === undefined) throw new Error("inferenceContext is required");
     actor.inferenceContext = inferenceContext;
+    actor.updatedAt = Date.now();
+    await this.#publishPresence(actor);
+    return this.#publicInfo(actor);
+  }
+  /** Set future runs' niceness (smarty-dev#1579); it only raises agents.nice, never lowers it. */
+  async setNice(id: string, nice: number): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    const parsed = parseAgentNice(nice);
+    if (parsed === undefined) throw new Error("nice is required");
+    actor.nice = parsed;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -1080,6 +1093,7 @@ export class ActorManager {
       ...(actor.tools ? { tools: [...actor.tools] } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
+      ...(actor.nice !== undefined ? { nice: actor.nice } : {}),
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
@@ -1921,6 +1935,7 @@ export class ActorManager {
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
+      ...(actor.nice !== undefined ? { nice: actor.nice } : {}),
     };
   }
 
@@ -2356,6 +2371,7 @@ export class ActorManager {
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
+      ...(actor.nice !== undefined ? { nice: actor.nice } : {}),
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
@@ -2558,6 +2574,7 @@ export class ActorManager {
           ? { transport: record.transport }
           : {}),
         ...(typeof record.timeoutMs === "number" ? { timeoutMs: record.timeoutMs } : {}),
+        ...(typeof record.nice === "number" && Number.isFinite(record.nice) ? { nice: parseAgentNice(record.nice) } : {}),
         ...(typeof record.extensions === "boolean" ? { extensions: record.extensions } : {}),
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         ...(typeof record.coalesceKey === "string" && COALESCE_KEY_LOAD_PATTERN.test(record.coalesceKey)
@@ -2879,6 +2896,7 @@ export class ActorManager {
       },
       ...(actor.tools ? { tools: [...actor.tools] } : {}),
       timeoutMs: actor.timeoutMs ?? this.agents.config.timeoutMs,
+      ...(actor.nice !== undefined ? { nice: actor.nice } : {}),
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),

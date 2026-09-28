@@ -50,7 +50,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     // The idle wake needs a Pi that queues a triggered message behind a live preflight. This Pi
     // predates that capability, so a test injects it; `optIn: false` leaves it absent.
     const capabilities = globalThis as Record<symbol, unknown>;
-    if (wake && extra.optIn !== false) capabilities[HOST_CAPABILITIES_KEY] = { triggeredMessageQueuesBehindPreflight: true };
+    if (wake && extra.optIn !== false) capabilities[HOST_CAPABILITIES_KEY] = { triggeredMessageQueuesBehindPreflight: true, promptPendingVisible: true };
     else delete capabilities[HOST_CAPABILITIES_KEY];
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify(extra.config ?? {}));
     const meshRoot = path.join(root, "mesh");
@@ -236,37 +236,9 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(inboxMessages()).toHaveLength(2);
   }, 60_000);
 
-  // Review F2: Pi reports idle during a user prompt's preflight (input to agent_start). A wake
-  // there would start a run and the user's prompt would fail before it reaches the agent.
-  it("does not wake during a user prompt's preflight: the prompt runs, and the batch comes once after it", async () => {
-    const gate = globalThis as { inboxGate?: (() => Promise<void>) | undefined };
-    const { session, faux, inboxMessages, missedWork } = await start(1_000, true, {
-      extensions: (root) => {
-        const file = path.join(root, "gate.mjs");
-        fs.writeFileSync(file, "export default function (pi) { pi.on('before_agent_start', async () => { await globalThis.inboxGate?.(); }); }\n");
-        return [file];
-      },
-    });
-    // A later before_agent_start handler waits past the mesh read cache (2 s); the event arrives
-    // meanwhile, older than the grace.
-    gate.inboxGate = async () => { gate.inboxGate = undefined; missedWork("Arrived during your preflight."); await sleep(3_000); };
-    faux.setResponses([fauxAssistantMessage("answered the user"), fauxAssistantMessage("took the inbox")]);
-    try {
-      await session.prompt("the user's prompt");
-    } finally {
-      gate.inboxGate = undefined;
-    }
-    const users = session.messages.filter((message) => message.role === "user");
-    expect(JSON.stringify(users.at(-1))).toContain("the user's prompt");
-    await until(() => inboxMessages().length > 0 && !session.isStreaming);
-    await sleep(500);
-    expect(inboxMessages()).toHaveLength(1);
-    expect(JSON.stringify(inboxMessages()[0])).toContain("Arrived during your preflight.");
-    // No run started inside the preflight: the user's prompt came first, then the inbox.
-    const userAt = session.messages.findIndex((message) => message.role === "user" && JSON.stringify(message).includes("the user's prompt"));
-    expect(userAt).toBeGreaterThan(-1);
-    expect(session.messages.indexOf(inboxMessages()[0]!)).toBeGreaterThan(userAt);
-  }, 60_000);
+  // A prompt's preflight (#107 review F2, #111 review) is the host's to report: the timer waits
+  // while ctx.isPromptPending() is true. That needs a Pi with pi#74, so its regression runs
+  // through the real CLIs (the PR's held-wake driver), not this older Pi.
 
   // Review F3: a fresh Main that announces itself at startup and has not had a turn yet: its inbox
   // starts when it becomes available, so an event sent before the first tick still wakes it.

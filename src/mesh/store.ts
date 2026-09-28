@@ -1134,7 +1134,16 @@ export class MeshStore {
     const deadline = Date.now() + this.#lockTimeoutMs;
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
+    // Attempts and the largest gap between two of them: a large gap means this waiter stalled
+    // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
+    let attempts = 0;
+    let maxGapMs = 0;
+    let lastAttemptAt = Date.now();
     while (true) {
+      const attemptAt = Date.now();
+      if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
+      attempts += 1;
+      lastAttemptAt = attemptAt;
       try {
         fs.mkdirSync(this.#lockPath, { mode: 0o700 });
         fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
@@ -1146,7 +1155,10 @@ export class MeshStore {
         if (errorCode(error) !== "EEXIST") throw error;
         if (this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
-          throw Object.assign(new Error(`Timed out waiting for the Fabric mesh lock${describeLockHolder(ownerPath)}`), {
+          throw Object.assign(new Error(
+            `Timed out waiting for the Fabric mesh lock${describeLockHolder(ownerPath)} ` +
+              `after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms`,
+          ), {
             code: "FABRIC_MESH_LOCK_TIMEOUT",
           });
         }

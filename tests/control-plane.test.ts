@@ -491,6 +491,8 @@ describe("FabricControlPlane", () => {
       { accepted: true, messageId: "m2", pendingFollowUps: -1, oldestAgeS: 2 },
       { accepted: true, messageId: "m3", pendingFollowUps: 1.5, oldestAgeS: "9" },
       { accepted: true, messageId: "m4" },
+      { accepted: true, messageId: "m5", pendingFollowUps: 1, oldestAgeS: 9, coalesced: true, replacedMessageId: "m4" },
+      { accepted: true, messageId: "m6", coalesced: "yes", replacedMessageId: 4 },
     ];
     sender.start(() => ({ accepted: false }));
     receiver.start(() => replies.shift() as never);
@@ -499,6 +501,11 @@ describe("FabricControlPlane", () => {
     for (const messageId of ["m2", "m3", "m4"]) {
       await expect(send()).resolves.toEqual({ queued: true, messageId, routed: "mesh", acknowledged: true });
     }
+    // A coalesced followUp (smarty-dev#1495) says which held one it replaced; a malformed report is dropped.
+    await expect(send()).resolves.toEqual({
+      queued: true, messageId: "m5", routed: "mesh", acknowledged: true, pendingFollowUps: 1, oldestAgeS: 9, coalesced: true, replacedMessageId: "m4",
+    });
+    await expect(send()).resolves.toEqual({ queued: true, messageId: "m6", routed: "mesh", acknowledged: true });
   });
 
   it("returns an authenticated result with the caller's actor binding", async () => {

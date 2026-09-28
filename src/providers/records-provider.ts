@@ -3,10 +3,8 @@ import { RECORD_KINDS } from "../records/kinds.js";
 
 /** The slice of the records service the provider calls; the service is opened at first use. */
 export interface RecordsProviderService {
-  /** The service's lifetime: closing the service cancels its callers' calls too. */
-  readonly signal: AbortSignal;
   principal(): import("../records/store.js").RecordsPrincipal;
-  store: import("../records/store.js").RecordsBackend;
+  readonly backend: import("../records/store.js").RecordsBackend;
   status(): Promise<unknown>;
 }
 
@@ -95,13 +93,13 @@ export class RecordsProvider implements FabricProvider {
     signal?.throwIfAborted();
     if (name === "status") return service.status();
     const principal = service.principal();
-    // Both lifetimes: the caller's, and the service's (close cancels a blocked append).
-    const options = { signal: signal ? AbortSignal.any([signal, service.signal]) : service.signal };
+    // The caller's lifetime; closing the service disconnects its client, which cancels every call on the service.
+    const options = signal ? { signal } : {};
     switch (name) {
-      case "append": return service.store.append(principal, args, options);
-      case "read": return service.store.read(principal, args, options);
-      case "get": return service.store.get(principal, args, options);
-      default: return service.store.list(principal, args, options);
+      case "append": return service.backend.append(principal, args, options);
+      case "read": return service.backend.read(principal, args, options);
+      case "get": return service.backend.get(principal, args, options);
+      default: return service.backend.list(principal, args, options);
     }
   }
 }

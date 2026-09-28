@@ -6,45 +6,73 @@ handoffs are **records**: append-only rows in the org's own PostgreSQL database,
 a new record that `supersedes` the old one. The mesh carries each record live ("commit, then nudge"); PostgreSQL
 holds it.
 
-The layer is off by default. It adds one dependency, the [`pg`](https://node-postgres.com) driver (MIT), which is
-loaded only when a session first uses `records.*` or reconciles its records inbox.
+The layer is off by default. It adds one dependency, the [`pg`](https://node-postgres.com) driver (MIT). Only the
+records service loads it.
+
+## Architecture: the records service (C10)
+
+Database authority lives in one place: the org's **records service**.
+
+- **Its own OS user.** The service runs as `<org>-records`, which owns the org's PostgreSQL cluster. The cluster
+  listens only on a 0700 socket directory. `pg_hba` admits that OS user alone, through peer authentication and the
+  `records` ident map, and rejects everything else, TCP included.
+- **Its own database role.** The service logs in as `records_service`, a member of `fabric_records_writer`. That
+  role has INSERT and SELECT on the tables, and EXECUTE on the SECURITY DEFINER functions that change mutable state:
+  cursors, publication acks, claims. It has no UPDATE, DELETE, TRUNCATE or DDL.
+- **Migration at install only.** Migrations run as the cluster owner (`postgres`), only at install
+  (`service-main.js migrate`).
+- **A socket for the org's agents.** Fabric reaches the service over a unix socket in a setgid 2750 directory that
+  belongs to the agents' group. Every call carries a **per-principal token**, and the service derives the caller's
+  principal from it, never from the payload.
+  - A Main (`session:<uuid>`) or an actor (its 32-hex id) registers its own participant id once. The first claim
+    wins, and a second is refused. The token is kept at 0600 in the agent directory
+    (`<agent dir>/fabric/records-credentials/`).
+  - The operator issues other principals: the importer and the mirror (`service-main.js issue`).
+- **Roles in the service's config.** The `importer` and `mirror` roles are granted in the service's own
+  configuration (`/etc/<org>-records/service.json`), which the org's agents cannot write.
+- **Nudges stay in Fabric.** Fabric keeps the publication relay, because the service cannot write the org's mesh. It
+  also keeps the records inbox and the watchdog's wakes and alarms, and it talks to the service for everything else.
+  A client that disconnects, or cancels a call, cancels that call on the service too.
+
+`scripts/records-paul-steps.sh` installs all of it in one idempotent run with `--dry-run`: the user, the cluster,
+pg_hba and ident, the units, the migration, and credential issuance.
 
 ## Configuration
 
+Fabric (`.pi/fabric.json`) names only the socket:
+
+```json
+{ "records": { "enabled": true, "socket": "/run/smarty-pants-records/records.sock", "alarmTo": "org" } }
+```
+
+`credentialFile` names an operator-issued credential (the importer's or the mirror's); a process with one does not
+register itself. Nothing in a caller's configuration grants a role or reaches the database.
+
+The service (`/etc/<org>-records/service.json`, written by the install script) holds the rest:
+
 ```json
 {
-  "records": {
-    "enabled": true,
-    "org": "smarty-pants",
-    "origin": "dev1",
-    "connection": { "host": "/run/smarty/smarty-pants/pg", "port": 5432, "database": "records", "user": "smarty-pants" },
-    "migrate": true,
-    "mirror": { "enabled": false, "repos": ["Smarty-Pants-Inc/smarty-dev"] },
-    "importers": [],
-    "mirrors": [],
-    "admission": {
-      "targets": [
-        { "name": "m4max", "command": ["wal-g", "--config", "/etc/wal-g/m4max.yaml", "wal-verify", "integrity", "--json"] },
-        { "name": "b2", "command": ["wal-g", "--config", "/etc/wal-g/b2.yaml", "wal-verify", "integrity", "--json"] }
-      ],
-      "alarmSeconds": 120,
-      "refuseSeconds": 300,
-      "refreshMs": 30000
-    },
-    "alarmTo": "org"
-  }
+  "org": "smarty-pants", "origin": "dev1", "socket": "/run/smarty-pants-records/records.sock",
+  "database": { "host": "/run/smarty-pants-records-pg", "port": 5433, "database": "records", "user": "records_service" },
+  "migration": { "host": "/run/smarty-pants-records-pg", "port": 5433, "database": "records", "user": "postgres" },
+  "roles": { "importer": ["importer:github"], "mirror": [] },
+  "mirror": { "enabled": false, "repos": ["Smarty-Pants-Inc/smarty-dev"] },
+  "admission": {
+    "targets": [
+      { "name": "m4max", "command": ["wal-g", "--config", "/etc/wal-g/m4max.yaml", "wal-verify", "integrity", "--json"] },
+      { "name": "b2", "command": ["wal-g", "--config", "/etc/wal-g/b2.yaml", "wal-verify", "integrity", "--json"] }
+    ],
+    "alarmSeconds": 120, "refuseSeconds": 300, "refreshMs": 30000
+  },
+  "statusFile": "/var/lib/smarty-pants-records/status/smarty-pants.status.json"
 }
 ```
 
-- **One database per org** (C13), run by the org's OS user, reached over a 0700 Unix socket directory (`host`). No
-  password belongs in this file; use the socket's peer authentication.
-- `origin` names this Node (default: the host name). Sequences are per origin.
-- `migrate` applies the schema at first use. It needs a role that may create tables and roles (the cluster owner).
+- `origin` names this Node. Sequences are per origin.
 - `mirror.enabled` writes the GitHub mirror's outbox rows. With it off, no rows are written and the record is the
   only copy. A repository outside `mirror.repos` gets rows in state `skipped`.
-- `importers` and `mirrors` list participant ids with those roles (below).
-- `admission.targets` turns on C2 admission; without targets it is off. This PR installs no archiver: standing up
-  WAL-G and each org's cluster is shared infrastructure and a separate, authorized step.
+- `admission.targets` turns on C2 admission; without targets it is off. WAL-G is set up in its own authorized step.
+  Until then, the install's `archive_command` fails, so no WAL is thrown away and `pg_wal` grows.
 
 ## Guest API
 
@@ -156,15 +184,17 @@ good frontier, so the lag grows: the gate fails closed.
 
 | Table | What | Service grants |
 |---|---|---|
-| `records` | the envelope: id, org, origin, seq, ref, kind, author, created_at, text, data, supersedes, key, payload_hash | INSERT, SELECT only; a trigger refuses UPDATE, DELETE and TRUNCATE for every role |
-| `outbox` | dev-lead's #1481 row plus record_id, edit_of, request_key; unique (record_id, owner, repo, target_thread) and (owner, request_key); states pending, posted, refused, skipped, unknown | INSERT, SELECT (the mirror role also UPDATE) |
-| `publication` | the mesh nudge per record | INSERT, SELECT, UPDATE |
+| `records` | the envelope: id, org, origin, seq, ref, kind, author, created_at, text, data, supersedes, key, payload_hash; CHECKs keep ids in data lowercase | INSERT, SELECT only; a trigger refuses UPDATE, DELETE and TRUNCATE for every role |
+| `outbox` | dev-lead's #1481 row plus record_id, edit_of, request_key; unique (record_id, owner, repo, target_thread) and (owner, request_key); states pending, posted, refused, skipped, unknown | INSERT, SELECT (the drainer will update state through the service) |
+| `publication` | the mesh nudge per record | INSERT, SELECT; claim, ack, fail and release by function |
 | `record_bounds` | each record's recovery bound (C2) | INSERT, SELECT |
-| `consumers` | processing cursors | INSERT, SELECT, UPDATE |
-| `archive_checks` | the last archive frontier per target, and who checks it now | INSERT, SELECT, UPDATE |
+| `consumers` | processing cursors | SELECT; open and save by function |
+| `archive_checks` | the last archive frontier per target, and who checks it now | SELECT; claim and record by function |
+| `alarms` | one alarm per key per window | SELECT; claim by function |
+| `principals` | registered and issued principals (token hashes) | INSERT, SELECT |
 
 Views: `current_issue`, `current_statuses`, `open_asks`, `current_links`, `current_decisions`, `mirror_state`,
-`live_records`. Every service transaction runs as `fabric_records_writer` (`SET LOCAL ROLE`).
+`live_records`. The service logs in as `records_service`, and every transaction also runs as `fabric_records_writer` (`SET LOCAL ROLE`).
 
 The outbox row of a status names the author's first status record on the ref in `edit_of`, and a superseding record
 names the root of its `supersedes` chain, so the mirror edits one GitHub object. Each mirrored body ends with
@@ -174,22 +204,22 @@ only the fields it carries (title, labels, body); one that changes nothing the f
 
 ## Trust boundary
 
-The in-process writer is **not** a boundary against a caller that runs as the same OS user. Every agent in an org
-runs as the org's OS user, so it can reach the database directly, set any `author`, or give itself the importer or
-mirror role in its project configuration. Within one org, authorship is **attribution, not authentication**. Across
-orgs, #820's per-org OS user and 0700 socket directory are the boundary.
+- **Closed by the records service (C10).** An ordinary agent, running as the org's OS user, cannot reach
+  PostgreSQL. `pg_hba` rejects it, and the socket directory is the records user's, mode 0700. It cannot run DDL,
+  remove the append-only trigger, give itself the importer or mirror role, or claim another participant's id. The
+  tests show these on a cluster started with the install's own pg_hba and ident.
+- **Not closed: impersonation between same-OS-user agents.** Agents that share the org's OS user can read one
+  another's memory, `/proc/<pid>/environ` and credential files. So a token proves "a process of this org holding
+  X's credential", not "agent X". Stealing a token is a deliberate act, not a configuration edit, and a second
+  registration of an id is refused loudly. Within one org, authorship stays **attribution, not authentication**
+  until agents run as separate OS users (#820).
+- Across orgs, #820's per-org OS users are the boundary.
 
-Records are off by default, and fleet use waits for the C10 records service
-([smarty-dev#1546](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/1546)). That service runs under its own OS
-user, authenticates each caller, and keeps migration authority separate. Do not enable records for real org data
-before it lands.
+## Remote hosts (C10, later)
 
-## The remote endpoint (C10)
-
-`RecordsBackend` (`src/records/store.ts`) is the interface both the local service and the future remote records
-endpoint serve: `append`, `read`, `get` and `list`, each with a `RecordsPrincipal` the server derives from the
-caller. The endpoint (a follow-up) will authenticate a per-principal token issued by the org's mesh and call the
-same backend; a payload never names its principal.
+The socket protocol (`src/records/protocol.ts`) is the endpoint a remote host will use over Tailscale, with the same
+per-principal tokens. `RecordsBackend` and `RecordsOps` are the interfaces both the local client and the service
+serve.
 
 ## Not in this layer
 

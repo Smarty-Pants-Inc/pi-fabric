@@ -6,16 +6,18 @@ describe("records configuration", () => {
   it("is off by default: absent, empty, or anything but enabled: true", () => {
     expect(DEFAULT_FABRIC_CONFIG.records.enabled).toBe(false);
     expect(normalizeFabricConfig({}).records.enabled).toBe(false);
-    for (const input of [undefined, {}, { enabled: "true" }, { enabled: 1 }, { org: "smarty-pants", connection: { host: "/run/pg" } }]) {
+    for (const input of [undefined, {}, { enabled: "true" }, { enabled: 1 }, { socket: "/run/smarty-pants-records/records.sock" }]) {
       expect(normalizeRecordsConfig(input).enabled).toBe(false);
     }
     expect(normalizeRecordsConfig({ enabled: true }).enabled).toBe(true);
   });
 
-  it("keeps admission off without targets and the mirror off unless enabled", () => {
-    const config = normalizeRecordsConfig({ enabled: true, admission: { targets: [{ name: "m4max" }] } });
-    expect(config.admission.targets).toEqual([]);
-    expect(config.mirror.enabled).toBe(false);
-    expect(config.admission).toMatchObject({ alarmSeconds: 120, refuseSeconds: 300 });
+  it("takes no database access or role policy from a caller's configuration (C10)", () => {
+    const config = normalizeRecordsConfig({
+      enabled: true, socket: "/run/org-records/records.sock",
+      connection: { host: "/run/org-records-pg", user: "postgres" }, importers: ["session:me"], mirrors: ["session:me"],
+      roles: { importer: ["session:me"] }, admission: { targets: [{ name: "x", command: ["true"] }] },
+    });
+    expect(Object.keys(config).sort()).toEqual(["consumerLagSeconds", "enabled", "socket", "watchdogMs"]);
   });
 });

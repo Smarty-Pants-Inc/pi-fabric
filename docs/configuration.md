@@ -557,7 +557,10 @@ If `state.json` is empty or unparseable, reads return an empty table and every w
 
 ## Records
 
-`records` (off by default) connects Fabric to the org's own PostgreSQL database for `records.*`: `enabled`, `org`, `origin` (default: the host name), `connection` (`host` is the socket directory; no password in config), `migrate`, `mirror` (`enabled`, `repos`), `importers`, `mirrors`, `admission` (`targets` with each WAL-G `command`, `alarmSeconds` 120, `refuseSeconds` 300, `refreshMs`), `statusFile`, `alarmTo`, `watchdogMs` and `consumerLagSeconds`. It needs the mesh. See [records](records.md).
+`records` (off by default) connects Fabric to the org's records service for `records.*`: `enabled`, `socket` (the
+service's unix socket), `credentialFile` (an operator-issued credential, for the importer or the mirror), `alarmTo`,
+`watchdogMs` and `consumerLagSeconds`. Database access, roles and archive admission are the service's own
+configuration, never a caller's. It needs the mesh. See [records](records.md).
 
 ## Actors
 

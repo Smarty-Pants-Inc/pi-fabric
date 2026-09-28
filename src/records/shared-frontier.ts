@@ -20,12 +20,8 @@ export class SharedFrontierProvider implements ArchiveFrontierProvider {
     // ponytail: the claim window is a little shorter than the interval, so the claimer re-claims on time.
     const windowSeconds = Math.max(1, Math.floor(this.refreshMs * 0.9) / 1000);
     const claimed = await store.transaction(async (client) => {
-      await client.query("INSERT INTO archive_checks (target) VALUES ($1) ON CONFLICT (target) DO NOTHING", [this.name]);
-      const { rowCount } = await client.query(
-        "UPDATE archive_checks SET claimed_at = clock_timestamp() WHERE target = $1 AND (claimed_at IS NULL OR claimed_at <= clock_timestamp() - make_interval(secs => $2))",
-        [this.name, windowSeconds],
-      );
-      return rowCount === 1;
+      const { rows } = await client.query<{ claimed: boolean }>("SELECT archive_claim($1, $2) AS claimed", [this.name, windowSeconds]);
+      return rows[0]!.claimed;
     }, "", signal);
     if (claimed) {
       let frontier: string | undefined;
@@ -46,12 +42,6 @@ export class SharedFrontierProvider implements ArchiveFrontierProvider {
 
   /** A failed check keeps the last good frontier and records why. */
   async #record(frontier: string | undefined, error: string | undefined): Promise<void> {
-    await this.store().transaction(async (client) => {
-      await client.query(
-        `UPDATE archive_checks SET frontier = coalesce($2::pg_lsn, frontier), checked_at = CASE WHEN $2::pg_lsn IS NULL THEN checked_at ELSE clock_timestamp() END,
-          error = $3 WHERE target = $1`,
-        [this.name, frontier ?? null, error?.slice(0, 500) ?? null],
-      );
-    });
+    await this.store().transaction((client) => client.query("SELECT archive_record($1, $2::pg_lsn, $3)", [this.name, frontier ?? null, error ?? null]));
   }
 }

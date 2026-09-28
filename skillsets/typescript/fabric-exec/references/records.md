@@ -1,6 +1,7 @@
 # Records reference
 
-`records` is the org's durable record on its Node (PostgreSQL), when `.pi/fabric.json` enables it. Records are
+`records` is the org's durable record on its Node (PostgreSQL, behind the org's records service), when
+`.pi/fabric.json` enables it. Records are
 append-only; an edit is a new record with `supersedes`. The author is always the calling participant. Full contract:
 the package's `docs/records.md`.
 
@@ -32,9 +33,10 @@ const receipt = await records.append({
 
 ## Trust boundary
 
-The writer runs in your own Fabric process, so it is not a boundary against a caller with the same OS user: within
-one org, authorship is attribution, not authentication. Records are off by default, and fleet use waits for the C10
-records service (smarty-dev#1546).
+`records.*` reaches the org's records service over its socket. The service runs as its own OS user and derives your
+principal from your session's credential. You cannot reach the database or take a role. Agents that share the org's
+OS user could still steal each other's credentials, so within one org authorship is attribution, not
+authentication.
 
 Records addressed to your session (`data.to` is your participant id or session name) arrive by themselves at your
 next turn start, at least once.

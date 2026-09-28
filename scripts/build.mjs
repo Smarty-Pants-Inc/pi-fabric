@@ -23,6 +23,7 @@ const primaryEntryPoints = [
   "src/memory/normalize.ts",
   "src/memory/worker-provider.ts",
   "src/providers/memory-provider.ts",
+  "src/records/service-main.ts",
 ];
 
 // Every package-local dynamic import is also an entry point. Its stable output

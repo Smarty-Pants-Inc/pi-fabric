@@ -8,13 +8,28 @@ import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { recordsInboxSession } from "../src/records/inbox.js";
+import pg from "pg";
+import { migrate } from "../src/records/schema.js";
+import { normalizeServiceConfig, RecordsServer } from "../src/records/server.js";
+import type { ClientPool } from "../src/records/store.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
 
 /** records.* end to end: guest code, type checks, provider, service, real PostgreSQL, mesh. */
 describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
   let server: TestPostgres;
-  beforeAll(async () => { server = await startPostgres(); }, 60_000);
-  afterAll(async () => { await server?.stop(); }, 30_000);
+  let service: RecordsServer;
+  let socket: string;
+  beforeAll(async () => {
+    server = await startPostgres();
+    socket = path.join(server.dir, "records.sock");
+    const pool = new pg.Pool({ ...server.connection, max: 6 });
+    pool.on("error", () => undefined);
+    const client = await pool.connect();
+    try { await migrate(client); } finally { client.release(); }
+    service = await RecordsServer.open(normalizeServiceConfig({ org: "smarty-pants", origin: "test-node", socket, database: server.connection }), { pool: pool as unknown as ClientPool });
+    await service.listen();
+  }, 60_000);
+  afterAll(async () => { await service?.close(); await server?.stop(); }, 30_000);
 
   it("appends from guest code, reads by cursor, retries by key, nudges the mesh and reconciles the inbox", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-records-runtime-"));
@@ -32,13 +47,13 @@ describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
     const context = {
       cwd, hasUI: false, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
       modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn(), getAvailable: () => [] },
-      sessionManager: { getSessionId: () => "records-runtime-session", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined, getEntries: () => entries },
+      sessionManager: { getSessionId: () => "01a0e500-0000-7000-8000-00000000cafe", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined, getEntries: () => entries },
       ui: { setStatus: vi.fn(), notify: vi.fn() },
     } as unknown as ExtensionContext;
     const config = normalizeFabricConfig({
       mcp: { enabled: false, cache: { enabled: false } }, mesh: { enabled: true }, memory: { enabled: false },
       agents: { enabled: false }, jev: { enabled: false },
-      records: { enabled: true, org: "smarty-pants", origin: "test-node", connection: server.connection },
+      records: { enabled: true, socket },
     });
     const fixture = path.join(cwd, "unused.mjs");
     fs.writeFileSync(fixture, "export default {};");
@@ -81,6 +96,8 @@ describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
 
       const probe = await runtime.execution.execute({ code: "return await records.status();", context, signal: undefined, parentToolCallId: "records-status", onPartial() {} });
       expect(probe.value).toMatchObject({ org: "smarty-pants", origin: "test-node", frontier: 2, unpublished: 0, admission: { state: "disabled" } });
+      // The session registered its own participant id; the credential sits in its agent directory.
+      expect(fs.readdirSync(path.join(cwd, "agent", "fabric", "records-credentials"))).toHaveLength(1);
       // The runtime's own ask is not delivered back to it (a consumer skips its own records).
       expect((await runtime.nextRecordsInbox(recordsInboxSession(entries)))?.records).toEqual([]);
     } finally {

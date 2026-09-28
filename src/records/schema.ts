@@ -3,19 +3,21 @@
  * C13). Migrations are applied in order under a transaction-scoped advisory lock and recorded in
  * `records_schema`, so concurrent Fabric processes apply each one once.
  *
- * Grants: the records service works as `fabric_records_writer` (SET LOCAL ROLE in every
- * transaction). That role may INSERT and SELECT `records`, never UPDATE, DELETE or TRUNCATE it;
- * a trigger refuses those for every role, the owner included. `outbox` belongs to the mirror
- * (dev-lead's drainer updates its state), so `fabric_records_mirror` may UPDATE it.
+ * Authority (C10, C13): the migration role (the cluster's `postgres`, used only at install) owns
+ * every object. The records service logs in as `records_service`, a member of
+ * `fabric_records_writer`, and every transaction also runs SET LOCAL ROLE to it. That role has
+ * INSERT and SELECT on the tables, EXECUTE on the SECURITY DEFINER functions that change the
+ * mutable state (cursors, publication acks, claims), and nothing else: no UPDATE, DELETE,
+ * TRUNCATE or DDL. A trigger also refuses UPDATE, DELETE and TRUNCATE of records for every role.
  */
 
 export const WRITER_ROLE = "fabric_records_writer";
-export const MIRROR_ROLE = "fabric_records_mirror";
+/** The service's login role; install creates it, the migration grants it the writer role. */
+export const SERVICE_ROLE = "records_service";
 
 const roles = `
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${WRITER_ROLE}') THEN CREATE ROLE ${WRITER_ROLE} NOLOGIN; END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${MIRROR_ROLE}') THEN CREATE ROLE ${MIRROR_ROLE} NOLOGIN; END IF;
 END $$;`;
 
 const v1 = `
@@ -32,7 +34,10 @@ CREATE TABLE records (
   author_name text,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   text text,
-  data jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(data) = 'object'),
+  data jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(data) = 'object')
+    -- Record ids in data are stored in one (lowercase) form, whoever writes them.
+    CHECK (NOT data ? 'ask' OR data->>'ask' = lower(data->>'ask'))
+    CHECK (NOT data ? 'mirrorOf' OR data->>'mirrorOf' = lower(data->>'mirrorOf')),
   supersedes uuid REFERENCES records(id),
   key text NOT NULL,
   payload_hash text NOT NULL,
@@ -101,7 +106,8 @@ CREATE TABLE publication (
   published_at timestamptz,
   mesh_sequence bigint,
   attempts integer NOT NULL DEFAULT 0,
-  error text
+  error text,
+  claimed_at timestamptz
 );
 CREATE INDEX publication_unpublished ON publication (origin, seq) WHERE published_at IS NULL;
 
@@ -113,8 +119,25 @@ CREATE TABLE consumers (
   names jsonb NOT NULL DEFAULT '[]'::jsonb,
   pending jsonb,
   advanced_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  seen_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  alarmed_at timestamptz
+  seen_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+-- One alarm per key per window across every process (consumer lag, archive lag).
+CREATE TABLE alarms (
+  key text PRIMARY KEY,
+  raised_at timestamptz NOT NULL
+);
+
+-- C10: the service's principals. A session or actor registers its own participant id once
+-- (the first claim wins; a second is refused); ids outside that shape are issued by the
+-- operator. Only a token's hash is stored. Roles (importer, mirror) live in the service's
+-- own configuration, never here and never in a caller's.
+CREATE TABLE principals (
+  id text PRIMARY KEY,
+  name text,
+  token_hash text NOT NULL UNIQUE,
+  issued_by text NOT NULL CHECK (issued_by IN ('register', 'operator')),
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
 -- C2: one process per refresh interval runs each archive check; every process reads the result.
@@ -173,19 +196,85 @@ CREATE VIEW mirror_state AS
   SELECT DISTINCT ON (data->>'mirrorOf') (data->>'mirrorOf')::uuid AS record_id, ref, id, seq, created_at, data
   FROM records WHERE kind = 'mirror' ORDER BY data->>'mirrorOf', seq DESC;
 
-REVOKE ALL ON records, record_bounds, outbox, publication, consumers, archive_checks FROM PUBLIC;
-GRANT SELECT, INSERT ON record_bounds TO ${WRITER_ROLE};
-GRANT SELECT, INSERT, UPDATE ON archive_checks TO ${WRITER_ROLE};
-GRANT SELECT, INSERT ON records TO ${WRITER_ROLE};
-GRANT SELECT, INSERT ON outbox TO ${WRITER_ROLE};
+-- The mutable state changes only through these functions (the writer has EXECUTE, not UPDATE).
+CREATE FUNCTION consumer_open(p_consumer text, p_origin text, p_names jsonb)
+  RETURNS TABLE (after bigint, pending jsonb) LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+  -- A consumer with no cursor starts at the present: the inbox is for what it misses from now on.
+  INSERT INTO consumers (consumer, origin, after, names)
+    SELECT p_consumer, p_origin, coalesce(max(seq), 0), p_names FROM records WHERE origin = p_origin
+    ON CONFLICT (consumer) DO UPDATE SET names = EXCLUDED.names, seen_at = clock_timestamp();
+  SELECT c.after, c.pending FROM consumers c WHERE c.consumer = p_consumer;
+$f$;
+CREATE FUNCTION consumer_save(p_consumer text, p_after bigint, p_pending jsonb)
+  RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+  UPDATE consumers SET after = greatest(after, p_after), pending = p_pending,
+    advanced_at = CASE WHEN p_after > after THEN clock_timestamp() ELSE advanced_at END
+  WHERE consumer = p_consumer;
+$f$;
+CREATE FUNCTION alarm_claim(p_key text, p_at timestamptz, p_before timestamptz)
+  RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+BEGIN
+  INSERT INTO alarms (key, raised_at) VALUES (p_key, p_at)
+    ON CONFLICT (key) DO UPDATE SET raised_at = EXCLUDED.raised_at WHERE alarms.raised_at <= p_before;
+  RETURN FOUND;
+END $f$;
+-- Unpublished nudges for one relay, in seq order; a claim expires, so a relay that died is replaced.
+CREATE FUNCTION publication_claim(p_origin text, p_limit integer, p_lease_seconds double precision)
+  RETURNS TABLE (record_id uuid, seq bigint, topic text, recipient text, kind text, ref text, author text, key text, text text, created_at timestamptz)
+  LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+  WITH claimed AS (
+    UPDATE publication p SET claimed_at = clock_timestamp()
+    WHERE p.record_id IN (
+      SELECT q.record_id FROM publication q
+      WHERE q.published_at IS NULL AND q.origin = p_origin
+        AND (q.claimed_at IS NULL OR q.claimed_at <= clock_timestamp() - make_interval(secs => p_lease_seconds))
+      ORDER BY q.seq LIMIT p_limit FOR UPDATE SKIP LOCKED)
+    RETURNING p.record_id, p.seq, p.topic, p.recipient)
+  SELECT c.record_id, c.seq, c.topic, c.recipient, r.kind, r.ref, r.author, r.key, r.text, r.created_at
+  FROM claimed c JOIN records r ON r.id = c.record_id ORDER BY c.seq;
+$f$;
+CREATE FUNCTION publication_ack(p_record uuid, p_mesh_sequence bigint)
+  RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+  UPDATE publication SET published_at = clock_timestamp(), mesh_sequence = p_mesh_sequence, attempts = attempts + 1, error = NULL, claimed_at = NULL
+  WHERE record_id = p_record AND published_at IS NULL;
+$f$;
+CREATE FUNCTION publication_fail(p_record uuid, p_error text)
+  RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+  UPDATE publication SET attempts = attempts + 1, error = left(p_error, 500), claimed_at = NULL
+  WHERE record_id = p_record AND published_at IS NULL;
+$f$;
+-- A relay that stopped at a failure gives back the rest of its claim at once.
+CREATE FUNCTION publication_release(p_records uuid[])
+  RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+  UPDATE publication SET claimed_at = NULL WHERE record_id = ANY(p_records) AND published_at IS NULL;
+$f$;
+CREATE FUNCTION archive_claim(p_target text, p_window_seconds double precision)
+  RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+BEGIN
+  INSERT INTO archive_checks (target) VALUES (p_target) ON CONFLICT (target) DO NOTHING;
+  UPDATE archive_checks SET claimed_at = clock_timestamp()
+    WHERE target = p_target AND (claimed_at IS NULL OR claimed_at <= clock_timestamp() - make_interval(secs => p_window_seconds));
+  RETURN FOUND;
+END $f$;
+-- A failed check keeps the last good frontier and records why.
+CREATE FUNCTION archive_record(p_target text, p_frontier pg_lsn, p_error text)
+  RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+  UPDATE archive_checks SET frontier = coalesce(p_frontier, frontier),
+    checked_at = CASE WHEN p_frontier IS NULL THEN checked_at ELSE clock_timestamp() END, error = left(p_error, 500)
+  WHERE target = p_target;
+$f$;
+
+REVOKE ALL ON records, record_bounds, outbox, publication, consumers, archive_checks, alarms, principals FROM PUBLIC;
+REVOKE ALL ON FUNCTION consumer_open(text, text, jsonb), consumer_save(text, bigint, jsonb), alarm_claim(text, timestamptz, timestamptz),
+  publication_claim(text, integer, double precision), publication_ack(uuid, bigint), publication_fail(uuid, text), publication_release(uuid[]),
+  archive_claim(text, double precision), archive_record(text, pg_lsn, text), records_append_only() FROM PUBLIC;
+GRANT SELECT, INSERT ON records, record_bounds, outbox, publication, principals TO ${WRITER_ROLE};
+GRANT SELECT ON consumers, archive_checks, alarms TO ${WRITER_ROLE};
 GRANT USAGE ON SEQUENCE outbox_seq_seq TO ${WRITER_ROLE};
-GRANT SELECT, INSERT, UPDATE ON publication TO ${WRITER_ROLE};
-GRANT SELECT, INSERT, UPDATE ON consumers TO ${WRITER_ROLE};
 GRANT SELECT ON live_records, current_issue, current_statuses, open_asks, current_links, current_decisions, mirror_state TO ${WRITER_ROLE};
-GRANT SELECT, INSERT ON records TO ${MIRROR_ROLE};
-GRANT SELECT, INSERT, UPDATE ON outbox TO ${MIRROR_ROLE};
-GRANT USAGE ON SEQUENCE outbox_seq_seq TO ${MIRROR_ROLE};
-GRANT SELECT ON live_records, current_issue, current_statuses, open_asks, current_links, current_decisions, mirror_state TO ${MIRROR_ROLE};
+GRANT EXECUTE ON FUNCTION consumer_open(text, text, jsonb), consumer_save(text, bigint, jsonb), alarm_claim(text, timestamptz, timestamptz),
+  publication_claim(text, integer, double precision), publication_ack(uuid, bigint), publication_fail(uuid, text), publication_release(uuid[]),
+  archive_claim(text, double precision), archive_record(text, pg_lsn, text) TO ${WRITER_ROLE};
 `;
 
 export const MIGRATIONS: readonly string[] = [v1];
@@ -209,6 +298,10 @@ export const migrate = async (client: SqlClient): Promise<number> => {
       await client.query(MIGRATIONS[version - 1]!);
       await client.query("INSERT INTO records_schema (version) VALUES ($1)", [version]);
     }
+    // The service's login role (created by install, never by the service) gets the writer role.
+    await client.query(`DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${SERVICE_ROLE}') THEN GRANT ${WRITER_ROLE} TO ${SERVICE_ROLE}; END IF;
+    END $$`);
     await client.query("COMMIT");
     return MIGRATIONS.length;
   } catch (error) {

@@ -1,4 +1,4 @@
-import type { RecordEnvelope, RecordStore } from "./store.js";
+import type { RecordEnvelope, RecordsOps } from "./store.js";
 
 /**
  * A consumer's reconcile by processing cursor (C4), for a root session: the records addressed to
@@ -15,11 +15,9 @@ const MAX_RECORD_TEXT_BYTES = 8 * 1024;
 export interface RecordsInboxBatch { records: RecordEnvelope[]; through: number }
 export interface RecordsInboxSession { holdsBatch(ids: readonly string[]): boolean }
 
-interface ConsumerRow { after: string; pending: { through: number; ids: string[] } | null }
-
 export class RecordsInbox {
   constructor(
-    readonly store: RecordStore,
+    readonly store: RecordsOps,
     /** The consumer id: this root's authenticated participant id. */
     readonly consumer: string,
     /** The names a sender may address this root by (its id first). */
@@ -31,33 +29,14 @@ export class RecordsInbox {
     return [...new Set([this.consumer, ...this.names()].map((name) => name.trim()).filter(Boolean))];
   }
 
-  async #load(): Promise<ConsumerRow> {
-    return this.store.transaction(async (client) => {
-      // A consumer with no cursor starts at the present: the inbox is for what it misses from now on.
-      await client.query(
-        `INSERT INTO consumers (consumer, origin, after, names)
-         SELECT $1, $2, coalesce(max(seq), 0), $3::jsonb FROM records WHERE origin = $2
-         ON CONFLICT (consumer) DO UPDATE SET names = EXCLUDED.names, seen_at = clock_timestamp()`,
-        [this.consumer, this.store.origin, JSON.stringify(this.#names())],
-      );
-      const { rows } = await client.query<ConsumerRow>("SELECT after, pending FROM consumers WHERE consumer = $1", [this.consumer]);
-      return rows[0]!;
-    }, "", this.options.signal);
-  }
-
-  async #save(after: number, pending: ConsumerRow["pending"]): Promise<void> {
-    await this.store.transaction(async (client) => {
-      await client.query(
-        "UPDATE consumers SET after = greatest(after, $2), pending = $3::jsonb, advanced_at = CASE WHEN $2 > after THEN clock_timestamp() ELSE advanced_at END WHERE consumer = $1",
-        [this.consumer, after, pending ? JSON.stringify(pending) : null],
-      );
-    }, "", this.options.signal);
+  async #save(after: number, pending: { through: number; ids: string[] } | null): Promise<void> {
+    await this.store.saveConsumer(this.consumer, after, pending, this.options.signal);
   }
 
   /** The batch to deliver now; empty when nothing addressed to this root is past its cursor. */
   async next(session: RecordsInboxSession): Promise<RecordsInboxBatch> {
-    const state = await this.#load();
-    let after = Number(state.after);
+    const state = await this.store.openConsumer(this.consumer, this.#names(), this.options.signal);
+    let after = state.after;
     if (state.pending) {
       if (!session.holdsBatch(state.pending.ids)) {
         // Delivered again, however many times, until the session holds it: by its saved ids, so a

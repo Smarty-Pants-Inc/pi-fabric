@@ -44,7 +44,8 @@ export interface TestPostgres {
   stop(): Promise<void>;
 }
 
-export const startPostgres = async (): Promise<TestPostgres> => {
+/** `hba` and `ident` replace the generated files (the records service's install policy). */
+export const startPostgres = async (options: { hba?: string; ident?: string } = {}): Promise<TestPostgres> => {
   if (!postgresBin) throw new Error("no PostgreSQL binaries");
   const { bin, env } = postgresBin;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-records-pg-"));
@@ -53,6 +54,8 @@ export const startPostgres = async (): Promise<TestPostgres> => {
   fs.mkdirSync(socketDir, { mode: 0o700 });
   const init = spawnSync(path.join(bin, "initdb"), ["-D", data, "-U", "postgres", "-A", "trust", "--no-sync", "-E", "UTF8", "--locale=C"], { env, encoding: "utf8" });
   if (init.status !== 0) throw new Error(`initdb failed: ${init.stderr}`);
+  if (options.hba !== undefined) fs.writeFileSync(path.join(data, "pg_hba.conf"), options.hba);
+  if (options.ident !== undefined) fs.writeFileSync(path.join(data, "pg_ident.conf"), options.ident);
   const port = 20_000 + Math.floor(Math.random() * 30_000);
   const server: ChildProcess = spawn(path.join(bin, "postgres"), [
     "-D", data, "-k", socketDir, "-p", String(port), "-c", "listen_addresses=", "-c", "fsync=off", "-c", "max_connections=60", "-c", "track_commit_timestamp=on",

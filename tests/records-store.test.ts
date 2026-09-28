@@ -6,9 +6,6 @@ import { PublicationRelay, type NudgePublisher } from "../src/records/relay.js";
 import { migrate, WRITER_ROLE } from "../src/records/schema.js";
 import { RecordKeyConflictError, RecordStore, type ClientPool, type RecordsPrincipal, type RecordStoreOptions } from "../src/records/store.js";
 import { RecordsWatchdog } from "../src/records/watchdog.js";
-import { RecordsService } from "../src/records/service.js";
-import { normalizeRecordsConfig } from "../src/records/config.js";
-import { RecordsProvider } from "../src/providers/records-provider.js";
 import { bigIntToLsn, lsnToBigInt, WalGFrontierProvider } from "../src/records/admission.js";
 import { SharedFrontierProvider } from "../src/records/shared-frontier.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
@@ -294,43 +291,6 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
     // Counterexample: with no cancel, the same pool and store commit.
     const live = new RecordStore(pool as unknown as ClientPool, { org: "smarty-pants", origin: "dev1" });
     expect((await live.append(alice, { ref: REF, kind: "status", key: "handoff", text: "must not land" })).sequence).toBe(1);
-  });
-
-  it("closing the service cancels a foreground append blocked on the org lock", async () => {
-    const { pool } = await freshDatabase();
-    const config = normalizeRecordsConfig({ enabled: true, org: "smarty-pants", origin: "dev1" });
-    const service = await RecordsService.open({ config, meshRoot: server.dir, publisher: recorder(), identity: { id: "session:alice" }, pool: pool as unknown as ClientPool });
-    const provider = new RecordsProvider(async () => service);
-    const blocker = new pg.Client({ ...server.connection, database: (pool as unknown as { options: { database: string } }).options.database });
-    await blocker.connect();
-    await blocker.query("BEGIN");
-    await blocker.query("SELECT pg_advisory_xact_lock(hashtextextended('fabric-records:smarty-pants', 0))");
-    const caller = new AbortController(); // the caller stays alive: only the service closes
-    const context = { signal: caller.signal } as never;
-    const blocked = provider.invoke("append", { ref: REF, kind: "status", key: "during-close", text: "must not land" }, context);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    await service.close(3_000);
-    await expect(blocked).rejects.toThrow(/records service closed/);
-    await blocker.query("COMMIT");
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    expect((await blocker.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
-    await blocker.end();
-  });
-
-  it("closes promptly while an archive check is running, and stops the checker", async () => {
-    const { pool } = await freshDatabase();
-    const config = normalizeRecordsConfig({
-      enabled: true, org: "smarty-pants", origin: "dev1",
-      admission: { targets: [{ name: "stuck", command: [process.execPath, "-e", "setTimeout(() => {}, 60000)"] }] },
-    });
-    const service = await RecordsService.open({ config, meshRoot: server.dir, publisher: recorder(), identity: { id: "session:alice" }, pool: pool as unknown as ClientPool });
-    const tick = service.watchdog.tick().catch((error: unknown) => error);
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const started = Date.now();
-    await service.close(3_000);
-    expect(Date.now() - started).toBeLessThan(2_000);
-    expect(await tick).toBeDefined();
-    expect((pool as unknown as { ending: boolean }).ending).toBe(true);
   });
 
   it("PATCHes only the issue fields an update carries; creation sends the whole issue", async () => {

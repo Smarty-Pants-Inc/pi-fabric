@@ -970,8 +970,8 @@ export class FabricRuntimeState {
       this.#openRecords = () => {
         this.#records ??= import("./records/service.js").then(({ RecordsService }) => RecordsService.open({
           config: recordsConfig,
-          meshRoot: mesh.root,
           identity: { id: recordsIdentity.id, name: recordsIdentity.name },
+          credentialDir: path.join(resolveAgentDir(), "fabric", "records-credentials"),
           publisher: { publish: (input) => mesh.publish({ ...input, from: recordsIdentity }) },
           ...(root ? {
             names: recordsNames,

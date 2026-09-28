@@ -99,6 +99,36 @@ export interface RecordsCallOptions { signal?: AbortSignal }
  */
 const AUTHOR_OWNED_SUPERSEDE = new Set<RecordKind>(["status", "comment", "decision", "ask", "answer", "handoff", "link", "close", "reopen", "mirror"]);
 
+export interface ConsumerState { after: number; pending: { through: number; ids: string[] } | null }
+export interface ClaimedPublication {
+  recordId: string; sequence: number; topic: string; recipient: string | null; kind: string; ref: string; from: string; key: string; text: string | null; createdAt: number;
+}
+export interface ConsumerLag { consumer: string; after: number; oldestAt: number; count: number }
+export interface PageArgs { after: number; limit: number; origin: string; ref?: string; kind?: RecordKind; to?: readonly string[]; exceptAuthor?: string }
+
+/**
+ * What the inbox, the relay and the watchdog need, whoever serves it: the store in process
+ * (tests, and the records service itself) or the records service over its socket (Fabric).
+ */
+export interface RecordsOps {
+  readonly org: string;
+  readonly origin: string;
+  page(args: PageArgs, signal?: AbortSignal): Promise<RecordsPage>;
+  byIds(ids: readonly string[], signal?: AbortSignal): Promise<RecordEnvelope[]>;
+  openConsumer(consumer: string, names: readonly string[], signal?: AbortSignal): Promise<ConsumerState>;
+  saveConsumer(consumer: string, after: number, pending: ConsumerState["pending"], signal?: AbortSignal): Promise<void>;
+  claimPublications(limit: number, signal?: AbortSignal): Promise<ClaimedPublication[]>;
+  ackPublication(recordId: string, meshSequence: number, signal?: AbortSignal): Promise<void>;
+  failPublication(recordId: string, error: string, signal?: AbortSignal): Promise<void>;
+  releasePublications(recordIds: readonly string[], signal?: AbortSignal): Promise<void>;
+  unpublished(signal?: AbortSignal): Promise<number>;
+  lagging(lagMs: number, now: number, signal?: AbortSignal): Promise<ConsumerLag[]>;
+  claimAlarm(key: string, now: number, realarmMs: number, signal?: AbortSignal): Promise<boolean>;
+}
+
+/** How long a relay's claim on unpublished nudges lasts before another relay may take them. */
+const PUBLICATION_LEASE_SECONDS = 30;
+
 export class RecordKeyConflictError extends Error {
   readonly code = "RECORD_KEY_CONFLICT";
   readonly retryable = false;
@@ -182,7 +212,7 @@ const optionalString = (name: string, value: unknown): string | undefined => {
   return value;
 };
 
-export class RecordStore implements RecordsBackend {
+export class RecordStore implements RecordsBackend, RecordsOps {
   readonly org: string;
   readonly origin: string;
   readonly #role: string;
@@ -441,7 +471,7 @@ export class RecordStore implements RecordsBackend {
    * Records after a cursor, up to the committed frontier, from one snapshot. Commit order is seq
    * order (the append lock), so no record below the frontier can still appear later.
    */
-  async page(args: { after: number; limit: number; origin: string; ref?: string; kind?: RecordKind; to?: readonly string[]; exceptAuthor?: string }, signal?: AbortSignal): Promise<RecordsPage> {
+  async page(args: PageArgs, signal?: AbortSignal): Promise<RecordsPage> {
     return this.transaction(async (client) => {
       const frontier = await client.query<{ seq: string }>("SELECT coalesce(max(seq), 0) AS seq FROM records WHERE origin = $1", [args.origin]);
       const values: unknown[] = [args.origin, args.after, args.limit];
@@ -457,6 +487,73 @@ export class RecordStore implements RecordsBackend {
       const next = records.length === args.limit ? records.at(-1)!.sequence : Math.max(args.after, top);
       return { records, next, frontier: top, origin: args.origin };
     }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", signal);
+  }
+
+  async openConsumer(consumer: string, names: readonly string[], signal?: AbortSignal): Promise<ConsumerState> {
+    return this.transaction(async (client) => {
+      const { rows } = await client.query<{ after: string; pending: ConsumerState["pending"] }>(
+        "SELECT after, pending FROM consumer_open($1, $2, $3::jsonb)", [consumer, this.origin, JSON.stringify(names)]);
+      return { after: Number(rows[0]!.after), pending: rows[0]!.pending };
+    }, "", signal);
+  }
+
+  async saveConsumer(consumer: string, after: number, pending: ConsumerState["pending"], signal?: AbortSignal): Promise<void> {
+    await this.transaction((client) => client.query("SELECT consumer_save($1, $2, $3::jsonb)", [consumer, after, pending ? JSON.stringify(pending) : null]), "", signal);
+  }
+
+  async claimPublications(limit: number, signal?: AbortSignal): Promise<ClaimedPublication[]> {
+    return this.transaction(async (client) => {
+      const { rows } = await client.query<{ record_id: string; seq: string; topic: string; recipient: string | null; kind: string; ref: string; author: string; key: string; text: string | null; created_at: Date }>(
+        "SELECT * FROM publication_claim($1, $2, $3)", [this.origin, limit, PUBLICATION_LEASE_SECONDS]);
+      return rows.map((row) => ({
+        recordId: row.record_id, sequence: Number(row.seq), topic: row.topic, recipient: row.recipient, kind: row.kind, ref: row.ref,
+        from: row.author, key: row.key, text: row.text, createdAt: row.created_at.getTime(),
+      }));
+    }, "", signal);
+  }
+
+  async ackPublication(recordId: string, meshSequence: number, signal?: AbortSignal): Promise<void> {
+    await this.transaction((client) => client.query("SELECT publication_ack($1, $2)", [recordId, meshSequence]), "", signal);
+  }
+
+  async failPublication(recordId: string, error: string, signal?: AbortSignal): Promise<void> {
+    await this.transaction((client) => client.query("SELECT publication_fail($1, $2)", [recordId, error]), "", signal);
+  }
+
+  async releasePublications(recordIds: readonly string[], signal?: AbortSignal): Promise<void> {
+    if (recordIds.length === 0) return;
+    await this.transaction((client) => client.query("SELECT publication_release($1::uuid[])", [[...recordIds]]), "", signal);
+  }
+
+  async unpublished(signal?: AbortSignal): Promise<number> {
+    return this.transaction(async (client) => {
+      const { rows } = await client.query<{ n: string }>("SELECT count(*) AS n FROM publication WHERE published_at IS NULL AND origin = $1", [this.origin]);
+      return Number(rows[0]!.n);
+    }, "", signal);
+  }
+
+  /** Consumers with an addressed record past their cursor older than the lag bound (C4). */
+  async lagging(lagMs: number, now: number, signal?: AbortSignal): Promise<ConsumerLag[]> {
+    return this.transaction(async (client) => {
+      const { rows } = await client.query<{ consumer: string; after: string; oldest: Date; n: string }>(
+        `SELECT c.consumer, c.after, min(r.created_at) AS oldest, count(*) AS n
+         FROM consumers c JOIN records r ON r.origin = c.origin AND r.seq > c.after AND r.author <> c.consumer
+           AND r.data->>'to' IN (SELECT jsonb_array_elements_text(c.names))
+         WHERE c.origin = $1
+         GROUP BY c.consumer, c.after
+         HAVING min(r.created_at) <= to_timestamp($2)`,
+        [this.origin, (now - lagMs) / 1000],
+      );
+      return rows.map((row) => ({ consumer: row.consumer, after: Number(row.after), oldestAt: row.oldest.getTime(), count: Number(row.n) }));
+    }, "", signal);
+  }
+
+  /** One alarm per key per window across every process. */
+  async claimAlarm(key: string, now: number, realarmMs: number, signal?: AbortSignal): Promise<boolean> {
+    return this.transaction(async (client) => {
+      const { rows } = await client.query<{ claimed: boolean }>("SELECT alarm_claim($1, to_timestamp($2), to_timestamp($3)) AS claimed", [key, now / 1000, (now - realarmMs) / 1000]);
+      return rows[0]!.claimed;
+    }, "", signal);
   }
 
   /** Records by id, in seq order (a pending inbox batch's replay). */

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 
@@ -99,6 +101,20 @@ export const resolveFabricIdentity = (
 const escapeXmlText = (value: string): string =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
+// Attribute values are quoted and escaped, so an identity field cannot close the header or
+// forge a second envelope (dev-lead review of pi-fabric#102).
+const escapeXmlAttribute = (value: string): string =>
+  escapeXmlText(value).replaceAll('"', "&quot;").replaceAll("'", "&apos;");
+
+/** Admission and batch bounds for followUps Fabric holds for a busy Main. */
+export const FOLLOW_UP_LIMITS = {
+  senderItems: 50,
+  senderBytes: 256 * 1024,
+  totalItems: 200,
+  totalBytes: 1024 * 1024,
+  batchBytes: 64 * 1024,
+} as const;
+
 const serializableData = (value: unknown): unknown => {
   try {
     const serialized = JSON.stringify(value);
@@ -116,9 +132,31 @@ interface HeldAgentMessage {
   data?: unknown;
 }
 
+const itemBytes = (item: HeldAgentMessage): number =>
+  Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data)));
+
+/** The ids of the agent messages a session's recent entries hold (delivered, not only queued). */
+const deliveredIds = (context: ExtensionContext | undefined, lookback = 1_000): Set<string> => {
+  const ids = new Set<string>();
+  let entries: readonly unknown[] = [];
+  try { entries = context?.sessionManager?.getEntries?.() ?? []; } catch { return ids; }
+  for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
+    const entry = entries[index] as { type?: string; customType?: string; details?: { id?: unknown; items?: unknown } } | undefined;
+    if (entry?.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") continue;
+    if (typeof entry.details?.id === "string") ids.add(entry.details.id);
+    if (Array.isArray(entry.details?.items)) {
+      for (const item of entry.details.items as Array<{ id?: unknown }>) if (typeof item?.id === "string") ids.add(item.id);
+    }
+  }
+  return ids;
+};
+
 export class MainAgentController implements FabricMainAgentTarget {
   readonly startedAt = Date.now();
   readonly #held: HeldAgentMessage[] = [];
+  // Handed to Pi, not yet in the session's entries. Kept in the journal until they are.
+  readonly #sent: HeldAgentMessage[] = [];
+  #journal: string | undefined;
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext | undefined;
   #flushMs = 0;
@@ -204,23 +242,111 @@ export class MainAgentController implements FabricMainAgentTarget {
     // followUp for a busy Main instead: turn_end flushes the due ones as one steer, and
     // agent_settled releases the rest as a followUp. A non-triggering one never waited.
     if (request.delivery === "followUp" && triggerTurn && this.#drainActive()) {
+      this.#admit(item);
       this.#held.push(item);
+      try {
+        this.#save();                                   // journalled before it is acknowledged
+      } catch (error) {
+        this.#held.pop();
+        throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
+      }
       if (this.#context!.isIdle()) this.#release(true);
     } else {
       this.#send([item], request.delivery, triggerTurn, false);
     }
-    return { queued: true, messageId: item.id, routed: "main", ...this.queueDepth() };
+    return { queued: true, messageId: item.id, routed: "main", ...this.queueDepth(item.from.id) };
   }
 
-  /** The followUps Fabric still holds for this Main, and the age of the oldest. */
-  queueDepth(): FabricFollowUpQueueDepth {
+  /**
+   * The followUps Fabric still holds for this Main, and the age of the oldest: the given
+   * sender's own, or all of them.
+   */
+  queueDepth(fromId?: string): FabricFollowUpQueueDepth {
     // ponytail: counts only what Fabric holds. With the drain off, followUps sit in Pi's own
     // queue, which exposes no depth to extensions, and this reports 0.
-    const oldest = this.#held[0];
+    const mine = fromId === undefined ? this.#held : this.#held.filter((item) => item.from.id === fromId);
+    const oldest = mine[0];
     return {
-      pendingFollowUps: this.#held.length,
+      pendingFollowUps: mine.length,
       oldestAgeS: oldest ? Math.max(0, Math.floor((Date.now() - oldest.sentAt) / 1000)) : 0,
     };
+  }
+
+  #admit(item: HeldAgentMessage): void {
+    const limits = FOLLOW_UP_LIMITS;
+    const bytes = itemBytes(item);
+    const mine = this.#held.filter((held) => held.from.id === item.from.id);
+    const mineBytes = mine.reduce((sum, held) => sum + itemBytes(held), 0);
+    const totalBytes = this.#held.reduce((sum, held) => sum + itemBytes(held), 0);
+    const full = (what: string) => new Error(
+      `Main's followUp queue is full (${what}); Main is busy and reads followUps only at its next tool boundary. ` +
+        "Wait, or send a short steer.",
+    );
+    if (mine.length + 1 > limits.senderItems || mineBytes + bytes > limits.senderBytes) {
+      throw full(`${mine.length} of yours, ${mineBytes} bytes; limit ${limits.senderItems} or ${limits.senderBytes} bytes per sender`);
+    }
+    if (this.#held.length + 1 > limits.totalItems || totalBytes + bytes > limits.totalBytes) {
+      throw full(`${this.#held.length} held, ${totalBytes} bytes; limit ${limits.totalItems} or ${limits.totalBytes} bytes in total`);
+    }
+  }
+
+  /** Write the held and unconfirmed followUps (0600), or remove the journal when none are left. */
+  #save(): void {
+    if (!this.#journal) return;
+    const items = [...this.#sent, ...this.#held];
+    if (!items.length) { fs.rmSync(this.#journal, { force: true }); return; }
+    fs.mkdirSync(path.dirname(this.#journal), { recursive: true, mode: 0o700 });
+    const temporary = `${this.#journal}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify({ version: 1, items }), { mode: 0o600 });
+    fs.renameSync(temporary, this.#journal);
+  }
+
+  #trySave(): void {
+    try { this.#save(); } catch {
+      // The previous journal still lists every item; the next change writes it again.
+    }
+  }
+
+  /** Drain off: once Pi's queue has them, the journal is not needed. */
+  #confirmSent(): void {
+    if (this.#held.length) return;                       // a failed send: keep the journal
+    this.#sent.splice(0);
+    this.#trySave();
+  }
+
+  /** Drop the handed-over followUps the session now holds. */
+  #confirm(): void {
+    if (!this.#sent.length) return;
+    const delivered = deliveredIds(this.#context);
+    const before = this.#sent.length;
+    for (let index = this.#sent.length - 1; index >= 0; index--) {
+      if (delivered.has(this.#sent[index]!.id)) this.#sent.splice(index, 1);
+    }
+    if (this.#sent.length !== before) this.#trySave();
+  }
+
+  /** After a restart: every journalled followUp the session does not hold goes back in the queue. */
+  #replay(): void {
+    if (!this.#journal) return;
+    let items: HeldAgentMessage[] = [];
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.#journal, "utf8")) as { items?: unknown };
+      if (Array.isArray(parsed.items)) {
+        items = (parsed.items as HeldAgentMessage[]).filter((item) =>
+          typeof item?.id === "string" && typeof item.message === "string" && typeof item.sentAt === "number" &&
+          typeof item.from?.id === "string" && typeof item.from?.name === "string" && typeof item.from?.kind === "string");
+      }
+    } catch {
+      return;                                            // no journal
+    }
+    const delivered = deliveredIds(this.#context, Number.MAX_SAFE_INTEGER);
+    const seen = new Set<string>();
+    for (const item of items.sort((a, b) => a.sentAt - b.sentAt)) {
+      if (delivered.has(item.id) || seen.has(item.id)) continue;
+      seen.add(item.id);
+      this.#held.push(item);
+    }
+    this.#trySave();
   }
 
   /**
@@ -228,12 +354,23 @@ export class MainAgentController implements FabricMainAgentTarget {
    * flushMs at the next boundary between tool calls (turn_end, the hook the shell and
    * completion inboxes use). flushMs 0 keeps Pi's followUp queue, as before.
    */
-  attachFollowUpDrain(context: ExtensionContext, flushMs: number): void {
+  attachFollowUpDrain(context: ExtensionContext, flushMs: number, journal?: string): void {
     this.closeFollowUpDrain();
-    if (!this.local || !(flushMs > 0) || typeof this.pi.on !== "function") return;
+    if (!this.local) return;
     this.#context = context;
-    this.#flushMs = flushMs;
     this.#closed = false;
+    this.#journal = journal;
+    if (!(flushMs > 0) || typeof this.pi.on !== "function") {
+      // Drain off: what an earlier drain journalled goes to Pi's own queue once.
+      this.#replay();
+      this.#release(true);
+      this.#confirmSent();
+      this.#journal = undefined;
+      this.#context = undefined;
+      this.#closed = true;
+      return;
+    }
+    this.#flushMs = flushMs;
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);
       if (typeof off === "function") this.#unsubscribe.push(off as () => void);
@@ -244,6 +381,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#suspended = true;
         return;
       }
+      this.#confirm();
       this.#flushDue();
     });
     // Main is about to go idle. Hand the held followUps to Pi's followUp queue here, the last
@@ -259,6 +397,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     // a Pi that reports no outcome cannot rule one out, so they are appended for the next run.
     on("agent_settled", (event: { outcome?: string }, ctx) => {
       this.#context = ctx;
+      this.#confirm();
       const completed = !this.#suspended && event.outcome === "completed";
       this.#suspended = false;
       this.#release(completed);
@@ -290,20 +429,23 @@ export class MainAgentController implements FabricMainAgentTarget {
     });
     on("agent_start", (_event, ctx) => { this.#context = ctx; this.#suspended = false; this.#stopWake(); });
     on("input", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
+    this.#replay();
+    if (this.#held.length && context.isIdle()) this.#release(true);
   }
 
   /** Stop holding; any held followUps go to Pi's own followUp queue, as before the drain. */
   closeFollowUpDrain(): void {
     this.#stopWake();
     for (const off of this.#unsubscribe.splice(0)) off();
-    const held = this.#held.splice(0);
     this.#closed = true;
+    // With a journal, a reload or the next start replays them; handing them to Pi here as
+    // well would deliver them twice. Without one, Pi's own queue takes them, as before.
+    if (this.#journal) this.#trySave();
+    else this.#release(true);
+    this.#held.splice(0);
+    this.#sent.splice(0);
+    this.#journal = undefined;
     this.#context = undefined;
-    for (const item of held) {
-      try { this.#send([item], "followUp", true, false); } catch {
-        // A session that is shutting down has no queue left to take it.
-      }
-    }
   }
 
   #drainActive(): boolean {
@@ -315,10 +457,30 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!this.#held.length || this.#suspended) return;
     const now = Date.now();
     let due = 0;
-    while (due < this.#held.length && now - this.#held[due]!.sentAt >= this.#flushMs) due++;
+    let bytes = 0;
+    while (due < this.#held.length && now - this.#held[due]!.sentAt >= this.#flushMs) {
+      bytes += itemBytes(this.#held[due]!);
+      // A byte-bounded FIFO prefix per boundary; the rest waits for the next one.
+      if (due > 0 && bytes > FOLLOW_UP_LIMITS.batchBytes) break;
+      due++;
+    }
     if (!due) return;
     // One message, queued behind any steer already in Pi's queue: it never overtakes one.
-    this.#send(this.#held.splice(0, due), "steer", true, true);
+    this.#handOver(due, "steer", true, true);
+  }
+
+  /** Send the first count held items as one message; they leave the queue only once it is sent. */
+  #handOver(count: number, deliverAs: FabricAgentMessageDelivery, triggerTurn: boolean, flushed: boolean): boolean {
+    const batch = this.#held.slice(0, count);
+    try {
+      this.#send(batch, deliverAs, triggerTurn, flushed);
+    } catch {
+      return false;                                      // kept; the next boundary or release retries
+    }
+    this.#held.splice(0, count);
+    this.#sent.push(...batch);
+    this.#trySave();
+    return true;
   }
 
   #wakeWhenIdle(): void {
@@ -346,8 +508,17 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   #release(triggerTurn: boolean): void {
     this.#stopWake();
-    if (!this.#held.length) return;
-    this.#send(this.#held.splice(0), "followUp", triggerTurn, false);
+    // In byte-bounded messages, oldest first; a failed send keeps the rest for a retry.
+    while (this.#held.length) {
+      let count = 0;
+      let bytes = 0;
+      while (count < this.#held.length) {
+        bytes += itemBytes(this.#held[count]!);
+        if (count > 0 && bytes > FOLLOW_UP_LIMITS.batchBytes) break;
+        count++;
+      }
+      if (!this.#handOver(count, "followUp", triggerTurn, false)) return;
+    }
   }
 
   #send(
@@ -359,7 +530,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.
     const delivery: FabricAgentMessageDelivery = flushed ? "followUp" : deliverAs;
     const blocks = items.map((item) => [
-      `<fabric-agent-message from_name=${JSON.stringify(item.from.name)} from_id=${JSON.stringify(item.from.id)} from_kind=${JSON.stringify(item.from.kind)} delivery="${delivery}" sent_at="${new Date(item.sentAt).toISOString()}">`,
+      `<fabric-agent-message from_name="${escapeXmlAttribute(item.from.name)}" from_id="${escapeXmlAttribute(item.from.id)}" from_kind="${escapeXmlAttribute(item.from.kind)}" delivery="${escapeXmlAttribute(delivery)}" sent_at="${escapeXmlAttribute(new Date(item.sentAt).toISOString())}">`,
       escapeXmlText(item.message),
       item.data === undefined ? undefined : `<data>${escapeXmlText(JSON.stringify(item.data))}</data>`,
       "</fabric-agent-message>",

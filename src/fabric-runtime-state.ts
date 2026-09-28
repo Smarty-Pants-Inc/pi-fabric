@@ -523,7 +523,6 @@ export class FabricRuntimeState {
       identity.kind === "main" ? sessionId : undefined,
     );
     this.#mainAgent = mainAgent;
-    mainAgent.attachFollowUpDrain(context, followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0);
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
     const configuredMeshRoot = this.#config.mesh.root;
     const meshRoot =
@@ -531,6 +530,12 @@ export class FabricRuntimeState {
       (configuredMeshRoot
         ? path.resolve(projectRoot, configuredMeshRoot)
         : path.join(projectRoot, ".pi", "fabric", "mesh"));
+    // Held followUps are journalled per session under the mesh root until the session holds them.
+    mainAgent.attachFollowUpDrain(
+      context,
+      followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0,
+      path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`),
+    );
     this.#mesh = new MeshStore(
       meshRoot,
       this.#config.mesh.maxEventBytes,

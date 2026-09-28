@@ -268,7 +268,9 @@ export class AgentMessageRouter {
       }
     }
     if (this.mainAgent.local && this.mainAgent.matches(command.targetId)) {
-      const result = this.mainAgent.deliverAgent({
+      let result: FabricAgentMessageResult;
+      try {
+        result = this.mainAgent.deliverAgent({
         from,
         message,
         delivery: command.operation,
@@ -276,7 +278,11 @@ export class AgentMessageRouter {
           ? { triggerTurn: command.triggerTurn }
           : {}),
         ...(command.data === undefined ? {} : { data: command.data }),
-      });
+        });
+      } catch (error) {
+        // A full followUp queue, for example: the sender sees why.
+        return { accepted: false, error: error instanceof Error ? error.message : String(error) };
+      }
       return {
         accepted: true,
         messageId: result.messageId,

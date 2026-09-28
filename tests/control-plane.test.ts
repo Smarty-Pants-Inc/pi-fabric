@@ -478,6 +478,29 @@ describe("FabricControlPlane", () => {
     expect(observe).not.toHaveBeenCalled();
   });
 
+  // smarty-dev#1495: a followUp through the owner reports the target Main's queue, so the
+  // sender can switch to steer; a malformed count from the owner is dropped, not passed on.
+  it("passes the owner's followUp queue depth to the sender, and drops a malformed one", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const sender = plane(meshRoot, "host:sender");
+    const receiver = plane(meshRoot, "host:receiver");
+    const replies = [
+      { accepted: true, messageId: "m1", pendingFollowUps: 3, oldestAgeS: 140 },
+      { accepted: true, messageId: "m2", pendingFollowUps: -1, oldestAgeS: 2 },
+      { accepted: true, messageId: "m3", pendingFollowUps: 1.5, oldestAgeS: "9" },
+      { accepted: true, messageId: "m4" },
+    ];
+    sender.start(() => ({ accepted: false }));
+    receiver.start(() => replies.shift() as never);
+    const send = () => sender.request("host:receiver", "session:main", "followUp", { message: "later" });
+    await expect(send()).resolves.toEqual({ queued: true, messageId: "m1", routed: "mesh", acknowledged: true, pendingFollowUps: 3, oldestAgeS: 140 });
+    for (const messageId of ["m2", "m3", "m4"]) {
+      await expect(send()).resolves.toEqual({ queued: true, messageId, routed: "mesh", acknowledged: true });
+    }
+  });
+
   it("returns an authenticated result with the caller's actor binding", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);

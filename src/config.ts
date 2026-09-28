@@ -260,6 +260,8 @@ export interface FabricMeshConfig {
   actorQueueLimit: number;
   eventContextChars: number;
   actorContextEntries: number;
+  /** A followUp to a busy Main that waited this long goes in at the next tool boundary; 0 disables. */
+  followUpFlushMs: number;
 }
 
 interface FabricRepairsConfig {
@@ -489,6 +491,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     actorQueueLimit: 32,
     eventContextChars: 40_000,
     actorContextEntries: 14,
+    followUpFlushMs: 120_000,
   },
   models: {
     aliases: {},
@@ -1164,6 +1167,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.mesh.actorContextEntries,
         1,
         100,
+      ),
+      followUpFlushMs: boundedInteger(
+        mesh.followUpFlushMs,
+        DEFAULT_FABRIC_CONFIG.mesh.followUpFlushMs,
+        0,
+        24 * 60 * 60_000,
       ),
     },
     models: {

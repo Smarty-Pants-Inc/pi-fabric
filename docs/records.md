@@ -66,8 +66,9 @@ verifies the staged copies, and installs and runs only those bytes, in root-owne
 an agent can write, before or during the install, is ever run as root or as the records user. Every path comes from
 its arguments (`--package-root`, `--node`), so the script also works when copied elsewhere, such as
 `/run/smarty-step.sh`. Everything written into the org user's home is written as that user. `--help` shows each
-root step, what a rerun does, the success line and the rollback. WAL accumulates until the WAL-G archive step; run
-it before sustained use and watch the disk.
+root step, what a rerun does, the success line and the rollback. Archiving is off until the WAL-G step, and WAL is
+bounded by `max_wal_size = 1GB` until then. PostgreSQL comes only from the distro package path, and its binaries and
+every ancestor directory must be root-owned and not group- or world-writable before anything there is run.
 
 ## Configuration
 

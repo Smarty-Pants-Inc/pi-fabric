@@ -8,7 +8,7 @@ import { RemoteRecords } from "../src/records/client.js";
 import { recordsInboxMessage, recordsInboxSession, RecordsInbox } from "../src/records/inbox.js";
 import { PublicationRelay, type NudgePublisher } from "../src/records/relay.js";
 import { migrate, SERVICE_ROLE } from "../src/records/schema.js";
-import { issuePrincipal, normalizeServiceConfig, RecordsServer, writeStatusFile, type OperatorRole, type RecordsServiceConfig } from "../src/records/server.js";
+import { issueCredentialFile, issuePrincipal, normalizeServiceConfig, RecordsServer, writeStatusFile, type OperatorRole, type RecordsServiceConfig } from "../src/records/server.js";
 import type { ClientPool } from "../src/records/store.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
 
@@ -658,6 +658,49 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     // A reissue never changes the role of an existing operator.
     await expect(issuePrincipal(config, "relay:fabric", "importer", "x", pool, true)).rejects.toThrow(/another kind or role/);
     expect((await owner.query("SELECT role FROM principals WHERE id = 'relay:fabric'")).rows[0].role).toBe("relay");
+  });
+
+  it("a reissue invalidates the old token in the RUNNING service at once (Astra F1 on #117)", async () => {
+    const { config, owner } = await freshService();
+    const pool = owner as unknown as ClientPool;
+    const out = path.join(dir, `f1-${databases}`, "relay.json");
+    await issueCredentialFile(config, "relay:fabric", "relay", out, { pool });
+    const old = JSON.parse(fs.readFileSync(out, "utf8")) as { token: string };
+    const before = await connect(config, "unused", out);
+    // The old token has been used, so a cache would now hold it.
+    expect((await before.claimPublications(10)).claims).toEqual([]);
+    const kept = path.join(dir, `f1-old-${databases}.json`);
+    fs.writeFileSync(kept, JSON.stringify({ id: "relay:fabric", token: old.token }), { mode: 0o600 });
+    await issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true });
+    const stale = await connect(config, "unused", kept);
+    await expect(stale.claimPublications(10)).rejects.toThrow(/not known to this service/);
+    await expect(before.claimPublications(10)).rejects.toThrow(/not known to this service/);
+    const fresh = await connect(config, "unused", out);
+    expect((await fresh.claimPublications(10)).claims).toEqual([]);
+  });
+
+  it("issues a credential file without ever losing a token (Astra F2 on #117)", async () => {
+    const { config, owner } = await freshService();
+    const pool = owner as unknown as ClientPool;
+    const dirOut = path.join(dir, `f2-${databases}`);
+    const out = path.join(dirOut, "relay.json");
+    await issueCredentialFile(config, "relay:fabric", "relay", out, { pool });
+    const first = fs.readFileSync(out, "utf8");
+    // Without --reissue an existing file is refused before the database is touched: the token still works.
+    await expect(issueCredentialFile(config, "relay:fabric", "relay", out, { pool })).rejects.toThrow(/exists; pass --reissue/);
+    expect(fs.readFileSync(out, "utf8")).toBe(first);
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
+    // A reissue whose database step fails (another role) leaves the file, the old token and no temp file.
+    await expect(issueCredentialFile(config, "relay:fabric", "importer", out, { pool, reissue: true })).rejects.toThrow(/another kind or role/);
+    expect(fs.readFileSync(out, "utf8")).toBe(first);
+    expect(fs.readdirSync(dirOut)).toEqual(["relay.json"]);
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
+    // A successful reissue replaces the file atomically with the new, working token, 0600.
+    await issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true });
+    expect(fs.readFileSync(out, "utf8")).not.toBe(first);
+    expect(fs.statSync(out).mode & 0o777).toBe(0o600);
+    expect(fs.readdirSync(dirOut)).toEqual(["relay.json"]);
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
   });
 
   it("a client closed while it reconnects starts no call (F3)", async () => {

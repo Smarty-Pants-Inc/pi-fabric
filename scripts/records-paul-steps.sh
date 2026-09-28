@@ -13,19 +13,19 @@
 # root-owned /opt/<org>-records/{node,service-main.mjs}; the units and every later command use only those copies.
 # Nothing derives a path from the script's own location: a copy at /run/smarty-step.sh behaves identically.
 #   sudo scripts/records-paul-steps.sh --org smarty-pants --org-user paul --rollback [--dry-run] [--yes-delete-records]
-# LIMIT: WAL accumulates until the WAL-G archive step; run it before sustained use and watch disk.
+# LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
 #
 # ROOT STEPS (one line each):
 #  0. mktemp -d /run/<org>-records-stage.XXXXXX (root, 0700; removed on exit); copy --node and the bundle into it once each; refuse (nothing changed) unless each staged copy's sha256 equals --node-sha256/--bundle-sha256
 #  1. useradd the <org>-records system user (skipped if it exists)
-#  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: without /etc/postgresql-common/createcluster.conf, write createcluster.d/99-smarty-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); use the highest N (16 or newer, or --pg-bin); install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records; check <org>-records runs it with no modules
+#  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records/restart-pending, root 0600); check <org>-records runs it with no modules
 #  3. create /var/lib/<org>-records/{,pg,status,credentials}, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes
 #  4. initdb the cluster as <org>-records if absent (an existing cluster keeps its own major, from PG_VERSION); write pg_hba.conf, pg_ident.conf, conf.d/records.conf; append include_dir to postgresql.conf
 #  5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
-#  6. write both systemd units; daemon-reload; enable --now <org>-records-pg.service (restart if its config or unit changed and it was running); wait for pg_isready
-#  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if node, bundle or unit changed and it was running)
+#  6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if its config changed or restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
+#  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
 #  8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
-#  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no TCP listener on the records port (changes nothing)
+#  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
 # ROLLBACK STEPS (--rollback; root; a real rollback needs --yes-delete-records; the PostgreSQL packages stay installed):
 #  R1. systemctl stop both units; refuse (nothing deleted) unless is-active says inactive, failed or unknown for both; systemctl disable both
 #  R2. rm -f both unit files; systemctl daemon-reload
@@ -44,14 +44,15 @@
 # An operator id holds exactly one role: the same id with two roles (in one run, or against service.json) is refused.
 # TEST ONLY: RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST=1 skips the root check so tests can run the real
 # (non-dry) path against PATH fakes; with it, RECORDS_PAUL_STEPS_TEST_ROOT=DIR prefixes every system path
-# (also /usr/lib/postgresql, where the PostgreSQL version is detected).
+# (also /usr/lib/postgresql, where the PostgreSQL version is detected), and the PostgreSQL trust check expects
+# the test user's uid instead of root (0) and stops at that root instead of / (the writable checks stay).
 # Never set either on a real host.
 set -Eeuo pipefail
 
 usage() {
 	cat <<'EOF'
 usage: records-paul-steps.sh --org <org> --org-user <orguser> --package-root DIR --node BIN
-         --bundle-sha256 HEX --node-sha256 HEX [--pg-bin DIR] [--origin NAME] [--port 5433]
+         --bundle-sha256 HEX --node-sha256 HEX [--origin NAME] [--port 5433]
          [--operator ROLE:ID]... [--dry-run]
        records-paul-steps.sh --print-digests --package-root DIR --node BIN
        records-paul-steps.sh --org <org> --org-user <orguser> --print hba|ident|conf|service-json|units|operator-edit-js
@@ -67,9 +68,9 @@ usage: records-paul-steps.sh --org <org> --org-user <orguser> --package-root DIR
                       (also --dry-run). Each source is read once into a root-only staging directory; unless the
                       staged copies match, nothing changes. Only the verified copies are installed and run.
   --print-digests     print 'bundle-sha256 <hex>  <path>' and 'node-sha256 <hex>  <path>' and exit; no root
-  LIMIT: WAL accumulates until the WAL-G archive step; run it before sustained use and watch disk.
-  --pg-bin DIR        PostgreSQL 16+ binaries (default: the highest /usr/lib/postgresql/<N>/bin, after
-                      apt-get install postgresql from the distro when none is present)
+  LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
+  PostgreSQL          only the distro's /usr/lib/postgresql/<N>/bin (after apt-get install postgresql when none is
+                      present); it and every ancestor must be root-owned, not symlinks, not group- or world-writable
   --rollback          undo the install in reverse order (keeps PostgreSQL installed). A real rollback deletes the
                       record database and needs --yes-delete-records; take the printed backup first.
   --operator ROLE:ID  grant ROLE (importer|mirror|relay) to principal ID and issue its credential into
@@ -106,14 +107,14 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 
-ORG="" ORG_USER="" PG_BIN="" NODE="" PACKAGE="" ORIGIN="" PORT=5433 BUNDLE_SHA="" NODE_SHA=""
+ORG="" ORG_USER="" NODE="" PACKAGE="" ORIGIN="" PORT=5433 BUNDLE_SHA="" NODE_SHA=""
 DRY=0 PRINT="" OPERATORS=() YES_DELETE=0 PRINT_DIGESTS=0
 while (($#)); do
 	case $1 in
-	--org | --org-user | --pg-bin | --node | --package-root | --origin | --port | --print | --operator | --bundle-sha256 | --node-sha256)
+	--org | --org-user | --node | --package-root | --origin | --port | --print | --operator | --bundle-sha256 | --node-sha256)
 		(($# >= 2)) || die "$1 needs a value"
 		case $1 in
-		--org) ORG=$2 ;; --org-user) ORG_USER=$2 ;; --pg-bin) PG_BIN=$2 ;; --node) NODE=$2 ;;
+		--org) ORG=$2 ;; --org-user) ORG_USER=$2 ;; --node) NODE=$2 ;;
 		--package-root) PACKAGE=$2 ;; --origin) ORIGIN=$2 ;; --port) PORT=$2 ;; --print) PRINT=$2 ;;
 		--operator) OPERATORS+=("$2") ;; --bundle-sha256) BUNDLE_SHA=$2 ;; --node-sha256) NODE_SHA=$2 ;;
 		esac
@@ -146,7 +147,6 @@ if ((HELP)); then
 	# --help needs no root and no other flag; given names are checked, missing ones stay placeholders.
 	[[ -z $ORG || ($ORG =~ ^[a-z][a-z0-9-]*$ && ${#ORG} -le 24) ]] || die "invalid --org '$ORG'"
 	[[ -z $ORG_USER || ($ORG_USER =~ ^[a-z_][a-z0-9_-]*$ && ${#ORG_USER} -le 32) ]] || die "invalid --org-user '$ORG_USER'"
-	[[ -z $PG_BIN || $PG_BIN =~ ^/[A-Za-z0-9._/+-]*$ ]] || die "invalid --pg-bin '$PG_BIN'"
 	ORG=${ORG:-<org>} ORG_USER=${ORG_USER:-<org-user>} PRINT=""
 else
 	[[ -n $ORG ]] || die "--org is required"
@@ -171,7 +171,7 @@ else
 	[[ $ORIGIN =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid --origin '$ORIGIN'"
 	((!ROLLBACK)) || [[ -z $PRINT ]] || die "--rollback and --print do not combine"
 	((ROLLBACK)) || ((!YES_DELETE)) || die "--yes-delete-records only applies to --rollback"
-	for p in "$PG_BIN" "$NODE" "$PACKAGE"; do
+	for p in "$NODE" "$PACKAGE"; do
 		[[ -z $p ]] && continue
 		[[ $p =~ $PATH_RE ]] || die "path must be absolute, without spaces or quotes: '$p'"
 	done
@@ -214,9 +214,9 @@ OPT="${T}/opt/${REC}"
 OPT_NODE="${OPT}/node"
 MAIN="${OPT}/service-main.mjs"
 SOCKET="${SVCSOCK}/records.sock"
-# PostgreSQL comes from the distro; its major version is detected, never assumed.
+# S4: PostgreSQL comes only from the distro path; its major is read from directory names, never by running anything.
 PG_BASE="${T}/usr/lib/postgresql"
-PG_MAJOR="" PG_BIN_GIVEN=${PG_BIN:+1} PG_REFUSAL=""
+PG_BIN="" PG_MAJOR="" PG_REFUSAL=""
 # F20: an existing cluster keeps its own major; highest-major detection is only for a fresh cluster.
 CLUSTER_MAJOR=""
 if [[ -f $DATA/PG_VERSION ]]; then
@@ -246,14 +246,30 @@ pg_derived() { # everything that names the PostgreSQL major or binaries
 	DELETE_WARNING="This deletes the org's record database. Take a backup first: ${BACKUP_CMD}"
 	APT_NOTE="Note: the PostgreSQL packages stay installed (other software may use them). Optional, to remove them too: apt-get remove postgresql postgresql-${PG_MAJOR:-<N>}"
 }
-if [[ -n $PG_BIN_GIVEN ]]; then
-	if [[ -x $PG_BIN/postgres ]] && v=$("$PG_BIN/postgres" --version 2>/dev/null) && [[ $v =~ \(PostgreSQL\)\ ([0-9]+) ]]; then
-		PG_MAJOR=${BASH_REMATCH[1]}
-	fi
-	if [[ -n $CLUSTER_MAJOR && -n $PG_MAJOR && $PG_MAJOR != "$CLUSTER_MAJOR" ]]; then
-		cluster_refusal "--pg-bin ${PG_BIN} is PostgreSQL ${PG_MAJOR}"
-	fi
-elif [[ -n $CLUSTER_MAJOR ]]; then
+# S4: nothing in PG_BIN runs unless each binary used and every ancestor directory (up to /) is a real file or
+# directory (no symlink), owned by root and not group- or world-writable. stat never follows a link.
+# TEST ONLY: in test mode the owner must be the test user and the walk stops at RECORDS_PAUL_STEPS_TEST_ROOT.
+pg_trusted() {
+	local want=0 top=/ p path s paths=()
+	if [[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} == 1 ]]; then want=$(id -u) top=${T:-/}; fi
+	for p in initdb postgres pg_isready psql createdb pg_dump; do
+		[[ ! -e $PG_BIN/$p && ! -L $PG_BIN/$p ]] || paths+=("$PG_BIN/$p")
+	done
+	path=$PG_BIN
+	while :; do
+		paths+=("$path")
+		[[ $path != "$top" && $path != / ]] || break
+		path=${path%/*} path=${path:-/}
+	done
+	for p in "${paths[@]}"; do
+		[[ ! -L $p && -e $p ]] || die "refused: ${p} is not root-owned and protected; nothing was changed"
+		s=$(stat -c '%u %a' -- "$p")
+		[[ ${s%% *} == "$want" ]] && ((!(8#${s#* } & 8#022))) ||
+			die "refused: ${p} is not root-owned and protected; nothing was changed"
+	done
+	echo "OK: ${PG_BIN}, its binaries and every ancestor are owned by uid ${want}, not symlinks, not group- or world-writable"
+}
+if [[ -n $CLUSTER_MAJOR ]]; then
 	PG_MAJOR=$CLUSTER_MAJOR PG_BIN="${PG_BASE}/${CLUSTER_MAJOR}/bin"
 	[[ -x $PG_BIN/initdb && -x $PG_BIN/postgres ]] || cluster_refusal "${PG_BIN} is missing"
 else
@@ -344,13 +360,12 @@ port = ${PORT}
 synchronous_commit = on
 fsync = on
 track_commit_timestamp = on
-archive_mode = on
-# WAL-G replaces archive_command in its own authorized step. Until then archiving fails
-# loudly and PostgreSQL keeps every WAL segment in pg_wal: no WAL is thrown away.
-archive_command = '/bin/false'
-archive_timeout = 60
-# LIMIT: WAL accumulates until the WAL-G archive step; run it before sustained use and watch disk.
-# (max_wal_size is deliberately not set: it cannot bound WAL that is waiting to be archived.)
+# P2-5: bounded bootstrap WAL. The WAL-G step turns archiving on in its own
+# authorized change; until then no segment waits to be archived, so pg_wal stays near max_wal_size.
+archive_mode = off
+max_wal_size = 1GB
+wal_keep_size = 0
+# LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
 EOF
 }
 render_service_json() {
@@ -564,14 +579,14 @@ root_steps() {
 	cat <<'EOF'
   0. mktemp -d /run/<org>-records-stage.XXXXXX (root, 0700; removed on exit); copy --node and the bundle into it once each; refuse (nothing changed) unless each staged copy's sha256 equals --node-sha256/--bundle-sha256
   1. useradd the <org>-records system user (skipped if it exists)
-  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: without /etc/postgresql-common/createcluster.conf, write createcluster.d/99-smarty-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); use the highest N (16 or newer, or --pg-bin); install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records; check <org>-records runs it with no modules
+  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records/restart-pending, root 0600); check <org>-records runs it with no modules
   3. create /var/lib/<org>-records/{,pg,status,credentials}, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes
   4. initdb the cluster as <org>-records if absent (an existing cluster keeps its own major, from PG_VERSION); write pg_hba.conf, pg_ident.conf, conf.d/records.conf; append include_dir to postgresql.conf
   5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
-  6. write both systemd units; daemon-reload; enable --now <org>-records-pg.service (restart if its config or unit changed and it was running); wait for pg_isready
-  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if node, bundle or unit changed and it was running)
+  6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if its config changed or restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
+  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
   8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
-  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no TCP listener on the records port (changes nothing)
+  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
 EOF
 }
 print_help() {
@@ -585,15 +600,15 @@ print_help() {
 IDEMPOTENCY: a second run with the same flags
   0. a fresh staging directory; the digests are checked again (removed on exit)
   1. skipped: user ${REC} exists
-  2. apt-get skipped (PostgreSQL ${PG_MAJOR:-<N>} found); the verified node and service-main.mjs installed only when content differs
+  2. apt-get skipped (PostgreSQL ${PG_MAJOR:-<N>} found); the verified node and service-main.mjs installed only when content differs (restart-pending written first)
   3. unchanged: the same directories, owners and modes are reapplied
   4. initdb skipped (cluster exists; an existing cluster keeps its own major); pg_hba.conf, pg_ident.conf, records.conf rewritten only when content
      differs; include_dir appended only once; PostgreSQL restarted only when its config changed
   5. skipped: service.json exists (never overwritten)
   6. units rewritten only when content differs; daemon-reload and enable --now leave running units unchanged
-     (a running PostgreSQL unit is restarted when its config or unit changed)
+     (a running unit is restarted when restart-pending lists it, also after an interrupted run, or PostgreSQL's config changed)
   7. createdb and CREATE ROLE skipped (exist); migrate applies only unapplied migrations; enable --now unchanged
-     (a running service is restarted when node, the bundle or its unit changed)
+     (a running service is restarted when restart-pending lists it: node, the bundle or its unit changed, now or in an interrupted run)
   8. an id that holds another role refused; a role added to service.json only when missing; a credential issued (--reissue) only when absent; the relay
      copy rewritten with the same content; an active service reloaded, so an interrupted earlier grant takes effect
   9. checks only; changes nothing
@@ -602,8 +617,8 @@ SUCCESS LINE: printed last by a real install, only after the step 9 checks pass;
   ${SUCCESS_LINE}
   checks: systemctl is-active ${SVC_UNIT} and ${PG_UNIT}; pg_isready as ${REC};
           python3 ctypes getsockopt as ${REC} (peer audit); ${ORG_USER} cannot reach PostgreSQL; test -S ${SOCKET};
-          ss -Hltnp shows no TCP listener on :${PORT}
-LIMIT: WAL accumulates until the WAL-G archive step; run it before sustained use and watch disk.
+          ss -Hltnp shows no PostgreSQL TCP listener (:5432, :${PORT}); du -sh ${DATA}/pg_wal (info)
+LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
 
 ROLLBACK: as root; preview first with: ${0##*/} --org ${ORG} --org-user ${ORG_USER} --rollback --dry-run
   ${0##*/} --org ${ORG} --org-user ${ORG_USER} --rollback --yes-delete-records
@@ -638,10 +653,7 @@ fi
 # F20: an existing cluster's major must be installed.
 [[ -z $PG_REFUSAL ]] || die "$PG_REFUSAL"
 candidate=""
-if [[ -n $PG_BIN_GIVEN ]]; then
-	[[ -x $PG_BIN/initdb ]] || die "${PG_BIN}/initdb not found. Install PostgreSQL 16 or newer there, or omit --pg-bin to use the distro's postgresql package; nothing was changed"
-	[[ -n $PG_MAJOR ]] || die "cannot read the PostgreSQL major version from ${PG_BIN}/postgres --version; nothing was changed"
-elif [[ -z $PG_MAJOR ]]; then
+if [[ -z $PG_MAJOR ]]; then
 	# The distro's metapackage (Ubuntu noble: 16); no repository is added. apt-cache changes nothing.
 	candidate=$(apt-cache policy postgresql 2>/dev/null | awk '$1 == "Candidate:" { print $2 }')
 	[[ -n $candidate && $candidate != "(none)" ]] ||
@@ -658,6 +670,8 @@ for p in "$NODE" "$SRC_MAIN"; do
 		[[ -f $p ]] || die "${p} is not a regular file: refused"
 	fi
 done
+# S4: before step 0, and before anything in PG_BIN runs. A fresh install is checked in step 2, after apt.
+if [[ -n $PG_MAJOR ]]; then pg_trusted; fi
 
 # P1-1: the sources are read once each into a fresh root-only directory; only staged copies whose sha256 is
 # the approved one go further. Every later step uses the staged, then installed, copies, never the sources.
@@ -696,9 +710,7 @@ else
 fi
 
 step 2 "Prerequisites: PostgreSQL ${PG_MAJOR:-<detected after install>}, node and the package under ${OPT}"
-if [[ -n $PG_BIN_GIVEN ]]; then
-	echo "= PostgreSQL ${PG_MAJOR} found at ${PG_BIN}"
-elif [[ -n $PG_MAJOR ]]; then
+if [[ -n $PG_MAJOR ]]; then
 	if [[ -n $CLUSTER_MAJOR ]]; then
 		echo "= PostgreSQL ${PG_MAJOR} found at ${PG_BIN} (the existing cluster's major, from ${DATA}/PG_VERSION)"
 	else
@@ -707,43 +719,64 @@ elif [[ -n $PG_MAJOR ]]; then
 else
 	echo "  note: the distro package postgresql ${candidate}. Unless disabled, it creates a cluster postgresql@<N>-main;"
 	echo "        an existing one stays as it is: this setup does not touch it (disable it yourself if you do not use it)."
-	# P2-1: on a host with no createcluster.conf yet, no new distro main cluster (and so no TCP listener) is created.
-	# A drop-in (postgresql-common >= 250) leaves the package's own conffile and every existing setting alone.
+	# P2-1: whatever createcluster.conf says, the install creates no new distro main cluster (and so no TCP listener).
+	# A drop-in (postgresql-common >= 250, read after createcluster.conf) leaves the conffile and existing clusters alone.
 	CC="${T}/etc/postgresql-common"
-	if [[ -e $CC/createcluster.conf ]]; then
-		echo "= ${CC}/createcluster.conf exists: kept as is (it decides whether a main cluster is created)"
-	else
-		echo "  ${CC}/createcluster.conf is absent: a drop-in stops apt from creating a new main cluster"
-		run install -d -m 0755 -o root -g root "$CC/createcluster.d"
-		write_file "$CC/createcluster.d/99-smarty-records.conf" 0644 root:root "# Written by records-paul-steps.sh: no new distro main cluster on install (it would listen on TCP).
+	[[ ! -e $CC/createcluster.conf ]] || echo "= ${CC}/createcluster.conf kept as is; the drop-in below overrides its create_main_cluster"
+	run install -d -m 0755 -o root -g root "$CC/createcluster.d"
+	# zz- sorts last: postgresql-common applies drop-ins in name order, so a later one cannot re-enable it.
+	write_file "$CC/createcluster.d/zz-${REC}.conf" 0644 root:root "# Written by records-paul-steps.sh: no new distro main cluster on install (it would listen on TCP).
 create_main_cluster = false"
-	fi
 	run apt-get install -y postgresql
 	if ((DRY)); then
 		echo "= PostgreSQL <detected after install>: the highest ${PG_BASE}/<N>/bin with initdb and postgres"
+		echo "? refuse unless ${PG_BASE}/<N>/bin, its binaries and every ancestor are root-owned, not symlinks, not group- or world-writable"
 	else
 		detect_pg
 		[[ -n $PG_MAJOR ]] || die "apt-get install postgresql left no ${PG_BASE}/<N>/bin with initdb and postgres"
 		check_major
+		pg_trusted
 		pg_derived
 		echo "= PostgreSQL ${PG_MAJOR} installed at ${PG_BIN} (an existing postgresql@${PG_MAJOR}-main is left alone)"
 	fi
 fi
 
+# F3: a unit whose node, bundle or unit file is replaced is listed here BEFORE the replacement and removed only
+# after its restart (or its fresh start), so a rerun after an interruption still restarts it though bytes match.
+MARKER="${HOME_DIR}/restart-pending"
+marker_has() { [[ -f $MARKER ]] && grep -qxF "$1" "$MARKER"; }
+marker_set() { # CONTENT: rewrite the marker (root, 0600), or remove it when empty
+	local tmp
+	if [[ -z $1 ]]; then run rm -f "$MARKER"; return; fi
+	[[ -d $HOME_DIR ]] || run install -d -m 0755 -o "$REC" -g "$REC" "$HOME_DIR"
+	tmp=$(mktemp "${MARKER}.XXXXXX")
+	printf '%s\n' "$1" >"$tmp"
+	if ! run install -m 0600 -o root -g root "$tmp" "$MARKER"; then rm -f "$tmp"; die "cannot write ${MARKER}"; fi
+	rm -f "$tmp"
+}
+marker_add() { # UNIT
+	if ((DRY)); then echo "? add ${1} to ${MARKER} (root, 0600; restart pending until it restarts)"; return 0; fi
+	marker_has "$1" && return 0
+	marker_set "$( [[ ! -f $MARKER ]] || cat "$MARKER"; echo "$1")"
+}
+marker_clear() { # UNIT
+	if ((DRY)); then echo "? remove ${1} from ${MARKER} (rm it when empty)"; return 0; fi
+	marker_has "$1" || return 0
+	marker_set "$(grep -vxF "$1" "$MARKER" || true)"
+}
 # Only the two verified staged files are installed; nothing under ${OPT} comes from the sources directly.
-BIN_CHANGED=0
 run install -d -m 0755 -o root -g root "$OPT"
 if cmp -s "${STAGE}/node" "$OPT_NODE"; then
 	echo "= ${OPT_NODE} matches the verified staged node"
 else
+	marker_add "$SVC_UNIT"
 	run install -m 0755 -o root -g root "${STAGE}/node" "$OPT_NODE"
-	BIN_CHANGED=1
 fi
 if cmp -s "${STAGE}/service-main.mjs" "$MAIN"; then
 	echo "= ${MAIN} matches the verified staged bundle"
 else
+	marker_add "$SVC_UNIT"
 	run install -m 0644 -o root -g root "${STAGE}/service-main.mjs" "$MAIN"
-	BIN_CHANGED=1
 fi
 if ((!DRY)); then
 	[[ $(sha_of "$OPT_NODE") == "$NODE_SHA" && $(sha_of "$MAIN") == "$BUNDLE_SHA" ]] ||
@@ -802,11 +835,12 @@ fi
 
 step 6 "systemd units"
 # A unit counts as changed when its content does (a mode or owner fix needs no restart).
-CONTENT_CHANGED=0
-write_file "$UNIT_DIR/$PG_UNIT" 0644 root:root "$(render_pg_unit)"
-PG_UNIT_CHANGED=$CONTENT_CHANGED CONTENT_CHANGED=0
-write_file "$UNIT_DIR/$SVC_UNIT" 0644 root:root "$(render_svc_unit)"
-SVC_UNIT_CHANGED=$CONTENT_CHANGED
+unit_differs() { ! [[ -f $1 && -r $1 && "$(cat "$1")" == "$2" ]]; }
+PG_UNIT_TEXT=$(render_pg_unit) SVC_UNIT_TEXT=$(render_svc_unit)
+! unit_differs "$UNIT_DIR/$PG_UNIT" "$PG_UNIT_TEXT" || marker_add "$PG_UNIT"
+! unit_differs "$UNIT_DIR/$SVC_UNIT" "$SVC_UNIT_TEXT" || marker_add "$SVC_UNIT"
+write_file "$UNIT_DIR/$PG_UNIT" 0644 root:root "$PG_UNIT_TEXT"
+write_file "$UNIT_DIR/$SVC_UNIT" 0644 root:root "$SVC_UNIT_TEXT"
 run systemctl daemon-reload
 # P2-3: enable --now does not restart a running unit; a changed config, unit or binary needs an explicit restart.
 was_active() { ((!DRY)) && systemctl is-active --quiet "$1"; }
@@ -814,9 +848,13 @@ PG_WAS_ACTIVE=0
 if was_active "$PG_UNIT"; then PG_WAS_ACTIVE=1; fi
 run systemctl enable --now "$PG_UNIT"
 if ((DRY)); then
-	((!(PG_CONF_CHANGED || PG_UNIT_CHANGED) || FRESH)) || echo "? if ${PG_UNIT} was already active: + systemctl restart ${PG_UNIT}  (its config or unit changed)"
-elif (((PG_CONF_CHANGED || PG_UNIT_CHANGED) && !FRESH && PG_WAS_ACTIVE)); then
-	run systemctl restart "$PG_UNIT"
+	((FRESH)) || echo "? if ${PG_UNIT} was already active and its config changed or ${MARKER} lists it: + systemctl restart ${PG_UNIT}"
+	marker_clear "$PG_UNIT"
+else
+	PG_PENDING=0
+	if marker_has "$PG_UNIT"; then PG_PENDING=1; fi
+	if (((PG_CONF_CHANGED || PG_PENDING) && !FRESH && PG_WAS_ACTIVE)); then run systemctl restart "$PG_UNIT"; fi
+	marker_clear "$PG_UNIT"
 fi
 PSQL=(runuser -u "$REC" -- "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$PGSOCK" -p "$PORT" -U postgres)
 if ((DRY)); then
@@ -845,10 +883,14 @@ wait_socket() {
 	[[ -S $SOCKET ]]
 }
 if ((DRY)); then
-	echo "? if node, the bundle or ${SVC_UNIT} changed and it was already active: + systemctl restart ${SVC_UNIT}, then wait up to 30 s for ${SOCKET}"
-elif ((SVC_WAS_ACTIVE && (BIN_CHANGED || SVC_UNIT_CHANGED))); then
-	run systemctl restart "$SVC_UNIT"
-	wait_socket || die "${SOCKET} did not appear within 30 s after restarting ${SVC_UNIT}; see journalctl -u ${SVC_UNIT}"
+	echo "? if ${MARKER} lists ${SVC_UNIT} (node, the bundle or its unit changed, now or in an interrupted run) and it was already active: + systemctl restart ${SVC_UNIT}, then wait up to 30 s for ${SOCKET}"
+	marker_clear "$SVC_UNIT"
+elif marker_has "$SVC_UNIT"; then
+	if ((SVC_WAS_ACTIVE)); then
+		run systemctl restart "$SVC_UNIT"
+		wait_socket || die "${SOCKET} did not appear within 30 s after restarting ${SVC_UNIT}; see journalctl -u ${SVC_UNIT}"
+	fi
+	marker_clear "$SVC_UNIT"
 fi
 
 step 8 "Operator principals"
@@ -955,23 +997,28 @@ success_check "PostgreSQL ready" runuser -u "$REC" -- "$PG_BIN/pg_isready" -h "$
 # The service reads SO_PEERCRED through python3 and ctypes: the peer audit needs both, as ${REC}.
 success_check "peer audit (python3 ctypes)" runuser -u "$REC" -- python3 -c 'import ctypes; ctypes.CDLL(None).getsockopt'
 success_check "service socket" test -S "$SOCKET"
-# P2-1: the records cluster listens on its Unix socket only. Other PostgreSQL TCP listeners are reported, not changed.
-no_tcp_listener() {
-	local out local_addr pg
+# P2-1: the records cluster listens on its Unix socket only, and the install must have created no distro
+# cluster on TCP: any listener on :5432 or :${PORT}, or any PostgreSQL TCP listener, fails loudly.
+no_pg_tcp_listener() {
+	local out line local_addr port bad=0
 	out=$(ss -Hltnp) || return 1
-	while read -r _ _ _ local_addr _; do
-		if [[ $local_addr == *":${PORT}" ]]; then
-			echo "a TCP listener on ${local_addr}: $(grep -F "${local_addr}" <<<"$out" | head -n1)" >&2
-			return 1
+	while read -r line; do
+		[[ -n $line ]] || continue
+		read -r _ _ _ local_addr _ <<<"$line"
+		port=${local_addr##*:}
+		if [[ $port == 5432 || $port == "$PORT" || ${line,,} == *postgres* ]]; then
+			echo "a PostgreSQL TCP listener exists on :${port}: ${line}" >&2
+			bad=1
 		fi
 	done <<<"$out"
-	pg=$(grep -i postgres <<<"$out" || true)
-	[[ -z $pg ]] || printf 'WARNING: PostgreSQL TCP listeners on other ports (not the records cluster; left as they are):\n%s\n' "$pg"
+	((!bad))
 }
 if ((DRY)); then
-	echo "? ss -Hltnp  (no TCP listener on :${PORT}; PostgreSQL TCP listeners on other ports only warn)"
+	echo "? ss -Hltnp  (no PostgreSQL TCP listener: none on :5432 or :${PORT}, no postgres process on any port; else fail)"
+	echo "? du -sh ${DATA}/pg_wal  (info only: WAL size; bounded by max_wal_size = 1GB until the WAL-G step)"
 else
-	success_check "no TCP listener on :${PORT}" no_tcp_listener
+	success_check "no PostgreSQL TCP listener on :5432 or :${PORT}" no_pg_tcp_listener
+	echo "WAL (info only): $(du -sh "$DATA/pg_wal" 2>/dev/null || echo "unknown ${DATA}/pg_wal")"
 fi
 cat <<EOF
 

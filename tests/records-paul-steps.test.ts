@@ -7,7 +7,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { normalizeRecordsConfig } from "../src/records/config.js";
 
 const script = resolve(__dirname, "../scripts/records-paul-steps.sh");
-const base = ["--org", "test-org", "--org-user", "nobodyuser", "--pg-bin", "/nonexistent", "--node", "/usr/bin/node"];
+const base = ["--org", "test-org", "--org-user", "nobodyuser", "--node", "/usr/bin/node"];
 
 function run(args: string[], env: NodeJS.ProcessEnv = process.env) {
 	const r = spawnSync("bash", [script, ...args], { encoding: "utf8", env });
@@ -33,7 +33,7 @@ const sources = (dir: string) => {
 	chmodSync(node, 0o755);
 	return { node, bundle, args: ["--node", node, "--package-root", join(dir, "pkg"), "--bundle-sha256", fileSha(bundle), "--node-sha256", fileSha(node)] };
 };
-// The host's own PostgreSQL, as the script detects it without --pg-bin (none: the <N> placeholder).
+// The host's own PostgreSQL, as the script detects it (none: the <N> placeholder).
 const hostPgMajor = (() => {
 	try {
 		const b = (n: string) => `/usr/lib/postgresql/${n}/bin`;
@@ -88,12 +88,14 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			"synchronous_commit = on",
 			"fsync = on",
 			"track_commit_timestamp = on",
-			"archive_mode = on",
-			"archive_command = '/bin/false'",
-			"archive_timeout = 60",
+			// P2-5: bounded bootstrap WAL until the WAL-G step turns archiving on.
+			"archive_mode = off",
+			"max_wal_size = 1GB",
+			"wal_keep_size = 0",
 		])
 			expect(conf).toContain(line);
-		expect(printed("conf")).toMatch(/# WAL-G replaces archive_command/);
+		expect(printed("conf")).not.toMatch(/archive_command|archive_timeout/);
+		expect(printed("conf")).toMatch(/# P2-5: .*The WAL-G step turns archiving on/);
 	});
 
 	it("renders service.json with the fixed shape", () => {
@@ -116,7 +118,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		const units = printed("units");
 		const [pg, svc] = units.split("# /etc/systemd/system/test-org-records.service");
 		expect(pg).toContain("User=test-org-records\n");
-		expect(pg).toContain("ExecStart=/nonexistent/postgres -D /var/lib/test-org-records/pg\n");
+		expect(pg).toContain(`ExecStart=${hostPgBin}/postgres -D /var/lib/test-org-records/pg\n`);
 		expect(pg).toContain("RuntimeDirectory=test-org-records-pg\n");
 		expect(pg).toContain("RuntimeDirectoryMode=0700\n");
 		expect(pg).toContain("RuntimeDirectoryPreserve=yes\n");
@@ -148,7 +150,6 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 	writeFileSync(join(fake, "apt-cache"), "#!/bin/sh\nprintf 'postgresql:\\n  Installed: (none)\\n  Candidate: 16+257build1.1\\n'\n");
 	chmodSync(join(fake, "apt-cache"), 0o755);
 	const fakeEnv = { ...process.env, PATH: `${fake}:${process.env.PATH}` };
-	// The default --pg-bin; the dry run below must not pass --pg-bin.
 	const dryBase = ["--org", "test-org", "--org-user", "nobodyuser", "--node", process.execPath, "--package-root", repo, "--bundle-sha256", Z, "--node-sha256", Z];
 
 	it("dry run prints every step and executes nothing", () => {
@@ -173,7 +174,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.out.indexOf("? STAGE=$(mktemp -d /run/test-org-records-stage.XXXXXX)")).toBeLessThan(r.out.indexOf("## 1. "));
 		expect(r.out).toContain(`? umask 077; cat ${process.execPath} > /run/test-org-records-stage.XXXXXX/node; `);
 		expect(r.out).toMatch(/^digest check: bundle (ok|MISMATCH|not readable), node MISMATCH {2}\(a real run refuses a MISMATCH\)$/m);
-		expect(r.out).toContain("? ss -Hltnp  (no TCP listener on :5433;");
+		expect(r.out).toContain("? ss -Hltnp  (no PostgreSQL TCP listener: none on :5432 or :5433,");
+		expect(r.out).toContain("? du -sh /var/lib/test-org-records/pg/pg_wal  (info only: WAL size;");
 		expect(r.out).not.toMatch(/rsync|node_modules|\/package\b|chown -R|chmod -R/);
 		expect(r.out).toContain("? find /opt/test-org-records -type l  (must print nothing)\n");
 		expect(r.out).toContain("? runuser -u test-org-records -- /opt/test-org-records/node /opt/test-org-records/service-main.mjs  (must exit 2");
@@ -338,11 +340,11 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 	});
 
-	it("fails clearly, before step 0, when a non-default --pg-bin has no initdb", () => {
+	it("S4: refuses --pg-bin as an unknown argument, before anything runs", () => {
 		writeFileSync(log, "");
-		const r = run([...dryBase, "--pg-bin", "/nonexistent", "--dry-run"], fakeEnv);
-		expect(r.code).not.toBe(0);
-		expect(r.err).toMatch(/\/nonexistent\/initdb not found/);
+		const r = run([...dryBase, "--pg-bin", "/usr/lib/postgresql/16/bin", "--dry-run"], fakeEnv);
+		expect(r.code).toBe(1);
+		expect(r.err).toContain("unknown argument: --pg-bin");
 		expect(r.out).not.toMatch(/^## \d/m);
 		expect(readFileSync(log, "utf8")).toBe("");
 	});
@@ -437,12 +439,12 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 	});
 
-	it("writes the createcluster.d drop-in only when createcluster.conf is absent", () => {
+	it("P2-1: writes the createcluster.d drop-in before apt, also when createcluster.conf exists", () => {
 		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-cc-"));
 		try {
 			const root = join(t, "root");
 			const env = { ...testEnv(), RECORDS_PAUL_STEPS_TEST_ROOT: root };
-			const dropIn = `+ write ${root}/etc/postgresql-common/createcluster.d/99-smarty-records.conf (mode 0644, owner root:root)\n    | # Written by records-paul-steps.sh`;
+			const dropIn = `+ write ${root}/etc/postgresql-common/createcluster.d/zz-test-org-records.conf (mode 0644, owner root:root)\n    | # Written by records-paul-steps.sh`;
 			let r = run([...dryBase, "--dry-run"], env);
 			expect(r.code, r.err).toBe(0);
 			expect(r.out).toContain(dropIn);
@@ -452,14 +454,14 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			writeFileSync(join(root, "etc/postgresql-common/createcluster.conf"), "create_main_cluster = true\n");
 			r = run([...dryBase, "--dry-run"], env);
 			expect(r.code, r.err).toBe(0);
-			expect(r.out).not.toContain("99-smarty-records.conf");
-			expect(r.out).toContain(`= ${root}/etc/postgresql-common/createcluster.conf exists: kept as is`);
-			expect(r.out).toContain("+ apt-get install -y postgresql\n");
+			expect(r.out).toContain(dropIn);
+			expect(r.out).toContain(`= ${root}/etc/postgresql-common/createcluster.conf kept as is; the drop-in below overrides`);
+			expect(r.out.indexOf(dropIn)).toBeLessThan(r.out.indexOf("+ apt-get install -y postgresql\n"));
 			// With PostgreSQL present, apt is not run and no drop-in is written.
 			rmSync(join(root, "etc"), { recursive: true });
 			pgTree(root, ["16"]);
 			r = run([...dryBase, "--dry-run"], env);
-			expect(r.out).not.toMatch(/99-smarty-records|apt-get install/);
+			expect(r.out).not.toMatch(/createcluster\.d|apt-get install/);
 		} finally {
 			rmSync(t, { recursive: true, force: true });
 		}
@@ -478,15 +480,24 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 	});
 
-	// A fake /usr/lib/postgresql under the test root: each major gets initdb and a postgres that reports it.
+	// S4: the test root and its PostgreSQL tree, 0755 whatever the umask (test mode: owned by the test user).
+	const protect = (root: string) => {
+		const walk = (p: string) => {
+			chmodSync(p, 0o755);
+			if (statSync(p).isDirectory()) for (const n of readdirSync(p)) walk(join(p, n));
+		};
+		for (const d of [root, join(root, "usr"), join(root, "usr/lib")]) if (existsSync(d)) chmodSync(d, 0o755);
+		if (existsSync(join(root, "usr/lib/postgresql"))) walk(join(root, "usr/lib/postgresql"));
+	};
+	// A fake /usr/lib/postgresql under the test root: each major gets initdb and postgres (never run by the script).
 	const pgTree = (root: string, majors: string[]) => {
 		for (const n of majors) {
 			const d = join(root, `usr/lib/postgresql/${n}/bin`);
 			mkdirSync(d, { recursive: true });
 			writeFileSync(join(d, "initdb"), "#!/bin/sh\nexit 0\n");
-			writeFileSync(join(d, "postgres"), `#!/bin/sh\necho "postgres (PostgreSQL) ${n}.4"\n`);
-			for (const f of ["initdb", "postgres"]) chmodSync(join(d, f), 0o755);
+			writeFileSync(join(d, "postgres"), "#!/bin/sh\nexit 0\n");
 		}
+		protect(root);
 	};
 
 	it("detects the highest /usr/lib/postgresql/<N>/bin: 17 over 16, and 16 alone", () => {
@@ -517,12 +528,12 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 	});
 
-	it("refuses a --pg-bin whose postgres --version is below 16, before step 1", () => {
+	it("refuses a detected PostgreSQL below 16 (from the directory name), before step 1", () => {
 		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-pg15-"));
 		try {
-			pgTree(t, ["15"]);
+			pgTree(join(t, "root"), ["15"]);
 			writeFileSync(log, "");
-			const r = run([...dryBase, "--pg-bin", join(t, "usr/lib/postgresql/15/bin"), "--dry-run"], fakeEnv);
+			const r = run([...dryBase, "--dry-run"], { ...testEnv(), RECORDS_PAUL_STEPS_TEST_ROOT: join(t, "root") });
 			expect(r.code).toBe(1);
 			expect(r.err).toMatch(/refused: PostgreSQL 15 at \S+ is too old; the record store needs PostgreSQL 16 or newer/);
 			expect(r.out).not.toContain("## 1. ");
@@ -650,12 +661,12 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 	// F12: the real (non-dry) path against fakes that act as root would, under a temp system root.
 	// Root-side install/chown/chmod log their args; install really runs only inside the temp system root.
 	// runuser drops "-u USER --" and runs the rest (the real binaries) as this user.
-	const relayRun = (layout: "plain" | "dest-link" | "config-link", pgFrom: "pg-bin" | "tree16" = "pg-bin", prep?: (root: string, t: string) => void) => {
+	const relayRun = (layout: "plain" | "dest-link" | "config-link", pgFrom: "tree17" | "tree16" = "tree17", prep?: (root: string, t: string) => void) => {
 		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-relay-"));
 		const L = join(t, "calls.log");
 		const bin = join(t, "bin");
-		// --pg-bin (a 17), or no --pg-bin and a detected /usr/lib/postgresql/16 under the test root.
-		const pg = pgFrom === "pg-bin" ? join(t, "pg") : join(t, "root/usr/lib/postgresql/16/bin");
+		// A detected /usr/lib/postgresql/17 or 16 under the test root.
+		const pg = join(t, `root/usr/lib/postgresql/${pgFrom === "tree17" ? "17" : "16"}/bin`);
 		const home = join(t, "home");
 		const outside = join(t, "outside");
 		for (const d of [bin, pg, home, outside, join(t, "pkg/dist/records-service"), join(t, "root/etc/systemd/system")]) mkdirSync(d, { recursive: true });
@@ -669,14 +680,15 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		for (const c of ["chown", "chmod"]) sh(bin, c, `${passUser}\necho "${c} $*" >> "${L}"`);
 		for (const c of ["useradd", "systemctl"]) sh(bin, c, `echo "${c} $*" >> "${L}"`);
 		sh(bin, "python3", `echo "python3 $*" >> "${L}"`);
-		// No TCP listener on the records port; a distro cluster on 5432 only warns.
-		sh(bin, "ss", `echo "ss $*" >> "${L}"; echo 'LISTEN 0 244 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=9,fd=6))'`);
+		// No PostgreSQL TCP listener: only sshd.
+		sh(bin, "ss", `echo "ss $*" >> "${L}"; echo 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=9,fd=3))'`);
 		// The service socket the success check tests with test -S: a real unix socket under the temp root.
 		mkdirSync(join(t, "root/run/test-org-records"), { recursive: true });
 		spawnSync(process.execPath, ["-e", "require('net').createServer().listen(process.argv[1], () => process.exit(0))", join(t, "root/run/test-org-records/records.sock")]);
 		sh(bin, "getent", `echo "${me}:x:1000:1000::${home}:/bin/sh"`);
 		for (const c of ["initdb", "pg_isready", "createdb"]) sh(pg, c, "exit 0");
-		sh(pg, "postgres", `echo "postgres (PostgreSQL) ${pgFrom === "pg-bin" ? "17.2" : "16.10"}"`);
+		// S4: the script never runs postgres (systemd does); any call is logged and fails the tests' call checks.
+		sh(pg, "postgres", `echo "postgres $*" >> "${L}"`);
 		sh(pg, "psql", `for a; do last=$a; done; [ "$last" = "select 1" ] && exit 2; exit 0`);
 		sh(t, "node", `exec "${process.execPath}" "$@"`);
 		writeFileSync(
@@ -693,10 +705,11 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		const digests = ["--bundle-sha256", fileSha(join(t, "pkg/dist/records-service/service-main.mjs")), "--node-sha256", fileSha(join(t, "node"))];
 		const again = (ops = ["--operator", "relay:relay:fabric", "--operator", "importer:github"]) =>
 			run(
-				["--org", "test-org", "--org-user", me, "--node", join(t, "node"), ...(pgFrom === "pg-bin" ? ["--pg-bin", pg] : []), "--package-root", join(t, "pkg"), ...digests, ...ops],
+				["--org", "test-org", "--org-user", me, "--node", join(t, "node"), "--package-root", join(t, "pkg"), ...digests, ...ops],
 				{ ...testEnv(bin), RECORDS_PAUL_STEPS_TEST_ROOT: `${t}/root` },
 			);
 		writeFileSync(L, "");
+		protect(join(t, "root"));
 		prep?.(join(t, "root"), t);
 		const r = again();
 		const calls = readFileSync(L, "utf8").split("\n").filter(Boolean);
@@ -779,12 +792,12 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(run([...base, "--operator", "importer:x:y", "--operator", "importer:x:y", "--print", "hba"]).code).toBe(0);
 	});
 
-	// F20: a full fake tree for another major, copied from the 16 one relayRun builds, with its own postgres --version.
+	// F20: a full fake tree for another major, copied from the 16 one relayRun builds.
 	const pgBase = (root: string) => join(root, "usr/lib/postgresql");
 	const cloneMajor = (root: string, n: string, move = false) => {
 		cpSync(join(pgBase(root), "16"), join(pgBase(root), n), { recursive: true });
 		if (move) rmSync(join(pgBase(root), "16"), { recursive: true });
-		writeFileSync(join(pgBase(root), n, "bin/postgres"), `#!/bin/bash\necho "postgres (PostgreSQL) ${n}.1"\n`);
+		protect(root);
 	};
 	const dataDir = (root: string) => join(root, "var/lib/test-org-records/pg");
 	const existingCluster = (root: string, major = "16") => {
@@ -852,13 +865,25 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 	});
 
-	it.skipIf(process.getuid?.() === 0)("F20: a --pg-bin of 17 against an existing 16 cluster is refused before step 1", () => {
-		const { t, r, calls } = relayRun("plain", "pg-bin", (root) => existingCluster(root));
+	it.skipIf(process.getuid?.() === 0)("S4: a PostgreSQL tree with a group-writable ancestor or a symlinked binary is refused before anything runs", () => {
+		const { t, r, calls, again, L } = relayRun("plain", "tree16", (root) => chmodSync(join(root, "usr/lib"), 0o775));
 		try {
-			expect(r.code).not.toBe(0);
-			expect(r.err).toContain(refusal16(join(t, "root"), `--pg-bin ${join(t, "pg")} is PostgreSQL 17`));
-			expect(r.out).not.toContain("## 1. ");
+			const root = join(t, "root");
+			expect(r.code).toBe(1);
+			expect(r.err).toContain(`refused: ${root}/usr/lib is not root-owned and protected; nothing was changed`);
+			expect(r.out).not.toMatch(/^## \d/m);
 			expect(calls).toEqual([]);
+			expect(existsSync(join(root, "opt"))).toBe(false);
+			// A symlinked binary is refused too, without following it.
+			chmodSync(join(root, "usr/lib"), 0o755);
+			const bin16 = join(pgBase(root), "16/bin");
+			rmSync(join(bin16, "psql"));
+			symlinkSync("/bin/true", join(bin16, "psql"));
+			writeFileSync(L, "");
+			const linked = again();
+			expect(linked.code).toBe(1);
+			expect(linked.err).toContain(`refused: ${bin16}/psql is not root-owned and protected; nothing was changed`);
+			expect(readFileSync(L, "utf8")).toBe("");
 		} finally {
 			rmSync(t, { recursive: true, force: true });
 		}
@@ -910,8 +935,10 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			// The fake reports the service active before enable: the new binaries need a restart; the reload always follows a grant.
 			expect(calls).toContain("systemctl restart test-org-records.service");
 			expect(calls).toContain("systemctl reload test-org-records.service");
-			expect(r.out).toMatch(/^WARNING: PostgreSQL TCP listeners on other ports/m);
-			expect(r.out).toMatch(/^OK: no TCP listener on :5433$/m);
+			expect(r.out).toMatch(/^OK: no PostgreSQL TCP listener on :5432 or :5433$/m);
+			expect(r.out).toMatch(/^WAL \(info only\): /m);
+			expect(r.out).toMatch(/^OK: \S+\/usr\/lib\/postgresql\/17\/bin, its binaries and every ancestor are owned by uid \d+/m);
+			expect(calls.filter((c) => c.startsWith("postgres "))).toEqual([]);
 			writeFileSync(L, "");
 			const second = again();
 			expect(second.code, second.err).toBe(0);
@@ -923,15 +950,48 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 	});
 
-	it.skipIf(process.getuid?.() === 0)("P2-1: a TCP listener on the records port fails the success checks", () => {
+	it.skipIf(process.getuid?.() === 0)("F3: a run interrupted before the restart leaves restart-pending; the rerun restarts and clears it", () => {
+		// The fake systemctl fails `restart` while <t>/fail-restart exists: the run stops after the copy, before the restart.
+		const { t, r, again, L } = relayRun("plain", "tree17", (_root, tt) => {
+			writeFileSync(join(tt, "fail-restart"), "");
+			writeFileSync(join(tt, "bin/systemctl"), `#!/bin/bash\necho "systemctl $*" >> "${tt}/calls.log"\n[ "$1" = restart ] && [ -e "${tt}/fail-restart" ] && exit 1\nexit 0\n`);
+		});
+		try {
+			const marker = `${t}/root/var/lib/test-org-records/restart-pending`;
+			expect(r.code).toBe(1);
+			expect(r.err).toMatch(/FAILED at step 7 .*systemctl restart test-org-records\.service/);
+			expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n");
+			expect(statSync(marker).mode & 0o777).toBe(0o600);
+			// Rerun with identical inputs: node, bundle and units now match, but the marker forces the restart.
+			rmSync(join(t, "fail-restart"));
+			writeFileSync(L, "");
+			const second = again();
+			expect(second.code, second.err + second.out).toBe(0);
+			expect(second.out).toContain(`= ${t}/root/opt/test-org-records/service-main.mjs matches`);
+			expect(readFileSync(L, "utf8")).toContain("systemctl restart test-org-records.service\n");
+			expect(existsSync(marker)).toBe(false);
+			// Counterexample: no marker and matching bytes, so no restart.
+			writeFileSync(L, "");
+			const third = again();
+			expect(third.code, third.err).toBe(0);
+			expect(readFileSync(L, "utf8")).not.toContain("systemctl restart");
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("P2-1: a TCP listener on the records port or on :5432 fails the success checks", () => {
 		const { t, again, bin } = relayRun("plain");
 		try {
-			writeFileSync(join(bin, "ss"), "#!/bin/bash\necho 'LISTEN 0 244 127.0.0.1:5433 0.0.0.0:*'\n");
-			const r = again();
-			expect(r.code).toBe(1);
-			expect(r.err).toContain("a TCP listener on 127.0.0.1:5433");
-			expect(r.err).toMatch(/FAILED at step 9 \(Verification\) .*check failed \(no TCP listener on :5433\)/);
-			expect(r.out).not.toContain("C10_RECORDS_INSTALLED org=");
+			for (const port of ["5433", "5432"]) {
+				writeFileSync(join(bin, "ss"), `#!/bin/bash\necho 'LISTEN 0 244 127.0.0.1:${port} 0.0.0.0:*'\n`);
+				const r = again();
+				expect(r.code, port).toBe(1);
+				expect(r.err).toContain(`a PostgreSQL TCP listener exists on :${port}`);
+				expect(r.err).toMatch(/FAILED at step 9 \(Verification\) .*check failed \(no PostgreSQL TCP listener on :5432 or :5433\)/);
+				expect(r.out).not.toContain("C10_RECORDS_INSTALLED org=");
+			}
 		} finally {
 			rmSync(t, { recursive: true, force: true });
 		}
@@ -944,8 +1004,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.code).toBe(1);
 			expect(r.err).toMatch(/^records-paul-steps: FAILED at step 2 \(Prerequisites: .*\) \(line \d+\): apt-get install postgresql left no /m);
 			expect(readFileSync(log, "utf8")).toBe("apt-get install -y postgresql\n");
-			expect(readFileSync(join(t, "root/etc/postgresql-common/createcluster.d/99-smarty-records.conf"), "utf8")).toMatch(/^create_main_cluster = false$/m);
-			expect(readdirSync(join(t, "root/etc/postgresql-common/createcluster.d"))).toEqual(["99-smarty-records.conf"]);
+			expect(readFileSync(join(t, "root/etc/postgresql-common/createcluster.d/zz-test-org-records.conf"), "utf8")).toMatch(/^create_main_cluster = false$/m);
+			expect(readdirSync(join(t, "root/etc/postgresql-common/createcluster.d"))).toEqual(["zz-test-org-records.conf"]);
 		} finally {
 			writeFileSync(log, "");
 			rmSync(t, { recursive: true, force: true });

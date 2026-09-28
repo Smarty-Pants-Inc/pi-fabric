@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { issuePrincipal, migrateService, normalizeServiceConfig, OPERATOR_ROLES, RecordsServer, type OperatorRole } from "./server.js";
+import { issueCredentialFile, migrateService, normalizeServiceConfig, OPERATOR_ROLES, RecordsServer, type OperatorRole } from "./server.js";
 
 /**
  * The records service's command line (C10), run as the org's `<org>-records` OS user:
@@ -53,11 +53,8 @@ const main = async (argv: string[]): Promise<number> => {
       return 2;
     }
     const name = flag(argv, "--name");
-    const credential = await issuePrincipal(config, id, role as OperatorRole, name, undefined, argv.includes("--reissue"));
-    fs.mkdirSync(path.dirname(out), { recursive: true });
-    // O_EXCL: an existing credential file is never overwritten.
     // The role and provenance go with the token, so the installer can verify a file before reuse or delivery.
-    fs.writeFileSync(out, `${JSON.stringify({ ...credential, role, issuedBy: "installer" })}\n`, { mode: 0o600, flag: "wx" });
+    await issueCredentialFile(config, id, role as OperatorRole, out, { ...(name ? { name } : {}), reissue: argv.includes("--reissue") });
     process.stdout.write(`issued ${id} to ${out}\n`);
     return 0;
   }

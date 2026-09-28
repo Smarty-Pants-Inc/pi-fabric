@@ -3,7 +3,7 @@
 Generated on Dev1 (no PostgreSQL installed yet), from a copy of the script at `/run/user/1000/smarty-step.sh` (the root step runs it as `/run/smarty-step.sh`), with the digests of a clean `bun run build`:
 
 ```
-smarty-step.sh --org smarty-pants --org-user paul --operator relay:relay:fabric --package-root <package> --node <node> --bundle-sha256 a5a6bb0a9a4a28920a2b1a4686e9b664996715a4cd7559fae0105c5682705fbe --node-sha256 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c --dry-run
+smarty-step.sh --org smarty-pants --org-user paul --operator relay:relay:fabric --package-root <package> --node <node> --bundle-sha256 9f604520d7d6fea394e67ef7d718c5cf3cc3d7a955287473976ef466827f55c2 --node-sha256 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c --dry-run
 ```
 
 ```
@@ -11,22 +11,24 @@ smarty-step.sh --org smarty-pants --org-user paul --operator relay:relay:fabric 
 ## 0. Stage and verify node and the bundle
 ? STAGE=$(mktemp -d /run/smarty-pants-records-stage.XXXXXX)  (root-only, 0700; removed on exit)
 ? umask 077; cat <node> > /run/smarty-pants-records-stage.XXXXXX/node; cat <package>/dist/records-service/service-main.mjs > /run/smarty-pants-records-stage.XXXXXX/service-main.mjs  (each source read once)
-? sha256sum /run/smarty-pants-records-stage.XXXXXX/node /run/smarty-pants-records-stage.XXXXXX/service-main.mjs  (must equal 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c and a5a6bb0a9a4a28920a2b1a4686e9b664996715a4cd7559fae0105c5682705fbe; otherwise refused, nothing changed)
+? sha256sum /run/smarty-pants-records-stage.XXXXXX/node /run/smarty-pants-records-stage.XXXXXX/service-main.mjs  (must equal 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c and 9f604520d7d6fea394e67ef7d718c5cf3cc3d7a955287473976ef466827f55c2; otherwise refused, nothing changed)
 digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
 ## 1. OS user smarty-pants-records
 + useradd --system --user-group --no-create-home --home-dir /var/lib/smarty-pants-records --shell /usr/sbin/nologin smarty-pants-records
 ## 2. Prerequisites: PostgreSQL <detected after install>, node and the package under /opt/smarty-pants-records
   note: the distro package postgresql 16+257build1.1. Unless disabled, it creates a cluster postgresql@<N>-main;
         an existing one stays as it is: this setup does not touch it (disable it yourself if you do not use it).
-  /etc/postgresql-common/createcluster.conf is absent: a drop-in stops apt from creating a new main cluster
 + install -d -m 0755 -o root -g root /etc/postgresql-common/createcluster.d
-+ write /etc/postgresql-common/createcluster.d/99-smarty-records.conf (mode 0644, owner root:root)
++ write /etc/postgresql-common/createcluster.d/zz-smarty-pants-records.conf (mode 0644, owner root:root)
     | # Written by records-paul-steps.sh: no new distro main cluster on install (it would listen on TCP).
     | create_main_cluster = false
 + apt-get install -y postgresql
 = PostgreSQL <detected after install>: the highest /usr/lib/postgresql/<N>/bin with initdb and postgres
+? refuse unless /usr/lib/postgresql/<N>/bin, its binaries and every ancestor are root-owned, not symlinks, not group- or world-writable
 + install -d -m 0755 -o root -g root /opt/smarty-pants-records
+? add smarty-pants-records.service to /var/lib/smarty-pants-records/restart-pending (root, 0600; restart pending until it restarts)
 + install -m 0755 -o root -g root /run/smarty-pants-records-stage.XXXXXX/node /opt/smarty-pants-records/node
+? add smarty-pants-records.service to /var/lib/smarty-pants-records/restart-pending (root, 0600; restart pending until it restarts)
 + install -m 0644 -o root -g root /run/smarty-pants-records-stage.XXXXXX/service-main.mjs /opt/smarty-pants-records/service-main.mjs
 ? find /opt/smarty-pants-records -type l  (must print nothing)
 ? runuser -u smarty-pants-records -- /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs  (must exit 2, usage: it runs with no external modules)
@@ -63,13 +65,12 @@ digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
     | synchronous_commit = on
     | fsync = on
     | track_commit_timestamp = on
-    | archive_mode = on
-    | # WAL-G replaces archive_command in its own authorized step. Until then archiving fails
-    | # loudly and PostgreSQL keeps every WAL segment in pg_wal: no WAL is thrown away.
-    | archive_command = '/bin/false'
-    | archive_timeout = 60
-    | # LIMIT: WAL accumulates until the WAL-G archive step; run it before sustained use and watch disk.
-    | # (max_wal_size is deliberately not set: it cannot bound WAL that is waiting to be archived.)
+    | # P2-5: bounded bootstrap WAL. The WAL-G step turns archiving on in its own
+    | # authorized change; until then no segment waits to be archived, so pg_wal stays near max_wal_size.
+    | archive_mode = off
+    | max_wal_size = 1GB
+    | wal_keep_size = 0
+    | # LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
 + _append /var/lib/smarty-pants-records/pg/postgresql.conf 'include_dir = '\''conf.d'\'''
 ## 5. Service config
 + write /etc/smarty-pants-records/service.json (mode 0640, owner root:smarty-pants-records)
@@ -85,6 +86,8 @@ digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
     |   "statusFile": "/var/lib/smarty-pants-records/status/smarty-pants.status.json"
     | }
 ## 6. systemd units
+? add smarty-pants-records-pg.service to /var/lib/smarty-pants-records/restart-pending (root, 0600; restart pending until it restarts)
+? add smarty-pants-records.service to /var/lib/smarty-pants-records/restart-pending (root, 0600; restart pending until it restarts)
 + write /etc/systemd/system/smarty-pants-records-pg.service (mode 0644, owner root:root)
     | [Unit]
     | Description=PostgreSQL record store for smarty-pants
@@ -136,13 +139,15 @@ digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
     | WantedBy=multi-user.target
 + systemctl daemon-reload
 + systemctl enable --now smarty-pants-records-pg.service
+? remove smarty-pants-records-pg.service from /var/lib/smarty-pants-records/restart-pending (rm it when empty)
 ? wait until /usr/lib/postgresql/<N>/bin/pg_isready -h /run/smarty-pants-records-pg -p 5433 succeeds
 ## 7. Database, role, migrations
 + runuser -u smarty-pants-records -- '/usr/lib/postgresql/<N>/bin/createdb' -h /run/smarty-pants-records-pg -p 5433 -U postgres records
 + runuser -u smarty-pants-records -- '/usr/lib/postgresql/<N>/bin/psql' -X -v ON_ERROR_STOP=1 -h /run/smarty-pants-records-pg -p 5433 -U postgres -d records -c 'DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='\''records_service'\'') THEN CREATE ROLE records_service LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT; END IF; END $$'
 + runuser -u smarty-pants-records -- /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs migrate --config /etc/smarty-pants-records/service.json
 + systemctl enable --now smarty-pants-records.service
-? if node, the bundle or smarty-pants-records.service changed and it was already active: + systemctl restart smarty-pants-records.service, then wait up to 30 s for /run/smarty-pants-records/records.sock
+? if /var/lib/smarty-pants-records/restart-pending lists smarty-pants-records.service (node, the bundle or its unit changed, now or in an interrupted run) and it was already active: + systemctl restart smarty-pants-records.service, then wait up to 30 s for /run/smarty-pants-records/records.sock
+? remove smarty-pants-records.service from /var/lib/smarty-pants-records/restart-pending (rm it when empty)
 ## 8. Operator principals
 ? /opt/smarty-pants-records/node -e "$(smarty-step.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json relay relay:fabric check  (refused if relay:fabric holds another role)
 + /opt/smarty-pants-records/node -e "$(smarty-step.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json relay relay:fabric
@@ -160,7 +165,8 @@ digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
 ? runuser -u smarty-pants-records -- '/usr/lib/postgresql/<N>/bin/pg_isready' -h /run/smarty-pants-records-pg -p 5433  (PostgreSQL ready)
 ? runuser -u smarty-pants-records -- python3 -c 'import ctypes; ctypes.CDLL(None).getsockopt'  (peer audit (python3 ctypes))
 ? test -S /run/smarty-pants-records/records.sock  (service socket)
-? ss -Hltnp  (no TCP listener on :5433; PostgreSQL TCP listeners on other ports only warn)
+? ss -Hltnp  (no PostgreSQL TCP listener: none on :5432 or :5433, no postgres process on any port; else fail)
+? du -sh /var/lib/smarty-pants-records/pg/pg_wal  (info only: WAL size; bounded by max_wal_size = 1GB until the WAL-G step)
 
 Fabric: point the org's agents at the service socket in .pi/fabric.json:
   { "records": { "enabled": true, "socket": "/run/smarty-pants-records/records.sock" } }

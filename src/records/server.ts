@@ -119,13 +119,13 @@ export const OPERATOR_ROLES: readonly OperatorRole[] = ["importer", "mirror", "r
  * reserved operator namespace (never a session or actor id, which only registration creates),
  * and the role is recorded with it in the same statement.
  */
-export const issuePrincipal = async (config: RecordsServiceConfig, id: string, role: OperatorRole, name?: string, pool?: ClientPool, reissue = false): Promise<{ id: string; token: string }> => {
+export const issuePrincipal = async (config: RecordsServiceConfig, id: string, role: OperatorRole, name?: string, pool?: ClientPool, reissue = false, presetToken?: string): Promise<{ id: string; token: string }> => {
   if (!/^[A-Za-z0-9._@:-]{1,128}$/.test(id) || SELF_REGISTERED.test(id)) throw new Error(`invalid operator principal id ${JSON.stringify(id)}: a session or actor id registers itself`);
   if (!OPERATOR_ROLES.includes(role)) throw new Error(`invalid operator role ${JSON.stringify(role)}`);
   const owner = pool ?? await openPool(config.database);
   const store = new RecordStore(owner, { org: config.org, origin: config.origin });
   try {
-    const token = newToken();
+    const token = presetToken ?? newToken();
     // reissue: an issuance interrupted after its commit (the credential file never written) is
     // recovered by rotating that operator principal's token. Only the same id AS AN OPERATOR WITH
     // THE SAME ROLE is rotated; a registered principal or another role is never touched.
@@ -143,6 +143,31 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, r
   }
 };
 
+/**
+ * Issue (or, with reissue, rotate) an operator credential into `out`, never losing a token: the
+ * new credential is written to a 0600 temp file beside `out` FIRST, the database is changed
+ * second, and the temp file is renamed over `out` last. A database failure removes the temp file
+ * and leaves `out` and the old token as they were. Without reissue an existing `out` is refused
+ * before the database is touched.
+ */
+export const issueCredentialFile = async (
+  config: RecordsServiceConfig, id: string, role: OperatorRole, out: string,
+  options: { name?: string; reissue?: boolean; pool?: ClientPool } = {},
+): Promise<void> => {
+  if (!options.reissue && fs.existsSync(out)) throw new Error(`${out} exists; pass --reissue to rotate its token`);
+  fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
+  const token = newToken();
+  const temp = `${out}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify({ id, token, role, issuedBy: "installer" })}\n`, { mode: 0o600, flag: "wx" });
+  try {
+    await issuePrincipal(config, id, role, options.name, options.pool, options.reissue === true, token);
+  } catch (error) {
+    fs.rmSync(temp, { force: true });
+    throw error;
+  }
+  fs.renameSync(temp, out);
+};
+
 type Handler = (principal: RecordsPrincipal, args: Record<string, unknown>, signal: AbortSignal, peer?: PeerInfo) => Promise<unknown>;
 
 /** One principal's token seen from a second live process within this window raises the theft alarm. */
@@ -155,7 +180,6 @@ export class RecordsServer {
   readonly watchdog: RecordsWatchdog;
   readonly statusFile: string | undefined;
   readonly #life = new AbortController();
-  readonly #principals = new Map<string, RecordsPrincipal>();
   readonly #handlers: Record<string, Handler>;
   #server: net.Server | undefined;
   readonly #connections = new Set<net.Socket>();
@@ -287,7 +311,6 @@ export class RecordsServer {
       return (await client.query<{ ok: boolean }>("SELECT principal_reenroll($1, $2, $3) AS ok", [id, hashToken(nonce), hashToken(token)])).rows[0]!.ok;
     }, "", signal);
     if (!enrolled) throw new RecordsServiceError(`records principal ${id} is already registered; use its credential`, "RECORD_PRINCIPAL_TAKEN");
-    this.#principals.clear();
     return { id, token };
   }
 
@@ -295,8 +318,8 @@ export class RecordsServer {
   async authenticate(token: unknown): Promise<RecordsPrincipal> {
     if (typeof token !== "string" || !token) throw new RecordsServiceError("records call needs a token", "RECORD_UNAUTHENTICATED");
     const hash = hashToken(token);
-    const cached = this.#principals.get(hash);
-    if (cached) return cached;
+    // No cache: every call reads the current token hash (one indexed lookup), so a reissued or
+    // removed token is refused at once by the running service, and a role reload applies at once.
     const row = await this.store.transaction(async (client) =>
       (await client.query<{ id: string; name: string | null; issued_by: string; role: string | null }>("SELECT id, name, issued_by, role FROM principals WHERE token_hash = $1", [hash])).rows[0], "", this.#life.signal);
     if (!row) throw new RecordsServiceError("records token is not known to this service", "RECORD_UNAUTHENTICATED");
@@ -305,7 +328,6 @@ export class RecordsServer {
       // A role needs the service config's grant AND the installer's issue for that role.
       importer: this.#holds(row, "importer"), mirror: this.#holds(row, "mirror"), relay: this.#holds(row, "relay"),
     };
-    this.#principals.set(hash, principal);
     return principal;
   }
 
@@ -416,10 +438,9 @@ export class RecordsServer {
     }).catch(() => undefined);
   }
 
-  /** Apply a new role policy (SIGHUP): cached principals are dropped and re-read. */
+  /** Apply a new role policy (SIGHUP); authentication reads it on the next call. */
   reloadRoles(roles: RecordsServiceConfig["roles"]): void {
     (this.config as { roles: RecordsServiceConfig["roles"] }).roles = roles;
-    this.#principals.clear();
   }
 
   /** How many client connections are open (status, and tests that must see a disconnect land). */

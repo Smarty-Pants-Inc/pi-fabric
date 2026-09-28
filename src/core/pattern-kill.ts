@@ -12,6 +12,10 @@
 // `kill -0`, a PID file (`kill $(cat run.pid)`), a variable of unknown origin (`kill $PID` after
 // `PID=$!`), `bin/smarty-reap`, and `pgrep` alone. Quoted text is data: `echo "never use pkill"`,
 // `grep -n pkill` and a quoted-delimiter heredoc pass.
+// Scope: this catches the kill-by-pattern forms agents actually write, against mistakes and
+// injected content (threat model A, smarty-dev#820). It is not a sandbox against a deliberately
+// evasive same-uid process: a script file, a binary or `python -c 'os.kill(…)'` can still kill by
+// pattern; per-agent OS users (#820) are that boundary.
 // ponytail: a small shell reader, not a shell. A kill hidden in a script file, an alias or a
 // variable holding a command passes; revisit if agents route around it.
 
@@ -210,7 +214,7 @@ type Verdict = { blocked: boolean; lookup: boolean };
 type Command = { words: Word[]; redirects: Word[]; heredocs: Array<{ body: string; quoted: boolean }> };
 
 /** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
-function unwrap(stageWords: Word[], scripts: string[]): { words: Word[]; fedByXargs: boolean } {
+function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>): { words: Word[]; fedByXargs: boolean } {
   let words = stageWords;
   let fedByXargs = false;
   for (;;) {
@@ -227,10 +231,13 @@ function unwrap(stageWords: Word[], scripts: string[]): { words: Word[]; fedByXa
       if (flag === "--") { words = words.slice(1); break; }
       let value: string | undefined;
       let takes = false;
+      // review/astra F7 on #105: remember that the option is env's split string (-S), whatever its spelling.
+      let split = false;
       if (flag.startsWith("--")) {
         const [key, inline] = flag.split(/=(.*)/s);
         takes = inline === undefined && options.includes(key!);
         value = inline;
+        split = key === "--split-string";
       } else {
         // review/astra F4 on #105: read a short cluster from its start. The first letter that takes a
         // value takes the rest of the word (`-uroot`), or the next word when nothing is left (`-Eu paul`).
@@ -238,12 +245,13 @@ function unwrap(stageWords: Word[], scripts: string[]): { words: Word[]; fedByXa
           if (!options.includes(`-${flag[at]}`)) continue;
           value = flag.slice(at + 1) || undefined;
           takes = value === undefined;
-          if (prefix === "env" && flag[at] === "S" && value) scripts.push(value);
+          split = flag[at] === "S";
           break;
         }
       }
-      if (takes) value = words[1]?.text;
-      if (prefix === "env" && (flag === "-S" || flag.startsWith("--split-string")) && value) scripts.push(value);
+      const source = takes ? words[1] : words[0];
+      if (takes) value = source?.text;
+      if (prefix === "env" && split && value && source) scripts.push({ text: value, source });
       words = words.slice(takes ? 2 : 1);
     }
     if (prefix === "timeout" && words[0]) words = words.slice(1);
@@ -286,9 +294,10 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       let captured = false;
       for (const sub of subs) captured = nested(sub).lookup || captured;
       const scripts: Array<{ text: string; feeds: boolean }> = [];
-      const envScripts: string[] = [];
+      const envScripts: Array<{ text: string; source: Word }> = [];
       const { words, fedByXargs } = unwrap(stage.words, envScripts);
-      for (const text of envScripts) scripts.push({ text, feeds: fed });
+      // review/astra F6 on #105: an `env -S` script gets the lookups expanded into its word.
+      for (const { text, source } of envScripts) scripts.push({ text, feeds: feedsLookup(source) });
       const name = words[0]?.text.split("/").pop() ?? "";
       const args = words.slice(1);
       let lookup = LOOKUPS.has(name);
@@ -311,7 +320,12 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
         });
         if (!probe && (byLookup || (fedByXargs && pipeFeed))) verdict.blocked = true;
       }
-      if (SHELLS.has(name) || name === "ssh") for (const heredoc of stage.heredocs) scripts.push({ text: heredoc.body, feeds: fed });
+      // review/astra F6 on #105: a heredoc script gets the lookups its unquoted body expands, even
+      // inside quotes there.
+      if (SHELLS.has(name) || name === "ssh") for (const heredoc of stage.heredocs) {
+        const feeds = fed || (!heredoc.quoted && heredocSubs(heredoc.body).some((sub) => scan(sub, depth + 1).lookup));
+        scripts.push({ text: heredoc.body, feeds });
+      }
       if (SHELLS.has(name)) {
         const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg.text));
         const payload = flag >= 0 ? args[flag + 1] : undefined;

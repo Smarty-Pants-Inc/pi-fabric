@@ -92,6 +92,15 @@ const refused: Array<[string, string]> = [
   ["ps piped into xargs kill", `ps -o pid= -p "$PID" | xargs kill`],
   ["a PID list from grep alone", `kill $(grep -l worker /proc/*/cmdline | cut -d/ -f3)`],
   ["a captured lookup killed in a substitution", `P=$(pgrep -f worker); echo "$(kill $P)"`],
+  // review/astra F6 on #105: lookups expanded into an env -S script or a heredoc script.
+  ["env -S \"kill $(pgrep …)\"", `env -S "kill $(pgrep -f worker)"`],
+  ["env --split-string \"kill $(pgrep …)\"", `env --split-string "kill $(pgrep -f worker)"`],
+  ["env --split-string=\"kill $(pgrep …)\"", `env --split-string="kill $(pgrep -f worker)"`],
+  ["an unquoted heredoc to bash with a quoted lookup", `bash <<EOF\nkill '$(pgrep -f worker)'\nEOF`],
+  ["an unquoted heredoc to ssh with a quoted lookup", `ssh HOST <<EOF\nkill '$(pgrep -f worker)'\nEOF`],
+  // review/astra F7 on #105: env's split string in a short cluster.
+  ["env -iS 'pkill …'", `env -iS 'pkill -f worker'`],
+  ["env -iS'pkill …'", `env -iS'pkill -f worker'`],
   ["a grep-selected PID", `kill $(ps aux | grep '[w]orker' | awk '{print $2}')`],
 ];
 
@@ -134,6 +143,15 @@ const allowed: Array<[string, string]> = [
   // Counterexamples for review/astra on #105.
   ["pgrep piped into a literal kill", `pgrep -f worker | kill 4242`],
   ["pgrep, then a PID file into xargs kill on the next line", `pgrep -fl worker\ncat run.pid | xargs kill`],
+  ["env -S with a literal PID", `env -S "kill 4242"`],
+  ["env -S with a PID file", `env -S "kill $(cat run.pid)"`],
+  ["env -iS with a literal PID", `env -iS 'kill 4242'`],
+  ["env -i with another command", `env -i PATH=/usr/bin ls -l`],
+  ["an unquoted heredoc to bash with a PID file", `bash <<EOF\nkill '$(cat run.pid)'\nEOF`],
+  ["an unquoted heredoc to bash with a literal PID", `bash <<EOF\nkill 4242\nEOF`],
+  ["a quoted-delimiter heredoc to bash with a quoted lookup (inert)", `bash <<'EOF'\nkill '$(pgrep -f worker)'\nEOF`],
+  ["a quoted-delimiter heredoc note to cat", `cat <<'EOF'\nkill '$(pgrep -f worker)'\nEOF`],
+  ["a lookup expanded into a heredoc to cat", `cat <<EOF > note.md\nworkers: '$(pgrep -f worker)'\nEOF`],
   ["kill $(cat run.pid)", `kill $(cat run.pid)`],
   ["kill $(< run.pid)", `kill $(< run.pid)`],
   ["kill -9 $PID", `kill -9 $PID`],

@@ -63,6 +63,7 @@ export class FabricState {
   #runtime: FabricRuntimeState | undefined;
   #activatingRuntime: FabricRuntimeState | undefined;
   #activation: Promise<FabricRuntimeState> | undefined;
+  #recordsWake: (() => Promise<void>) | undefined;
   #activationGeneration: number | undefined;
   #config: FabricConfig | undefined;
   #kernelReloadRequired = false;
@@ -259,7 +260,13 @@ export class FabricState {
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
     return this.#current()?.nextRootInbox(session, idle);
   }
-  /** The records inbox message for this turn, if any (built in the lazy runtime; smarty-dev#754). */
+  /** Give the records watchdog the host's gated idle wake (F21). */
+  setRecordsWake(wake: (() => Promise<void>) | undefined): void {
+    this.#recordsWake = wake;
+    const current = this.#current();
+    if (current) current.recordsWake = wake;
+  }
+
   async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
     return this.#current()?.nextRecordsInboxMessage(entries);
   }
@@ -480,6 +487,7 @@ export class FabricState {
         await candidate.settleComponents?.();
         assertCurrent();
         this.#activatingRuntime = candidate;
+        candidate.recordsWake = this.#recordsWake;
         candidate.widgetDismissedAt = this.#widgetDismissedAt;
         await this.#activationHook?.(context);
         assertCurrent();

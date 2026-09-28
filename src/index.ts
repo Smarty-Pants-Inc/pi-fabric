@@ -586,7 +586,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       if (!idle()) return;
       const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
-      if (inbox?.events.length && idle()) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+      if (inbox?.events.length && idle()) {
+        pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+        return;
+      }
+      // Records: the same gate, re-checked after the read (F21).
+      if (!idle()) return;
+      const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
+      if (records && idle()) pi.sendMessage(records, { deliverAs: "followUp", triggerTurn: true });
     } catch {
       // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
     } finally {
@@ -620,7 +627,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       }
     }
     await state.bootstrap(context);
-    // Inert until Pi queues a triggered message behind a live prompt preflight.
+    // Inert until Pi queues a triggered message behind a live prompt preflight (also for records, F21).
+    state.setRecordsWake(hostQueuesTriggeredBehindPreflight() ? () => wakeIdleMain() : undefined);
     if (hostQueuesTriggeredBehindPreflight()) {
       inboxWake.timer = setInterval(() => void wakeIdleMain(), inboxWakeMs());
       inboxWake.timer.unref?.();

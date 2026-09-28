@@ -332,6 +332,9 @@ export class FabricRuntimeState {
     return idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session);
   }
 
+  /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
+  recordsWake: (() => Promise<void>) | undefined;
+
   /** The records addressed to this root past its processing cursor (smarty-dev#754 C4). */
   async nextRecordsInbox(session: RecordsInboxSession): Promise<RecordsInboxBatch | undefined> {
     if (!this.#openRecords) return undefined;
@@ -993,11 +996,10 @@ export class FabricRuntimeState {
           publisher: { publish: (input) => mesh.publish({ ...input, from: recordsIdentity }) },
           ...(root ? {
             names: recordsNames,
-            wake: async () => {
-              const service = await this.#records;
-              const batch = await service?.inbox?.next(recordsInboxSession(context.sessionManager.getEntries()));
-              if (batch?.records.length) this.pi.sendMessage(recordsInboxMessage(batch.records), { deliverAs: "followUp", triggerTurn: true });
-            },
+            // The watchdog never starts a turn itself (F21): it asks the host's session-owned idle
+            // gate (#107), which delivers only to an idle, armed Main with no prompt preflight.
+            // Without that gate, records wait for the next turn (before_agent_start delivers them).
+            wake: async () => { await this.recordsWake?.(); },
           } : {}),
         })).catch((error: unknown) => {
           // A failed open (the database is down) is retried at the next use, not cached.

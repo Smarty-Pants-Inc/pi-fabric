@@ -5,6 +5,12 @@ import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
 import { normalizeRecordsConfig } from "../src/records/config.js";
+import pg from "pg";
+import { RemoteRecords } from "../src/records/client.js";
+import { SERVICE_ROLE } from "../src/records/schema.js";
+import { issueCredentialFile, normalizeServiceConfig, RecordsServer } from "../src/records/server.js";
+import type { ClientPool } from "../src/records/store.js";
+import { postgresBin, startPostgres } from "./helpers/postgres.js";
 
 const script = resolve(__dirname, "../scripts/records-paul-steps.sh");
 const base = ["--org", "test-org", "--org-user", "nobodyuser", "--node", "/usr/bin/node"];
@@ -675,7 +681,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 	// F12: the real (non-dry) path against fakes that act as root would, under a temp system root.
 	// Root-side install/chown/chmod log their args; install really runs only inside the temp system root.
 	// runuser drops "-u USER --" and runs the rest (the real binaries) as this user.
-	const relayRun = (layout: "plain" | "dest-link" | "config-link", pgFrom: "tree17" | "tree16" = "tree17", prep?: (root: string, t: string) => void) => {
+	const relayRun = (layout: "plain" | "dest-link" | "config-link", pgFrom: "tree17" | "tree16" = "tree17", prep?: (root: string, t: string) => void, real?: { bundle: string; port: number }) => {
 		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-relay-"));
 		const L = join(t, "calls.log");
 		const bin = join(t, "bin");
@@ -705,7 +711,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		sh(pg, "postgres", `echo "postgres $*" >> "${L}"`);
 		sh(pg, "psql", `for a; do last=$a; done; [ "$last" = "select 1" ] && exit 2; exit 0`);
 		sh(t, "node", `exec "${process.execPath}" "$@"`);
-		writeFileSync(
+		if (real) cpSync(real.bundle, join(t, "pkg/dist/records-service/service-main.mjs"));
+		else writeFileSync(
 			join(t, "pkg/dist/records-service/service-main.mjs"),
 			`import fs from "node:fs";\nconst a = process.argv.slice(2), f = (n) => a[a.indexOf(n) + 1];\nif (!a.length) process.exit(2);\nif (a[0] === "issue") fs.writeFileSync(f("--out"), JSON.stringify({ id: f("--id"), token: "tok-" + f("--id"), role: f("--role"), issuedBy: "installer" }) + "\\n", { mode: 0o600, flag: "wx" });\n`,
 		);
@@ -719,7 +726,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		const digests = ["--bundle-sha256", fileSha(join(t, "pkg/dist/records-service/service-main.mjs")), "--node-sha256", fileSha(join(t, "node"))];
 		const again = (ops = ["--operator", "relay:relay:fabric", "--operator", "importer:github"]) =>
 			run(
-				["--org", "test-org", "--org-user", me, "--node", join(t, "node"), "--package-root", join(t, "pkg"), ...digests, ...ops],
+				["--org", "test-org", "--org-user", me, "--node", join(t, "node"), "--package-root", join(t, "pkg"), ...digests, ...ops, ...(real ? ["--port", String(real.port)] : [])],
 				{ ...testEnv(bin), RECORDS_PAUL_STEPS_TEST_ROOT: `${t}/root` },
 			);
 		writeFileSync(L, "");
@@ -732,6 +739,85 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		const calls = readFileSync(L, "utf8").split("\n").filter(Boolean);
 		return { t, r, calls, home, outside, before, again, bin, L };
 	};
+
+	// Astra round 3 F2/S2, end to end: the installer, the real bundle, a real cluster and the running service.
+	const realBundle = resolve(__dirname, "../dist/records-service/service-main.mjs");
+	it.skipIf(process.getuid?.() === 0 || !postgresBin || process.platform === "win32" || !existsSync(realBundle))(
+		"F2/S2: a rerun publishes the token an interrupted reissue committed, and refuses a dead one",
+		async () => {
+			const osUser = userInfo().username;
+			const rendered = (what: string) => {
+				const r = spawnSync("bash", [script, "--org", "test-org", "--org-user", "nobodyuser", "--print", what], { encoding: "utf8" });
+				return r.stdout.replaceAll("test-org-records", osUser);
+			};
+			const server = await startPostgres({ hba: rendered("hba"), ident: rendered("ident") });
+			const admin = new pg.Client({ ...server.connection });
+			await admin.connect();
+			await admin.query(`CREATE ROLE ${SERVICE_ROLE} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT`);
+			await admin.query("CREATE DATABASE records");
+			await admin.end();
+			let t = "";
+			const closers: (() => Promise<unknown>)[] = [];
+			try {
+				// The installer's cluster socket directory is this test's real cluster.
+				const first = relayRun("plain", "tree17", (root) => {
+					mkdirSync(join(root, "run"), { recursive: true });
+					symlinkSync(server.socketDir, join(root, "run/test-org-records-pg"));
+				}, { bundle: realBundle, port: server.port });
+				t = first.t;
+				expect(first.r.code, first.r.err + first.r.out).toBe(0);
+				const again = () => first.again(["--operator", "relay:relay:fabric", "--operator", "importer:github"]);
+				const cred = `${t}/root/var/lib/test-org-records/credentials/${sha("relay:fabric")}.json`;
+				const relayFile = join(first.home, ".config/test-org-records/relay.json");
+				const tokenOf = (file: string) => (JSON.parse(readFileSync(file, "utf8")) as { token: string }).token;
+				const oldToken = tokenOf(cred);
+				// The running service, on the installer's config.
+				const config = { ...normalizeServiceConfig(JSON.parse(readFileSync(`${t}/root/etc/test-org-records/service.json`, "utf8"))), socket: join(t, "svc.sock") };
+				const owner = new pg.Pool({ ...config.migration!, max: 2 });
+				const pool = new pg.Pool({ ...config.database, max: 4 });
+				pool.on("error", () => undefined);
+				const service = await RecordsServer.open(config, { pool: pool as unknown as ClientPool });
+				await service.listen();
+				closers.push(() => service.close(), () => pool.end(), () => owner.end());
+				const claims = async (file: string) => {
+					const client = new RemoteRecords({ socket: config.socket, identity: { id: "unused", name: "x" }, credentialDir: join(t, "cd"), credentialFile: file });
+					await client.open();
+					try { return (await client.claimPublications(1)).claims.length; } finally { await client.close(); }
+				};
+				expect(await claims(cred)).toBe(0);
+				// An interrupted --reissue: the database now holds the new token, <cred>.pending holds it, <cred> the old one.
+				const old = join(t, "old.json");
+				cpSync(cred, old);
+				await expect(issueCredentialFile(config, "relay:fabric", "relay", cred, { pool: owner as unknown as ClientPool, reissue: true, afterCommit: async () => { throw new Error("killed"); } })).rejects.toThrow("killed");
+				expect(tokenOf(cred)).toBe(oldToken);
+				const pendingToken = tokenOf(`${cred}.pending`);
+				// The rerun publishes the pending token and delivers it; the old one is refused by the running service.
+				const rerun = again();
+				expect(rerun.code, rerun.err + rerun.out).toBe(0);
+				expect(rerun.out).toContain(`recovered the pending credential of relay:fabric in ${cred}`);
+				expect(tokenOf(cred)).toBe(pendingToken);
+				expect(existsSync(`${cred}.pending`)).toBe(false);
+				expect(tokenOf(relayFile)).toBe(pendingToken);
+				expect(await claims(cred)).toBe(0);
+				await expect(claims(old)).rejects.toThrow(/not known to this service/);
+				// A plain rerun verifies and reuses the live file.
+				const plain = again();
+				expect(plain.code, plain.err).toBe(0);
+				expect(plain.out).toContain(`verified relay:fabric in ${cred}`);
+				// Counterexample: a canonical file whose token the database does not hold is refused, not reused or delivered.
+				cpSync(old, cred);
+				const dead = again();
+				expect(dead.code).toBe(1);
+				expect(dead.err).toContain(`${cred} does not hold the live token of relay:fabric; rerun issue with --reissue`);
+				expect(tokenOf(relayFile)).toBe(pendingToken);
+			} finally {
+				for (const close of closers.reverse()) await close().catch(() => undefined);
+				await server.stop();
+				if (t) rmSync(t, { recursive: true, force: true });
+			}
+		},
+		120_000,
+	);
 
 	it.skipIf(process.getuid?.() === 0)("F12: a plain home gets relay.json 0600, written only by the org user", () => {
 		const { t, r, calls, home, again } = relayRun("plain");
@@ -748,7 +834,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			const second = again();
 			expect(second.code, second.err).toBe(0);
 			const relayCred = `${t}/root/var/lib/test-org-records/credentials/${sha("relay:fabric")}.json`;
-			expect(second.out).toContain(`= ${relayCred} exists; not reissued`);
+			// F2/S2: an existing credential is verified (and a pending one recovered) before it is reused.
+			expect(second.out).toContain(`+ runuser -u test-org-records -- ${t}/root/opt/test-org-records/node ${t}/root/opt/test-org-records/service-main.mjs verify --config ${t}/root/etc/test-org-records/service.json --id relay:fabric --role relay --out ${relayCred}\n`);
 			expect(second.out).toContain(`= ${t}/root/opt/test-org-records/service-main.mjs matches`);
 			// A credential file that holds another principal is never reused or delivered.
 			const refusedMsg = `${relayCred} does not hold principal relay:fabric with role relay issued by the installer; refused`;

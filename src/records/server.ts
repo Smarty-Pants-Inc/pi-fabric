@@ -157,8 +157,8 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, r
  */
 export const issueCredentialFile = async (
   config: RecordsServiceConfig, id: string, role: OperatorRole, out: string,
-  options: { name?: string; reissue?: boolean; pool?: ClientPool; afterCommit?: () => Promise<void> } = {},
-): Promise<void> => {
+  options: { name?: string; reissue?: boolean; pool?: ClientPool; afterCommit?: () => Promise<void>; verifyOnly?: boolean } = {},
+): Promise<"published-pending" | "verified" | "issued"> => {
   const owner = options.pool ?? await openPool(config.database);
   const lock = await owner.connect();
   const pending = `${out}.pending`;
@@ -174,11 +174,22 @@ export const issueCredentialFile = async (
       try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
     };
     // 1. Recover an interrupted run: its pending token is the live one exactly when the database holds it.
+    let recovered = false;
     if (fs.existsSync(pending)) {
       let token: unknown;
       try { token = (JSON.parse(fs.readFileSync(pending, "utf8")) as { token?: unknown }).token; } catch { token = undefined; }
-      if (typeof token === "string" && hashToken(token) === await storedHash()) publish();
+      if (typeof token === "string" && hashToken(token) === await storedHash()) { publish(); recovered = true; }
       else fs.rmSync(pending, { force: true });
+    }
+    // verify: the canonical file must hold the token the database holds; nothing is issued.
+    if (options.verifyOnly) {
+      let token: unknown;
+      try { token = (JSON.parse(fs.readFileSync(out, "utf8")) as { token?: unknown }).token; } catch { token = undefined; }
+      const live = await storedHash();
+      if (typeof token !== "string" || live === undefined || hashToken(token) !== live) {
+        throw new Error(`${out} does not hold the live token of ${id} (${role}); run the installer's issue with --reissue`);
+      }
+      return recovered ? "published-pending" : "verified";
     }
     if (!options.reissue && fs.existsSync(out)) throw new Error(`${out} exists; pass --reissue to rotate its token`);
     // 2. The new credential is on disk before the database can make it the live one.
@@ -200,6 +211,7 @@ export const issueCredentialFile = async (
     await options.afterCommit?.();
     // 4. Publish.
     publish();
+    return "issued";
   } finally {
     await lock.query("SELECT pg_advisory_unlock_all()").catch(() => undefined);
     lock.release();

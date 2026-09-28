@@ -24,7 +24,7 @@ process.on("SIGHUP", () => {
   else reloadPending = true;
 });
 
-const usage = "usage: service-main.js serve|migrate|issue --config FILE [--id ID --role importer|mirror|relay [--reissue]] [--name NAME] [--out FILE]";
+const usage = "usage: service-main.js serve|migrate|issue|verify --config FILE [--id ID --role importer|mirror|relay [--reissue]] [--name NAME] [--out FILE]";
 
 const flag = (argv: string[], name: string): string | undefined => {
   const index = argv.indexOf(name);
@@ -42,6 +42,20 @@ const main = async (argv: string[]): Promise<number> => {
   if (command === "migrate") {
     const version = await migrateService(config);
     process.stdout.write(`records schema at version ${version}\n`);
+    return 0;
+  }
+  if (command === "verify") {
+    // The installer's first step for an existing credential: publish a pending token an interrupted
+    // reissue left (under the per-principal lock), then require the file to hold the live token.
+    const id = flag(argv, "--id");
+    const out = flag(argv, "--out");
+    const role = flag(argv, "--role");
+    if (!id || !out || !role || !(OPERATOR_ROLES as readonly string[]).includes(role)) {
+      process.stderr.write(`${usage}\n`);
+      return 2;
+    }
+    const result = await issueCredentialFile(config, id, role as OperatorRole, out, { verifyOnly: true });
+    process.stdout.write(`${result === "published-pending" ? "recovered the pending credential of" : "verified"} ${id} in ${out}\n`);
     return 0;
   }
   if (command === "issue") {

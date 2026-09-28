@@ -24,7 +24,7 @@
 #  5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
 #  6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
 #  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
-#  8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
+#  8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent, else verify it (publish a <file>.pending the database holds; refuse a file without the live token) (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
 #  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
 # ROLLBACK STEPS (--rollback; root; a real rollback needs --yes-delete-records; the PostgreSQL packages stay installed):
 #  R1. systemctl stop both units; refuse (nothing deleted) unless is-active says inactive, failed or unknown for both; systemctl disable both
@@ -628,7 +628,7 @@ root_steps() {
   5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
   6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
   7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
-  8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
+  8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent, else verify it (publish a <file>.pending the database holds; refuse a file without the live token) (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
   9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
 EOF
 }
@@ -652,7 +652,7 @@ IDEMPOTENCY: a second run with the same flags
      (a running unit is restarted when restart-pending lists it: its config or unit changed, now or in an interrupted run)
   7. createdb and CREATE ROLE skipped (exist); migrate applies only unapplied migrations; enable --now unchanged
      (a running service is restarted when restart-pending lists it: node, the bundle or its unit changed, now or in an interrupted run)
-  8. an id that holds another role refused; a role added to service.json only when missing; a credential issued (--reissue) only when absent; the relay
+  8. an id that holds another role refused; a role added to service.json only when missing; a credential issued (--reissue) only when absent, otherwise verified against the database; the relay
      copy rewritten with the same content; an active service reloaded, so an interrupted earlier grant takes effect
   9. checks only; changes nothing
 
@@ -985,8 +985,13 @@ for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 		result=$("$OPT_NODE" -e "$(render_operator_edit_js)" "$CFG" "$role" "$id") || die "could not grant ${role} to ${id} in ${CFG}"
 		echo "  ${result}: roles.${role} has ${id}"
 	fi
-	if [[ -f $cred ]]; then
-		echo "= ${cred} exists; not reissued"
+	# Only a stat as root (no open); both branches run as ${REC}.
+	if [[ -e $cred || -L $cred || -e ${cred}.pending || -L ${cred}.pending ]]; then
+		# F2/S2: an existing credential is reused only if it holds the live token. verify first
+		# publishes a pending token an interrupted reissue left (under the per-principal lock),
+		# then refuses a file whose token the database no longer holds.
+		run runuser -u "$REC" -- "$OPT_NODE" "$MAIN" verify --config "$CFG" --id "$id" --role "$role" --out "$cred" ||
+			die "${cred} does not hold the live token of ${id}; rerun issue with --reissue: runuser -u ${REC} -- ${OPT_NODE} ${MAIN} issue --config ${CFG} --id ${id} --role ${role} --out ${cred} --reissue"
 	else
 		# The issue command writes the file 0600 with O_EXCL, as ${REC}, in its 0700 directory. Never copy it elsewhere.
 		# P2-3: --reissue rotates the token of an existing principal with this id and role (a run interrupted

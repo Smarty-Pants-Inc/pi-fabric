@@ -14,7 +14,7 @@
 // variable holding a command passes; revisit if agents route around it.
 
 type Word = { text: string; subs: string[]; dynamic: boolean };
-type Token = { op: string } | { word: Word } | { heredoc: { body: string; quoted: boolean } };
+type Token = { op: string } | { word: Word } | { redirect: Word } | { heredoc: { body: string; quoted: boolean } };
 
 const OPERATORS = ["&&", "||", ";;", "|&", "|", "&", ";", "(", ")"];
 
@@ -42,7 +42,8 @@ function readDouble(text: string, index: number, word: { subs: string[]; text?: 
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(text, start, "`", "`") : readBalanced(text, start, "(", ")");
       word.subs.push(text.slice(start, end - 1));
-      word.text = (word.text ?? "") + "$";
+      // review/astra F1 on #105: keep the substitution, so `bash -c "kill $(pgrep x)"` still shows it.
+      word.text = (word.text ?? "") + text.slice(index, end);
       word.dynamic = true;
       index = end;
       continue;
@@ -54,6 +55,24 @@ function readDouble(text: string, index: number, word: { subs: string[]; text?: 
   return index + 1;
 }
 
+/** The `$(…)` and backtick substitutions an unquoted heredoc body runs; quotes and `#` are literal. */
+function heredocSubs(body: string): string[] {
+  const subs: string[] = [];
+  for (let index = 0; index < body.length;) {
+    const c = body[index]!;
+    if (c === "\\") { index += 2; continue; }
+    if ((c === "$" && body[index + 1] === "(") || c === "`") {
+      const start = index + (c === "`" ? 1 : 2);
+      const end = c === "`" ? readBalanced(body, start, "`", "`") : readBalanced(body, start, "(", ")");
+      subs.push(body.slice(start, end - 1));
+      index = end;
+      continue;
+    }
+    index += 1;
+  }
+  return subs;
+}
+
 function tokenize(source: string): Token[] {
   // As in comment-cut (#104): a backslash-newline continues the line.
   const text = source.replace(/\\\r?\n/g, " ");
@@ -61,7 +80,12 @@ function tokenize(source: string): Token[] {
   const pending: Array<{ delimiter: string; strip: boolean; token: { heredoc: { body: string; quoted: boolean } } }> = [];
   let index = 0;
   let word: Word | undefined;
-  const endWord = (): void => { if (word) tokens.push({ word }); word = undefined; };
+  let target = false;
+  const endWord = (): void => {
+    if (word) tokens.push(target ? { redirect: word } : { word });
+    word = undefined;
+    target = false;
+  };
   const current = (): Word => (word ??= { text: "", subs: [], dynamic: false });
   while (index < text.length) {
     const c = text[index]!;
@@ -106,17 +130,14 @@ function tokenize(source: string): Token[] {
       index = end;
       continue;
     }
-    if (c === "<" || c === ">" || (c === "&" && text[index + 1] === ">")) {
-      // A redirection target is not an argument (`kill "$PID" 2>/dev/null`).
+    if (c === "<" || c === ">" || (c === "&" && !word && text[index + 1] === ">")) {
+      // review/astra F3 on #105: the `2` of `2>/dev/null pkill …` is a descriptor, not a word.
+      if (word && !target && /^\d+$/.test(word.text)) word = undefined;
       endWord();
       while (index < text.length && /[<>&|]/.test(text[index]!)) index += 1;
       while (text[index] === " " || text[index] === "\t") index += 1;
-      while (index < text.length && !/[\s;&|()<>]/.test(text[index]!)) {
-        if (text[index] === "'" || text[index] === "\"") {
-          const end = text.indexOf(text[index]!, index + 1);
-          index = end < 0 ? text.length : end + 1;
-        } else index += 1;
-      }
+      // review/astra F2 on #105: the target is not an argument, but its substitutions run.
+      target = true;
       continue;
     }
     const operator = !word || c === ";" || c === "|" || c === "&" || c === ")" || c === "("
@@ -143,7 +164,7 @@ function tokenize(source: string): Token[] {
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(text, start, "`", "`") : readBalanced(text, start, "(", ")");
       w.subs.push(text.slice(start, end - 1));
-      w.text += "$";
+      w.text += text.slice(index, end);
       w.dynamic = true;
       index = end;
     } else if (c === "\\") {
@@ -159,11 +180,19 @@ function tokenize(source: string): Token[] {
   return tokens;
 }
 
-// Words that run the next words as a command, with their options that take a value.
+// Words that run the next words as a command, with their options that take a separate value
+// (review/astra F3 on #105: long forms too, as in `sudo --user paul pkill …`).
 const PREFIXES: Record<string, string[]> = {
-  sudo: ["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U"], doas: ["-u"], env: ["-u", "-C", "-S"],
-  timeout: ["-s", "-k"], nice: ["-n"], ionice: ["-c", "-n", "-p"], nohup: [], setsid: [], time: [],
-  command: [], exec: ["-a"], builtin: [], stdbuf: ["-i", "-o", "-e"], xargs: ["-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a"],
+  sudo: ["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "--user", "--group", "--host", "--prompt",
+    "--close-from", "--chdir", "--role", "--type", "--other-user", "--command-timeout"],
+  doas: ["-u", "-C"],
+  env: ["-u", "-C", "-S", "--unset", "--chdir", "--split-string"],
+  timeout: ["-s", "-k", "--signal", "--kill-after"], nice: ["-n", "--adjustment"],
+  ionice: ["-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid", "--pgid", "--uid"],
+  nohup: [], setsid: [], time: ["-f", "-o", "--format", "--output"], command: [], exec: ["-a"], builtin: [],
+  stdbuf: ["-i", "-o", "-e", "--input", "--output", "--error"],
+  xargs: ["-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs", "--max-lines",
+    "--max-chars", "--delimiter", "--eof", "--arg-file", "--process-slot-var"],
   "!": [], "{": [], then: [], do: [], else: [], if: [], elif: [], while: [], until: [],
 };
 const KILL_BY_NAME = new Set(["pkill", "killall", "killall5"]);
@@ -175,7 +204,7 @@ const SSH_VALUE_OPTIONS = new Set(["-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i
 
 // `blocked`: a kill by pattern. `lookup`: runs pgrep or pidof. `search`: runs `ps … | grep`.
 type Verdict = { blocked: boolean; lookup: boolean; search: boolean };
-type Command = { words: Word[]; heredocs: Array<{ body: string; quoted: boolean }> };
+type Command = { words: Word[]; redirects: Word[]; heredocs: Array<{ body: string; quoted: boolean }> };
 
 function scan(script: string, depth: number): Verdict {
   const verdict: Verdict = { blocked: false, lookup: false, search: false };
@@ -186,7 +215,7 @@ function scan(script: string, depth: number): Verdict {
   // counts only as `ps … | grep` fed straight into the kill (its arguments or the same pipeline).
   let tainted = false;
   let stages: Command[] = [];
-  let command: Command = { words: [], heredocs: [] };
+  let command: Command = { words: [], redirects: [], heredocs: [] };
 
   const nested = (text: string): Verdict => {
     const inner = scan(text, depth + 1);
@@ -201,11 +230,12 @@ function scan(script: string, depth: number): Verdict {
     stages.forEach((stage, position) => {
       const piped = position < stages.length - 1;
       let captured = false;
-      for (const word of stage.words) for (const sub of word.subs) captured = nested(sub).lookup || captured;
-      // Unquoted heredoc bodies expand their substitutions.
-      for (const heredoc of stage.heredocs) if (!heredoc.quoted) for (const token of tokenize(heredoc.body)) {
-        if ("word" in token) for (const sub of token.word.subs) captured = nested(sub).lookup || captured;
-      }
+      // Substitutions in words and redirection targets run; so do those of an unquoted heredoc
+      // body, where quotes and `#` are literal (review/astra F2 on #105).
+      const subs = [...stage.words, ...stage.redirects].flatMap((word) => word.subs);
+      for (const heredoc of stage.heredocs) if (!heredoc.quoted) subs.push(...heredocSubs(heredoc.body));
+      for (const sub of subs) captured = nested(sub).lookup || captured;
+      const scripts: string[] = [];
       let words = stage.words;
       let fedByXargs = false;
       for (;;) {
@@ -213,12 +243,19 @@ function scan(script: string, depth: number): Verdict {
         const prefix = words[0]?.text.split("/").pop() ?? "";
         const options = PREFIXES[prefix];
         if (!options) break;
+        // `command -v pkill` names the command; it does not run it.
+        if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) { words = []; break; }
         if (prefix === "xargs") fedByXargs = true;
         words = words.slice(1);
         while (words[0]?.text.startsWith("-") && words[0].text.length > 1) {
           const flag = words[0].text;
-          words = words.slice(flag !== "--" && options.includes(flag) ? 2 : 1);
-          if (flag === "--") break;
+          if (flag === "--") { words = words.slice(1); break; }
+          const [key, inline] = flag.split(/=(.*)/s);
+          // A short cluster such as `-Eu paul` takes a value when its last letter does.
+          const takes = inline === undefined && (options.includes(key!) || (!key!.startsWith("--") && options.includes(`-${key!.at(-1)}`)));
+          const value = takes ? words[1]?.text : inline;
+          if (prefix === "env" && (key === "-S" || key === "--split-string") && value) scripts.push(value);
+          words = words.slice(takes ? 2 : 1);
         }
         if (prefix === "timeout" && words[0]) words = words.slice(1);
       }
@@ -232,7 +269,7 @@ function scan(script: string, depth: number): Verdict {
         const ownFeed = args.some((arg) => arg.subs.some((sub) => { const inner = scan(sub, depth + 1); return inner.lookup || inner.search; }));
         if (!probe && variable && (tainted || pipeFeed || ownFeed)) verdict.blocked = true;
       }
-      const scripts: string[] = stage.heredocs.filter(() => SHELLS.has(name) || name === "ssh").map((heredoc) => heredoc.body);
+      if (SHELLS.has(name) || name === "ssh") scripts.push(...stage.heredocs.map((heredoc) => heredoc.body));
       if (SHELLS.has(name)) {
         const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg.text));
         if (flag >= 0 && args[flag + 1]) scripts.push(args[flag + 1]!.text);
@@ -255,12 +292,13 @@ function scan(script: string, depth: number): Verdict {
 
   for (const token of tokenize(script)) {
     if ("word" in token) { command.words.push(token.word); continue; }
+    if ("redirect" in token) { command.redirects.push(token.redirect); continue; }
     if ("heredoc" in token) { command.heredocs.push(token.heredoc); continue; }
-    if (command.words.length > 0 || command.heredocs.length > 0) stages.push(command);
-    command = { words: [], heredocs: [] };
+    if (command.words.length > 0 || command.redirects.length > 0 || command.heredocs.length > 0) stages.push(command);
+    command = { words: [], redirects: [], heredocs: [] };
     if (token.op !== "|" && token.op !== "|&") runPipeline();
   }
-  if (command.words.length > 0 || command.heredocs.length > 0) stages.push(command);
+  if (command.words.length > 0 || command.redirects.length > 0 || command.heredocs.length > 0) stages.push(command);
   runPipeline();
   return verdict;
 }

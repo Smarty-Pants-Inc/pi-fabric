@@ -45,6 +45,37 @@ const refused: Array<[string, string]> = [
   ["a pkill in a command substitution", `echo "$(pkill -f server)"`],
   ["a pkill in a subshell", `(cd /tmp && pkill -f x)`],
   ["a pkill in an if", `if true; then pkill -f x; fi`],
+  // review/astra F1 on #105: a lookup expanded into the script a shell, eval or ssh runs.
+  ["bash -c \"kill $(pgrep …)\"", `bash -c "kill $(pgrep -f worker)"`],
+  ["eval \"kill $(pgrep …)\"", `eval "kill $(pgrep -f worker)"`],
+  ["ssh HOST \"kill $(pgrep …)\"", `ssh HOST "kill $(pgrep -f worker)"`],
+  ["ssh HOST kill $(pgrep …), unquoted", `ssh HOST kill $(pgrep -f worker)`],
+  ["ssh HOST \"kill `pgrep …`\"", "ssh HOST \"kill `pgrep -f worker`\""],
+  // review/astra F2 on #105: substitutions in a redirection target and an unquoted heredoc run.
+  ["a redirection target", `: >"$(pkill -f worker)"`],
+  ["an unquoted redirection target", `echo x > $(pkill -f worker).log`],
+  ["single quotes in an unquoted heredoc", `cat <<EOF\n'$(pkill -f worker)'\nEOF`],
+  ["a # line in an unquoted heredoc", `cat <<EOF\n# $(pkill -f worker)\nEOF`],
+  ["a backtick in an unquoted heredoc", "cat <<EOF\nnote `pkill -f worker`\nEOF"],
+  ["a lookup in an unquoted heredoc, then kill", `cat > p.txt <<EOF\n$(pgrep -f worker)\nEOF\nkill $(cat p.txt) $P`],
+  // review/astra F3 on #105: a leading redirection and long or clustered wrapper options.
+  ["a leading 2> redirection", `2>/dev/null pkill -f worker`],
+  ["a leading >file redirection", `>out.log pkill -f worker`],
+  ["sudo --user X", `sudo --user paul pkill -f worker`],
+  ["sudo -Eu X", `sudo -Eu paul pkill -f worker`],
+  ["env --unset X", `env --unset GH_TOKEN pkill -f worker`],
+  ["env --unset=X", `env --unset=GH_TOKEN pkill -f worker`],
+  ["env -S 'pkill …'", `env -S 'pkill -f worker'`],
+  ["nice -n 5", `nice -n 5 pkill -f worker`],
+  ["timeout 5", `timeout 5 pkill -f worker`],
+  ["timeout --signal KILL 5", `timeout --signal KILL 5 pkill -f worker`],
+  ["nohup", `nohup pkill -f worker &`],
+  ["setsid", `setsid pkill -f worker`],
+  ["command", `command pkill -f worker`],
+  ["exec", `exec pkill -f worker`],
+  ["xargs -r kill", `pgrep -f worker | xargs -r kill`],
+  ["xargs --max-args 1 kill", `pgrep -f worker | xargs --max-args 1 kill -TERM`],
+  ["a lookup kill with a trailing redirection", `kill $(pgrep -f worker) 2>/dev/null`],
 ];
 
 const allowed: Array<[string, string]> = [
@@ -85,6 +116,19 @@ const allowed: Array<[string, string]> = [
   ["a comment that holds a pkill after ;", `ls # do not run: sleep 1; pkill -f x`],
   ["a recorded PID piped from ps", `ps -o pid= -p "$PID" | xargs kill`],
   ["pgrep, then a recorded kill on the next line", `pgrep -fl server\nkill "$PID"`],
+  // Counterexamples for review/astra on #105.
+  ["bash -c \"kill $PID\"", `bash -c "kill $PID"`],
+  ["bash -c echo of a lookup", `bash -c 'echo "kill $(pgrep x) is refused"'`],
+  ["eval \"kill $PID\"", `eval "kill $PID"`],
+  ["ssh HOST kill of a recorded PID file", `ssh HOST "kill $(cat /tmp/w/worker.pid)"`],
+  ["a redirection target with date", `: >"$(date +%s).log"`],
+  ["a quoted heredoc with a substitution", `cat <<'EOF'\n'$(pkill -f worker)'\nEOF`],
+  ["an unquoted heredoc that names pkill", `cat <<EOF\nnever run pkill -f worker ($(date -u +%H:%MZ))\nEOF`],
+  ["a leading 2> on pgrep", `2>/dev/null pgrep -f worker`],
+  ["sudo --user X kill of a literal PID", `sudo --user paul kill 4242`],
+  ["env --unset X grep pkill", `env --unset GH_TOKEN grep -n pkill notes.md`],
+  ["command -v pkill", `command -v pkill`],
+  ["nohup with redirections", `nohup ./server > server.log 2>&1 &`],
   ["a vitest filter", `./node_modules/.bin/vitest run tests/pattern-kill.test.ts -t pkill`],
 ];
 

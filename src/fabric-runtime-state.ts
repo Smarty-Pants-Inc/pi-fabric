@@ -130,6 +130,7 @@ import {
 import { participantProject, participantRole } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
+import { readStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
 import { ResidencyClient } from "./residency/client.js";
@@ -728,8 +729,27 @@ export class FabricRuntimeState {
         if (lifecycle) void lifecycle.publish(event).catch(() => undefined);
       },
       onBackgroundComplete: (result) => completionInbox.enqueue(result),
-      onResultConsumed: (id) => completionInbox.acknowledge(id),
+      onResultConsumed: (id) => {
+        completionInbox.acknowledge(id);
+        markStoppedDelivered(id);
+      },
+      onStoppedAtClose: (results) =>
+        this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results }),
     });
+    // Runs a previous runtime of this session stopped at reload/shutdown (smarty-dev#1602):
+    // wait/status answer from the record, and each result reaches the spawner once.
+    const stoppedRuns = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []);
+    const undeliveredStopped = new Set(stoppedRuns.undelivered.map((run) => run.id));
+    const markStoppedDelivered = (id: string): void => {
+      if (!undeliveredStopped.delete(id)) return;
+      try {
+        this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { delivered: [id] });
+      } catch { /* a stale runtime: the next start delivers it */ }
+    };
+    this.#agents.restorePreviousRuns(stoppedRuns.runs);
+    for (const run of stoppedRuns.undelivered) {
+      completionInbox.enqueue(run, () => markStoppedDelivered(run.id));
+    }
     const canManageActor = (actorId: string): boolean | undefined => {
       const participant = this.#participants?.get(actorId);
       return participant ? participant.ownerHostId === hostId : undefined;

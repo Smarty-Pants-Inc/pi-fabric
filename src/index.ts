@@ -111,6 +111,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
+import { readStoppedRuns } from "./agents/stopped-runs.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -646,7 +647,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
     refreshCodePreviewSettings();
     applyFabricMode();
-    if (state.shouldEagerlyActivate(context)) await state.ensure(context);
+    // Results of task agents the last reload/shutdown stopped reach the spawner now (smarty-dev#1602).
+    const stoppedUndelivered = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []).undelivered.length > 0;
+    if (stoppedUndelivered || state.shouldEagerlyActivate(context)) await state.ensure(context);
   });
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget
@@ -1074,8 +1077,17 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     state.dispatchHostEvent(eventName, event, context);
   });
 
-  pi.on("session_shutdown", async (_event, context) => {
+  pi.on("session_shutdown", async (event, context) => {
     stopInboxWake();
+    let stopping = 0;
+    try { stopping = state.initialized ? state.agents.runningCount() : 0; } catch { /* not initialized */ }
+    if (stopping > 0 && context.hasUI) {
+      context.ui.notify(
+        `${event.reason === "reload" ? "Reload" : "Shutdown"} stops ${stopping} running task agent${stopping === 1 ? "" : "s"}; ` +
+          'each spawner gets a stopped result. Spawn with residency: "durable" to keep an agent across reloads.',
+        "warning",
+      );
+    }
     // Queue the richest final window and let async I/O/cooperative scoring
     // finish before teardown; the TUI event loop remains responsive.
     if (entropyEvidenceThisTurn) {

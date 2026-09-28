@@ -425,6 +425,24 @@ const failedRecord = (
   };
 };
 
+export const HOST_STOP_REASON = "stopped by host reload/shutdown";
+
+const lastEventTime = (managed: ManagedAgent): number | undefined => {
+  try {
+    return fs.statSync(path.join(managed.runDirectory, "events.jsonl")).mtimeMs;
+  } catch {
+    return managed.latestRecord?.updatedAt;
+  }
+};
+
+/** The result a spawner gets for a run the host stopped at close: the reason, last error, last event. */
+const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefined): AgentRunResult => {
+  if (result.status !== "stopped") return result;
+  const { logFile: _logFile, nestedAgents: _nestedAgents, budget: _budget, ...rest } = result;
+  const lastEvent = lastEventAt === undefined ? "none" : new Date(lastEventAt).toISOString();
+  return { ...rest, error: `${HOST_STOP_REASON}; last error: ${result.error ?? "none"}; last event: ${lastEvent}` };
+};
+
 const runRootHasUnresolvedWorker = (root: string): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
@@ -459,6 +477,9 @@ export class AgentManager {
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
+  readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
+  /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
+  readonly #previousRuns = new Map<string, AgentRunResult>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #preparePiModel:
     | ((model: string | undefined) => Promise<string | void>)
@@ -509,6 +530,7 @@ export class AgentManager {
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onResultConsumed?: (id: string) => void;
+      onStoppedAtClose?: (results: AgentRunResult[]) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       preparePiModel?: (model: string | undefined) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
@@ -532,6 +554,7 @@ export class AgentManager {
       options.vedaBinary ?? process.env.PI_FABRIC_VEDA_BINARY ?? config.veda.binary;
     this.#onBackgroundComplete = options.onBackgroundComplete;
     this.#onResultConsumed = options.onResultConsumed;
+    this.#onStoppedAtClose = options.onStoppedAtClose;
     this.#onLifecycle = options.onLifecycle;
     this.#preparePiModel = options.preparePiModel;
     this.#resolveHandoffCompactionBudget = options.resolveHandoffCompactionBudget;
@@ -1016,6 +1039,8 @@ export class AgentManager {
    * as a completion message.
    */
   async wait(id: string, options: { timeoutMs?: number } = {}): Promise<AgentRunResult> {
+    const previous = this.#previousRun(id);
+    if (previous) return previous;
     const managed = this.#requireRun(id);
     managed.background = false;
     if (!managed.settled) {
@@ -1051,7 +1076,7 @@ export class AgentManager {
   }
 
   markForeground(id: string): void {
-    this.#requireRun(id).background = false;
+    if (!this.#previousRun(id)) this.#requireRun(id).background = false;
     this.#onResultConsumed?.(id);
   }
 
@@ -1119,6 +1144,8 @@ export class AgentManager {
   }
 
   status(id: string): AgentRunRecord | AgentHandleInfo {
+    const previous = this.#previousRuns.get(id);
+    if (previous && !this.#runs.has(id)) return structuredClone(previous);
     const managed = this.#requireRun(id);
     const record = managed.settled
       ? readRecord(managed.statusFile) ?? managed.latestRecord
@@ -1186,7 +1213,28 @@ export class AgentManager {
     return structuredClone(value);
   }
 
+  /** Runs a previous runtime of this session stopped; wait/status return them, not Unknown. */
+  restorePreviousRuns(results: AgentRunResult[]): void {
+    for (const result of results) {
+      if (!this.#runs.has(result.id)) this.#previousRuns.set(result.id, structuredClone(result));
+    }
+  }
+
+  /** Running (not settled) task agents: what a reload or shutdown would stop. */
+  runningCount(): number {
+    return [...this.#runs.values()].filter((managed) => !managed.settled).length;
+  }
+
+  #previousRun(id: string): AgentRunResult | undefined {
+    const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id);
+    if (!previous) return undefined;
+    this.#onResultConsumed?.(id);
+    return structuredClone(previous);
+  }
+
   async stop(id: string): Promise<AgentRunResult> {
+    const previous = this.#previousRuns.get(id);
+    if (previous && !this.#runs.has(id)) return structuredClone(previous);
     const managed = this.#requireRun(id);
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
@@ -1325,7 +1373,14 @@ export class AgentManager {
     this.#retentionTimer = undefined;
     await this.#retentionSweep?.catch(() => undefined);
     const running = [...this.#runs.values()].filter((managed) => !managed.settled);
-    await Promise.allSettled(running.map((managed) => this.stop(managed.id)));
+    const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
+    const stopped = await Promise.allSettled(running.map((managed) => this.stop(managed.id)));
+    // A reload or shutdown ends these runs; tell the spawner's session (smarty-dev#1602).
+    const results = stopped.flatMap((outcome) =>
+      outcome.status === "fulfilled" ? [hostStoppedResult(outcome.value, lastEventAt.get(outcome.value.id))] : []);
+    if (results.length > 0) {
+      try { this.#onStoppedAtClose?.(results); } catch { /* must not block close */ }
+    }
     await Promise.allSettled([...this.#spawns]);
     await Promise.allSettled([...this.#launches]);
     const all = [...this.#runs.values()];
@@ -1997,7 +2052,13 @@ export class AgentManager {
 
   #requireRun(id: string): ManagedAgent {
     const managed = this.#runs.get(id);
-    if (!managed) throw new Error(`Unknown Fabric agent: ${id}`);
+    if (!managed) {
+      const previous = this.#previousRuns.get(id);
+      if (previous) {
+        throw new Error(`Fabric agent ${previous.name} (${id}) is ${previous.status}: ${previous.error ?? "no error"}; it has no running target`);
+      }
+      throw new Error(`Unknown Fabric agent: ${id}`);
+    }
     return managed;
   }
 

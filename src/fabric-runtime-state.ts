@@ -319,9 +319,12 @@ export class FabricRuntimeState {
     return this.#participants?.peers() ?? [];
   }
 
-  /** The inbox batch this Main should see now (smarty-dev#754); undefined when it has no inbox. */
-  async nextRootInbox(session: RootInboxSession): Promise<RootInboxBatch | undefined> {
-    return this.#rootInbox?.next(session);
+  /**
+   * The inbox batch this Main should see now (smarty-dev#754); undefined when it has no inbox.
+   * With `idle`, the batch an idle Main wakes for (smarty-dev#1595), under the wake cooldown.
+   */
+  async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
+    return idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session);
   }
 
   /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
@@ -546,6 +549,8 @@ export class FabricRuntimeState {
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
       : undefined;
+    // The idle wake reads this inbox on a timer: its start boundary is now, not its first read.
+    this.#rootInbox?.start();
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       enabled: this.#config.mesh.enabled,

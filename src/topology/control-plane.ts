@@ -570,20 +570,45 @@ export class FabricControlPlane {
       // answering every past command added one locked publish each, thousands per
       // relaunch wave (smarty-dev#367). Only a sender that may still wait gets an answer.
       if (!answerable) return;
-      // An owner restarted past the deadline may have run it before: answer this host's record
-      // first, like a duplicate. Only no claim and no outcome proves it did not run here; a
-      // runtime that admitted it in time and claims it now expires it before the handler
-      // (see #executeClaimedCommand), since the deadline has passed (review/astra F1 on #121).
-      const seen = this.#seenRecord(key);
-      const own = seen?.hostId === this.options.hostId && seen.commandId === command.commandId &&
-        seen.targetId === command.targetId;
-      await this.#publishAcknowledgement(
-        command,
-        !seen
-          ? { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true }
-          : (own ? seen.acceptance : undefined) ??
-            { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" },
-      );
+      // An owner restarted past the deadline may have run it before, and a runtime before
+      // smarty-dev#643 claims only the shared key. No read proves it did not run (a read can be
+      // cached, and a claim can land after it): this runtime wins the shared claim first, with
+      // the same create-only put as admission, and records the expiry in it. Then no runtime,
+      // new or old, can claim or run it. Otherwise the claim holder's record answers, never
+      // notRun (review/astra F1 on #121). A runtime that admitted it in time and claims it now
+      // expires it before the handler (see #executeClaimedCommand).
+      const ownRecord = (record: FabricControlSeenRecord | undefined) =>
+        record?.hostId === this.options.hostId && record.commandId === command.commandId &&
+          record.targetId === command.targetId ? record : undefined;
+      const indeterminate = { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" };
+      const local = ownRecord(controlSeenRecord(this.#seen.get(key)?.value));
+      let acceptance: FabricControlAcceptance;
+      if (local) acceptance = local.acceptance ?? indeterminate;
+      else {
+        const expired = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true } as const;
+        try {
+          await this.mesh.put({
+            key,
+            value: {
+              format: 1,
+              hostId: this.options.hostId,
+              commandId: command.commandId,
+              targetId: command.targetId,
+              expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
+              ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
+              acceptance: expired,
+            } satisfies FabricControlSeenRecord,
+            identity: this.identity,
+            ifVersion: 0,
+          });
+          acceptance = expired;
+        } catch (error) {
+          if (isLockTimeout(error)) throw error;
+          acceptance = ownRecord(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value))?.acceptance ??
+            indeterminate;
+        }
+      }
+      await this.#publishAcknowledgement(command, acceptance);
       return;
     }
 

@@ -918,6 +918,8 @@ export class ActionRegistry {
       // TypeBox validator messages describe schema expectations only — they
       // never echo argument values — so they are safe for durable traces.
       if (catalog.invalid) {
+        const hint = await provider.invalidArgumentsHint?.(providerActionName, catalog.args);
+        const invalidMessage = `Invalid arguments for ${ref}: ${catalog.invalid}${hint ? `\n${hint}` : ""}`;
         // A validate-rejected attempt is in-domain evidence against the
         // effective surface, but rejected argument values are untrusted
         // input and never enter the durable record. The trace-safe feed
@@ -964,7 +966,7 @@ export class ActionRegistry {
             provider: action.provider,
             args: attemptArgs,
             success: false,
-            error: `Invalid arguments for ${ref}: ${catalog.invalid}`,
+            error: invalidMessage,
             endedAt: Date.now(),
             ...(resolved.repairedFrom !== undefined
               ? { repairedFrom: resolved.repairedFrom }
@@ -972,7 +974,7 @@ export class ActionRegistry {
           };
           context.audits.push(attempt);
         }
-        throw new FabricTraceSafeError(`Invalid arguments for ${ref}: ${catalog.invalid}`);
+        throw new FabricTraceSafeError(invalidMessage);
       }
 
       failureStage = "approve";

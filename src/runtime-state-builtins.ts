@@ -120,7 +120,7 @@ export class RuntimeStateBuiltins {
         provider: "state",
         description: "Labeled world state over the project mesh",
         requires: ["mesh.get"],
-        create: () => new StateProvider(mesh, identity),
+        create: () => new StateProvider(mesh, identity, () => config.fullCodeMode || config.schema.mode === "enforce"),
       }));
     } else {
       const meshDisabled =

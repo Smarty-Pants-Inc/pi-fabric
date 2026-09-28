@@ -27,6 +27,18 @@ const SAVE_INTERVAL_MS = 10 * 60_000;
 const MAX_BATCH_EVENTS = 20;
 const MAX_BATCH_TEXT_BYTES = 32 * 1024;
 const MAX_EVENT_TEXT_BYTES = 8 * 1024;
+/**
+ * Every idle wake is a model turn (smarty-dev#1579), so an idle root wakes at most this often,
+ * unless the batch holds an urgent event. PI_FABRIC_INBOX_WAKE_COOLDOWN_MS overrides it.
+ */
+const WAKE_COOLDOWN_MS = 5 * 60_000;
+const URGENT_KINDS = new Set(["p0", "steer"]);
+/** Each idle wake publishes one event here, so the fleet's wakes per hour can be counted. */
+export const ROOT_INBOX_WAKE_TOPIC = "fabric.inbox.wake";
+const wakeCooldownMs = (): number => {
+  const value = Number(process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS);
+  return process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS?.trim() && Number.isFinite(value) && value >= 0 ? value : WAKE_COOLDOWN_MS;
+};
 
 export interface RootInboxBatch {
   events: MeshEvent[];
@@ -56,13 +68,14 @@ export class RootInbox {
   #state: RootInboxState | undefined;
   #saved: string | undefined;
   #savedAt = 0;
+  #wokeAt = Number.NEGATIVE_INFINITY;
 
   constructor(
     readonly mesh: MeshStore,
     readonly identity: MeshIdentity,
     /** The ids and names a sender may address this root by (its id first). */
     readonly names: () => readonly string[],
-    readonly options: { now?: () => number; steerGraceMs?: number; pageSize?: number } = {},
+    readonly options: { now?: () => number; steerGraceMs?: number; pageSize?: number; wakeCooldownMs?: number } = {},
   ) {}
 
   get key(): string {
@@ -93,6 +106,34 @@ export class RootInbox {
     state.pending = { through: batch.through, ids: batch.events.map((event) => event.id) };
     await this.#save(true);
     return batch;
+  }
+
+  /**
+   * The batch an idle root wakes for now (smarty-dev#1595), or undefined. It is `next`, at most
+   * once per wake cooldown; an urgent event (kind p0 or steer) wakes at once. Inside the cooldown
+   * nothing is saved, so a batch held back does not block an urgent event behind it as pending.
+   * `idle` is checked again after the read: a turn that started meanwhile takes the batch itself.
+   */
+  async wake(session: RootInboxSession, idle: () => boolean): Promise<RootInboxBatch | undefined> {
+    const cooling = this.#now() - this.#wokeAt < (this.options.wakeCooldownMs ?? wakeCooldownMs());
+    if (cooling && !this.#peek(session).some((event) => URGENT_KINDS.has(event.kind))) return undefined;
+    const batch = await this.next(session);
+    if (batch.events.length === 0 || !idle()) return undefined;
+    const reason = batch.events.some((event) => URGENT_KINDS.has(event.kind)) ? "p0" : "idle";
+    this.#wokeAt = this.#now();
+    void this.mesh.publish({
+      topic: ROOT_INBOX_WAKE_TOPIC, kind: "idle-wake", from: this.identity,
+      data: { count: batch.events.length, reason, ids: batch.events.map((event) => event.id) },
+    }).catch(() => undefined);
+    return batch;
+  }
+
+  /** The events `next` would bring now, without saving anything. */
+  #peek(session: RootInboxSession): MeshEvent[] {
+    const state = this.#load();
+    const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
+    const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
+    return [...(pending ? this.#reread(state.after, pending) : []), ...this.#scan(after, session).events];
   }
 
   #scan(after: number, session: RootInboxSession): RootInboxBatch {

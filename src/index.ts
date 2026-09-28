@@ -195,6 +195,13 @@ const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
 const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sessionManager.getEntries());
 
+// An idle Main reads its inbox this often (smarty-dev#1595). With the 60 s steer grace, an event
+// published to an idle Main starts a turn about 60-75 s later. PI_FABRIC_INBOX_WAKE_MS overrides it.
+const inboxWakeMs = (): number => {
+  const value = Number(process.env.PI_FABRIC_INBOX_WAKE_MS);
+  return Number.isFinite(value) && value > 0 ? value : 15_000;
+};
+
 export default async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
@@ -532,7 +539,39 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     while (entropyCompileInFlight) await entropyCompileInFlight;
   };
 
+  // smarty-dev#1595: an idle Main takes the work events addressed to it without waiting for a
+  // turn, with the same call as a completed settle. The timer keeps the latest handler's context.
+  // `settling` covers the settle handler: its own read and follow-up win, so a batch goes once.
+  const inboxWake: { timer?: ReturnType<typeof setInterval> | undefined; context?: ExtensionContext | undefined; armed: boolean; reading: boolean; settling: boolean } =
+    { armed: true, reading: false, settling: false };
+  const stopInboxWake = (): void => {
+    if (inboxWake.timer) clearInterval(inboxWake.timer);
+    inboxWake.timer = undefined;
+    inboxWake.context = undefined;
+  };
+  const wakeIdleMain = async (): Promise<void> => {
+    const context = inboxWake.context;
+    if (!context || !inboxWake.armed || inboxWake.reading || !state.initialized) return;
+    const idle = () => inboxWake.context === context && inboxWake.armed && !inboxWake.settling && context.isIdle() && !context.hasPendingMessages();
+    inboxWake.reading = true;
+    try {
+      if (!idle()) return;
+      const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
+      // A turn that started meanwhile takes the pending batch at its own start: never a second run.
+      if (inbox?.events.length && idle()) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+    } catch {
+      // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
+    } finally {
+      inboxWake.reading = false;
+    }
+  };
+
   pi.on("session_start", async (_event, context) => {
+    stopInboxWake();
+    inboxWake.context = context;
+    inboxWake.armed = true;
+    inboxWake.timer = setInterval(() => void wakeIdleMain(), inboxWakeMs());
+    inboxWake.timer.unref?.();
     entropyLifecycleEpoch += 1;
     entropyCaches = createEntropyCaches();
     entropyEvidenceThisTurn = false;
@@ -607,6 +646,17 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("agent_settled", async (event, context) => {
+    inboxWake.settling = true;
+    try {
+      await settle(event, context);
+    } finally {
+      inboxWake.settling = false;
+    }
+  });
+  const settle = async (event: unknown, context: ExtensionContext): Promise<void> => {
+    // A user's cancel (or a failed run) keeps the idle wake off until the next turn starts.
+    inboxWake.context = context;
+    inboxWake.armed = settledCompleted(event, context);
     if (!state.initialized) {
       await compactAtConfiguredThreshold(context, state.config);
       return;
@@ -645,7 +695,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
       if (inbox?.events.length) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
     }
-  });
+  };
 
 
   // Speculative PTC: follow fabric_exec argument streaming and pre-launch
@@ -953,6 +1003,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   // Work events a steer missed reach the Main with its next turn (smarty-dev#754).
   pi.on("before_agent_start", async (_event, context) => {
+    inboxWake.context = context;
+    inboxWake.armed = true;
     if (!state.initialized) return;
     const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
     if (!inbox?.events.length) return;
@@ -965,6 +1017,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("session_shutdown", async (_event, context) => {
+    stopInboxWake();
     // Queue the richest final window and let async I/O/cooperative scoring
     // finish before teardown; the TUI event loop remains responsive.
     if (entropyEvidenceThisTurn) {

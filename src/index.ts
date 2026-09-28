@@ -559,6 +559,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   const wakeIdleMain = async (): Promise<void> => {
     const context = inboxWake.context;
     if (!context || !inboxWake.armed || inboxWake.reading || !state.initialized) return;
+    try {
+      context.isIdle();
+    } catch {
+      // A stale context (Pi disposed or replaced the session): this timer has no session left.
+      if (inboxWake.context === context) stopInboxWake();
+      return;
+    }
     const idle = () => inboxWake.context === context && inboxWake.armed && !inboxWake.settling &&
       Date.now() - inboxWake.preflightAt > PROMPT_PREFLIGHT_MAX_MS && context.isIdle() && !context.hasPendingMessages();
     inboxWake.reading = true;
@@ -578,8 +585,6 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     stopInboxWake();
     inboxWake.context = context;
     inboxWake.armed = true;
-    inboxWake.timer = setInterval(() => void wakeIdleMain(), inboxWakeMs());
-    inboxWake.timer.unref?.();
     entropyLifecycleEpoch += 1;
     entropyCaches = createEntropyCaches();
     entropyEvidenceThisTurn = false;
@@ -602,6 +607,11 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       }
     }
     await state.bootstrap(context);
+    // Opt-in until Pi queues a triggered message behind a live prompt preflight (mesh.inboxIdleWake).
+    if (state.config.mesh.inboxIdleWake) {
+      inboxWake.timer = setInterval(() => void wakeIdleMain(), inboxWakeMs());
+      inboxWake.timer.unref?.();
+    }
     // bootstrap() cancels any live arm; the borrowed Main model survives so a
     // new session that inherited the in-place executor can snap back.
     await restoreBorrowedInPlaceMain(state.prewalk, pi, context);

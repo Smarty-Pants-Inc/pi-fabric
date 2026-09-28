@@ -33,7 +33,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
 
   // `wake`: the idle wake ticks every 100 ms with no cooldown (smarty-dev#1595); otherwise it
   // keeps its 15 s default and stays out of these short tests.
-  const start = async (tokensPerSecond = 1_000, wake = false, extra: { extensions?: (root: string) => string[]; warm?: boolean; wakeMs?: string; config?: unknown } = {}) => {
+  const start = async (tokensPerSecond = 1_000, wake = false, extra: { extensions?: (root: string) => string[]; warm?: boolean; wakeMs?: string; config?: unknown; optIn?: boolean } = {}) => {
     if (wake) {
       process.env.PI_FABRIC_INBOX_WAKE_MS = extra.wakeMs ?? "100";
       process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS = "0";
@@ -45,7 +45,11 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     roots.push(root);
     const agentDir = path.join(root, "agent");
     fs.mkdirSync(agentDir, { recursive: true });
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify(extra.config ?? {}));
+    // The idle wake is opt-in (mesh.inboxIdleWake) until Pi queues a triggered message behind a
+    // live prompt preflight; `optIn: false` keeps the fast tick but leaves the wake at its default.
+    const config = (extra.config ?? {}) as { mesh?: Record<string, unknown> };
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify(
+      wake && extra.optIn !== false ? { ...config, mesh: { ...config.mesh, inboxIdleWake: true } } : config));
     const meshRoot = path.join(root, "mesh");
     process.env.PI_FABRIC_MESH_ROOT = meshRoot;
     process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -270,6 +274,18 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await until(() => inboxMessages().length > 0 && !session.isStreaming, 15_000);
     expect(inboxMessages()).toHaveLength(1);
     expect(JSON.stringify(inboxMessages()[0])).toContain("Sent right after you started.");
+  }, 60_000);
+
+  it("is off by default: without mesh.inboxIdleWake an idle Main takes the event at its next turn", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true, { optIn: false });
+    faux.setResponses([fauxAssistantMessage("should not run"), fauxAssistantMessage("next turn")]);
+    missedWork("Waiting for your next turn.");
+    await sleep(3_000);
+    expect(inboxMessages()).toEqual([]);
+    expect(session.isStreaming).toBe(false);
+    faux.setResponses([fauxAssistantMessage("next turn")]);
+    await session.prompt("next");
+    expect(inboxMessages()).toHaveLength(1);
   }, 60_000);
 });
 

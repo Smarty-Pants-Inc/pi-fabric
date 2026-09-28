@@ -549,6 +549,8 @@ export class FabricRuntimeState {
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, this.pi.getSessionName?.() ?? ""])
       : undefined;
+    // The idle wake reads this inbox on a timer: its start boundary is now, not its first read.
+    this.#rootInbox?.start();
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       enabled: this.#config.mesh.enabled,

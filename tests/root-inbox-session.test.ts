@@ -33,9 +33,9 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
 
   // `wake`: the idle wake ticks every 100 ms with no cooldown (smarty-dev#1595); otherwise it
   // keeps its 15 s default and stays out of these short tests.
-  const start = async (tokensPerSecond = 1_000, wake = false) => {
+  const start = async (tokensPerSecond = 1_000, wake = false, extra: { extensions?: (root: string) => string[]; warm?: boolean; wakeMs?: string; config?: unknown } = {}) => {
     if (wake) {
-      process.env.PI_FABRIC_INBOX_WAKE_MS = "100";
+      process.env.PI_FABRIC_INBOX_WAKE_MS = extra.wakeMs ?? "100";
       process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS = "0";
     } else {
       delete process.env.PI_FABRIC_INBOX_WAKE_MS;
@@ -45,7 +45,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     roots.push(root);
     const agentDir = path.join(root, "agent");
     fs.mkdirSync(agentDir, { recursive: true });
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({}));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify(extra.config ?? {}));
     const meshRoot = path.join(root, "mesh");
     process.env.PI_FABRIC_MESH_ROOT = meshRoot;
     process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -54,7 +54,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     modelRuntime.registerNativeProvider(faux.provider);
     const loader = new DefaultResourceLoader({
       cwd: root, agentDir, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      additionalExtensionPaths: [fabricEntry],
+      additionalExtensionPaths: [fabricEntry, ...(extra.extensions?.(root) ?? [])],
     });
     await loader.reload();
     const { session } = await createAgentSession({
@@ -79,6 +79,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       fs.writeFileSync(path.join(meshRoot, "sequence"), String(sequence));
     };
     // The first turn activates Fabric; its settle starts the inbox at the present.
+    if (extra.warm === false) return { session, faux, inboxMessages, missedWork };
     faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })), fauxAssistantMessage("ready")]);
     await session.prompt("start");
     expect(inboxMessages()).toEqual([]);
@@ -227,4 +228,48 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await until(() => inboxMessages().length > 1 && !session.isStreaming);
     expect(inboxMessages()).toHaveLength(2);
   }, 60_000);
+
+  // Review F2: Pi reports idle during a user prompt's preflight (input to agent_start). A wake
+  // there would start a run and the user's prompt would fail before it reaches the agent.
+  it("does not wake during a user prompt's preflight: the prompt runs, and the batch comes once after it", async () => {
+    const gate = globalThis as { inboxGate?: (() => Promise<void>) | undefined };
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true, {
+      extensions: (root) => {
+        const file = path.join(root, "gate.mjs");
+        fs.writeFileSync(file, "export default function (pi) { pi.on('before_agent_start', async () => { await globalThis.inboxGate?.(); }); }\n");
+        return [file];
+      },
+    });
+    // A later before_agent_start handler waits past the mesh read cache (2 s); the event arrives
+    // meanwhile, older than the grace.
+    gate.inboxGate = async () => { gate.inboxGate = undefined; missedWork("Arrived during your preflight."); await sleep(3_000); };
+    faux.setResponses([fauxAssistantMessage("answered the user"), fauxAssistantMessage("took the inbox")]);
+    try {
+      await session.prompt("the user's prompt");
+    } finally {
+      gate.inboxGate = undefined;
+    }
+    const users = session.messages.filter((message) => message.role === "user");
+    expect(JSON.stringify(users.at(-1))).toContain("the user's prompt");
+    await until(() => inboxMessages().length > 0 && !session.isStreaming);
+    await sleep(500);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(JSON.stringify(inboxMessages()[0])).toContain("Arrived during your preflight.");
+    // No run started inside the preflight: the user's prompt came first, then the inbox.
+    const userAt = session.messages.findIndex((message) => message.role === "user" && JSON.stringify(message).includes("the user's prompt"));
+    expect(userAt).toBeGreaterThan(-1);
+    expect(session.messages.indexOf(inboxMessages()[0]!)).toBeGreaterThan(userAt);
+  }, 60_000);
+
+  // Review F3: a fresh Main that announces itself at startup and has not had a turn yet: its inbox
+  // starts when it becomes available, so an event sent before the first tick still wakes it.
+  it("wakes a fresh Main, with no turn yet, for an event sent before its first tick", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true, { warm: false, wakeMs: "1500", config: { mesh: { announce: true } } });
+    faux.setResponses([fauxAssistantMessage("woken fresh")]);
+    missedWork("Sent right after you started.");
+    await until(() => inboxMessages().length > 0 && !session.isStreaming, 15_000);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(JSON.stringify(inboxMessages()[0])).toContain("Sent right after you started.");
+  }, 60_000);
 });
+

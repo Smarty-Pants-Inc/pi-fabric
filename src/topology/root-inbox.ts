@@ -112,14 +112,18 @@ export class RootInbox {
    * The batch an idle root wakes for now (smarty-dev#1595), or undefined. It is `next`, at most
    * once per wake cooldown; an urgent event (kind p0 or steer) wakes at once. Inside the cooldown
    * nothing is saved, so a batch held back does not block an urgent event behind it as pending.
+   * The urgency check looks past the batch bounds (review F1): an urgent event behind a full batch
+   * still wakes the root at once. The wake brings the batches in order, one per completed run
+   * (the settle path has no cooldown), so the cursor never skips an event.
    * `idle` is checked again after the read: a turn that started meanwhile takes the batch itself.
    */
   async wake(session: RootInboxSession, idle: () => boolean): Promise<RootInboxBatch | undefined> {
     const cooling = this.#now() - this.#wokeAt < (this.options.wakeCooldownMs ?? wakeCooldownMs());
-    if (cooling && !this.#peek(session).some((event) => URGENT_KINDS.has(event.kind))) return undefined;
+    const urgent = this.#peek(session).some((event) => URGENT_KINDS.has(event.kind));
+    if (cooling && !urgent) return undefined;
     const batch = await this.next(session);
     if (batch.events.length === 0 || !idle()) return undefined;
-    const reason = batch.events.some((event) => URGENT_KINDS.has(event.kind)) ? "p0" : "idle";
+    const reason = urgent ? "p0" : "idle";
     this.#wokeAt = this.#now();
     void this.mesh.publish({
       topic: ROOT_INBOX_WAKE_TOPIC, kind: "idle-wake", from: this.identity,
@@ -128,15 +132,23 @@ export class RootInbox {
     return batch;
   }
 
-  /** The events `next` would bring now, without saving anything. */
+  /**
+   * Set the start boundary now (review F3): a root with no saved cursor starts at the present
+   * when it becomes available, not at its first read, so an event sent between the two counts.
+   */
+  start(): void {
+    this.#load();
+  }
+
+  /** Every event `next` would bring now or in later batches, without the batch bounds or a save. */
   #peek(session: RootInboxSession): MeshEvent[] {
     const state = this.#load();
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
-    return [...(pending ? this.#reread(state.after, pending) : []), ...this.#scan(after, session).events];
+    return [...(pending ? this.#reread(state.after, pending) : []), ...this.#scan(after, session, false).events];
   }
 
-  #scan(after: number, session: RootInboxSession): RootInboxBatch {
+  #scan(after: number, session: RootInboxSession, bounded = true): RootInboxBatch {
     const now = this.#now();
     const names = new Set(this.names().filter((name) => name.trim()));
     const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
@@ -150,7 +162,7 @@ export class RootInbox {
         if (event.createdAt > cutoff) return { events, through };
         if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to) && !this.#steered(event, session)) {
           const size = Math.min(Buffer.byteLength(event.text ?? ""), MAX_EVENT_TEXT_BYTES);
-          if (events.length >= MAX_BATCH_EVENTS || (events.length > 0 && bytes + size > MAX_BATCH_TEXT_BYTES)) {
+          if (bounded && (events.length >= MAX_BATCH_EVENTS || (events.length > 0 && bytes + size > MAX_BATCH_TEXT_BYTES))) {
             return { events, through };
           }
           events.push(event);

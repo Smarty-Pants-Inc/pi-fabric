@@ -232,5 +232,42 @@ describe("RootInbox.wake", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(wakes(mesh)).toHaveLength(1);
   });
+
+  it("wakes at once for an urgent event behind a full ordinary batch, by count or by text (review F1)", async () => {
+    const { mesh, clock, inbox, work, texts } = setup();
+    const box = inbox(0);
+    await box.next(held);
+    await work("first");
+    clock.advance(1);
+    expect(await box.wake(held, idle)).toBeDefined();               // the cooldown starts here
+    for (let index = 1; index <= 20; index++) await work(`item ${index}`);
+    await work("urgent", me.id, "fleet.work.pi-fabric.2", "urgent", "p0");
+    clock.advance(1);
+    const first = await box.wake(held, idle);
+    expect(first!.events).toHaveLength(20);
+    // The settle of that run brings the next batch, with the urgent event: none is skipped.
+    expect(texts((await box.next(held)).events)).toEqual(["urgent"]);
+    for (let index = 1; index <= 4; index++) await work(`${index}${"x".repeat(9_000)}`);
+    await work("urgent steer", me.id, "fleet.work.pi-fabric.3", "s", "steer");
+    clock.advance(1);
+    expect((await box.wake(held, idle))!.events).toHaveLength(4);
+    expect(texts((await box.next(held)).events)).toEqual(["urgent steer"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(wakes(mesh).map((event) => (event.data as { reason: string }).reason)).toEqual(["idle", "p0", "p0"]);
+    // Without an urgent event, a full batch inside the cooldown still waits.
+    for (let index = 1; index <= 21; index++) await work(`plain ${index}`);
+    clock.advance(1);
+    expect(await box.wake(held, idle)).toBeUndefined();
+  });
+
+  it("starts at the moment it becomes available, so an event before the first read is not skipped (review F3)", async () => {
+    const { clock, inbox, work, texts } = setup();
+    await work("before the root existed");
+    const box = inbox(0);
+    box.start();
+    await work("after start, before the first tick");
+    clock.advance(1);
+    expect(texts((await box.wake(held, idle))!.events)).toEqual(["after start, before the first tick"]);
+  });
 });
 

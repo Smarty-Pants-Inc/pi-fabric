@@ -542,8 +542,15 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // smarty-dev#1595: an idle Main takes the work events addressed to it without waiting for a
   // turn, with the same call as a completed settle. The timer keeps the latest handler's context.
   // `settling` covers the settle handler: its own read and follow-up win, so a batch goes once.
-  const inboxWake: { timer?: ReturnType<typeof setInterval> | undefined; context?: ExtensionContext | undefined; armed: boolean; reading: boolean; settling: boolean } =
-    { armed: true, reading: false, settling: false };
+  // `preflightAt` covers a user prompt from its input event to its agent_start (review F2): Pi
+  // still reports idle there, and a wake then would start a run that makes the prompt fail.
+  const inboxWake: {
+    timer?: ReturnType<typeof setInterval> | undefined; context?: ExtensionContext | undefined;
+    armed: boolean; reading: boolean; settling: boolean; preflightAt: number;
+  } = { armed: true, reading: false, settling: false, preflightAt: Number.NEGATIVE_INFINITY };
+  // ponytail: a prompt that input handlers consume, or whose preflight throws, has no agent_start;
+  // the wake treats a preflight older than this as ended rather than tracking every exit.
+  const PROMPT_PREFLIGHT_MAX_MS = 120_000;
   const stopInboxWake = (): void => {
     if (inboxWake.timer) clearInterval(inboxWake.timer);
     inboxWake.timer = undefined;
@@ -552,7 +559,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   const wakeIdleMain = async (): Promise<void> => {
     const context = inboxWake.context;
     if (!context || !inboxWake.armed || inboxWake.reading || !state.initialized) return;
-    const idle = () => inboxWake.context === context && inboxWake.armed && !inboxWake.settling && context.isIdle() && !context.hasPendingMessages();
+    const idle = () => inboxWake.context === context && inboxWake.armed && !inboxWake.settling &&
+      Date.now() - inboxWake.preflightAt > PROMPT_PREFLIGHT_MAX_MS && context.isIdle() && !context.hasPendingMessages();
     inboxWake.reading = true;
     try {
       if (!idle()) return;
@@ -615,6 +623,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("input", async (event, context) => {
+    if (context.isIdle()) inboxWake.preflightAt = Date.now();
     if (!state.initialized) return;
     state.prewalk.observeTask(
       context.sessionManager.getSessionId(),
@@ -624,6 +633,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("agent_start", async (event) => {
+    inboxWake.preflightAt = Number.NEGATIVE_INFINITY;
     if (state.initialized) await state.publishHostLifecycle("pi.agent_start", event);
   });
 
@@ -657,6 +667,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // A user's cancel (or a failed run) keeps the idle wake off until the next turn starts.
     inboxWake.context = context;
     inboxWake.armed = settledCompleted(event, context);
+    inboxWake.preflightAt = Number.NEGATIVE_INFINITY;
     if (!state.initialized) {
       await compactAtConfiguredThreshold(context, state.config);
       return;
@@ -1005,6 +1016,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   pi.on("before_agent_start", async (_event, context) => {
     inboxWake.context = context;
     inboxWake.armed = true;
+    inboxWake.preflightAt = Date.now();
     if (!state.initialized) return;
     const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
     if (!inbox?.events.length) return;

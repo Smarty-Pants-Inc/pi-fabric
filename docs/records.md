@@ -235,9 +235,11 @@ only the fields it carries (title, labels, body); one that changes nothing the f
 
 ## Trust boundary
 
-C10 closes direct SQL, DDL, trigger removal and self-assigned roles (a real OS boundary), and makes impersonation a
-deliberate token theft, not a config edit. Authorship between same-uid agents is attributed, not proven, until
-per-agent OS users (#820 stage 2+).
+C10 closes direct SQL, DDL, trigger removal, self-assigned roles and reserved identities (a real OS boundary:
+separate OS user, peer-only pg_hba, a 0700 socket directory). It does not authenticate same-uid session identities:
+any process running as the org's OS user can read that user's tokens, or register a known session id before its
+owner does, and write as it. Such writes are attributed, not proven, until per-agent OS users (#820 stage 2+), and
+every append records its kernel-reported peer process in `record_peers` for audit.
 
 - **Closed by the records service (C10).** An ordinary agent, running as the org's OS user, cannot reach
   PostgreSQL. `pg_hba` rejects it, and the socket directory belongs to the records user, mode 0700. It cannot run

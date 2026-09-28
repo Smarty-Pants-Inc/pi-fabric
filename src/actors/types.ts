@@ -266,6 +266,11 @@ export interface FabricActorInfo {
   /** Events the activation filter skipped without a model run. */
   filteredCount?: number;
   lastFilteredAt?: number;
+  /**
+   * Set when the stored activationFilter cannot be read (written by another version or by hand).
+   * The entry and its stored value are kept, but no event is filtered until a valid filter is set.
+   */
+  activationFilterError?: string;
   residency?: FabricParticipantResidency;
   /** Effective value for this caller after session bindings overlay project defaults. */
   model?: string;
@@ -364,4 +369,9 @@ export interface GlobalActorDefinition extends FabricActorRequest {
   coalesce: boolean;
   residency?: FabricParticipantResidency;
   runner: FabricAgentRunner;
+  /**
+   * Set when the stored activationFilter cannot be read (written by another version or by hand).
+   * The entry and its stored value are kept, but no event is filtered until a valid filter is set.
+   */
+  activationFilterError?: string;
 }

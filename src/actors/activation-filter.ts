@@ -36,7 +36,10 @@ export interface ActorActivationSkipRule {
   kind?: string[];
   /** Every predicate must match. */
   where?: ActorActivationFilterPredicate[];
-  /** When every one of these predicates matches too, the event is delivered after all. */
+  /**
+   * The exception: the event is delivered unless some predicate here is known false (its field is
+   * there and does not match). A missing field leaves the exception open, so the event is delivered.
+   */
   unless?: ActorActivationFilterPredicate[];
 }
 
@@ -210,16 +213,30 @@ function valuesAt(root: unknown, path: string): unknown[] {
   return values;
 }
 
-function predicateMatches(predicate: ActorActivationFilterPredicate, payload: unknown): boolean {
+/** true or false when the field is there; undefined when it is missing (unknown). */
+function predicateResult(predicate: ActorActivationFilterPredicate, payload: unknown): boolean | undefined {
   const paths = typeof predicate.path === "string" ? [predicate.path] : predicate.path;
   let values: unknown[] = [];
   for (const path of paths) {
     values = valuesAt(payload, path);
     if (values.length > 0) break;
   }
-  if (predicate.exists) return values.length > 0;
+  if (values.length === 0) return undefined;
+  if (predicate.exists) return true;
   if (predicate.in) return values.some((value) => predicate.in!.includes(value as ActorActivationFilterScalar));
   return values.some((value) => value === predicate.equals);
+}
+
+/**
+ * Unsure means deliver, in both lists. `where` holds only when every predicate is known true. The
+ * `unless` exception is ruled out only when some predicate in it is known false: a held comment
+ * (action "created") rules out the unlabel exception though it has no label field, but an
+ * "unlabeled" event with no label name leaves the exception open, so the event is delivered.
+ */
+function ruleSkips(rule: ActorActivationSkipRule, payload: unknown): boolean {
+  if (rule.where && !rule.where.every((predicate) => predicateResult(predicate, payload) === true)) return false;
+  if (rule.unless && !rule.unless.some((predicate) => predicateResult(predicate, payload) === false)) return false;
+  return true;
 }
 
 /**
@@ -239,9 +256,7 @@ export function activationFilterSkip(
     if (!matchesPattern(source, rule.source)) continue;
     if (rule.topic && !matchesPattern(topic, rule.topic)) continue;
     if (rule.kind && !matchesPattern(kind, rule.kind)) continue;
-    if (rule.where && !rule.where.every((predicate) => predicateMatches(predicate, payload))) continue;
-    if (rule.unless?.every((predicate) => predicateMatches(predicate, payload))) continue;
-    return rule.id;
+    if (ruleSkips(rule, payload)) return rule.id;
   }
   return undefined;
 }

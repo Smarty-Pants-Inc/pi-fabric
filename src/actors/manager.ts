@@ -93,6 +93,8 @@ interface ManagedActor {
   coalesce: boolean;
   coalesceKey?: string;
   activationFilter?: FabricActorActivationFilter;
+  /** A stored filter that cannot be read: kept as stored and written back, never applied. */
+  invalidActivationFilter?: { value: unknown; error: string };
   filteredCount?: number;
   lastFilteredAt?: number;
   residency: FabricParticipantResidency;
@@ -144,13 +146,28 @@ const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 const PRESENCE_RETRY_MS = 5_000;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
-function loadedActivationFilter(value: unknown): { activationFilter?: FabricActorActivationFilter } {
+const warnedActivationFilters = new Set<string>();
+// smarty-dev#1579: an unreadable stored filter never drops or rewrites its actor. It is kept as
+// stored (and written back unchanged) but not applied, so every event is delivered.
+function loadedActivationFilter(
+  value: unknown,
+  actor: { id: string; name: string },
+): { activationFilter?: FabricActorActivationFilter; invalidActivationFilter?: { value: unknown; error: string } } {
   if (value === undefined) return {};
   try {
     const filter = normalizeActorActivationFilter(value);
     return filter.length > 0 ? { activationFilter: filter } : {};
-  } catch {
-    return {};
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    const key = `${actor.id}\0${reason}`;
+    if (!warnedActivationFilters.has(key)) {
+      warnedActivationFilters.add(key);
+      process.emitWarning(
+        `Fabric actor ${actor.name} (${actor.id}) has an unreadable activationFilter; it is kept but not applied, so every event is delivered: ${reason}`,
+        { code: "PI_FABRIC_ACTIVATION_FILTER" },
+      );
+    }
+    return { invalidActivationFilter: { value: structuredClone(value), error: reason } };
   }
 }
 const COALESCE_KEY_LOAD_PATTERN = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
@@ -726,6 +743,7 @@ export class ActorManager {
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
     if (filter.length > 0) actor.activationFilter = filter;
     else delete actor.activationFilter;
+    delete actor.invalidActivationFilter;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -2341,7 +2359,11 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
-      ...(actor.activationFilter ? { activationFilter: actor.activationFilter } : {}),
+      ...(actor.activationFilter
+        ? { activationFilter: actor.activationFilter }
+        : actor.invalidActivationFilter
+          ? { activationFilter: actor.invalidActivationFilter.value }
+          : {}),
       ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       requirements: actor.requirements,
@@ -2542,7 +2564,7 @@ export class ActorManager {
           ? { coalesceKey: record.coalesceKey }
           : {}),
         // An unreadable filter is dropped, never guessed: unsure means deliver.
-        ...loadedActivationFilter(record.activationFilter),
+        ...loadedActivationFilter((record as { activationFilter?: unknown }).activationFilter, { id: record.id, name: record.name }),
         ...(typeof record.filteredCount === "number" && Number.isSafeInteger(record.filteredCount) && record.filteredCount > 0
           ? { filteredCount: record.filteredCount }
           : {}),
@@ -2863,6 +2885,7 @@ export class ActorManager {
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
       ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
       ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
+      ...(actor.invalidActivationFilter ? { activationFilterError: actor.invalidActivationFilter.error } : {}),
       requirements: actor.requirements.map((requirement) => ({ ...requirement })),
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.missingCapabilities

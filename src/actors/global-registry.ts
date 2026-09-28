@@ -102,11 +102,17 @@ const resolveDefinition = (
  * file then rename) so concurrent sessions cannot corrupt the store, though
  * truly simultaneous edits are last-write-wins.
  */
+// One warning per template and reason per process, however often the registry is reread.
+const warnedFilters = new Set<string>();
+
 export class GlobalActorRegistry {
   readonly #actors = new Map<string, GlobalActorDefinition>();
   readonly #path: string;
   readonly #maxBytes: number;
   #fingerprint: string | undefined;
+  // Templates whose stored activationFilter cannot be read, with the reason (smarty-dev#1579).
+  // The stored value is kept byte for byte and written back; it is only not applied.
+  readonly #invalidFilters = new Map<string, string>();
 
   constructor(agentDir: string, maxInstructionsBytes: number) {
     this.#path = path.join(agentDir, "fabric", "actors", "global-actors.json");
@@ -116,13 +122,41 @@ export class GlobalActorRegistry {
 
   list(): GlobalActorDefinition[] {
     this.#refresh();
-    return [...this.#actors.values()].map(clone);
+    return [...this.#actors.values()].map((def) => this.#withStatus(def));
   }
 
   resolve(idOrName: string): GlobalActorDefinition | undefined {
     this.#refresh();
     const found = resolveDefinition(this.#actors, idOrName);
-    return found ? clone(found) : undefined;
+    return found ? this.#withStatus(found) : undefined;
+  }
+
+  #withStatus(def: GlobalActorDefinition): GlobalActorDefinition {
+    const error = this.#invalidFilters.get(def.id);
+    return error ? { ...clone(def), activationFilterError: error } : clone(def);
+  }
+
+  // Records whether a stored template's filter is readable; never drops the template.
+  #noteFilter(def: GlobalActorDefinition): void {
+    if (def.activationFilter === undefined) {
+      this.#invalidFilters.delete(def.id);
+      return;
+    }
+    try {
+      normalizeActorActivationFilter(def.activationFilter);
+      this.#invalidFilters.delete(def.id);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.#invalidFilters.set(def.id, reason);
+      const key = `${def.id}\0${reason}`;
+      if (!warnedFilters.has(key)) {
+        warnedFilters.add(key);
+        process.emitWarning(
+          `Global actor template ${def.name} (${def.id}) has an unreadable activationFilter; it is kept but not applied, so every event is delivered: ${reason}`,
+          { code: "PI_FABRIC_ACTIVATION_FILTER" },
+        );
+      }
+    }
   }
 
   /**
@@ -148,7 +182,8 @@ export class GlobalActorRegistry {
       };
       this.#actors.set(existing.id, updated);
       this.#save();
-      return clone(updated);
+      this.#noteFilter(updated);
+      return this.#withStatus(updated);
     }
     const created: GlobalActorDefinition = {
       ...validated,
@@ -218,7 +253,7 @@ export class GlobalActorRegistry {
         ? {}
         : patch.activationFilter !== undefined
           ? { activationFilter: patch.activationFilter }
-          : existing.activationFilter !== undefined
+          : existing.activationFilter !== undefined && !this.#invalidFilters.has(existing.id)
             ? { activationFilter: existing.activationFilter }
             : {}),
       ...(patch.validWhile !== undefined
@@ -236,15 +271,19 @@ export class GlobalActorRegistry {
         throw new Error(`A global actor named ${validated.name} already exists (${clash.id})`);
       }
     }
+    // An unreadable stored filter the patch does not replace is written back as it was.
+    const keepStored = patch.activationFilter === undefined && this.#invalidFilters.has(existing.id);
     const updated: GlobalActorDefinition = {
       ...validated,
+      ...(keepStored ? { activationFilter: existing.activationFilter! } : {}),
       id: existing.id,
       createdAt: existing.createdAt,
       updatedAt: Date.now(),
     };
     this.#actors.set(existing.id, updated);
     this.#save();
-    return clone(updated);
+    this.#noteFilter(updated);
+    return this.#withStatus(updated);
   }
 
   remove(idOrName: string): { removed: boolean } {
@@ -283,7 +322,9 @@ export class GlobalActorRegistry {
       ...(typeof def.extensions === "boolean" ? { extensions: def.extensions } : {}),
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
-      ...(def.activationFilter !== undefined ? { activationFilter: clone(def.activationFilter) } : {}),
+      ...(def.activationFilter !== undefined && !def.activationFilterError && !this.#invalidFilters.has(def.id)
+        ? { activationFilter: clone(def.activationFilter) }
+        : {}),
       ...(def.validWhile ? { validWhile: clone(def.validWhile) } : {}),
     };
     return request;
@@ -403,7 +444,11 @@ export class GlobalActorRegistry {
       return;
     }
     this.#actors.clear();
-    for (const [id, def] of loaded) this.#actors.set(id, def);
+    this.#invalidFilters.clear();
+    for (const [id, def] of loaded) {
+      this.#actors.set(id, def);
+      this.#noteFilter(def);
+    }
     this.#fingerprint = fingerprint;
   }
 
@@ -472,7 +517,6 @@ export class GlobalActorRegistry {
       try {
         validateActorInferenceContext(record.inferenceContext, runner);
         validateActorCoalesceKey(record.coalesceKey);
-        if (record.activationFilter !== undefined) normalizeActorActivationFilter(record.activationFilter);
         requires = normalizeRequirements(record.requires);
       } catch {
         continue;
@@ -506,9 +550,8 @@ export class GlobalActorRegistry {
         ...(requires && requires.length > 0 ? { requires } : {}),
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         ...(record.coalesceKey !== undefined ? { coalesceKey: record.coalesceKey } : {}),
-        ...(record.activationFilter !== undefined && record.activationFilter.length > 0
-          ? { activationFilter: normalizeActorActivationFilter(record.activationFilter) }
-          : {}),
+        // Kept as stored, even when unreadable: #noteFilter disables it instead (smarty-dev#1579).
+        ...(record.activationFilter !== undefined ? { activationFilter: record.activationFilter } : {}),
         ...(validWhile ? { validWhile } : {}),
       };
       actors.set(def.id, def);

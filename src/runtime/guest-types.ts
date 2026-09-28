@@ -683,6 +683,7 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   coalesce: boolean;
   coalesceKey?: string;
   runner: FabricAgentRunner;
+  activationFilterError?: string;
   validWhile?: { version: 1; source: string };
 };
 interface FabricActorInfo {
@@ -708,6 +709,8 @@ interface FabricActorInfo {
   /** Events the activation filter skipped without a model run. */
   filteredCount?: number;
   lastFilteredAt?: number;
+  /** The stored filter cannot be read: it is kept but not applied (every event is delivered). */
+  activationFilterError?: string;
   model?: string;
   thinking?: FabricThinking;
   binding?: FabricActorRunBinding & { scope: "session"; sessionId: string; updatedAt?: number };

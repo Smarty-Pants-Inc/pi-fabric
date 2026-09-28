@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import {
@@ -9,6 +9,7 @@ import {
   normalizeActorActivationFilter,
   type FabricActorActivationFilter,
 } from "../src/actors/activation-filter.js";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -73,6 +74,39 @@ describe("activation filter rules on real envelopes", () => {
     // GitHub sends the labels after the change; a stale or duplicated list must not hide the wake.
     expect(skip(BOTH, unlabel(hold, []))).toBeUndefined();
     expect(skip(BOTH, unlabel(hold, [hold, bug]))).toBeUndefined();
+  });
+
+  // review/astra F1 on #106: a missing field in the exception must not turn into a skip.
+  it("R1 delivers an unlabel event whose label, label name or action is missing (unsure means deliver)", () => {
+    const noLabel = withLabels("issues.unlabeled", [hold]);                // stale list, which label unknown
+    expect(noLabel.payload.data.payload.label).toBeUndefined();
+    expect(skip(BOTH, noLabel)).toBeUndefined();
+    expect(skip(BOTH, unlabel({ id: 1, color: "B60205" }, [hold]))).toBeUndefined();   // label without a name
+    const noAction = withLabels("issue_comment.created", [hold]);
+    delete noAction.payload.data.payload.action;
+    expect(skip(BOTH, noAction)).toBeUndefined();
+    // Counterexamples the fix must keep: a known other action or a known other label rules the
+    // exception out, though a comment carries no label field.
+    expect(skip(BOTH, withLabels("issue_comment.created", [hold]))).toBe("hold");
+    expect(skip(BOTH, unlabel(bug, [hold]))).toBe("hold");
+  });
+
+  it("custom unless: skips only when some exception predicate is known false", () => {
+    const filter: FabricActorActivationFilter = [{
+      id: "quiet", topic: ["ops.owner"],
+      unless: [{ path: "data.urgent", equals: true }, { path: "data.key", in: ["a", "b"] }],
+    }];
+    const owner = (data: Record<string, unknown>) => ({ source: "mesh:ops.owner", payload: { topic: "ops.owner", kind: "x", data } });
+    expect(skip(filter, owner({ urgent: false, key: "a" }))).toBe("quiet");        // urgent known false
+    expect(skip(filter, owner({ urgent: true, key: "c" }))).toBe("quiet");         // key known not in the list
+    expect(skip(filter, owner({ urgent: true, key: "a" }))).toBeUndefined();       // the exception holds
+    expect(skip(filter, owner({ urgent: true }))).toBeUndefined();                 // key missing: unsure
+    expect(skip(filter, owner({}))).toBeUndefined();                               // both missing
+    expect(skip(filter, owner({ key: "z" }))).toBe("quiet");                       // key known false is enough
+    // A missing where field is not a match either.
+    const where: FabricActorActivationFilter = [{ id: "w", topic: ["ops.owner"], where: [{ path: "data.key", equals: "a" }] }];
+    expect(skip(where, owner({}))).toBeUndefined();
+    expect(skip(where, owner({ key: "a" }))).toBe("w");
   });
 
   it("R1 delivers when the labels field is missing (the projected payload today) or has no hold", () => {
@@ -259,5 +293,73 @@ describe("actor activation filter in ActorManager", () => {
     const cleared = await again.setActivationFilter(actor.id, null);
     expect(cleared.activationFilter).toBeUndefined();
     expect(cleared.filteredCount).toBe(1);
+  }, 30_000);
+});
+
+// review/astra F2 on #106: an unreadable stored filter must never drop or rewrite its actor.
+describe("an unreadable stored activation filter", () => {
+  const badFilter = ["hold", { id: "future", topic: ["github.*"], someNewField: 1 }];
+  const recordOf = (file: string, id: string) =>
+    JSON.stringify((JSON.parse(fs.readFileSync(file, "utf8")).actors as Array<{ id: string }>).find((a) => a.id === id));
+
+  it("keeps a global template byte for byte, disables only its filter, and survives other saves", () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-activation-filter-global-"));
+    roots.push(agentDir);
+    const first = new GlobalActorRegistry(agentDir, 64 * 1024);
+    const template = first.create({ name: "sup", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold"] });
+    const file = path.join(agentDir, "fabric", "actors", "global-actors.json");
+    const stored = JSON.parse(fs.readFileSync(file, "utf8"));
+    stored.actors[0].activationFilter = badFilter;                          // another version wrote it
+    fs.writeFileSync(file, JSON.stringify(stored, null, 2));
+    const before = recordOf(file, template.id);
+    const emitWarning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    try {
+      const registry = new GlobalActorRegistry(agentDir, 64 * 1024);
+      const listed = registry.resolve("sup")!;
+      expect(listed.activationFilterError).toMatch(/unknown field someNewField/);
+      expect(registry.toRequest(listed)).not.toHaveProperty("activationFilter");    // import delivers everything
+      registry.create({ name: "other", instructions: "Other." });                   // saves the registry
+      // Every stored field and value is unchanged. (Key order is the registry's own: any load and
+      // save writes templates in its load order, with or without a filter.)
+      expect(JSON.parse(recordOf(file, template.id))).toStrictEqual(JSON.parse(before));
+      expect(JSON.parse(recordOf(file, template.id)).activationFilter).toEqual(badFilter);
+      expect(new GlobalActorRegistry(agentDir, 64 * 1024).list().map((t) => t.name).sort()).toEqual(["other", "sup"]);
+      // Updating the template itself keeps the stored filter; setting a valid one repairs it.
+      const renamed = registry.update("sup", { instructions: "Supervise more." });
+      expect(renamed.activationFilterError).toBeDefined();
+      expect(JSON.parse(recordOf(file, template.id)).activationFilter).toEqual(badFilter);
+      const repaired = registry.update("sup", { activationFilter: ["never-message-events"] });
+      expect(repaired.activationFilterError).toBeUndefined();
+      expect(repaired.activationFilter).toEqual(["never-message-events"]);
+      expect(emitWarning.mock.calls.map(([message]) => String(message))
+        .filter((message) => message.includes("unreadable activationFilter") && message.includes(template.id))).toHaveLength(1);
+    } finally {
+      emitWarning.mockRestore();
+    }
+  });
+
+  it("keeps a project actor and its stored filter, delivers every event, and shows the error", async () => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "sup", instructions: "Supervise.", topics: ["github.demo"], coalesce: false, activationFilter: ["hold"] });
+    await first.actors.close();
+    closers.length = 0;
+    await first.agents.close();
+    const file = path.join(first.root, "actors", "actors.json");
+    const stored = JSON.parse(fs.readFileSync(file, "utf8"));
+    stored.actors.find((a: { id: string }) => a.id === actor.id).activationFilter = badFilter;
+    fs.writeFileSync(file, JSON.stringify(stored));
+    const { root, mesh, actors } = setup(first.root);
+    const status = actors.status(actor.id);
+    expect(status.activationFilterError).toMatch(/unknown field someNewField/);
+    expect(status.activationFilter).toBeUndefined();
+    await publish(mesh, envelope("issues.typed"), "github.demo");
+    await publish(mesh, withLabels("issue_comment.created", [hold]), "github.demo");
+    await waitFor(() => runDirs(root, actor.id).length === 2);             // nothing filtered
+    expect(filtered(actors, actor.id)).toHaveLength(0);
+    await actors.create({ name: "other", instructions: "Other.", topics: ["x"] });   // saves actors.json
+    expect(JSON.parse(recordOf(file, actor.id)).activationFilter).toEqual(badFilter);
+    const repaired = await actors.setActivationFilter(actor.id, ["hold"]);
+    expect(repaired.activationFilterError).toBeUndefined();
+    expect(JSON.parse(recordOf(file, actor.id)).activationFilter).toEqual(["hold"]);
   }, 30_000);
 });

@@ -112,6 +112,18 @@ const escapeXmlText = (value: string): string =>
 const escapeXmlAttribute = (value: string): string =>
   escapeXmlText(value).replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 
+/**
+ * The sender as Main shows it: a missing or empty name becomes the id. A sender without an id
+ * or kind is refused (undefined). A nameless sender held for a busy Main made every hand-over
+ * throw and blocked the queue for 7 h (smarty-dev#1826).
+ */
+const senderIdentity = (from: unknown): MeshIdentity | undefined => {
+  const value = from as Partial<MeshIdentity> | null | undefined;
+  if (typeof value?.id !== "string" || !value.id.trim() || typeof value.kind !== "string" || !value.kind.trim()) return undefined;
+  const name = typeof value.name === "string" && value.name.trim() ? value.name : value.id;
+  return { ...structuredClone(value), name } as MeshIdentity;
+};
+
 /** Admission and batch bounds for followUps Fabric holds for a busy Main. */
 export const FOLLOW_UP_LIMITS = {
   senderItems: 50,
@@ -177,6 +189,14 @@ const agentMessageIds = (messages: readonly unknown[] | undefined): Set<string> 
 };
 
 type BoundaryEvent = { context?: { pendingMessages?: readonly unknown[] } };
+
+/** One item's envelope as Main reads it. Throws on an item it cannot render. */
+const agentMessageBlock = (item: HeldAgentMessage, delivery: FabricAgentMessageDelivery): string => [
+  `<fabric-agent-message from_name="${escapeXmlAttribute(item.from.name)}" from_id="${escapeXmlAttribute(item.from.id)}" from_kind="${escapeXmlAttribute(item.from.kind)}" delivery="${escapeXmlAttribute(delivery)}" sent_at="${escapeXmlAttribute(new Date(item.sentAt).toISOString())}"${item.replacedAt === undefined ? "" : ` replaced_at="${escapeXmlAttribute(new Date(item.replacedAt).toISOString())}"`}>`,
+  escapeXmlText(item.message),
+  item.data === undefined ? undefined : `<data>${escapeXmlText(JSON.stringify(item.data))}</data>`,
+  "</fabric-agent-message>",
+].filter((line): line is string => Boolean(line)).join("\n");
 
 const itemBytes = (item: HeldAgentMessage): number =>
   Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data)));
@@ -281,9 +301,11 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
     const message = request.message.trim();
     if (!message) throw new Error("Main agent message must not be empty");
+    const sender = senderIdentity(request.from);
+    if (!sender) throw new Error("Main agent message needs a sender with a string id and kind");
     const item: HeldAgentMessage = {
       id: randomUUID(),
-      from: structuredClone(request.from),
+      from: sender,
       message,
       sentAt: Date.now(),
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),
@@ -456,9 +478,15 @@ export class MainAgentController implements FabricMainAgentTarget {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.#journal, "utf8")) as { items?: unknown };
       if (Array.isArray(parsed.items)) {
-        items = (parsed.items as HeldAgentMessage[]).filter((item) =>
-          typeof item?.id === "string" && typeof item.message === "string" && typeof item.sentAt === "number" &&
-          typeof item.from?.id === "string" && typeof item.from?.name === "string" && typeof item.from?.kind === "string");
+        // An older runtime journalled nameless senders (smarty-dev#1826): they go under their id.
+        for (const item of parsed.items as HeldAgentMessage[]) {
+          const sender = senderIdentity(item?.from);
+          if (typeof item?.id !== "string" || typeof item.message !== "string" || typeof item.sentAt !== "number" || !sender) {
+            console.warn(`[pi-fabric] dropped a malformed followUp from the journal: ${String((item as { id?: unknown } | null)?.id)}`);
+            continue;
+          }
+          items.push({ ...item, from: sender });
+        }
       }
     } catch {
       return;                                            // no journal
@@ -618,6 +646,26 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Send the first count held items as one message; they leave the queue only once it is sent. */
   #handOver(count: number, deliverAs: FabricAgentMessageDelivery, triggerTurn: boolean, flushed: boolean): boolean {
+    // smarty-dev#1826: an item that cannot be rendered fails every retry and, first in the queue,
+    // holds every later followUp. It leaves the queue, with a report; the rest go. A failure of
+    // Pi's queue itself keeps them all for the next boundary.
+    const delivery: FabricAgentMessageDelivery = flushed ? "followUp" : deliverAs;
+    for (let index = 0; index < Math.min(count, this.#held.length);) {
+      const item = this.#held[index]!;
+      try {
+        agentMessageBlock(item, delivery);
+        index++;
+      } catch (error) {
+        this.#held.splice(index, 1);
+        count--;
+        console.warn(
+          `[pi-fabric] dropped undeliverable followUp ${item.id} from ${String(item.from?.id)}: ` +
+            (error instanceof Error ? error.message : String(error)),
+        );
+      }
+    }
+    count = Math.min(count, this.#held.length);
+    if (count <= 0) { this.#trySave(); return true; }
     const batch = this.#held.slice(0, count);
     try {
       this.#send(batch, deliverAs, triggerTurn, flushed);
@@ -677,12 +725,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   ): void {
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.
     const delivery: FabricAgentMessageDelivery = flushed ? "followUp" : deliverAs;
-    const blocks = items.map((item) => [
-      `<fabric-agent-message from_name="${escapeXmlAttribute(item.from.name)}" from_id="${escapeXmlAttribute(item.from.id)}" from_kind="${escapeXmlAttribute(item.from.kind)}" delivery="${escapeXmlAttribute(delivery)}" sent_at="${escapeXmlAttribute(new Date(item.sentAt).toISOString())}"${item.replacedAt === undefined ? "" : ` replaced_at="${escapeXmlAttribute(new Date(item.replacedAt).toISOString())}"`}>`,
-      escapeXmlText(item.message),
-      item.data === undefined ? undefined : `<data>${escapeXmlText(JSON.stringify(item.data))}</data>`,
-      "</fabric-agent-message>",
-    ].filter((line): line is string => Boolean(line)).join("\n"));
+    const blocks = items.map((item) => agentMessageBlock(item, delivery));
     const itemDetails = (item: HeldAgentMessage) => ({
       id: item.id,
       from: item.from,

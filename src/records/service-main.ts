@@ -49,6 +49,15 @@ const main = async (argv: string[]): Promise<number> => {
     const server = await RecordsServer.open(config);
     await server.listen();
     process.stdout.write(`records service for ${config.org} (${config.origin}) on ${config.socket}\n`);
+    // SIGHUP re-reads the role policy (the installer's `systemctl reload`).
+    process.on("SIGHUP", () => {
+      try {
+        server.reloadRoles(normalizeServiceConfig(JSON.parse(fs.readFileSync(configFile, "utf8"))).roles);
+        process.stdout.write("records roles reloaded\n");
+      } catch (error) {
+        process.stderr.write(`records service: reload failed, keeping the old policy: ${error instanceof Error ? error.message : String(error)}\n`);
+      }
+    });
     await new Promise<void>((resolve) => {
       const stop = () => resolve();
       process.once("SIGTERM", stop);

@@ -9,6 +9,8 @@ export interface FabricRecordsConfig {
   socket?: string;
   /** An operator-issued credential (the importer or the mirror) instead of registering this participant. */
   credentialFile?: string;
+  /** The records relay's credential (0600, the org user's): with it, this process publishes nudges and raises alarms. */
+  relayCredentialFile?: string;
   /** Who gets ops.records alarms (a participant id or name); unaddressed when absent. */
   alarmTo?: string;
   watchdogMs: number;
@@ -33,6 +35,7 @@ export const normalizeRecordsConfig = (input: unknown): FabricRecordsConfig => {
     enabled: raw.enabled === true,
     ...(text(raw.socket) ? { socket: text(raw.socket)! } : {}),
     ...(text(raw.credentialFile) ? { credentialFile: text(raw.credentialFile)! } : {}),
+    ...(text(raw.relayCredentialFile) ? { relayCredentialFile: text(raw.relayCredentialFile)! } : {}),
     ...(text(raw.alarmTo) ? { alarmTo: text(raw.alarmTo)! } : {}),
     watchdogMs: integer(raw.watchdogMs, DEFAULT_RECORDS_CONFIG.watchdogMs, 1_000, 3_600_000),
     consumerLagSeconds: integer(raw.consumerLagSeconds, DEFAULT_RECORDS_CONFIG.consumerLagSeconds, 1, 86_400),

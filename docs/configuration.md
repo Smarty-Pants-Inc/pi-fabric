@@ -558,7 +558,8 @@ If `state.json` is empty or unparseable, reads return an empty table and every w
 ## Records
 
 `records` (off by default) connects Fabric to the org's records service for `records.*`: `enabled`, `socket` (the
-service's unix socket), `credentialFile` (an operator-issued credential, for the importer or the mirror), `alarmTo`,
+service's unix socket), `credentialFile` (an operator-issued credential, for the importer or the mirror), `relayCredentialFile` (the relay's
+credential: this process then publishes nudges and raises alarms), `alarmTo`,
 `watchdogMs` and `consumerLagSeconds`. Database access, roles and archive admission are the service's own
 configuration, never a caller's. It needs the mesh. See [records](records.md).
 

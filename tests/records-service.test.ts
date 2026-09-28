@@ -67,7 +67,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
       org: "smarty-pants", origin: "dev1", socket: path.join(dir, `records-${n}.sock`),
       database: { host: server.socketDir, port: server.port, database: "records", user: SERVICE_ROLE },
       migration: { host: server.socketDir, port: server.port, database: "records", user: "postgres" },
-      roles: { importer: ["importer:github"], mirror: [] },
+      roles: { importer: ["importer:github"], mirror: [], relay: ["relay:fabric", "relay:other"] },
     }), ...overrides };
     const owner = new pg.Pool({ ...config.migration!, max: 2 });
     const client = await owner.connect();
@@ -78,6 +78,13 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     await service.listen();
     cleanups.push(() => service.close(), () => owner.end());
     return { config, service, owner };
+  };
+  /** An operator-issued principal's client (the relay, the importer), as the installer issues it. */
+  const operator = async (config: RecordsServiceConfig, owner: pg.Pool, id: string) => {
+    const issued = await issuePrincipal(config, id, id, owner as unknown as ClientPool);
+    const file = path.join(dir, `${id.replaceAll(":", "_")}-${databases}.json`);
+    fs.writeFileSync(file, JSON.stringify(issued), { mode: 0o600 });
+    return connect(config, "unused", file);
   };
   const connect = async (config: RecordsServiceConfig, id: string, credentialFile?: string) => {
     const client = new RemoteRecords({ socket: config.socket, identity: { id, name: id.slice(-4) }, credentialDir: path.join(dir, "credentials", id.replaceAll(":", "_")), ...(credentialFile ? { credentialFile } : {}) });
@@ -117,9 +124,11 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await raw({ id: 1, method: "append", args: { args: { ref: REF, kind: "comment", key: "k", text: "x" } } })).error?.code).toBe("RECORD_UNAUTHENTICATED");
     expect((await raw({ id: 1, method: "read", token: "made-up", args: { args: {} } })).error?.code).toBe("RECORD_UNAUTHENTICATED");
     // Alice's id is taken: another process cannot claim it and write as her.
-    expect((await raw({ id: 1, method: "register", args: { id: ALICE } })).error?.code).toBe("RECORD_PRINCIPAL_TAKEN");
+    // Alice's id is taken: another process, with its own nonce or none, cannot claim it.
+    expect((await raw({ id: 1, method: "register", args: { id: ALICE, nonce: "x".repeat(43) } })).error?.code).toBe("RECORD_PRINCIPAL_TAKEN");
+    expect((await raw({ id: 1, method: "register", args: { id: ALICE } })).error?.code).toBe("RECORD_INVALID");
     for (const id of ["importer:github", "github:paul", "fabric-v2", "session:not-a-uuid"]) {
-      expect((await raw({ id: 1, method: "register", args: { id } })).error?.code).toBe("RECORD_PRINCIPAL_INVALID");
+      expect((await raw({ id: 1, method: "register", args: { id, nonce: "y".repeat(43) } })).error?.code).toBe("RECORD_PRINCIPAL_INVALID");
     }
     expect((await raw({ id: 1, method: "drop tables", token: "x", args: {} })).error?.code).toBe("RECORD_UNKNOWN_METHOD");
   });
@@ -140,9 +149,10 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
   });
 
   it("serves the inbox, relay and watchdog paths, with each consumer's cursor its own", async () => {
-    const { config } = await freshService();
+    const { config, owner } = await freshService();
     const alice = await connect(config, ALICE);
     const bob = await connect(config, BOB);
+    const relay = await operator(config, owner, "relay:fabric");
     const inbox = new RecordsInbox(bob, BOB, () => ["bob"]);
     await inbox.next(recordsInboxSession([]));
     const ask = await alice.append({ id: ALICE }, { ref: REF, kind: "ask", key: "a", text: "host?", data: { to: "bob" } });
@@ -155,7 +165,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await inbox.next(recordsInboxSession([]))).records).toEqual([]);
     const events: { topic: string; kind: string; to?: string }[] = [];
     const publisher: NudgePublisher = { publish: async (input) => { events.push(input); return { sequence: events.length }; } };
-    expect(await new PublicationRelay(bob, publisher).flush()).toEqual({ published: 1, failed: 0 });
+    expect(await new PublicationRelay(relay, publisher).flush()).toEqual({ published: 1, failed: 0 });
     expect(events).toMatchObject([{ topic: "record/Smarty-Pants-Inc/smarty-dev/754", kind: "record.ask", to: "bob" }]);
     expect(await alice.unpublished()).toBe(0);
   });
@@ -185,7 +195,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     const blocked = alice.append({ id: ALICE }, { ref: REF, kind: "status", key: "late", text: "must not land" });
     await new Promise((resolve) => setTimeout(resolve, 300));
     alice.close();
-    await expect(blocked).rejects.toThrow(/outcome is unknown: retry with the same key/);
+    await expect(blocked).rejects.toThrow(/outcome is unknown: retry with the same key|closed/);
     await blocker.query("COMMIT");
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect((await blocker.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
@@ -211,7 +221,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     const blocked = provider.invoke("append", { ref: REF, kind: "status", key: "late", text: "must not land" }, { signal: caller.signal } as never);
     await new Promise((resolve) => setTimeout(resolve, 300));
     await fabric.close(3_000);
-    await expect(blocked).rejects.toThrow(/outcome is unknown: retry with the same key/);
+    await expect(blocked).rejects.toThrow(/outcome is unknown: retry with the same key|closed/);
     await blocker.query("COMMIT");
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect((await blocker.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
@@ -294,8 +304,14 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     await blocker.query("BEGIN");
     await blocker.query("LOCK TABLE principals IN ACCESS EXCLUSIVE MODE");
     const raw = await rawClient(config.socket);
-    raw.send({ id: 1, method: "register", args: { id: BOB } });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    raw.send({ id: 1, method: "register", args: { id: BOB, nonce: "z".repeat(43) } });
+    // Disconnect only once the registration's INSERT is waiting on the lock (no timing guess).
+    for (let i = 0; i < 250; i++) {
+      const { rows } = await owner.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO principals%'");
+      if (rows[0].n > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect((await owner.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO principals%'")).rows[0].n).toBe(1);
     raw.socket.destroy();
     await blocker.query("COMMIT");
     blocker.release();
@@ -305,35 +321,181 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     await connect(config, BOB);
   });
 
-  it("completes a publication only through its own live claim (F9)", async () => {
+  it("gives publication and alarm authority only to the reserved relay role (F9)", async () => {
     const { config, owner } = await freshService();
     const alice = await connect(config, ALICE);
     const bob = await connect(config, BOB);
     const record = await alice.append({ id: ALICE }, { ref: REF, kind: "ask", key: "a", text: "host?", data: { to: "bob" } });
     const published = async () => (await owner.query("SELECT published_at IS NOT NULL AS p FROM publication WHERE record_id = $1", [record.id])).rows[0].p as boolean;
-    // The reported sequence: an ordinary principal acks an unclaimed row with a made-up claim.
-    expect(await bob.ackPublication({ claimId: "00000000-0000-4000-8000-000000000000", recordId: record.id }, 999)).toBe(false);
+    // The reported sequence: an ordinary token claims, then falsely acks. Every step is refused.
+    await expect(bob.claimPublications(10)).rejects.toThrow(/only the records relay/);
+    const fake = { claimId: "00000000-0000-4000-8000-000000000000", recordId: record.id };
+    await expect(bob.ackPublication(fake, 999)).rejects.toThrow(/only the records relay/);
+    await expect(bob.failPublication(fake, "x")).rejects.toThrow(/only the records relay/);
+    await expect(bob.releasePublications(fake.claimId, [record.id])).rejects.toThrow(/only the records relay/);
+    await expect(bob.claimAlarm(`consumer-lag:${ALICE}`, Date.now(), 600_000)).rejects.toThrow(/only the records relay/);
     expect(await published()).toBe(false);
-    // Alice claims it; Bob cannot ack, fail or release her claim, even with its claim id.
-    const [claim] = await alice.claimPublications(10);
+    // Between relays, a claim stays its claimant's.
+    const relay = await operator(config, owner, "relay:fabric");
+    const other = await operator(config, owner, "relay:other");
+    const [claim] = await relay.claimPublications(10);
     expect(claim!.recordId).toBe(record.id);
-    expect(await bob.ackPublication(claim!, 999)).toBe(false);
-    await bob.failPublication(claim!, "suppressed");
-    await bob.releasePublications(claim!.claimId, [record.id]);
-    expect((await owner.query("SELECT claimed_by, error FROM publication WHERE record_id = $1", [record.id])).rows[0]).toEqual({ claimed_by: ALICE, error: null });
-    expect(await bob.claimPublications(10)).toEqual([]);
-    // Counterexample: the claimant acks its own live claim.
-    expect(await alice.ackPublication(claim!, 5)).toBe(true);
+    expect(await other.ackPublication(claim!, 999)).toBe(false);
+    await other.failPublication(claim!, "suppressed");
+    expect((await owner.query("SELECT claimed_by, error FROM publication WHERE record_id = $1", [record.id])).rows[0]).toEqual({ claimed_by: "relay:fabric", error: null });
+    // Counterexample: the relay acks its own live claim after publishing.
+    expect(await relay.ackPublication(claim!, 5)).toBe(true);
     expect(await published()).toBe(true);
   });
 
-  it("honors an alarm claim only while its condition holds (F9)", async () => {
-    const { config } = await freshService();
+  it("delivers by cursor even when a publication was acked with no mesh event (F9 is bounded)", async () => {
+    const { config, owner } = await freshService();
     const alice = await connect(config, ALICE);
-    // Nothing lags and the gate is not alarming: a claim cannot silence a future alarm.
-    expect(await alice.claimAlarm(`consumer-lag:${BOB}`, Date.now(), 10 * 60_000)).toBe(false);
-    expect(await alice.claimAlarm("archive-lag:refuse", Date.now(), 10 * 60_000)).toBe(false);
-    await expect(alice.claimAlarm("anything", Date.now(), 1)).rejects.toThrow(/unknown alarm key/);
+    const bob = await connect(config, BOB);
+    const relay = await operator(config, owner, "relay:fabric");
+    const inbox = new RecordsInbox(bob, BOB, () => ["bob"]);
+    await inbox.next(recordsInboxSession([]));
+    const ask = await alice.append({ id: ALICE }, { ref: REF, kind: "ask", key: "a", text: "host?", data: { to: "bob" } });
+    // A relay (the only one allowed) marks the nudge published but never publishes it.
+    const [claim] = await relay.claimPublications(10);
+    expect(await relay.ackPublication(claim!, 1)).toBe(true);
+    // The receiver's next reconcile still delivers the record.
+    expect((await inbox.next(recordsInboxSession([]))).records.map((record) => record.id)).toEqual([ask.id]);
+  });
+
+  it("honors a relay's alarm claim only while its condition holds (F9)", async () => {
+    const { config, owner } = await freshService();
+    const relay = await operator(config, owner, "relay:fabric");
+    expect(await relay.claimAlarm(`consumer-lag:${BOB}`, Date.now(), 10 * 60_000)).toBe(false);
+    expect(await relay.claimAlarm("archive-lag:refuse", Date.now(), 10 * 60_000)).toBe(false);
+    await expect(relay.claimAlarm("anything", Date.now(), 1)).rejects.toThrow(/unknown alarm key/);
+  });
+
+  it("recovers an enrollment whose response was lost, with its saved nonce only (F3)", async () => {
+    const { config, service, owner } = await freshService();
+    const credentialDir = path.join(dir, "enroll");
+    // The service commits the registration but the client never gets the credential.
+    const client = new RemoteRecords({ socket: config.socket, identity: { id: BOB }, credentialDir });
+    const original = service.register.bind(service);
+    let lose = true;
+    (service as unknown as { register: typeof service.register }).register = async (...args) => {
+      const issued = await original(...args);
+      if (lose) { lose = false; service.disconnectAll(); throw new Error("lost"); }
+      return issued;
+    };
+    await expect(client.open()).rejects.toThrow();
+    client.close();
+    expect((await owner.query("SELECT count(*)::int AS n FROM principals WHERE id = $1", [BOB])).rows[0].n).toBe(1);
+    // An attacker with no nonce, or another nonce, cannot take the id.
+    const raw = await rawClient(config.socket);
+    raw.send({ id: 1, method: "register", args: { id: BOB, nonce: "a".repeat(43) } });
+    expect((await raw.response(1))?.error?.code).toBe("RECORD_PRINCIPAL_TAKEN");
+    raw.send({ id: 2, method: "register", args: { id: BOB } });
+    expect((await raw.response(2))?.error?.code).toBe("RECORD_INVALID");
+    // The owner's retry, with the nonce it saved before sending, gets a working credential.
+    // Another directory (no saved nonce) is refused too: only the saved nonce recovers.
+    await expect(connect(config, BOB)).rejects.toThrow(/already registered/);
+    const again = new RemoteRecords({ socket: config.socket, identity: { id: BOB }, credentialDir });
+    await again.open();
+    cleanups.push(async () => again.close());
+    expect((await again.append({ id: BOB }, { ref: REF, kind: "comment", key: "c", text: "recovered" })).sequence).toBe(1);
+  });
+
+  it("audits each append's peer process and raises the token-reuse alarm (B)", async () => {
+    const { config, service, owner } = await freshService({ statusFile: path.join(dir, "status.json") } as Partial<RecordsServiceConfig>);
+    const alice = await connect(config, ALICE);
+    const record = await alice.append({ id: ALICE }, { ref: REF, kind: "comment", key: "c", text: "audited" });
+    const peer = (await owner.query("SELECT principal, pid, uid, cmdline FROM record_peers WHERE record_id = $1", [record.id])).rows[0];
+    expect(peer).toMatchObject({ principal: ALICE, pid: process.pid, uid: process.getuid!() });
+    expect(peer.cmdline).toContain("node");
+    // The same token used from another live process (a stolen credential).
+    const file = path.join(dir, "credentials", ALICE.replaceAll(":", "_"), fs.readdirSync(path.join(dir, "credentials", ALICE.replaceAll(":", "_")))[0]!);
+    const { token } = JSON.parse(fs.readFileSync(file, "utf8")) as { token: string };
+    const { spawn } = await import("node:child_process");
+    const thief = spawn(process.execPath, ["-e", `
+      const s = require("node:net").connect(${JSON.stringify(config.socket)});
+      s.on("connect", () => s.write(JSON.stringify({ id: 1, method: "whoami", token: ${JSON.stringify(token)}, args: {} }) + String.fromCharCode(10)));
+      s.on("data", () => { s.destroy(); });`], { stdio: "ignore" });
+    expect(await new Promise((resolve) => thief.on("exit", resolve))).toBe(0);
+    for (let i = 0; i < 50 && service.alerts().length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(service.alerts().at(-1)).toMatchObject({ principal: ALICE });
+    expect(service.alerts().at(-1)!.pids).toContain(process.pid);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).alarm).toMatch(new RegExp(`token of ${ALICE} used by live processes`));
+    // Counterexample: one process calling many times raises nothing new.
+    const count = service.alerts().length;
+    await alice.read({ id: ALICE }, {});
+    await alice.read({ id: ALICE }, {});
+    expect(service.alerts().length).toBe(count);
+  });
+
+  it("reloads the role policy without a restart (SIGHUP)", async () => {
+    const { config, service, owner } = await freshService();
+    const newcomer = await operator(config, owner, "importer:new");
+    await expect(newcomer.append({ id: "x" }, { ref: REF, kind: "comment", key: "k", text: "t", author: "github:paul", data: { via: "github:bot" } })).rejects.toThrow(/importer role/);
+    service.reloadRoles({ ...config.roles, importer: [...config.roles.importer, "importer:new"] });
+    expect((await newcomer.append({ id: "x" }, { ref: REF, kind: "comment", key: "k", text: "t", author: "github:paul", data: { via: "github:bot" } })).sequence).toBe(1);
+  });
+
+  it("delivers near-limit records through the inbox, relay and read in bounded responses (F10)", async () => {
+    const { config, owner } = await freshService();
+    const alice = await connect(config, ALICE);
+    const bob = await connect(config, BOB);
+    const relay = await operator(config, owner, "relay:fabric");
+    const inbox = new RecordsInbox(bob, BOB, () => ["bob"]);
+    await inbox.next(recordsInboxSession([]));
+    // 20 asks at the text limit, with quotes that JSON escapes: one page of them is several MiB.
+    const text = `"${"x".repeat(60 * 1024)}"`;
+    const ids: string[] = [];
+    for (let i = 0; i < 20; i++) ids.push((await alice.append({ id: ALICE }, { ref: REF, kind: "ask", key: `big-${i}`, text, data: { to: "bob" } })).id);
+    // The inbox: every record arrives, over several bounded batches.
+    const delivered: string[] = [];
+    let entries: unknown[] = [];
+    for (let round = 0; round < 40 && delivered.length < 20; round++) {
+      const batch = await inbox.next(recordsInboxSession(entries));
+      expect(batch.records.length).toBeGreaterThan(0);
+      expect(batch.records.length).toBeLessThan(20);
+      delivered.push(...batch.records.map((record) => record.id));
+      entries = [{ type: "custom_message", ...recordsInboxMessage(batch.records) }];
+    }
+    expect(delivered).toEqual(ids);
+    // read by cursor pages through them too.
+    const seen: string[] = [];
+    for (let after = 0, round = 0; round < 40 && seen.length < 20; round++) {
+      const page = await bob.read({ id: BOB }, { after, limit: 500 });
+      seen.push(...page.records.map((record) => record.id));
+      after = page.next;
+    }
+    expect(seen).toEqual(ids);
+    // byIds (any client may ask for up to 500 ids) answers within the budget too.
+    expect((await bob.byIds(ids)).length).toBeLessThan(20);
+    // get bounds its history too.
+    const got = await bob.get({ id: BOB }, { ref: REF, limit: 500 });
+    expect(got.history.length).toBeLessThan(20);
+    expect(got.next).toBe(got.history.at(-1)!.sequence);
+    // The relay publishes all of them.
+    const events: unknown[] = [];
+    expect(await new PublicationRelay(relay, { publish: async (input) => { events.push(input); return { sequence: events.length }; } }).flush()).toEqual({ published: 20, failed: 0 });
+  }, 60_000);
+
+  it("a client closed while it reconnects starts no call (F3)", async () => {
+    const { config, service, owner } = await freshService();
+    const alice = await connect(config, ALICE);
+    // The connection drops; the next append starts reconnecting; close() comes before connect completes.
+    service.disconnectAll();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const caller = new AbortController(); // still live
+    const append = alice.append({ id: ALICE }, { ref: REF, kind: "status", key: "after-close", text: "must not land" }, { signal: caller.signal });
+    alice.close();
+    await expect(append).rejects.toThrow(/closed/);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect((await owner.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
+    await expect(alice.read({ id: ALICE }, {})).rejects.toThrow(/closed/);
+    // Counterexample: a client that is not closed reconnects and appends.
+    const again = await connect(config, ALICE);
+    service.disconnectAll();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect((await again.append({ id: ALICE }, { ref: REF, kind: "status", key: "after-close", text: "must not land" })).sequence).toBe(1);
   });
 
   it("closes promptly while an archive check is running", async () => {

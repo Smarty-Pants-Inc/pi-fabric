@@ -4,6 +4,7 @@ import {
   type AppendArgs, type RecordKind,
 } from "./kinds.js";
 import { WRITER_ROLE, type SqlClient } from "./schema.js";
+import { RESPONSE_BUDGET_BYTES, withinBudget } from "./protocol.js";
 
 /**
  * The record layer over the org's PostgreSQL database (smarty-dev#754 §1-5).
@@ -24,6 +25,8 @@ export interface RecordsPrincipal {
   importer?: boolean;
   /** The mirror role: may append record.mirror. */
   mirror?: boolean;
+  /** The relay role: may claim and complete publications, and claim alarms (C4). */
+  relay?: boolean;
 }
 
 export interface RecordReceipt {
@@ -91,7 +94,11 @@ export interface RecordsBackend {
 }
 
 /** The caller's lifetime: once aborted, no further step of its call runs and nothing it started commits. */
-export interface RecordsCallOptions { signal?: AbortSignal }
+export interface RecordsCallOptions {
+  signal?: AbortSignal;
+  /** The service's audit of the caller's connection (C10), stored beside the record. */
+  peer?: { pid: number; uid: number; gid: number; cmdline?: string; cwd?: string };
+}
 
 /**
  * Kinds whose records belong to their author: only the same author may supersede one. An issue is
@@ -306,6 +313,10 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       );
       const row = inserted.rows[0]!;
       await this.#outbox(client, row, args, parsed);
+      if (options.peer) {
+        await client.query("INSERT INTO record_peers (record_id, principal, pid, uid, gid, cmdline, cwd) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+          [row.id, principal.id, options.peer.pid, options.peer.uid, options.peer.gid, options.peer.cmdline ?? null, options.peer.cwd ?? null]);
+      }
       await client.query(
         "INSERT INTO publication (record_id, origin, seq, topic, recipient) VALUES ($1, $2, $3, $4, $5)",
         [row.id, this.origin, seq, recordTopic(parsed), typeof args.data?.to === "string" ? args.data.to : null],
@@ -483,10 +494,12 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       if (args.to) { values.push([...args.to]); where.push(`data->>'to' = ANY($${values.length}::text[])`); }
       if (args.exceptAuthor) { values.push(args.exceptAuthor); where.push(`author <> $${values.length}`); }
       const { rows } = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE ${where.join(" AND ")} ORDER BY seq LIMIT $3`, values);
-      const records = rows.map(envelope);
+      const all = rows.map(envelope);
+      // A page also stops near the response budget (F10), always with at least one record.
+      const records = withinBudget(all);
       const top = Number(frontier.rows[0]!.seq);
-      // A full page ends at its last record; a short page has read everything up to the frontier.
-      const next = records.length === args.limit ? records.at(-1)!.sequence : Math.max(args.after, top);
+      // A full or cut page ends at its last record; a short page has read everything up to the frontier.
+      const next = records.length < all.length || all.length === args.limit ? records.at(-1)!.sequence : Math.max(args.after, top);
       return { records, next, frontier: top, origin: args.origin };
     }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", signal);
   }
@@ -568,7 +581,8 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     if (ids.length === 0) return [];
     return this.transaction(async (client) => {
       const { rows } = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE id = ANY($1::uuid[]) ORDER BY seq`, [[...ids]]);
-      return rows.map(envelope);
+      // A pending batch was cut to the budget when it was saved, so this fits the same budget.
+      return withinBudget(rows.map(envelope));
     }, "READ ONLY", signal);
   }
 
@@ -584,7 +598,10 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       const issue = await client.query<{ data: Record<string, unknown>; open: boolean }>("SELECT data, open FROM current_issue WHERE ref = $1", [ref]);
       const statuses = await client.query<{ author: string; author_name: string | null; id: string; created_at: Date; text: string | null; data: Record<string, unknown> }>(
         "SELECT author, author_name, id, created_at, text, data FROM current_statuses WHERE ref = $1", [ref]);
-      const list = async (view: string) => (await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE id IN (SELECT id FROM ${view} WHERE ref = $1) ORDER BY seq`, [ref])).rows.map(envelope);
+      // The fold's lists carry at most 2 KiB of each text and a quarter of the budget each (F10);
+      // the whole records are in the history.
+      const list = async (view: string) => withinBudget((await client.query<RecordRow>(
+        `SELECT ${RECORD_COLUMNS.replace("text,", "left(text, 2048) AS text,")} FROM records WHERE id IN (SELECT id FROM ${view} WHERE ref = $1) ORDER BY seq DESC`, [ref])).rows.map(envelope), RESPONSE_BUDGET_BYTES / 8).reverse();
       const mirror = await client.query<{ record_id: string; data: Record<string, unknown> }>("SELECT record_id, data FROM mirror_state WHERE ref = $1", [ref]);
       const history = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE ref = $1 AND seq > $2 ORDER BY seq LIMIT $3`, [ref, after, limit + 1]);
       const fields = issue.rows[0]?.data ?? {};
@@ -601,8 +618,9 @@ export class RecordStore implements RecordsBackend, RecordsOps {
         links: await list("current_links"),
         mirror: Object.fromEntries(mirror.rows.map((row) => [row.record_id, row.data])),
       };
-      const rows = history.rows.slice(0, limit).map(envelope);
-      return { ref, state, history: rows, ...(history.rows.length > limit ? { next: rows.at(-1)!.sequence } : {}) };
+      const page = history.rows.slice(0, limit).map(envelope);
+      const rows = withinBudget(page, RESPONSE_BUDGET_BYTES - Buffer.byteLength(JSON.stringify(state)));
+      return { ref, state, history: rows, ...(history.rows.length > limit || rows.length < page.length ? { next: rows.at(-1)!.sequence } : {}) };
     }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
   }
 

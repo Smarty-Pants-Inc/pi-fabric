@@ -10,6 +10,7 @@ import { migrate } from "./schema.js";
 import { SharedFrontierProvider } from "./shared-frontier.js";
 import { RecordStore, type ClientPool, type PageArgs, type RecordsPrincipal } from "./store.js";
 import { RecordsWatchdog } from "./watchdog.js";
+import { peerCredentials, processAlive, type PeerInfo } from "./peer.js";
 
 /**
  * The records service (C10): the only process with database authority. It runs as the org's
@@ -29,7 +30,7 @@ export interface RecordsServiceConfig {
   /** How `migrate` connects: the cluster owner, only at install. */
   migration?: { host?: string; port?: number; database?: string; user?: string };
   /** Principal ids with each role; only the operator edits this file. */
-  roles: { importer: string[]; mirror: string[] };
+  roles: { importer: string[]; mirror: string[]; relay: string[] };
   mirror: { enabled: boolean; repos?: string[] };
   admission: { targets: { name: string; command: string[]; env?: Record<string, string>; timeoutMs?: number }[]; alarmSeconds: number; refuseSeconds: number; refreshMs: number; segmentSize?: number };
   statusFile?: string;
@@ -74,7 +75,7 @@ export const normalizeServiceConfig = (input: unknown): RecordsServiceConfig => 
     org, origin, socket,
     database: connection(raw.database),
     ...(raw.migration !== undefined ? { migration: connection(raw.migration) } : {}),
-    roles: { importer: strings(roles.importer), mirror: strings(roles.mirror) },
+    roles: { importer: strings(roles.importer), mirror: strings(roles.mirror), relay: strings(roles.relay) },
     mirror: { enabled: mirror.enabled === true, ...(Array.isArray(mirror.repos) ? { repos: strings(mirror.repos) } : {}) },
     admission: {
       targets, alarmSeconds,
@@ -125,7 +126,11 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, n
   }
 };
 
-type Handler = (principal: RecordsPrincipal, args: Record<string, unknown>, signal: AbortSignal) => Promise<unknown>;
+type Handler = (principal: RecordsPrincipal, args: Record<string, unknown>, signal: AbortSignal, peer?: PeerInfo) => Promise<unknown>;
+
+/** One principal's token seen from a second live process within this window raises the theft alarm. */
+const TOKEN_REUSE_WINDOW_MS = 60 * 60_000;
+export interface TokenReuseAlert { principal: string; pids: number[]; cmdlines: string[]; at: string }
 
 export class RecordsServer {
   readonly store: RecordStore;
@@ -138,6 +143,10 @@ export class RecordsServer {
   #server: net.Server | undefined;
   readonly #connections = new Set<net.Socket>();
   #statusWrite: Promise<void> = Promise.resolve();
+  #admission: AdmissionStatus | undefined;
+  /** Each principal's processes, by pid, and when each last called. */
+  readonly #seen = new Map<string, Map<number, { at: number; cmdline?: string }>>();
+  readonly #alerts: TokenReuseAlert[] = [];
 
   private constructor(readonly config: RecordsServiceConfig, pool: ClientPool, readonly options: { now?: () => number } = {}) {
     this.statusFile = config.statusFile;
@@ -166,10 +175,15 @@ export class RecordsServer {
     });
     const store = this.store;
     const ownArgs = (args: Record<string, unknown>) => args;
+    // Publication and alarm state belongs to the reserved relay role, never to ordinary tokens (F9).
+    const relayOnly = (handler: Handler): Handler => (principal, args, signal) => {
+      if (!principal.relay) throw new RecordsServiceError("only the records relay may claim or complete publications and alarms", "RECORD_FORBIDDEN");
+      return handler(principal, args, signal);
+    };
     this.#handlers = {
       whoami: async (principal) => ({ id: principal.id, importer: principal.importer === true, mirror: principal.mirror === true }),
       status: async (_principal, _args, signal) => this.status(signal),
-      append: (principal, args, signal) => store.append(principal, args.args, { signal }),
+      append: (principal, args, signal, peer) => store.append(principal, args.args, { signal, ...(peer ? { peer } : {}) }),
       read: (principal, args, signal) => store.read(principal, args.args, { signal }),
       get: (principal, args, signal) => store.get(principal, args.args, { signal }),
       list: (principal, args, signal) => store.list(principal, args.args, { signal }),
@@ -179,13 +193,13 @@ export class RecordsServer {
       openConsumer: (principal, args, signal) => store.openConsumer(principal.id, names(args.names), signal),
       saveConsumer: (principal, args, signal) => store.saveConsumer(principal.id, count(args.after), pending(args.pending), signal),
       // A claim belongs to the principal that took it: only it acks, fails or releases its rows.
-      claimPublications: (principal, args, signal) => store.claimPublications(Math.min(500, Math.max(1, count(args.limit))), signal, principal.id),
-      ackPublication: (principal, args, signal) => store.ackPublication({ claimId: uuid(args.claimId), recordId: uuid(args.recordId) }, count(args.meshSequence), signal, principal.id),
-      failPublication: (principal, args, signal) => store.failPublication({ claimId: uuid(args.claimId), recordId: uuid(args.recordId) }, String(args.error ?? "").slice(0, 500), signal, principal.id),
-      releasePublications: (principal, args, signal) => store.releasePublications(uuid(args.claimId), ids(args.recordIds), signal, principal.id),
+      claimPublications: relayOnly((principal, args, signal) => store.claimPublications(Math.min(500, Math.max(1, count(args.limit))), signal, principal.id)),
+      ackPublication: relayOnly((principal, args, signal) => store.ackPublication({ claimId: uuid(args.claimId), recordId: uuid(args.recordId) }, count(args.meshSequence), signal, principal.id)),
+      failPublication: relayOnly((principal, args, signal) => store.failPublication({ claimId: uuid(args.claimId), recordId: uuid(args.recordId) }, String(args.error ?? "").slice(0, 500), signal, principal.id)),
+      releasePublications: relayOnly((principal, args, signal) => store.releasePublications(uuid(args.claimId), ids(args.recordIds), signal, principal.id)),
       unpublished: (_principal, _args, signal) => store.unpublished(signal),
       lagging: (_principal, args, signal) => store.lagging(count(args.lagMs), this.#now(), signal),
-      claimAlarm: (_principal, args, signal) => this.#claimAlarm(args.key, count(args.realarmMs), signal),
+      claimAlarm: relayOnly((_principal, args, signal) => this.#claimAlarm(args.key, count(args.realarmMs), signal)),
     };
   }
 
@@ -234,15 +248,24 @@ export class RecordsServer {
   }
 
   /** Register a session's or actor's own participant id (the first claim wins). */
-  async register(id: unknown, name: unknown, signal: AbortSignal = this.#life.signal): Promise<{ id: string; token: string }> {
+  async register(id: unknown, name: unknown, signal: AbortSignal = this.#life.signal, nonce?: unknown): Promise<{ id: string; token: string }> {
     if (typeof id !== "string" || !SELF_REGISTERED.test(id)) {
       throw new RecordsServiceError("only a session (session:<uuid>) or an actor (its 32-hex id) registers itself; other principals are issued by the operator", "RECORD_PRINCIPAL_INVALID");
     }
+    if (typeof nonce !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(nonce)) {
+      throw new RecordsServiceError("registration needs an enrollment nonce the client saved first", "RECORD_INVALID");
+    }
     const token = newToken();
-    const inserted = await this.store.transaction(async (client) => (await client.query(
-      "INSERT INTO principals (id, name, token_hash, issued_by) VALUES ($1, $2, $3, 'register') ON CONFLICT (id) DO NOTHING",
-      [id, typeof name === "string" ? name.slice(0, 128) : null, hashToken(token)])).rowCount === 1, "", signal);
-    if (!inserted) throw new RecordsServiceError(`records principal ${id} is already registered; use its credential`, "RECORD_PRINCIPAL_TAKEN");
+    const enrolled = await this.store.transaction(async (client) => {
+      const inserted = (await client.query(
+        "INSERT INTO principals (id, name, token_hash, nonce_hash, issued_by) VALUES ($1, $2, $3, $4, 'register') ON CONFLICT (id) DO NOTHING",
+        [id, typeof name === "string" ? name.slice(0, 128) : null, hashToken(token), hashToken(nonce)])).rowCount === 1;
+      if (inserted) return true;
+      // Only the same nonce re-enrolls: the client that registered first, retrying after a lost response.
+      return (await client.query<{ ok: boolean }>("SELECT principal_reenroll($1, $2, $3) AS ok", [id, hashToken(nonce), hashToken(token)])).rows[0]!.ok;
+    }, "", signal);
+    if (!enrolled) throw new RecordsServiceError(`records principal ${id} is already registered; use its credential`, "RECORD_PRINCIPAL_TAKEN");
+    this.#principals.clear();
     return { id, token };
   }
 
@@ -258,6 +281,7 @@ export class RecordsServer {
     const principal: RecordsPrincipal = {
       id: row.id, ...(row.name ? { name: row.name } : {}),
       importer: this.config.roles.importer.includes(row.id), mirror: this.config.roles.mirror.includes(row.id),
+      relay: this.config.roles.relay.includes(row.id),
     };
     this.#principals.set(hash, principal);
     return principal;
@@ -279,6 +303,8 @@ export class RecordsServer {
     this.#connections.add(socket);
     socket.setEncoding("utf8");
     const calls = new Map<number, AbortController>();
+    // The kernel's view of who is on the other end, asked once per connection.
+    const peer = peerCredentials(socket);
     const send = (response: WireResponse) => { if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`); };
     const reader = new LineReader((line) => {
       // A malformed frame ends this connection only; nothing in it may throw past here.
@@ -296,7 +322,7 @@ export class RecordsServer {
       }
       const call = new AbortController();
       calls.set(request.id, call);
-      void this.#dispatch(request, AbortSignal.any([call.signal, this.#life.signal]))
+      void this.#dispatch(request, AbortSignal.any([call.signal, this.#life.signal]), peer)
         .then((result) => send({ id: request.id, ok: true, result: result ?? null }), (error: unknown) => send({ id: request.id, ok: false, error: wireError(error) }))
         .finally(() => calls.delete(request.id));
     }, () => socket.destroy());
@@ -311,26 +337,72 @@ export class RecordsServer {
     socket.on("error", () => undefined);
   }
 
-  async #dispatch(request: WireRequest, signal: AbortSignal): Promise<unknown> {
+  async #dispatch(request: WireRequest, signal: AbortSignal, peerLookup?: Promise<PeerInfo | undefined>): Promise<unknown> {
     // async: any throw below, argument checks included, becomes this call's error response.
     const args = object(request.args);
     if (request.method === "hello") return { org: this.store.org, origin: this.store.origin, protocol: 1 };
-    if (request.method === "register") return this.register(args.id, args.name, signal);
+    if (request.method === "register") return this.register(args.id, args.name, signal, args.nonce);
     const handler = Object.hasOwn(this.#handlers, request.method) ? this.#handlers[request.method] : undefined;
     if (!handler) throw new RecordsServiceError(`unknown records method ${JSON.stringify(String(request.method).slice(0, 64))}`, "RECORD_UNKNOWN_METHOD");
     const principal = await this.authenticate(request.token);
+    const peer = await peerLookup;
+    if (peer) this.#notePeer(principal.id, peer);
     signal.throwIfAborted();
-    return handler(principal, args, signal);
+    return handler(principal, args, signal, peer);
+  }
+
+  /** The theft alarm: one token in use from two live processes within an hour. */
+  #notePeer(principal: string, peer: PeerInfo): void {
+    const now = this.#now();
+    const seen = this.#seen.get(principal) ?? new Map<number, { at: number; cmdline?: string }>();
+    this.#seen.set(principal, seen);
+    for (const [pid, entry] of seen) if (now - entry.at > TOKEN_REUSE_WINDOW_MS || (pid !== peer.pid && !processAlive(pid))) seen.delete(pid);
+    const fresh = !seen.has(peer.pid);
+    seen.set(peer.pid, { at: now, ...(peer.cmdline ? { cmdline: peer.cmdline } : {}) });
+    if (!fresh || seen.size < 2) return;
+    const alert: TokenReuseAlert = {
+      principal, pids: [...seen.keys()], cmdlines: [...seen.values()].map((entry) => entry.cmdline ?? "?"), at: new Date(now).toISOString(),
+    };
+    this.#alerts.push(alert);
+    if (this.#alerts.length > 50) this.#alerts.shift();
+    process.stderr.write(`records service: ALARM token of ${principal} used by ${alert.pids.length} live processes: ${alert.pids.join(", ")}\n`);
+    this.#flushStatus();
+  }
+
+  /** Token-reuse alerts so far (newest last). */
+  alerts(): readonly TokenReuseAlert[] {
+    return this.#alerts;
   }
 
   #writeStatus(status: AdmissionStatus): void {
+    this.#admission = status;
+    this.#flushStatus();
+  }
+
+  #flushStatus(): void {
     const file = this.statusFile;
     if (!file) return;
-    const record = { org: this.store.org, origin: this.store.origin, updatedAt: new Date(status.checkedAt).toISOString(), admission: status };
+    const alarms = this.#alerts.map((alert) => `token of ${alert.principal} used by live processes ${alert.pids.join(", ")} at ${alert.at}`);
+    const record = {
+      org: this.store.org, origin: this.store.origin, updatedAt: new Date(this.#now()).toISOString(),
+      ...(this.#admission ? { admission: this.#admission } : {}),
+      ...(alarms.length ? { alarm: alarms.at(-1), tokenReuse: this.#alerts } : {}),
+    };
     this.#statusWrite = this.#statusWrite.then(async () => {
       await fs.promises.mkdir(path.dirname(file), { recursive: true, mode: 0o755 });
       await writeJsonAtomicAsync(file, record, { space: 2, newline: true });
     }).catch(() => undefined);
+  }
+
+  /** Apply a new role policy (SIGHUP): cached principals are dropped and re-read. */
+  reloadRoles(roles: RecordsServiceConfig["roles"]): void {
+    (this.config as { roles: RecordsServiceConfig["roles"] }).roles = roles;
+    this.#principals.clear();
+  }
+
+  /** Drop every client connection (their calls in flight are cancelled); clients reconnect. */
+  disconnectAll(): void {
+    for (const socket of this.#connections) socket.destroy();
   }
 
   /** Stop accepting calls, cancel those in flight (their connections roll back), and end the pool. Bounded. */

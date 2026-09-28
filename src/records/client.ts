@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -10,6 +10,8 @@ import type {
 
 /** A principal's credential as the client keeps it: 0600, in the agent's own directory. */
 export interface RecordsCredential { id: string; token: string }
+/** What is saved before registering: the enrollment nonce, and then the token too. */
+interface SavedEnrollment { id: string; nonce?: string; token?: string }
 
 export interface RemoteRecordsOptions {
   socket: string;
@@ -35,7 +37,11 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
   org = "";
   origin = "";
   #socket: net.Socket | undefined;
+  /** The socket still connecting, owned here so close() destroys it too. */
+  #pendingSocket: net.Socket | undefined;
   #connecting: Promise<net.Socket> | undefined;
+  /** The client's lifetime: close() aborts it, and every call observes it. */
+  readonly #life = new AbortController();
   #next = 1;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: unknown) => void }>();
   #credential: RecordsCredential | undefined;
@@ -54,25 +60,37 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
 
   get principalId(): string { return this.#credential?.id ?? this.options.identity.id; }
 
+  /**
+   * This participant's credential. A saved token the service still knows is reused. Otherwise
+   * the client registers with an enrollment nonce it saved (0600) before sending, so a response
+   * lost after the service committed is recovered by registering again with the same nonce.
+   */
   async #loadCredential(signal?: AbortSignal): Promise<RecordsCredential> {
     if (this.options.credentialFile) return readCredential(this.options.credentialFile);
     const file = credentialPath(this.options.credentialDir, this.options.identity.id);
+    let saved: SavedEnrollment | undefined;
     try {
-      const saved = readCredential(file);
-      if (saved.id === this.options.identity.id) {
-        // A token the service no longer knows (its database was restored) is replaced by registering again.
-        const known = await this.#call("whoami", {}, signal, true, saved.token).then(() => true, (error: { code?: string }) => {
-          if (error.code === "RECORD_UNAUTHENTICATED") return false;
-          throw error;
-        });
-        if (known) return saved;
-      }
-    } catch (error) {
-      if ((error as { code?: string }).code === "RECORD_SERVICE_UNREACHABLE") throw error;
+      const value = JSON.parse(fs.readFileSync(file, "utf8")) as SavedEnrollment;
+      if (value.id === this.options.identity.id) saved = value;
+    } catch { /* not enrolled yet */ }
+    if (saved?.token) {
+      const known = await this.#call("whoami", {}, signal, true, saved.token).then(() => true, (error: { code?: string }) => {
+        if (error.code === "RECORD_UNAUTHENTICATED") return false;
+        throw error;
+      });
+      if (known) return { id: saved.id, token: saved.token };
     }
-    const issued = await this.#call("register", { id: this.options.identity.id, name: this.options.identity.name }, signal, false) as RecordsCredential;
-    fs.mkdirSync(this.options.credentialDir, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(file, `${JSON.stringify(issued)}\n`, { mode: 0o600 });
+    const nonce = saved?.nonce ?? randomBytes(32).toString("base64url");
+    const save = (value: SavedEnrollment) => {
+      fs.mkdirSync(this.options.credentialDir, { recursive: true, mode: 0o700 });
+      const temp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(temp, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+      fs.renameSync(temp, file);
+    };
+    // The nonce is on disk before the service can commit anything for it.
+    if (!saved?.nonce) save({ id: this.options.identity.id, nonce });
+    const issued = await this.#call("register", { id: this.options.identity.id, name: this.options.identity.name, nonce }, signal, false) as RecordsCredential;
+    save({ id: issued.id, nonce, token: issued.token });
     return issued;
   }
 
@@ -81,6 +99,7 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
     if (this.#socket && !this.#socket.destroyed) return Promise.resolve(this.#socket);
     this.#connecting ??= new Promise<net.Socket>((resolve, reject) => {
       const socket = net.connect(this.options.socket);
+      this.#pendingSocket = socket;
       socket.setEncoding("utf8");
       const reader = new LineReader((line) => {
         let response: WireResponse;
@@ -92,10 +111,22 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
         else waiter.reject(errorFromWire(response.error));
       }, () => socket.destroy());
       socket.on("data", (chunk: string) => reader.push(chunk));
-      socket.once("connect", () => { this.#socket = socket; this.#connecting = undefined; resolve(socket); });
-      socket.once("error", (error) => { this.#connecting = undefined; reject(Object.assign(new Error(`records service unreachable at ${this.options.socket}: ${error.message}`), { code: "RECORD_SERVICE_UNREACHABLE", retryable: true })); });
+      socket.once("connect", () => {
+        this.#pendingSocket = undefined;
+        this.#connecting = undefined;
+        // Closed while connecting: this socket never carries a call.
+        if (this.#closed) { socket.destroy(); reject(new Error("records client closed")); return; }
+        this.#socket = socket;
+        resolve(socket);
+      });
+      socket.once("error", (error) => { if (this.#pendingSocket === socket) this.#pendingSocket = undefined; this.#connecting = undefined; reject(Object.assign(new Error(`records service unreachable at ${this.options.socket}: ${error.message}`), { code: "RECORD_SERVICE_UNREACHABLE", retryable: true })); });
       socket.on("close", () => {
         if (this.#socket === socket) this.#socket = undefined;
+        if (this.#pendingSocket === socket) {
+          this.#pendingSocket = undefined;
+          this.#connecting = undefined;
+          reject(new Error("records client closed"));
+        }
         // The outcome of a call in flight is unknown; a retry with the same key settles it (C3).
         for (const [id, waiter] of this.#pending) {
           this.#pending.delete(id);
@@ -108,13 +139,17 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
 
   async #call(method: string, args: unknown, signal?: AbortSignal, authenticated = true, tokenOverride?: string): Promise<unknown> {
     signal?.throwIfAborted();
+    this.#life.signal.throwIfAborted();
     const socket = await this.#connect();
     signal?.throwIfAborted();
+    // Recheck after every wait: a call never starts on a closed client.
+    this.#life.signal.throwIfAborted();
+    if (socket.destroyed) throw Object.assign(new Error("records service connection closed"), { code: "RECORD_SERVICE_UNREACHABLE", retryable: true });
     const id = this.#next++;
     const token = authenticated ? tokenOverride ?? this.#credential?.token : undefined;
     if (authenticated && !token) throw new Error("records client is not open");
     const deadline = AbortSignal.timeout(this.options.timeoutMs ?? 120_000);
-    const stop = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    const stop = AbortSignal.any([...(signal ? [signal] : []), deadline, this.#life.signal]);
     return new Promise((resolve, reject) => {
       const onAbort = () => {
         if (!this.#pending.delete(id)) return;
@@ -182,6 +217,8 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
   /** Cancel every call in flight (the service rolls them back) and disconnect. */
   close(): void {
     this.#closed = true;
+    this.#life.abort(new Error("records client closed"));
+    this.#pendingSocket?.destroy();
     this.#socket?.destroy();
   }
 }

@@ -10,7 +10,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { recordsInboxSession } from "../src/records/inbox.js";
 import pg from "pg";
 import { migrate } from "../src/records/schema.js";
-import { normalizeServiceConfig, RecordsServer } from "../src/records/server.js";
+import { issuePrincipal, normalizeServiceConfig, RecordsServer } from "../src/records/server.js";
 import type { ClientPool } from "../src/records/store.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
 
@@ -19,6 +19,7 @@ describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
   let server: TestPostgres;
   let service: RecordsServer;
   let socket: string;
+  let relayCredential: string;
   beforeAll(async () => {
     server = await startPostgres();
     socket = path.join(server.dir, "records.sock");
@@ -26,8 +27,12 @@ describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
     pool.on("error", () => undefined);
     const client = await pool.connect();
     try { await migrate(client); } finally { client.release(); }
-    service = await RecordsServer.open(normalizeServiceConfig({ org: "smarty-pants", origin: "test-node", socket, database: server.connection }), { pool: pool as unknown as ClientPool });
+    const serviceConfig = normalizeServiceConfig({ org: "smarty-pants", origin: "test-node", socket, database: server.connection, roles: { relay: ["relay:fabric"] } });
+    service = await RecordsServer.open(serviceConfig, { pool: pool as unknown as ClientPool });
     await service.listen();
+    // The installer's --operator relay:relay:fabric: the relay credential, for the org user's Fabric.
+    relayCredential = path.join(server.dir, "relay.json");
+    fs.writeFileSync(relayCredential, JSON.stringify(await issuePrincipal(serviceConfig, "relay:fabric", "relay", pool as unknown as ClientPool)), { mode: 0o600 });
   }, 60_000);
   afterAll(async () => { await service?.close(); await server?.stop(); }, 30_000);
 
@@ -53,7 +58,7 @@ describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
     const config = normalizeFabricConfig({
       mcp: { enabled: false, cache: { enabled: false } }, mesh: { enabled: true }, memory: { enabled: false },
       agents: { enabled: false }, jev: { enabled: false },
-      records: { enabled: true, socket },
+      records: { enabled: true, socket, relayCredentialFile: relayCredential },
     });
     const fixture = path.join(cwd, "unused.mjs");
     fs.writeFileSync(fixture, "export default {};");

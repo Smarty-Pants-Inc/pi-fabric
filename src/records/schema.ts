@@ -70,6 +70,19 @@ CREATE TABLE record_bounds (
 CREATE INDEX record_bounds_origin_bound ON record_bounds (origin, bound);
 CREATE INDEX record_bounds_origin_seq ON record_bounds (origin, seq);
 
+-- The theft audit (C10): the kernel-reported peer of the connection each record came over.
+-- Service-side metadata, never part of the record's payload.
+CREATE TABLE record_peers (
+  record_id uuid PRIMARY KEY REFERENCES records(id),
+  principal text NOT NULL,
+  pid integer NOT NULL,
+  uid integer NOT NULL,
+  gid integer NOT NULL,
+  cmdline text,
+  cwd text,
+  at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 -- dev-lead's #1481 outbox row with the v1.3 additions (record_id, edit_of, request_key, skipped).
 CREATE TABLE outbox (
   seq bigserial PRIMARY KEY,
@@ -140,6 +153,9 @@ CREATE TABLE principals (
   id text PRIMARY KEY,
   name text,
   token_hash text NOT NULL UNIQUE,
+  -- A self-registration's enrollment nonce (hashed): the same nonce may enroll again after a
+  -- lost response, and nothing else can.
+  nonce_hash text,
   issued_by text NOT NULL CHECK (issued_by IN ('register', 'operator')),
   created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
@@ -235,7 +251,8 @@ CREATE FUNCTION publication_claim(p_origin text, p_limit integer, p_lease_second
         AND (q.claimed_at IS NULL OR q.claimed_at <= clock_timestamp() - make_interval(secs => p_lease_seconds))
       ORDER BY q.seq LIMIT p_limit FOR UPDATE SKIP LOCKED)
     RETURNING p.claim_id, p.record_id, p.seq, p.topic, p.recipient)
-  SELECT c.claim_id, c.record_id, c.seq, c.topic, c.recipient, r.kind, r.ref, r.author, r.key, r.text, r.created_at
+  -- A nudge carries at most 2 KiB of text, so a claim of 50 stays far below the frame limit (F10).
+  SELECT c.claim_id, c.record_id, c.seq, c.topic, c.recipient, r.kind, r.ref, r.author, r.key, left(r.text, 2048), r.created_at
   FROM claimed c JOIN records r ON r.id = c.record_id ORDER BY c.seq;
 $f$;
 -- Each completes only the caller's own live claim on the row; anything else changes nothing.
@@ -253,6 +270,14 @@ CREATE FUNCTION publication_fail(p_record uuid, p_claim uuid, p_claimant text, p
 BEGIN
   UPDATE publication SET attempts = attempts + 1, error = left(p_error, 500), claimed_at = NULL, claimed_by = NULL, claim_id = NULL
   WHERE record_id = p_record AND published_at IS NULL AND claim_id = p_claim AND claimed_by = p_claimant;
+  RETURN FOUND;
+END $f$;
+-- A self-registration retried with its own nonce gets a fresh token (its response was lost).
+CREATE FUNCTION principal_reenroll(p_id text, p_nonce_hash text, p_token_hash text)
+  RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+BEGIN
+  UPDATE principals SET token_hash = p_token_hash
+  WHERE id = p_id AND issued_by = 'register' AND nonce_hash IS NOT NULL AND nonce_hash = p_nonce_hash;
   RETURN FOUND;
 END $f$;
 -- A relay that stopped at a failure gives back the rest of its claim at once.
@@ -277,16 +302,16 @@ CREATE FUNCTION archive_record(p_target text, p_frontier pg_lsn, p_error text)
   WHERE target = p_target;
 $f$;
 
-REVOKE ALL ON records, record_bounds, outbox, publication, consumers, archive_checks, alarms, principals FROM PUBLIC;
+REVOKE ALL ON records, record_bounds, record_peers, outbox, publication, consumers, archive_checks, alarms, principals FROM PUBLIC;
 REVOKE ALL ON FUNCTION consumer_open(text, text, jsonb), consumer_save(text, bigint, jsonb), alarm_claim(text, timestamptz, timestamptz),
-  publication_claim(text, integer, double precision, text), publication_ack(uuid, uuid, text, bigint, double precision), publication_fail(uuid, uuid, text, text), publication_release(uuid[], uuid, text),
+  publication_claim(text, integer, double precision, text), publication_ack(uuid, uuid, text, bigint, double precision), publication_fail(uuid, uuid, text, text), publication_release(uuid[], uuid, text), principal_reenroll(text, text, text),
   archive_claim(text, double precision), archive_record(text, pg_lsn, text), records_append_only() FROM PUBLIC;
-GRANT SELECT, INSERT ON records, record_bounds, outbox, publication, principals TO ${WRITER_ROLE};
+GRANT SELECT, INSERT ON records, record_bounds, record_peers, outbox, publication, principals TO ${WRITER_ROLE};
 GRANT SELECT ON consumers, archive_checks, alarms TO ${WRITER_ROLE};
 GRANT USAGE ON SEQUENCE outbox_seq_seq TO ${WRITER_ROLE};
 GRANT SELECT ON live_records, current_issue, current_statuses, open_asks, current_links, current_decisions, mirror_state TO ${WRITER_ROLE};
 GRANT EXECUTE ON FUNCTION consumer_open(text, text, jsonb), consumer_save(text, bigint, jsonb), alarm_claim(text, timestamptz, timestamptz),
-  publication_claim(text, integer, double precision, text), publication_ack(uuid, uuid, text, bigint, double precision), publication_fail(uuid, uuid, text, text), publication_release(uuid[], uuid, text),
+  publication_claim(text, integer, double precision, text), publication_ack(uuid, uuid, text, bigint, double precision), publication_fail(uuid, uuid, text, text), publication_release(uuid[], uuid, text), principal_reenroll(text, text, text),
   archive_claim(text, double precision), archive_record(text, pg_lsn, text) TO ${WRITER_ROLE};
 `;
 

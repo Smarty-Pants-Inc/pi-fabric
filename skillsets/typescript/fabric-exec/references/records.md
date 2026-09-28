@@ -34,9 +34,9 @@ const receipt = await records.append({
 ## Trust boundary
 
 `records.*` reaches the org's records service over its socket. The service runs as its own OS user and derives your
-principal from your session's credential. You cannot reach the database or take a role. Agents that share the org's
-OS user could still steal each other's credentials, so within one org authorship is attribution, not
-authentication.
+principal from your session's credential. You cannot reach the database or take a reserved role (importer, mirror,
+relay). Agents that share the org's OS user could still steal each other's credentials, so within one org a
+session's authorship is attribution, not authentication, until per-agent OS users (#820).
 
 Records addressed to your session (`data.to` is your participant id or session name) arrive by themselves at your
 next turn start, at least once.

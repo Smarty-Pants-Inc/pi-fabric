@@ -29,22 +29,28 @@ export interface RecordsServiceOptions {
  */
 export class RecordsService {
   readonly store: RemoteRecords;
-  readonly relay: PublicationRelay;
+  /** The relay's client (the reserved relay principal), when this process holds its credential. */
+  readonly relayClient: RemoteRecords | undefined;
+  readonly relay: PublicationRelay | undefined;
   readonly inbox: RecordsInbox | undefined;
   readonly watchdog: RecordsWatchdog;
   readonly #life = new AbortController();
 
-  private constructor(readonly options: RecordsServiceOptions, client: RemoteRecords) {
+  private constructor(readonly options: RecordsServiceOptions, client: RemoteRecords, relayClient: RemoteRecords | undefined) {
     const { config } = options;
     this.store = client;
-    this.relay = new PublicationRelay(client, options.publisher);
+    this.relayClient = relayClient;
+    // Only the reserved relay principal claims and completes nudges and alarms (F9); a process
+    // without its credential still delivers by cursor (the records inbox) and wakes its own root.
+    this.relay = relayClient ? new PublicationRelay(relayClient, options.publisher) : undefined;
     this.inbox = options.names ? new RecordsInbox(client, client.principalId, options.names, { signal: this.#life.signal }) : undefined;
     this.watchdog = new RecordsWatchdog({
-      store: client, relay: this.relay,
-      check: (signal) => this.#archiveAlarm(signal),
+      store: relayClient ?? client,
+      ...(this.relay ? { relay: this.relay } : {}),
+      ...(relayClient ? { check: (signal: AbortSignal | undefined) => this.#archiveAlarm(signal) } : {}),
       ...(this.inbox ? { self: client.principalId } : {}),
       ...(options.wake ? { wake: options.wake } : {}),
-      alarm: (lag) => this.#consumerAlarm(lag),
+      ...(relayClient ? { alarm: (lag: ConsumerLag) => this.#consumerAlarm(lag) } : {}),
       lagMs: config.consumerLagSeconds * 1000,
       intervalMs: config.watchdogMs,
       signal: this.#life.signal,
@@ -59,14 +65,19 @@ export class RecordsService {
       socket: config.socket, identity: options.identity, credentialDir: options.credentialDir,
       ...(config.credentialFile ? { credentialFile: config.credentialFile } : {}),
     });
+    const relayClient = config.relayCredentialFile ? new RemoteRecords({
+      socket: config.socket, identity: options.identity, credentialDir: options.credentialDir, credentialFile: config.relayCredentialFile,
+    }) : undefined;
     try {
       await client.open();
+      await relayClient?.open();
     } catch (error) {
       client.close();
+      relayClient?.close();
       throw error;
     }
-    const service = new RecordsService(options, client);
-    void service.relay.flush(service.#life.signal).catch(() => undefined);
+    const service = new RecordsService(options, client, relayClient);
+    void service.relay?.flush(service.#life.signal).catch(() => undefined);
     service.watchdog.start();
     return service;
   }
@@ -83,7 +94,7 @@ export class RecordsService {
     return {
       append: async (principal, args, options) => {
         const receipt = await client.append(principal, args, options);
-        if (!this.#life.signal.aborted) void this.relay.flush(this.#life.signal).catch(() => undefined);
+        if (!this.#life.signal.aborted) void this.relay?.flush(this.#life.signal).catch(() => undefined);
         return receipt;
       },
       read: (principal, args, options) => client.read(principal, args, options),
@@ -99,7 +110,7 @@ export class RecordsService {
     const admission = status.admission as { state?: string; lagSeconds?: number; alarmSeconds?: number; refuseSeconds?: number; frontier?: string; insertLsn?: string } | undefined;
     const state = admission?.state;
     if (state !== "alarm" && state !== "refuse") return;
-    if (!await this.store.claimAlarm(`archive-lag:${state}`, Date.now(), REALARM_MS, signal)) return;
+    if (!this.relayClient || !await this.relayClient.claimAlarm(`archive-lag:${state}`, Date.now(), REALARM_MS, signal)) return;
     const text = state === "refuse"
       ? `records archive lagging ${admission!.lagSeconds} s: records.append refuses new records (C2, over ${admission!.refuseSeconds} s). Restore WAL archiving.`
       : `records archive lagging ${admission!.lagSeconds} s (alarm at ${admission!.alarmSeconds} s; appends are refused past ${admission!.refuseSeconds} s). Check WAL archiving.`;
@@ -122,6 +133,7 @@ export class RecordsService {
     this.watchdog.stop();
     this.#life.abort(new Error("records service closed"));
     this.store.close();
+    this.relayClient?.close();
     await Promise.race([this.watchdog.idle(), new Promise((resolve) => setTimeout(resolve, timeoutMs).unref?.())]);
   }
 }

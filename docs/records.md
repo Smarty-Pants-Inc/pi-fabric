@@ -24,18 +24,30 @@ Database authority lives in one place: the org's **records service**.
 - **A socket for the org's agents.** Fabric reaches the service over a unix socket in a setgid 2750 directory that
   belongs to the agents' group. Every call carries a **per-principal token**, and the service derives the caller's
   principal from it, never from the payload.
-  - A Main (`session:<uuid>`) or an actor (its 32-hex id) registers its own participant id once. The first claim
-    wins, and a second is refused. Nothing proves the first claimant is the id's owner (see Trust boundary). The token is kept at 0600 in the agent directory
-    (`<agent dir>/fabric/records-credentials/`).
-  - The operator issues other principals: the importer and the mirror (`service-main.js issue`).
-- **Roles in the service's config.** The `importer` and `mirror` roles are granted in the service's own
+  - A Main (`session:<uuid>`) or an actor (its 32-hex id) registers its own participant id once, with an
+    enrollment nonce it saved (0600, `<agent dir>/fabric/records-credentials/`) before sending. The first claim
+    wins. A retry with the same nonce recovers a credential whose response was lost; any other claim is refused.
+    Nothing proves the first claimant is the id's owner (see Trust boundary).
+  - **Reserved identities** are never registrable: the installer grants them (`--operator ROLE:ID`) in the
+    service's config and issues their credentials. The **importer** and the **mirror** run as `<org>-records`, and
+    their credentials stay in its 0700 `/var/lib/<org>-records/credentials`. The **relay** publishes nudges on the
+    org's mesh, which only the org user can write, so its credential goes to the org user (0600,
+    `~/.config/<org>-records/relay.json`, Fabric's `records.relayCredentialFile`).
+- **Roles in the service's config.** The `importer`, `mirror` and `relay` roles are granted in the service's own
   configuration (`/etc/<org>-records/service.json`), which the org's agents cannot write.
 - **Nudges stay in Fabric.** Fabric keeps the publication relay, because the service cannot write the org's mesh. It
   also keeps the records inbox and the watchdog's wakes and alarms, and it talks to the service for everything else.
   A client that disconnects, or cancels a call, cancels that call on the service too.
-- **Claims are the claimant's.** A relay's publication claim can be acked, failed or released only by the principal
-  that took it, and only while its lease lasts. An alarm claim is honored only while its condition holds (the
-  consumer lags now; the archive gate is in that state now). A malformed frame ends only its own connection.
+- **Publication and alarm authority is the relay's.** Only the relay role may claim, ack, fail or release a
+  publication, or claim an alarm, and only its own live claim. An alarm claim is honored only while its condition
+  holds. A process without the relay credential still delivers by cursor and wakes its own root. A malformed frame
+  ends only its own connection.
+- **Responses are byte-bounded.** A page, an inbox replay, a history or a fold list stops near 768 KiB and returns
+  `next`, always with at least one record (one record is at most ~450 KiB). A nudge claim carries at most 2 KiB of
+  text per record. Every protocol line is at most 1 MiB, checked on the whole line wherever the stream splits.
+- **The theft audit.** The service asks the kernel (SO_PEERCRED) who is on each connection. It stores the pid, uid,
+  gid and command line with each append (`record_peers`, never in the record). When one principal's token is used
+  by two live processes within an hour, it writes a one-line `alarm` to its status file.
 
 `scripts/records-paul-steps.sh` installs all of it in one idempotent run with `--dry-run`: the user, the cluster,
 pg_hba and ident, the units, the migration, and credential issuance.
@@ -194,7 +206,8 @@ good frontier, so the lag grows: the gate fails closed.
 | `consumers` | processing cursors | SELECT; open and save by function |
 | `archive_checks` | the last archive frontier per target, and who checks it now | SELECT; claim and record by function |
 | `alarms` | one alarm per key per window | SELECT; claim by function |
-| `principals` | registered and issued principals (token hashes) | INSERT, SELECT |
+| `principals` | registered and issued principals (token and nonce hashes) | INSERT, SELECT; re-enrollment by function |
+| `record_peers` | the kernel-reported peer process of each append (the theft audit) | INSERT, SELECT |
 
 Views: `current_issue`, `current_statuses`, `open_asks`, `current_links`, `current_decisions`, `mirror_state`,
 `live_records`. The service logs in as `records_service`, and every transaction also runs as `fabric_records_writer` (`SET LOCAL ROLE`).
@@ -208,15 +221,20 @@ only the fields it carries (title, labels, body); one that changes nothing the f
 ## Trust boundary
 
 - **Closed by the records service (C10).** An ordinary agent, running as the org's OS user, cannot reach
-  PostgreSQL. `pg_hba` rejects it, and the socket directory is the records user's, mode 0700. It cannot run DDL,
-  remove the append-only trigger, give itself the importer or mirror role, or claim another participant's id. The
-  tests show these on a cluster started with the install's own pg_hba and ident.
-- **Not closed: impersonation between same-OS-user agents.** Agents that share the org's OS user can read one
-  another's memory, `/proc/<pid>/environ` and credential files. A process can also register a known session or
-  actor id before its owner first does: the service has no identity to check the claim against, and the owner then
-  gets `RECORD_PRINCIPAL_TAKEN`. So a token proves "a process of this org holding X's credential", not "agent X".
-  Within one org, authorship stays **attribution, not authentication** until agents run as separate OS users
-  (#820), which gives the service a peer identity (SO_PEERCRED) to bind enrollment to.
+  PostgreSQL. `pg_hba` rejects it, and the socket directory belongs to the records user, mode 0700. It cannot run
+  DDL, remove the append-only trigger, give itself a role, or register a reserved identity (importer, mirror,
+  relay). The tests show these on a cluster started with the install's own pg_hba and ident.
+- **Protected: reserved identities.** The importer and the mirror run as `<org>-records`, with credentials only in
+  that user's 0700 directory, so an org agent cannot read them.
+- **Attributed, not authenticated: same-uid session identities, until #820's per-agent users.**
+  - Agents that share the org's OS user can read one another's memory and credential files.
+  - A process can register a known session id before its owner does.
+  - The relay's credential is the org user's.
+
+  Within one org, a session's authorship is attribution. The audit makes theft visible (the peer process of each
+  append, and the token-reuse alarm) but does not prevent it.
+- **Why a bad relay is bounded.** A publication is only the live nudge. Every consumer reconciles by `records.read`
+  cursor at turn start and settle (C4), so a forged or dropped ack delays delivery and never loses a record (tested).
 - Across orgs, #820's per-org OS users are the boundary.
 
 ## Remote hosts (C10, later)

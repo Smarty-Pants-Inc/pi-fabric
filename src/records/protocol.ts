@@ -9,6 +9,25 @@
  * principal from it, never from `args`. Closing the connection cancels its calls in flight.
  */
 export const MAX_LINE_BYTES = 1024 * 1024;
+/**
+ * What one response's records may add up to (JSON bytes). A page, a replay or a history stops
+ * near it and returns `next`, always with at least one record: one record's JSON is at most
+ * ~450 KiB (64 KiB of text, escaped, plus 64 KiB of data), so a response always fits a line.
+ */
+export const RESPONSE_BUDGET_BYTES = 768 * 1024;
+
+/** The longest prefix of `items` whose JSON fits the budget, never fewer than one item. */
+export const withinBudget = <T>(items: readonly T[], budget = RESPONSE_BUDGET_BYTES): T[] => {
+  let used = 0;
+  const kept: T[] = [];
+  for (const item of items) {
+    const size = Buffer.byteLength(JSON.stringify(item)) + 1;
+    if (kept.length > 0 && used + size > budget) break;
+    kept.push(item);
+    used += size;
+  }
+  return kept;
+};
 
 export interface WireRequest { id: number; method: string; token?: string; args?: unknown }
 export interface WireError { message: string; code?: string; retryable?: boolean }
@@ -43,6 +62,12 @@ export class LineReader {
     while ((index = this.#buffer.indexOf("\n")) >= 0) {
       const line = this.#buffer.slice(0, index);
       this.#buffer = this.#buffer.slice(index + 1);
+      // The limit holds for every whole line, however the stream was split.
+      if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
+        this.#buffer = "";
+        this.onOverflow();
+        return;
+      }
       if (line.trim()) this.onLine(line);
     }
     if (Buffer.byteLength(this.#buffer) > MAX_LINE_BYTES) {

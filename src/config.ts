@@ -174,6 +174,8 @@ export interface FabricAgentConfig {
   sessionExport: boolean;
   /** Export store root override; PI_FABRIC_AGENT_DIR wins. Empty = ~/.pi-fabric/agent. */
   sessionExportDir: string;
+  /** Unix niceness 0-19 for every child agent; 0 leaves priority unchanged. */
+  nice: number;
 }
 
 export interface FabricToolCaptureConfig {
@@ -434,6 +436,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxTokensPerChild: 0,
     sessionExport: true,
     sessionExportDir: "",
+    nice: 0,
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
   components: [],
@@ -1044,6 +1047,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         typeof agents.sessionExportDir === "string"
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
+      nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
     },
     jev: normalizeJevConfig(input.jev),
     components: configuredComponents.map((entry) => structuredClone(entry)),

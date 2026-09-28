@@ -39,6 +39,12 @@ const runProperties = {
     enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
   },
   tools: { type: "array", items: { type: "string" } },
+  nice: {
+    type: "integer",
+    minimum: 0,
+    maximum: 19,
+    description: "Unix niceness for this child and its tools. Only raises agents.nice, never lowers it.",
+  },
   timeoutMs: {
     type: "number",
     description:
@@ -398,6 +404,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         tools: runProperties.tools,
         transport: runProperties.transport,
         timeoutMs: runProperties.timeoutMs,
+        nice: runProperties.nice,
         extensions: runProperties.extensions,
         inferenceContext: { type: "string", enum: ["full-history", "activation"], description: "Inference-only activation window (Pi only); journals remain complete. Default full-history." },
         requires: {
@@ -651,6 +658,21 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         scope: { type: "string", enum: ["project", "global"] },
       },
       required: ["id", "activationFilter"],
+      additionalProperties: false,
+    },
+    risk: "agent",
+  },
+  {
+    name: "setNice",
+    description: "Set an actor's Unix niceness (0-19) for future runs; it only raises agents.nice, never lowers it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        nice: runProperties.nice,
+        scope: { type: "string", enum: ["project", "global"] },
+      },
+      required: ["id", "nice"],
       additionalProperties: false,
     },
     risk: "agent",

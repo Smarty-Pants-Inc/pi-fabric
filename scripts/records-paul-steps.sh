@@ -18,7 +18,7 @@
 # ROOT STEPS (one line each):
 #  0. mktemp -d /run/<org>-records-stage.XXXXXX (root, 0700; removed on exit); copy --node and the bundle into it once each; refuse (nothing changed) unless each staged copy's sha256 equals --node-sha256/--bundle-sha256; install -d -m 0700 -o root -g root the installer state dir /var/lib/<org>-records-installer (restart-pending, root-only temp files) and refuse unless it is no symlink, root-owned, 0700, with every ancestor root-owned and not group- or world-writable
 #  1. useradd the <org>-records system user (skipped if it exists)
-#  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records-installer/restart-pending, root 0600; each line must be one of the two unit names, otherwise refused); check <org>-records runs it with no modules
+#  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records-installer/restart-pending, root 0600, replaced only atomically: temp file, fsync, rename, directory fsync; each line must be one of the two unit names, otherwise refused); check <org>-records runs it with no modules
 #  3. create /var/lib/<org>-records, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes; <org>-records itself creates /var/lib/<org>-records/{pg,status,credentials} (root names no path inside its home)
 #  4. initdb the cluster as <org>-records if absent (an existing cluster keeps its own major, from PG_VERSION); as <org>-records (never root), write pg_hba.conf, pg_ident.conf, conf.d/records.conf and append include_dir to postgresql.conf (each only when it changes, first listing <org>-records-pg.service in restart-pending before a config change)
 #  5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
@@ -222,8 +222,21 @@ PG_BASE="${T}/usr/lib/postgresql"
 PG_BIN="" PG_MAJOR="" PG_REFUSAL=""
 # F20: an existing cluster keeps its own major; highest-major detection is only for a fresh cluster.
 CLUSTER_MAJOR=""
-if [[ -f $DATA/PG_VERSION ]]; then
-	CLUSTER_MAJOR=$(<"$DATA/PG_VERSION") || die "cannot read ${DATA}/PG_VERSION"
+as_rec() { runuser -u "$REC" -- "$@"; }
+# C10D-P3-1: root never opens a path in the records user's tree. Reads there run as ${REC} (runuser) in a real run,
+# and in a dry run by root when ${REC} exists; an unprivileged dry run, --help or --print reads as its own user.
+rec_reads_as_rec() {
+	if ((DRY || HELP)) || [[ -n $PRINT ]]; then ((EUID == 0)) && id -u "$REC" >/dev/null 2>&1; else ((EUID == 0)) || [[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} == 1 ]]; fi
+}
+# PG_VERSION: no symlink (nor a symlinked data dir), a regular file, at most 16 bytes, read as above.
+if [[ -e $DATA/PG_VERSION || -L $DATA/PG_VERSION || -L $DATA ]]; then
+	[[ ! -L $HOME_DIR && ! -L $DATA && ! -L $DATA/PG_VERSION && -f $DATA/PG_VERSION ]] ||
+		die "refused: ${DATA}/PG_VERSION is not a regular file in a real directory (a symlink?); nothing was changed"
+	if rec_reads_as_rec; then
+		CLUSTER_MAJOR=$(as_rec head -c 16 -- "$DATA/PG_VERSION") || die "cannot read ${DATA}/PG_VERSION as ${REC}"
+	else
+		CLUSTER_MAJOR=$(head -c 16 -- "$DATA/PG_VERSION") || die "cannot read ${DATA}/PG_VERSION"
+	fi
 	[[ $CLUSTER_MAJOR =~ ^[0-9]+$ ]] || die "refused: ${DATA}/PG_VERSION does not hold a PostgreSQL major version; nothing was changed"
 fi
 cluster_refusal() { # WHAT: why the cluster's own binaries are not used
@@ -496,9 +509,10 @@ CHANGED=0 CONTENT_CHANGED=0 BEFORE_CONTENT_CHANGE=
 # The owner a records-owned file must have. TEST ONLY: the test user, who stands in for ${REC}.
 REC_OWNER="${REC}:${REC}"
 [[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} != 1 ]] || REC_OWNER="$(id -un):$(id -gn)"
-# S5: a file inside a records-owned directory is read and written only as ${REC}: root never opens a path the
-# records user could swap for a symlink. A dry run only reads (as the invoking user) and prints.
-rec_read() { if ((DRY)); then cat -- "$1" 2>/dev/null || true; else as_rec cat -- "$1" 2>/dev/null || true; fi; }
+# S5/C10D-P3-1: a file inside a records-owned directory is read and written only as ${REC}: root never opens a path
+# the records user could swap for a symlink (root only stats them, which follows no final link and opens nothing).
+# A dry run by root reads as ${REC} too when it exists; an unprivileged dry run reads as its own user and prints.
+rec_read() { if ((!DRY)) || rec_reads_as_rec; then as_rec cat -- "$1" 2>/dev/null || true; else cat -- "$1" 2>/dev/null || true; fi; }
 write_file() { # PATH MODE OWNER CONTENT; idempotent: writes only when content, mode or owner differ
 	local path=$1 mode=$2 owner=$3 content=$4 tmp want
 	local rec=0
@@ -549,7 +563,6 @@ write_file() { # PATH MODE OWNER CONTENT; idempotent: writes only when content, 
 	fi
 	rm -f "$tmp"
 }
-as_rec() { runuser -u "$REC" -- "$@"; }
 # The org user's relay credential directory; "~user/..." (print only) when the user has no home here.
 relay_dir() {
 	local home
@@ -622,7 +635,7 @@ root_steps() {
 	cat <<'EOF'
   0. mktemp -d /run/<org>-records-stage.XXXXXX (root, 0700; removed on exit); copy --node and the bundle into it once each; refuse (nothing changed) unless each staged copy's sha256 equals --node-sha256/--bundle-sha256; install -d -m 0700 -o root -g root the installer state dir /var/lib/<org>-records-installer (restart-pending, root-only temp files) and refuse unless it is no symlink, root-owned, 0700, with every ancestor root-owned and not group- or world-writable
   1. useradd the <org>-records system user (skipped if it exists)
-  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records-installer/restart-pending, root 0600; each line must be one of the two unit names, otherwise refused); check <org>-records runs it with no modules
+  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records-installer/restart-pending, root 0600, replaced only atomically: temp file, fsync, rename, directory fsync; each line must be one of the two unit names, otherwise refused); check <org>-records runs it with no modules
   3. create /var/lib/<org>-records, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes; <org>-records itself creates /var/lib/<org>-records/{pg,status,credentials} (root names no path inside its home)
   4. initdb the cluster as <org>-records if absent (an existing cluster keeps its own major, from PG_VERSION); as <org>-records (never root), write pg_hba.conf, pg_ident.conf, conf.d/records.conf and append include_dir to postgresql.conf (each only when it changes, first listing <org>-records-pg.service in restart-pending before a config change)
   5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
@@ -729,21 +742,25 @@ marker_check() {
 	done <"$MARKER"
 }
 marker_has() { marker_check; [[ -f $MARKER ]] && grep -qxF "$1" "$MARKER"; }
-marker_set() { # CONTENT: rewrite the marker (root, 0600), or remove it when empty; its temp file is in root-only ${STATE}
+# C10D-P2-1: the marker is replaced atomically. The complete new marker is written to a temp file in the root-only
+# ${STATE} (mktemp: root, 0600), fsynced, renamed over the old one, and the directory fsynced. Until the rename the
+# old marker stays whole, so a failure anywhere keeps every obligation it holds (the rerun restarts too much, never too little).
+marker_set() { # CONTENT: replace the marker (root, 0600), or remove it when empty
 	local tmp
-	if [[ -z $1 ]]; then run rm -f "$MARKER"; return; fi
-	tmp=$(mktemp "${STATE}/restart-pending.XXXXXX")
-	printf '%s\n' "$1" >"$tmp"
-	if ! run install -m 0600 -o root -g root "$tmp" "$MARKER"; then rm -f "$tmp"; die "cannot write ${MARKER}"; fi
-	rm -f "$tmp"
+	if [[ -z $1 ]]; then run rm -f "$MARKER" && run sync -- "$STATE" || die "cannot remove ${MARKER}"; return; fi
+	tmp=$(mktemp "${STATE}/restart-pending.XXXXXX") || die "cannot write ${MARKER}"
+	if ! { printf '%s\n' "$1" >"$tmp" && run sync -- "$tmp" && run mv -fT -- "$tmp" "$MARKER" && run sync -- "$STATE"; }; then
+		rm -f -- "$tmp"
+		die "cannot write ${MARKER} (the previous marker, if any, is kept)"
+	fi
 }
 marker_add() { # UNIT
-	if ((DRY)); then echo "? add ${1} to ${MARKER} (root, 0600; restart pending until it restarts)"; return 0; fi
+	if ((DRY)); then echo "? add ${1} to ${MARKER} (root, 0600; restart pending until it restarts; replaced atomically: temp file in ${STATE}, fsync, rename, fsync ${STATE})"; return 0; fi
 	marker_has "$1" && return 0
 	marker_set "$( [[ ! -f $MARKER ]] || cat "$MARKER"; echo "$1")"
 }
 marker_clear() { # UNIT
-	if ((DRY)); then echo "? remove ${1} from ${MARKER} (rm it when empty)"; return 0; fi
+	if ((DRY)); then echo "? remove ${1} from ${MARKER} (same atomic replace; rm it when empty, then fsync ${STATE})"; return 0; fi
 	marker_has "$1" || return 0
 	marker_set "$(grep -vxF "$1" "$MARKER" || true)"
 }
@@ -1091,7 +1108,8 @@ if ((DRY)); then
 	echo "? du -sh ${DATA}/pg_wal  (info only: WAL size; max_wal_size = 1GB is a soft target, not a quota)"
 else
 	success_check "no PostgreSQL TCP listener on :5432 or :${PORT}" no_pg_tcp_listener
-	echo "WAL (info only): $(du -sh "$DATA/pg_wal" 2>/dev/null || echo "unknown ${DATA}/pg_wal")"
+	# C10D-P3-1: as ${REC}, so a redirected directory in its tree shows root nothing.
+	echo "WAL (info only): $(as_rec du -sh -- "$DATA/pg_wal" 2>/dev/null || echo "unknown ${DATA}/pg_wal")"
 fi
 cat <<EOF
 

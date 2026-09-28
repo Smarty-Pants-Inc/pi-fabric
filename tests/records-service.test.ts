@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import pg from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { RemoteRecords } from "../src/records/client.js";
 import { recordsInboxMessage, recordsInboxSession, RecordsInbox } from "../src/records/inbox.js";
 import { PublicationRelay, type NudgePublisher } from "../src/records/relay.js";
@@ -29,6 +30,8 @@ const rendered = (what: string): string => {
   return result.stdout.replaceAll("test-org-records", osUser);
 };
 const canRun = Boolean(postgresBin) && process.platform !== "win32";
+const originalOpen = fs.openSync.bind(fs);
+const originalFsync = fs.fsyncSync.bind(fs);
 
 describe.skipIf(!canRun)("the records service (C10)", () => {
   let server: TestPostgres;
@@ -745,6 +748,105 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     await expect(issueCredentialFile(config, "relay:fabric", "relay", out, { pool })).rejects.toThrow(/exists/);
     expect(fs.readFileSync(out, "utf8")).toBe(published);
     expect(fs.existsSync(`${out}.pending`)).toBe(false);
+  });
+
+  it("S6: losing the lock's session during a paused rotation loses the rotation too; verify then keeps a live credential (#117 S6)", async () => {
+    const { config } = await freshService();
+    // The issuer's pool, as the CLI's openPool makes it: room for a lock and a rotation session.
+    const issuers = new pg.Pool({ ...config.migration!, max: 4 });
+    issuers.on("error", () => undefined);
+    issuers.on("connect", (client) => { client.on("error", () => undefined); });
+    cleanups.push(() => issuers.end());
+    const pool = issuers as unknown as ClientPool;
+    const dirOut = path.join(dir, `s6-${databases}`);
+    const out = path.join(dirOut, "relay.json");
+    await issueCredentialFile(config, "relay:fabric", "relay", out, { pool });
+    const first = fs.readFileSync(out, "utf8");
+    // Pause the rotation inside its transaction: another session holds the principal's row.
+    // The blocker and the probes use their own connections, outside the issuer's pool.
+    const blocker = new pg.Client({ ...config.migration! });
+    const probe = new pg.Client({ ...config.migration! });
+    await blocker.connect();
+    await probe.connect();
+    cleanups.push(() => blocker.end(), () => probe.end());
+    await blocker.query("BEGIN");
+    await blocker.query("SELECT 1 FROM principals WHERE id = 'relay:fabric' FOR UPDATE");
+    const a = issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true });
+    const settled = a.then(() => "ok", (error: Error) => error.message);
+    const waiting = async () => Number((await probe.query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname = 'records' AND wait_event_type = 'Lock'")).rows[0].n);
+    for (let i = 0; i < 100 && await waiting() === 0; i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(await waiting()).toBe(1);
+    expect(fs.existsSync(`${out}.pending`)).toBe(true);
+    // Only the session holding the per-principal advisory lock is lost.
+    const holders = (await probe.query("SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted")).rows as { pid: number }[];
+    expect(holders).toHaveLength(1);
+    await probe.query("SELECT pg_terminate_backend($1)", [holders[0]!.pid]);
+    // A concurrent verify takes the lock, finds the pending token not live, and verifies the old file.
+    expect(await issueCredentialFile(config, "relay:fabric", "relay", out, { pool, verifyOnly: true })).toBe("verified");
+    // The paused rotation can no longer commit: its transaction died with the lock's session.
+    await blocker.query("ROLLBACK");
+    expect(await settled).not.toBe("ok");
+    const live = (await probe.query("SELECT token_hash FROM principals WHERE id = 'relay:fabric'")).rows[0].token_hash as string;
+    const token = (JSON.parse(fs.readFileSync(out, "utf8")) as { token: string }).token;
+    expect(fs.readFileSync(out, "utf8")).toBe(first);
+    expect(createHash("sha256").update(token).digest("hex")).toBe(live);
+    expect(await issueCredentialFile(config, "relay:fabric", "relay", out, { pool, verifyOnly: true })).toBe("verified");
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
+    expect(fs.readdirSync(dirOut)).toEqual(["relay.json"]);
+  });
+
+  it("F5: the pending file and every new directory are fsynced before the database change; a failed directory fsync changes nothing (#117 F5)", async () => {
+    const { config, owner } = await freshService();
+    const pool = owner as unknown as ClientPool;
+    const base = path.join(dir, `f5-${databases}`);
+    const out = path.join(base, "new", "deeper", "relay.json");
+    fs.mkdirSync(base);
+    const names = new Map<number, string>();
+    const events: string[] = [];
+    const open = vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+      const fd = originalOpen(...args);
+      names.set(fd, String(args[0]));
+      return fd;
+    }) as typeof fs.openSync);
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+      events.push(`fsync ${path.relative(base, names.get(fd) ?? "?") || "."}`);
+      originalFsync(fd);
+    });
+    const query = owner.query.bind(owner);
+    const hash = async () => (await query("SELECT token_hash FROM principals WHERE id = 'relay:fabric'")).rows[0]?.token_hash as string | undefined;
+    try {
+      const spyPool: ClientPool = {
+        connect: async () => {
+          const client = await owner.connect();
+          const inner = client.query.bind(client);
+          return Object.assign(client, { query: (...args: Parameters<typeof inner>) => { if (/INSERT INTO principals|principal_reissue/.test(String(args[0]))) events.push("database change"); return inner(...args); } }) as unknown as Awaited<ReturnType<ClientPool["connect"]>>;
+        },
+      };
+      await issueCredentialFile(config, "relay:fabric", "relay", out, { pool: spyPool }); 
+      expect(events).toEqual([
+        "fsync new/deeper/relay.json.pending",
+        "fsync new/deeper",
+        "fsync new",
+        "fsync .",
+        "database change",
+        "fsync new/deeper",
+      ]);
+      // A failed directory fsync before the change: the call fails, the database and the file are unchanged.
+      const before = await hash(); 
+      const first = fs.readFileSync(out, "utf8");
+      sync.mockImplementation((fd: number) => {
+        if (names.get(fd) === path.dirname(out)) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+        originalFsync(fd);
+      });
+      await expect(issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true })).rejects.toThrow("EIO: injected");
+      expect(await hash()).toBe(before); 
+      expect(fs.readFileSync(out, "utf8")).toBe(first);
+      expect(fs.readdirSync(path.dirname(out))).toEqual(["relay.json"]);
+    } finally {
+      open.mockRestore();
+      sync.mockRestore();
+    }
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
   });
 
   it("a client closed while it reconnects starts no call (F3)", async () => {

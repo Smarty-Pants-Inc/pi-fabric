@@ -166,8 +166,11 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, r
  * is published (so concurrent issues for one principal run one at a time):
  *  1. a leftover `<out>.pending` from an interrupted run is published if the database holds its
  *     token, and discarded otherwise;
- *  2. the new credential goes to `<out>.pending` (0600, fixed name), and is fsynced;
- *  3. the database is changed;
+ *  2. the new credential goes to `<out>.pending` (0600, fixed name); the file, its directory and
+ *     any directory just created (in its parent) are fsynced, so the pending pathname survives a
+ *     host crash before the database can hold its token (F5);
+ *  3. the database is changed ON THE SESSION THAT HOLDS THE LOCK (S6): if that session is lost, its
+ *     rotation is lost with it, so no other run can hold the lock while this change may still commit;
  *  4. `<out>.pending` is renamed over `out`, and the directory fsynced.
  * A database failure that certainly did not commit removes `<out>.pending` and leaves `out` and its
  * token as they were; after a failed COMMIT (outcome unknown) the pending file is kept and the call
@@ -180,17 +183,34 @@ export const issueCredentialFile = async (
 ): Promise<"published-pending" | "verified" | "issued"> => {
   const owner = options.pool ?? await openPool(config.database);
   const lock = await owner.connect();
+  // A lost session rejects its query; the client's later "error" event must not crash the process.
+  (lock as { on?: (event: string, listener: () => void) => unknown }).on?.("error", () => undefined);
+  let lockBroken = false;
+  // S6: the rotation's transaction runs on the lock's own session, never on another pooled one.
+  const session: ClientPool = {
+    connect: async () => ({
+      query: lock.query.bind(lock),
+      release: (destroy) => { if (destroy) lockBroken = true; },
+    }),
+  };
   const pending = `${out}.pending`;
+  const fsyncDir = (dir: string): void => {
+    const fd = fs.openSync(dir, "r");
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  };
   try {
     await lock.query("SET ROLE fabric_records_writer");
     await lock.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [`fabric-records:issue:${id}`]);
-    fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
+    const outDir = path.dirname(out);
+    // F5: every directory created here gets its entry fsynced (in its parent) before the database change.
+    const created = fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+    const syncDirs: string[] = [outDir];
+    for (let d = outDir; created !== undefined && d !== path.dirname(created); d = path.dirname(d)) syncDirs.push(path.dirname(d));
     const storedHash = async (): Promise<string | undefined> =>
       (await lock.query<{ token_hash: string }>("SELECT token_hash FROM principals WHERE id = $1 AND issued_by = 'operator' AND role = $2", [id, role])).rows[0]?.token_hash;
     const publish = (): void => {
       fs.renameSync(pending, out);
-      const dir = fs.openSync(path.dirname(out), "r");
-      try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+      fsyncDir(outDir);
     };
     // 1. Recover an interrupted run: its pending token is the live one exactly when the database holds it.
     let recovered = false;
@@ -220,9 +240,15 @@ export const issueCredentialFile = async (
     } finally {
       fs.closeSync(fd);
     }
-    // 3. The database change.
     try {
-      await issuePrincipal(config, id, role, options.name, owner, options.reissue === true, token);
+      for (const d of syncDirs) fsyncDir(d);
+    } catch (error) {
+      fs.rmSync(pending, { force: true });
+      throw error;
+    }
+    // 3. The database change, on the lock's session.
+    try {
+      await issuePrincipal(config, id, role, options.name, session, options.reissue === true, token);
     } catch (error) {
       // S2/F4: a failed COMMIT may have committed. Its pending token is kept for the next run's
       // recovery (step 8's verify publishes it if the database holds it). It is removed only when
@@ -238,8 +264,9 @@ export const issueCredentialFile = async (
     publish();
     return "issued";
   } finally {
-    await lock.query("SELECT pg_advisory_unlock_all()").catch(() => undefined);
-    lock.release();
+    // The session goes back to a caller's pool as it came: no lock, no role.
+    if (!lockBroken) await lock.query("SELECT pg_advisory_unlock_all()").then(() => lock.query("RESET ROLE")).catch(() => { lockBroken = true; });
+    lock.release(lockBroken);
     if (!options.pool) await owner.end?.();
   }
 };

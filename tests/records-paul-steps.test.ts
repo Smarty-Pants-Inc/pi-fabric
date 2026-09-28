@@ -1225,6 +1225,40 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 	});
 
+	// #119 F3: the rename succeeds, the state dir's fsync fails; the rerun finds the unit listed and still syncs the dir first.
+	it.skipIf(process.getuid?.() === 0)("#119 F3: a failed state-dir fsync after the marker's rename is an error; the rerun with the marker in place syncs the dir before the install", () => {
+		const { t, r, again, bin } = relayRun("plain", "tree17", (root) => existingCluster(root, "17"));
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			const state = `${t}/root/var/lib/test-org-records-installer`;
+			const marker = `${state}/restart-pending`;
+			const main = `${t}/root/opt/test-org-records/service-main.mjs`;
+			writeFileSync(main, "// older bundle\n");
+			writeFileSync(join(bin, "sync"), `#!/bin/bash\nfor a; do last=$a; done\n[ "$last" = "${state}" ] && [ -e "${t}/fail-sync" ] && exit 1\nexec /usr/bin/env PATH=/usr/bin:/bin sync "$@"\n`);
+			chmodSync(join(bin, "sync"), 0o755);
+			writeFileSync(join(t, "fail-sync"), "");
+			const failed = again();
+			expect(failed.code).toBe(1);
+			expect(failed.err).toContain(`cannot sync ${state} after replacing ${marker}`);
+			// The rename happened (the marker lists the unit), the bundle was not replaced.
+			expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n");
+			expect(readFileSync(main, "utf8")).toBe("// older bundle\n");
+			rmSync(join(t, "fail-sync"));
+			const second = again();
+			expect(second.code, second.err + second.out).toBe(0);
+			const synced = second.out.search(new RegExp(`^\\+ sync -- ${reEsc(state)}$`, "m"));
+			const installed = second.out.indexOf(`service-main.mjs ${main}`);
+			expect(synced).toBeGreaterThan(-1);
+			expect(installed).toBeGreaterThan(-1);
+			expect(synced).toBeLessThan(installed);
+			expect(second.out).not.toMatch(/restart-pending\.\w{6}/);
+			expect(second.out.indexOf("+ systemctl restart test-org-records.service")).toBeLessThan(second.out.indexOf("C10_RECORDS_INSTALLED"));
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
 	// C10D-P3-1: a service-controlled PG_VERSION is never followed, and in a real run it is read as the records user.
 	it.skipIf(process.getuid?.() === 0)("C10D-P3-1: a symlinked PG_VERSION or data dir is refused before step 1; a real one is read as the records user", () => {
 		const { t, r, again, L } = relayRun("plain", "tree17", (root) => existingCluster(root, "17"));

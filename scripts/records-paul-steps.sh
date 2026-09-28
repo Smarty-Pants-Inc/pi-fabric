@@ -744,19 +744,23 @@ marker_check() {
 marker_has() { marker_check; [[ -f $MARKER ]] && grep -qxF "$1" "$MARKER"; }
 # C10D-P2-1: the marker is replaced atomically. The complete new marker is written to a temp file in the root-only
 # ${STATE} (mktemp: root, 0600), fsynced, renamed over the old one, and the directory fsynced. Until the rename the
-# old marker stays whole, so a failure anywhere keeps every obligation it holds (the rerun restarts too much, never too little).
+# old marker stays whole, so a failure before the rename keeps every obligation it holds (the rerun restarts too much, never too little).
+# #119 F3: a failed ${STATE} fsync after the rename is an error, and every later marker_add syncs ${STATE} again even
+# when the marker already lists the unit, so a rename that may not be durable never authorizes a replacement.
+marker_sync() { run sync -- "$STATE" || die "cannot sync ${STATE} after replacing ${MARKER} (the new marker may not be durable; rerun to retry)"; }
 marker_set() { # CONTENT: replace the marker (root, 0600), or remove it when empty
 	local tmp
 	if [[ -z $1 ]]; then run rm -f "$MARKER" && run sync -- "$STATE" || die "cannot remove ${MARKER}"; return; fi
 	tmp=$(mktemp "${STATE}/restart-pending.XXXXXX") || die "cannot write ${MARKER}"
-	if ! { printf '%s\n' "$1" >"$tmp" && run sync -- "$tmp" && run mv -fT -- "$tmp" "$MARKER" && run sync -- "$STATE"; }; then
+	if ! { printf '%s\n' "$1" >"$tmp" && run sync -- "$tmp" && run mv -fT -- "$tmp" "$MARKER"; }; then
 		rm -f -- "$tmp"
 		die "cannot write ${MARKER} (the previous marker, if any, is kept)"
 	fi
+	marker_sync
 }
 marker_add() { # UNIT
-	if ((DRY)); then echo "? add ${1} to ${MARKER} (root, 0600; restart pending until it restarts; replaced atomically: temp file in ${STATE}, fsync, rename, fsync ${STATE})"; return 0; fi
-	marker_has "$1" && return 0
+	if ((DRY)); then echo "? add ${1} to ${MARKER} (root, 0600; restart pending until it restarts; replaced atomically: temp file in ${STATE}, fsync, rename, fsync ${STATE}; already listed: fsync ${STATE})"; return 0; fi
+	if marker_has "$1"; then marker_sync; return 0; fi
 	marker_set "$( [[ ! -f $MARKER ]] || cat "$MARKER"; echo "$1")"
 }
 marker_clear() { # UNIT

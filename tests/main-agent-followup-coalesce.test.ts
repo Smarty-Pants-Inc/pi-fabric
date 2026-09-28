@@ -192,6 +192,33 @@ describe("Main followUp coalescing (unit)", () => {
     expect(third.next.sent).toHaveLength(0);
     expect(fs.existsSync(journal)).toBe(false);
   });
+
+  // review/astra F1 on pi-fabric#114: supersedes keeps 32 ids; replay must not depend on it.
+  it("after a 34-message burst, a restart never brings back the first, even when a journal still lists it", () => {
+    const { dir, journal } = journalPath();
+    const firstPi = fakePi();
+    const main = new MainAgentController(firstPi.pi, "session:root", true, dir, "root");
+    main.attachFollowUpDrain(busyContext(), 120_000, journal);
+    main.deliverAgent({ from: from("other"), message: "plain", delivery: "followUp" });
+    const burst = Array.from({ length: 34 }, (_, index) => { vi.advanceTimersByTime(1_000); return main.deliverAgent(wake(`h${index + 1}`)); });
+    main.deliverAgent(wake("x1", "repo#8/state"));
+    main.deliverAgent(wake("r1", "repo#7/state", "reviewer"));          // same key, another sender
+    main.closeFollowUpDrain();
+    const written = JSON.parse(fs.readFileSync(journal, "utf8"));
+    const newest = written.items.find((item: { id: string }) => item.id === burst[33]!.messageId);
+    expect(newest.supersedes).toHaveLength(32);
+    expect(newest.supersedes).not.toContain(burst[0]!.messageId);        // past the audit trail
+    // Stale copies, as an older writer could leave them: the first of the chain, and one of its middle.
+    written.items.push(
+      { id: burst[0]!.messageId, from: from("factory"), message: "head h1", sentAt: newest.sentAt, data: { coalesceKey: "repo#7/state", head: "h1" } },
+      { id: burst[20]!.messageId, from: from("factory"), message: "head h21", sentAt: newest.sentAt, data: { coalesceKey: "repo#7/state", head: "h21" } },
+    );
+    fs.writeFileSync(journal, JSON.stringify(written));
+    const next = fakePi();
+    new MainAgentController(next.pi, "session:root", true, dir, "root").attachFollowUpDrain(busyContext([], { idle: true }), 120_000, journal);
+    // Counterexample: the unkeyed followUp, the other key and the other sender still arrive, in their places.
+    expect(delivered(next.sent)).toEqual(["plain", "head h34", "head x1", "head r1"]);
+  });
 });
 
 const sessions: AgentSession[] = [];

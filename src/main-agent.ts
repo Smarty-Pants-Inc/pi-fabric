@@ -439,10 +439,26 @@ export class MainAgentController implements FabricMainAgentTarget {
     // The owner rule (dev-lead on pi-fabric#102): skip every id the session holds; a handoff
     // may still sit in Pi's queue, so it waits for a boundary to check; the rest is held again.
     const delivered = this.#refreshDelivered();
-    // A superseded id never comes back, even from a journal an older writer left.
     const seen = new Set<string>(items.flatMap((item) => Array.isArray(item.supersedes) ? item.supersedes : []));
+    // A held followUp keeps only the newest of its (sender, coalesceKey), whatever the journal
+    // lists: the same rule as a live replacement, so no superseded id comes back, however long
+    // the burst was (review/astra F1 on pi-fabric#114; supersedes is a bounded audit trail).
+    const newest = new Map<string, HeldAgentMessage>();
+    const chain = (item: HeldAgentMessage) => {
+      const key = item.handed ? undefined : followUpCoalesceKey(item.data);
+      return key === undefined ? undefined : JSON.stringify([item.from.id, key]);
+    };
+    const updatedAt = (item: HeldAgentMessage) => typeof item.replacedAt === "number" ? item.replacedAt : item.sentAt;
+    for (const item of items) {
+      const key = chain(item);
+      if (key === undefined || delivered.has(item.id) || seen.has(item.id)) continue;
+      const other = newest.get(key);
+      if (!other || updatedAt(item) >= updatedAt(other)) newest.set(key, item);
+    }
     for (const item of items.sort((a, b) => a.sentAt - b.sentAt)) {
       if (delivered.has(item.id) || seen.has(item.id)) continue;
+      const key = chain(item);
+      if (key !== undefined && newest.get(key) !== item) continue;
       seen.add(item.id);
       (item.handed ? this.#unverified : this.#held).push(item);
     }

@@ -339,7 +339,7 @@ const lifecycleSubscription = (
     };
     for (const method of ["tell", "followUp"]) {
       await expect(provider.invoke(method, { id: "main", message: "still there?" }, context)).rejects.toThrow(
-        "Fabric followUp to main was accepted but is not being delivered: 4 held, oldest 20520 s, target idle. " +
+        "Fabric followUp to main was accepted but is not being delivered: target idle and its held queue stalled (yours: 4 held, oldest 20520 s). " +
           "The message is still held, not withdrawn.",
       );
     }

@@ -88,8 +88,8 @@ export class AgentMessageRouter {
     // Older owners never report `stalled`, so their results pass unchanged.
     if (kind === "followUp" && result?.stalled) {
       throw new Error(
-        `Fabric followUp to ${id} was accepted but is not being delivered: ${result.pendingFollowUps ?? 0} held, ` +
-          `oldest ${result.oldestAgeS ?? 0} s, target idle. The message is still held, not withdrawn. ` +
+        `Fabric followUp to ${id} was accepted but is not being delivered: target idle and its held queue stalled ` +
+          `(yours: ${result.pendingFollowUps ?? 0} held, oldest ${result.oldestAgeS ?? 0} s). The message is still held, not withdrawn. ` +
           "Use agents.steer meanwhile (smarty-dev#1826).",
       );
     }

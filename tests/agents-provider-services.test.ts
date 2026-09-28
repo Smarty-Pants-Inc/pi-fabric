@@ -307,7 +307,7 @@ describe("agents provider message routing service boundaries", () => {
     participants.get.mockReturnValue({ ...participant(), id: "session:peer", rootId: "session:peer" });
     control.request.mockResolvedValueOnce({ queued: true, messageId: "m", routed: "mesh", acknowledged: true, pendingFollowUps: 8, oldestAgeS: 900, stalled: true });
     await expect(router.routeMessage("session:peer", "hi", undefined, "followUp")).rejects.toThrow(
-      "Fabric followUp to session:peer was accepted but is not being delivered: 8 held, oldest 900 s, target idle.",
+      "Fabric followUp to session:peer was accepted but is not being delivered: target idle and its held queue stalled (yours: 8 held, oldest 900 s).",
     );
     control.request.mockResolvedValueOnce({ queued: true, messageId: "m", routed: "mesh", acknowledged: true, pendingFollowUps: 8, oldestAgeS: 900 });
     await expect(router.routeMessage("session:peer", "hi", undefined, "followUp")).resolves.toMatchObject({ pendingFollowUps: 8 });

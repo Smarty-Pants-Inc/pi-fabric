@@ -129,7 +129,7 @@ describe("Main followUp drain (unit)", () => {
       failSends(pi);                                         // no release reaches Pi
       state.idle = true;
       await expect(followUp(router, "two")).rejects.toThrow(
-        "Fabric followUp to main was accepted but is not being delivered: 2 held, oldest 601 s, target idle. " +
+        "Fabric followUp to main was accepted but is not being delivered: target idle and its held queue stalled (yours: 2 held, oldest 601 s). " +
           "The message is still held, not withdrawn. Use agents.steer meanwhile (smarty-dev#1826).",
       );
       expect(main.queueDepth().pendingFollowUps).toBe(2);
@@ -174,7 +174,7 @@ describe("Main followUp drain (unit)", () => {
         vi.advanceTimersByTime(3_600_000);
         failSends(pi);
         state.idle = true;
-        if (stalled) await expect(followUp(router, "two")).rejects.toThrow(/not being delivered: 2 held, oldest 3600 s/);
+        if (stalled) await expect(followUp(router, "two")).rejects.toThrow(/not being delivered: target idle and its held queue stalled \(yours: 2 held, oldest 3600 s\)/);
         else await expect(followUp(router, "two")).resolves.toMatchObject({ pendingFollowUps: 2, oldestAgeS: 3_600 });
       }
     });

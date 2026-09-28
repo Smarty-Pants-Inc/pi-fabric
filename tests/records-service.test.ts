@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import pg from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { RemoteRecords } from "../src/records/client.js";
 import { recordsInboxMessage, recordsInboxSession, RecordsInbox } from "../src/records/inbox.js";
 import { PublicationRelay, type NudgePublisher } from "../src/records/relay.js";
@@ -29,6 +30,8 @@ const rendered = (what: string): string => {
   return result.stdout.replaceAll("test-org-records", osUser);
 };
 const canRun = Boolean(postgresBin) && process.platform !== "win32";
+const originalOpen = fs.openSync.bind(fs);
+const originalFsync = fs.fsyncSync.bind(fs);
 
 describe.skipIf(!canRun)("the records service (C10)", () => {
   let server: TestPostgres;
@@ -693,13 +696,13 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     // A reissue whose database step fails (another role) leaves the file, the old token and no temp file.
     await expect(issueCredentialFile(config, "relay:fabric", "importer", out, { pool, reissue: true })).rejects.toThrow(/another kind or role/);
     expect(fs.readFileSync(out, "utf8")).toBe(first);
-    expect(fs.readdirSync(dirOut)).toEqual(["relay.json"]);
+    expect(fs.readdirSync(dirOut)).toEqual(["relay.json", "relay.json.lock"]);
     expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
     // A successful reissue replaces the file atomically with the new, working token, 0600.
     await issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true });
     expect(fs.readFileSync(out, "utf8")).not.toBe(first);
     expect(fs.statSync(out).mode & 0o777).toBe(0o600);
-    expect(fs.readdirSync(dirOut)).toEqual(["relay.json"]);
+    expect(fs.readdirSync(dirOut)).toEqual(["relay.json", "relay.json.lock"]);
     expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
   });
 
@@ -722,7 +725,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     releaseA();
     await Promise.all([a, b]);
     expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
-    expect(fs.readdirSync(dirOut)).toEqual(["relay.json"]);
+    expect(fs.readdirSync(dirOut)).toEqual(["relay.json", "relay.json.lock"]);
   });
 
   it("recovers a reissue interrupted after its commit and before publishing (Astra round 2 F2/S2)", async () => {
@@ -745,6 +748,273 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     await expect(issueCredentialFile(config, "relay:fabric", "relay", out, { pool })).rejects.toThrow(/exists/);
     expect(fs.readFileSync(out, "utf8")).toBe(published);
     expect(fs.existsSync(`${out}.pending`)).toBe(false);
+  });
+
+  it("S6: losing the lock's session during a paused rotation loses the rotation too; verify then keeps a live credential (#117 S6)", async () => {
+    const { config } = await freshService();
+    // The issuer's pool, as the CLI's openPool makes it: room for a lock and a rotation session.
+    const issuers = new pg.Pool({ ...config.migration!, max: 4 });
+    issuers.on("error", () => undefined);
+    issuers.on("connect", (client) => { client.on("error", () => undefined); });
+    cleanups.push(() => issuers.end());
+    const pool = issuers as unknown as ClientPool;
+    const dirOut = path.join(dir, `s6-${databases}`);
+    const out = path.join(dirOut, "relay.json");
+    await issueCredentialFile(config, "relay:fabric", "relay", out, { pool });
+    const first = fs.readFileSync(out, "utf8");
+    // Pause the rotation inside its transaction: another session holds the principal's row.
+    // The blocker and the probes use their own connections, outside the issuer's pool.
+    const blocker = new pg.Client({ ...config.migration! });
+    const probe = new pg.Client({ ...config.migration! });
+    await blocker.connect();
+    await probe.connect();
+    cleanups.push(() => blocker.end(), () => probe.end());
+    await blocker.query("BEGIN");
+    await blocker.query("SELECT 1 FROM principals WHERE id = 'relay:fabric' FOR UPDATE");
+    const a = issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true });
+    const settled = a.then(() => "ok", (error: Error) => error.message);
+    const waiting = async () => Number((await probe.query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname = 'records' AND wait_event_type = 'Lock'")).rows[0].n);
+    for (let i = 0; i < 100 && await waiting() === 0; i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(await waiting()).toBe(1);
+    expect(fs.existsSync(`${out}.pending`)).toBe(true);
+    // Only the session holding the per-principal advisory lock is lost.
+    const holders = (await probe.query("SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted")).rows as { pid: number }[];
+    expect(holders).toHaveLength(1);
+    await probe.query("SELECT pg_terminate_backend($1)", [holders[0]!.pid]);
+    // A concurrent verify takes the lock, finds the pending token not live, and verifies the old file.
+    expect(await issueCredentialFile(config, "relay:fabric", "relay", out, { pool, verifyOnly: true })).toBe("verified");
+    // The paused rotation can no longer commit: its transaction died with the lock's session.
+    await blocker.query("ROLLBACK");
+    expect(await settled).not.toBe("ok");
+    const live = (await probe.query("SELECT token_hash FROM principals WHERE id = 'relay:fabric'")).rows[0].token_hash as string;
+    const token = (JSON.parse(fs.readFileSync(out, "utf8")) as { token: string }).token;
+    expect(fs.readFileSync(out, "utf8")).toBe(first);
+    expect(createHash("sha256").update(token).digest("hex")).toBe(live);
+    expect(await issueCredentialFile(config, "relay:fabric", "relay", out, { pool, verifyOnly: true })).toBe("verified");
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
+    expect(fs.readdirSync(dirOut)).toEqual(["relay.json", "relay.json.lock"]);
+  });
+
+  /**
+   * The fsync-order fixture: every fsync (named by its path relative to `base`) and every database
+   * change of an issue, in order. `above` is what an issue must also sync above `base`: each
+   * ancestor up to the first one this user does not own.
+   */
+  const fsyncOrder = (owner: pg.Pool, base: string) => {
+    const names = new Map<number, string>();
+    const events: string[] = [];
+    const open = vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+      const fd = originalOpen(...args);
+      names.set(fd, String(args[0]));
+      return fd;
+    }) as typeof fs.openSync);
+    const record = (fd: number) => events.push(`fsync ${path.relative(base, names.get(fd) ?? "?") || "."}`);
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation((fd: number) => { record(fd); originalFsync(fd); });
+    const failOn = (dirPath: string) => sync.mockImplementation((fd: number) => {
+      if (names.get(fd) === dirPath) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+      record(fd);
+      originalFsync(fd);
+    });
+    const heal = () => sync.mockImplementation((fd: number) => { record(fd); originalFsync(fd); });
+    const wrapped = new WeakSet<object>();
+    const spyPool: ClientPool = {
+      connect: async () => {
+        const client = await owner.connect();
+        if (wrapped.has(client)) return client as unknown as Awaited<ReturnType<ClientPool["connect"]>>;
+        wrapped.add(client);
+        const inner = client.query.bind(client);
+        return Object.assign(client, { query: (...args: Parameters<typeof inner>) => { if (/INSERT INTO principals|principal_reissue/.test(String(args[0]))) events.push("database change"); return inner(...args); } }) as unknown as Awaited<ReturnType<ClientPool["connect"]>>;
+      },
+    };
+    const above: string[] = [];
+    for (let d = base; d !== path.dirname(d) && fs.statSync(d).uid === process.getuid?.();) { d = path.dirname(d); above.push(`fsync ${path.relative(base, d)}`); }
+    return { events, spyPool, failOn, heal, above, restore: () => { open.mockRestore(); sync.mockRestore(); } };
+  };
+
+  it("F5: the pending file and every new directory are fsynced before the database change; a failed directory fsync changes nothing (#117 F5)", async () => {
+    const { config, owner } = await freshService();
+    const pool = owner as unknown as ClientPool;
+    const base = path.join(dir, `f5-${databases}`);
+    const out = path.join(base, "new", "deeper", "relay.json");
+    fs.mkdirSync(base);
+    const query = owner.query.bind(owner);
+    const hash = async () => (await query("SELECT token_hash FROM principals WHERE id = 'relay:fabric'")).rows[0]?.token_hash as string | undefined;
+    const fixture = fsyncOrder(owner, base);
+    try {
+      await issueCredentialFile(config, "relay:fabric", "relay", out, { pool: fixture.spyPool });
+      expect(fixture.above.length).toBeGreaterThan(0);
+      expect(fixture.events).toEqual([
+        "fsync new/deeper/relay.json.pending",
+        "fsync new/deeper",
+        "fsync new",
+        "fsync .",
+        ...fixture.above,
+        "database change",
+        "fsync new/deeper",
+      ]);
+      // A failed directory fsync before the change: the call fails, the database and the file are unchanged.
+      const before = await hash();
+      const first = fs.readFileSync(out, "utf8");
+      fixture.failOn(path.dirname(out));
+      await expect(issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true })).rejects.toThrow("EIO: injected");
+      expect(await hash()).toBe(before);
+      expect(fs.readFileSync(out, "utf8")).toBe(first);
+      expect(fs.readdirSync(path.dirname(out))).toEqual(["relay.json", "relay.json.lock"]);
+    } finally {
+      fixture.restore();
+    }
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
+  });
+
+  it("#119 F2: a retry fsyncs the ancestor directories a failed first issue created, before its database change", async () => {
+    const { config, owner } = await freshService();
+    const base = path.join(dir, `f2-${databases}`);
+    const out = path.join(base, "new", "deeper", "relay.json");
+    fs.mkdirSync(base);
+    const fixture = fsyncOrder(owner, base);
+    try {
+      // The first issue creates new/deeper, then the fsync of `new` fails: nothing reaches the database.
+      fixture.failOn(path.join(base, "new"));
+      await expect(issueCredentialFile(config, "relay:fabric", "relay", out, { pool: fixture.spyPool })).rejects.toThrow("EIO: injected");
+      expect(fixture.events).not.toContain("database change");
+      expect(fs.readdirSync(path.dirname(out))).toEqual(["relay.json.lock"]);
+      expect((await owner.query("SELECT 1 FROM principals WHERE id = 'relay:fabric'")).rowCount).toBe(0);
+      // The retry finds the directories in place and still syncs every one of them first.
+      fixture.heal();
+      fixture.events.length = 0;
+      await issueCredentialFile(config, "relay:fabric", "relay", out, { pool: fixture.spyPool });
+      expect(fixture.events).toEqual([
+        "fsync new/deeper/relay.json.pending",
+        "fsync new/deeper",
+        "fsync new",
+        "fsync .",
+        ...fixture.above,
+        "database change",
+        "fsync new/deeper",
+      ]);
+    } finally {
+      fixture.restore();
+    }
+    expect(await issueCredentialFile(config, "relay:fabric", "relay", out, { pool: owner as unknown as ClientPool, verifyOnly: true })).toBe("verified");
+  });
+
+  it.each(["resumes late", "crashes"] as const)("#119 F1: a CLI issuer that loses its session and %s: the next CLI issuer waits on the file lock, then issues and publishes its own credential", async (fate) => {
+    const { config } = await freshService();
+    const dirOut = path.join(dir, `f1-${fate.replace(" ", "-")}-${databases}`);
+    const out = path.join(dirOut, "relay.json");
+    const cfg = path.join(dir, `service-f1-${databases}.json`);
+    fs.writeFileSync(cfg, JSON.stringify(config));
+    const main = path.resolve(__dirname, "../src/records/service-main.ts");
+    const { spawn } = await import("node:child_process");
+    const cli = (...args: string[]) => {
+      const child = spawn("bun", [main, ...args, "--config", cfg], { stdio: ["ignore", "pipe", "pipe"] });
+      let err = "";
+      child.stderr.on("data", (chunk: Buffer) => { err += String(chunk); });
+      const done = new Promise<{ code: number | null; err: string }>((resolve) => child.on("exit", (code) => resolve({ code, err })));
+      cleanups.push(async () => { if (child.exitCode === null && child.signalCode === null) { child.kill("SIGCONT"); child.kill("SIGKILL"); } await done; });
+      return { child, done };
+    };
+    const issueArgs = ["issue", "--id", "relay:fabric", "--role", "relay", "--out", out, "--reissue"];
+    expect((await cli(...issueArgs).done).code).toBe(0);
+    const blocker = new pg.Client({ ...config.migration! });
+    const probe = new pg.Client({ ...config.migration! });
+    await blocker.connect();
+    await probe.connect();
+    cleanups.push(() => blocker.end(), () => probe.end());
+    const until = async (what: string, ok: () => Promise<boolean> | boolean) => {
+      for (let i = 0; i < 400; i++) { if (await ok()) return; await new Promise((resolve) => setTimeout(resolve, 50)); }
+      throw new Error(`timed out waiting for ${what}`);
+    };
+    const holder = async () => ((await probe.query("SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted")).rows as { pid: number }[]).map((r) => r.pid);
+    const waiting = async () => Number((await probe.query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname = 'records' AND wait_event_type = 'Lock'")).rows[0].n);
+    const pendingToken = () => { try { return (JSON.parse(fs.readFileSync(`${out}.pending`, "utf8")) as { token: string }).token; } catch { return undefined; } };
+    // A rotates and waits on the principal's row, holding the per-principal lock and its pending file.
+    await blocker.query("BEGIN");
+    await blocker.query("SELECT 1 FROM principals WHERE id = 'relay:fabric' FOR UPDATE");
+    const a = cli(...issueArgs);
+    await until("A to wait on the row", async () => await waiting() === 1 && pendingToken() !== undefined);
+    const aToken = pendingToken();
+    const [aBackend] = await holder();
+    // A's process is suspended, then its session is lost: its transaction and lock are gone.
+    a.child.kill("SIGSTOP");
+    await probe.query("SELECT pg_terminate_backend($1)", [aBackend]);
+    await until("A's session to end", async () => !(await holder()).includes(aBackend!) && await waiting() === 0);
+    // B starts while A is suspended (at any point after its last database result): B waits on A's file lock.
+    // It takes no database lock and never touches <out>.pending while A's process lives.
+    const b = cli(...issueArgs);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(await holder()).toEqual([]);
+    expect(pendingToken()).toBe(aToken);
+    expect(b.child.exitCode).toBeNull();
+    // A resumes and removes its own uncommitted pending file under its lock, or crashes and the kernel drops the lock.
+    a.child.kill(fate === "crashes" ? "SIGKILL" : "SIGCONT");
+    const aDone = await a.done;
+    expect(aDone.code).not.toBe(0);
+    // B takes both locks, discards any uncommitted pending token of A's, writes its own and waits on the row.
+    await until("B to wait on the row", async () => await waiting() === 1 && pendingToken() !== undefined && pendingToken() !== aToken);
+    const bToken = pendingToken();
+    // B commits and publishes its own token.
+    await blocker.query("ROLLBACK");
+    const bDone = await b.done;
+    expect(bDone.code, bDone.err).toBe(0);
+    const live = (await probe.query("SELECT token_hash FROM principals WHERE id = 'relay:fabric'")).rows[0].token_hash as string;
+    const token = (JSON.parse(fs.readFileSync(out, "utf8")) as { token: string }).token;
+    expect(token).toBe(bToken);
+    expect(createHash("sha256").update(token).digest("hex")).toBe(live);
+    expect(fs.readdirSync(dirOut)).toEqual(["relay.json", "relay.json.lock"]);
+    const verified = spawnSync("bun", [main, "verify", "--id", "relay:fabric", "--role", "relay", "--out", out, "--config", cfg], { encoding: "utf8" });
+    expect(verified.status, verified.stderr).toBe(0);
+    expect(verified.stdout).toContain("verified relay:fabric");
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
+  }, 60_000);
+
+  it("#119 F1: an issuer whose session is lost after its last successful query cannot touch a successor's pending file", async () => {
+    const { config, owner } = await freshService();
+    const out = path.join(dir, `f1-probe-${databases}`, "relay.json");
+    const pool = owner as unknown as ClientPool;
+    await issueCredentialFile(config, "relay:fabric", "relay", out, { pool });
+    // An interrupted run left a pending token the database never held.
+    const stale = JSON.stringify({ id: "relay:fabric", token: "stale", role: "relay", issuedBy: "installer" });
+    fs.writeFileSync(`${out}.pending`, stale, { mode: 0o600 });
+    // A's recovery read of the live hash succeeds; its result is held until the test releases it (a paused process).
+    let reached!: () => void;
+    const atRead = new Promise<void>((resolve) => { reached = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let aPid = 0;
+    const paused: ClientPool = {
+      connect: async () => {
+        const client = await owner.connect();
+        aPid = (await client.query("SELECT pg_backend_pid() AS pid")).rows[0].pid as number;
+        const inner = client.query.bind(client);
+        return Object.assign(client, {
+          query: async (...args: Parameters<typeof inner>) => {
+            const result = await inner(...args);
+            if (/SELECT token_hash FROM principals/.test(String(args[0]))) { reached(); await gate; }
+            return result;
+          },
+        }) as unknown as Awaited<ReturnType<ClientPool["connect"]>>;
+      },
+    };
+    const a = issueCredentialFile(config, "relay:fabric", "relay", out, { pool: paused, reissue: true });
+    a.catch(() => undefined);
+    await atRead;
+    // A's session is lost after that successful query; B starts. B must wait for A's file lock.
+    await owner.query("SELECT pg_terminate_backend($1)", [aPid]);
+    let bSettled = false;
+    const b = issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true }).finally(() => { bSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    expect(bSettled).toBe(false);
+    expect(fs.readFileSync(`${out}.pending`, "utf8")).toBe(stale);
+    // A resumes: it acts only on its own view, under its lock, then fails on its lost session and releases the lock.
+    release();
+    await expect(a).rejects.toThrow();
+    // B then recovers, issues and publishes its own credential, which the database holds.
+    expect(await b).toBe("issued");
+    const live = (await owner.query("SELECT token_hash FROM principals WHERE id = 'relay:fabric'")).rows[0].token_hash as string;
+    const token = (JSON.parse(fs.readFileSync(out, "utf8")) as { token: string }).token;
+    expect(createHash("sha256").update(token).digest("hex")).toBe(live);
+    expect(fs.readdirSync(path.dirname(out))).toEqual(["relay.json", "relay.json.lock"]);
   });
 
   it("a client closed while it reconnects starts no call (F3)", async () => {

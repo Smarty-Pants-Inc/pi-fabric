@@ -999,8 +999,10 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.err).toContain(msg);
 			expect(r.out).not.toContain("## 1. ");
 			expect(digest(root)).toEqual(before);
-			expect(calls).toEqual([]);
-			// A dry run shows the same refusal.
+			// C10D-P3-1: the only command is the version read, as the records user.
+			expect(calls).toEqual([`runuser head -c 16 -- ${dataDir(root)}/PG_VERSION`]);
+			// A dry run (unprivileged: it reads as itself) shows the same refusal and runs nothing.
+			writeFileSync(L, "");
 			const dry = again(["--dry-run"]);
 			expect(dry.code).not.toBe(0);
 			expect(dry.err).toContain(msg);
@@ -1171,6 +1173,125 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(third.code, third.err).toBe(0);
 			expect(readFileSync(L, "utf8")).not.toContain("systemctl restart test-org-records-pg.service");
 			expect(existsSync(marker)).toBe(false);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	// C10D-P2-1 (dev-lead's delta pass on #117): the reproduced path, with the fault in the marker's rename.
+	it.skipIf(process.getuid?.() === 0)("C10D-P2-1: a failed marker rewrite keeps the old marker whole; the rerun still restarts the service", () => {
+		const { t, r, again, L, bin } = relayRun("plain", "tree17", (root) => existingCluster(root, "17"));
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			const state = `${t}/root/var/lib/test-org-records-installer`;
+			const marker = `${state}/restart-pending`;
+			expect(existsSync(marker)).toBe(false);
+			// Older installed bundle and pg_hba.conf: both units become pending. The rename of a new marker fails
+			// while <t>/fail-marker exists and the new marker drops the pg unit: clearing it after its restart fails in step 6.
+			writeFileSync(`${t}/root/opt/test-org-records/service-main.mjs`, "// older bundle\n");
+			writeFileSync(join(dataDir(`${t}/root`), "pg_hba.conf"), "# older pg_hba.conf\n");
+			writeFileSync(join(bin, "mv"), `#!/bin/bash\nfor a; do last=$a; done\nif [ "$last" = "${marker}" ]; then echo "mv $*" >> "${L}"; [ -e "${t}/fail-marker" ] && [ -e "$last" ] && ! grep -q pg.service "$3" && exit 1; fi\nexec /usr/bin/env PATH=/usr/bin:/bin mv "$@"\n`);
+			chmodSync(join(bin, "mv"), 0o755);
+			const pending = () => readFileSync(marker, "utf8").split("\n").filter(Boolean).sort();
+			const both = ["test-org-records-pg.service", "test-org-records.service"];
+			writeFileSync(L, "");
+			writeFileSync(join(t, "fail-marker"), "");
+			const failed = again();
+			expect(failed.code).toBe(1);
+			expect(failed.err).toMatch(/FAILED at step 6 \(systemd units\)/);
+			expect(failed.err).toContain(`cannot write ${marker} (the previous marker, if any, is kept)`);
+			const calls = readFileSync(L, "utf8");
+			expect(calls).toContain("systemctl restart test-org-records-pg.service\n");
+			expect(calls).not.toContain("systemctl restart test-org-records.service\n");
+			// The old marker is whole: both obligations, root-only, and no temp file is left behind.
+			expect(pending()).toEqual(both);
+			expect(statSync(marker).mode & 0o777).toBe(0o600);
+			expect(readdirSync(state)).toEqual(["restart-pending"]);
+			expect(failed.out).toMatch(new RegExp(`^\\+ sync -- ${reEsc(state)}/restart-pending\\.\\w{6}$`, "m"));
+			// The fault is gone: the rerun still restarts the service (bytes now match) before its receipt.
+			rmSync(join(t, "fail-marker"));
+			writeFileSync(L, "");
+			const second = again();
+			expect(second.code, second.err + second.out).toBe(0);
+			expect(second.out).toContain(`= ${t}/root/opt/test-org-records/service-main.mjs matches`);
+			const calls2 = readFileSync(L, "utf8");
+			expect(calls2).toContain("systemctl restart test-org-records.service\n");
+			expect(second.out.indexOf("+ systemctl restart test-org-records.service")).toBeLessThan(second.out.indexOf("C10_RECORDS_INSTALLED"));
+			expect(second.out).toMatch(new RegExp(`^\\+ sync -- ${reEsc(state)}$`, "m"));
+			expect(existsSync(marker)).toBe(false);
+			expect(readdirSync(state)).toEqual([]);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	// #119 F3: the rename succeeds, the state dir's fsync fails; the rerun finds the unit listed and still syncs the dir first.
+	it.skipIf(process.getuid?.() === 0)("#119 F3: a failed state-dir fsync after the marker's rename is an error; the rerun with the marker in place syncs the dir before the install", () => {
+		const { t, r, again, bin } = relayRun("plain", "tree17", (root) => existingCluster(root, "17"));
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			const state = `${t}/root/var/lib/test-org-records-installer`;
+			const marker = `${state}/restart-pending`;
+			const main = `${t}/root/opt/test-org-records/service-main.mjs`;
+			writeFileSync(main, "// older bundle\n");
+			writeFileSync(join(bin, "sync"), `#!/bin/bash\nfor a; do last=$a; done\n[ "$last" = "${state}" ] && [ -e "${t}/fail-sync" ] && exit 1\nexec /usr/bin/env PATH=/usr/bin:/bin sync "$@"\n`);
+			chmodSync(join(bin, "sync"), 0o755);
+			writeFileSync(join(t, "fail-sync"), "");
+			const failed = again();
+			expect(failed.code).toBe(1);
+			expect(failed.err).toContain(`cannot sync ${state} after replacing ${marker}`);
+			// The rename happened (the marker lists the unit), the bundle was not replaced.
+			expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n");
+			expect(readFileSync(main, "utf8")).toBe("// older bundle\n");
+			rmSync(join(t, "fail-sync"));
+			const second = again();
+			expect(second.code, second.err + second.out).toBe(0);
+			const synced = second.out.search(new RegExp(`^\\+ sync -- ${reEsc(state)}$`, "m"));
+			const installed = second.out.indexOf(`service-main.mjs ${main}`);
+			expect(synced).toBeGreaterThan(-1);
+			expect(installed).toBeGreaterThan(-1);
+			expect(synced).toBeLessThan(installed);
+			expect(second.out).not.toMatch(/restart-pending\.\w{6}/);
+			expect(second.out.indexOf("+ systemctl restart test-org-records.service")).toBeLessThan(second.out.indexOf("C10_RECORDS_INSTALLED"));
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	// C10D-P3-1: a service-controlled PG_VERSION is never followed, and in a real run it is read as the records user.
+	it.skipIf(process.getuid?.() === 0)("C10D-P3-1: a symlinked PG_VERSION or data dir is refused before step 1; a real one is read as the records user", () => {
+		const { t, r, again, L } = relayRun("plain", "tree17", (root) => existingCluster(root, "17"));
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			const data = dataDir(`${t}/root`);
+			writeFileSync(L, "");
+			expect(again().code).toBe(0);
+			expect(readFileSync(L, "utf8")).toContain(`runuser head -c 16 -- ${data}/PG_VERSION\n`);
+			expect(readFileSync(L, "utf8")).toContain(`runuser du -sh -- ${data}/pg_wal\n`);
+			const canary = join(t, "outside/PG_VERSION");
+			writeFileSync(canary, "16\n");
+			const refused = `refused: ${data}/PG_VERSION is not a regular file in a real directory (a symlink?); nothing was changed`;
+			// The version file is a symlink to a canary.
+			rmSync(join(data, "PG_VERSION"));
+			symlinkSync(canary, join(data, "PG_VERSION"));
+			writeFileSync(L, "");
+			const link = again();
+			expect(link.code).toBe(1);
+			expect(link.err).toContain(refused);
+			expect(link.out).not.toContain("## 1. ");
+			expect(readFileSync(L, "utf8")).toBe("");
+			// The data dir itself is redirected to a directory holding a plain PG_VERSION.
+			rmSync(join(data, "PG_VERSION"));
+			const moved = join(t, "outside/pg");
+			cpSync(data, moved, { recursive: true });
+			writeFileSync(join(moved, "PG_VERSION"), "16\n");
+			rmSync(data, { recursive: true });
+			symlinkSync(moved, data);
+			const dir = again();
+			expect(dir.code).toBe(1);
+			expect(dir.err).toContain(refused);
+			expect(dir.out).not.toContain("## 1. ");
 		} finally {
 			rmSync(t, { recursive: true, force: true });
 		}

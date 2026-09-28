@@ -43,6 +43,10 @@ export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDep
   messageId: string;
   routed: "local" | "main" | "mesh";
   acknowledged?: boolean;
+  /** This followUp replaced a held one with the same sender and data.coalesceKey. */
+  coalesced?: true;
+  /** The id of the held followUp it replaced; that one is never delivered. */
+  replacedMessageId?: string;
 }
 
 export interface FabricMainModelSwitchResult {
@@ -129,11 +133,25 @@ const serializableData = (value: unknown): unknown => {
   }
 };
 
+/** A followUp's `data.coalesceKey`: a non-empty string of at most 200 characters, or none. */
+export const followUpCoalesceKey = (data: unknown): string | undefined => {
+  const key = (data as { coalesceKey?: unknown } | null | undefined)?.coalesceKey;
+  return typeof key === "string" && key.length > 0 && key.length <= 200 ? key : undefined;
+};
+
+/** Superseded ids kept per held item: enough to audit a burst, bounded for the journal. */
+const SUPERSEDED_KEPT = 32;
+
 interface HeldAgentMessage {
   id: string;
   from: MeshIdentity;
   message: string;
+  /** The first send of a coalesced chain: it keeps the queue position and the flush wait. */
   sentAt: number;
+  /** When the newest replacement arrived (smarty-dev#1495). */
+  replacedAt?: number;
+  /** The held ids this one replaced, newest last: never delivered, even after a restart. */
+  supersedes?: string[];
   data?: unknown;
   /** Handed to Pi's queue; it may still be there after a reload. Unset while Fabric holds it. */
   handed?: true;
@@ -264,24 +282,41 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),
     };
     const triggerTurn = request.triggerTurn ?? true;
+    let replaced: HeldAgentMessage | undefined;
     // Pi releases its own followUp queue only when Main has no more work, so a Main that
     // chains turns reads it an hour late (smarty-dev#1495). Fabric holds a triggering
     // followUp for a busy Main instead: turn_end flushes the due ones as one steer, and
     // agent_settled releases the rest as a followUp. A non-triggering one never waited.
     if (request.delivery === "followUp" && triggerTurn && this.#drainActive()) {
-      this.#admit(item);
-      this.#held.push(item);
+      // smarty-dev#1495: a held followUp with the same sender and data.coalesceKey is replaced
+      // in place, so a sender that notifies on each state change leaves one message, the newest.
+      const key = followUpCoalesceKey(item.data);
+      const index = key === undefined ? -1 : this.#held.findIndex((held) =>
+        held.from.id === item.from.id && followUpCoalesceKey(held.data) === key);
+      replaced = index < 0 ? undefined : this.#held[index];
+      this.#admit(item, replaced);
+      if (replaced) {
+        item.sentAt = replaced.sentAt;
+        item.replacedAt = Date.now();
+        item.supersedes = [...(replaced.supersedes ?? []), replaced.id].slice(-SUPERSEDED_KEPT);
+        this.#held[index] = item;
+      } else this.#held.push(item);
       try {
         this.#save();                                   // journalled before it is acknowledged
       } catch (error) {
-        this.#held.pop();
+        if (replaced) this.#held[index] = replaced;
+        else this.#held.pop();
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
       if (this.#context!.isIdle()) this.#release(true);
     } else {
       this.#send([item], request.delivery, triggerTurn, false);
     }
-    return { queued: true, messageId: item.id, routed: "main", ...this.queueDepth(item.from.id) };
+    return {
+      queued: true, messageId: item.id, routed: "main",
+      ...(replaced ? { coalesced: true as const, replacedMessageId: replaced.id } : {}),
+      ...this.queueDepth(item.from.id),
+    };
   }
 
   /**
@@ -299,12 +334,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     };
   }
 
-  #admit(item: HeldAgentMessage): void {
+  /** Quotas for a new held item; one that replaces a held item frees that item's share first. */
+  #admit(item: HeldAgentMessage, replacing?: HeldAgentMessage): void {
     const limits = FOLLOW_UP_LIMITS;
     const bytes = itemBytes(item);
-    const mine = this.#held.filter((held) => held.from.id === item.from.id);
-    const mineBytes = mine.reduce((sum, held) => sum + itemBytes(held), 0);
-    const totalBytes = this.#held.reduce((sum, held) => sum + itemBytes(held), 0);
+    const held = replacing ? this.#held.filter((other) => other !== replacing) : this.#held;
+    const mine = held.filter((other) => other.from.id === item.from.id);
+    const mineBytes = mine.reduce((sum, other) => sum + itemBytes(other), 0);
+    const totalBytes = held.reduce((sum, other) => sum + itemBytes(other), 0);
     const full = (what: string) => new Error(
       `Main's followUp queue is full (${what}); Main is busy and reads followUps only at its next tool boundary. ` +
         "Wait, or send a short steer.",
@@ -312,8 +349,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (mine.length + 1 > limits.senderItems || mineBytes + bytes > limits.senderBytes) {
       throw full(`${mine.length} of yours, ${mineBytes} bytes; limit ${limits.senderItems} or ${limits.senderBytes} bytes per sender`);
     }
-    if (this.#held.length + 1 > limits.totalItems || totalBytes + bytes > limits.totalBytes) {
-      throw full(`${this.#held.length} held, ${totalBytes} bytes; limit ${limits.totalItems} or ${limits.totalBytes} bytes in total`);
+    if (held.length + 1 > limits.totalItems || totalBytes + bytes > limits.totalBytes) {
+      throw full(`${held.length} held, ${totalBytes} bytes; limit ${limits.totalItems} or ${limits.totalBytes} bytes in total`);
     }
   }
 
@@ -402,7 +439,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     // The owner rule (dev-lead on pi-fabric#102): skip every id the session holds; a handoff
     // may still sit in Pi's queue, so it waits for a boundary to check; the rest is held again.
     const delivered = this.#refreshDelivered();
-    const seen = new Set<string>();
+    // A superseded id never comes back, even from a journal an older writer left.
+    const seen = new Set<string>(items.flatMap((item) => Array.isArray(item.supersedes) ? item.supersedes : []));
     for (const item of items.sort((a, b) => a.sentAt - b.sentAt)) {
       if (delivered.has(item.id) || seen.has(item.id)) continue;
       seen.add(item.id);
@@ -604,7 +642,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.
     const delivery: FabricAgentMessageDelivery = flushed ? "followUp" : deliverAs;
     const blocks = items.map((item) => [
-      `<fabric-agent-message from_name="${escapeXmlAttribute(item.from.name)}" from_id="${escapeXmlAttribute(item.from.id)}" from_kind="${escapeXmlAttribute(item.from.kind)}" delivery="${escapeXmlAttribute(delivery)}" sent_at="${escapeXmlAttribute(new Date(item.sentAt).toISOString())}">`,
+      `<fabric-agent-message from_name="${escapeXmlAttribute(item.from.name)}" from_id="${escapeXmlAttribute(item.from.id)}" from_kind="${escapeXmlAttribute(item.from.kind)}" delivery="${escapeXmlAttribute(delivery)}" sent_at="${escapeXmlAttribute(new Date(item.sentAt).toISOString())}"${item.replacedAt === undefined ? "" : ` replaced_at="${escapeXmlAttribute(new Date(item.replacedAt).toISOString())}"`}>`,
       escapeXmlText(item.message),
       item.data === undefined ? undefined : `<data>${escapeXmlText(JSON.stringify(item.data))}</data>`,
       "</fabric-agent-message>",
@@ -614,6 +652,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       from: item.from,
       delivery,
       sentAt: new Date(item.sentAt).toISOString(),
+      ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
+      ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
       ...(item.data === undefined ? {} : { data: item.data }),
     });
     const first = items[0]!;

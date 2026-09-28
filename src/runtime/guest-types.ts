@@ -779,7 +779,25 @@ type FabricMessageTarget =
   | { to: string; id?: string; sessionId?: FabricSessionIdHint };
 /** sessionId is not a field: write id: "session:<sessionId>". */
 type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionId>'";
-type FabricMessageArgs = FabricMessageTarget & { message: string; data?: unknown };
+/** Structured message data. Any JSON value; an object may carry coalesceKey. */
+interface FabricMessageData {
+  /**
+   * For a followUp (or tell) to a busy Main: while Main still holds an unread followUp from you
+   * with the same key, the new one replaces it in place (keeps its position) and the old one is
+   * never delivered. A non-empty string of at most 200 characters; other values do not coalesce.
+   * The parallel of an actor's mailbox coalesceKey.
+   */
+  coalesceKey?: string;
+  [key: string]: unknown;
+}
+type FabricMessageArgs = FabricMessageTarget & {
+  message: string;
+  /**
+   * Any JSON value, sent with the message. Shape it as FabricMessageData to use coalesceKey.
+   * ponytail: typed unknown, so existing callers that pass any value still type-check.
+   */
+  data?: unknown;
+};
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricMessageDelivery {
   queued: true;
@@ -790,6 +808,10 @@ interface FabricMessageDelivery {
   pendingFollowUps?: number;
   /** For a Main target: the age in seconds of your oldest followUp it still holds (0 when none). */
   oldestAgeS?: number;
+  /** For a Main target: this followUp replaced your held one with the same data.coalesceKey. */
+  coalesced?: true;
+  /** The id of the replaced followUp; it is never delivered. */
+  replacedMessageId?: string;
 }
 interface FabricAgentsApi {
   run(args: FabricAgentRequest): Promise<FabricAgentResult>;

@@ -20,6 +20,7 @@ export const effectiveAgentNice = (configured: number, requested?: number): numb
   Math.min(MAX_AGENT_NICE, Math.max(configured, requested ?? 0));
 
 export interface ChildPriorityDeps {
+  getPriority: (pid: number) => number;
   setPriority: (pid: number, priority: number) => void;
   ionice: (pid: number) => { error?: Error; status: number | null; stderr?: string | Buffer | null };
   platform: NodeJS.Platform;
@@ -39,6 +40,7 @@ const logOnce = (log: (message: string) => void, kind: string, message: string):
 export const resetChildPriorityLog = (): void => loggedFailures.clear();
 
 const defaultDeps = (log: (message: string) => void): ChildPriorityDeps => ({
+  getPriority: (pid) => os.getPriority(pid),
   setPriority: (pid, priority) => os.setPriority(pid, priority),
   ionice: (pid) => spawnSync("ionice", ["-c2", "-n7", "-p", String(pid)], { stdio: ["ignore", "ignore", "pipe"], timeout: 5_000 }),
   platform: process.platform,
@@ -46,9 +48,11 @@ const defaultDeps = (log: (message: string) => void): ChildPriorityDeps => ({
 });
 
 /**
- * Lower a spawned child's CPU priority (and IO priority on Linux) to `nice`.
- * Best effort: on Windows os.setPriority maps to a priority class. The child's
- * own subprocesses (its bash tool) inherit both on Linux and macOS.
+ * Lower a process's CPU priority (and IO priority on Linux) to `nice`. The worker
+ * calls it on itself before it spawns the CLI: on Linux both are per thread and
+ * inherited at fork, so the child, all its threads and its tools start lowered.
+ * Already lower (a niced host) is kept: an unprivileged process cannot raise it.
+ * Best effort: on Windows os.setPriority maps to a priority class.
  */
 export const applyChildPriority = (
   pid: number | undefined,
@@ -58,7 +62,9 @@ export const applyChildPriority = (
 ): void => {
   if (!pid || nice <= 0) return;
   try {
-    deps.setPriority(pid, Math.min(MAX_AGENT_NICE, nice));
+    let current = 0;
+    try { current = deps.getPriority(pid); } catch { /* unknown: try to set it */ }
+    if (current < nice) deps.setPriority(pid, Math.min(MAX_AGENT_NICE, nice));
   } catch (error) {
     logOnce(deps.log, "setPriority", `agents.nice: setPriority(${pid}, ${nice}) failed: ${error instanceof Error ? error.message : String(error)}`);
   }

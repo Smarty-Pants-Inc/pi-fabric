@@ -392,6 +392,13 @@ const main = async (): Promise<void> => {
         ? options.vedaBinary
         : options.piBinary;
 
+  // smarty-dev#1579: agents.nice lowers CPU and IO priority. This dedicated worker lowers its own
+  // spawning (main) thread before the fork, so the child, every thread it starts and its tools
+  // inherit it. Setting the child's pid after spawn races Linux per-thread priority.
+  if (options.nice) {
+    applyChildPriority(process.pid, options.nice, (message) =>
+      appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
+  }
   const child = spawnCli(childBinary, childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
@@ -442,11 +449,6 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  // smarty-dev#1579: agents.nice lowers the child's CPU and IO priority; its tools inherit it.
-  if (options.nice) {
-    applyChildPriority(child.pid, options.nice, (message) =>
-      appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
-  }
   let stderr = "";
   let outputBuffer = "";
   // Veda emits a single JSON document on stdout (progress goes to stderr, and

@@ -253,12 +253,6 @@ export interface FabricMeshConfig {
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
   announce: boolean;
-  /**
-   * An idle Main reads its root inbox on a timer and starts a turn for it (smarty-dev#1595). Off
-   * by default until Pi queues a triggered message behind a live prompt preflight: before that,
-   * a wake can race a prompt that is typed or sent (herdr) during its preflight.
-   */
-  inboxIdleWake: boolean;
   actorScope: FabricActorScope;
   maxEventBytes: number;
   maxReadEvents: number;
@@ -490,7 +484,6 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   mesh: {
     enabled: true,
     announce: false,
-    inboxIdleWake: false,
     actorScope: "project",
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
@@ -1138,7 +1131,6 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
-      inboxIdleWake: booleanValue(mesh.inboxIdleWake, DEFAULT_FABRIC_CONFIG.mesh.inboxIdleWake),
       actorScope: actorScopeValue(mesh.actorScope, DEFAULT_FABRIC_CONFIG.mesh.actorScope),
       maxEventBytes: boundedInteger(
         mesh.maxEventBytes,

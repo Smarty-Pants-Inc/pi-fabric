@@ -190,7 +190,6 @@ where absent values do not participate. Orchestration programs (`agents.run` / `
   "mesh": {
     "enabled": true,
     "announce": false,
-    "inboxIdleWake": false,
     "actorScope": "project",
     "maxEventBytes": 262144,
     "maxReadEvents": 500,
@@ -527,8 +526,6 @@ See the [interface reference](interface.md).
 Mesh data lives at `<project>/.pi/fabric/mesh` by default. Set `mesh.root` to a relative or absolute path to relocate durable topics, shared state, and actor sessions. Add `.pi/fabric/mesh/` to the project's ignore file unless you version the coordination log on purpose. Set `mesh.enabled` to `false` to disable both mesh actions and ambient actor restoration.
 
 Sessions that share one `mesh.root` share one participant directory, so each sees the others through `agents.sessions()` and can `steer` or `followUp` them. A Main normally joins that directory when it first uses Fabric. Set `mesh.announce` to `true` in the project configuration to join at session start instead, so an idle peer is reachable. Announcing loads the Fabric runtime during startup, so avoid it in a global configuration that applies to every project.
-
-Set `mesh.inboxIdleWake` to `true` so that an idle Main reads its work inbox on a timer and starts a turn for it ([agents](agents.md), smarty-dev#1595). It is off by default. Until Pi queues a triggered message behind a live prompt preflight, a wake can start a run while a prompt (typed, or sent through herdr) is still in its preflight, and that prompt then fails. Turn it on only for headless or test sessions.
 
 When several projects share a root, project-scoped actors are shared too: any live Main on that root can adopt a project actor whose owner has gone. Set `mesh.actorScope` to `"session"` so new actors default to their root Pi session, which other sessions do not load or adopt. This is only the default for `agents.create`: existing project actors, and actors created with an explicit `scope: "project"`, stay shared. Session actors do not survive `/new`.
 

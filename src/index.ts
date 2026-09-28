@@ -8,6 +8,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import * as piHost from "@earendil-works/pi-coding-agent";
 import { defaultCodePreviewSettings } from "./ui/code-preview.js";
 import {
   type FabricToolShellDecorator,
@@ -197,6 +198,18 @@ const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sess
 
 // An idle Main reads its inbox this often (smarty-dev#1595). With the 60 s steer grace, an event
 // published to an idle Main starts a turn about 60-75 s later. PI_FABRIC_INBOX_WAKE_MS overrides it.
+// The idle wake needs a Pi that queues a triggered message behind a live prompt preflight;
+// otherwise a wake can start a run that makes a prompt in its preflight fail (#107 review F2).
+// Pi declares it with HOST_CAPABILITIES; an older Pi lacks it, and the wake stays off. Tests
+// inject the capability under the global symbol below, since their Pi predates it.
+type HostCapabilities = { triggeredMessageQueuesBehindPreflight?: unknown };
+const TEST_HOST_CAPABILITIES = Symbol.for("pi-fabric.test.hostCapabilities");
+const hostQueuesTriggeredBehindPreflight = (): boolean => {
+  const injected = (globalThis as Record<symbol, HostCapabilities | undefined>)[TEST_HOST_CAPABILITIES];
+  const declared = (piHost as { HOST_CAPABILITIES?: HostCapabilities }).HOST_CAPABILITIES;
+  return (injected ?? declared)?.triggeredMessageQueuesBehindPreflight === true;
+};
+
 const inboxWakeMs = (): number => {
   const value = Number(process.env.PI_FABRIC_INBOX_WAKE_MS);
   return Number.isFinite(value) && value > 0 ? value : 15_000;
@@ -607,8 +620,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       }
     }
     await state.bootstrap(context);
-    // Opt-in until Pi queues a triggered message behind a live prompt preflight (mesh.inboxIdleWake).
-    if (state.config.mesh.inboxIdleWake) {
+    // Inert until Pi queues a triggered message behind a live prompt preflight.
+    if (hostQueuesTriggeredBehindPreflight()) {
       inboxWake.timer = setInterval(() => void wakeIdleMain(), inboxWakeMs());
       inboxWake.timer.unref?.();
     }

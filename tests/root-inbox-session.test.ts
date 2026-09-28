@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 // this Main that no steer delivered reaches it with its next turn, once.
 const fabricEntry = path.resolve("dist/index.js");
 const built = fs.existsSync(fabricEntry);
+const HOST_CAPABILITIES_KEY = Symbol.for("pi-fabric.test.hostCapabilities");
 const ENV_KEYS = ["PI_FABRIC_MESH_ROOT", "PI_CODING_AGENT_DIR", "PI_FABRIC_INBOX_WAKE_MS", "PI_FABRIC_INBOX_WAKE_COOLDOWN_MS"] as const;
 
 describe.skipIf(!built)("the root inbox in a real Pi session", () => {
@@ -29,6 +30,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       else process.env[key] = value;
     }
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+    delete (globalThis as Record<symbol, unknown>)[HOST_CAPABILITIES_KEY];
   });
 
   // `wake`: the idle wake ticks every 100 ms with no cooldown (smarty-dev#1595); otherwise it
@@ -45,11 +47,12 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     roots.push(root);
     const agentDir = path.join(root, "agent");
     fs.mkdirSync(agentDir, { recursive: true });
-    // The idle wake is opt-in (mesh.inboxIdleWake) until Pi queues a triggered message behind a
-    // live prompt preflight; `optIn: false` keeps the fast tick but leaves the wake at its default.
-    const config = (extra.config ?? {}) as { mesh?: Record<string, unknown> };
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify(
-      wake && extra.optIn !== false ? { ...config, mesh: { ...config.mesh, inboxIdleWake: true } } : config));
+    // The idle wake needs a Pi that queues a triggered message behind a live preflight. This Pi
+    // predates that capability, so a test injects it; `optIn: false` leaves it absent.
+    const capabilities = globalThis as Record<symbol, unknown>;
+    if (wake && extra.optIn !== false) capabilities[HOST_CAPABILITIES_KEY] = { triggeredMessageQueuesBehindPreflight: true };
+    else delete capabilities[HOST_CAPABILITIES_KEY];
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify(extra.config ?? {}));
     const meshRoot = path.join(root, "mesh");
     process.env.PI_FABRIC_MESH_ROOT = meshRoot;
     process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -276,7 +279,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(JSON.stringify(inboxMessages()[0])).toContain("Sent right after you started.");
   }, 60_000);
 
-  it("is off by default: without mesh.inboxIdleWake an idle Main takes the event at its next turn", async () => {
+  it("is inert on a Pi without the preflight capability: an idle Main takes the event at its next turn", async () => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, true, { optIn: false });
     faux.setResponses([fauxAssistantMessage("should not run"), fauxAssistantMessage("next turn")]);
     missedWork("Waiting for your next turn.");

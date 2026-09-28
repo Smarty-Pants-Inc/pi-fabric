@@ -289,6 +289,12 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.acceptControl({ ...command("steer"), targetId: "main" }, actors.identity)).resolves.toEqual({
       accepted: true, messageId: "main-msg",
     });
+    main.deliverAgent.mockReturnValueOnce({
+      queued: true, messageId: "newest", routed: "main", pendingFollowUps: 1, oldestAgeS: 5, coalesced: true, replacedMessageId: "held",
+    });
+    await expect(router.acceptControl({ ...command("followUp"), targetId: "main" }, actors.identity)).resolves.toEqual({
+      accepted: true, messageId: "newest", pendingFollowUps: 1, oldestAgeS: 5, coalesced: true, replacedMessageId: "held",
+    });
   });
 
   it("rejects a remote followUp to a full Main queue with the reason", async () => {

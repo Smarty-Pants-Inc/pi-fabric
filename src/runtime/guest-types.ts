@@ -784,7 +784,9 @@ type FabricMessageTarget =
   | { to: string; id?: string; sessionId?: FabricSessionIdHint };
 /** sessionId is not a field: write id: "session:<sessionId>". */
 type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionId>'";
-type FabricMessageArgs = FabricMessageTarget & { message: string; data?: unknown };
+/** coalesceKey (1-200 chars): a followUp/tell replaces your unread held one to a busy Main with the same key (like actor coalesceKey). */
+interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
+type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricMessageDelivery {
   queued: true;
@@ -795,6 +797,9 @@ interface FabricMessageDelivery {
   pendingFollowUps?: number;
   /** For a Main target: the age in seconds of your oldest followUp it still holds (0 when none). */
   oldestAgeS?: number;
+  /** Main: it replaced your held followUp replacedMessageId (same data.coalesceKey). */
+  coalesced?: true;
+  replacedMessageId?: string;
 }
 interface FabricAgentsApi {
   run(args: FabricAgentRequest): Promise<FabricAgentResult>;

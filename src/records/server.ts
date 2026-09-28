@@ -2,7 +2,6 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { writeJsonAtomicAsync } from "../core/atomic-write.js";
 import { AdmissionGate, WalGFrontierProvider, type AdmissionStatus } from "./admission.js";
 import { RecordsArgumentError } from "./kinds.js";
 import { LineReader, RecordsServiceError, wireError, type WireRequest, type WireResponse } from "./protocol.js";
@@ -404,8 +403,7 @@ export class RecordsServer {
     };
     this.#statusWrite = this.#statusWrite.then(async () => {
       await fs.promises.mkdir(path.dirname(file), { recursive: true, mode: 0o755 });
-      // Readable by the factory check (another user); it holds no secret.
-      await writeJsonAtomicAsync(file, record, { space: 2, newline: true, mode: 0o644, dirMode: 0o755 });
+      await writeStatusFile(file, `${JSON.stringify(record, null, 2)}\n`);
     }).catch(() => undefined);
   }
 
@@ -413,6 +411,11 @@ export class RecordsServer {
   reloadRoles(roles: RecordsServiceConfig["roles"]): void {
     (this.config as { roles: RecordsServiceConfig["roles"] }).roles = roles;
     this.#principals.clear();
+  }
+
+  /** How many client connections are open (status, and tests that must see a disconnect land). */
+  get connectionCount(): number {
+    return this.#connections.size;
   }
 
   /** Drop every client connection (their calls in flight are cancelled); clients reconnect. */
@@ -458,6 +461,30 @@ const pageArgs = (args: Record<string, unknown>, origin: string): PageArgs => ({
   ...(Array.isArray(args.to) ? { to: names(args.to) } : {}),
   ...(typeof args.exceptAuthor === "string" ? { exceptAuthor: args.exceptAuthor } : {}),
 });
+
+/**
+ * The status file is readable by the factory check (another user) and holds no secret: 0644
+ * whatever the process umask (the unit's UMask=0007 would make it 0640). The mode is set with
+ * fchmod on the new file's descriptor before the atomic rename. Secrets are never written here.
+ */
+export const writeStatusFile = async (file: string, text: string): Promise<void> => {
+  await fs.promises.mkdir(path.dirname(file), { recursive: true, mode: 0o755 });
+  const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  const handle = await fs.promises.open(temp, "wx", 0o600);
+  try {
+    await handle.writeFile(text);
+    await handle.chmod(0o644);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await fs.promises.rename(temp, file);
+  } catch (error) {
+    await fs.promises.rm(temp, { force: true });
+    throw error;
+  }
+};
 
 /** A request envelope, or undefined for anything else (never throws). */
 const parseRequest = (line: string): WireRequest | undefined => {

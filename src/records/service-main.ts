@@ -56,7 +56,8 @@ const main = async (argv: string[]): Promise<number> => {
     const credential = await issuePrincipal(config, id, role as OperatorRole, name);
     fs.mkdirSync(path.dirname(out), { recursive: true });
     // O_EXCL: an existing credential file is never overwritten.
-    fs.writeFileSync(out, `${JSON.stringify(credential)}\n`, { mode: 0o600, flag: "wx" });
+    // The role and provenance go with the token, so the installer can verify a file before reuse or delivery.
+    fs.writeFileSync(out, `${JSON.stringify({ ...credential, role, issuedBy: "installer" })}\n`, { mode: 0o600, flag: "wx" });
     process.stdout.write(`issued ${id} to ${out}\n`);
     return 0;
   }

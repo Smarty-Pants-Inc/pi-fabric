@@ -19,9 +19,27 @@ const printed = (what: string) => {
 	return r.out;
 };
 const sha = (id: string) => createHash("sha256").update(id).digest("hex");
+// The host's own PostgreSQL, as the script detects it without --pg-bin (none: the <N> placeholder).
+const hostPgMajor = (() => {
+	try {
+		const b = (n: string) => `/usr/lib/postgresql/${n}/bin`;
+		return readdirSync("/usr/lib/postgresql")
+			.filter((n) => /^\d+$/.test(n) && existsSync(`${b(n)}/initdb`) && existsSync(`${b(n)}/postgres`))
+			.map(Number)
+			.sort((a, c) => c - a)[0];
+	} catch {
+		return undefined;
+	}
+})();
+const hostN = hostPgMajor === undefined ? "<N>" : String(hostPgMajor);
+const hostPgBin = `/usr/lib/postgresql/${hostN}/bin`;
+// show() quotes an argument with the placeholder's < >.
+const q = (p: string) => (p.includes("<") ? `'${p}'` : p);
+const reEsc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const lines = (text: string) => text.split("\n").filter((l) => l.trim() !== "" && !l.startsWith("#"));
 
-describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
+// The real-path runs take several seconds each under nice (#1600): allow them a minute.
+describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout: 60_000 }, () => {
 	const fake = mkdtempSync(join(tmpdir(), "records-paul-steps-"));
 	afterAll(() => rmSync(fake, { recursive: true, force: true }));
 
@@ -113,22 +131,22 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 		chmodSync(join(fake, cmd), 0o755);
 	}
 	// Non-mutating: the script queries it for real, also in a dry run.
-	writeFileSync(join(fake, "apt-cache"), "#!/bin/sh\nprintf 'postgresql-17:\\n  Installed: (none)\\n  Candidate: 17.6-1.pgdg\\n'\n");
+	writeFileSync(join(fake, "apt-cache"), "#!/bin/sh\nprintf 'postgresql:\\n  Installed: (none)\\n  Candidate: 16+257build1.1\\n'\n");
 	chmodSync(join(fake, "apt-cache"), 0o755);
 	const fakeEnv = { ...process.env, PATH: `${fake}:${process.env.PATH}` };
 	// The default --pg-bin; the dry run below must not pass --pg-bin.
 	const dryBase = ["--org", "test-org", "--org-user", "nobodyuser", "--node", process.execPath];
-	const defaultInitdb = "/usr/lib/postgresql/17/bin/initdb";
 
 	it("dry run prints every step and executes nothing", () => {
 		writeFileSync(log, "");
 		const r = run([...dryBase, "--dry-run", "--operator", "importer:github"], fakeEnv);
 		expect(r.code, r.err).toBe(0);
 		expect(r.out).toMatch(/^\+ useradd --system .* --shell \/usr\/sbin\/nologin test-org-records$/m);
-		if (existsSync(defaultInitdb)) expect(r.out).toContain("= PostgreSQL found at /usr/lib/postgresql/17/bin\n");
+		if (hostPgMajor !== undefined) expect(r.out).toContain(`= PostgreSQL ${hostN} found at ${hostPgBin} `);
 		else {
-			expect(r.out).toContain("+ apt-get install -y postgresql-17\n");
-			expect(r.out).toMatch(/postgresql@17-main;\n.*does not touch it/);
+			expect(r.out).toContain("+ apt-get install -y postgresql\n");
+			expect(r.out).toMatch(/postgresql@<N>-main;\n.*does not touch it/);
+			expect(r.out).toContain("= PostgreSQL <detected after install>");
 		}
 		expect(r.out).toContain("+ install -d -m 0755 -o root -g root /opt/test-org-records\n");
 		// F13: exactly two files are staged, a node binary and the self-contained bundle.
@@ -140,7 +158,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 		expect(r.out).not.toMatch(/rsync|node_modules|\/package\b|chown -R|chmod -R/);
 		expect(r.out).toContain("? find /opt/test-org-records -type l  (must print nothing)\n");
 		expect(r.out).toContain("? runuser -u test-org-records -- /opt/test-org-records/node /opt/test-org-records/service-main.mjs  (must exit 2");
-		expect(r.out).toMatch(/^\+ runuser -u test-org-records -- \/usr\/lib\/postgresql\/17\/bin\/initdb -D \/var\/lib\/test-org-records\/pg -U postgres --auth-local=peer --auth-host=reject -E UTF8 --locale=C$/m);
+		expect(r.out).toMatch(new RegExp(`^\\+ runuser -u test-org-records -- ${reEsc(q(`${hostPgBin}/initdb`))} -D`, "m"));
+		expect(r.out).toMatch(/^\+ runuser -u test-org-records -- \S+\/initdb'? -D \/var\/lib\/test-org-records\/pg -U postgres --auth-local=peer --auth-host=reject -E UTF8 --locale=C$/m);
 		expect(r.out).toContain("+ install -d -m 0700 -o test-org-records -g test-org-records /var/lib/test-org-records/pg\n");
 		expect(r.out).toContain("+ install -d -m 0755 -o test-org-records -g test-org-records /var/lib/test-org-records\n");
 		expect(r.out).toContain("+ install -d -m 0700 -o test-org-records -g test-org-records /var/lib/test-org-records/credentials\n");
@@ -172,7 +191,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 		expect(r.out).toContain(`"credentialFile": "${gh}"`);
 		expect(r.out).toContain("systemctl reload test-org-records.service");
 		expect(r.out).not.toMatch(/sudo -u/);
-		expect(r.out).toMatch(/runuser -u nobodyuser -- \/usr\/lib\/postgresql\/17\/bin\/psql -h \/run\/test-org-records-pg .*expected to fail/);
+		expect(r.out).toContain(`? runuser -u nobodyuser -- ${hostPgBin}/psql -h /run/test-org-records-pg `);
+		expect(r.out).toMatch(/runuser -u nobodyuser -- \S+\/psql -h \/run\/test-org-records-pg .*expected to fail/);
 		expect(readFileSync(log, "utf8")).toBe("");
 	});
 
@@ -218,8 +238,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 		expect(tail).toContain("  userdel test-org-records\n");
 		expect(tail).toContain("  rm -rf /opt/test-org-records\n");
 		expect(tail).toContain("  systemctl disable --now test-org-records.service test-org-records-pg.service\n");
-		expect(tail).toContain("Take a backup first: runuser -u test-org-records -- /usr/lib/postgresql/17/bin/pg_dump ");
-		expect(tail).toContain("apt-get remove postgresql-17");
+		expect(tail).toContain(`Take a backup first: runuser -u test-org-records -- ${hostPgBin}/pg_dump `);
+		expect(tail).toContain(`Optional, to remove them too: apt-get remove postgresql postgresql-${hostN}`);
 		expect(readFileSync(log, "utf8")).toBe("");
 	});
 
@@ -242,7 +262,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 		const cmds = r.out.split("\n").filter((l) => l.startsWith("+ ")).map((l) => l.slice(2));
 		expect(cmds).toEqual(rollbackOrder);
 		expect(r.out).toContain("This deletes the org's record database. Take a backup first: runuser -u test-org-records -- ");
-		expect(r.out).toContain("apt-get remove postgresql-17");
+		expect(r.out).toContain(`apt-get remove postgresql postgresql-${hostN}`);
 		expect(r.out).not.toContain("## 1. ");
 		// The ROLLBACK section of an install lists the same commands.
 		const install = run([...dryBase, "--dry-run"], fakeEnv);
@@ -301,15 +321,87 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 		expect(r.err).toMatch(/\/nonexistent\/initdb not found/);
 	});
 
-	it("fails clearly when apt has no postgresql-17 candidate", () => {
-		if (existsSync(defaultInitdb)) return;
+	it("fails clearly when apt has no candidate for the distro postgresql", () => {
 		const noCand = mkdtempSync(join(tmpdir(), "records-paul-steps-apt-"));
-		writeFileSync(join(noCand, "apt-cache"), "#!/bin/sh\nprintf 'postgresql-17:\\n  Candidate: (none)\\n'\n");
-		chmodSync(join(noCand, "apt-cache"), 0o755);
-		const r = run([...dryBase, "--dry-run"], { ...process.env, PATH: `${noCand}:${fake}:${process.env.PATH}` });
-		rmSync(noCand, { recursive: true, force: true });
-		expect(r.code).not.toBe(0);
-		expect(r.err).toMatch(/PGDG apt repository/);
+		try {
+			writeFileSync(join(noCand, "apt-cache"), "#!/bin/sh\nprintf 'postgresql:\\n  Candidate: (none)\\n'\n");
+			chmodSync(join(noCand, "apt-cache"), 0o755);
+			const r = run([...dryBase, "--dry-run"], { ...testEnv(noCand), RECORDS_PAUL_STEPS_TEST_ROOT: `${noCand}/root` });
+			expect(r.code).not.toBe(0);
+			expect(r.err).toMatch(/no apt candidate for the distro package postgresql/);
+		} finally {
+			rmSync(noCand, { recursive: true, force: true });
+		}
+	});
+
+	// A fake /usr/lib/postgresql under the test root: each major gets initdb and a postgres that reports it.
+	const pgTree = (root: string, majors: string[]) => {
+		for (const n of majors) {
+			const d = join(root, `usr/lib/postgresql/${n}/bin`);
+			mkdirSync(d, { recursive: true });
+			writeFileSync(join(d, "initdb"), "#!/bin/sh\nexit 0\n");
+			writeFileSync(join(d, "postgres"), `#!/bin/sh\necho "postgres (PostgreSQL) ${n}.4"\n`);
+			for (const f of ["initdb", "postgres"]) chmodSync(join(d, f), 0o755);
+		}
+	};
+
+	it("detects the highest /usr/lib/postgresql/<N>/bin: 17 over 16, and 16 alone", () => {
+		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-pgtree-"));
+		try {
+			const root = join(t, "root");
+			pgTree(root, ["16", "17"]);
+			// A directory without postgres is not a server install.
+			mkdirSync(join(root, "usr/lib/postgresql/18/bin"), { recursive: true });
+			writeFileSync(join(root, "usr/lib/postgresql/18/bin/initdb"), "");
+			const env = { ...testEnv(), RECORDS_PAUL_STEPS_TEST_ROOT: root };
+			let r = run([...dryBase, "--dry-run"], env);
+			expect(r.code, r.err).toBe(0);
+			expect(r.out).toContain(`## 2. Prerequisites: PostgreSQL 17, `);
+			expect(r.out).toContain(`= PostgreSQL 17 found at ${root}/usr/lib/postgresql/17/bin `);
+			expect(r.out).not.toContain("apt-get install");
+			expect(r.out).toContain(`+ runuser -u test-org-records -- ${root}/usr/lib/postgresql/17/bin/initdb -D `);
+			r = run(["--help", "--org", "test-org", "--org-user", "nobodyuser"], env);
+			expect(r.out).toContain("cluster=17/test-org-records");
+			rmSync(join(root, "usr/lib/postgresql/17"), { recursive: true });
+			r = run([...dryBase, "--dry-run"], env);
+			expect(r.code, r.err).toBe(0);
+			expect(r.out).toContain(`= PostgreSQL 16 found at ${root}/usr/lib/postgresql/16/bin `);
+			expect(r.out).toContain("apt-get remove postgresql postgresql-16");
+			expect(r.out).not.toMatch(/postgresql-17|\/17\/|PGDG/i);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a --pg-bin whose postgres --version is below 16, before step 1", () => {
+		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-pg15-"));
+		try {
+			pgTree(t, ["15"]);
+			writeFileSync(log, "");
+			const r = run([...dryBase, "--pg-bin", join(t, "usr/lib/postgresql/15/bin"), "--dry-run"], fakeEnv);
+			expect(r.code).toBe(1);
+			expect(r.err).toMatch(/refused: PostgreSQL 15 at \S+ is too old; the record store needs PostgreSQL 16 or newer/);
+			expect(r.out).not.toContain("## 1. ");
+			expect(readFileSync(log, "utf8")).toBe("");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it("with no PostgreSQL present, the dry run installs the distro postgresql and never mentions postgresql-17 or PGDG", () => {
+		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-nopg-"));
+		try {
+			writeFileSync(log, "");
+			const r = run([...dryBase, "--dry-run", "--operator", "importer:github"], { ...testEnv(), RECORDS_PAUL_STEPS_TEST_ROOT: join(t, "root") });
+			expect(r.code, r.err).toBe(0);
+			expect(r.out).toContain("## 2. Prerequisites: PostgreSQL <detected after install>, ");
+			expect(r.out).toContain("+ apt-get install -y postgresql\n");
+			expect(r.out).toMatch(/postgresql@<N>-main;\n.*does not touch it/);
+			expect(r.out).not.toMatch(/postgresql-17|PGDG|add-apt-repository|sources\.list|\/17\//i);
+			expect(readFileSync(log, "utf8")).toBe("");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
 	});
 
 	it("edits service.json roles idempotently and keeps every other field", () => {
@@ -340,6 +432,17 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 			const r = spawnSync(process.execPath, ["-e", js, noRoles, "mirror", "mirror:dev1"], { encoding: "utf8" });
 			expect(r.status, r.stderr).toBe(0);
 			expect(JSON.parse(readFileSync(noRoles, "utf8"))).toEqual({ org: "o", roles: { mirror: ["mirror:dev1"] } });
+			// F18: an id already under another role is refused (exit 3) and nothing is written, also in check mode.
+			const before = readFileSync(file, "utf8");
+			for (const extra of [[], ["check"]]) {
+				const c = spawnSync(process.execPath, ["-e", js, file, "relay", "importer:github", ...extra], { encoding: "utf8" });
+				expect(c.status).toBe(3);
+				expect(c.stderr).toContain("importer:github already holds role importer; an operator id holds exactly one role, so relay is refused");
+			}
+			expect(readFileSync(file, "utf8")).toBe(before);
+			const ok = spawnSync(process.execPath, ["-e", js, file, "relay", "relay:new", "check"], { encoding: "utf8" });
+			expect([ok.status, ok.stdout.trim()]).toEqual([0, "ok"]);
+			expect(readFileSync(file, "utf8")).toBe(before);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -374,7 +477,9 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 		expect(r.out).toContain(`--id team:import_job --role importer --out ${imp}\n`);
 		expect(r.out).toContain(`--id team_import:job --role relay --out ${rel}\n`);
 		for (const [cred, id] of [[imp, "team:import_job"], [rel, "team_import:job"]])
-			expect(r.out).toMatch(new RegExp(`^\\? runuser -u test-org-records -- /opt/test-org-records/node -e '.*\\.id !== id.*' ${cred} ${id} {2}\\(stored \\.id must equal`, "m"));
+			expect(r.out).toMatch(
+				new RegExp(`^\\? runuser -u test-org-records -- /opt/test-org-records/node -e '.*\\.id !== id \\|\\| c\\.role !== role \\|\\| c\\.issuedBy !== "installer".*' ${cred} ${id} (importer|relay) {2}\\(stored \\.id, \\.role, \\.issuedBy must equal`, "m"),
+			);
 		expect(r.out).toContain(`sh '~nobodyuser/.config/test-org-records/relay.json' < ${rel}\n`);
 		expect(r.out).not.toContain(`< ${imp}`);
 		expect(readFileSync(log, "utf8")).toBe("");
@@ -401,11 +506,12 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 	// F12: the real (non-dry) path against fakes that act as root would, under a temp system root.
 	// Root-side install/chown/chmod log their args; install really runs only inside the temp system root.
 	// runuser drops "-u USER --" and runs the rest (the real binaries) as this user.
-	const relayRun = (layout: "plain" | "dest-link" | "config-link") => {
+	const relayRun = (layout: "plain" | "dest-link" | "config-link", pgFrom: "pg-bin" | "tree16" = "pg-bin") => {
 		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-relay-"));
 		const L = join(t, "calls.log");
 		const bin = join(t, "bin");
-		const pg = join(t, "pg");
+		// --pg-bin (a 17), or no --pg-bin and a detected /usr/lib/postgresql/16 under the test root.
+		const pg = pgFrom === "pg-bin" ? join(t, "pg") : join(t, "root/usr/lib/postgresql/16/bin");
 		const home = join(t, "home");
 		const outside = join(t, "outside");
 		for (const d of [bin, pg, home, outside, join(t, "pkg/dist/records-service"), join(t, "root/etc/systemd/system")]) mkdirSync(d, { recursive: true });
@@ -424,11 +530,12 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 		spawnSync(process.execPath, ["-e", "require('net').createServer().listen(process.argv[1], () => process.exit(0))", join(t, "root/run/test-org-records/records.sock")]);
 		sh(bin, "getent", `echo "${me}:x:1000:1000::${home}:/bin/sh"`);
 		for (const c of ["initdb", "pg_isready", "createdb"]) sh(pg, c, "exit 0");
+		sh(pg, "postgres", `echo "postgres (PostgreSQL) ${pgFrom === "pg-bin" ? "17.2" : "16.10"}"`);
 		sh(pg, "psql", `for a; do last=$a; done; [ "$last" = "select 1" ] && exit 2; exit 0`);
 		sh(t, "node", `exec "${process.execPath}" "$@"`);
 		writeFileSync(
 			join(t, "pkg/dist/records-service/service-main.mjs"),
-			`import fs from "node:fs";\nconst a = process.argv.slice(2), f = (n) => a[a.indexOf(n) + 1];\nif (!a.length) process.exit(2);\nif (a[0] === "issue") fs.writeFileSync(f("--out"), JSON.stringify({ id: f("--id"), token: "tok-" + f("--id") }) + "\\n", { mode: 0o600, flag: "wx" });\n`,
+			`import fs from "node:fs";\nconst a = process.argv.slice(2), f = (n) => a[a.indexOf(n) + 1];\nif (!a.length) process.exit(2);\nif (a[0] === "issue") fs.writeFileSync(f("--out"), JSON.stringify({ id: f("--id"), token: "tok-" + f("--id"), role: f("--role"), issuedBy: "installer" }) + "\\n", { mode: 0o600, flag: "wx" });\n`,
 		);
 		writeFileSync(join(outside, "keep"), "keep");
 		chmodSync(outside, 0o700);
@@ -437,9 +544,9 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 			symlinkSync(outside, join(home, ".config/test-org-records"));
 		} else if (layout === "config-link") symlinkSync(outside, join(home, ".config"));
 		const before = statSync(outside);
-		const again = () =>
+		const again = (ops = ["--operator", "relay:relay:fabric", "--operator", "importer:github"]) =>
 			run(
-				["--org", "test-org", "--org-user", me, "--node", join(t, "node"), "--pg-bin", pg, "--package", join(t, "pkg"), "--operator", "relay:relay:fabric", "--operator", "importer:github"],
+				["--org", "test-org", "--org-user", me, "--node", join(t, "node"), ...(pgFrom === "pg-bin" ? ["--pg-bin", pg] : []), "--package", join(t, "pkg"), ...ops],
 				{ ...testEnv(bin), RECORDS_PAUL_STEPS_TEST_ROOT: `${t}/root` },
 			);
 		const r = again();
@@ -465,29 +572,91 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 			expect(second.out).toContain(`= ${relayCred} exists; not reissued`);
 			expect(second.out).toContain(`= ${t}/root/opt/test-org-records/service-main.mjs matches`);
 			// A credential file that holds another principal is never reused or delivered.
-			writeFileSync(relayCred, JSON.stringify({ id: "importer:github", token: "x" }));
-			const third = again();
-			expect(third.code).toBe(1);
-			expect(third.err).toContain(`${relayCred} does not hold principal relay:fabric; refused`);
-			expect(JSON.parse(readFileSync(file, "utf8")).token).toBe("tok-relay:fabric");
+			const refusedMsg = `${relayCred} does not hold principal relay:fabric with role relay issued by the installer; refused`;
+			for (const stored of [
+				{ id: "importer:github", token: "x", role: "relay", issuedBy: "installer" },
+				// F18: the right id with another role, or not from the installer's issue command, is refused too.
+				{ id: "relay:fabric", token: "x", role: "importer", issuedBy: "installer" },
+				{ id: "relay:fabric", token: "x", role: "relay" },
+				{ id: "relay:fabric", token: "x", role: "relay", issuedBy: "someone" },
+			]) {
+				writeFileSync(relayCred, JSON.stringify(stored));
+				const third = again();
+				expect(third.code, JSON.stringify(stored)).toBe(1);
+				expect(third.err).toContain(refusedMsg);
+				expect(third.out).not.toContain("relay.json\n");
+				expect(JSON.parse(readFileSync(file, "utf8")).token).toBe("tok-relay:fabric");
+			}
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("F18: an importer id later requested as relay is refused before any grant or delivery", () => {
+		const { t, r, home, again, L, calls } = relayRun("plain");
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			expect(calls.some((c) => c.startsWith("runuser sh -c umask 077"))).toBe(true);
+			const cfg = `${t}/root/etc/test-org-records/service.json`;
+			expect(JSON.parse(readFileSync(cfg, "utf8")).roles.importer).toEqual(["importer:github"]);
+			const cfgBefore = readFileSync(cfg, "utf8");
+			const relayBefore = readFileSync(join(home, ".config/test-org-records/relay.json"), "utf8");
+			writeFileSync(L, "");
+			// relay:importer:github grants relay to principal importer:github, already an importer.
+			const second = again(["--operator", "relay:importer:github"]);
+			expect(second.code).toBe(1);
+			expect(second.err).toContain("importer:github already holds role importer; an operator id holds exactly one role, so relay is refused");
+			expect(second.err).toMatch(/FAILED at step 8 \(Operator principals\) .*refused: importer:github already holds another role in \S+service\.json/);
+			expect(readFileSync(cfg, "utf8")).toBe(cfgBefore);
+			expect(readFileSync(join(home, ".config/test-org-records/relay.json"), "utf8")).toBe(relayBefore);
+			const log2 = readFileSync(L, "utf8");
+			expect(log2).not.toContain("issue --config");
+			expect(log2).not.toContain(`${home}/.config`);
+			expect(log2).not.toMatch(/runuser sh -c/);
+			expect(second.out).not.toMatch(/relay\.json|sha256|issue --config/);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("F18: one id with two roles in one invocation is refused before step 1", () => {
+		writeFileSync(log, "");
+		const r = run(["--org", "test-org", "--org-user", me, "--node", process.execPath, "--operator", "importer:x:y", "--operator", "relay:x:y"], testEnv());
+		expect(r.code).toBe(1);
+		expect(r.err).toContain("refused: operator id 'x:y' is given with two roles (importer and relay); an id holds exactly one role");
+		expect(r.out).not.toContain("## 1. ");
+		expect(readFileSync(log, "utf8")).toBe("");
+		// The same id twice with the same role is fine.
+		expect(run([...base, "--operator", "importer:x:y", "--operator", "importer:x:y", "--print", "hba"]).code).toBe(0);
+	});
+
+	it.skipIf(process.getuid?.() === 0)("with only a detected PostgreSQL 16, a real run says cluster=16", () => {
+		const { t, r } = relayRun("plain", "tree16");
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			expect(r.out).toContain(`= PostgreSQL 16 found at ${t}/root/usr/lib/postgresql/16/bin `);
+			expect(r.out.trimEnd().split("\n").at(-1)).toBe("C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=16/test-org-records unit=active peer-audit=ok");
+			expect(r.out).not.toMatch(/postgresql-17|PGDG/i);
 		} finally {
 			rmSync(t, { recursive: true, force: true });
 		}
 	});
 
 	const success = "C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=17/test-org-records unit=active peer-audit=ok";
+	const helpSuccess = `C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=${hostN}/test-org-records unit=active peer-audit=ok`;
 
 	it("--help needs no root or other flag and prints the four sections for the bundle", () => {
 		for (const flag of ["--help", "-h"]) {
 			const r = run([flag], { ...process.env, PATH: `${fake}:${process.env.PATH}` });
 			expect(r.code, r.err).toBe(0);
 			for (const h of ["WHAT IT CHANGES:", "IDEMPOTENCY:", "SUCCESS LINE:", "ROLLBACK:"]) expect(r.out).toMatch(new RegExp(`^${h}`, "m"));
-			expect(r.out).toContain("C10_RECORDS_INSTALLED org=<org> user=<org>-records cluster=17/<org>-records unit=active peer-audit=ok");
+			expect(r.out).toContain(`C10_RECORDS_INSTALLED org=<org> user=<org>-records cluster=${hostN}/<org>-records unit=active peer-audit=ok`);
+			if (hostPgMajor === undefined) expect(r.out).not.toMatch(/postgresql-17|\/17\/|=17\//);
 			expect(r.out).toContain("  userdel <org>-records\n");
 		}
 		const r = run(["--help", "--org", "test-org", "--org-user", "nobodyuser"], fakeEnv);
 		expect(r.code, r.err).toBe(0);
-		expect(r.out).toContain(`  ${success}\n`);
+		expect(r.out).toContain(`  ${helpSuccess}\n`);
 		expect(r.out).toContain("--org test-org --org-user nobodyuser --rollback --yes-delete-records");
 		expect(r.out).toContain("--rollback --dry-run");
 		expect(r.out).toContain("  1. useradd the test-org-records system user");
@@ -505,7 +674,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", () => {
 		for (const check of [
 			"? systemctl is-active --quiet test-org-records.service",
 			"? systemctl is-active --quiet test-org-records-pg.service",
-			"? runuser -u test-org-records -- /usr/lib/postgresql/17/bin/pg_isready -h /run/test-org-records-pg -p 5433",
+			`? runuser -u test-org-records -- ${q(`${hostPgBin}/pg_isready`)} -h /run/test-org-records-pg -p 5433`,
 			"? runuser -u test-org-records -- python3 -c 'import ctypes; ctypes.CDLL(None).getsockopt'",
 			"? test -S /run/test-org-records/records.sock",
 		])

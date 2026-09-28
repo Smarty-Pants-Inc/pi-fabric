@@ -155,11 +155,11 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
     await store.append(alice, { ref: REF, kind: "link", key: "l", data: { pr: "Smarty-Pants-Inc/pi-fabric#102" } });
     const got = await store.get(alice, { ref: REF });
     expect(got.state).toMatchObject({ title: "Record", owner: "fabric-v2", stage: "review", labels: ["p1"], open: true });
-    expect(got.state.statuses["session:alice"]).toMatchObject({ id: aliceNew.id, text: "second", state: "done", name: "alice" });
-    expect(got.state.statuses["session:bob"]).toMatchObject({ state: "blocked", waitOn: "paul" });
-    expect(got.state.decisions.map((record) => record.id)).toEqual([revised.id]);
-    expect(got.state.openAsks.map((record) => record.id)).toEqual([ask2.id]);
-    expect(got.state.links).toHaveLength(1);
+    expect(got.state!.statuses["session:alice"]).toMatchObject({ id: aliceNew.id, text: "second", state: "done", name: "alice" });
+    expect(got.state!.statuses["session:bob"]).toMatchObject({ state: "blocked", waitOn: "paul" });
+    expect(got.state!.decisions.map((record) => record.id)).toEqual([revised.id]);
+    expect(got.state!.openAsks.map((record) => record.id)).toEqual([ask2.id]);
+    expect(got.state!.links).toHaveLength(1);
     expect(got.history).toHaveLength(11);
     const paged = await store.get(alice, { ref: REF, limit: 4 });
     expect(paged.history).toHaveLength(4);
@@ -229,7 +229,7 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
     await store.append(importer, { ref: REF, kind: "comment", key: "gh-1-edit", text: "edited on GitHub", author: "github:paul", supersedes: imported.id, data: { via: "github:paul" } });
     const issue = await store.append(alice, { ref: REF, kind: "issue", key: "i", data: { title: "Record", stage: "build" } });
     await store.append(bob, { ref: REF, kind: "issue", key: "stage", supersedes: issue.id, data: { stage: "review" } });
-    expect((await store.get(bob, { ref: REF })).state).toMatchObject({ title: "Record", stage: "review" });
+    expect((await store.get(bob, { ref: REF })).state!).toMatchObject({ title: "Record", stage: "review" });
   });
 
   it("commits nothing for an append aborted while it waits for the org lock or a connection", async () => {
@@ -315,10 +315,10 @@ describe.skipIf(!postgresBin)("records on a real PostgreSQL", () => {
     const mirrorer: RecordsPrincipal = { id: "mirror", mirror: true };
     const ask = await store.append(bob, { ref: REF, kind: "ask", key: "a", text: "host?", data: { to: "paul" } });
     await store.append(alice, { ref: REF, kind: "answer", key: "ans", text: "m4max", data: { ask: ask.id.toUpperCase(), outcome: "answered" } });
-    expect((await store.get(alice, { ref: REF })).state.openAsks).toEqual([]);
+    expect((await store.get(alice, { ref: REF })).state!.openAsks).toEqual([]);
     await store.append(mirrorer, { ref: REF, kind: "mirror", key: "m1", data: { mirrorOf: ask.id.toUpperCase(), target: "github", state: "pending" } });
     await store.append(mirrorer, { ref: REF, kind: "mirror", key: "m2", data: { mirrorOf: ask.id, target: "github", state: "mirrored", githubId: "5858" } });
-    expect((await store.get(alice, { ref: REF })).state.mirror).toEqual({ [ask.id]: expect.objectContaining({ state: "mirrored", mirrorOf: ask.id }) });
+    expect((await store.get(alice, { ref: REF })).state!.mirror).toEqual({ [ask.id]: expect.objectContaining({ state: "mirrored", mirrorOf: ask.id }) });
     // The same payload spelled either way is one idempotent retry.
     const again = await store.append(alice, { ref: REF, kind: "answer", key: "ans", text: "m4max", data: { ask: ask.id, outcome: "answered" } });
     expect(again.sequence).toBe(2);

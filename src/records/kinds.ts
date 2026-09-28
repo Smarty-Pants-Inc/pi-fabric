@@ -13,6 +13,11 @@ export const IMPORT_FIELDS = ["via", "githubId"] as const;
 export const MAX_TEXT_BYTES = 64 * 1024;
 export const MAX_DATA_BYTES = 64 * 1024;
 export const MAX_KEY_LENGTH = 256;
+/**
+ * A record's text and data as they are sent (JSON, escapes included) are at most this, so every
+ * record fits one response with room to spare (F10): a raw-byte limit alone lets escapes grow it.
+ */
+export const MAX_ENCODED_RECORD_BYTES = 192 * 1024;
 
 type FieldType = "string" | "strings" | "number" | "boolean" | "uuid" | "eta";
 interface FieldSpec { type: FieldType; required?: boolean; values?: readonly string[]; pattern?: RegExp; hint?: string }
@@ -149,6 +154,9 @@ export const validateAppend = (input: unknown, options: { importer: boolean; mir
   if (data !== undefined && !isObject(data)) throw new RecordsArgumentError("data must be an object");
   const fields = (data ?? {}) as Record<string, unknown>;
   if (Buffer.byteLength(JSON.stringify(fields)) > MAX_DATA_BYTES) throw new RecordsArgumentError(`data exceeds ${MAX_DATA_BYTES} bytes`);
+  if (Buffer.byteLength(JSON.stringify({ text: text ?? null, data: fields })) > MAX_ENCODED_RECORD_BYTES) {
+    throw new RecordsArgumentError(`text and data exceed ${MAX_ENCODED_RECORD_BYTES} bytes as JSON (escapes count)`);
+  }
   const specs = KIND_FIELDS[recordKind];
   for (const [name, value] of Object.entries(fields)) {
     if ((IMPORT_FIELDS as readonly string[]).includes(name) && !(recordKind === "mirror" && name === "githubId")) {

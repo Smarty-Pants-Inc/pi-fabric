@@ -1446,7 +1446,6 @@ interface FabricCacheApi {
 }
 
 type FabricRecordKind = "issue" | "status" | "comment" | "decision" | "ask" | "answer" | "handoff" | "link" | "close" | "reopen" | "mirror";
-/** The kind's fields; unknown kinds and fields are refused. See the fabric-exec records reference. */
 interface FabricRecordData {
   title?: string; body?: string; owner?: string; acceptance?: string; labels?: string[]; nextAction?: string; stage?: string;
   eta?: string | { stage: string; at: string }[]; state?: "in progress" | "waiting" | "blocked" | "done" | "pending" | "mirrored" | "refused" | "skipped" | "unknown"; waitOn?: string;
@@ -1454,28 +1453,21 @@ interface FabricRecordData {
   ask?: string; outcome?: "answered" | "withdrawn"; key?: string;
   pr?: string; issue?: string; commit?: string; url?: string; forge?: string; number?: number;
   reason?: string; mirrorOf?: string; target?: string; githubId?: string; attempts?: number; error?: string;
-  /** Importer role only (with author). */
   via?: string;
 }
 interface FabricRecordsAppendArgs {
-  /** Owner/repo#123, or a Node-native Owner/repo#L12. */
   ref?: string;
-  /** Owner/repo without ref: creates an issue and allocates its Node-native ref. */
   repo?: string;
   kind: FabricRecordKind;
-  /** Required idempotency key: retry with the same key; a different payload under it is refused. */
   key: string;
   text?: string;
   data?: FabricRecordData;
-  /** The id of the record this one replaces (same ref and kind). */
   supersedes?: string;
-  /** Importer role only, with data.via; everyone else is the authenticated caller. */
   author?: string;
 }
 interface FabricRecordReceipt { id: string; sequence: number; origin: string; topic: string; ref: string; key: string; createdAt: number }
 interface FabricRecord {
   id: string; org: string; origin: string; sequence: number; ref: string; topic: string; kind: FabricRecordKind;
-  /** The author: a participant id, or github:<login> for an imported record. */
   from: string; fromName?: string; createdAt: number; text?: string; data: FabricRecordData; supersedes?: string; key: string;
 }
 interface FabricRecordsPage { records: FabricRecord[]; next: number; frontier: number; origin: string }
@@ -1483,29 +1475,21 @@ interface FabricRecordFold {
   title?: string; body?: string; owner?: string; acceptance?: string; labels?: string[]; nextAction?: string; stage?: string; open: boolean;
   statuses: Record<string, { id: string; at: number; text?: string; state?: string; eta?: unknown; waitOn?: string; name?: string }>;
   decisions: FabricRecord[]; openAsks: FabricRecord[]; links: FabricRecord[]; mirror: Record<string, FabricRecordData>;
-  /** Fold fields cut to 16 KiB; the whole values are in the history. */
   truncated?: string[];
-  /** Collections that continue: page each with records.fold({ ref, part, after }) until no next. */
   more?: Partial<Record<FabricRecordFoldPart, string>>;
 }
 type FabricRecordFoldPart = "statuses" | "mirror" | "decisions" | "openAsks" | "links";
 interface FabricRecordsListItem {
   ref: string; title?: string; owner?: string; stage?: string; open: boolean; updatedAt: number;
-  /** The 20 newest authors' statuses of statusCount; all of them: records.get. */
   statuses: Record<string, { at: number; state?: string; eta?: unknown }>; statusCount: number;
-  /** The 20 oldest open asks of openAskCount. */
   openAsks: { id: string; to?: string; at: number }[]; openAskCount: number;
 }
+/** The org record; see the fabric-exec records reference. Retry append with the same key. */
 interface FabricRecordsApi {
-  /** Commit one record; the receipt comes only after the commit. Throws "record archive lagging N s; retry with the same key" (retryable) past the archive bound. */
   append(args: FabricRecordsAppendArgs): Promise<FabricRecordReceipt>;
-  /** Records in commit order after a processing cursor, up to the committed frontier; advance your cursor to next only after acting. */
   read(args?: { after?: number; limit?: number; origin?: string; ref?: string; kind?: FabricRecordKind; to?: string }): Promise<FabricRecordsPage>;
-  /** A ref's fold and its history, oldest first; page with after = next. */
-  get(args: { ref: string; after?: number; limit?: number }): Promise<{ ref: string; state: FabricRecordFold; history: FabricRecord[]; next?: number }>;
-  /** One page of a fold collection, from records.get's state.more or the previous page's next. */
+  get(args: { ref: string; after?: number; limit?: number }): Promise<{ ref: string; state?: FabricRecordFold; history: FabricRecord[]; next?: number }>;
   fold(args: { ref: string; part: FabricRecordFoldPart; after?: string }): Promise<{ ref: string; part: FabricRecordFoldPart; items: unknown[]; next?: string }>;
-  /** A view query over current issues (never a delivery path). */
   list(args?: { org?: string; repo?: string; open?: boolean; owner?: string; hasOpenAsk?: boolean; updatedSince?: number; limit?: number; after?: string }): Promise<{ items: FabricRecordsListItem[]; next?: string }>;
   status(): Promise<{ org: string; origin: string; frontier: number; unpublished: number; admission: { state: "ok" | "alarm" | "refuse" | "disabled"; lagSeconds?: number; frontier?: string; insertLsn?: string }; statusFile: string }>;
 }

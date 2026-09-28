@@ -81,7 +81,12 @@ export type RecordFoldPart = "statuses" | "mirror" | "decisions" | "openAsks" | 
 export const RECORD_FOLD_PARTS: readonly RecordFoldPart[] = ["statuses", "mirror", "decisions", "openAsks", "links"];
 export interface RecordsGetArgs { ref: string; after?: number; limit?: number }
 export interface RecordsFoldArgs { ref: string; part: RecordFoldPart; after?: string }
-export interface RecordsGetResult { ref: string; state: RecordFold; history: RecordEnvelope[]; next?: number }
+/**
+ * A ref's fold and the first page of its history; or, when called with a history cursor
+ * (`after`), the next history page alone, with no state. Every page that has `next` holds at
+ * least one record, so paging always advances.
+ */
+export interface RecordsGetResult { ref: string; state?: RecordFold; history: RecordEnvelope[]; next?: number }
 /** One page of one fold collection (records.fold). */
 export interface RecordsGetPart { ref: string; part: RecordFoldPart; items: unknown[]; next?: string }
 
@@ -206,8 +211,7 @@ const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
 /** Fold fields and each fold collection's share of a get response (F10). */
 const FOLD_FIELD_BYTES = 16 * 1024;
 const FOLD_PART_BUDGET: Record<RecordFoldPart, number> = { statuses: 128 * 1024, mirror: 64 * 1024, decisions: 64 * 1024, openAsks: 64 * 1024, links: 64 * 1024 };
-/** One record's JSON is at most this (64 KiB of text, escaped, plus 64 KiB of data). */
-const MAX_RECORD_JSON_BYTES = 460 * 1024;
+
 const MAX_PAGE = 500;
 
 interface RecordRow {
@@ -636,8 +640,21 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     const ref = optionalString("ref", input.ref);
     if (!ref) throw new RecordsArgumentError("records.get needs ref");
     parseRef(ref);
-    const after = optionalInteger("after", input.after, 0, Number.MAX_SAFE_INTEGER) ?? 0;
+    const cursor = optionalInteger("after", input.after, 0, Number.MAX_SAFE_INTEGER);
+    const after = cursor ?? 0;
     const limit = optionalInteger("limit", input.limit, 1, MAX_PAGE) ?? 50;
+    const historyPage = async (client: SqlClient, room: number): Promise<{ history: RecordEnvelope[]; next?: number }> => {
+      const history = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE ref = $1 AND seq > $2 ORDER BY seq LIMIT $3`, [ref, after, limit + 1]);
+      const page = history.rows.slice(0, limit).map(envelope);
+      const rows = withinBudget(page, room, false);
+      const next = history.rows.length > limit || rows.length < page.length ? (rows.at(-1)?.sequence ?? after) : undefined;
+      return { history: rows, ...(next !== undefined ? { next } : {}) };
+    };
+    // With a history cursor: history only, never the state again (F10). A record always fits a
+    // whole budget, so each such page holds at least one record and the cursor advances.
+    if (cursor !== undefined) {
+      return this.transaction(async (client) => ({ ref, ...await historyPage(client, RESPONSE_BUDGET_BYTES) }), "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
+    }
     return this.transaction(async (client) => {
       const issue = await client.query<{ data: Record<string, unknown>; open: boolean }>("SELECT data, open FROM current_issue WHERE ref = $1", [ref]);
       const fields = issue.rows[0]?.data ?? {};
@@ -664,14 +681,9 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       }
       if (truncated.length) state.truncated = truncated;
       if (Object.keys(more).length) state.more = more;
-      const history = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE ref = $1 AND seq > $2 ORDER BY seq LIMIT $3`, [ref, after, limit + 1]);
-      const page = history.rows.slice(0, limit).map(envelope);
-      // The history gets what the state left of the budget; if not even one record fits, it is
-      // empty here and continues from `next`.
-      const room = RESPONSE_BUDGET_BYTES - Buffer.byteLength(JSON.stringify(state));
-      const rows = withinBudget(page, room, room >= MAX_RECORD_JSON_BYTES);
-      const next = history.rows.length > limit || rows.length < page.length ? (rows.at(-1)?.sequence ?? after) : undefined;
-      return { ref, state, history: rows, ...(next !== undefined ? { next } : {}) };
+      // The first history page gets what the state left of the budget, possibly nothing; `next`
+      // then leads to history-only pages.
+      return { ref, state, ...await historyPage(client, RESPONSE_BUDGET_BYTES - Buffer.byteLength(JSON.stringify(state))) };
     }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
   }
 

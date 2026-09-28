@@ -12,15 +12,15 @@
 #
 # ROOT STEPS (one line each):
 #  1. useradd the <org>-records system user (skipped if it exists)
-#  2. apt-get install postgresql-17 if missing; install node (0755) and the self-contained service-main.mjs (0644) root-owned in /opt/<org>-records (no symlinks); check <org>-records runs it with no modules
+#  2. apt-get install postgresql (the distro package; no repository added) if no /usr/lib/postgresql/<N>/bin has initdb and postgres; use the highest N (16 or newer, or --pg-bin); install node (0755) and the self-contained service-main.mjs (0644) root-owned in /opt/<org>-records (no symlinks); check <org>-records runs it with no modules
 #  3. create /var/lib/<org>-records/{,pg,status,credentials}, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes
 #  4. initdb the cluster as <org>-records if absent; write pg_hba.conf, pg_ident.conf, conf.d/records.conf; append include_dir to postgresql.conf
 #  5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
 #  6. write both systemd units; daemon-reload; enable --now <org>-records-pg.service (restart if its config changed); wait for pg_isready
 #  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service
-#  8. per --operator: add the role to service.json, issue its credential (sha256(id).json, id checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if roles changed
+#  8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if roles changed
 #  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit and the service socket (changes nothing)
-# ROLLBACK STEPS (--rollback; root; a real rollback needs --yes-delete-records; postgresql-17 stays installed):
+# ROLLBACK STEPS (--rollback; root; a real rollback needs --yes-delete-records; the PostgreSQL packages stay installed):
 #  R1. systemctl disable --now <org>-records.service <org>-records-pg.service (failure ignored: already absent)
 #  R2. rm -f both unit files; systemctl daemon-reload
 #  R3. rm -rf /etc/<org>-records
@@ -33,10 +33,12 @@
 # --help prints usage and, for the bundle, WHAT IT CHANGES (the ROOT STEPS above), IDEMPOTENCY (a second
 # run skips or leaves unchanged every step; files are rewritten only when content differs; the service is
 # reloaded only when roles changed), SUCCESS LINE and ROLLBACK (the list above). A real install ends with
-#   C10_RECORDS_INSTALLED org=<org> user=<org>-records cluster=17/<org>-records unit=active peer-audit=ok
-# printed last, only after the step 9 checks pass. A dry run never prints it.
+#   C10_RECORDS_INSTALLED org=<org> user=<org>-records cluster=<N>/<org>-records unit=active peer-audit=ok
+# printed last, only after the step 9 checks pass. A dry run never prints it. <N> is the detected PostgreSQL major.
+# An operator id holds exactly one role: the same id with two roles (in one run, or against service.json) is refused.
 # TEST ONLY: RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST=1 skips the root check so tests can run the real
-# (non-dry) path against PATH fakes; with it, RECORDS_PAUL_STEPS_TEST_ROOT=DIR prefixes every system path.
+# (non-dry) path against PATH fakes; with it, RECORDS_PAUL_STEPS_TEST_ROOT=DIR prefixes every system path
+# (also /usr/lib/postgresql, where the PostgreSQL version is detected).
 # Never set either on a real host.
 set -Eeuo pipefail
 
@@ -48,11 +50,14 @@ usage: records-paul-steps.sh --org <org> --org-user <orguser> [--pg-bin DIR] [--
          [--rollback [--yes-delete-records]]
   -h, --help          print this help, what the script changes, idempotency, the success line and the
                       rollback commands (with --org/--org-user filled in when given); needs no root
-  --rollback          undo the install in reverse order (keeps postgresql-17). A real rollback deletes the
+  --pg-bin DIR        PostgreSQL 16+ binaries (default: the highest /usr/lib/postgresql/<N>/bin, after
+                      apt-get install postgresql from the distro when none is present)
+  --rollback          undo the install in reverse order (keeps PostgreSQL installed). A real rollback deletes the
                       record database and needs --yes-delete-records; take the printed backup first.
   --operator ROLE:ID  grant ROLE (importer|mirror|relay) to principal ID and issue its credential into
                       /var/lib/<org>-records/credentials/ (repeatable). 'importer:github' is
                       principal importer:github; 'importer:fabric:dev1' is principal fabric:dev1.
+                      An id holds exactly one role: an id already granted another role is refused.
 EOF
 }
 STEP="" RUN_CMD="" ROLLBACK=0 HELP=0
@@ -83,8 +88,7 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 
-DEFAULT_PG_BIN=/usr/lib/postgresql/17/bin
-ORG="" ORG_USER="" PG_BIN=$DEFAULT_PG_BIN NODE="" PACKAGE="" ORIGIN="" PORT=5433
+ORG="" ORG_USER="" PG_BIN="" NODE="" PACKAGE="" ORIGIN="" PORT=5433
 DRY=0 PRINT="" OPERATORS=() YES_DELETE=0
 while (($#)); do
 	case $1 in
@@ -110,6 +114,7 @@ if ((HELP)); then
 	# --help needs no root and no other flag; given names are checked, missing ones stay placeholders.
 	[[ -z $ORG || ($ORG =~ ^[a-z][a-z0-9-]*$ && ${#ORG} -le 24) ]] || die "invalid --org '$ORG'"
 	[[ -z $ORG_USER || ($ORG_USER =~ ^[a-z_][a-z0-9_-]*$ && ${#ORG_USER} -le 32) ]] || die "invalid --org-user '$ORG_USER'"
+	[[ -z $PG_BIN || $PG_BIN =~ ^/[A-Za-z0-9._/+-]*$ ]] || die "invalid --pg-bin '$PG_BIN'"
 	ORG=${ORG:-<org>} ORG_USER=${ORG_USER:-<org-user>} PRINT=""
 else
 	[[ -n $ORG ]] || die "--org is required"
@@ -129,11 +134,12 @@ else
 	((!ROLLBACK)) || [[ -z $PRINT ]] || die "--rollback and --print do not combine"
 	((ROLLBACK)) || ((!YES_DELETE)) || die "--yes-delete-records only applies to --rollback"
 	for p in "$PG_BIN" "$NODE" "$PACKAGE"; do
-		[[ -z $p ]] && ((ROLLBACK)) && continue
+		[[ -z $p ]] && continue
 		[[ $p =~ ^/[A-Za-z0-9._/+-]*$ ]] || die "path must be absolute, without spaces or quotes: '$p'"
 	done
 	case $PRINT in "" | hba | ident | conf | service-json | units | operator-edit-js) ;; *) die "invalid --print '$PRINT'" ;; esac
 	ID_RE='^[a-z][a-z0-9._-]{0,63}:[a-z0-9._@-]{1,64}$'
+	declare -A OP_ROLE=()
 	for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 		[[ $spec == *:* ]] || die "invalid --operator '$spec': use ROLE:ID, e.g. importer:github"
 		role=${spec%%:*} id=${spec#*:}
@@ -141,6 +147,11 @@ else
 		[[ $id == *:* ]] || id=$spec
 		[[ $role == importer || $role == mirror || $role == relay ]] || die "invalid --operator '$spec': ROLE must be importer, mirror or relay"
 		[[ $id =~ $ID_RE ]] || die "invalid --operator '$spec': ID must match $ID_RE"
+		# F18: an id holds exactly one role; refused before anything changes.
+		if [[ -n ${OP_ROLE[$id]:-} && ${OP_ROLE[$id]} != "$role" ]]; then
+			die "refused: operator id '$id' is given with two roles (${OP_ROLE[$id]} and $role); an id holds exactly one role"
+		fi
+		OP_ROLE[$id]=$role
 	done
 fi
 
@@ -165,7 +176,38 @@ OPT="${T}/opt/${REC}"
 OPT_NODE="${OPT}/node"
 MAIN="${OPT}/service-main.mjs"
 SOCKET="${SVCSOCK}/records.sock"
-SUCCESS_LINE="C10_RECORDS_INSTALLED org=${ORG} user=${REC} cluster=17/${REC} unit=active peer-audit=ok"
+# PostgreSQL comes from the distro; its major version is detected, never assumed.
+PG_BASE="${T}/usr/lib/postgresql"
+PG_MAJOR="" PG_BIN_GIVEN=${PG_BIN:+1}
+detect_pg() { # PG_BIN, PG_MAJOR := the highest ${PG_BASE}/<N>/bin with initdb and postgres, or a placeholder
+	local d n best=""
+	for d in "$PG_BASE"/*/bin; do
+		n=${d%/bin} n=${n##*/}
+		[[ $n =~ ^[0-9]+$ && -x $d/initdb && -x $d/postgres ]] || continue
+		if [[ -z $best ]] || ((n > best)); then best=$n; fi
+	done
+	PG_MAJOR=$best
+	if [[ -n $best ]]; then PG_BIN="${PG_BASE}/${best}/bin"; else PG_BIN="${PG_BASE}/<N>/bin"; fi
+}
+check_major() {
+	[[ -z $PG_MAJOR ]] || ((PG_MAJOR >= 16)) ||
+		die "refused: PostgreSQL ${PG_MAJOR} at ${PG_BIN} is too old; the record store needs PostgreSQL 16 or newer"
+}
+pg_derived() { # everything that names the PostgreSQL major or binaries
+	SUCCESS_LINE="C10_RECORDS_INSTALLED org=${ORG} user=${REC} cluster=${PG_MAJOR:-<N>}/${REC} unit=active peer-audit=ok"
+	BACKUP_CMD="runuser -u ${REC} -- ${PG_BIN}/pg_dump -h ${PGSOCK} -p ${PORT} -U postgres -Fc records > /root/${REC}-backup.dump"
+	DELETE_WARNING="This deletes the org's record database. Take a backup first: ${BACKUP_CMD}"
+	APT_NOTE="Note: the PostgreSQL packages stay installed (other software may use them). Optional, to remove them too: apt-get remove postgresql postgresql-${PG_MAJOR:-<N>}"
+}
+if [[ -n $PG_BIN_GIVEN ]]; then
+	if [[ -x $PG_BIN/postgres ]] && v=$("$PG_BIN/postgres" --version 2>/dev/null) && [[ $v =~ \(PostgreSQL\)\ ([0-9]+) ]]; then
+		PG_MAJOR=${BASH_REMATCH[1]}
+	fi
+else
+	detect_pg
+fi
+check_major
+pg_derived
 if [[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} == 1 ]]; then
 	echo "records-paul-steps: TEST MODE (RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST=1): root check skipped" >&2
 else
@@ -183,10 +225,22 @@ fi
 render_operator_edit_js() {
 	cat <<'EOF'
 const fs = require("fs");
-const [file, role, id] = process.argv.slice(1);
+const [file, role, id, mode] = process.argv.slice(1);
 const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
 if (cfg.roles === undefined) cfg.roles = {};
 if (typeof cfg.roles !== "object" || cfg.roles === null || Array.isArray(cfg.roles)) throw new Error(`${file}: roles is not an object`);
+// F18: an id holds exactly one role. Exit 3: the id is already granted another role; nothing is written.
+for (const [other, ids] of Object.entries(cfg.roles)) {
+	if (other !== role && Array.isArray(ids) && ids.includes(id)) {
+		console.error(`${file}: ${id} already holds role ${other}; an operator id holds exactly one role, so ${role} is refused`);
+		process.exit(3);
+	}
+}
+// "check" only tests for a conflict and changes nothing.
+if (mode === "check") {
+	console.log("ok");
+	process.exit(0);
+}
 if (cfg.roles[role] === undefined) cfg.roles[role] = [];
 const list = cfg.roles[role];
 if (!Array.isArray(list)) throw new Error(`${file}: roles.${role} is not an array`);
@@ -386,9 +440,6 @@ relay_dir() {
 	home=$(getent passwd "$ORG_USER" | cut -d: -f6 || true)
 	printf '%s/.config/%s-records\n' "${home:-~$ORG_USER}" "$ORG"
 }
-BACKUP_CMD="runuser -u ${REC} -- ${PG_BIN}/pg_dump -h ${PGSOCK} -p ${PORT} -U postgres -Fc records > /root/${REC}-backup.dump"
-DELETE_WARNING="This deletes the org's record database. Take a backup first: ${BACKUP_CMD}"
-APT_NOTE="Note: postgresql-17 stays installed (other software may use it). To remove it too: apt-get remove postgresql-17"
 
 # The rollback list, in order. RB_MODE=print lists the commands; RB_MODE=run executes them through run.
 RB_MODE=print
@@ -434,19 +485,19 @@ print_help() {
 	echo
 	echo "WHAT IT CHANGES: as root, in order, one line per step"
 	# The ROOT STEPS block of this file's header, with the names filled in: one source for both.
-	sed -n 's/^#  \([0-9]\.\)/  \1/p' "${BASH_SOURCE[0]}" | sed "s/<org-user>/${ORG_USER}/g; s/<org>/${ORG}/g"
+	sed -n 's/^#  \([0-9]\.\)/  \1/p' "${BASH_SOURCE[0]}" | sed "s/<org-user>/${ORG_USER}/g; s/<org>/${ORG}/g; s/<N>/${PG_MAJOR:-<N>}/g"
 	cat <<EOF
 
 IDEMPOTENCY: a second run with the same flags
   1. skipped: user ${REC} exists
-  2. apt-get skipped (PostgreSQL 17 found); node and service-main.mjs copied only when content differs
+  2. apt-get skipped (PostgreSQL ${PG_MAJOR:-<N>} found); node and service-main.mjs copied only when content differs
   3. unchanged: the same directories, owners and modes are reapplied
   4. initdb skipped (cluster exists); pg_hba.conf, pg_ident.conf, records.conf rewritten only when content
      differs; include_dir appended only once; PostgreSQL restarted only when its config changed
   5. skipped: service.json exists (never overwritten)
   6. units rewritten only when content differs; daemon-reload and enable --now leave running units unchanged
   7. createdb and CREATE ROLE skipped (exist); migrate applies only unapplied migrations; enable --now unchanged
-  8. a role added to service.json only when missing; a credential issued only when absent; the relay copy
+  8. an id that holds another role refused; a role added to service.json only when missing; a credential issued only when absent; the relay copy
      rewritten with the same content; the service reloaded only when roles changed
   9. checks only; changes nothing
 
@@ -457,7 +508,8 @@ SUCCESS LINE: printed last by a real install, only after the step 9 checks pass;
 
 ROLLBACK: as root; preview first with: ${0##*/} --org ${ORG} --org-user ${ORG_USER} --rollback --dry-run
   ${0##*/} --org ${ORG} --org-user ${ORG_USER} --rollback --yes-delete-records
-runs these commands in this order (postgresql-17 stays installed):
+runs these commands in this order (the PostgreSQL packages stay installed; optional afterwards:
+apt-get remove postgresql postgresql-${PG_MAJOR:-<N>}):
 ${DELETE_WARNING}
 EOF
 	rollback_steps
@@ -490,19 +542,30 @@ else
 	run useradd --system --user-group --no-create-home --home-dir "$HOME_DIR" --shell /usr/sbin/nologin "$REC"
 fi
 
-step 2 "Prerequisites: PostgreSQL 17, node and the package under ${OPT}"
-if [[ -x $PG_BIN/initdb ]]; then
-	echo "= PostgreSQL found at ${PG_BIN}"
-elif [[ $PG_BIN == "$DEFAULT_PG_BIN" ]]; then
-	# Non-mutating check first: without the PGDG apt repository, Debian/Ubuntu may have no postgresql-17.
-	candidate=$(apt-cache policy postgresql-17 2>/dev/null | awk '$1 == "Candidate:" { print $2 }')
-	[[ -n $candidate && $candidate != "(none)" ]] ||
-		die "no apt candidate for postgresql-17. Configure the PGDG apt repository first (https://www.postgresql.org/download/linux/debian/), then rerun."
-	echo "  note: postgresql-17 ${candidate} from apt. Debian's package creates its own cluster service postgresql@17-main;"
-	echo "        this setup does not need it and does not touch it (disable it yourself if you do not use it)."
-	run apt-get install -y postgresql-17
+step 2 "Prerequisites: PostgreSQL ${PG_MAJOR:-<detected after install>}, node and the package under ${OPT}"
+if [[ -n $PG_BIN_GIVEN ]]; then
+	[[ -x $PG_BIN/initdb ]] || die "${PG_BIN}/initdb not found. Install PostgreSQL 16 or newer there, or omit --pg-bin to use the distro's postgresql package."
+	[[ -n $PG_MAJOR ]] || die "cannot read the PostgreSQL major version from ${PG_BIN}/postgres --version"
+	echo "= PostgreSQL ${PG_MAJOR} found at ${PG_BIN}"
+elif [[ -n $PG_MAJOR ]]; then
+	echo "= PostgreSQL ${PG_MAJOR} found at ${PG_BIN} (the highest ${PG_BASE}/<N>/bin with initdb and postgres)"
 else
-	die "${PG_BIN}/initdb not found. Install PostgreSQL 17 there, or omit --pg-bin to install postgresql-17 from apt."
+	# The distro's metapackage (Ubuntu noble: 16); no repository is added. Non-mutating check first.
+	candidate=$(apt-cache policy postgresql 2>/dev/null | awk '$1 == "Candidate:" { print $2 }')
+	[[ -n $candidate && $candidate != "(none)" ]] ||
+		die "no apt candidate for the distro package postgresql; check the apt sources (apt-get update), then rerun."
+	echo "  note: the distro package postgresql ${candidate}. It creates its own cluster service postgresql@<N>-main;"
+	echo "        this setup does not need it and does not touch it (disable it yourself if you do not use it)."
+	run apt-get install -y postgresql
+	if ((DRY)); then
+		echo "= PostgreSQL <detected after install>: the highest ${PG_BASE}/<N>/bin with initdb and postgres"
+	else
+		detect_pg
+		[[ -n $PG_MAJOR ]] || die "apt-get install postgresql left no ${PG_BASE}/<N>/bin with initdb and postgres"
+		check_major
+		pg_derived
+		echo "= PostgreSQL ${PG_MAJOR} installed at ${PG_BIN} (its own postgresql@${PG_MAJOR}-main is left alone)"
+	fi
 fi
 
 # F13: the service is one self-contained file (every package inlined) plus node. Only these two regular
@@ -606,8 +669,22 @@ run runuser -u "$REC" -- "$OPT_NODE" "$MAIN" migrate --config "$CFG"
 run systemctl enable --now "$SVC_UNIT"
 
 step 8 "Operator principals"
-CHECK_ID_JS='const [f, id] = process.argv.slice(1); if (JSON.parse(require("fs").readFileSync(f, "utf8")).id !== id) { console.error(`${f}: not ${id}`); process.exit(1); }'
+# F18: the stored credential must name the requested id and role and come from the installer's issue command.
+CHECK_ID_JS='const [f, id, role] = process.argv.slice(1); const c = JSON.parse(require("fs").readFileSync(f, "utf8")); if (c.id !== id || c.role !== role || c.issuedBy !== "installer") { console.error(`${f}: not ${id} as ${role} issued by the installer`); process.exit(1); }'
 POLICY_CHANGED=0
+# F18: before any grant, issue or delivery, refuse every id that service.json already lists under another role.
+for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
+	role=${spec%%:*} id=${spec#*:}
+	[[ $id == *:* ]] || id=$spec
+	if ((DRY)); then
+		printf '? %s -e "$(%s --print operator-edit-js)" %s check  (refused if %s holds another role)\n' "$OPT_NODE" "${0##*/}" "$(show "$CFG" "$role" "$id")" "$id"
+		continue
+	fi
+	rc=0
+	"$OPT_NODE" -e "$(render_operator_edit_js)" "$CFG" "$role" "$id" check >/dev/null || rc=$?
+	((rc != 3)) || die "refused: ${id} already holds another role in ${CFG}; an operator id holds exactly one role. Nothing was granted, issued or delivered."
+	((rc == 0)) || die "could not check the roles of ${id} in ${CFG} (exit ${rc})"
+done
 for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 	role=${spec%%:*} id=${spec#*:}
 	[[ $id == *:* ]] || id=$spec
@@ -628,9 +705,9 @@ for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 	fi
 	# Before the credential is used or delivered, its stored principal must be the requested one.
 	if ((DRY)); then
-		echo "? runuser -u ${REC} -- ${OPT_NODE} -e '${CHECK_ID_JS}' ${cred} ${id}  (stored .id must equal ${id})"
+		echo "? runuser -u ${REC} -- ${OPT_NODE} -e '${CHECK_ID_JS}' ${cred} ${id} ${role}  (stored .id, .role, .issuedBy must equal ${id}, ${role}, installer)"
 	else
-		as_rec "$OPT_NODE" -e "$CHECK_ID_JS" "$cred" "$id" || die "${cred} does not hold principal ${id}; refused"
+		as_rec "$OPT_NODE" -e "$CHECK_ID_JS" "$cred" "$id" "$role" || die "${cred} does not hold principal ${id} with role ${role} issued by the installer; refused"
 	fi
 	if [[ $role == relay ]]; then
 		# The relay publishes nudges on the org's mesh, which only the org user can write: its credential

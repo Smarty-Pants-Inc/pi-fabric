@@ -8,7 +8,7 @@ import { RemoteRecords } from "../src/records/client.js";
 import { recordsInboxMessage, recordsInboxSession, RecordsInbox } from "../src/records/inbox.js";
 import { PublicationRelay, type NudgePublisher } from "../src/records/relay.js";
 import { migrate, SERVICE_ROLE } from "../src/records/schema.js";
-import { issuePrincipal, normalizeServiceConfig, RecordsServer, type OperatorRole, type RecordsServiceConfig } from "../src/records/server.js";
+import { issuePrincipal, normalizeServiceConfig, RecordsServer, writeStatusFile, type OperatorRole, type RecordsServiceConfig } from "../src/records/server.js";
 import type { ClientPool } from "../src/records/store.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
 
@@ -187,7 +187,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
   });
 
   it("a client that disconnects cancels its blocked append on the service", async () => {
-    const { config, owner } = await freshService();
+    const { config, owner, service } = await freshService();
     const alice = await connect(config, ALICE);
     const blocker = await owner.connect();
     await blocker.query("BEGIN");
@@ -196,6 +196,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     alice.close();
     await expect(blocked).rejects.toThrow(/outcome is unknown: retry with the same key|closed/);
+    await disconnected(service, 0);
     await blocker.query("COMMIT");
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect((await blocker.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
@@ -227,6 +228,12 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await blocker.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
     blocker.release();
   });
+
+  /** Wait until the service has seen a disconnect (its open connections drop to `count`). */
+  const disconnected = async (service: RecordsServer, count: number) => {
+    for (let i = 0; i < 250 && service.connectionCount > count; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(service.connectionCount).toBe(count);
+  };
 
   /** A raw protocol connection: send frames, read responses by id. */
   const rawClient = async (socketPath: string) => {
@@ -272,7 +279,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
   });
 
   it("refuses a duplicate in-flight request id, so a disconnect still cancels the first call (F3)", async () => {
-    const { config, owner } = await freshService();
+    const { config, owner, service } = await freshService();
     const alice = await connect(config, ALICE);
     const token = JSON.parse(fs.readFileSync(path.join(dir, "credentials", ALICE.replaceAll(":", "_"), fs.readdirSync(path.join(dir, "credentials", ALICE.replaceAll(":", "_")))[0]!), "utf8")).token as string;
     void alice;
@@ -286,6 +293,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     raw.send({ id: 7, method: "read", token, args: { args: {} } });
     expect((await raw.response(7))?.error?.code).toBe("RECORD_DUPLICATE_REQUEST");
     raw.socket.destroy();
+    await disconnected(service, 1); // Alice's own connection stays
     await blocker.query("COMMIT");
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect((await blocker.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
@@ -299,7 +307,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
   });
 
   it("cancels a registration whose client disconnects before it commits (F3)", async () => {
-    const { config, owner } = await freshService();
+    const { config, owner, service } = await freshService();
     const blocker = await owner.connect();
     await blocker.query("BEGIN");
     await blocker.query("LOCK TABLE principals IN ACCESS EXCLUSIVE MODE");
@@ -313,6 +321,8 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     }
     expect((await owner.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO principals%'")).rows[0].n).toBeGreaterThanOrEqual(1);
     raw.socket.destroy();
+    // The lock is released only once the service has seen the disconnect (else it is a lost response, not a cancel).
+    await disconnected(service, 0);
     await blocker.query("COMMIT");
     blocker.release();
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -512,12 +522,12 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     const got = await importer.get({ id: "x" }, { ref: REF, limit: 500 });
     // Bounded: the state and the history each fit, and the fold says what continues.
     expect(Buffer.byteLength(JSON.stringify(got))).toBeLessThan(1024 * 1024);
-    expect(got.state.truncated).toEqual(["title"]);
-    expect(Object.values(got.state.statuses).every((status) => Buffer.byteLength(status.text ?? "") <= 2048)).toBe(true);
-    expect(Object.keys(got.state.statuses).length).toBeLessThan(70);
-    expect(got.state.more?.statuses).toBeDefined();
-    const seen = new Set(Object.keys(got.state.statuses));
-    let cursor = got.state.more?.statuses;
+    expect(got.state!.truncated).toEqual(["title"]);
+    expect(Object.values(got.state!.statuses).every((status) => Buffer.byteLength(status.text ?? "") <= 2048)).toBe(true);
+    expect(Object.keys(got.state!.statuses).length).toBeLessThan(70);
+    expect(got.state!.more?.statuses).toBeDefined();
+    const seen = new Set(Object.keys(got.state!.statuses));
+    let cursor = got.state!.more?.statuses;
     for (let round = 0; cursor !== undefined && round < 20; round++) {
       const page = await importer.fold({ id: "x" }, { ref: REF, part: "statuses", after: cursor });
       for (const item of page.items as { author: string }[]) seen.add(item.author);
@@ -534,6 +544,58 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     }
     expect(history).toEqual(Array.from({ length: 71 }, (_, i) => i + 1));
   }, 60_000);
+
+  it("traverses all history past a populated fold, with escape-heavy near-limit records (F10)", async () => {
+    const { config, owner } = await freshService();
+    const importer = await operator(config, owner, "importer:github");
+    // Escapes grow JSON: quotes, backslashes and control characters (\u0001 is 6 bytes encoded).
+    const heavy = (n: number) => '"\\\u0001'.repeat(n);
+    // The encoded-size limit refuses a record that raw limits would let through.
+    await expect(importer.append({ id: "x" }, { ref: REF, kind: "comment", key: "too-big", text: heavy(20 * 1024), author: "github:paul", data: { via: "github:bot" } }))
+      .rejects.toThrow(/as JSON \(escapes count\)/);
+    // A populated fold: 70 statuses and a large title, then near-limit escape-heavy records.
+    for (let i = 0; i < 70; i++) {
+      await importer.append({ id: "x" }, { ref: REF, kind: "status", key: `st-${i}`, text: "s".repeat(2048), author: `github:a${i}`, data: { state: "waiting", via: "github:bot" } });
+    }
+    await importer.append({ id: "x" }, { ref: REF, kind: "issue", key: "issue", author: "github:paul", data: { title: "T".repeat(60 * 1024), via: "github:bot" } });
+    const big = heavy(7 * 1024); // ~84 KiB encoded text
+    for (let i = 0; i < 6; i++) {
+      await importer.append({ id: "x" }, { ref: REF, kind: "comment", key: `big-${i}`, text: big, author: "github:paul", data: { via: `github:${"q".repeat(40)}`, githubId: heavy(4 * 1024) } });
+    }
+    const first = await importer.get({ id: "x" }, { ref: REF, limit: 500 });
+    expect(first.state).toBeDefined();
+    expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThan(1024 * 1024);
+    // Every later page: history only, never the state again, at least one record, advancing.
+    const seqs = first.history.map((record) => record.sequence);
+    let next = first.next;
+    for (let round = 0; next !== undefined && round < 200; round++) {
+      const page = await importer.get({ id: "x" }, { ref: REF, after: next, limit: 500 });
+      expect(page.state).toBeUndefined();
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(1024 * 1024);
+      if (page.next !== undefined) {
+        expect(page.history.length).toBeGreaterThan(0);
+        expect(page.next).toBeGreaterThan(next);
+      }
+      seqs.push(...page.history.map((record) => record.sequence));
+      next = page.next;
+    }
+    expect(seqs).toEqual(Array.from({ length: 77 }, (_, i) => i + 1));
+  }, 120_000);
+
+  it("writes the status file 0644 under the unit's umask 0007, fresh and replaced (F16)", async () => {
+    const file = path.join(dir, "status-umask", "o.status.json");
+    const previous = process.umask(0o007);
+    try {
+      await writeStatusFile(file, "{\"a\":1}\n");
+      expect(fs.statSync(file).mode & 0o777).toBe(0o644);
+      await writeStatusFile(file, "{\"a\":2}\n");
+      expect(fs.statSync(file).mode & 0o777).toBe(0o644);
+      expect(fs.readFileSync(file, "utf8")).toBe("{\"a\":2}\n");
+      expect(fs.readdirSync(path.dirname(file))).toEqual(["o.status.json"]);
+    } finally {
+      process.umask(previous);
+    }
+  });
 
   it("pages a list of issues with large titles to completion (F10)", async () => {
     const { config, owner } = await freshService();

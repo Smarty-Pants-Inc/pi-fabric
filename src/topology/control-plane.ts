@@ -8,6 +8,7 @@ const ACK_TOPIC = "fabric.control.ack";
 const CONTROL_SEEN_PREFIX = "topology/control-seen/";
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
+const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 // The sender keeps waiting this long past the command deadline. The owner admits a
@@ -249,7 +250,7 @@ export class FabricControlPlane {
     input: FabricControlInput = {},
     ownerIdentityId = ownerHostId,
   ): Promise<FabricControlResult> {
-    const { commandId, acceptance } = await this.#requestAcceptance(
+    const send = () => this.#requestAcceptance(
       ownerHostId,
       targetId,
       operation,
@@ -257,6 +258,23 @@ export class FabricControlPlane {
       ownerIdentityId,
       { timeoutMs: this.#ackTimeoutMs },
     );
+    let sent;
+    try {
+      sent = await send();
+    } catch (error) {
+      // ponytail: one retry, for messages only. An expired rejection is answered before the
+      // handler runs (see #acceptCommand and #executeClaimedCommand), so the message was not
+      // delivered and a new command cannot deliver it twice. An owner that picks commands up
+      // late (a fleet relaunch) expired 4 of 2,802 commands, and a manual retry 6 s later
+      // worked (smarty-dev#816). A second expiry means the owner is stuck: report it.
+      if (
+        (operation !== "steer" && operation !== "followUp") ||
+        !(error instanceof Error) ||
+        error.message !== CONTROL_COMMAND_EXPIRED
+      ) throw error;
+      sent = await send();
+    }
+    const { commandId, acceptance } = sent;
     return {
       queued: true,
       messageId: acceptance.messageId ?? commandId,
@@ -540,7 +558,7 @@ export class FabricControlPlane {
       if (answerable) {
         await this.#publishAcknowledgement(command, {
           accepted: false,
-          error: "Fabric control command expired",
+          error: CONTROL_COMMAND_EXPIRED,
         });
       }
       return;
@@ -672,7 +690,7 @@ export class FabricControlPlane {
       try {
         // The claim can wait for a lock, or this process can pause after it commits: the deadline
         // may have passed since admission. An expired command is recorded, not run.
-        if (Date.now() > deadlineAt) acceptance = { accepted: false, error: "Fabric control command expired" };
+        if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED };
         else acceptance = this.#handler
           ? await this.#handler(command, from, controller.signal)
           : { accepted: false, error: "Fabric owner has no control handler" };

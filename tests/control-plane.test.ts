@@ -1031,4 +1031,57 @@ describe("FabricControlPlane", () => {
       sender.request("host:receiver", "agent:missing", "stop"),
     ).rejects.toThrow("target already settled");
   });
+
+  // smarty-dev#816: an owner that picked a command up after its deadline rejected it as expired
+  // (4 of 2,802 commands, mostly in a fleet relaunch); the sender's manual retry worked.
+  describe("when the owner rejects a command as expired", () => {
+    const run = async (operation: "followUp" | "stop", rejection?: string) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const sender = plane(meshRoot, "host:sender");                     // a 1 s deadline
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn((command: { commandId: string }) => rejection
+        ? { accepted: false, error: rejection }
+        : { accepted: true, messageId: "delivered:" + command.commandId });
+      sender.start(() => ({ accepted: false }));
+      const outcome = sender.request("host:receiver", "agent:target", operation, { message: "late" })
+        .then(
+          (value) => ({ value, error: undefined as Error | undefined }),
+          (error: Error) => ({ value: undefined, error: error as Error | undefined }),
+        );
+      // The owner polls only after the first command's deadline; later commands are on time.
+      if (!rejection) await new Promise((resolve) => setTimeout(resolve, 1_300));
+      receiver.start(receive);
+      const settled = await outcome;
+      const commands = new MeshStore(meshRoot, 64 * 1024, 1_000)
+        .read({ topic: "fabric.control.command", limit: 100 })
+        .filter((event) => event.kind === operation);
+      return { ...settled, receive, commands };
+    };
+
+    it("retries a message once with a new command, and the owner delivers it once", async () => {
+      const { value, error, receive, commands } = await run("followUp");
+      expect(error).toBeUndefined();
+      expect(commands).toHaveLength(2);
+      const retry = commands[1]!.data as { commandId: string };
+      expect((commands[0]!.data as { commandId: string }).commandId).not.toBe(retry.commandId);
+      expect(value).toMatchObject({ acknowledged: true, messageId: "delivered:" + retry.commandId });
+      expect(receive).toHaveBeenCalledTimes(1);
+    }, 15_000);
+
+    it("does not retry a command that is not a message", async () => {
+      const { error, receive, commands } = await run("stop");
+      expect(error?.message).toBe("Fabric control command expired");
+      expect(commands).toHaveLength(1);
+      expect(receive).not.toHaveBeenCalled();
+    }, 15_000);
+
+    it("does not retry a message the owner rejected for another reason", async () => {
+      const { error, receive, commands } = await run("followUp", "target already settled");
+      expect(error?.message).toBe("target already settled");
+      expect(commands).toHaveLength(1);
+      expect(receive).toHaveBeenCalledTimes(1);
+    }, 15_000);
+  });
 });

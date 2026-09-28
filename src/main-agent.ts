@@ -139,9 +139,6 @@ export const followUpCoalesceKey = (data: unknown): string | undefined => {
   return typeof key === "string" && key.length > 0 && key.length <= 200 ? key : undefined;
 };
 
-/** Superseded ids kept per held item: enough to audit a burst, bounded for the journal. */
-const SUPERSEDED_KEPT = 32;
-
 interface HeldAgentMessage {
   id: string;
   from: MeshIdentity;
@@ -150,8 +147,14 @@ interface HeldAgentMessage {
   sentAt: number;
   /** When the newest replacement arrived (smarty-dev#1495). */
   replacedAt?: number;
-  /** The held ids this one replaced, newest last: never delivered, even after a restart. */
-  supersedes?: string[];
+  /**
+   * A replacement's chain: the first id, and its place in the chain. Only a held item is
+   * replaced, so a handed or delivered member is its chain's last; the others never go.
+   */
+  chain?: string;
+  generation?: number;
+  /** The held id this one replaced. */
+  replaces?: string;
   data?: unknown;
   /** Handed to Pi's queue; it may still be there after a reload. Unset while Fabric holds it. */
   handed?: true;
@@ -181,9 +184,10 @@ type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; custo
 /** Add the followUp ids a persisted agent-message entry carries. */
 const addDelivered = (ids: Set<string>, entry: SessionEntryLike | undefined): void => {
   if (entry?.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") return;
-  if (typeof entry.details?.id === "string") ids.add(entry.details.id);
-  if (Array.isArray(entry.details?.items)) {
-    for (const item of entry.details.items as Array<{ id?: unknown }>) if (typeof item?.id === "string") ids.add(item.id);
+  // A delivered replacement's chain counts as delivered too: its earlier members never go.
+  for (const item of [entry.details, ...(Array.isArray(entry.details?.items) ? entry.details.items : [])] as Array<{ id?: unknown; chain?: unknown } | undefined>) {
+    if (typeof item?.id === "string") ids.add(item.id);
+    if (typeof item?.chain === "string") ids.add(item.chain);
   }
 };
 
@@ -298,7 +302,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (replaced) {
         item.sentAt = replaced.sentAt;
         item.replacedAt = Date.now();
-        item.supersedes = [...(replaced.supersedes ?? []), replaced.id].slice(-SUPERSEDED_KEPT);
+        item.chain = replaced.chain ?? replaced.id;
+        item.generation = (replaced.generation ?? 0) + 1;
+        item.replaces = replaced.id;
         this.#held[index] = item;
       } else this.#held.push(item);
       try {
@@ -439,27 +445,19 @@ export class MainAgentController implements FabricMainAgentTarget {
     // The owner rule (dev-lead on pi-fabric#102): skip every id the session holds; a handoff
     // may still sit in Pi's queue, so it waits for a boundary to check; the rest is held again.
     const delivered = this.#refreshDelivered();
-    const seen = new Set<string>(items.flatMap((item) => Array.isArray(item.supersedes) ? item.supersedes : []));
-    // A held followUp keeps only the newest of its (sender, coalesceKey), whatever the journal
-    // lists: the same rule as a live replacement, so no superseded id comes back, however long
-    // the burst was (review/astra F1 on pi-fabric#114; supersedes is a bounded audit trail).
-    const newest = new Map<string, HeldAgentMessage>();
-    const chain = (item: HeldAgentMessage) => {
-      const key = item.handed ? undefined : followUpCoalesceKey(item.data);
-      return key === undefined ? undefined : JSON.stringify([item.from.id, key]);
-    };
-    const updatedAt = (item: HeldAgentMessage) => typeof item.replacedAt === "number" ? item.replacedAt : item.sentAt;
+    // One member per replacement chain survives, the latest (a handed one is its chain's last),
+    // and none once the session holds one. So no replaced id comes back, however long the burst
+    // (review/astra F1 on pi-fabric#114).
+    const chainOf = (item: HeldAgentMessage) => typeof item.chain === "string" ? item.chain : item.id;
+    const rank = (item: HeldAgentMessage) => typeof item.generation === "number" ? item.generation : 0;
+    const last = new Map<string, HeldAgentMessage>();
     for (const item of items) {
-      const key = chain(item);
-      if (key === undefined || delivered.has(item.id) || seen.has(item.id)) continue;
-      const other = newest.get(key);
-      if (!other || updatedAt(item) >= updatedAt(other)) newest.set(key, item);
+      const other = last.get(chainOf(item));
+      if (!other || rank(item) > rank(other)) last.set(chainOf(item), item);
     }
     for (const item of items.sort((a, b) => a.sentAt - b.sentAt)) {
-      if (delivered.has(item.id) || seen.has(item.id)) continue;
-      const key = chain(item);
-      if (key !== undefined && newest.get(key) !== item) continue;
-      seen.add(item.id);
+      if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item) continue;
+      last.delete(chainOf(item));                          // a duplicate id goes once
       (item.handed ? this.#unverified : this.#held).push(item);
     }
     this.#trySave();
@@ -669,7 +667,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       delivery,
       sentAt: new Date(item.sentAt).toISOString(),
       ...(item.replacedAt === undefined ? {} : { replacedAt: new Date(item.replacedAt).toISOString() }),
-      ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
+      ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
       ...(item.data === undefined ? {} : { data: item.data }),
     });
     const first = items[0]!;

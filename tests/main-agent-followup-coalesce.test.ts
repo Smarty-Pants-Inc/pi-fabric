@@ -86,7 +86,7 @@ describe("Main followUp coalescing (unit)", () => {
     emit("turn_end", toolTurn, ctx);
     expect(delivered(sent)).toEqual(["before", "head h3", "after"]);
     const item = sent[0]!.message.details.items[1];
-    expect(item).toMatchObject({ id: third.messageId, data: { head: "h3" }, supersedes: [first.messageId, second.messageId] });
+    expect(item).toMatchObject({ id: third.messageId, data: { head: "h3" }, chain: first.messageId, generation: 2, replaces: second.messageId });
     expect(item.replacedAt).toBe("2026-09-28T06:01:00.000Z");
     expect(sent[0]!.message.content).toContain('sent_at="2026-09-28T06:00:00.000Z" replaced_at="2026-09-28T06:01:00.000Z">\nhead h3');
   });
@@ -152,9 +152,9 @@ describe("Main followUp coalescing (unit)", () => {
     const { main } = setup(journal);
     const first = main.deliverAgent(wake("h1"));
     const second = main.deliverAgent(wake("h2"));
-    const items = JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{ id: string; supersedes?: string[] }>;
+    const items = JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{ id: string; chain?: string; generation?: number }>;
     expect(items.map((item) => item.id)).toEqual([second.messageId]);
-    expect(items[0]!.supersedes).toEqual([first.messageId]);
+    expect(items[0]).toMatchObject({ chain: first.messageId, generation: 1, replaces: first.messageId });
     fs.rmSync(journal);
     fs.mkdirSync(journal);                               // the next write cannot replace a directory
     expect(() => main.deliverAgent(wake("h3"))).toThrow(/could not record/);
@@ -193,32 +193,56 @@ describe("Main followUp coalescing (unit)", () => {
     expect(fs.existsSync(journal)).toBe(false);
   });
 
-  // review/astra F1 on pi-fabric#114: supersedes keeps 32 ids; replay must not depend on it.
-  it("after a 34-message burst, a restart never brings back the first, even when a journal still lists it", () => {
-    const { dir, journal } = journalPath();
-    const firstPi = fakePi();
-    const main = new MainAgentController(firstPi.pi, "session:root", true, dir, "root");
-    main.attachFollowUpDrain(busyContext(), 120_000, journal);
-    main.deliverAgent({ from: from("other"), message: "plain", delivery: "followUp" });
-    const burst = Array.from({ length: 34 }, (_, index) => { vi.advanceTimersByTime(1_000); return main.deliverAgent(wake(`h${index + 1}`)); });
-    main.deliverAgent(wake("x1", "repo#8/state"));
-    main.deliverAgent(wake("r1", "repo#7/state", "reviewer"));          // same key, another sender
-    main.closeFollowUpDrain();
-    const written = JSON.parse(fs.readFileSync(journal, "utf8"));
-    const newest = written.items.find((item: { id: string }) => item.id === burst[33]!.messageId);
-    expect(newest.supersedes).toHaveLength(32);
-    expect(newest.supersedes).not.toContain(burst[0]!.messageId);        // past the audit trail
-    // Stale copies, as an older writer could leave them: the first of the chain, and one of its middle.
-    written.items.push(
-      { id: burst[0]!.messageId, from: from("factory"), message: "head h1", sentAt: newest.sentAt, data: { coalesceKey: "repo#7/state", head: "h1" } },
-      { id: burst[20]!.messageId, from: from("factory"), message: "head h21", sentAt: newest.sentAt, data: { coalesceKey: "repo#7/state", head: "h21" } },
-    );
-    fs.writeFileSync(journal, JSON.stringify(written));
-    const next = fakePi();
-    new MainAgentController(next.pi, "session:root", true, dir, "root").attachFollowUpDrain(busyContext([], { idle: true }), 120_000, journal);
-    // Counterexample: the unkeyed followUp, the other key and the other sender still arrive, in their places.
-    expect(delivered(next.sent)).toEqual(["plain", "head h34", "head x1", "head r1"]);
-  });
+  // review/astra F1 on pi-fabric#114, rounds 1 and 2: a 34-message burst, then a restart whose
+  // journal still lists stale copies (as this writer wrote them earlier), with the newest still
+  // held, handed to Pi, or already in the session.
+  for (const stage of ["held", "handed", "in the session"] as const) {
+    it(`after a 34-message burst, the newest ${stage}, a restart never brings back an earlier one`, () => {
+      const { dir, journal } = journalPath();
+      const firstPi = fakePi();
+      const entries: unknown[] = [];
+      const main = new MainAgentController(firstPi.pi, "session:root", true, dir, "root");
+      main.attachFollowUpDrain(busyContext(entries), 120_000, journal);
+      // Counterexample: an earlier same-key followUp already handed over is its own message.
+      main.deliverAgent(wake("h0"));
+      vi.advanceTimersByTime(120_000);
+      firstPi.emit("turn_end", toolTurn, busyContext(entries));
+      entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: firstPi.sent[0]!.message.details });
+      firstPi.emit("turn_end", toolTurn, busyContext(entries));                // confirmed: out of the journal
+      main.deliverAgent({ from: from("other"), message: "plain", delivery: "followUp" });
+      const copies: unknown[] = [];
+      const burst = Array.from({ length: 34 }, (_, index) => {
+        vi.advanceTimersByTime(1_000);
+        const result = main.deliverAgent(wake(`h${index + 1}`));
+        copies.push(JSON.parse(fs.readFileSync(journal, "utf8")).items.find((item: { id: string }) => item.id === result.messageId));
+        return result;
+      });
+      main.deliverAgent(wake("x1", "repo#8/state"));
+      main.deliverAgent(wake("r1", "repo#7/state", "reviewer"));          // same key, another sender
+      if (stage !== "held") {
+        vi.advanceTimersByTime(120_000);
+        firstPi.emit("turn_end", toolTurn, busyContext(entries));             // all handed to Pi
+        expect(delivered(firstPi.sent.slice(1))).toEqual(["plain", "head h34", "head x1", "head r1"]);
+        if (stage === "in the session") {
+          entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: firstPi.sent[1]!.message.details });
+          firstPi.emit("turn_end", toolTurn, busyContext(entries));           // confirmed: h34 leaves the journal
+          expect(fs.existsSync(journal)).toBe(false);
+        }
+      }
+      main.closeFollowUpDrain();
+      const written = fs.existsSync(journal) ? JSON.parse(fs.readFileSync(journal, "utf8")) : { version: 1, items: [] };
+      written.items.push(copies[0], copies[1], copies[20]);                   // stale: h1, h2, h21
+      fs.writeFileSync(journal, JSON.stringify(written));
+      const next = fakePi();
+      const again = new MainAgentController(next.pi, "session:root", true, dir, "root");
+      again.attachFollowUpDrain(busyContext(entries, { idle: true }), 120_000, journal);
+      next.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, busyContext(entries));
+      const expected = stage === "in the session" ? [] : ["plain", "head h34", "head x1", "head r1"];
+      expect(delivered(next.sent)).toEqual(expected);
+      expect(next.sent.flatMap((entry) => entry.message.details.items?.map((item: { id: string }) => item.id) ?? [entry.message.details.id]))
+        .not.toContain(burst[0]!.messageId);
+    });
+  }
 });
 
 const sessions: AgentSession[] = [];

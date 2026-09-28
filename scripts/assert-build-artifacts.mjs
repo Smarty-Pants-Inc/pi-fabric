@@ -48,6 +48,7 @@ const lazy = [
   "runtime/monty-runtime.js",
   "runtime/quickjs-runtime.js",
   "runtime/type-checker.js",
+  "type-error-guidance.js",
   "speculation/scanner.js",
   "speculation/python-scanner.js",
   "ui/dashboard.js",

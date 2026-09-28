@@ -4,7 +4,7 @@ import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 import { typeErrorRecoveryHint } from "../src/type-error-guidance.js";
 import {
   CORE_TOOL_NAMES,
-  CORE_TOOL_PROPERTIES,
+  coreToolProperties,
 } from "../src/runtime/core-tool-properties.js";
 
 const typeError = (message: string, line = 1, column = 1) => ({ line, column, message });
@@ -130,12 +130,12 @@ describe("typeErrorRecoveryHint", () => {
     expect(CORE_TOOL_NAMES).toEqual([
       "read", "bash", "powershell", "edit", "write", "grep", "find", "ls",
     ]);
-    expect(CORE_TOOL_PROPERTIES.get("settle")).toEqual(["bash", "powershell"]);
-    expect(CORE_TOOL_PROPERTIES.get("timeout")).toEqual(["bash", "powershell"]);
-    expect(CORE_TOOL_PROPERTIES.get("edits")).toEqual(["edit"]);
-    expect(CORE_TOOL_PROPERTIES.get("context")).toEqual(["grep"]);
-    expect(CORE_TOOL_PROPERTIES.get("content")).toEqual(["write"]);
-    expect(CORE_TOOL_PROPERTIES.get("path") ?? []).toEqual(
+    expect(coreToolProperties().get("settle")).toEqual(["bash", "powershell"]);
+    expect(coreToolProperties().get("timeout")).toEqual(["bash", "powershell"]);
+    expect(coreToolProperties().get("edits")).toEqual(["edit"]);
+    expect(coreToolProperties().get("context")).toEqual(["grep"]);
+    expect(coreToolProperties().get("content")).toEqual(["write"]);
+    expect(coreToolProperties().get("path") ?? []).toEqual(
       expect.arrayContaining(["read", "edit", "write", "grep", "find", "ls"]),
     );
   });

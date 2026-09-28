@@ -13,6 +13,7 @@ const SHELL_HANG_SNAPSHOT_BYTES = 8_000;
 export const SHELL_TAIL_BYTES = 1024 * 1024;
 export const SHELL_LOG_BYTES = 8 * 1024 * 1024;
 export const SHELL_COMPLETED_HANDLES = 256;
+const SHELL_SPILL_PID_WAIT_MS = 10_000;
 const SHELL_COMPLETED_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const LOG_HEADER = "[Bounded shell log: starts with retained pre-spill tail; 8 MiB total cap, then further output is omitted. Not a full-output archive.]\n";
 const LOG_TRUNCATED = "\n[Shell log truncated: disk limit reached; subsequent output omitted.]\n";
@@ -105,6 +106,7 @@ export interface FabricShellJobHandle {
   snapshotText(maxBytes?: number): string;
   persistLog(): Promise<string>;
   readPid(): Promise<number | undefined>;
+  waitForPid(timeoutMs?: number): Promise<number | undefined>;
   spill(): void;
   whenSpill(): Promise<void>;
   finish(exitCode?: number | null, footer?: string): Promise<void>;
@@ -266,6 +268,18 @@ class FabricShellJob implements FabricShellJobHandle {
     return this.#pidRead;
   }
 
+  // A spilled result must carry the pid, but a starved runner can start the shell after the
+  // hang timer and the 250 ms bounded read (smarty-dev#883). Wait for the late watch until the
+  // shell writes its pid, the job ends, or the bound passes.
+  async waitForPid(timeoutMs = SHELL_SPILL_PID_WAIT_MS): Promise<number | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    await this.readPid();
+    while (this.pid === undefined && !this.finished && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return this.pid;
+  }
+
   // A shell that starts slowly (Git Bash on Windows CI can take over a second) writes its pid
   // after the bounded read above gave up. Keep looking until the job finishes, so a late pid
   // still reaches info(), list() and later readPid() calls (smarty-dev#883).
@@ -365,13 +379,22 @@ class FabricShellJob implements FabricShellJobHandle {
   }
 }
 
+// Test-only seam (smarty-dev#883): PI_FABRIC_TEST_PID_DELAY_MS delays the shell's pid write, the
+// way a starved runner starts the shell late, so a real Pi session can prove the late-pid path.
+// Ignored unless set to a positive integer.
+const testPidDelay = (tool: PiShellToolName): string => {
+  const ms = Number(process.env.PI_FABRIC_TEST_PID_DELAY_MS);
+  if (!Number.isInteger(ms) || ms <= 0) return "";
+  return tool === "powershell" ? `Start-Sleep -Milliseconds ${ms}\n` : `sleep ${ms / 1000}\n`;
+};
+
 export const trackShellOperations = (
   inner: BashOperations,
   job: FabricShellJobHandle,
   tool: PiShellToolName,
 ): BashOperations => ({
   exec: (command, cwd, options) =>
-    inner.exec(wrapShellCommandForPid(command, job.pidPath, tool), cwd, {
+    inner.exec(testPidDelay(tool) + wrapShellCommandForPid(command, job.pidPath, tool), cwd, {
       ...options,
       onData: (data) => {
         job.append(data);
@@ -513,8 +536,10 @@ export const raceShellHang = async <T>(options: {
   hangMs: number;
   immediate?: boolean;
   job: FabricShellJobHandle;
-}): Promise<{ status: "done"; value: T } | { status: "error"; error: unknown } | { status: "spilled" }> => {
+}): Promise<{ status: "done"; value: T } | { status: "error"; error: unknown } | { status: "spilled"; auto: boolean }> => {
   const { job, parentSignal, hangMs } = options;
+  // True only when the hang timer spilled the job; a manual (Ctrl+B) or explicit handoff is not.
+  let auto = false;
   const onParentAbort = (): void => {
     if (job.spilled || job.finished || job.abort.signal.aborted) return;
     job.abort.abort(parentSignal?.reason ?? new Error("Command aborted"));
@@ -532,6 +557,7 @@ export const raceShellHang = async <T>(options: {
     const finish = (): void => resolve("spill");
     if (hangMs > 0) {
       hangTimer = setTimeout(() => {
+        auto = !job.spilled && !job.finished;
         job.spill();
         finish();
       }, hangMs);
@@ -565,7 +591,7 @@ export const raceShellHang = async <T>(options: {
         const message = result.error instanceof Error ? result.error.message : String(result.error);
         await job.finish(null, "\n\n[" + message + "]\n");
       });
-      return { status: "spilled" };
+      return { status: "spilled", auto };
     }
     detachParent();
     return first;

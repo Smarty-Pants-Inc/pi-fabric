@@ -1,7 +1,7 @@
 import type { FabricTypeError } from "./runtime/type-checker.js";
 import {
   CORE_TOOL_NAMES,
-  CORE_TOOL_PROPERTIES,
+  coreToolProperties,
 } from "./runtime/core-tool-properties.js";
 
 const SYNTAX_ERROR_PATTERN = /expected|unterminated|unexpected|invalid character/i;
@@ -96,7 +96,7 @@ const unknownPropertyHint = (
   if (envelopeNote !== undefined) {
     return `Recovery hint: \`${property}\` is a \`fabric_exec\` argument, not a \`pi.${tool}\` property. ${envelopeNote}`;
   }
-  const ownerTools = CORE_TOOL_PROPERTIES.get(property);
+  const ownerTools = coreToolProperties().get(property);
   if (ownerTools === undefined || ownerTools.includes(tool as never)) return undefined;
   const owners = ownerTools.map((owner) => `\`pi.${owner}\``).join(", ");
   const note = PROPERTY_NOTES[property];

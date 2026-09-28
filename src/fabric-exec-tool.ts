@@ -37,7 +37,6 @@ import {
   fabricRepeatBlockText,
   fabricRepeatWarnText,
 } from "./repeat-guard.js";
-import { typeErrorRecoveryHint } from "./type-error-guidance.js";
 import { normalizeRunDisplay } from "./run-display.js";
 import type { PendingFabricHandoff } from "./prewalk/handoff.js";
 import type { FabricMediaBlock } from "./protocol.js";
@@ -987,6 +986,9 @@ export const createFabricExecTool = (
               : error.message,
           )
           .join("\n");
+        // Lazy: the guidance parses the guest declarations, which stay off
+        // the startup graph (loaded here only after a type check fails).
+        const { typeErrorRecoveryHint } = await import("./type-error-guidance.js");
         const recoveryHint = typeErrorRecoveryHint(code, result.typeErrors);
         const bounded = await boundModelOutput(
           `Type errors; code was not executed:\n${text}${

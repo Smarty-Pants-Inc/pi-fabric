@@ -64,7 +64,7 @@ describe.skipIf(!canRun)("records wake a Main only through the idle gate (F21)",
     const agentDir = path.join(root, "agent");
     fs.mkdirSync(agentDir, { recursive: true });
     const capabilities = globalThis as Record<symbol, unknown>;
-    if (capability) capabilities[HOST_CAPABILITIES_KEY] = { triggeredMessageQueuesBehindPreflight: true };
+    if (capability) capabilities[HOST_CAPABILITIES_KEY] = { triggeredMessageQueuesBehindPreflight: true, promptPendingVisible: true };
     else delete capabilities[HOST_CAPABILITIES_KEY];
     // A fast watchdog (1 s) with a 1 s lag bound: it would wake a lagging root within seconds.
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({

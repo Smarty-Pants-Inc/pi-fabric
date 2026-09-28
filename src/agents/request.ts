@@ -1,5 +1,6 @@
 import type { AgentRunRequest } from "./types.js";
 import { isFabricThinking } from "../thinking.js";
+import { parseAgentNice } from "./priority.js";
 import { aliasThinking, type FabricModelAliases } from "../core/model-resolution.js";
 
 const stringArray = (value: unknown): string[] | undefined => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
@@ -46,6 +47,7 @@ export const normalizeAgentRunRequest = (
       ? `${defaults.inheritedModel.provider}/${defaults.inheritedModel.id}`
       : undefined;
   const kernel = checkedKernel(args.kernel);
+  const nice = parseAgentNice(args.nice);
   if (args.recursive === true && args.extensions === false) {
     throw new Error("Recursive Fabric requires extensions enabled; omit recursive or extensions: false");
   }
@@ -64,6 +66,7 @@ export const normalizeAgentRunRequest = (
       ? { persona: args.persona.trim() }
       : {}),
     ...(thinking ? { thinking } : {}),
+    ...(nice !== undefined ? { nice } : {}),
     ...(tools ? { tools } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(typeof args.extensions === "boolean"

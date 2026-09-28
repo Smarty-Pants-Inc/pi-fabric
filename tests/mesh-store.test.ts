@@ -572,6 +572,26 @@ describe("MeshStore lock recovery", () => {
     expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`${process.pid}\n`);
   });
 
+  // The count and the largest gap tell a starved waiter (large gap) from one that kept
+  // losing the race (many attempts, small gaps) (smarty-dev#816).
+  it("reports the attempt count and the largest gap between attempts on a lock timeout", async () => {
+    const store = createStore({ lockTimeoutMs: 400 });
+    holdLock(store, `other\n${process.pid}\n${Date.now()}\n`);
+    // Starve the waiter's event loop once for 200 ms while it retries.
+    setTimeout(() => {
+      const until = Date.now() + 200;
+      while (Date.now() < until) { /* busy */ }
+    }, 50);
+
+    const error = await store
+      .publish({ topic: "team.auth", from: identity, text: "blocked" })
+      .then(() => undefined, (caught: unknown) => caught as Error);
+    const match = /after (\d+) attempts, largest gap between attempts (\d+) ms$/.exec(error?.message ?? "");
+    expect(match, error?.message).not.toBeNull();
+    expect(Number(match![1])).toBeGreaterThan(2);
+    expect(Number(match![2])).toBeGreaterThanOrEqual(190);
+  });
+
   // A stopped holder keeps the lock (taking it over could let the holder commit stale
   // state on resume); the timeout must name it so it can be restarted (smarty-dev#266).
   it.skipIf(process.platform !== "linux")(

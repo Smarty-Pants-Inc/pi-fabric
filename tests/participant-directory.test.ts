@@ -227,6 +227,92 @@ describe("ParticipantDirectory host leases", () => {
   });
 });
 
+// smarty-dev#816: more than half of the participant rewrites of the shared state carried only
+// activity counters. Those ride along with another write, or at most once a minute.
+describe("ParticipantDirectory activity counters", () => {
+  const identityOf = (name: string): MeshIdentity => ({ id: `session:${name}`, name: "main", kind: "main", sessionId: name });
+  const setup = async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    await store.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: identityOf("owner") });
+    const worker = { status: "running", turns: 0, toolCalls: 0, calls: 0 };
+    // Every read of the source is new activity: the counters and the current tool move.
+    const alpha = createDirectory(meshRoot, identityOf("alpha"), "session:alpha", () => {
+      worker.calls += 1;
+      worker.turns += 1;
+      worker.toolCalls += 2;
+      return [
+        rootRecord("session:alpha", "session:alpha", "alpha"),
+        {
+          ...agentRecord("agent:worker", "session:alpha", "session:alpha", "session:alpha"),
+          status: worker.status,
+          currentTool: `tool-${worker.calls}`,
+          turns: worker.turns,
+          toolCalls: worker.toolCalls,
+          usage: { input: worker.turns * 10, output: worker.turns, cacheRead: 0, cacheWrite: 0, cost: worker.turns / 100 },
+          actorQueued: worker.calls,
+          actorMessages: worker.calls,
+          updatedAt: Date.now(),
+        },
+      ];
+    });
+    const beta = createDirectory(meshRoot, identityOf("beta"), "session:beta", () => [rootRecord("session:beta", "session:beta", "beta")]);
+    await alpha.start();
+    await beta.start();
+    const shared = () => store.listAll("topology/participants/", { fresh: true })
+      .map((entry) => entry.value as FabricParticipantRecord)
+      .find((participant) => participant.id === "agent:worker")!;
+    const batches = vi.spyOn(MeshStore.prototype, "writeBatch");
+    const alphaBatches = () => batches.mock.calls
+      .filter((call) => (call[0] as { identity: MeshIdentity }).identity.id === "session:alpha").length;
+    return { alpha, beta, worker, shared, batches, alphaBatches };
+  };
+
+  it("writes nothing for counter-only changes over many heartbeats and change refreshes", async () => {
+    const { alpha, worker, shared, batches, alphaBatches } = await setup();
+    const before = shared();
+    const calls = worker.calls;
+    for (let index = 0; index < 8; index++) {
+      alpha.scheduleRefresh();
+      await new Promise((resolve) => setTimeout(resolve, 100));    // 100 ms heartbeats
+    }
+    expect(worker.calls - calls).toBeGreaterThanOrEqual(5);        // the heartbeats did read new counters
+    expect(alphaBatches()).toBe(0);
+    expect(shared()).toEqual(before);
+    batches.mockRestore();
+  });
+
+  it("writes a status change at once, with the latest counters", async () => {
+    const { alpha, worker, shared, batches, alphaBatches } = await setup();
+    worker.status = "completed";
+    await alpha.refresh();
+    expect(alphaBatches()).toBe(1);
+    expect(shared()).toMatchObject({ status: "completed", turns: worker.turns, toolCalls: worker.toolCalls });
+    batches.mockRestore();
+  });
+
+  it("carries the counters to a peer within ACTIVITY_REFRESH_MS", async () => {
+    const { beta, worker, shared, batches, alphaBatches } = await setup();
+    const before = shared().turns!;
+    const now = Date.now;
+    vi.spyOn(Date, "now").mockImplementation(() => now() + 60_000);
+    await vi.waitFor(() => expect(shared().turns).toBeGreaterThan(before), { timeout: 2_000, interval: 20 });
+    const seen = beta.get("agent:worker")!;
+    expect(seen).toMatchObject({ stale: false, status: "running" });
+    expect(seen.turns).toBeGreaterThan(before);
+    expect(seen.currentTool).toMatch(/^tool-\d+$/);
+    expect(seen.usage?.input).toBe(seen.turns! * 10);
+    // One carrying write, then quiet again for the next minute.
+    const carried = alphaBatches();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(alphaBatches()).toBe(carried);
+    vi.restoreAllMocks();
+    batches.mockRestore();
+  });
+});
+
 // smarty-dev#784: actor ownership checks call get() per actor; it listed and cloned the whole
 // directory each time.
 describe("ParticipantDirectory.get", () => {

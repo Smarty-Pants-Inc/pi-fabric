@@ -81,5 +81,9 @@ const collectCoreToolProperties = (declarations: string): Map<string, CoreToolNa
   return new Map([...owners].map(([property, toolSet]) => [property, [...toolSet]]));
 };
 
-export const CORE_TOOL_PROPERTIES: ReadonlyMap<string, readonly CoreToolName[]> =
-  collectCoreToolProperties(GUEST_TYPE_DECLARATIONS);
+// Memoized at first use: parsing the ~60 KB declarations text at module load
+// cost startup time on every Pi launch, and the map is needed only after a
+// type check fails.
+let coreToolProperties_: ReadonlyMap<string, readonly CoreToolName[]> | undefined;
+export const coreToolProperties = (): ReadonlyMap<string, readonly CoreToolName[]> =>
+  (coreToolProperties_ ??= collectCoreToolProperties(GUEST_TYPE_DECLARATIONS));

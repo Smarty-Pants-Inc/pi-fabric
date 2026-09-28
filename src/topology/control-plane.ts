@@ -49,6 +49,9 @@ export interface FabricControlAcceptance {
   /** The owner's followUp queue for a Main target (smarty-dev#1495). */
   pendingFollowUps?: number;
   oldestAgeS?: number;
+  /** The followUp replaced a held one with the same sender and data.coalesceKey. */
+  coalesced?: true;
+  replacedMessageId?: string;
   result?: unknown;
   error?: string;
 }
@@ -60,6 +63,8 @@ export interface FabricControlResult {
   acknowledged: true;
   pendingFollowUps?: number;
   oldestAgeS?: number;
+  coalesced?: true;
+  replacedMessageId?: string;
 }
 
 /** A queue count from another owner: a non-negative whole number, or nothing. */
@@ -71,6 +76,12 @@ const queueDepthOf = (source: Record<string, unknown>): { pendingFollowUps: numb
   const oldestAgeS = queueCount(source.oldestAgeS);
   return pendingFollowUps === undefined || oldestAgeS === undefined ? undefined : { pendingFollowUps, oldestAgeS };
 };
+
+/** The owner's coalesce report for a Main followUp (smarty-dev#1495), or nothing. */
+const coalescedOf = (source: Record<string, unknown>): { coalesced: true; replacedMessageId: string } | undefined =>
+  source.coalesced === true && typeof source.replacedMessageId === "string" && source.replacedMessageId.length <= 200
+    ? { coalesced: true, replacedMessageId: source.replacedMessageId }
+    : undefined;
 
 export type FabricControlHandler = (
   command: FabricControlCommand,
@@ -252,6 +263,7 @@ export class FabricControlPlane {
       routed: "mesh",
       acknowledged: true,
       ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
+      ...coalescedOf(acceptance as unknown as Record<string, unknown>),
     };
   }
 
@@ -489,6 +501,7 @@ export class FabricControlPlane {
       accepted: event.data.accepted === true,
       ...(typeof event.data.messageId === "string" ? { messageId: event.data.messageId } : {}),
       ...queueDepthOf(event.data),
+      ...coalescedOf(event.data),
       ...(Object.prototype.hasOwnProperty.call(event.data, "result")
         ? { result: event.data.result }
         : {}),
@@ -819,6 +832,7 @@ export class FabricControlPlane {
           accepted: acceptance.accepted,
           ...(acceptance.messageId ? { messageId: acceptance.messageId } : {}),
           ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
+          ...coalescedOf(acceptance as unknown as Record<string, unknown>),
           ...(Object.prototype.hasOwnProperty.call(acceptance, "result")
             ? { result: acceptance.result }
             : {}),

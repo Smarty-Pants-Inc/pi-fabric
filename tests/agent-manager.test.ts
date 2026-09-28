@@ -112,7 +112,9 @@ describe("effectiveAgentTimeoutMs", () => {
 
 afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  // ponytail: on Windows a just-exited child can still hold its cwd (EBUSY on rmdir);
+  // Node retries EBUSY/ENOTEMPTY/EPERM with backoff when maxRetries is set (smarty-dev#883).
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 describe("AgentManager", () => {

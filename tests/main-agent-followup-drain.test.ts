@@ -1046,6 +1046,58 @@ describe("Main followUp delivered ids span the whole session", () => {
     expect(fs.existsSync(journal)).toBe(false);
   });
 
+  // review/astra F6 on pi-fabric#102: an in-memory session (--no-session) has no file to read.
+  it("an in-memory session: a delivered followUp on an inactive branch is not resent after a reload", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-window-"));
+    roots.push(root);
+    const journal = path.join(root, "main-followups", "root.json");
+    const manager = SessionManager.inMemory(root);
+    manager.appendMessage({ role: "user", content: "start", timestamp: Date.now() });
+    manager.appendMessage(fauxAssistantMessage("ok"));
+    const fork = manager.getLeafId()!;
+    const first = persistingPi(manager);                    // appends each delivery to the session
+    const main = new MainAgentController(first.pi, "session:root", true, root, "root");
+    main.attachFollowUpDrain(ctxOf(manager), 120_000, journal);
+    main.deliverAgent({ from: from("a"), message: "once", delivery: "followUp" });
+    first.emit("agent_settled", { outcome: "aborted" }, ctxOf(manager, true));   // appended, not yet confirmed
+    expect(first.sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: false }]);
+    expect(fs.existsSync(journal)).toBe(true);
+    manager.branch(fork);                                   // /tree to before it, then reload
+    main.closeFollowUpDrain();
+    const second = fakePi();
+    new MainAgentController(second.pi, "session:root", true, root, "root").attachFollowUpDrain(ctxOf(manager), 120_000, journal);
+    second.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, ctxOf(manager));
+    expect(second.sent).toHaveLength(0);
+    expect(fs.existsSync(journal)).toBe(false);
+  });
+
+  it("a live controller confirms a delivery that /tree moved off the current branch", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-window-"));
+    roots.push(root);
+    const journal = path.join(root, "main-followups", "root.json");
+    for (const manager of [fileSession(root), SessionManager.inMemory(root)]) {
+      if (!manager.getLeafId()) { manager.appendMessage({ role: "user", content: "start", timestamp: Date.now() }); manager.appendMessage(fauxAssistantMessage("ok")); }
+      const fake = persistingPi(manager);
+      const main = new MainAgentController(fake.pi, "session:root", true, root, "root");
+      main.attachFollowUpDrain(ctxOf(manager), 120_000, journal);
+      const boundary = () => fake.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" }, context: { pendingMessages: [] } }, ctxOf(manager));
+      main.deliverAgent({ from: from("a"), message: "warm", delivery: "followUp" });
+      fake.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, ctxOf(manager));
+      boundary();                                           // the set is built and scanned to here
+      expect(fs.existsSync(journal)).toBe(false);
+      const scanned = manager.getLeafId()!;
+      main.deliverAgent({ from: from("a"), message: "once", delivery: "followUp" });
+      fake.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, ctxOf(manager));   // persisted
+      manager.branch(scanned);                              // /tree back to the last scanned entry
+      fake.emit("session_tree", {}, ctxOf(manager));
+      manager.appendMessage({ role: "user", content: "elsewhere", timestamp: Date.now() });
+      boundary();
+      expect(fs.existsSync(journal)).toBe(false);
+      expect(fake.sent).toHaveLength(2);
+      main.closeFollowUpDrain();
+    }
+  });
+
   it("long turns leave no delivered followUp in the journal", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-window-"));
     roots.push(root);

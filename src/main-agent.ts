@@ -169,43 +169,6 @@ const addDelivered = (ids: Set<string>, entry: SessionEntryLike | undefined): vo
   }
 };
 
-/**
- * Stream a session file line by line, calling visit for each entry that may carry an agent
- * message, and return the id of its last entry. Holds one chunk, not the file.
- */
-const streamSessionFile = (file: string, visit: (entry: SessionEntryLike) => void): string | undefined => {
-  const fd = fs.openSync(file, "r");
-  const buffer = Buffer.alloc(256 * 1024);
-  let rest = "";
-  let last: string | undefined;
-  const line = (text: string) => {
-    if (!text.trim()) return;
-    const cheap = /"id"\s*:\s*"([^"]+)"/.exec(text);
-    if (cheap) last = cheap[1];
-    if (!text.includes("pi-fabric-agent-message")) return;
-    try {
-      const entry = JSON.parse(text) as SessionEntryLike;
-      if (typeof entry.id === "string") last = entry.id;
-      visit(entry);
-    } catch {
-      // A torn last line: Pi rewrites it on its next append.
-    }
-  };
-  try {
-    for (;;) {
-      const read = fs.readSync(fd, buffer, 0, buffer.length, null);
-      if (read <= 0) break;
-      const lines = (rest + buffer.toString("utf8", 0, read)).split("\n");
-      rest = lines.pop() ?? "";
-      for (const text of lines) line(text);
-    }
-    line(rest);
-  } finally {
-    fs.closeSync(fd);
-  }
-  return last;
-};
-
 export class MainAgentController implements FabricMainAgentTarget {
   readonly startedAt = Date.now();
   readonly #held: HeldAgentMessage[] = [];
@@ -214,11 +177,12 @@ export class MainAgentController implements FabricMainAgentTarget {
   // Replayed handoffs of an earlier controller: in Pi's queue after a live reload, lost after a
   // restart. Only a boundary shows Pi's queue, so they wait for one (#reconcile).
   readonly #unverified: HeldAgentMessage[] = [];
-  // Every followUp id the session holds, complete: built once from the whole session at
-  // attach, then extended from the entries appended since (dev-lead on pi-fabric#102: a
-  // 1,000-entry window let a long turn push an id out, so it was sent twice).
+  // Every followUp id the session holds, on every branch, flushed or not: indexed from Pi's
+  // append-only entry list, never from the active branch (dev-lead on pi-fabric#102).
+  // ponytail: memory is O(unique ids + one id per entry scanned once), about 74 MiB at 1M ids;
+  // the list is Pi's own, already in memory, so nothing is re-read from disk.
   #delivered = new Set<string>();
-  #scannedLeaf: string | null | undefined;
+  #scanned: number | undefined;
   #journal: string | undefined;
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext | undefined;
@@ -370,46 +334,19 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
   }
 
-  /** Build the delivered set from the whole session: the file, streamed, then its unflushed tail. */
-  #loadDelivered(): void {
-    this.#delivered = new Set();
-    this.#scannedLeaf = undefined;
-    const sessions = this.#context?.sessionManager;
-    if (!sessions) return;
-    if (typeof sessions.getLeafId !== "function") { this.#scannedLeaf = null; return; }
-    let fileLast: string | undefined;
-    try {
-      const file = sessions.getSessionFile?.();
-      if (file && fs.existsSync(file)) fileLast = streamSessionFile(file, (entry) => addDelivered(this.#delivered, entry));
-    } catch {
-      fileLast = undefined;
-    }
-    this.#scannedLeaf = fileLast ?? null;
-    this.#refreshDelivered();
-  }
-
-  /** Add what the session appended since the last scan: the leaf chain back to the scanned leaf. */
+  /**
+   * Index the session entries appended since the last call, whatever branch they are on. Pi's
+   * entry list only grows within a session; a shorter list (a new session) starts over.
+   */
   #refreshDelivered(): Set<string> {
-    // Built at first need, not at attach: session start stays cheap (AGENTS.md startup budget).
-    if (this.#scannedLeaf === undefined) this.#loadDelivered();
-    const sessions = this.#context?.sessionManager;
-    if (!sessions || this.#scannedLeaf === undefined) return this.#delivered;
-    if (typeof sessions.getLeafId !== "function" || typeof sessions.getEntry !== "function") {
-      // A host without the tree API: scan every entry (complete, never a window).
-      try { for (const entry of sessions.getEntries?.() ?? []) addDelivered(this.#delivered, entry as SessionEntryLike); } catch { /* retry next time */ }
-      return this.#delivered;
-    }
     try {
-      const leaf = sessions.getLeafId?.() ?? null;
-      // ponytail: after /tree moves the leaf to another branch, this walks that branch to its
-      // root once; every entry of the old branch was scanned when it was appended.
-      for (let id = leaf; id !== null && id !== this.#scannedLeaf;) {
-        const entry = sessions.getEntry?.(id) as SessionEntryLike | undefined;
-        if (!entry) break;
-        addDelivered(this.#delivered, entry);
-        id = typeof entry.parentId === "string" ? entry.parentId : null;
+      const entries = this.#context?.sessionManager?.getEntries?.() ?? [];
+      if (this.#scanned === undefined || entries.length < this.#scanned) {
+        this.#delivered = new Set();
+        this.#scanned = 0;
       }
-      this.#scannedLeaf = leaf;
+      for (let index = this.#scanned; index < entries.length; index++) addDelivered(this.#delivered, entries[index] as SessionEntryLike);
+      this.#scanned = entries.length;
     } catch {
       // The set stays as it was; the next boundary scans again.
     }
@@ -579,7 +516,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#sent.splice(0);
     this.#unverified.splice(0);
     this.#delivered = new Set();
-    this.#scannedLeaf = undefined;
+    this.#scanned = undefined;
     this.#journal = undefined;
     this.#context = undefined;
   }

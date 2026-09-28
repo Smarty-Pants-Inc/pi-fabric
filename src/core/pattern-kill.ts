@@ -19,7 +19,20 @@
 // ponytail: a small shell reader, not a shell. A kill hidden in a script file, an alias or a
 // variable holding a command passes; revisit if agents route around it.
 
-type Word = { text: string; subs: string[]; dynamic: boolean };
+// `names[i]` is the placeholder `${name}` that stands for `subs[i]` in `text`: a script run by
+// bash -c, eval, ssh, env -S or a heredoc sees which operand came from which substitution.
+type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean };
+type Expansion = { subs: string[]; names: string[]; text?: string; dynamic?: boolean };
+
+let placeholders = 0;
+/** Records a substitution and returns the placeholder that stands for its output. */
+function substitute(into: Expansion, sub: string): string {
+  const name = `__pk_sub_${++placeholders}`;
+  into.subs.push(sub);
+  into.names.push(name);
+  into.dynamic = true;
+  return `\${${name}}`;
+}
 type Token = { op: string } | { word: Word } | { redirect: Word } | { heredoc: { body: string; quoted: boolean } };
 
 const OPERATORS = ["&&", "||", ";;", "|&", "|", "&", ";", "(", ")"];
@@ -31,7 +44,7 @@ function readBalanced(text: string, index: number, open: string, close: string):
     const c = text[index]!;
     if (c === "\\") { index += 2; continue; }
     if (c === "'" && close !== "`") { const end = text.indexOf("'", index + 1); index = end < 0 ? text.length : end + 1; continue; }
-    if (c === "\"" && close !== "`") { index = readDouble(text, index + 1, { subs: [] }); continue; }
+    if (c === "\"" && close !== "`") { index = readDouble(text, index + 1, { subs: [], names: [] }); continue; }
     if (c === close) { depth -= 1; index += 1; if (depth === 0) return index; continue; }
     if (open !== close && c === open) depth += 1;
     index += 1;
@@ -40,16 +53,14 @@ function readBalanced(text: string, index: number, open: string, close: string):
 }
 
 /** Reads a double-quoted body from `index`; collects its `$(…)` and backtick substitutions. */
-function readDouble(text: string, index: number, word: { subs: string[]; text?: string; dynamic?: boolean }): number {
+function readDouble(text: string, index: number, word: Expansion): number {
   while (index < text.length && text[index] !== "\"") {
     const c = text[index]!;
     if (c === "\\") { word.text = (word.text ?? "") + (text[index + 1] ?? ""); index += 2; continue; }
     if ((c === "$" && text[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(text, start, "`", "`") : readBalanced(text, start, "(", ")");
-      word.subs.push(text.slice(start, end - 1));
-      word.text = (word.text ?? "") + "$";
-      word.dynamic = true;
+      word.text = (word.text ?? "") + substitute(word, text.slice(start, end - 1));
       index = end;
       continue;
     }
@@ -60,22 +71,27 @@ function readDouble(text: string, index: number, word: { subs: string[]; text?: 
   return index + 1;
 }
 
-/** The `$(…)` and backtick substitutions an unquoted heredoc body runs; quotes and `#` are literal. */
-function heredocSubs(body: string): string[] {
-  const subs: string[] = [];
+/**
+ * An unquoted heredoc body as the command that reads it receives it: each `$(…)` and backtick
+ * substitution replaced by its placeholder. Quotes and `#` are literal there.
+ */
+function expandHeredoc(body: string): Expansion & { text: string } {
+  const expansion: Expansion & { text: string } = { subs: [], names: [], text: "" };
   for (let index = 0; index < body.length;) {
     const c = body[index]!;
-    if (c === "\\") { index += 2; continue; }
+    // In a heredoc a backslash escapes only $, ` and \: the reader gets `\$(…)` as `$(…)`.
+    if (c === "\\") { expansion.text += /[$`\\]/.test(body[index + 1] ?? "") ? body[index + 1] : body.slice(index, index + 2); index += 2; continue; }
     if ((c === "$" && body[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(body, start, "`", "`") : readBalanced(body, start, "(", ")");
-      subs.push(body.slice(start, end - 1));
+      expansion.text += substitute(expansion, body.slice(start, end - 1));
       index = end;
       continue;
     }
+    expansion.text += c;
     index += 1;
   }
-  return subs;
+  return expansion;
 }
 
 function tokenize(source: string): Token[] {
@@ -91,7 +107,7 @@ function tokenize(source: string): Token[] {
     word = undefined;
     target = false;
   };
-  const current = (): Word => (word ??= { text: "", subs: [], dynamic: false });
+  const current = (): Word => (word ??= { text: "", subs: [], names: [], dynamic: false });
   while (index < text.length) {
     const c = text[index]!;
     if (c === " " || c === "\t" || c === "\r") { endWord(); index += 1; continue; }
@@ -130,8 +146,7 @@ function tokenize(source: string): Token[] {
     if ((c === "<" || c === ">") && text[index + 1] === "(") {
       const end = readBalanced(text, index + 2, "(", ")");
       const w = current();
-      w.subs.push(text.slice(index + 2, end - 1));
-      w.dynamic = true;
+      w.text += substitute(w, text.slice(index + 2, end - 1));
       index = end;
       continue;
     }
@@ -168,9 +183,7 @@ function tokenize(source: string): Token[] {
     } else if ((c === "$" && text[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(text, start, "`", "`") : readBalanced(text, start, "(", ")");
-      w.subs.push(text.slice(start, end - 1));
-      w.text += "$";
-      w.dynamic = true;
+      w.text += substitute(w, text.slice(start, end - 1));
       index = end;
     } else if (c === "\\") {
       w.text += text[index + 1] ?? "";
@@ -205,9 +218,7 @@ const KILL_BY_NAME = new Set(["pkill", "killall", "killall5"]);
 const LOOKUPS = new Set(["pgrep", "pidof", "ps", "grep", "egrep", "awk"]);
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 const SSH_VALUE_OPTIONS = new Set(["-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w", "-B"]);
-// A kill argument that names no process by itself: a literal PID or group, a job, a signal.
-const LITERAL = /^(?:-?\d+|%\S*|--|-[A-Za-z][A-Za-z0-9+-]*|-\d+)$/;
-const VARIABLE = /\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
+const VARIABLE = /\$\{?([A-Za-z_][A-Za-z0-9_]*|[0-9@*])/g;
 
 // `blocked`: a kill by pattern. `lookup`: runs a name lookup (LOOKUPS) anywhere.
 type Verdict = { blocked: boolean; lookup: boolean };
@@ -259,86 +270,88 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
 }
 
 /**
- * Scans a shell script. `names` holds the variables that hold name-lookup output in the calling
- * script; `fed` is true when the calling script expanded a lookup into this script's text.
+ * Scans a shell script. `names` holds the variables and placeholders whose value comes from a name
+ * lookup in the calling script (review/astra F8 on #105: per operand, never the whole script).
  */
-function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), fed = false): Verdict {
+function scan(script: string, depth: number, names: ReadonlySet<string> = new Set()): Verdict {
   const verdict: Verdict = { blocked: false, lookup: false };
   if (depth > 6) return verdict;
   // Variables whose value comes from a name lookup (`P=$(pgrep …)`, `for p in $(pgrep …)`,
-  // `pgrep … | while read p`). A `kill` of one is a kill by pattern; a variable of unknown origin
-  // may be a PID the session recorded (`PID=$!`) and passes.
+  // `pgrep … | while read p`), and the placeholders of lookup substitutions. A `kill` of one is a
+  // kill by pattern; a variable of unknown origin may be a PID the session recorded (`PID=$!`).
   const tainted = new Set(names);
   let stages: Command[] = [];
   let command: Command = { words: [], redirects: [], heredocs: [] };
 
-  const nested = (text: string, feeds = false): Verdict => {
-    const inner = scan(text, depth + 1, tainted, feeds);
+  const nested = (text: string, extra: Iterable<string> = []): Verdict => {
+    const inner = scan(text, depth + 1, new Set([...tainted, ...extra]));
     verdict.blocked ||= inner.blocked;
     verdict.lookup ||= inner.lookup;
     return inner;
   };
-  // review/astra F1/F5 on #105: a script run by bash -c, eval or ssh gets the lookups the calling
-  // shell expands into it (then any non-literal PID there is theirs, even quoted), and the
-  // tainted variables it can read.
-  const feedsLookup = (word: Word): boolean => fed || word.subs.some((sub) => scan(sub, depth + 1).lookup);
+  const fromLookup = (text: string): boolean => [...text.matchAll(VARIABLE)].some((match) => tainted.has(match[1]!));
 
   const runPipeline = (): void => {
     let pipeFeed = false;
     stages.forEach((stage, position) => {
       const piped = position < stages.length - 1;
       // Substitutions in words and redirection targets run; so do those of an unquoted heredoc
-      // body, where quotes and `#` are literal (review/astra F2 on #105).
-      const subs = [...stage.words, ...stage.redirects].flatMap((word) => word.subs);
-      for (const heredoc of stage.heredocs) if (!heredoc.quoted) subs.push(...heredocSubs(heredoc.body));
+      // body, where quotes and `#` are literal (review/astra F2 on #105). A lookup's placeholder
+      // is tainted, so a script that receives its output knows which operand holds it.
+      const heredocs = stage.heredocs.map((heredoc) => heredoc.quoted ? { text: heredoc.body, subs: [], names: [] } : expandHeredoc(heredoc.body));
+      const expansions: Expansion[] = [...stage.words, ...stage.redirects, ...heredocs];
       let captured = false;
-      for (const sub of subs) captured = nested(sub).lookup || captured;
-      const scripts: Array<{ text: string; feeds: boolean }> = [];
+      for (const expansion of expansions) expansion.subs.forEach((sub, k) => {
+        if (!nested(sub).lookup) return;
+        captured = true;
+        tainted.add(expansion.names[k]!);
+      });
+      const scripts: Array<{ text: string; extra?: string[] }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
       const { words, fedByXargs } = unwrap(stage.words, envScripts);
-      // review/astra F6 on #105: an `env -S` script gets the lookups expanded into its word.
-      for (const { text, source } of envScripts) scripts.push({ text, feeds: feedsLookup(source) });
+      // review/astra F6 on #105: an `env -S` script, with the placeholders of its word.
+      for (const { text } of envScripts) scripts.push({ text });
       const name = words[0]?.text.split("/").pop() ?? "";
       const args = words.slice(1);
       let lookup = LOOKUPS.has(name);
       if (KILL_BY_NAME.has(name)) verdict.blocked = true;
       // Assignments and loop variables that take lookup output.
       for (const word of stage.words) {
-        const assigned = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(word.text);
-        if (assigned && word.subs.some((sub) => scan(sub, depth + 1).lookup)) tainted.add(assigned[1]!);
+        const assigned = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word.text);
+        if (assigned && fromLookup(assigned[2]!)) tainted.add(assigned[1]!);
       }
-      if (name === "for" && args[0] && captured) tainted.add(args[0].text);
-      if (name === "read" && (pipeFeed || fed)) for (const arg of args) if (!arg.text.startsWith("-")) tainted.add(arg.text);
+      if (name === "for" && args[0] && args.slice(2).some((arg) => fromLookup(arg.text))) tainted.add(args[0].text);
+      if (name === "read" && pipeFeed) for (const arg of args) if (!arg.text.startsWith("-")) tainted.add(arg.text);
+      // xargs appends its input: from a lookup, `{}` and every positional parameter hold it.
+      const xargsFeed = fedByXargs && pipeFeed;
       if (name === "kill") {
         const probe = args.some((arg, i) => arg.text === "-0" || arg.text === "-l" || (arg.text === "-s" && args[i + 1]?.text === "0"));
-        const byLookup = args.some((arg) => {
-          if (LITERAL.test(arg.text) && !arg.dynamic) return false;
-          // A PID file (`$(cat run.pid)`, `$(< run.pid)`) is a recorded PID; a lookup is not.
-          if (arg.subs.some((sub) => scan(sub, depth + 1).lookup)) return true;
-          if ([...arg.text.matchAll(VARIABLE)].some((match) => tainted.has(match[1]!))) return true;
-          return fed;
-        });
-        if (!probe && (byLookup || (fedByXargs && pipeFeed))) verdict.blocked = true;
+        // A PID file (`$(cat run.pid)`, `$(< run.pid)`) is a recorded PID; a lookup is not.
+        const byLookup = args.some((arg) => fromLookup(arg.text) || tainted.has(arg.text));
+        if (!probe && (byLookup || xargsFeed)) verdict.blocked = true;
       }
-      // review/astra F6 on #105: a heredoc script gets the lookups its unquoted body expands, even
-      // inside quotes there.
-      if (SHELLS.has(name) || name === "ssh") for (const heredoc of stage.heredocs) {
-        const feeds = fed || (!heredoc.quoted && heredocSubs(heredoc.body).some((sub) => scan(sub, depth + 1).lookup));
-        scripts.push({ text: heredoc.body, feeds });
-      }
+      // review/astra F6 on #105: a heredoc script as the shell receives it, placeholders included.
+      if (SHELLS.has(name) || name === "ssh") for (const heredoc of heredocs) scripts.push({ text: heredoc.text });
       if (SHELLS.has(name)) {
         const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg.text));
         const payload = flag >= 0 ? args[flag + 1] : undefined;
-        if (payload) scripts.push({ text: payload.text, feeds: feedsLookup(payload) });
+        if (payload) {
+          // review/astra F9 on #105: `sh -c SCRIPT NAME ARGS…` binds $0, $1, … (and $@, $*) to the
+          // words after the script; xargs appends its input after them.
+          const extra: string[] = [];
+          const positional = args.slice(flag + 2);
+          positional.forEach((arg, k) => { if (fromLookup(arg.text)) extra.push(String(k), "@", "*"); });
+          if (xargsFeed) extra.push(..."123456789@*".split(""), "{}");
+          scripts.push({ text: payload.text, extra });
+        }
       }
-      if (name === "eval") scripts.push({ text: args.map((arg) => arg.text).join(" "), feeds: args.some(feedsLookup) });
+      if (name === "eval") scripts.push({ text: args.map((arg) => arg.text).join(" ") });
       if (name === "ssh") {
         let i = 0;
         while (args[i]?.text.startsWith("-")) i += SSH_VALUE_OPTIONS.has(args[i]!.text) ? 2 : 1;
-        const remote = args.slice(i + 1);
-        scripts.push({ text: remote.map((arg) => arg.text).join(" "), feeds: remote.some(feedsLookup) });
+        scripts.push({ text: args.slice(i + 1).map((arg) => arg.text).join(" ") });
       }
-      for (const inner of scripts) lookup = nested(inner.text, inner.feeds).lookup || lookup;
+      for (const inner of scripts) lookup = nested(inner.text, inner.extra).lookup || lookup;
       if (lookup) verdict.lookup = true;
       if (piped && lookup) pipeFeed = true;
     });

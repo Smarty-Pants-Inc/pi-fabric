@@ -101,6 +101,19 @@ const refused: Array<[string, string]> = [
   // review/astra F7 on #105: env's split string in a short cluster.
   ["env -iS 'pkill …'", `env -iS 'pkill -f worker'`],
   ["env -iS'pkill …'", `env -iS'pkill -f worker'`],
+  // review/astra F8 on #105: provenance per operand inside a heredoc or -c script.
+  ["a heredoc diagnostic, then a lookup kill", `bash <<EOF\necho "workers: $(pgrep -c worker)"\nkill $(pgrep -f worker)\nEOF`],
+  ["a captured lookup killed inside a heredoc", `bash <<'EOF'\np=$(pgrep x); kill $p\nEOF`],
+  ["a captured lookup killed inside an unquoted heredoc", `bash <<EOF\np=\\$(pgrep x); kill \\$p\nEOF`],
+  ["a bash -c diagnostic, then a lookup kill", `bash -c "echo $(pgrep -c worker); kill $(pgrep -f worker)"`],
+  // review/astra F9 on #105: positional parameters after -c, and xargs input.
+  ["bash -c 'kill \"$1\"' _ \"$(pgrep …)\"", `bash -c 'kill "$1"' _ "$(pgrep -f worker)"`],
+  ["bash -c 'kill \"$@\"' _ $(pgrep …)", `bash -c 'kill "$@"' _ $(pgrep -f worker)`],
+  ["sh -c 'kill $0' $(pgrep …)", `sh -c 'kill $0' $(pgrep -f worker)`],
+  ["a captured lookup passed as $1", `P=$(pgrep -f worker); bash -c 'kill "$1"' _ "$P"`],
+  ["pgrep | xargs sh -c 'kill \"$@\"' _", `pgrep x | xargs sh -c 'kill "$@"' _`],
+  ["pgrep | xargs -r sh -c 'kill \"$@\"' _", `pgrep -f worker | xargs -r sh -c 'kill "$@"' _`],
+  ["pgrep | xargs -I{} sh -c 'kill {}'", `pgrep -f worker | xargs -I{} sh -c 'kill {}'`],
   ["a grep-selected PID", `kill $(ps aux | grep '[w]orker' | awk '{print $2}')`],
 ];
 
@@ -152,6 +165,13 @@ const allowed: Array<[string, string]> = [
   ["a quoted-delimiter heredoc to bash with a quoted lookup (inert)", `bash <<'EOF'\nkill '$(pgrep -f worker)'\nEOF`],
   ["a quoted-delimiter heredoc note to cat", `cat <<'EOF'\nkill '$(pgrep -f worker)'\nEOF`],
   ["a lookup expanded into a heredoc to cat", `cat <<EOF > note.md\nworkers: '$(pgrep -f worker)'\nEOF`],
+  // Counterexamples for F8 and F9.
+  ["a heredoc diagnostic, then a PID-file kill", `bash <<EOF\necho "workers: $(pgrep -c worker)"\nkill $(cat run.pid)\nEOF`],
+  ["a bash -c diagnostic, then a PID-file kill", `bash -c "echo $(pgrep -c worker); kill $(cat run.pid)"`],
+  ["bash -c 'kill \"$1\"' _ 12345", `bash -c 'kill "$1"' _ 12345`],
+  ["bash -c with a lookup in another positional", `bash -c 'kill "$1"; echo "$2"' _ 12345 "$(pgrep -c worker)"`],
+  ["xargs -a run.pids sh -c 'kill \"$@\"' _", `xargs -a run.pids sh -c 'kill "$@"' _`],
+  ["cat run.pids | xargs sh -c 'kill \"$@\"' _", `cat run.pids | xargs sh -c 'kill "$@"' _`],
   ["kill $(cat run.pid)", `kill $(cat run.pid)`],
   ["kill $(< run.pid)", `kill $(< run.pid)`],
   ["kill -9 $PID", `kill -9 $PID`],

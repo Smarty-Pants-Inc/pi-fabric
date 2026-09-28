@@ -11,6 +11,8 @@
  * TRUNCATE or DDL. A trigger also refuses UPDATE, DELETE and TRUNCATE of records for every role.
  */
 
+import { backfillChain } from "./chain.js";
+
 export const WRITER_ROLE = "fabric_records_writer";
 /** The service's login role; install creates it, the migration grants it the writer role. */
 export const SERVICE_ROLE = "records_service";
@@ -319,7 +321,23 @@ GRANT EXECUTE ON FUNCTION consumer_open(text, text, jsonb), consumer_save(text, 
   archive_claim(text, double precision), archive_record(text, pg_lsn, text) TO ${WRITER_ROLE};
 `;
 
-export const MIGRATIONS: readonly string[] = [v1];
+/**
+ * v2 (smarty-dev#754 R3): the hash chain. prev_hash is the SHA-256 of the org's previous record's
+ * canonical bytes (chain.ts); existing rows are backfilled here, the only UPDATE records ever sees,
+ * with the append-only trigger off inside this transaction.
+ */
+const v2 = async (client: SqlClient): Promise<void> => {
+  await client.query(`
+    ALTER TABLE records ADD COLUMN prev_hash text CHECK (prev_hash ~ '^[0-9a-f]{64}$');
+    CREATE INDEX records_org_seq ON records (org, seq);
+    ALTER TABLE records DISABLE TRIGGER records_no_update_delete;`);
+  await backfillChain(client);
+  await client.query("ALTER TABLE records ENABLE TRIGGER records_no_update_delete");
+};
+
+/** A migration is SQL, or a step that needs code (a backfill), run in the migration's transaction. */
+export type Migration = string | ((client: SqlClient) => Promise<void>);
+export const MIGRATIONS: readonly Migration[] = [v1, v2];
 
 /** A minimal client: pg's PoolClient satisfies it, and so does a test double. */
 export interface SqlClient {
@@ -337,7 +355,9 @@ export const migrate = async (client: SqlClient): Promise<number> => {
     const { rows } = await client.query<{ version: number | null }>("SELECT max(version) AS version FROM records_schema");
     const current = rows[0]?.version ?? 0;
     for (let version = current + 1; version <= MIGRATIONS.length; version++) {
-      await client.query(MIGRATIONS[version - 1]!);
+      const migration = MIGRATIONS[version - 1]!;
+      if (typeof migration === "string") await client.query(migration);
+      else await migration(client);
       await client.query("INSERT INTO records_schema (version) VALUES ($1)", [version]);
     }
     // The service's login role (created by install, never by the service) gets the writer role.

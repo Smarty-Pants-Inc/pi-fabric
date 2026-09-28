@@ -3,6 +3,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { errorFromWire, LineReader, type WireResponse } from "./protocol.js";
+import type { RecordsAnchor, RecordsVerifyResult } from "./chain.js";
 import type {
   ClaimedPublication, ConsumerLag, ConsumerState, PageArgs, RecordEnvelope, RecordReceipt, RecordsBackend, RecordsCallOptions,
   RecordsGetPart, RecordsGetResult, RecordsListResult, RecordsOps, RecordsPage, RecordsPrincipal,
@@ -179,6 +180,12 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
   }
   list(_principal: RecordsPrincipal, args: unknown, options: RecordsCallOptions = {}): Promise<RecordsListResult> {
     return this.#call("list", { args }, options.signal) as Promise<RecordsListResult>;
+  }
+  anchor(_principal: RecordsPrincipal, args: unknown = {}, options: RecordsCallOptions = {}): Promise<RecordsAnchor> {
+    return this.#call("anchor", { args }, options.signal) as Promise<RecordsAnchor>;
+  }
+  verify(_principal: RecordsPrincipal, args: unknown = {}, options: RecordsCallOptions = {}): Promise<RecordsVerifyResult> {
+    return this.#call("verify", { args }, options.signal) as Promise<RecordsVerifyResult>;
   }
   status(signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.#call("status", {}, signal) as Promise<Record<string, unknown>>;

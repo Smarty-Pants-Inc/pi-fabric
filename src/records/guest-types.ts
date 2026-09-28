@@ -43,6 +43,16 @@ interface FabricRecordsListItem {
   statuses: Record<string, { at: number; state?: string; eta?: unknown }>; statusCount: number;
   openAsks: { id: string; to?: string; at: number }[]; openAskCount: number;
 }
+interface FabricRecordsAnchor { org: string; seq: number; hash: string | null; at: string }
+interface FabricRecordsVerifyResult {
+  org: string; rows: number; last?: { seq: number; hash: string };
+  /** No chain break and every anchor holds. */ ok: boolean;
+  /** ok, and every record is covered by an anchor. */ clean: boolean;
+  break?: { org: string; seq: number; reason: "prev_hash" | "gap"; expected: string | null; found: string | null };
+  anchors: { seq: number; hash: string; ok: boolean; found: string | null }[];
+  unanchored?: { from: number; to: number };
+  summary: string;
+}
 /** The org record; see the fabric-exec records reference. Retry append with the same key. */
 interface FabricRecordsApi {
   append(args: FabricRecordsAppendArgs): Promise<FabricRecordReceipt>;
@@ -50,6 +60,10 @@ interface FabricRecordsApi {
   get(args: { ref: string; after?: number; limit?: number }): Promise<{ ref: string; state?: FabricRecordFold; history: FabricRecord[]; next?: number }>;
   fold(args: { ref: string; part: FabricRecordFoldPart; after?: string }): Promise<{ ref: string; part: FabricRecordFoldPart; items: unknown[]; next?: string }>;
   list(args?: { org?: string; repo?: string; open?: boolean; owner?: string; hasOpenAsk?: boolean; updatedSince?: number; limit?: number; after?: string }): Promise<{ items: FabricRecordsListItem[]; next?: string }>;
+  /** The last record's seq and chain hash; the backup adapter writes it to every target. */
+  anchor(): Promise<FabricRecordsAnchor>;
+  /** Recompute the hash chain and check the anchors (as records.anchor gave them). */
+  verify(args?: { anchors?: { seq: number; hash: string }[] }): Promise<FabricRecordsVerifyResult>;
   status(): Promise<{ org: string; origin: string; frontier: number; unpublished: number; admission: { state: "ok" | "alarm" | "refuse" | "disabled"; lagSeconds?: number; frontier?: string; insertLsn?: string }; statusFile: string }>;
 }
 

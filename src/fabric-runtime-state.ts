@@ -2,6 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
+import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
@@ -1017,7 +1018,7 @@ export class FabricRuntimeState {
     } else {
       this.#registry.markUnavailable("records", this.#config.records.enabled
         ? "records need the mesh and a local host (not Schema enforce mode or a managed host)"
-        : 'disabled by configuration; set "records": { "enabled": true, "org": ..., "connection": {...} } in .pi/fabric.json');
+        : RECORDS_DISABLED_HINT);
     }
     await builtins.memory(context, this.#config, sessionId);
     builtins.assertActive(this.#config);

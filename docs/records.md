@@ -164,6 +164,23 @@ const health = await records.status();
   boards and alarms, newest update first, with up to 20 authors' statuses and 20 open asks per item (and their
   counts). It is never a delivery path.
 
+## The hash chain and anchors (#754 R3)
+
+The record is append-only and tamper-evident. Each record's `prev_hash` is the SHA-256 of the org's previous
+record's canonical bytes: the UTF-8 of the stored row as JSON with sorted keys, every column in its PostgreSQL text
+form (`created_at` as UTC ISO 8601 with microseconds), NULL as `null`. The append sets it inside its transaction,
+under the per-org lock; migration v2 backfilled the rows before it. The first record's `prev_hash` is NULL.
+
+- `records.anchor()` (or `service-main anchor --config FILE`) returns `{ org, seq, hash, at }` for the last record.
+  The backup adapter writes it to every backup target on each run: at least every 5 min on the admission target,
+  daily on the others. A copy off the host is what makes a rewrite of the whole chain detectable.
+- `records.verify({ anchors })` (or `service-main verify --config FILE --anchors FILE`, exit 0 clean, 1 broken,
+  3 unanchored) recomputes the chain from one snapshot and reports the first `break` (`org`, `seq`, `reason`
+  `prev_hash` or `gap`, `expected`, `found`), checks each anchor (the row at that seq exists with that hash), and
+  reports `unanchored: { from, to }` for rows after the latest anchor. `ok` means no break and every anchor holds;
+  `clean` also needs no unanchored rows. An edit after the latest anchor that no later row covers shows only as
+  unanchored, so a result is clean only when it is anchored through the last row.
+
 ## Commit, then nudge
 
 Each append writes a `publication` row in its transaction. After the commit, a relay publishes it on the mesh topic

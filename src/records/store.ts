@@ -1,4 +1,5 @@
 import type { AdmissionGate } from "./admission.js";
+import { lastHash, parseAnchors, verifyChain, type RecordsAnchor, type RecordsVerifyResult } from "./chain.js";
 import {
   MIRRORED_KINDS, RecordsArgumentError, parseRef, parseRepo, payloadHash, recordTopic, validateAppend,
   type AppendArgs, type RecordKind,
@@ -113,6 +114,10 @@ export interface RecordsBackend {
   get(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsGetResult>;
   fold(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsGetPart>;
   list(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsListResult>;
+  /** The org's last record's (seq, hash): what the backup adapter writes to every target. */
+  anchor(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsAnchor>;
+  /** Recompute the hash chain and check the supplied anchors. */
+  verify(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsVerifyResult>;
 }
 
 /** The caller's lifetime: once aborted, no further step of its call runs and nothing it started commits. */
@@ -213,6 +218,23 @@ const FOLD_FIELD_BYTES = 16 * 1024;
 const FOLD_PART_BUDGET: Record<RecordFoldPart, number> = { statuses: 128 * 1024, mirror: 64 * 1024, decisions: 64 * 1024, openAsks: 64 * 1024, links: 64 * 1024 };
 
 const MAX_PAGE = 500;
+
+/**
+ * The longest prefix of `value` whose JSON encoding (quotes included) is at most `limit` bytes,
+ * cut between code points. Measured in the same encoding as the limit: an escape such as U+0001
+ * is 6 bytes in JSON, 1 in raw UTF-8 (#1720 item 1).
+ */
+export const jsonPrefix = (value: string, limit: number): string => {
+  let size = 2;
+  let end = 0;
+  for (const char of value) {
+    const bytes = Buffer.byteLength(JSON.stringify(char)) - 2;
+    if (size + bytes > limit) break;
+    size += bytes;
+    end += char.length;
+  }
+  return value.slice(0, end);
+};
 
 interface RecordRow {
   id: string; org: string; origin: string; seq: string; ref: string; kind: RecordKind; author: string; author_name: string | null;
@@ -332,11 +354,13 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       await this.#checkReferences(client, args, ref, author);
       const next = await client.query<{ seq: string }>("SELECT coalesce(max(seq), 0) + 1 AS seq FROM records WHERE origin = $1", [this.origin]);
       const seq = next.rows[0]!.seq;
+      // The hash chain (#754 R3): under the org lock, so the previous record is the org's last.
+      const prev = await lastHash(client, this.org);
       const inserted = await client.query<RecordRow>(
-        `INSERT INTO records (org, origin, seq, ref, kind, author, author_name, text, data, supersedes, key, payload_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        `INSERT INTO records (org, origin, seq, ref, kind, author, author_name, text, data, supersedes, key, payload_hash, prev_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          RETURNING ${RECORD_COLUMNS}`,
-        [this.org, this.origin, seq, ref, args.kind, author, authorName, args.text ?? null, JSON.stringify(args.data ?? {}), args.supersedes ?? null, args.key, hash],
+        [this.org, this.origin, seq, ref, args.kind, author, authorName, args.text ?? null, JSON.stringify(args.data ?? {}), args.supersedes ?? null, args.key, hash, prev?.hash ?? null],
       );
       const row = inserted.rows[0]!;
       await this.#outbox(client, row, args, parsed);
@@ -663,7 +687,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
         // Each fold field is at most 16 KiB (F10); the whole value is in the history.
         if (Buffer.byteLength(JSON.stringify(value)) <= FOLD_FIELD_BYTES) return value;
         truncated.push(name);
-        return typeof value === "string" ? Buffer.from(value).subarray(0, FOLD_FIELD_BYTES).toString("utf8").replace(/\uFFFD$/u, "") : undefined;
+        return typeof value === "string" ? jsonPrefix(value, FOLD_FIELD_BYTES) : undefined;
       };
       const state: RecordFold = {
         ...Object.fromEntries(["title", "body", "owner", "acceptance", "labels", "nextAction", "stage"]
@@ -778,6 +802,21 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       const continues = rows.length > limit || items.length < page.length;
       return { items, ...(continues && last ? { next: Buffer.from(JSON.stringify({ u: String(last.updated_us), r: last.ref })).toString("base64url") } : {}) };
     }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
+  }
+
+  async anchor(_principal: RecordsPrincipal, input: unknown = {}, options: RecordsCallOptions = {}): Promise<RecordsAnchor> {
+    if (!isObject(input ?? {})) throw new RecordsArgumentError("records.anchor takes {}");
+    checkKeys("anchor", (input ?? {}) as Record<string, unknown>, []);
+    const last = await this.transaction((client) => lastHash(client, this.org), "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
+    return { org: this.org, seq: last?.seq ?? 0, hash: last?.hash ?? null, at: new Date().toISOString() };
+  }
+
+  async verify(_principal: RecordsPrincipal, input: unknown = {}, options: RecordsCallOptions = {}): Promise<RecordsVerifyResult> {
+    const args = (input ?? {}) as Record<string, unknown>;
+    if (!isObject(args)) throw new RecordsArgumentError("records.verify takes {anchors?}");
+    checkKeys("verify", args, ["anchors"]);
+    const anchors = parseAnchors(args.anchors);
+    return this.transaction((client) => verifyChain(client, this.org, anchors, options.signal), "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
   }
 
   async close(): Promise<void> { await this.pool.end?.(); }

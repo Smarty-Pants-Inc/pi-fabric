@@ -41,3 +41,11 @@ export const normalizeRecordsConfig = (input: unknown): FabricRecordsConfig => {
     consumerLagSeconds: integer(raw.consumerLagSeconds, DEFAULT_RECORDS_CONFIG.consumerLagSeconds, 1, 86_400),
   };
 };
+
+/**
+ * The activation config the installer prints: Fabric needs only the service socket (C10); the
+ * database is the service's. The disabled provider's guidance shows this same snippet (#1720 item 4).
+ */
+export const RECORDS_ACTIVATION = { enabled: true, socket: "/run/<org>-records/records.sock" } as const;
+export const RECORDS_DISABLED_HINT =
+  `disabled by configuration; set "records": ${JSON.stringify(RECORDS_ACTIVATION)} in .pi/fabric.json (the socket the records installer printed)`;

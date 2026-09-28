@@ -23,6 +23,7 @@ const primaryEntryPoints = [
   "src/memory/normalize.ts",
   "src/memory/worker-provider.ts",
   "src/providers/memory-provider.ts",
+  "src/records/service-main.ts",
 ];
 
 // Every package-local dynamic import is also an entry point. Its stable output
@@ -37,6 +38,7 @@ const lazyEntryPoints = [
   "src/fabric-runtime-state.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
+  "src/records/service.ts",
   "src/jev/client.ts",
   "src/jev/observation.ts",
   "src/runtime/core-override-guest-types.ts",
@@ -119,6 +121,19 @@ const standalone = await build({
           : { path: args.path, external: true });
     },
   }],
+});
+
+// The records service runs as its own OS user from a root-owned copy of one file:
+// inline every package (pg included) so no module resolves outside that copy.
+await build({
+  entryPoints: ["src/records/service-main.ts"],
+  outfile: "dist/records-service/service-main.mjs",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  logLevel: "info",
+  banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
 });
 
 // tsc does not copy input .d.ts files; ship the generated kernel ABI and receipt.

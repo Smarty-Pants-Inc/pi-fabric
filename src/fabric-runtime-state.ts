@@ -1,5 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
+import type { RecordsService } from "./records/service.js";
+import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
+import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import {
@@ -195,6 +198,8 @@ export class FabricRuntimeState {
   #jevObservationHost: JevObservationHost | undefined;
   #globalActors: GlobalActorRegistry | undefined;
   #rootInbox: RootInbox | undefined;
+  #records: Promise<RecordsService> | undefined;
+  #openRecords: (() => Promise<RecordsService>) | undefined;
   #mesh: MeshStore | undefined;
   #identity: MeshIdentity | undefined;
   #mainAgent: MainAgentController | undefined;
@@ -325,6 +330,29 @@ export class FabricRuntimeState {
    */
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
     return idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session);
+  }
+
+  /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
+  recordsWake: (() => Promise<void>) | undefined;
+
+  /** The records addressed to this root past its processing cursor (smarty-dev#754 C4). */
+  async nextRecordsInbox(session: RecordsInboxSession): Promise<RecordsInboxBatch | undefined> {
+    if (!this.#openRecords) return undefined;
+    const service = await this.#openRecords();
+    return service.inbox?.next(session);
+  }
+
+  /** The same, as the one message that brings the batch into the session; undefined when empty. */
+  async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<ReturnType<typeof recordsInboxMessage> | undefined> {
+    const batch = await this.nextRecordsInbox(recordsInboxSession(entries));
+    return batch?.records.length ? recordsInboxMessage(batch.records) : undefined;
+  }
+
+  async #closeRecords(): Promise<void> {
+    const opening = this.#records;
+    this.#records = undefined;
+    this.#openRecords = undefined;
+    await opening?.then((service) => service.close()).catch(() => undefined);
   }
 
   /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
@@ -953,6 +981,44 @@ export class FabricRuntimeState {
     } else {
       this.#registry.markUnavailable("jev", enforceSchema ? "Jev network programs are unavailable in Schema enforce mode" : "disabled by configuration (jev.enabled=false)");
     }
+    if (!this.#managedHost && this.#config.records.enabled && this.#config.mesh.enabled && !enforceSchema) {
+      // The org's record (smarty-dev#754): the driver loads and the database connects at first use.
+      const recordsConfig = this.#config.records;
+      const mesh = this.#mesh;
+      const recordsIdentity = identity;
+      const root = identity.kind === "main" && mainAgent.local;
+      const recordsNames = () => [mainAgentId, this.pi.getSessionName?.() ?? ""];
+      this.#openRecords = () => {
+        this.#records ??= import("./records/service.js").then(({ RecordsService }) => RecordsService.open({
+          config: recordsConfig,
+          identity: { id: recordsIdentity.id, name: recordsIdentity.name },
+          credentialDir: path.join(resolveAgentDir(), "fabric", "records-credentials"),
+          publisher: { publish: (input) => mesh.publish({ ...input, from: recordsIdentity }) },
+          ...(root ? {
+            names: recordsNames,
+            // The watchdog never starts a turn itself (F21): it asks the host's session-owned idle
+            // gate (#107), which delivers only to an idle, armed Main with no prompt preflight.
+            // Without that gate, records wait for the next turn (before_agent_start delivers them).
+            wake: async () => { await this.recordsWake?.(); },
+          } : {}),
+        })).catch((error: unknown) => {
+          // A failed open (the database is down) is retried at the next use, not cached.
+          this.#records = undefined;
+          throw error;
+        });
+        return this.#records;
+      };
+      const openRecords = this.#openRecords;
+      await builtins.install(createProviderComponent({
+        provider: "records",
+        description: "The org's durable record on its Node (PostgreSQL)",
+        create: () => new RecordsProvider(openRecords),
+      }));
+    } else {
+      this.#registry.markUnavailable("records", this.#config.records.enabled
+        ? "records need the mesh and a local host (not Schema enforce mode or a managed host)"
+        : 'disabled by configuration; set "records": { "enabled": true, "org": ..., "connection": {...} } in .pi/fabric.json');
+    }
     await builtins.memory(context, this.#config, sessionId);
     builtins.assertActive(this.#config);
     await this.#mountExecution(context, enforceSchema);
@@ -1389,6 +1455,7 @@ export class FabricRuntimeState {
     this.#sessionCapabilityLease = undefined;
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
+    await this.#closeRecords();
     await this.#agents?.close();
     await this.shellJobs.close();
     try {
@@ -1489,6 +1556,7 @@ export class FabricRuntimeState {
     this.#sessionCapabilityLease = undefined;
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
+    await this.#closeRecords();
     await this.#agents?.close();
     const externalNames = new Set(this.#externalProviders.keys());
     try {

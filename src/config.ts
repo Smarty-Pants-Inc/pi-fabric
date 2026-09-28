@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
+import { DEFAULT_RECORDS_CONFIG, normalizeRecordsConfig, type FabricRecordsConfig } from "./records/config.js";
 import { normalizeJevApprovalModel } from "./jev/model-key.js";
 export type { FabricJevConfig } from "./jev/config.js";
 import os from "node:os";
@@ -337,6 +338,7 @@ export interface FabricConfig {
   mesh: FabricMeshConfig;
   memory: FabricMemoryConfig;
   jev: FabricJevConfig;
+  records: FabricRecordsConfig;
   entropy: FabricEntropyConfig;
   repairs: FabricRepairsConfig;
   schema: FabricSchemaConfig;
@@ -439,6 +441,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     nice: 0,
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
+  records: structuredClone(DEFAULT_RECORDS_CONFIG),
   components: [],
   capture: {
     enabled: true,
@@ -1050,6 +1053,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
     },
     jev: normalizeJevConfig(input.jev),
+    records: normalizeRecordsConfig(input.records),
     components: configuredComponents.map((entry) => structuredClone(entry)),
     capture: {
       enabled: booleanValue(capture.enabled, DEFAULT_FABRIC_CONFIG.capture.enabled),

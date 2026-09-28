@@ -172,6 +172,7 @@ export class RuntimeStateBuiltins {
       "agents",
       ...(!this.managedHost && config.jev.enabled && config.schema.mode !== "enforce" ? ["jev"] : []),
       ...(config.memory.enabled || this.managedHost?.has("memory") ? ["memory"] : []),
+      ...(!this.managedHost && config.records.enabled && config.mesh.enabled && config.schema.mode !== "enforce" ? ["records"] : []),
     ]);
     this.manifest.assertActive(expectedBuiltinProviders, this.registry);
   }

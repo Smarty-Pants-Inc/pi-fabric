@@ -3,7 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { formatSkillsForPrompt, loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
+import { GUEST_TYPE_DECLARATIONS as BASE_GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
+import { withRecordsDeclarations } from "../src/records/guest-types.js";
+const GUEST_TYPE_DECLARATIONS = withRecordsDeclarations(BASE_GUEST_TYPE_DECLARATIONS);
 import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 
 /** TypeScript fences; the `host` info word marks host, extension or library code. */

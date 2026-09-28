@@ -560,6 +560,14 @@ Shared state keeps a persistent revision clock (`highWater` in the mesh `state.j
 
 If `state.json` is empty or unparseable, reads return an empty table and every write fails with `invalid state format`. This barrier keeps Fabric from issuing a revision that an earlier caller still holds. To repair a root, stop every Fabric process that uses it, inspect the file, fix it or move it aside, and then start the processes again. Moving the file aside restarts revisions. That is safe only while no process runs, because each process reads fresh revisions after it starts.
 
+## Records
+
+`records` (off by default) connects Fabric to the org's records service for `records.*`: `enabled`, `socket` (the
+service's unix socket), `credentialFile` (an operator-issued credential, for the importer or the mirror), `relayCredentialFile` (the relay's
+credential: this process then publishes nudges and raises alarms), `alarmTo`,
+`watchdogMs` and `consumerLagSeconds`. Database access, roles and archive admission are the service's own
+configuration, never a caller's. It needs the mesh. See [records](records.md).
+
 ## Actors
 
 `actors.maxSessionBytes` limits the size of a persistent actor's Pi session file, in bytes. The default is `20971520` (20 MiB). Set it to `0` to disable the limit. Before a run starts, Fabric checks the session file. A larger file gets the same reset as `agents.resetSession()`, with trigger `size`: Fabric archives the file and the run starts a fresh session. So Fabric never starts a run that must compact a session past the limit. Durable actors use the same setting. See [fresh actor sessions](agents.md#fresh-actor-sessions).

@@ -594,7 +594,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       if (!idle()) return;
       const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
-      if (inbox?.events.length && idle()) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+      if (inbox?.events.length && idle()) {
+        pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+        return;
+      }
+      // Records: the same gate, re-checked after the read (F21).
+      if (!idle()) return;
+      const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
+      if (records && idle()) pi.sendMessage(records, { deliverAs: "followUp", triggerTurn: true });
     } catch {
       // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
     } finally {
@@ -628,7 +635,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       }
     }
     await state.bootstrap(context);
-    // Inert until Pi queues a triggered message behind a live prompt preflight.
+    // Inert until Pi queues a triggered message behind a live prompt preflight (also for records, F21).
+    state.setRecordsWake(hostQueuesTriggeredBehindPreflight(pi) ? () => wakeIdleMain() : undefined);
     if (hostQueuesTriggeredBehindPreflight(pi)) {
       inboxWake.timer = setInterval(() => void wakeIdleMain(), inboxWakeMs());
       inboxWake.timer.unref?.();
@@ -733,6 +741,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (settledCompleted(event, context)) {
       const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
       if (inbox?.events.length) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+      // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
+      const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
+      if (records) pi.sendMessage(records, { deliverAs: "followUp", triggerTurn: true });
     }
   };
 
@@ -1048,6 +1059,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
     if (!inbox?.events.length) return;
     return { message: rootInboxMessage(inbox.events) };
+  });
+
+  // Records addressed to this root reach it with its next turn (smarty-dev#754 C4).
+  pi.on("before_agent_start", async (_event, context) => {
+    if (!state.initialized) return;
+    const message = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
+    if (!message) return;
+    return { message };
   });
 
   registerFabricActorHostEventObservers(pi, (eventName, event, context) => {

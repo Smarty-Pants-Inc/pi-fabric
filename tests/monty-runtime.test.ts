@@ -22,6 +22,12 @@ const run = (code: string, host: FabricHostCall = echo, extra: Partial<FabricSan
 afterEach(() => vi.restoreAllMocks());
 
 describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + missing + ")" : ""}`, () => {
+  it("routes the records primitive through the same host bridge", async () => {
+    expect(await run('return await records.read(after=3, limit=2)')).toMatchObject({
+      terminationReason: "completed", value: { ref: "records.read", args: { after: 3, limit: 2 } },
+    });
+  });
+
   it("routes the cache primitive through the same host bridge", async () => {
     expect(await run('return await cache.status(target="self")')).toMatchObject({
       terminationReason: "completed", value: { ref: "cache.status", args: { target: "self" } },

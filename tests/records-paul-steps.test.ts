@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -506,7 +506,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 	// F12: the real (non-dry) path against fakes that act as root would, under a temp system root.
 	// Root-side install/chown/chmod log their args; install really runs only inside the temp system root.
 	// runuser drops "-u USER --" and runs the rest (the real binaries) as this user.
-	const relayRun = (layout: "plain" | "dest-link" | "config-link", pgFrom: "pg-bin" | "tree16" = "pg-bin") => {
+	const relayRun = (layout: "plain" | "dest-link" | "config-link", pgFrom: "pg-bin" | "tree16" = "pg-bin", prep?: (root: string, t: string) => void) => {
 		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-relay-"));
 		const L = join(t, "calls.log");
 		const bin = join(t, "bin");
@@ -549,6 +549,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 				["--org", "test-org", "--org-user", me, "--node", join(t, "node"), ...(pgFrom === "pg-bin" ? ["--pg-bin", pg] : []), "--package", join(t, "pkg"), ...ops],
 				{ ...testEnv(bin), RECORDS_PAUL_STEPS_TEST_ROOT: `${t}/root` },
 			);
+		writeFileSync(L, "");
+		prep?.(join(t, "root"), t);
 		const r = again();
 		const calls = readFileSync(L, "utf8").split("\n").filter(Boolean);
 		return { t, r, calls, home, outside, before, again, bin, L };
@@ -628,6 +630,105 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(readFileSync(log, "utf8")).toBe("");
 		// The same id twice with the same role is fine.
 		expect(run([...base, "--operator", "importer:x:y", "--operator", "importer:x:y", "--print", "hba"]).code).toBe(0);
+	});
+
+	// F20: a full fake tree for another major, copied from the 16 one relayRun builds, with its own postgres --version.
+	const pgBase = (root: string) => join(root, "usr/lib/postgresql");
+	const cloneMajor = (root: string, n: string, move = false) => {
+		cpSync(join(pgBase(root), "16"), join(pgBase(root), n), { recursive: true });
+		if (move) rmSync(join(pgBase(root), "16"), { recursive: true });
+		writeFileSync(join(pgBase(root), n, "bin/postgres"), `#!/bin/bash\necho "postgres (PostgreSQL) ${n}.1"\n`);
+	};
+	const dataDir = (root: string) => join(root, "var/lib/test-org-records/pg");
+	const existingCluster = (root: string, major = "16") => {
+		mkdirSync(dataDir(root), { recursive: true });
+		writeFileSync(join(dataDir(root), "PG_VERSION"), `${major}\n`);
+	};
+	const refusal16 = (root: string, but: string) =>
+		`refused: the cluster at ${dataDir(root)} is PostgreSQL 16, but ${but}; install postgresql-16 (apt-get install postgresql-16) or upgrade the cluster explicitly (pg_upgradecluster); nothing was changed`;
+
+	it.skipIf(process.getuid?.() === 0)("F20: a rerun on an existing 16 cluster keeps 16 when 17 is also installed", () => {
+		const { t, r } = relayRun("plain", "tree16", (root) => {
+			cloneMajor(root, "17");
+			existingCluster(root);
+		});
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			const root = join(t, "root");
+			expect(r.out).toContain(`= PostgreSQL 16 found at ${pgBase(root)}/16/bin (the existing cluster's major`);
+			const unit = readFileSync(join(root, "etc/systemd/system/test-org-records-pg.service"), "utf8");
+			expect(unit).toContain(`ExecStart=${pgBase(root)}/16/bin/postgres -D ${dataDir(root)}`);
+			expect(unit).not.toContain("/17/");
+			expect(r.out).not.toContain("/17/bin");
+			expect(r.out.trimEnd().split("\n").at(-1)).toBe("C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=16/test-org-records unit=active peer-audit=ok");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("F20: an existing 16 cluster with only 17 installed is refused before step 1 and nothing changes", () => {
+		const files = (root: string) => [
+			join(root, "etc/systemd/system/test-org-records-pg.service"),
+			join(root, "etc/systemd/system/test-org-records.service"),
+			join(dataDir(root), "pg_hba.conf"),
+			join(dataDir(root), "conf.d/records.conf"),
+			join(root, "etc/test-org-records/service.json"),
+		];
+		const digest = (root: string) => files(root).map((f) => createHash("sha256").update(readFileSync(f)).digest("hex"));
+		let before: string[] = [];
+		const { t, r, calls, again, L } = relayRun("plain", "tree16", (root) => {
+			cloneMajor(root, "17", true);
+			existingCluster(root);
+			for (const f of files(root)) {
+				mkdirSync(dirname(f), { recursive: true });
+				writeFileSync(f, `old ${f}\n`);
+			}
+			before = digest(root);
+		});
+		try {
+			const root = join(t, "root");
+			const msg = refusal16(root, `${pgBase(root)}/16/bin is missing`);
+			expect(r.code).not.toBe(0);
+			expect(r.err).toContain(msg);
+			expect(r.out).not.toContain("## 1. ");
+			expect(digest(root)).toEqual(before);
+			expect(calls).toEqual([]);
+			// A dry run shows the same refusal.
+			const dry = again(["--dry-run"]);
+			expect(dry.code).not.toBe(0);
+			expect(dry.err).toContain(msg);
+			expect(dry.out).not.toContain("## 1. ");
+			expect(readFileSync(L, "utf8")).toBe("");
+			expect(digest(root)).toEqual(before);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("F20: a --pg-bin of 17 against an existing 16 cluster is refused before step 1", () => {
+		const { t, r, calls } = relayRun("plain", "pg-bin", (root) => existingCluster(root));
+		try {
+			expect(r.code).not.toBe(0);
+			expect(r.err).toContain(refusal16(join(t, "root"), `--pg-bin ${join(t, "pg")} is PostgreSQL 17`));
+			expect(r.out).not.toContain("## 1. ");
+			expect(calls).toEqual([]);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("F20 counterexample: a fresh cluster with 16 and 17 installed picks 17", () => {
+		const { t, r } = relayRun("plain", "tree16", (root) => cloneMajor(root, "17"));
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			const root = join(t, "root");
+			const unit = readFileSync(join(root, "etc/systemd/system/test-org-records-pg.service"), "utf8");
+			expect(unit).toContain(`ExecStart=${pgBase(root)}/17/bin/postgres -D ${dataDir(root)}`);
+			expect(r.out).toContain(`+ runuser -u test-org-records -- ${pgBase(root)}/17/bin/initdb -D `);
+			expect(r.out.trimEnd().split("\n").at(-1)).toBe("C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=17/test-org-records unit=active peer-audit=ok");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
 	});
 
 	it.skipIf(process.getuid?.() === 0)("with only a detected PostgreSQL 16, a real run says cluster=16", () => {

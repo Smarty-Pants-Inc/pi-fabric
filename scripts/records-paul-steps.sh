@@ -14,7 +14,7 @@
 #  1. useradd the <org>-records system user (skipped if it exists)
 #  2. apt-get install postgresql (the distro package; no repository added) if no /usr/lib/postgresql/<N>/bin has initdb and postgres; use the highest N (16 or newer, or --pg-bin); install node (0755) and the self-contained service-main.mjs (0644) root-owned in /opt/<org>-records (no symlinks); check <org>-records runs it with no modules
 #  3. create /var/lib/<org>-records/{,pg,status,credentials}, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes
-#  4. initdb the cluster as <org>-records if absent; write pg_hba.conf, pg_ident.conf, conf.d/records.conf; append include_dir to postgresql.conf
+#  4. initdb the cluster as <org>-records if absent (an existing cluster keeps its own major, from PG_VERSION); write pg_hba.conf, pg_ident.conf, conf.d/records.conf; append include_dir to postgresql.conf
 #  5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
 #  6. write both systemd units; daemon-reload; enable --now <org>-records-pg.service (restart if its config changed); wait for pg_isready
 #  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service
@@ -178,7 +178,16 @@ MAIN="${OPT}/service-main.mjs"
 SOCKET="${SVCSOCK}/records.sock"
 # PostgreSQL comes from the distro; its major version is detected, never assumed.
 PG_BASE="${T}/usr/lib/postgresql"
-PG_MAJOR="" PG_BIN_GIVEN=${PG_BIN:+1}
+PG_MAJOR="" PG_BIN_GIVEN=${PG_BIN:+1} PG_REFUSAL=""
+# F20: an existing cluster keeps its own major; highest-major detection is only for a fresh cluster.
+CLUSTER_MAJOR=""
+if [[ -f $DATA/PG_VERSION ]]; then
+	CLUSTER_MAJOR=$(<"$DATA/PG_VERSION") || die "cannot read ${DATA}/PG_VERSION"
+	[[ $CLUSTER_MAJOR =~ ^[0-9]+$ ]] || die "refused: ${DATA}/PG_VERSION does not hold a PostgreSQL major version; nothing was changed"
+fi
+cluster_refusal() { # WHAT: why the cluster's own binaries are not used
+	PG_REFUSAL="refused: the cluster at ${DATA} is PostgreSQL ${CLUSTER_MAJOR}, but $1; install postgresql-${CLUSTER_MAJOR} (apt-get install postgresql-${CLUSTER_MAJOR}) or upgrade the cluster explicitly (pg_upgradecluster); nothing was changed"
+}
 detect_pg() { # PG_BIN, PG_MAJOR := the highest ${PG_BASE}/<N>/bin with initdb and postgres, or a placeholder
 	local d n best=""
 	for d in "$PG_BASE"/*/bin; do
@@ -203,6 +212,12 @@ if [[ -n $PG_BIN_GIVEN ]]; then
 	if [[ -x $PG_BIN/postgres ]] && v=$("$PG_BIN/postgres" --version 2>/dev/null) && [[ $v =~ \(PostgreSQL\)\ ([0-9]+) ]]; then
 		PG_MAJOR=${BASH_REMATCH[1]}
 	fi
+	if [[ -n $CLUSTER_MAJOR && -n $PG_MAJOR && $PG_MAJOR != "$CLUSTER_MAJOR" ]]; then
+		cluster_refusal "--pg-bin ${PG_BIN} is PostgreSQL ${PG_MAJOR}"
+	fi
+elif [[ -n $CLUSTER_MAJOR ]]; then
+	PG_MAJOR=$CLUSTER_MAJOR PG_BIN="${PG_BASE}/${CLUSTER_MAJOR}/bin"
+	[[ -x $PG_BIN/initdb && -x $PG_BIN/postgres ]] || cluster_refusal "${PG_BIN} is missing"
 else
 	detect_pg
 fi
@@ -492,7 +507,7 @@ IDEMPOTENCY: a second run with the same flags
   1. skipped: user ${REC} exists
   2. apt-get skipped (PostgreSQL ${PG_MAJOR:-<N>} found); node and service-main.mjs copied only when content differs
   3. unchanged: the same directories, owners and modes are reapplied
-  4. initdb skipped (cluster exists); pg_hba.conf, pg_ident.conf, records.conf rewritten only when content
+  4. initdb skipped (cluster exists; an existing cluster keeps its own major); pg_hba.conf, pg_ident.conf, records.conf rewritten only when content
      differs; include_dir appended only once; PostgreSQL restarted only when its config changed
   5. skipped: service.json exists (never overwritten)
   6. units rewritten only when content differs; daemon-reload and enable --now leave running units unchanged
@@ -535,6 +550,9 @@ if ((ROLLBACK)); then
 	exit 0
 fi
 
+# F20: before step 1 in every mode (dry run included), so nothing is changed.
+[[ -z $PG_REFUSAL ]] || die "$PG_REFUSAL"
+
 step 1 "OS user ${REC}"
 if id -u "$REC" >/dev/null 2>&1; then
 	echo "= user ${REC} exists"
@@ -548,7 +566,11 @@ if [[ -n $PG_BIN_GIVEN ]]; then
 	[[ -n $PG_MAJOR ]] || die "cannot read the PostgreSQL major version from ${PG_BIN}/postgres --version"
 	echo "= PostgreSQL ${PG_MAJOR} found at ${PG_BIN}"
 elif [[ -n $PG_MAJOR ]]; then
-	echo "= PostgreSQL ${PG_MAJOR} found at ${PG_BIN} (the highest ${PG_BASE}/<N>/bin with initdb and postgres)"
+	if [[ -n $CLUSTER_MAJOR ]]; then
+		echo "= PostgreSQL ${PG_MAJOR} found at ${PG_BIN} (the existing cluster's major, from ${DATA}/PG_VERSION)"
+	else
+		echo "= PostgreSQL ${PG_MAJOR} found at ${PG_BIN} (the highest ${PG_BASE}/<N>/bin with initdb and postgres)"
+	fi
 else
 	# The distro's metapackage (Ubuntu noble: 16); no repository is added. Non-mutating check first.
 	candidate=$(apt-cache policy postgresql 2>/dev/null | awk '$1 == "Candidate:" { print $2 }')

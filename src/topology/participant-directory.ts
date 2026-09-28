@@ -40,6 +40,23 @@ const PARTICIPANT_LEASE_MS = 15_000;
  * the lease every heartbeat interval.
  */
 const CHANGE_REFRESH_MIN_MS = 1_000;
+/**
+ * Activity counters change on almost every turn and tool call. A change in them alone does not
+ * rewrite the shared state; a write carries them at most this often, or with any other write
+ * (smarty-dev#816: more than half of the participant rewrites were counters only). Readers
+ * (the dashboard, agents.list/status/members of remote agents) show them up to this old.
+ */
+const ACTIVITY_REFRESH_MS = 60_000;
+/** Fields a record's `changed` test ignores: timestamps and activity counters. */
+const QUIET_FIELDS = {
+  updatedAt: undefined,
+  currentTool: undefined,
+  turns: undefined,
+  toolCalls: undefined,
+  usage: undefined,
+  actorQueued: undefined,
+  actorMessages: undefined,
+} as const;
 /** How often a host sweeps records of long-dead hosts (smarty-dev#367); the first sweep waits too. */
 const DEAD_HOST_SWEEP_MS = 15 * 60 * 1_000;
 const keyFor = (prefix: string, id: string): string =>
@@ -289,6 +306,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshError: unknown;
   #deadHostSweepAt = Date.now();
   #quiescing = false;
+  /** When a committed write last carried this host's participant records. */
+  #recordsWrittenAt = 0;
 
   constructor(
     readonly mesh: MeshStore,
@@ -790,10 +809,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return actor ? [[actor.id, actor.ownerIdentityId] as const] : [];
         }),
     );
-    // A change-driven refresh needs a change beyond the timestamps that sources stamp on
-    // every read (Main's info() sets updatedAt to now).
+    // A write needs a change beyond the timestamps that sources stamp on every read (Main's
+    // info() sets updatedAt to now) and the activity counters, which ride along at most every
+    // ACTIVITY_REFRESH_MS.
     const withoutTime = (value: unknown): string =>
-      JSON.stringify({ ...(isObject(value) ? value : {}), updatedAt: undefined });
+      JSON.stringify({ ...(isObject(value) ? value : {}), ...QUIET_FIELDS });
+    let activity = false;
     for (const record of desired.values()) {
       const current = existingById.get(record.id);
       if (current && JSON.stringify(current.participant) === JSON.stringify(record)) continue;
@@ -816,6 +837,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }
       if (!current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
+      else activity ||= JSON.stringify({ ...current.participant, updatedAt: undefined }) !==
+        JSON.stringify({ ...record, updatedAt: undefined });
       ops.push({
         kind: "put",
         key,
@@ -834,6 +857,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       changed = true;
       ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
     }
+    if (activity && now - this.#recordsWrittenAt >= ACTIVITY_REFRESH_MS) changed = true;
     if (!full && !changed) return false;                       // nothing to publish
     // The file lease is renewed first and on every heartbeat, without the mesh lock
     // (smarty-dev#816). Under the fleet owner's policy, a renewal that changes nothing writes
@@ -884,6 +908,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }),
     });
     await this.mesh.writeBatch({ identity: this.options.identity, ops });
+    this.#recordsWrittenAt = Date.now();
     return true;
   }
 

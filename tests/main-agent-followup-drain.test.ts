@@ -969,3 +969,98 @@ describe("Main followUp journal across a kill with the drain off, in real Pi ses
     expect(fs.existsSync(journal)).toBe(false);
   });
 });
+
+// dev-lead's second pass on pi-fabric#102 (43b66fb): reconcile and confirm read only the last
+// 1,000 session entries, so a long turn pushed a persisted id out: resent, or never confirmed.
+describe("Main followUp delivered ids span the whole session", () => {
+  const TOOLS = 1_001;
+  const fileSession = (root: string) => {
+    const manager = SessionManager.create(root, path.join(root, "sessions"));
+    manager.appendMessage({ role: "user", content: "start", timestamp: Date.now() });
+    manager.appendMessage(fauxAssistantMessage("ok"));   // Pi writes the file from the first assistant message
+    return manager;
+  };
+  const longTurn = (manager: SessionManager) => {
+    for (let index = 0; index < TOOLS; index++) {
+      manager.appendMessage({ role: "toolResult", toolCallId: `t${index}`, toolName: "noop", content: [{ type: "text", text: "ok" }], isError: false, timestamp: Date.now() });
+    }
+  };
+  const ctxOf = (manager: SessionManager, idle = false) =>
+    ({ isIdle: () => idle, hasPendingMessages: () => false, sessionManager: manager }) as unknown as ExtensionContext;
+  const persistingPi = (manager: SessionManager) => {
+    const fake = fakePi();
+    (fake.pi.sendMessage as unknown as ReturnType<typeof vi.fn>).mockImplementation((message: { content: string; details: unknown }, options: unknown) => {
+      fake.sent.push({ message, options } as never);
+      manager.appendCustomMessageEntry("pi-fabric-agent-message", message.content, true, message.details);
+    });
+    return fake;
+  };
+
+  // The handoff is in Pi's queue at the reload; Pi persists it early in the next run, then 1,001
+  // tool results follow before the new controller's first boundary.
+  it("after a reload, a handoff persisted before 1,001 tool results is not resent at the first boundary", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-window-"));
+    roots.push(root);
+    const journal = path.join(root, "main-followups", "root.json");
+    const manager = fileSession(root);
+    const first = fakePi();                               // Pi queues it; the session has not written it
+    const main = new MainAgentController(first.pi, "session:root", true, root, "root");
+    main.attachFollowUpDrain(ctxOf(manager), 120_000, journal);
+    main.deliverAgent({ from: from("a"), message: "once", delivery: "followUp" });
+    first.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, ctxOf(manager));
+    expect(first.sent).toHaveLength(1);
+    main.closeFollowUpDrain();                            // live reload
+    const second = fakePi();
+    const reloaded = new MainAgentController(second.pi, "session:root", true, root, "root");
+    reloaded.attachFollowUpDrain(ctxOf(manager), 120_000, journal);
+    const queued = first.sent[0]!.message;
+    manager.appendCustomMessageEntry("pi-fabric-agent-message", queued.content, true, queued.details);   // Pi persists it
+    longTurn(manager);
+    second.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" }, context: { pendingMessages: [] } }, ctxOf(manager));
+    expect(second.sent).toHaveLength(0);
+    expect(fs.existsSync(journal)).toBe(false);
+  });
+
+  it("a restart reads every branch of the session file, not only the current one", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-window-"));
+    roots.push(root);
+    const journal = path.join(root, "main-followups", "root.json");
+    const manager = fileSession(root);
+    const fork = manager.getLeafId()!;
+    const first = fakePi();
+    const main = new MainAgentController(first.pi, "session:root", true, root, "root");
+    main.attachFollowUpDrain(ctxOf(manager), 120_000, journal);
+    main.deliverAgent({ from: from("a"), message: "once", delivery: "followUp" });
+    first.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, ctxOf(manager));
+    const queued = first.sent[0]!.message;
+    manager.appendCustomMessageEntry("pi-fabric-agent-message", queued.content, true, queued.details);
+    manager.branch(fork);                                 // /tree back: the delivery is off the new branch
+    manager.appendMessage({ role: "user", content: "other branch", timestamp: Date.now() });
+    manager.appendMessage(fauxAssistantMessage("ok"));
+    // SIGKILL; restart reads the file.
+    const reopened = SessionManager.open(manager.getSessionFile()!, path.join(root, "sessions"));
+    const second = fakePi();
+    new MainAgentController(second.pi, "session:root", true, root, "root").attachFollowUpDrain(ctxOf(reopened), 120_000, journal);
+    second.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" }, context: { pendingMessages: [] } }, ctxOf(reopened));
+    expect(second.sent).toHaveLength(0);
+    expect(fs.existsSync(journal)).toBe(false);
+  });
+
+  it("long turns leave no delivered followUp in the journal", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-window-"));
+    roots.push(root);
+    const journal = path.join(root, "main-followups", "root.json");
+    const manager = fileSession(root);
+    const fake = persistingPi(manager);
+    const main = new MainAgentController(fake.pi, "session:root", true, root, "root");
+    main.attachFollowUpDrain(ctxOf(manager), 120_000, journal);
+    for (let cycle = 0; cycle < 3; cycle++) {
+      main.deliverAgent({ from: from("a"), message: `cycle ${cycle}`, delivery: "followUp" });
+      fake.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } }, ctxOf(manager));   // persisted
+      longTurn(manager);
+      fake.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" }, context: { pendingMessages: [] } }, ctxOf(manager));
+      expect(fs.existsSync(journal)).toBe(false);          // 0 retained after delivery
+    }
+    expect(fake.sent).toHaveLength(3);
+  });
+});

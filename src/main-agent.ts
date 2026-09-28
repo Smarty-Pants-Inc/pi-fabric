@@ -158,20 +158,52 @@ type BoundaryEvent = { context?: { pendingMessages?: readonly unknown[] } };
 const itemBytes = (item: HeldAgentMessage): number =>
   Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data)));
 
-/** The ids of the agent messages a session's recent entries hold (delivered, not only queued). */
-const deliveredIds = (context: ExtensionContext | undefined, lookback = 1_000): Set<string> => {
-  const ids = new Set<string>();
-  let entries: readonly unknown[] = [];
-  try { entries = context?.sessionManager?.getEntries?.() ?? []; } catch { return ids; }
-  for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
-    const entry = entries[index] as { type?: string; customType?: string; details?: { id?: unknown; items?: unknown } } | undefined;
-    if (entry?.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") continue;
-    if (typeof entry.details?.id === "string") ids.add(entry.details.id);
-    if (Array.isArray(entry.details?.items)) {
-      for (const item of entry.details.items as Array<{ id?: unknown }>) if (typeof item?.id === "string") ids.add(item.id);
-    }
+type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; customType?: string; details?: { id?: unknown; items?: unknown } };
+
+/** Add the followUp ids a persisted agent-message entry carries. */
+const addDelivered = (ids: Set<string>, entry: SessionEntryLike | undefined): void => {
+  if (entry?.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") return;
+  if (typeof entry.details?.id === "string") ids.add(entry.details.id);
+  if (Array.isArray(entry.details?.items)) {
+    for (const item of entry.details.items as Array<{ id?: unknown }>) if (typeof item?.id === "string") ids.add(item.id);
   }
-  return ids;
+};
+
+/**
+ * Stream a session file line by line, calling visit for each entry that may carry an agent
+ * message, and return the id of its last entry. Holds one chunk, not the file.
+ */
+const streamSessionFile = (file: string, visit: (entry: SessionEntryLike) => void): string | undefined => {
+  const fd = fs.openSync(file, "r");
+  const buffer = Buffer.alloc(256 * 1024);
+  let rest = "";
+  let last: string | undefined;
+  const line = (text: string) => {
+    if (!text.trim()) return;
+    const cheap = /"id"\s*:\s*"([^"]+)"/.exec(text);
+    if (cheap) last = cheap[1];
+    if (!text.includes("pi-fabric-agent-message")) return;
+    try {
+      const entry = JSON.parse(text) as SessionEntryLike;
+      if (typeof entry.id === "string") last = entry.id;
+      visit(entry);
+    } catch {
+      // A torn last line: Pi rewrites it on its next append.
+    }
+  };
+  try {
+    for (;;) {
+      const read = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (read <= 0) break;
+      const lines = (rest + buffer.toString("utf8", 0, read)).split("\n");
+      rest = lines.pop() ?? "";
+      for (const text of lines) line(text);
+    }
+    line(rest);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return last;
 };
 
 export class MainAgentController implements FabricMainAgentTarget {
@@ -182,6 +214,11 @@ export class MainAgentController implements FabricMainAgentTarget {
   // Replayed handoffs of an earlier controller: in Pi's queue after a live reload, lost after a
   // restart. Only a boundary shows Pi's queue, so they wait for one (#reconcile).
   readonly #unverified: HeldAgentMessage[] = [];
+  // Every followUp id the session holds, complete: built once from the whole session at
+  // attach, then extended from the entries appended since (dev-lead on pi-fabric#102: a
+  // 1,000-entry window let a long turn push an id out, so it was sent twice).
+  #delivered = new Set<string>();
+  #scannedLeaf: string | null | undefined;
   #journal: string | undefined;
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext | undefined;
@@ -333,6 +370,52 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
   }
 
+  /** Build the delivered set from the whole session: the file, streamed, then its unflushed tail. */
+  #loadDelivered(): void {
+    this.#delivered = new Set();
+    this.#scannedLeaf = undefined;
+    const sessions = this.#context?.sessionManager;
+    if (!sessions) return;
+    if (typeof sessions.getLeafId !== "function") { this.#scannedLeaf = null; return; }
+    let fileLast: string | undefined;
+    try {
+      const file = sessions.getSessionFile?.();
+      if (file && fs.existsSync(file)) fileLast = streamSessionFile(file, (entry) => addDelivered(this.#delivered, entry));
+    } catch {
+      fileLast = undefined;
+    }
+    this.#scannedLeaf = fileLast ?? null;
+    this.#refreshDelivered();
+  }
+
+  /** Add what the session appended since the last scan: the leaf chain back to the scanned leaf. */
+  #refreshDelivered(): Set<string> {
+    // Built at first need, not at attach: session start stays cheap (AGENTS.md startup budget).
+    if (this.#scannedLeaf === undefined) this.#loadDelivered();
+    const sessions = this.#context?.sessionManager;
+    if (!sessions || this.#scannedLeaf === undefined) return this.#delivered;
+    if (typeof sessions.getLeafId !== "function" || typeof sessions.getEntry !== "function") {
+      // A host without the tree API: scan every entry (complete, never a window).
+      try { for (const entry of sessions.getEntries?.() ?? []) addDelivered(this.#delivered, entry as SessionEntryLike); } catch { /* retry next time */ }
+      return this.#delivered;
+    }
+    try {
+      const leaf = sessions.getLeafId?.() ?? null;
+      // ponytail: after /tree moves the leaf to another branch, this walks that branch to its
+      // root once; every entry of the old branch was scanned when it was appended.
+      for (let id = leaf; id !== null && id !== this.#scannedLeaf;) {
+        const entry = sessions.getEntry?.(id) as SessionEntryLike | undefined;
+        if (!entry) break;
+        addDelivered(this.#delivered, entry);
+        id = typeof entry.parentId === "string" ? entry.parentId : null;
+      }
+      this.#scannedLeaf = leaf;
+    } catch {
+      // The set stays as it was; the next boundary scans again.
+    }
+    return this.#delivered;
+  }
+
   /**
    * At a boundary, where Pi shows its pending queue: a replayed handoff the session holds is
    * done, one still in Pi's queue awaits the session, and any other was lost and is held again.
@@ -341,7 +424,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const pending = event.context?.pendingMessages;
     if (!this.#unverified.length || !Array.isArray(pending)) return;
     const queued = agentMessageIds(pending);
-    const delivered = deliveredIds(this.#context);
+    const delivered = this.#refreshDelivered();
     for (const item of this.#unverified.splice(0)) {
       if (delivered.has(item.id)) continue;
       if (queued.has(item.id)) this.#sent.push(item);
@@ -357,7 +440,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
     if (!this.#sent.length) return;
-    const delivered = deliveredIds(this.#context);
+    const delivered = this.#refreshDelivered();
     const before = this.#sent.length;
     for (let index = this.#sent.length - 1; index >= 0; index--) {
       if (delivered.has(this.#sent[index]!.id)) this.#sent.splice(index, 1);
@@ -381,7 +464,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
     // The owner rule (dev-lead on pi-fabric#102): skip every id the session holds; a handoff
     // may still sit in Pi's queue, so it waits for a boundary to check; the rest is held again.
-    const delivered = deliveredIds(this.#context, Number.MAX_SAFE_INTEGER);
+    const delivered = this.#refreshDelivered();
     const seen = new Set<string>();
     for (const item of items.sort((a, b) => a.sentAt - b.sentAt)) {
       if (delivered.has(item.id) || seen.has(item.id)) continue;
@@ -495,6 +578,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#held.splice(0);
     this.#sent.splice(0);
     this.#unverified.splice(0);
+    this.#delivered = new Set();
+    this.#scannedLeaf = undefined;
     this.#journal = undefined;
     this.#context = undefined;
   }

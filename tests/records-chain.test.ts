@@ -51,12 +51,13 @@ const tamper = async (pool: pg.Pool, sql: string, values: unknown[] = []): Promi
   }
 };
 
+beforeAll(async () => { if (postgresBin) server = await startPostgres(); }, 60_000);
+afterAll(async () => {
+  await Promise.allSettled(open.map((pool) => pool.end()));
+  await server?.stop();
+}, 30_000);
+
 describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () => {
-  beforeAll(async () => { server = await startPostgres(); }, 60_000);
-  afterAll(async () => {
-    await Promise.allSettled(open.map((pool) => pool.end()));
-    await server?.stop();
-  }, 30_000);
 
   it("an untouched chain verifies clean; each prev_hash is the previous row's canonical hash", async () => {
     const { pool, store } = await chain(5);
@@ -232,6 +233,91 @@ describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () 
     expect(await store.verify(alice, { anchors: [await store.anchor(alice, {})] })).toMatchObject({ ok: true, clean: true, rows: 1204 });
     // The trigger is back on: records stay append-only for every role.
     await expect(pool.query("UPDATE records SET text = 'x' WHERE seq = 1")).rejects.toThrow(/append-only/);
+  });
+});
+
+/**
+ * A pool that can pause a call right after its membership check (#118 S2), so a second connection
+ * commits an edit between the check and what the call reads next.
+ */
+const pausable = (pool: pg.Pool) => {
+  let armed = 0;
+  let hit: (() => void) | undefined;
+  let resume: (() => void) | undefined;
+  const wrapped: ClientPool = {
+    connect: async () => {
+      const client = await pool.connect();
+      return Object.assign(Object.create(client), {
+        query: async (text: string, values?: unknown[]) => {
+          const result = await client.query(text, values);
+          if (armed > 0 && text.includes("AS min_org") && --armed === 0) {
+            hit?.();
+            await new Promise<void>((resolve) => { resume = resolve; });
+          }
+          return result;
+        },
+        release: (error?: Error | boolean) => client.release(error),
+      });
+    },
+  };
+  /** Pause at the n-th membership check from now; resolves when the call is paused there. */
+  const pauseAt = (n: number) => { armed = n; return new Promise<void>((resolve) => { hit = resolve; }); };
+  return { wrapped, pauseAt, resume: () => resume?.() };
+};
+
+describe.skipIf(!postgresBin)("the membership check and what a call consumes share one snapshot (#118 S2)", () => {
+  const setup = async () => {
+    const { pool } = await chain(0);
+    const gate = pausable(pool);
+    const store = new RecordStore(gate.wrapped, { org: "smarty-pants", origin: "dev1" });
+    for (let n = 1; n <= 3; n++) await store.append(alice, { ref: REF, kind: "status", key: `k${n}`, text: `record ${n}`, data: { state: "in progress" } });
+    const target = (await pool.query<{ id: string }>("SELECT id FROM records WHERE seq = 3")).rows[0]!.id;
+    const forge = () => tamper(pool, "UPDATE records SET origin = 'dev9', text = 'forged' WHERE seq = 3");
+    return { pool, store, gate, target, forge };
+  };
+
+  it("by-id replay returns the checked version when an edit commits after the check", async () => {
+    const { store, gate, target, forge } = await setup();
+    const paused = gate.pauseAt(1);
+    const call = store.byIds([target]);
+    await paused;
+    await forge();
+    gate.resume();
+    expect((await call).map((record) => [record.sequence, record.text, record.origin])).toEqual([[3, "record 3", "dev1"]]);
+    await expect(store.byIds([target])).rejects.toMatchObject({ code: "RECORD_INTEGRITY" });
+  });
+
+  it("the relay publishes the checked version when an edit commits after the check", async () => {
+    const { store, gate, forge } = await setup();
+    // The second check: the one in the snapshot the published content is read from.
+    const paused = gate.pauseAt(2);
+    const call = store.claimPublications(10);
+    await paused;
+    await forge();
+    gate.resume();
+    expect((await call).claims.map((claim) => [claim.sequence, claim.text])).toEqual([[1, "record 1"], [2, "record 2"], [3, "record 3"]]);
+    await expect(store.claimPublications(10)).rejects.toMatchObject({ code: "RECORD_INTEGRITY" });
+  });
+
+  it("an append links to the checked version of the last row when an edit commits after the check", async () => {
+    const { store, gate, forge, pool } = await setup();
+    const before = await store.anchor(alice, {});
+    const paused = gate.pauseAt(1);
+    const call = store.append(alice, { ref: REF, kind: "status", key: "k4", text: "record 4", data: { state: "in progress" } });
+    await paused;
+    await forge();
+    gate.resume();
+    expect(await call).toMatchObject({ sequence: 4 });
+    expect((await pool.query<{ prev_hash: string }>("SELECT prev_hash FROM records WHERE seq = 4")).rows[0]!.prev_hash).toBe(before.hash);
+    // The forged row is foreign now: verify names it, and the next append refuses.
+    expect(await store.verify(alice, {})).toMatchObject({ ok: false, break: { seq: 3, reason: "origin" } });
+    await expect(store.append(alice, { ref: REF, kind: "status", key: "k5", text: "x", data: { state: "in progress" } })).rejects.toMatchObject({ code: "RECORD_INTEGRITY" });
+  });
+
+  it("appends still commit in seq order and chain cleanly under concurrency", async () => {
+    const { store } = await setup();
+    await Promise.all(Array.from({ length: 40 }, (_, n) => store.append(alice, { ref: REF, kind: "comment", key: `c${n}`, text: `${n}` })));
+    expect(await store.verify(alice, { anchors: [await store.anchor(alice, {})] })).toMatchObject({ ok: true, clean: true, rows: 43 });
   });
 });
 

@@ -125,10 +125,14 @@ describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
         await superuser.query("ALTER TABLE records ENABLE TRIGGER records_no_update_delete");
       } finally { await superuser.end(); }
       const broken = (await runtime.execution.execute({
-        code: `return await records.verify({ anchors: [${JSON.stringify({ seq: clean.anchor.seq, hash: clean.anchor.hash })}] });`,
+        // The guest type names every break reason, the membership ones included (a comparison with a
+        // reason missing from the type fails the type check).
+        code: `const result = await records.verify({ anchors: [${JSON.stringify({ seq: clean.anchor.seq, hash: clean.anchor.hash })}] });
+          const foreign = result.break?.reason === "org" || result.break?.reason === "origin";
+          return { ...result, foreign };`,
         context, signal: undefined, parentToolCallId: "records-verify-2", onPartial() {},
-      })).value as { ok: boolean; break?: { seq: number; reason: string }; summary: string };
-      expect(broken).toMatchObject({ ok: false, break: { seq: 2, reason: "prev_hash" } });
+      })).value as { ok: boolean; break?: { seq: number; reason: string }; summary: string; foreign: boolean };
+      expect(broken).toMatchObject({ ok: false, break: { seq: 2, reason: "prev_hash" }, foreign: false });
       expect(broken.summary).toMatch(/^chain broken at smarty-pants seq 2/);
     } finally {
       await runtime.shutdown();

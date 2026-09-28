@@ -48,7 +48,7 @@ interface FabricRecordsVerifyResult {
   org: string; rows: number; last?: { seq: number; hash: string };
   /** No chain break and every anchor holds. */ ok: boolean;
   /** ok, and every record is covered by an anchor. */ clean: boolean;
-  break?: { org: string; seq: number; reason: "prev_hash" | "gap"; expected: string | null; found: string | null };
+  break?: { org: string; seq: number; reason: "prev_hash" | "gap" | "org" | "origin"; expected: string | null; found: string | null };
   /** Every supplied anchor is checked; only the first 20 failures are listed. */
   anchors: { checked: number; passed: number; failed: number };
   failedAnchors: { seq: number; hash: string; found: string | null }[];

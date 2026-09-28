@@ -289,9 +289,10 @@ export class RecordStore implements RecordsBackend, RecordsOps {
    * aborted caller started commits later. Only an abort during COMMIT itself leaves the outcome
    * unknown, which a retry with the same key resolves (C3).
    */
-  async transaction<T>(work: (client: SqlClient) => Promise<T>, mode = "", signal?: AbortSignal): Promise<T> {
+  async transaction<T>(work: (client: SqlClient) => Promise<T>, mode = "", signal?: AbortSignal, sessionLock?: string): Promise<T> {
     const client = await connect(this.pool, signal);
     let released = false;
+    let locked = false;
     const release = (destroy: boolean) => {
       if (released) return;
       released = true;
@@ -307,6 +308,15 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       signal.throwIfAborted();
     }
     try {
+      if (sessionLock) {
+        // Held across BEGIN..COMMIT and taken before BEGIN, so a REPEATABLE READ snapshot starts only
+        // once the lock is ours: it sees every earlier holder's commit (#118 S2). A destroyed
+        // connection (abort) frees it with the backend.
+        await client.query(`SET lock_timeout = '${LOCK_TIMEOUT}'`);
+        await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [sessionLock]);
+        locked = true;
+        await client.query("RESET lock_timeout");
+      }
       await client.query(`BEGIN${mode ? ` ${mode}` : ""}`);
       await client.query(`SET LOCAL ROLE ${this.#role}`);
       await client.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
@@ -324,6 +334,10 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       throw error;
     } finally {
       signal?.removeEventListener("abort", onAbort);
+      if (locked && !released) {
+        await client.query("RESET lock_timeout").catch(() => undefined);
+        await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [sessionLock]).catch(() => release(true));
+      }
       release(false);
     }
   }
@@ -339,9 +353,11 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     // The archive frontier is read before the lock, never inside it (a wal-g run takes seconds).
     const gate = this.options.admission;
     if (gate?.enabled && !gate.refreshed) await gate.refresh(signal);
-    const result = await this.transaction(async (client) => {
-      // The per-org lock: commit order equals seq, and the key check below cannot race (C3, C4).
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`fabric-records:${this.org}`]);
+    const attempt = () => this.transaction(async (client) => {
+      // The per-org lock (taken before BEGIN, below): commit order equals seq, and the key check
+      // cannot race (C3, C4). One REPEATABLE READ snapshot from here to COMMIT: the membership
+      // check and every row this append builds on (key, references, seq, prev_hash) are the same
+      // versions, whatever commits meanwhile (#118 S2).
       await client.query("SET LOCAL synchronous_commit = on");
       // No new record, and so no new link, on top of a table that holds another org's or origin's row.
       await this.#member(client);
@@ -377,7 +393,15 @@ export class RecordStore implements RecordsBackend, RecordsOps {
         [row.id, this.origin, seq, recordTopic(parsed), typeof args.data?.to === "string" ? args.data.to : null],
       );
       return { receipt: receipt(row), committed: true };
-    }, "", signal);
+    }, "ISOLATION LEVEL REPEATABLE READ", signal, `fabric-records:${this.org}`);
+    // A REPEATABLE READ conflict (40001, e.g. a recovery bound another process wrote meanwhile)
+    // rolled everything back: retry; the key makes a retry safe (C3).
+    let result!: Awaited<ReturnType<typeof attempt>>;
+    for (let tries = 1; ; tries++) {
+      try { result = await attempt(); break; } catch (error) {
+        if (tries >= 5 || (error as { code?: string }).code !== "40001" || (error as { commitUncertain?: boolean }).commitUncertain) throw error;
+      }
+    }
     if (result.committed) {
       // The recovery bound, read after COMMIT (C2). A crash before it is filled by the next check.
       await this.transaction((client) => this.fillBounds(client, "recent")).catch(() => undefined);
@@ -596,15 +620,28 @@ export class RecordStore implements RecordsBackend, RecordsOps {
    * the records service passes the authenticated caller (`as`).
    */
   async claimPublications(limit: number, signal?: AbortSignal, as = `relay:${this.origin}`): Promise<{ claims: ClaimedPublication[]; more: boolean }> {
-    const all = await this.transaction(async (client) => {
+    // The claim itself is only lease metadata. What the relay publishes is read again below, from one
+    // REPEATABLE READ snapshot that also holds the membership check (#118 S2): never a record
+    // version the check did not see.
+    const leased = await this.transaction(async (client) => {
       await this.#member(client);
-      const { rows } = await client.query<{ claim_id: string; record_id: string; seq: string; topic: string; recipient: string | null; kind: string; ref: string; author: string; key: string; text: string | null; created_at: Date }>(
-        "SELECT * FROM publication_claim($1, $2, $3, $4)", [this.origin, limit, PUBLICATION_LEASE_SECONDS, as]);
-      return rows.map((row) => ({
-        claimId: row.claim_id, recordId: row.record_id, sequence: Number(row.seq), topic: row.topic, recipient: row.recipient, kind: row.kind, ref: row.ref,
-        from: row.author, key: row.key, text: row.text, createdAt: row.created_at.getTime(),
-      }));
+      return (await client.query<{ claim_id: string; record_id: string; seq: string; topic: string; recipient: string | null }>(
+        "SELECT claim_id, record_id, seq, topic, recipient FROM publication_claim($1, $2, $3, $4)", [this.origin, limit, PUBLICATION_LEASE_SECONDS, as])).rows;
     }, "", signal);
+    const checked = leased.length === 0 ? new Map<string, { kind: string; ref: string; author: string; key: string; text: string | null; created_at: Date }>() : await this.transaction(async (client) => {
+      await this.#member(client);
+      const { rows } = await client.query<{ id: string; kind: string; ref: string; author: string; key: string; text: string | null; created_at: Date }>(
+        "SELECT id, kind, ref, author, key, left(text, 2048) AS text, created_at FROM records WHERE id = ANY($1::uuid[]) AND org = $2 AND origin = $3",
+        [leased.map((row) => row.record_id), this.org, this.origin]);
+      return new Map(rows.map((row) => [row.id, row]));
+    }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", signal);
+    const all = leased.flatMap((row) => {
+      const record = checked.get(row.record_id);
+      return record ? [{
+        claimId: row.claim_id, recordId: row.record_id, sequence: Number(row.seq), topic: row.topic, recipient: row.recipient, kind: record.kind, ref: record.ref,
+        from: record.author, key: record.key, text: record.text, createdAt: record.created_at.getTime(),
+      }] : [];
+    });
     // The whole claim stays within the response budget (F10); what does not fit is given back now.
     const claims = withinBudget(all);
     const omitted = all.slice(claims.length);
@@ -662,10 +699,10 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     if (ids.length === 0) return [];
     return this.transaction(async (client) => {
       await this.#member(client);
-      const { rows } = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE id = ANY($1::uuid[]) AND org = $2 ORDER BY seq`, [[...ids], this.org]);
+      const { rows } = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE id = ANY($1::uuid[]) AND org = $2 AND origin = $3 ORDER BY seq`, [[...ids], this.org, this.origin]);
       // A pending batch was cut to the budget when it was saved, so this fits the same budget.
       return withinBudget(rows.map(envelope));
-    }, "READ ONLY", signal);
+    }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", signal);
   }
 
   /** One page of one fold collection, from the cursor get's `state.more` (or the previous page's next). */

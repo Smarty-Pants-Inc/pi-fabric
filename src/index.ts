@@ -199,7 +199,7 @@ const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sess
 // published to an idle Main starts a turn about 60-75 s later. PI_FABRIC_INBOX_WAKE_MS overrides it.
 // The idle wake needs a Pi that queues a triggered message behind a live prompt preflight;
 // otherwise a wake can start a run that makes a prompt in its preflight fail (#107 review F2).
-// Pi declares it on the extension API (pi.hostCapabilities, Smarty-Pants-Inc/pi#74), not through
+// Pi declares it on the extension API (pi.hostCapabilities, Smarty-Pants-Inc/pi#74 and #76), not through
 // a module export: Fabric ships its own copy of the Pi package, whose export describes that copy.
 // An older Pi lacks it, and the wake stays off. Tests inject the capability under the global
 // symbol below, since their Pi predates it.

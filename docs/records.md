@@ -59,10 +59,17 @@ Database authority lives in one place: the org's **records service**.
 
 `scripts/records-paul-steps.sh` installs all of it in one idempotent run with `--dry-run`: the user, the cluster,
 pg_hba and ident, the units, the migration, and credential issuance. The service runs from a self-contained bundle
-(`dist/records-service/service-main.mjs`, every dependency inlined), which the installer copies with the node binary
-into root-owned `/opt/<org>-records`: no dependency tree and no symlinks, so nothing an agent can write is ever run
-as the records user. Everything written into the org user's home is written as that user. `--help` shows each root
-step, what a rerun does, the success line and the rollback.
+(`dist/records-service/service-main.mjs`, every dependency inlined). The installer takes the approved sha256 of
+that bundle and of the node binary as required arguments (`--bundle-sha256`, `--node-sha256`; `--print-digests`
+shows them for a build). Before it changes anything, it copies both once into a fresh root-only staging directory,
+verifies the staged copies, and installs and runs only those bytes, in root-owned `/opt/<org>-records`. So nothing
+an agent can write, before or during the install, is ever run as root or as the records user. Every path comes from
+its arguments (`--package-root`, `--node`), so the script also works when copied elsewhere, such as
+`/run/smarty-step.sh`. Everything written into the org user's home is written as that user. `--help` shows each
+root step, what a rerun does, the success line and the rollback. Archiving is off until the WAL-G step. Until then
+`max_wal_size = 1GB` is PostgreSQL's soft checkpoint target, not a hard quota: `pg_wal` can pass it under heavy
+writes, and step 9 prints its size. PostgreSQL comes only from the distro package path, and its binaries and
+every ancestor directory must be root-owned and not group- or world-writable before anything there is run.
 
 ## Configuration
 
@@ -99,7 +106,8 @@ The service (`/etc/<org>-records/service.json`, written by the install script) h
 - `mirror.enabled` writes the GitHub mirror's outbox rows. With it off, no rows are written and the record is the
   only copy. A repository outside `mirror.repos` gets rows in state `skipped`.
 - `admission.targets` turns on C2 admission; without targets it is off. WAL-G is set up in its own authorized step.
-  Until then, the install's `archive_command` fails, so no WAL is thrown away and `pg_wal` grows.
+  Until then, archiving is off (`archive_mode = off`): WAL is recycled after each checkpoint, and nothing is copied
+  off this host.
 
 ## Guest API
 
@@ -170,12 +178,12 @@ The record is append-only and tamper-evident. Each record's `prev_hash` is the S
 record's canonical bytes: the UTF-8 of the stored row as JSON with sorted keys, every column in its PostgreSQL text
 form (`created_at` as its exact epoch, `extract(epoch FROM created_at)::text`: seconds with six decimals, era-complete,
 `Infinity`/`-Infinity` spelled out), NULL as `null`. The append sets it inside its transaction,
-under the per-org lock; migration v2 backfilled the rows before it. The first record's `prev_hash` is NULL.
+under the per-org lock; migration v3 backfilled the rows before it. The first record's `prev_hash` is NULL.
 
 - `records.anchor()` (or `service-main anchor --config FILE`) returns `{ org, seq, hash, at }` for the last record.
   The backup adapter writes it to every backup target on each run: at least every 5 min on the admission target,
   daily on the others. A copy off the host is what makes a rewrite of the whole chain detectable.
-- `records.verify({ anchors })` (or `service-main verify --config FILE --anchors FILE`, exit 0 clean, 1 broken,
+- `records.verify({ anchors })` (or `service-main verify-chain --config FILE --anchors FILE`, exit 0 clean, 1 broken,
   3 unanchored) recomputes the chain from one snapshot and reports the first `break` (`org`, `seq`, `reason`
   `prev_hash` or `gap`, `expected`, `found`), checks each anchor (the row at that seq exists with that hash), and
   reports `unanchored: { from, to }` for rows after the latest anchor. It scans the whole table: a row of another org

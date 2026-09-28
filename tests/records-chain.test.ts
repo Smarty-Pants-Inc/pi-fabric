@@ -200,21 +200,32 @@ describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () 
     expect(state!.body!.length).toBeGreaterThan(2000);
   });
 
-  it("the migration backfills a chain over existing rows", async () => {
+  it("a fresh install runs v1, v2 (principal_reissue) and v3 (the chain)", async () => {
+    const pool = await database();
+    const client = await pool.connect();
+    try { expect(await migrate(client)).toBe(3); } finally { client.release(); }
+    expect((await pool.query("SELECT version FROM records_schema ORDER BY version")).rows.map((row) => row.version)).toEqual([1, 2, 3]);
+    expect((await pool.query("SELECT 1 FROM pg_proc WHERE proname = 'principal_reissue'")).rowCount).toBe(1);
+    expect((await pool.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'records' AND column_name = 'prev_hash'")).rowCount).toBe(1);
+  });
+
+  it.each([1, 2])("an existing v%i database with rows upgrades to v3 and its backfilled chain verifies", async (from) => {
     const pool = await database();
     const client = await pool.connect();
     try {
-      // A v1 database, as #103 left it, with rows.
+      // A database as #103 (v1) or #117 (v2) left it, with rows.
       await client.query("BEGIN");
       await client.query("CREATE TABLE records_schema (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
-      await client.query(MIGRATIONS[0] as string);
-      await client.query("INSERT INTO records_schema (version) VALUES (1)");
+      for (let version = 1; version <= from; version++) {
+        await client.query(MIGRATIONS[version - 1] as string);
+        await client.query("INSERT INTO records_schema (version) VALUES ($1)", [version]);
+      }
       for (let n = 1; n <= 1203; n++) {
         await client.query("INSERT INTO records (org, origin, seq, ref, kind, author, text, data, key, payload_hash) VALUES ('smarty-pants', 'dev1', $1, $2, 'comment', 'session:alice', $3, $4, $5, 'h')",
           [n, REF, `old ${n}`, JSON.stringify({ n, big: 12345678901234567890n.toString() }), `old${n}`]);
       }
       await client.query("COMMIT");
-      expect(await migrate(client)).toBe(MIGRATIONS.length);
+      expect(await migrate(client)).toBe(3);
     } finally { client.release(); }
     const store = new RecordStore(pool as unknown as ClientPool, { org: "smarty-pants", origin: "dev1" });
     await store.append(alice, { ref: REF, kind: "comment", key: "new", text: "after the migration" });

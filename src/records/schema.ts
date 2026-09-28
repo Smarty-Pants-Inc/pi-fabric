@@ -321,12 +321,25 @@ GRANT EXECUTE ON FUNCTION consumer_open(text, text, jsonb), consumer_save(text, 
   archive_claim(text, double precision), archive_record(text, pg_lsn, text) TO ${WRITER_ROLE};
 `;
 
+// v2: recover an operator issuance interrupted after its commit (the credential file never written):
+// rotate that operator principal's token, only for the same id as an operator with the same role.
+const v2 = `
+CREATE FUNCTION principal_reissue(p_id text, p_role text, p_token_hash text)
+  RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+BEGIN
+  UPDATE principals SET token_hash = p_token_hash WHERE id = p_id AND issued_by = 'operator' AND role = p_role;
+  RETURN FOUND;
+END $f$;
+REVOKE ALL ON FUNCTION principal_reissue(text, text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION principal_reissue(text, text, text) TO ${WRITER_ROLE};
+`;
+
 /**
- * v2 (smarty-dev#754 R3): the hash chain. prev_hash is the SHA-256 of the org's previous record's
+ * v3 (smarty-dev#754 R3): the hash chain. prev_hash is the SHA-256 of the org's previous record's
  * canonical bytes (chain.ts); existing rows are backfilled here, the only UPDATE records ever sees,
  * with the append-only trigger off inside this transaction.
  */
-const v2 = async (client: SqlClient): Promise<void> => {
+const v3 = async (client: SqlClient): Promise<void> => {
   await client.query(`
     ALTER TABLE records ADD COLUMN prev_hash text CHECK (prev_hash ~ '^[0-9a-f]{64}$');
     CREATE INDEX records_org_seq ON records (org, seq);
@@ -337,7 +350,7 @@ const v2 = async (client: SqlClient): Promise<void> => {
 
 /** A migration is SQL, or a step that needs code (a backfill), run in the migration's transaction. */
 export type Migration = string | ((client: SqlClient) => Promise<void>);
-export const MIGRATIONS: readonly Migration[] = [v1, v2];
+export const MIGRATIONS: readonly Migration[] = [v1, v2, v3];
 
 /** A minimal client: pg's PoolClient satisfies it, and so does a test double. */
 export interface SqlClient {

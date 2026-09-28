@@ -27,7 +27,8 @@ const receipt = await records.append({
 - `records.read({ after: cursor, limit })` pages events in commit order up to the committed frontier; save `next`
   as your cursor only **after** acting on the page.
 - `records.get({ ref })` returns `{ state, history, next? }`: `state.statuses[author]`, `state.openAsks`,
-  `state.decisions`, `state.links`, `state.open`, and the issue fields.
+  `state.decisions`, `state.links`, `state.open`, and the issue fields. If `state.more` is set, a collection
+  continues: `records.fold({ ref, part, after: state.more[part] })`, then each page's `next`.
 - `records.list({ repo?, open?, owner?, hasOpenAsk?, updatedSince? })` is a view query, never a delivery path.
 - `records.status()` shows the frontier, unpublished nudges and archive admission.
 

@@ -122,6 +122,19 @@ const standalone = await build({
   }],
 });
 
+// The records service runs as its own OS user from a root-owned copy of one file:
+// inline every package (pg included) so no module resolves outside that copy.
+await build({
+  entryPoints: ["src/records/service-main.ts"],
+  outfile: "dist/records-service/service-main.mjs",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  logLevel: "info",
+  banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
+});
+
 // tsc does not copy input .d.ts files; ship the generated kernel ABI and receipt.
 mkdirSync("dist/verified/generated", { recursive: true });
 const receiptPath = "src/verified/generated/manifest.json";

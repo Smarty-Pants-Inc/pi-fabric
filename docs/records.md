@@ -29,7 +29,8 @@ Database authority lives in one place: the org's **records service**.
     wins. A retry with the same nonce recovers a credential whose response was lost; any other claim is refused.
     Nothing proves the first claimant is the id's owner (see Trust boundary).
   - **Reserved identities** are never registrable: the installer grants them (`--operator ROLE:ID`) in the
-    service's config and issues their credentials. The **importer** and the **mirror** run as `<org>-records`, and
+    service's config and issues their credentials. An operator id can never be a session or actor id. A role needs
+    both the config's grant and an issue for that role (recorded with the principal). The **importer** and the **mirror** run as `<org>-records`, and
     their credentials stay in its 0700 `/var/lib/<org>-records/credentials`. The **relay** publishes nudges on the
     org's mesh, which only the org user can write, so its credential goes to the org user (0600,
     `~/.config/<org>-records/relay.json`, Fabric's `records.relayCredentialFile`).
@@ -42,15 +43,26 @@ Database authority lives in one place: the org's **records service**.
   publication, or claim an alarm, and only its own live claim. An alarm claim is honored only while its condition
   holds. A process without the relay credential still delivers by cursor and wakes its own root. A malformed frame
   ends only its own connection.
-- **Responses are byte-bounded.** A page, an inbox replay, a history or a fold list stops near 768 KiB and returns
-  `next`, always with at least one record (one record is at most ~450 KiB). A nudge claim carries at most 2 KiB of
-  text per record. Every protocol line is at most 1 MiB, checked on the whole line wherever the stream splits.
+- **Responses are byte-bounded.** Every response stays near 768 KiB, and each collection continues explicitly:
+  - pages, inbox replays and histories return `next`;
+  - `records.get`'s fold fields are cut to 16 KiB (listed in `state.truncated`), each fold collection gets a share,
+    and `state.more` gives a cursor per collection to page with `records.fold`;
+  - `records.list` pages by bytes too, and each item carries at most 20 statuses and 20 open asks, with
+    `statusCount` and `openAskCount`;
+  - a nudge claim carries at most 2 KiB of text per record, and a recipient (`data.to`) is at most 256 characters of
+    `A-Z a-z 0-9 . _ @ : / -`, checked at append; a claim that would not fit returns fewer rows and `more`.
+
+  Every protocol line is at most 1 MiB, checked on the whole line wherever the stream splits.
 - **The theft audit.** The service asks the kernel (SO_PEERCRED) who is on each connection. It stores the pid, uid,
   gid and command line with each append (`record_peers`, never in the record). When one principal's token is used
   by two live processes within an hour, it writes a one-line `alarm` to its status file.
 
 `scripts/records-paul-steps.sh` installs all of it in one idempotent run with `--dry-run`: the user, the cluster,
-pg_hba and ident, the units, the migration, and credential issuance.
+pg_hba and ident, the units, the migration, and credential issuance. The service runs from a self-contained bundle
+(`dist/records-service/service-main.mjs`, every dependency inlined), which the installer copies with the node binary
+into root-owned `/opt/<org>-records`: no dependency tree and no symlinks, so nothing an agent can write is ever run
+as the records user. Everything written into the org user's home is written as that user. `--help` shows each root
+step, what a rerun does, the success line and the rollback.
 
 ## Configuration
 
@@ -145,9 +157,12 @@ const health = await records.status();
   cursor, up to the committed frontier, from one snapshot. `next` is the cursor to save **after** you act on the
   page. Every consumer that must not miss a record reads this way (C4).
 - `records.get({ ref, after?, limit? })` returns the ref's fold (`title`, `owner`, `stage`, `open`, `statuses` per
-  author, `decisions`, `openAsks`, `links`, `mirror`) and its history, oldest first; page with `after: next`.
+  author, `decisions`, `openAsks`, `links`, `mirror`) and its history, oldest first; page with `after: next`. When
+  `state.more` is present, a collection continues: page it with
+  `records.fold({ ref, part, after: state.more[part] })` until a page has no `next`.
 - `records.list({ org?, repo?, open?, owner?, hasOpenAsk?, updatedSince?, limit?, after? })` is a **view query** for
-  boards and alarms, newest update first, with each author's status and the open asks. It is never a delivery path.
+  boards and alarms, newest update first, with up to 20 authors' statuses and 20 open asks per item (and their
+  counts). It is never a delivery path.
 
 ## Commit, then nudge
 

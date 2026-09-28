@@ -45,6 +45,12 @@ const descriptors: FabricActionDescriptor[] = [
     risk: "read", namespace: "coordination",
   },
   {
+    name: "fold",
+    description: "One page of one of a ref's fold collections (statuses, mirror, decisions, openAsks, links), from the cursor in records.get's state.more or the previous page's next.",
+    inputSchema: { type: "object", required: ["ref", "part"], additionalProperties: false, properties: { ref: { type: "string" }, part: { type: "string", enum: ["statuses", "mirror", "decisions", "openAsks", "links"] }, after: { type: "string" } } },
+    risk: "read", namespace: "coordination",
+  },
+  {
     name: "list",
     description: "A view query over current issues (for boards and alarms, never a delivery path): items with statuses per author and open asks, newest update first.",
     inputSchema: {
@@ -102,6 +108,7 @@ export class RecordsProvider implements FabricProvider {
       case "append": return service.backend.append(principal, args, options);
       case "read": return service.backend.read(principal, args, options);
       case "get": return service.backend.get(principal, args, options);
+      case "fold": return service.backend.fold(principal, args, options);
       default: return service.backend.list(principal, args, options);
     }
   }

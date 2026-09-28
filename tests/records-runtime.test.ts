@@ -32,7 +32,7 @@ describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
     await service.listen();
     // The installer's --operator relay:relay:fabric: the relay credential, for the org user's Fabric.
     relayCredential = path.join(server.dir, "relay.json");
-    fs.writeFileSync(relayCredential, JSON.stringify(await issuePrincipal(serviceConfig, "relay:fabric", "relay", pool as unknown as ClientPool)), { mode: 0o600 });
+    fs.writeFileSync(relayCredential, JSON.stringify(await issuePrincipal(serviceConfig, "relay:fabric", "relay", "relay", pool as unknown as ClientPool)), { mode: 0o600 });
   }, 60_000);
   afterAll(async () => { await service?.close(); await server?.stop(); }, 30_000);
 

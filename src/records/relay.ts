@@ -50,7 +50,7 @@ export class PublicationRelay {
     let published = 0;
     const limit = this.options.batch ?? BATCH;
     for (;;) {
-      const rows = await this.store.claimPublications(limit, signal);
+      const { claims: rows, more } = await this.store.claimPublications(limit, signal);
       for (const [index, row] of rows.entries()) {
         let sequence: number;
         try {
@@ -74,7 +74,7 @@ export class PublicationRelay {
         // False when the lease ran out and another relay took the row: it publishes again (at least once).
         if (await this.store.ackPublication(row, sequence, signal)) published++;
       }
-      if (rows.length < limit) return { published, failed: 0 };
+      if (!more) return { published, failed: 0 };
     }
   }
 

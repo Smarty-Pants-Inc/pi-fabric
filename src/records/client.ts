@@ -5,7 +5,7 @@ import path from "node:path";
 import { errorFromWire, LineReader, type WireResponse } from "./protocol.js";
 import type {
   ClaimedPublication, ConsumerLag, ConsumerState, PageArgs, RecordEnvelope, RecordReceipt, RecordsBackend, RecordsCallOptions,
-  RecordsGetResult, RecordsListResult, RecordsOps, RecordsPage, RecordsPrincipal,
+  RecordsGetPart, RecordsGetResult, RecordsListResult, RecordsOps, RecordsPage, RecordsPrincipal,
 } from "./store.js";
 
 /** A principal's credential as the client keeps it: 0600, in the agent's own directory. */
@@ -174,6 +174,9 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
   get(_principal: RecordsPrincipal, args: unknown, options: RecordsCallOptions = {}): Promise<RecordsGetResult> {
     return this.#call("get", { args }, options.signal) as Promise<RecordsGetResult>;
   }
+  fold(_principal: RecordsPrincipal, args: unknown, options: RecordsCallOptions = {}): Promise<RecordsGetPart> {
+    return this.#call("fold", { args }, options.signal) as Promise<RecordsGetPart>;
+  }
   list(_principal: RecordsPrincipal, args: unknown, options: RecordsCallOptions = {}): Promise<RecordsListResult> {
     return this.#call("list", { args }, options.signal) as Promise<RecordsListResult>;
   }
@@ -192,8 +195,8 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
   async saveConsumer(_consumer: string, after: number, pending: ConsumerState["pending"], signal?: AbortSignal): Promise<void> {
     await this.#call("saveConsumer", { after, pending }, signal);
   }
-  claimPublications(limit: number, signal?: AbortSignal): Promise<ClaimedPublication[]> {
-    return this.#call("claimPublications", { limit }, signal) as Promise<ClaimedPublication[]>;
+  claimPublications(limit: number, signal?: AbortSignal): Promise<{ claims: ClaimedPublication[]; more: boolean }> {
+    return this.#call("claimPublications", { limit }, signal) as Promise<{ claims: ClaimedPublication[]; more: boolean }>;
   }
   ackPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, meshSequence: number, signal?: AbortSignal): Promise<boolean> {
     return this.#call("ackPublication", { claimId: claim.claimId, recordId: claim.recordId, meshSequence }, signal) as Promise<boolean>;

@@ -5,28 +5,87 @@
 #
 #   sudo scripts/records-paul-steps.sh --org smarty-pants --org-user paul [--dry-run]
 #   scripts/records-paul-steps.sh --org smarty-pants --org-user paul --print hba|ident|conf|service-json|units|operator-edit-js
-# --node and --package are SOURCES: the script copies them to root-owned /opt/<org>-records/{node,package},
-# and the units and every later command use only those copies.
-set -euo pipefail
+# --node (the node binary) and --package (a built checkout: dist/records-service/service-main.mjs, a
+# self-contained bundle) are SOURCES: the script copies the two files to root-owned
+# /opt/<org>-records/{node,service-main.mjs}, and the units and every later command use only those copies.
+#   sudo scripts/records-paul-steps.sh --org smarty-pants --org-user paul --rollback [--dry-run] [--yes-delete-records]
+#
+# ROOT STEPS (one line each):
+#  1. useradd the <org>-records system user (skipped if it exists)
+#  2. apt-get install postgresql-17 if missing; install node (0755) and the self-contained service-main.mjs (0644) root-owned in /opt/<org>-records (no symlinks); check <org>-records runs it with no modules
+#  3. create /var/lib/<org>-records/{,pg,status,credentials}, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes
+#  4. initdb the cluster as <org>-records if absent; write pg_hba.conf, pg_ident.conf, conf.d/records.conf; append include_dir to postgresql.conf
+#  5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
+#  6. write both systemd units; daemon-reload; enable --now <org>-records-pg.service (restart if its config changed); wait for pg_isready
+#  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service
+#  8. per --operator: add the role to service.json, issue its credential (sha256(id).json, id checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if roles changed
+#  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit and the service socket (changes nothing)
+# ROLLBACK STEPS (--rollback; root; a real rollback needs --yes-delete-records; postgresql-17 stays installed):
+#  R1. systemctl disable --now <org>-records.service <org>-records-pg.service (failure ignored: already absent)
+#  R2. rm -f both unit files; systemctl daemon-reload
+#  R3. rm -rf /etc/<org>-records
+#  R4. rm -rf /var/lib/<org>-records (cluster data, credentials, status: take the printed pg_dump backup first)
+#  R5. rm -rf /run/<org>-records /run/<org>-records-pg
+#  R6. rm -rf /opt/<org>-records
+#  R7. as <org-user>: rm -rf ~<org-user>/.config/<org>-records (relay credential; root never deletes in that home)
+#  R8. userdel <org>-records (skipped if absent)
+# On the first failed step the script stops, names the step and the command on stderr, and exits 1.
+# --help prints usage and, for the bundle, WHAT IT CHANGES (the ROOT STEPS above), IDEMPOTENCY (a second
+# run skips or leaves unchanged every step; files are rewritten only when content differs; the service is
+# reloaded only when roles changed), SUCCESS LINE and ROLLBACK (the list above). A real install ends with
+#   C10_RECORDS_INSTALLED org=<org> user=<org>-records cluster=17/<org>-records unit=active peer-audit=ok
+# printed last, only after the step 9 checks pass. A dry run never prints it.
+# TEST ONLY: RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST=1 skips the root check so tests can run the real
+# (non-dry) path against PATH fakes; with it, RECORDS_PAUL_STEPS_TEST_ROOT=DIR prefixes every system path.
+# Never set either on a real host.
+set -Eeuo pipefail
 
 usage() {
 	cat <<'EOF'
 usage: records-paul-steps.sh --org <org> --org-user <orguser> [--pg-bin DIR] [--node BIN]
          [--package DIR] [--origin NAME] [--port 5433] [--operator ROLE:ID]... [--dry-run]
          [--print hba|ident|conf|service-json|units|operator-edit-js]
+         [--rollback [--yes-delete-records]]
+  -h, --help          print this help, what the script changes, idempotency, the success line and the
+                      rollback commands (with --org/--org-user filled in when given); needs no root
+  --rollback          undo the install in reverse order (keeps postgresql-17). A real rollback deletes the
+                      record database and needs --yes-delete-records; take the printed backup first.
   --operator ROLE:ID  grant ROLE (importer|mirror|relay) to principal ID and issue its credential into
                       /var/lib/<org>-records/credentials/ (repeatable). 'importer:github' is
                       principal importer:github; 'importer:fabric:dev1' is principal fabric:dev1.
 EOF
 }
+STEP="" RUN_CMD="" ROLLBACK=0 HELP=0
+# Stderr report for the first failed step; nothing after it runs.
+fail_report() { # LINE WHAT
+	if [[ -n $STEP ]]; then
+		printf 'records-paul-steps: FAILED at step %s (line %s): %s\n' "$STEP" "$1" "$2" >&2
+		if ((ROLLBACK)); then
+			printf 'Nothing after this step ran. Fix the cause and rerun --rollback (it is idempotent).\n' >&2
+		else
+			printf 'Nothing after this step ran. Fix the cause and rerun (the script is idempotent), or undo with --rollback.\n' >&2
+		fi
+	else
+		printf 'records-paul-steps: FAILED (line %s): %s\n' "$1" "$2" >&2
+	fi
+}
 die() {
 	printf 'records-paul-steps: %s\n' "$*" >&2
+	[[ -z $STEP ]] || fail_report "${BASH_LINENO[0]}" "$*"
 	exit 1
 }
+on_error() {
+	local rc=$?
+	# ponytail: a failing subshell ($(...)) exits quietly; its parent's own ERR report names the command.
+	((BASH_SUBSHELL == 0)) || exit "$rc"
+	fail_report "$1" "${RUN_CMD:-$BASH_COMMAND} (exit $rc)"
+	exit 1
+}
+trap 'on_error $LINENO' ERR
 
 DEFAULT_PG_BIN=/usr/lib/postgresql/17/bin
 ORG="" ORG_USER="" PG_BIN=$DEFAULT_PG_BIN NODE="" PACKAGE="" ORIGIN="" PORT=5433
-DRY=0 PRINT="" OPERATORS=()
+DRY=0 PRINT="" OPERATORS=() YES_DELETE=0
 while (($#)); do
 	case $1 in
 	--org | --org-user | --pg-bin | --node | --package | --origin | --port | --print | --operator)
@@ -39,58 +98,82 @@ while (($#)); do
 		shift 2
 		;;
 	--dry-run) DRY=1; shift ;;
-	-h | --help) usage; exit 0 ;;
+	--rollback) ROLLBACK=1; shift ;;
+	--yes-delete-records) YES_DELETE=1; shift ;;
+	-h | --help) HELP=1; shift ;;
 	*) usage >&2; die "unknown argument: $1" ;;
 	esac
 done
 
 # --- validation (trust boundary: every value below lands in unit files, JSON and root commands) ---
-[[ -n $ORG ]] || die "--org is required"
-[[ -n $ORG_USER ]] || die "--org-user is required"
-# ponytail: must start with a letter and stay <= 24 chars so "<org>-records" is a valid 32-char user name.
-[[ $ORG =~ ^[a-z][a-z0-9-]*$ && ${#ORG} -le 24 ]] || die "invalid --org '$ORG': use [a-z0-9-]+, starting with a letter, at most 24 chars"
-[[ $ORG_USER =~ ^[a-z_][a-z0-9_-]*$ && ${#ORG_USER} -le 32 ]] || die "invalid --org-user '$ORG_USER'"
-[[ $ORG_USER != root ]] || die "--org-user must not be root: agents must never run as root"
-if uid=$(id -u "$ORG_USER" 2>/dev/null) && [[ $uid == 0 ]]; then die "--org-user '$ORG_USER' has uid 0; refused"; fi
-[[ $PORT =~ ^[0-9]+$ ]] && ((PORT >= 1024 && PORT <= 65535)) || die "invalid --port '$PORT'"
-[[ -n $NODE ]] || NODE=$(command -v node || true)
-[[ -n $NODE ]] || die "node not found; pass --node BIN"
-[[ -n $PACKAGE ]] || PACKAGE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-[[ -n $ORIGIN ]] || ORIGIN=$(hostname -s)
-[[ $ORIGIN =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid --origin '$ORIGIN'"
-for p in "$PG_BIN" "$NODE" "$PACKAGE"; do
-	[[ $p =~ ^/[A-Za-z0-9._/+-]*$ ]] || die "path must be absolute, without spaces or quotes: '$p'"
-done
-case $PRINT in "" | hba | ident | conf | service-json | units | operator-edit-js) ;; *) die "invalid --print '$PRINT'" ;; esac
-ID_RE='^[a-z][a-z0-9._-]{0,63}:[a-z0-9._@-]{1,64}$'
-for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
-	[[ $spec == *:* ]] || die "invalid --operator '$spec': use ROLE:ID, e.g. importer:github"
-	role=${spec%%:*} id=${spec#*:}
-	# ponytail: 'importer:github' names principal importer:github with role importer; 'importer:fabric:dev1' grants importer to fabric:dev1.
-	[[ $id == *:* ]] || id=$spec
-	[[ $role == importer || $role == mirror || $role == relay ]] || die "invalid --operator '$spec': ROLE must be importer, mirror or relay"
-	[[ $id =~ $ID_RE ]] || die "invalid --operator '$spec': ID must match $ID_RE"
-done
+if ((HELP)); then
+	# --help needs no root and no other flag; given names are checked, missing ones stay placeholders.
+	[[ -z $ORG || ($ORG =~ ^[a-z][a-z0-9-]*$ && ${#ORG} -le 24) ]] || die "invalid --org '$ORG'"
+	[[ -z $ORG_USER || ($ORG_USER =~ ^[a-z_][a-z0-9_-]*$ && ${#ORG_USER} -le 32) ]] || die "invalid --org-user '$ORG_USER'"
+	ORG=${ORG:-<org>} ORG_USER=${ORG_USER:-<org-user>} PRINT=""
+else
+	[[ -n $ORG ]] || die "--org is required"
+	[[ -n $ORG_USER ]] || die "--org-user is required"
+	# ponytail: must start with a letter and stay <= 24 chars so "<org>-records" is a valid 32-char user name.
+	[[ $ORG =~ ^[a-z][a-z0-9-]*$ && ${#ORG} -le 24 ]] || die "invalid --org '$ORG': use [a-z0-9-]+, starting with a letter, at most 24 chars"
+	[[ $ORG_USER =~ ^[a-z_][a-z0-9_-]*$ && ${#ORG_USER} -le 32 ]] || die "invalid --org-user '$ORG_USER'"
+	[[ $ORG_USER != root ]] || die "--org-user must not be root: agents must never run as root"
+	if uid=$(id -u "$ORG_USER" 2>/dev/null) && [[ $uid == 0 ]]; then die "--org-user '$ORG_USER' has uid 0; refused"; fi
+	[[ $PORT =~ ^[0-9]+$ ]] && ((PORT >= 1024 && PORT <= 65535)) || die "invalid --port '$PORT'"
+	# ponytail: the default node is resolved (e.g. /usr/bin/node -> nodejs); an explicit --node must not be a symlink.
+	[[ -n $NODE ]] || NODE=$(readlink -f "$(command -v node)" 2>/dev/null || true)
+	[[ -n $NODE ]] || ((ROLLBACK)) || die "node not found; pass --node BIN"
+	[[ -n $PACKAGE ]] || PACKAGE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+	[[ -n $ORIGIN ]] || ORIGIN=$(hostname -s)
+	[[ $ORIGIN =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid --origin '$ORIGIN'"
+	((!ROLLBACK)) || [[ -z $PRINT ]] || die "--rollback and --print do not combine"
+	((ROLLBACK)) || ((!YES_DELETE)) || die "--yes-delete-records only applies to --rollback"
+	for p in "$PG_BIN" "$NODE" "$PACKAGE"; do
+		[[ -z $p ]] && ((ROLLBACK)) && continue
+		[[ $p =~ ^/[A-Za-z0-9._/+-]*$ ]] || die "path must be absolute, without spaces or quotes: '$p'"
+	done
+	case $PRINT in "" | hba | ident | conf | service-json | units | operator-edit-js) ;; *) die "invalid --print '$PRINT'" ;; esac
+	ID_RE='^[a-z][a-z0-9._-]{0,63}:[a-z0-9._@-]{1,64}$'
+	for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
+		[[ $spec == *:* ]] || die "invalid --operator '$spec': use ROLE:ID, e.g. importer:github"
+		role=${spec%%:*} id=${spec#*:}
+		# ponytail: 'importer:github' names principal importer:github with role importer; 'importer:fabric:dev1' grants importer to fabric:dev1.
+		[[ $id == *:* ]] || id=$spec
+		[[ $role == importer || $role == mirror || $role == relay ]] || die "invalid --operator '$spec': ROLE must be importer, mirror or relay"
+		[[ $id =~ $ID_RE ]] || die "invalid --operator '$spec': ID must match $ID_RE"
+	done
+fi
 
 REC="${ORG}-records"
-HOME_DIR="/var/lib/${REC}"
+T=""
+if [[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} == 1 ]]; then
+	T=${RECORDS_PAUL_STEPS_TEST_ROOT:-}
+	[[ -z $T || $T =~ ^/[A-Za-z0-9._/+-]*$ ]] || die "invalid RECORDS_PAUL_STEPS_TEST_ROOT"
+fi
+HOME_DIR="${T}/var/lib/${REC}"
 DATA="${HOME_DIR}/pg"
-PGSOCK="/run/${REC}-pg"
-SVCSOCK="/run/${REC}"
-CONF_DIR="/etc/${REC}"
+PGSOCK="${T}/run/${REC}-pg"
+SVCSOCK="${T}/run/${REC}"
+CONF_DIR="${T}/etc/${REC}"
+UNIT_DIR="${T}/etc/systemd/system"
 CRED_DIR="${HOME_DIR}/credentials"
 STATUS_DIR="${HOME_DIR}/status"
 CFG="${CONF_DIR}/service.json"
 PG_UNIT="${REC}-pg.service"
 SVC_UNIT="${REC}.service"
-OPT="/opt/${REC}"
+OPT="${T}/opt/${REC}"
 OPT_NODE="${OPT}/node"
-OPT_PKG="${OPT}/package"
-MAIN="${OPT_PKG}/dist/records/service-main.js"
-[[ -n $PRINT ]] || ((DRY)) || ((EUID == 0)) || die "must run as root (sudo), or pass --dry-run to only print the steps"
+MAIN="${OPT}/service-main.mjs"
+SOCKET="${SVCSOCK}/records.sock"
+SUCCESS_LINE="C10_RECORDS_INSTALLED org=${ORG} user=${REC} cluster=17/${REC} unit=active peer-audit=ok"
+if [[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} == 1 ]]; then
+	echo "records-paul-steps: TEST MODE (RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST=1): root check skipped" >&2
+else
+	[[ -n $PRINT ]] || ((DRY || HELP)) || ((EUID == 0)) || die "must run as root (sudo), or pass --dry-run to only print the steps"
+fi
 if ! ORG_GROUP=$(id -gn "$ORG_USER" 2>/dev/null); then
-	# Only --print and --dry-run may continue for a user that does not exist on this host.
-	((DRY)) || [[ -n $PRINT ]] || die "--org-user '$ORG_USER' does not exist"
+	# Only --print, --dry-run and --rollback may continue for a user that does not exist on this host.
+	((DRY || ROLLBACK || HELP)) || [[ -n $PRINT ]] || die "--org-user '$ORG_USER' does not exist"
 	ORG_GROUP=$ORG_USER
 fi
 
@@ -258,8 +341,18 @@ show() {
 	printf '%s\n' "${out# }"
 }
 run() {
-	printf '+ %s\n' "$(show "$@")"
-	((DRY)) || "$@"
+	RUN_CMD=$(show "$@")
+	printf '+ %s\n' "$RUN_CMD"
+	if ((DRY)); then RUN_CMD=""; return 0; fi
+	# RUN_CMD stays set on failure so on_error names the command.
+	"$@" || return
+	RUN_CMD=""
+}
+# run, but a failure (e.g. already-absent state) is reported and ignored.
+try_run() { run "$@" || { RUN_CMD=""; echo "= ignored: failed, already absent?"; }; }
+step() { # N TITLE
+	STEP="$1 ($2)"
+	echo "## $1. $2"
 }
 _append() { printf '%s\n' "$2" >>"$1"; }
 CHANGED=0
@@ -287,18 +380,117 @@ write_file() { # PATH MODE OWNER CONTENT; idempotent: writes only when content, 
 	rm -f "$tmp"
 }
 as_rec() { runuser -u "$REC" -- "$@"; }
+# The org user's relay credential directory; "~user/..." (print only) when the user has no home here.
+relay_dir() {
+	local home
+	home=$(getent passwd "$ORG_USER" | cut -d: -f6 || true)
+	printf '%s/.config/%s-records\n' "${home:-~$ORG_USER}" "$ORG"
+}
+BACKUP_CMD="runuser -u ${REC} -- ${PG_BIN}/pg_dump -h ${PGSOCK} -p ${PORT} -U postgres -Fc records > /root/${REC}-backup.dump"
+DELETE_WARNING="This deletes the org's record database. Take a backup first: ${BACKUP_CMD}"
+APT_NOTE="Note: postgresql-17 stays installed (other software may use it). To remove it too: apt-get remove postgresql-17"
+
+# The rollback list, in order. RB_MODE=print lists the commands; RB_MODE=run executes them through run.
+RB_MODE=print
+rb_step() { [[ $RB_MODE == print ]] || step "$1" "$2"; }
+# ponytail: --help with <org> placeholders prints the commands unquoted; they are a template, not shell.
+rb_show() { if [[ $ORG == "<org>" || $ORG_USER == "<org-user>" ]]; then printf '  %s\n' "$*"; else printf '  %s\n' "$(show "$@")"; fi; }
+rb() { if [[ $RB_MODE == print ]]; then rb_show "$@"; else run "$@"; fi; }
+rb_try() { if [[ $RB_MODE == print ]]; then rb_show "$@"; else try_run "$@"; fi; }
+rollback_steps() {
+	local rdir
+	rb_step R1 "stop and disable both services"
+	rb_try systemctl disable --now "$SVC_UNIT" "$PG_UNIT"
+	rb_step R2 "remove the systemd units"
+	rb rm -f "$UNIT_DIR/$SVC_UNIT" "$UNIT_DIR/$PG_UNIT"
+	rb systemctl daemon-reload
+	rb_step R3 "remove ${CONF_DIR}"
+	rb rm -rf "$CONF_DIR"
+	rb_step R4 "remove ${HOME_DIR} (record database, credentials, status)"
+	[[ $RB_MODE == print ]] || echo "!! ${DELETE_WARNING}"
+	rb rm -rf "$HOME_DIR"
+	rb_step R5 "remove the runtime directories"
+	rb rm -rf "$SVCSOCK" "$PGSOCK"
+	rb_step R6 "remove ${OPT}"
+	rb rm -rf "$OPT"
+	rb_step R7 "remove the relay credential directory of ${ORG_USER}"
+	rdir=$(relay_dir)
+	if [[ $RB_MODE == run && $rdir == "~"* ]] && ((!DRY)); then
+		echo "= ${ORG_USER} has no home directory here; nothing to remove"
+	else
+		rb runuser -u "$ORG_USER" -- rm -rf "$rdir"
+	fi
+	rb_step R8 "remove the OS user ${REC}"
+	# A dry run lists every command, like the rm -rf lines, whatever exists on this host.
+	if [[ $RB_MODE == run ]] && ((!DRY)) && ! id -u "$REC" >/dev/null 2>&1; then
+		echo "= user ${REC} does not exist"
+	else
+		rb userdel "$REC"
+	fi
+}
+
+print_help() {
+	usage
+	echo
+	echo "WHAT IT CHANGES: as root, in order, one line per step"
+	# The ROOT STEPS block of this file's header, with the names filled in: one source for both.
+	sed -n 's/^#  \([0-9]\.\)/  \1/p' "${BASH_SOURCE[0]}" | sed "s/<org-user>/${ORG_USER}/g; s/<org>/${ORG}/g"
+	cat <<EOF
+
+IDEMPOTENCY: a second run with the same flags
+  1. skipped: user ${REC} exists
+  2. apt-get skipped (PostgreSQL 17 found); node and service-main.mjs copied only when content differs
+  3. unchanged: the same directories, owners and modes are reapplied
+  4. initdb skipped (cluster exists); pg_hba.conf, pg_ident.conf, records.conf rewritten only when content
+     differs; include_dir appended only once; PostgreSQL restarted only when its config changed
+  5. skipped: service.json exists (never overwritten)
+  6. units rewritten only when content differs; daemon-reload and enable --now leave running units unchanged
+  7. createdb and CREATE ROLE skipped (exist); migrate applies only unapplied migrations; enable --now unchanged
+  8. a role added to service.json only when missing; a credential issued only when absent; the relay copy
+     rewritten with the same content; the service reloaded only when roles changed
+  9. checks only; changes nothing
+
+SUCCESS LINE: printed last by a real install, only after the step 9 checks pass; never by --dry-run
+  ${SUCCESS_LINE}
+  checks: systemctl is-active ${SVC_UNIT} and ${PG_UNIT}; pg_isready as ${REC};
+          python3 ctypes getsockopt as ${REC} (peer audit); ${ORG_USER} cannot reach PostgreSQL; test -S ${SOCKET}
+
+ROLLBACK: as root; preview first with: ${0##*/} --org ${ORG} --org-user ${ORG_USER} --rollback --dry-run
+  ${0##*/} --org ${ORG} --org-user ${ORG_USER} --rollback --yes-delete-records
+runs these commands in this order (postgresql-17 stays installed):
+${DELETE_WARNING}
+EOF
+	rollback_steps
+}
+if ((HELP)); then
+	print_help
+	exit 0
+fi
 
 ((DRY)) && echo "# DRY RUN: nothing below is executed or written."
 cd /
 
-echo "## 1. OS user ${REC}"
+if ((ROLLBACK)); then
+	echo "!! ${DELETE_WARNING}"
+	if ((!DRY && !YES_DELETE)); then
+		die "refused: a real --rollback deletes ${HOME_DIR} (the record database). Take the backup above, then rerun with --yes-delete-records"
+	fi
+	RB_MODE=run
+	rollback_steps
+	STEP=""
+	echo "${APT_NOTE}"
+	((DRY)) && echo "# DRY RUN: nothing was executed." || echo "OK: rollback done"
+	exit 0
+fi
+
+step 1 "OS user ${REC}"
 if id -u "$REC" >/dev/null 2>&1; then
 	echo "= user ${REC} exists"
 else
 	run useradd --system --user-group --no-create-home --home-dir "$HOME_DIR" --shell /usr/sbin/nologin "$REC"
 fi
 
-echo "## 2. Prerequisites: PostgreSQL 17, node and the package under ${OPT}"
+step 2 "Prerequisites: PostgreSQL 17, node and the package under ${OPT}"
 if [[ -x $PG_BIN/initdb ]]; then
 	echo "= PostgreSQL found at ${PG_BIN}"
 elif [[ $PG_BIN == "$DEFAULT_PG_BIN" ]]; then
@@ -313,35 +505,44 @@ else
 	die "${PG_BIN}/initdb not found. Install PostgreSQL 17 there, or omit --pg-bin to install postgresql-17 from apt."
 fi
 
-SRC_MAIN="${PACKAGE}/dist/records/service-main.js"
-for p in "$SRC_MAIN" "$PACKAGE/package.json" "$PACKAGE/node_modules"; do
+# F13: the service is one self-contained file (every package inlined) plus node. Only these two regular
+# files are copied; a symlink source is refused, so nothing under ${OPT} can point at agent-writable storage.
+SRC_MAIN="${PACKAGE}/dist/records-service/service-main.mjs"
+for p in "$NODE" "$SRC_MAIN"; do
+	[[ ! -L $p ]] || die "${p} is a symlink: refused. Pass the real file (readlink -f)"
 	if [[ ! -e $p ]]; then
 		((DRY)) || die "${p} not found: pass --package with a built package (bun run build)"
 		echo "! ${p} not found: build the package (bun run build) before the real run"
+	else
+		[[ -f $p ]] || die "${p} is not a regular file: refused"
 	fi
 done
-run install -d -m 0755 -o root -g root "$OPT" "$OPT_PKG"
+run install -d -m 0755 -o root -g root "$OPT"
 if cmp -s "$NODE" "$OPT_NODE"; then
 	echo "= ${OPT_NODE} matches ${NODE}"
 else
 	run install -m 0755 -o root -g root "$NODE" "$OPT_NODE"
 fi
-run rsync -a --delete "$PACKAGE/dist/" "$OPT_PKG/dist/"
-run rsync -a --delete "$PACKAGE/node_modules/" "$OPT_PKG/node_modules/"
-run rsync -a "$PACKAGE/package.json" "$OPT_PKG/package.json"
-run chown -R root:root "$OPT_PKG"
-run chmod -R go-w,a+rX "$OPT_PKG"
-VERIFY_JS="require(\"fs\").accessSync(\"${MAIN}\")"
+if cmp -s "$SRC_MAIN" "$MAIN"; then
+	echo "= ${MAIN} matches ${SRC_MAIN}"
+else
+	run install -m 0644 -o root -g root "$SRC_MAIN" "$MAIN"
+fi
 if ((DRY)); then
-	echo "? runuser -u ${REC} -- ${OPT_NODE} -e '${VERIFY_JS}'"
+	echo "? find ${OPT} -type l  (must print nothing)"
+	echo "? runuser -u ${REC} -- ${OPT_NODE} ${MAIN}  (must exit 2, usage: it runs with no external modules)"
 	echo "? runuser -u ${REC} -- test -x ${PG_BIN}/initdb"
 else
-	as_rec "$OPT_NODE" -e "$VERIFY_JS" || die "${REC} cannot run ${OPT_NODE} or read ${MAIN}; check the modes under ${OPT}"
+	links=$(find "$OPT" -type l) || die "cannot list ${OPT}"
+	[[ -z $links ]] || die "symlinks under ${OPT} (remove them, then rerun): ${links//$'\n'/ }"
+	rc=0
+	as_rec "$OPT_NODE" "$MAIN" >/dev/null 2>&1 || rc=$?
+	((rc == 2)) || die "${REC} cannot run ${OPT_NODE} ${MAIN} (exit ${rc}, expected 2: usage); check the modes under ${OPT}"
 	as_rec test -x "$PG_BIN/initdb" || die "${REC} cannot run ${PG_BIN}/initdb"
-	echo "OK: ${REC} runs ${OPT_NODE} and reads ${MAIN}"
+	echo "OK: ${REC} runs ${OPT_NODE} ${MAIN} with no external modules"
 fi
 
-echo "## 3. Directories"
+step 3 "Directories"
 run install -d -m 0755 -o "$REC" -g "$REC" "$HOME_DIR"
 run install -d -m 0700 -o "$REC" -g "$REC" "$DATA"
 run install -d -m 0755 -o "$REC" -g "$REC" "$STATUS_DIR"
@@ -350,7 +551,7 @@ run install -d -m 0700 -o "$REC" -g "$REC" "$PGSOCK"
 run install -d -m 2750 -o "$REC" -g "$ORG_GROUP" "$SVCSOCK"
 run install -d -m 0750 -o root -g "$REC" "$CONF_DIR"
 
-echo "## 4. Cluster"
+step 4 "Cluster"
 FRESH=0
 if [[ -f $DATA/PG_VERSION ]]; then
 	echo "= cluster exists at ${DATA}"
@@ -371,16 +572,16 @@ else
 fi
 PG_CONF_CHANGED=$CHANGED
 
-echo "## 5. Service config"
+step 5 "Service config"
 if [[ -f $CFG ]]; then
 	echo "= ${CFG} exists; not overwritten (it holds granted roles). Compare with --print service-json."
 else
 	write_file "$CFG" 0640 "root:$REC" "$(render_service_json)"
 fi
 
-echo "## 6. systemd units"
-write_file "/etc/systemd/system/$PG_UNIT" 0644 root:root "$(render_pg_unit)"
-write_file "/etc/systemd/system/$SVC_UNIT" 0644 root:root "$(render_svc_unit)"
+step 6 "systemd units"
+write_file "$UNIT_DIR/$PG_UNIT" 0644 root:root "$(render_pg_unit)"
+write_file "$UNIT_DIR/$SVC_UNIT" 0644 root:root "$(render_svc_unit)"
 run systemctl daemon-reload
 run systemctl enable --now "$PG_UNIT"
 if ((PG_CONF_CHANGED && !FRESH)); then run systemctl restart "$PG_UNIT"; fi
@@ -392,7 +593,7 @@ else
 	as_rec "$PG_BIN/pg_isready" -q -h "$PGSOCK" -p "$PORT" || die "PostgreSQL did not become ready; see journalctl -u $PG_UNIT"
 fi
 
-echo "## 7. Database, role, migrations"
+step 7 "Database, role, migrations"
 HAVE_DB=""
 ((DRY)) || HAVE_DB=$("${PSQL[@]}" -d postgres -tAc "select 1 from pg_database where datname='records'")
 if [[ $HAVE_DB == 1 ]]; then
@@ -404,12 +605,15 @@ run "${PSQL[@]}" -d records -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_ro
 run runuser -u "$REC" -- "$OPT_NODE" "$MAIN" migrate --config "$CFG"
 run systemctl enable --now "$SVC_UNIT"
 
-echo "## 8. Operator principals"
+step 8 "Operator principals"
+CHECK_ID_JS='const [f, id] = process.argv.slice(1); if (JSON.parse(require("fs").readFileSync(f, "utf8")).id !== id) { console.error(`${f}: not ${id}`); process.exit(1); }'
 POLICY_CHANGED=0
 for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 	role=${spec%%:*} id=${spec#*:}
 	[[ $id == *:* ]] || id=$spec
-	cred="$CRED_DIR/${id//:/_}.json"
+	# F14: the name is the sha256 of the whole id (injective in practice): team:import_job and
+	# team_import:job never share a file.
+	cred="$CRED_DIR/$(printf %s "$id" | sha256sum | cut -c1-64).json"
 	printf '+ %s -e "$(%s --print operator-edit-js)" %s\n' "$OPT_NODE" "${0##*/}" "$(show "$CFG" "$role" "$id")"
 	if ((!DRY)); then
 		result=$("$OPT_NODE" -e "$(render_operator_edit_js)" "$CFG" "$role" "$id") || die "could not grant ${role} to ${id} in ${CFG}"
@@ -420,19 +624,27 @@ for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 		echo "= ${cred} exists; not reissued"
 	else
 		# The issue command writes the file 0600 with O_EXCL, as ${REC}, in its 0700 directory. Never copy it elsewhere.
-		run runuser -u "$REC" -- "$OPT_NODE" "$MAIN" issue --config "$CFG" --id "$id" --out "$cred"
+		run runuser -u "$REC" -- "$OPT_NODE" "$MAIN" issue --config "$CFG" --id "$id" --role "$role" --out "$cred"
+	fi
+	# Before the credential is used or delivered, its stored principal must be the requested one.
+	if ((DRY)); then
+		echo "? runuser -u ${REC} -- ${OPT_NODE} -e '${CHECK_ID_JS}' ${cred} ${id}  (stored .id must equal ${id})"
+	else
+		as_rec "$OPT_NODE" -e "$CHECK_ID_JS" "$cred" "$id" || die "${cred} does not hold principal ${id}; refused"
 	fi
 	if [[ $role == relay ]]; then
 		# The relay publishes nudges on the org's mesh, which only the org user can write: its credential
 		# goes to that user (0600). Its protection ends at the same-uid limit (docs/records.md, Trust boundary).
-		org_home=$(getent passwd "$ORG_USER" | cut -d: -f6 || true)
-		if [[ -z $org_home ]]; then
-			((DRY)) || die "no home directory for ${ORG_USER}"
-			org_home="~${ORG_USER}"
-		fi
-		relay_dir="${org_home}/.config/${ORG}-records"
-		run install -d -m 0700 -o "$ORG_USER" -g "$ORG_GROUP" "$relay_dir"
-		run install -m 0600 -o "$ORG_USER" -g "$ORG_GROUP" "$cred" "${relay_dir}/relay.json"
+		# F12: root never writes under the org user's home. The org user creates the directory and the
+		# file itself, so a symlink there reaches only what that user already owns; root feeds the token on stdin.
+		relay_dir=$(relay_dir)
+		if [[ $relay_dir == "~"* ]]; then ((DRY)) || die "no home directory for ${ORG_USER}"; fi
+		run runuser -u "$ORG_USER" -- install -d -m 0700 "$relay_dir"
+		deliver=(runuser -u "$ORG_USER" -- sh -c 'umask 077 && cat > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"' sh "${relay_dir}/relay.json")
+		RUN_CMD="$(show "${deliver[@]}") < $(show "$cred")"
+		printf '+ %s\n' "$RUN_CMD"
+		if ((!DRY)); then "${deliver[@]}" <"$cred"; fi
+		RUN_CMD=""
 		cat <<EOF
   -> ${id} (relay): Fabric of ${ORG_USER} uses it with "records": { "relayCredentialFile": "${relay_dir}/relay.json" }.
 EOF
@@ -445,27 +657,62 @@ EOF
 done
 if ((${#OPERATORS[@]})); then
 	if ((DRY)); then
-		echo "? if systemctl is-active --quiet ${SVC_UNIT} and roles changed: + systemctl reload ${SVC_UNIT}"
+		echo "? if roles changed and ${SVC_UNIT} is active: wait up to 30 s for ${SOCKET} (the service's SIGHUP handler is in place by then), then + systemctl reload ${SVC_UNIT}"
 	elif ((POLICY_CHANGED)) && systemctl is-active --quiet "$SVC_UNIT"; then
+		# A SIGHUP before Node has loaded the service would end it: reload only once the socket exists.
+		for _ in $(seq 1 300); do [[ -S $SOCKET ]] && break; sleep 0.1; done
+		[[ -S $SOCKET ]] || die "${SOCKET} did not appear within 30 s; not reloading ${SVC_UNIT}"
 		run systemctl reload "$SVC_UNIT"
 	else
 		echo "= no reload: roles unchanged or ${SVC_UNIT} not active (it reads roles at start)"
 	fi
 fi
 
-echo "## 9. Verification"
+step 9 "Verification"
 if ((DRY)); then
-	echo "? stat -c '%A %U:%G %n' $OPT_NODE $OPT_PKG $HOME_DIR $DATA $STATUS_DIR $CRED_DIR $PGSOCK $SVCSOCK $CONF_DIR"
+	echo "? stat -c '%A %U:%G %n' $OPT_NODE $MAIN $HOME_DIR $DATA $STATUS_DIR $CRED_DIR $PGSOCK $SVCSOCK $CONF_DIR"
 	echo "? runuser -u ${ORG_USER} -- ${PG_BIN}/psql -h ${PGSOCK} -p ${PORT} -U postgres -d records -c 'select 1'  (expected to fail: agent cannot reach PostgreSQL)"
 else
-	stat -c '%A %U:%G %n' "$OPT_NODE" "$OPT_PKG" "$HOME_DIR" "$DATA" "$STATUS_DIR" "$CRED_DIR" "$PGSOCK" "$SVCSOCK" "$CONF_DIR"
+	stat -c '%A %U:%G %n' "$OPT_NODE" "$MAIN" "$HOME_DIR" "$DATA" "$STATUS_DIR" "$CRED_DIR" "$PGSOCK" "$SVCSOCK" "$CONF_DIR"
 	if runuser -u "$ORG_USER" -- "$PG_BIN/psql" -X -h "$PGSOCK" -p "$PORT" -U postgres -d records -c 'select 1' >/dev/null 2>&1; then
 		die "FAIL: ${ORG_USER} reached PostgreSQL at ${PGSOCK}; the record store is not isolated"
 	fi
 	echo "OK: agent cannot reach PostgreSQL"
 fi
+# The success line's own checks; each failure stops the script here with the step 9 report.
+success_check() { # WHAT CMD...
+	local what=$1
+	shift
+	if ((DRY)); then
+		echo "? $(show "$@")  (${what})"
+	else
+		"$@" || die "check failed (${what}): $(show "$@")"
+		echo "OK: ${what}"
+	fi
+}
+success_check "${SVC_UNIT} active" systemctl is-active --quiet "$SVC_UNIT"
+success_check "${PG_UNIT} active" systemctl is-active --quiet "$PG_UNIT"
+success_check "PostgreSQL ready" runuser -u "$REC" -- "$PG_BIN/pg_isready" -h "$PGSOCK" -p "$PORT"
+# The service reads SO_PEERCRED through python3 and ctypes: the peer audit needs both, as ${REC}.
+success_check "peer audit (python3 ctypes)" runuser -u "$REC" -- python3 -c 'import ctypes; ctypes.CDLL(None).getsockopt'
+success_check "service socket" test -S "$SOCKET"
 cat <<EOF
 
 Fabric: point the org's agents at the service socket in .pi/fabric.json:
-  { "records": { "socket": "${SVCSOCK}/records.sock" } }
+  { "records": { "socket": "${SOCKET}" } }
 EOF
+STEP=""
+cat <<EOF
+
+## ROLLBACK
+To undo this install later, run (as root) '${0##*/} --org ${ORG} --org-user ${ORG_USER} --rollback --yes-delete-records',
+which runs these commands in this order:
+${DELETE_WARNING}
+EOF
+rollback_steps
+echo "${APT_NOTE}"
+if ((DRY)); then
+	echo "(dry run: the success line C10_RECORDS_INSTALLED ... is printed only by a real run after its checks)"
+else
+	echo "${SUCCESS_LINE}"
+fi

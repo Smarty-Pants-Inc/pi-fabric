@@ -157,6 +157,10 @@ CREATE TABLE principals (
   -- lost response, and nothing else can.
   nonce_hash text,
   issued_by text NOT NULL CHECK (issued_by IN ('register', 'operator')),
+  -- The role the installer issued an operator principal for. Authority needs this AND the
+  -- service config's grant; a registered principal never has one.
+  role text CHECK (role IN ('importer', 'mirror', 'relay')),
+  CHECK ((issued_by = 'operator') = (role IS NOT NULL)),
   created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 

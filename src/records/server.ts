@@ -112,14 +112,23 @@ export const migrateService = async (config: RecordsServiceConfig, pool?: Client
 };
 
 /** Issue an operator principal's token (for the importer or the mirror). Prints nothing; returns it. */
-export const issuePrincipal = async (config: RecordsServiceConfig, id: string, name?: string, pool?: ClientPool): Promise<{ id: string; token: string }> => {
-  if (!/^[A-Za-z0-9._@:-]{1,128}$/.test(id)) throw new Error(`invalid principal id ${JSON.stringify(id)}`);
+export type OperatorRole = "importer" | "mirror" | "relay";
+export const OPERATOR_ROLES: readonly OperatorRole[] = ["importer", "mirror", "relay"];
+
+/**
+ * Issue an operator principal's token (the installer, as the records user). The id is in the
+ * reserved operator namespace (never a session or actor id, which only registration creates),
+ * and the role is recorded with it in the same statement.
+ */
+export const issuePrincipal = async (config: RecordsServiceConfig, id: string, role: OperatorRole, name?: string, pool?: ClientPool): Promise<{ id: string; token: string }> => {
+  if (!/^[A-Za-z0-9._@:-]{1,128}$/.test(id) || SELF_REGISTERED.test(id)) throw new Error(`invalid operator principal id ${JSON.stringify(id)}: a session or actor id registers itself`);
+  if (!OPERATOR_ROLES.includes(role)) throw new Error(`invalid operator role ${JSON.stringify(role)}`);
   const owner = pool ?? await openPool(config.database);
   const store = new RecordStore(owner, { org: config.org, origin: config.origin });
   try {
     const token = newToken();
     await store.transaction((client) => client.query(
-      "INSERT INTO principals (id, name, token_hash, issued_by) VALUES ($1, $2, $3, 'operator')", [id, name ?? id, hashToken(token)]));
+      "INSERT INTO principals (id, name, token_hash, issued_by, role) VALUES ($1, $2, $3, 'operator', $4)", [id, name ?? id, hashToken(token), role]));
     return { id, token };
   } finally {
     if (!pool) await owner.end?.();
@@ -186,6 +195,7 @@ export class RecordsServer {
       append: (principal, args, signal, peer) => store.append(principal, args.args, { signal, ...(peer ? { peer } : {}) }),
       read: (principal, args, signal) => store.read(principal, args.args, { signal }),
       get: (principal, args, signal) => store.get(principal, args.args, { signal }),
+      fold: (principal, args, signal) => store.fold(principal, args.args, { signal }),
       list: (principal, args, signal) => store.list(principal, args.args, { signal }),
       page: (_principal, args, signal) => store.page(pageArgs(ownArgs(args), store.origin), signal),
       byIds: (_principal, args, signal) => store.byIds(ids(args.ids), signal),
@@ -247,6 +257,10 @@ export class RecordsServer {
     };
   }
 
+  #holds(row: { id: string; issued_by: string; role: string | null }, role: OperatorRole): boolean {
+    return row.issued_by === "operator" && row.role === role && this.config.roles[role].includes(row.id);
+  }
+
   /** Register a session's or actor's own participant id (the first claim wins). */
   async register(id: unknown, name: unknown, signal: AbortSignal = this.#life.signal, nonce?: unknown): Promise<{ id: string; token: string }> {
     if (typeof id !== "string" || !SELF_REGISTERED.test(id)) {
@@ -276,12 +290,12 @@ export class RecordsServer {
     const cached = this.#principals.get(hash);
     if (cached) return cached;
     const row = await this.store.transaction(async (client) =>
-      (await client.query<{ id: string; name: string | null }>("SELECT id, name FROM principals WHERE token_hash = $1", [hash])).rows[0], "", this.#life.signal);
+      (await client.query<{ id: string; name: string | null; issued_by: string; role: string | null }>("SELECT id, name, issued_by, role FROM principals WHERE token_hash = $1", [hash])).rows[0], "", this.#life.signal);
     if (!row) throw new RecordsServiceError("records token is not known to this service", "RECORD_UNAUTHENTICATED");
     const principal: RecordsPrincipal = {
       id: row.id, ...(row.name ? { name: row.name } : {}),
-      importer: this.config.roles.importer.includes(row.id), mirror: this.config.roles.mirror.includes(row.id),
-      relay: this.config.roles.relay.includes(row.id),
+      // A role needs the service config's grant AND the installer's issue for that role.
+      importer: this.#holds(row, "importer"), mirror: this.#holds(row, "mirror"), relay: this.#holds(row, "relay"),
     };
     this.#principals.set(hash, principal);
     return principal;
@@ -390,7 +404,8 @@ export class RecordsServer {
     };
     this.#statusWrite = this.#statusWrite.then(async () => {
       await fs.promises.mkdir(path.dirname(file), { recursive: true, mode: 0o755 });
-      await writeJsonAtomicAsync(file, record, { space: 2, newline: true });
+      // Readable by the factory check (another user); it holds no secret.
+      await writeJsonAtomicAsync(file, record, { space: 2, newline: true, mode: 0o644, dirMode: 0o755 });
     }).catch(() => undefined);
   }
 

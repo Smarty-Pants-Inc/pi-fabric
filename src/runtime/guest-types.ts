@@ -1449,10 +1449,18 @@ interface FabricRecordFold {
   title?: string; body?: string; owner?: string; acceptance?: string; labels?: string[]; nextAction?: string; stage?: string; open: boolean;
   statuses: Record<string, { id: string; at: number; text?: string; state?: string; eta?: unknown; waitOn?: string; name?: string }>;
   decisions: FabricRecord[]; openAsks: FabricRecord[]; links: FabricRecord[]; mirror: Record<string, FabricRecordData>;
+  /** Fold fields cut to 16 KiB; the whole values are in the history. */
+  truncated?: string[];
+  /** Collections that continue: page each with records.fold({ ref, part, after }) until no next. */
+  more?: Partial<Record<FabricRecordFoldPart, string>>;
 }
+type FabricRecordFoldPart = "statuses" | "mirror" | "decisions" | "openAsks" | "links";
 interface FabricRecordsListItem {
   ref: string; title?: string; owner?: string; stage?: string; open: boolean; updatedAt: number;
-  statuses: Record<string, { at: number; state?: string; eta?: unknown }>; openAsks: { id: string; to?: string; at: number }[];
+  /** The 20 newest authors' statuses of statusCount; all of them: records.get. */
+  statuses: Record<string, { at: number; state?: string; eta?: unknown }>; statusCount: number;
+  /** The 20 oldest open asks of openAskCount. */
+  openAsks: { id: string; to?: string; at: number }[]; openAskCount: number;
 }
 interface FabricRecordsApi {
   /** Commit one record; the receipt comes only after the commit. Throws "record archive lagging N s; retry with the same key" (retryable) past the archive bound. */
@@ -1461,6 +1469,8 @@ interface FabricRecordsApi {
   read(args?: { after?: number; limit?: number; origin?: string; ref?: string; kind?: FabricRecordKind; to?: string }): Promise<FabricRecordsPage>;
   /** A ref's fold and its history, oldest first; page with after = next. */
   get(args: { ref: string; after?: number; limit?: number }): Promise<{ ref: string; state: FabricRecordFold; history: FabricRecord[]; next?: number }>;
+  /** One page of a fold collection, from records.get's state.more or the previous page's next. */
+  fold(args: { ref: string; part: FabricRecordFoldPart; after?: string }): Promise<{ ref: string; part: FabricRecordFoldPart; items: unknown[]; next?: string }>;
   /** A view query over current issues (never a delivery path). */
   list(args?: { org?: string; repo?: string; open?: boolean; owner?: string; hasOpenAsk?: boolean; updatedSince?: number; limit?: number; after?: string }): Promise<{ items: FabricRecordsListItem[]; next?: string }>;
   status(): Promise<{ org: string; origin: string; frontier: number; unpublished: number; admission: { state: "ok" | "alarm" | "refuse" | "disabled"; lagSeconds?: number; frontier?: string; insertLsn?: string }; statusFile: string }>;

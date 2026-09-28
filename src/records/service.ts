@@ -99,6 +99,7 @@ export class RecordsService {
       },
       read: (principal, args, options) => client.read(principal, args, options),
       get: (principal, args, options) => client.get(principal, args, options),
+      fold: (principal, args, options) => client.fold(principal, args, options),
       list: (principal, args, options) => client.list(principal, args, options),
     };
   }

@@ -15,7 +15,13 @@ export const MAX_DATA_BYTES = 64 * 1024;
 export const MAX_KEY_LENGTH = 256;
 
 type FieldType = "string" | "strings" | "number" | "boolean" | "uuid" | "eta";
-interface FieldSpec { type: FieldType; required?: boolean; values?: readonly string[] }
+interface FieldSpec { type: FieldType; required?: boolean; values?: readonly string[]; pattern?: RegExp; hint?: string }
+
+/**
+ * A recipient: a participant id or name. It is the relay's `to` and an index key, so it is short
+ * and plain (F10): at most 256 characters of letters, digits and . _ @ : / -.
+ */
+const RECIPIENT = /^[A-Za-z0-9._@:/-]{1,256}$/;
 
 const STATUS_STATES = ["in progress", "waiting", "blocked", "done"] as const;
 const MIRROR_STATES = ["pending", "mirrored", "refused", "skipped", "unknown"] as const;
@@ -25,9 +31,9 @@ const KIND_FIELDS: Record<RecordKind, Record<string, FieldSpec>> = {
   status: { eta: { type: "eta" }, state: { type: "string", values: STATUS_STATES }, waitOn: { type: "string" } },
   comment: { deleted: { type: "boolean" } },
   decision: { by: { type: "string" }, where: { type: "string" } },
-  ask: { to: { type: "string", required: true }, class: { type: "string" }, minutes: { type: "number" } },
+  ask: { to: { type: "string", required: true, pattern: RECIPIENT, hint: "a participant id or name (1-256 of A-Z a-z 0-9 . _ @ : / -)" }, class: { type: "string" }, minutes: { type: "number" } },
   answer: { ask: { type: "uuid", required: true }, outcome: { type: "string", required: true, values: ["answered", "withdrawn"] } },
-  handoff: { to: { type: "string", required: true }, key: { type: "string" } },
+  handoff: { to: { type: "string", required: true, pattern: RECIPIENT, hint: "a participant id or name (1-256 of A-Z a-z 0-9 . _ @ : / -)" }, key: { type: "string" } },
   link: { pr: { type: "string" }, issue: { type: "string" }, commit: { type: "string" }, url: { type: "string" }, forge: { type: "string" }, number: { type: "number" } },
   close: { reason: { type: "string" } },
   reopen: { reason: { type: "string" } },
@@ -88,6 +94,7 @@ const checkField = (kind: string, name: string, spec: FieldSpec, value: unknown)
     case "string":
       if (typeof value !== "string") throw bad("a string");
       if (spec.values && !spec.values.includes(value)) throw bad(`one of ${spec.values.map((v) => JSON.stringify(v)).join(", ")}`);
+      if (spec.pattern && !spec.pattern.test(value)) throw bad(spec.hint ?? `a string matching ${spec.pattern}`);
       return;
     case "strings":
       if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) throw bad("an array of strings");

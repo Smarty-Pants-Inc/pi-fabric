@@ -69,15 +69,31 @@ export interface RecordFold {
   openAsks: RecordEnvelope[];
   links: RecordEnvelope[];
   mirror: Record<string, Record<string, unknown>>;
+  /** Fold fields cut to 16 KiB (the whole values are in the history). */
+  truncated?: string[];
+  /**
+   * Collections that continue: page each with records.fold({ ref, part, after }) from this cursor
+   * until it has no `next`. A fold is complete only when this is absent.
+   */
+  more?: Partial<Record<RecordFoldPart, string>>;
 }
+export type RecordFoldPart = "statuses" | "mirror" | "decisions" | "openAsks" | "links";
+export const RECORD_FOLD_PARTS: readonly RecordFoldPart[] = ["statuses", "mirror", "decisions", "openAsks", "links"];
 export interface RecordsGetArgs { ref: string; after?: number; limit?: number }
+export interface RecordsFoldArgs { ref: string; part: RecordFoldPart; after?: string }
 export interface RecordsGetResult { ref: string; state: RecordFold; history: RecordEnvelope[]; next?: number }
+/** One page of one fold collection (records.fold). */
+export interface RecordsGetPart { ref: string; part: RecordFoldPart; items: unknown[]; next?: string }
 
 export interface RecordsListArgs { org?: string; repo?: string; open?: boolean; owner?: string; hasOpenAsk?: boolean; updatedSince?: number; limit?: number; after?: string }
 export interface RecordsListItem {
   ref: string; title?: string; owner?: string; stage?: string; open: boolean; updatedAt: number;
+  /** The 20 newest authors' statuses; `statusCount` says how many there are (all of them: records.get). */
   statuses: Record<string, { at: number; state?: string; eta?: unknown }>;
+  statusCount: number;
+  /** The 20 oldest open asks; `openAskCount` says how many there are. */
   openAsks: { id: string; to?: string; at: number }[];
+  openAskCount: number;
 }
 export interface RecordsListResult { items: RecordsListItem[]; next?: string }
 
@@ -90,6 +106,7 @@ export interface RecordsBackend {
   append(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordReceipt>;
   read(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsPage>;
   get(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsGetResult>;
+  fold(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsGetPart>;
   list(principal: RecordsPrincipal, args: unknown, options?: RecordsCallOptions): Promise<RecordsListResult>;
 }
 
@@ -126,7 +143,8 @@ export interface RecordsOps {
   byIds(ids: readonly string[], signal?: AbortSignal): Promise<RecordEnvelope[]>;
   openConsumer(consumer: string, names: readonly string[], signal?: AbortSignal): Promise<ConsumerState>;
   saveConsumer(consumer: string, after: number, pending: ConsumerState["pending"], signal?: AbortSignal): Promise<void>;
-  claimPublications(limit: number, signal?: AbortSignal): Promise<ClaimedPublication[]>;
+  /** A byte-bounded claim; `more` says rows remain (the omitted ones are released at once). */
+  claimPublications(limit: number, signal?: AbortSignal): Promise<{ claims: ClaimedPublication[]; more: boolean }>;
   ackPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, meshSequence: number, signal?: AbortSignal): Promise<boolean>;
   failPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, error: string, signal?: AbortSignal): Promise<void>;
   releasePublications(claimId: string, recordIds: readonly string[], signal?: AbortSignal): Promise<void>;
@@ -185,6 +203,11 @@ export interface RecordStoreOptions {
 }
 
 const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
+/** Fold fields and each fold collection's share of a get response (F10). */
+const FOLD_FIELD_BYTES = 16 * 1024;
+const FOLD_PART_BUDGET: Record<RecordFoldPart, number> = { statuses: 128 * 1024, mirror: 64 * 1024, decisions: 64 * 1024, openAsks: 64 * 1024, links: 64 * 1024 };
+/** One record's JSON is at most this (64 KiB of text, escaped, plus 64 KiB of data). */
+const MAX_RECORD_JSON_BYTES = 460 * 1024;
 const MAX_PAGE = 500;
 
 interface RecordRow {
@@ -520,8 +543,8 @@ export class RecordStore implements RecordsBackend, RecordsOps {
    * The claimant is the principal the relay runs as. In process it is this store's origin relay;
    * the records service passes the authenticated caller (`as`).
    */
-  async claimPublications(limit: number, signal?: AbortSignal, as = `relay:${this.origin}`): Promise<ClaimedPublication[]> {
-    return this.transaction(async (client) => {
+  async claimPublications(limit: number, signal?: AbortSignal, as = `relay:${this.origin}`): Promise<{ claims: ClaimedPublication[]; more: boolean }> {
+    const all = await this.transaction(async (client) => {
       const { rows } = await client.query<{ claim_id: string; record_id: string; seq: string; topic: string; recipient: string | null; kind: string; ref: string; author: string; key: string; text: string | null; created_at: Date }>(
         "SELECT * FROM publication_claim($1, $2, $3, $4)", [this.origin, limit, PUBLICATION_LEASE_SECONDS, as]);
       return rows.map((row) => ({
@@ -529,6 +552,11 @@ export class RecordStore implements RecordsBackend, RecordsOps {
         from: row.author, key: row.key, text: row.text, createdAt: row.created_at.getTime(),
       }));
     }, "", signal);
+    // The whole claim stays within the response budget (F10); what does not fit is given back now.
+    const claims = withinBudget(all);
+    const omitted = all.slice(claims.length);
+    if (omitted.length) await this.releasePublications(omitted[0]!.claimId, omitted.map((row) => row.recordId), signal, as);
+    return { claims, more: omitted.length > 0 || all.length === limit };
   }
 
   async ackPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, meshSequence: number, signal?: AbortSignal, as = `relay:${this.origin}`): Promise<boolean> {
@@ -586,6 +614,22 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     }, "READ ONLY", signal);
   }
 
+  /** One page of one fold collection, from the cursor get's `state.more` (or the previous page's next). */
+  async fold(_principal: RecordsPrincipal, input: unknown, options: RecordsCallOptions = {}): Promise<RecordsGetPart> {
+    if (!isObject(input)) throw new RecordsArgumentError("records.fold takes {ref, part, after?}");
+    checkKeys("fold", input, ["ref", "part", "after"]);
+    const ref = optionalString("ref", input.ref);
+    if (!ref) throw new RecordsArgumentError("records.fold needs ref");
+    parseRef(ref);
+    const part = optionalString("part", input.part) as RecordFoldPart | undefined;
+    if (part === undefined || !RECORD_FOLD_PARTS.includes(part)) throw new RecordsArgumentError(`part must be one of ${RECORD_FOLD_PARTS.join(", ")}`);
+    const after = optionalString("after", input.after);
+    return this.transaction(async (client) => {
+      const page = await this.#foldPart(client, ref, part, after, RESPONSE_BUDGET_BYTES);
+      return { ref, part, items: page.items, ...(page.next !== undefined ? { next: page.next } : {}) };
+    }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
+  }
+
   async get(_principal: RecordsPrincipal, input: unknown, options: RecordsCallOptions = {}): Promise<RecordsGetResult> {
     if (!isObject(input)) throw new RecordsArgumentError("records.get takes {ref, after?, limit?}");
     checkKeys("get", input, ["ref", "after", "limit"]);
@@ -596,32 +640,72 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     const limit = optionalInteger("limit", input.limit, 1, MAX_PAGE) ?? 50;
     return this.transaction(async (client) => {
       const issue = await client.query<{ data: Record<string, unknown>; open: boolean }>("SELECT data, open FROM current_issue WHERE ref = $1", [ref]);
-      const statuses = await client.query<{ author: string; author_name: string | null; id: string; created_at: Date; text: string | null; data: Record<string, unknown> }>(
-        "SELECT author, author_name, id, created_at, text, data FROM current_statuses WHERE ref = $1", [ref]);
-      // The fold's lists carry at most 2 KiB of each text and a quarter of the budget each (F10);
-      // the whole records are in the history.
-      const list = async (view: string) => withinBudget((await client.query<RecordRow>(
-        `SELECT ${RECORD_COLUMNS.replace("text,", "left(text, 2048) AS text,")} FROM records WHERE id IN (SELECT id FROM ${view} WHERE ref = $1) ORDER BY seq DESC`, [ref])).rows.map(envelope), RESPONSE_BUDGET_BYTES / 8).reverse();
-      const mirror = await client.query<{ record_id: string; data: Record<string, unknown> }>("SELECT record_id, data FROM mirror_state WHERE ref = $1", [ref]);
-      const history = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE ref = $1 AND seq > $2 ORDER BY seq LIMIT $3`, [ref, after, limit + 1]);
       const fields = issue.rows[0]?.data ?? {};
-      const state: RecordFold = {
-        ...Object.fromEntries(["title", "body", "owner", "acceptance", "labels", "nextAction", "stage"].filter((name) => fields[name] !== undefined).map((name) => [name, fields[name]])),
-        open: issue.rows[0]?.open ?? true,
-        statuses: Object.fromEntries(statuses.rows.map((row) => [row.author, {
-          id: row.id, at: row.created_at.getTime(), ...(row.text !== null ? { text: row.text } : {}),
-          ...(row.author_name ? { name: row.author_name } : {}),
-          ...Object.fromEntries(["state", "eta", "waitOn"].filter((name) => row.data[name] !== undefined).map((name) => [name, row.data[name]])),
-        }])),
-        decisions: await list("current_decisions"),
-        openAsks: await list("open_asks"),
-        links: await list("current_links"),
-        mirror: Object.fromEntries(mirror.rows.map((row) => [row.record_id, row.data])),
+      const truncated: string[] = [];
+      const field = (name: string, value: unknown): unknown => {
+        // Each fold field is at most 16 KiB (F10); the whole value is in the history.
+        if (Buffer.byteLength(JSON.stringify(value)) <= FOLD_FIELD_BYTES) return value;
+        truncated.push(name);
+        return typeof value === "string" ? Buffer.from(value).subarray(0, FOLD_FIELD_BYTES).toString("utf8").replace(/\uFFFD$/u, "") : undefined;
       };
+      const state: RecordFold = {
+        ...Object.fromEntries(["title", "body", "owner", "acceptance", "labels", "nextAction", "stage"]
+          .filter((name) => fields[name] !== undefined).map((name) => [name, field(name, fields[name])]).filter(([, value]) => value !== undefined)),
+        open: issue.rows[0]?.open ?? true,
+        statuses: {}, decisions: [], openAsks: [], links: [], mirror: {},
+      };
+      const more: Partial<Record<RecordFoldPart, string>> = {};
+      for (const name of RECORD_FOLD_PARTS) {
+        const page = await this.#foldPart(client, ref, name, undefined, FOLD_PART_BUDGET[name]);
+        if (name === "statuses") state.statuses = Object.fromEntries(page.items.map((item) => { const { author, ...rest } = item as { author: string }; return [author, rest as RecordStatusFold]; }));
+        else if (name === "mirror") state.mirror = Object.fromEntries(page.items.map((item) => { const { recordId, data } = item as { recordId: string; data: Record<string, unknown> }; return [recordId, data]; }));
+        else state[name] = page.items as RecordEnvelope[];
+        if (page.next !== undefined) more[name] = page.next;
+      }
+      if (truncated.length) state.truncated = truncated;
+      if (Object.keys(more).length) state.more = more;
+      const history = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE ref = $1 AND seq > $2 ORDER BY seq LIMIT $3`, [ref, after, limit + 1]);
       const page = history.rows.slice(0, limit).map(envelope);
-      const rows = withinBudget(page, RESPONSE_BUDGET_BYTES - Buffer.byteLength(JSON.stringify(state)));
-      return { ref, state, history: rows, ...(history.rows.length > limit || rows.length < page.length ? { next: rows.at(-1)!.sequence } : {}) };
+      // The history gets what the state left of the budget; if not even one record fits, it is
+      // empty here and continues from `next`.
+      const room = RESPONSE_BUDGET_BYTES - Buffer.byteLength(JSON.stringify(state));
+      const rows = withinBudget(page, room, room >= MAX_RECORD_JSON_BYTES);
+      const next = history.rows.length > limit || rows.length < page.length ? (rows.at(-1)?.sequence ?? after) : undefined;
+      return { ref, state, history: rows, ...(next !== undefined ? { next } : {}) };
     }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
+  }
+
+  /** One fold collection from a cursor, within a byte budget; `next` when it continues. */
+  async #foldPart(client: SqlClient, ref: string, part: RecordFoldPart, after: string | undefined, budget: number): Promise<{ items: unknown[]; next?: string }> {
+    const pageLimit = 500;
+    let items: { item: unknown; cursor: string }[];
+    if (part === "statuses") {
+      const { rows } = await client.query<{ author: string; author_name: string | null; id: string; created_at: Date; text: string | null; data: Record<string, unknown> }>(
+        `SELECT author, author_name, id, created_at, left(text, 2048) AS text, data FROM current_statuses WHERE ref = $1 AND author > $2 ORDER BY author LIMIT $3`,
+        [ref, after ?? "", pageLimit + 1]);
+      items = rows.map((row) => ({ cursor: row.author, item: {
+        author: row.author, id: row.id, at: row.created_at.getTime(), ...(row.text !== null ? { text: row.text } : {}),
+        ...(row.author_name ? { name: row.author_name } : {}),
+        ...Object.fromEntries(["state", "eta", "waitOn"].filter((name) => row.data[name] !== undefined).map((name) => [name, row.data[name]])),
+      } }));
+    } else if (part === "mirror") {
+      const { rows } = await client.query<{ record_id: string; data: Record<string, unknown> }>(
+        "SELECT record_id, data FROM mirror_state WHERE ref = $1 AND record_id::text > $2 ORDER BY record_id::text LIMIT $3", [ref, after ?? "", pageLimit + 1]);
+      items = rows.map((row) => ({ cursor: row.record_id, item: { recordId: row.record_id, data: row.data } }));
+    } else {
+      const view = { decisions: "current_decisions", openAsks: "open_asks", links: "current_links" }[part];
+      const seq = after === undefined ? 0 : Number(after);
+      if (!Number.isSafeInteger(seq) || seq < 0) throw new RecordsArgumentError("partAfter must be the previous page's next");
+      // The fold's lists carry at most 2 KiB of each text; the whole records are in the history.
+      const { rows } = await client.query<RecordRow>(
+        `SELECT ${RECORD_COLUMNS.replace("text,", "left(text, 2048) AS text,")} FROM records WHERE id IN (SELECT id FROM ${view} WHERE ref = $1) AND seq > $2 ORDER BY seq LIMIT $3`,
+        [ref, seq, pageLimit + 1]);
+      items = rows.map((row) => ({ cursor: String(row.seq), item: envelope(row) }));
+    }
+    const page = items.slice(0, pageLimit);
+    const kept = withinBudget(page.map((entry) => entry.item), budget);
+    const continues = items.length > pageLimit || kept.length < page.length;
+    return { items: kept, ...(continues && kept.length ? { next: page[kept.length - 1]!.cursor } : {}) };
   }
 
   /** A query for views (the ETA alarm, the board, `smarty log --open`); never a delivery path (C4). */
@@ -657,22 +741,30 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     const sql = `
       SELECT * FROM (
         SELECT i.ref, i.data, i.open, i.updated_at, (extract(epoch FROM i.updated_at) * 1000000)::bigint AS updated_us,
-          coalesce((SELECT jsonb_object_agg(s.author, jsonb_strip_nulls(jsonb_build_object('at', (extract(epoch FROM s.created_at) * 1000)::bigint, 'state', s.data->'state', 'eta', s.data->'eta')))
-            FROM current_statuses s WHERE s.ref = i.ref), '{}'::jsonb) AS statuses,
+          -- Per item at most 20 statuses and 20 asks, with counts (F10); an eta over 1 KiB is left out.
+          coalesce((SELECT jsonb_object_agg(s.author, jsonb_strip_nulls(jsonb_build_object('at', (extract(epoch FROM s.created_at) * 1000)::bigint, 'state', s.data->'state',
+              'eta', CASE WHEN octet_length((s.data->'eta')::text) <= 1024 THEN s.data->'eta' END)))
+            FROM (SELECT * FROM current_statuses s WHERE s.ref = i.ref ORDER BY s.created_at DESC LIMIT 20) s), '{}'::jsonb) AS statuses,
+          (SELECT count(*) FROM current_statuses s WHERE s.ref = i.ref)::int AS status_count,
           coalesce((SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object('id', a.id, 'to', a.data->>'to', 'at', (extract(epoch FROM a.created_at) * 1000)::bigint)) ORDER BY a.seq)
-            FROM open_asks a WHERE a.ref = i.ref), '[]'::jsonb) AS open_asks
+            FROM (SELECT * FROM open_asks a WHERE a.ref = i.ref ORDER BY a.seq LIMIT 20) a), '[]'::jsonb) AS open_asks,
+          (SELECT count(*) FROM open_asks a WHERE a.ref = i.ref)::int AS open_ask_count
         FROM current_issue i
       ) i ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
       ORDER BY i.updated_us DESC, i.ref DESC LIMIT ${bind(limit + 1)}`;
     return this.transaction(async (client) => {
-      const { rows } = await client.query<{ ref: string; data: Record<string, unknown>; open: boolean; updated_at: Date; updated_us: string; statuses: RecordsListItem["statuses"]; open_asks: RecordsListItem["openAsks"] }>(sql, values);
-      const items = rows.slice(0, limit).map((row) => ({
+      const { rows } = await client.query<{ ref: string; data: Record<string, unknown>; open: boolean; updated_at: Date; updated_us: string; statuses: RecordsListItem["statuses"]; status_count: number; open_asks: RecordsListItem["openAsks"]; open_ask_count: number }>(sql, values);
+      const page = rows.slice(0, limit).map((row) => ({
         ref: row.ref,
         ...Object.fromEntries(["title", "owner", "stage"].filter((name) => typeof row.data[name] === "string").map((name) => [name, row.data[name]])),
-        open: row.open, updatedAt: row.updated_at.getTime(), statuses: row.statuses, openAsks: row.open_asks,
+        open: row.open, updatedAt: row.updated_at.getTime(),
+        statuses: row.statuses, statusCount: row.status_count, openAsks: row.open_asks, openAskCount: row.open_ask_count,
       }) as RecordsListItem);
-      const last = rows[limit - 1];
-      return { items, ...(rows.length > limit && last ? { next: Buffer.from(JSON.stringify({ u: String(last.updated_us), r: last.ref })).toString("base64url") } : {}) };
+      // The page stops near the response budget too (F10); `next` continues after its last item.
+      const items = withinBudget(page);
+      const last = rows[items.length - 1];
+      const continues = rows.length > limit || items.length < page.length;
+      return { items, ...(continues && last ? { next: Buffer.from(JSON.stringify({ u: String(last.updated_us), r: last.ref })).toString("base64url") } : {}) };
     }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
   }
 

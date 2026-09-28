@@ -17,12 +17,12 @@ export const MAX_LINE_BYTES = 1024 * 1024;
 export const RESPONSE_BUDGET_BYTES = 768 * 1024;
 
 /** The longest prefix of `items` whose JSON fits the budget, never fewer than one item. */
-export const withinBudget = <T>(items: readonly T[], budget = RESPONSE_BUDGET_BYTES): T[] => {
+export const withinBudget = <T>(items: readonly T[], budget = RESPONSE_BUDGET_BYTES, atLeastOne = true): T[] => {
   let used = 0;
   const kept: T[] = [];
   for (const item of items) {
     const size = Buffer.byteLength(JSON.stringify(item)) + 1;
-    if (kept.length > 0 && used + size > budget) break;
+    if ((kept.length > 0 || !atLeastOne) && used + size > budget) break;
     kept.push(item);
     used += size;
   }

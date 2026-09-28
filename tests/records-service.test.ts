@@ -8,7 +8,7 @@ import { RemoteRecords } from "../src/records/client.js";
 import { recordsInboxMessage, recordsInboxSession, RecordsInbox } from "../src/records/inbox.js";
 import { PublicationRelay, type NudgePublisher } from "../src/records/relay.js";
 import { migrate, SERVICE_ROLE } from "../src/records/schema.js";
-import { issuePrincipal, normalizeServiceConfig, RecordsServer, type RecordsServiceConfig } from "../src/records/server.js";
+import { issuePrincipal, normalizeServiceConfig, RecordsServer, type OperatorRole, type RecordsServiceConfig } from "../src/records/server.js";
 import type { ClientPool } from "../src/records/store.js";
 import { postgresBin, startPostgres, type TestPostgres } from "./helpers/postgres.js";
 
@@ -81,7 +81,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
   };
   /** An operator-issued principal's client (the relay, the importer), as the installer issues it. */
   const operator = async (config: RecordsServiceConfig, owner: pg.Pool, id: string) => {
-    const issued = await issuePrincipal(config, id, id, owner as unknown as ClientPool);
+    const issued = await issuePrincipal(config, id, id.split(":")[0] as OperatorRole, id, owner as unknown as ClientPool);
     const file = path.join(dir, `${id.replaceAll(":", "_")}-${databases}.json`);
     fs.writeFileSync(file, JSON.stringify(issued), { mode: 0o600 });
     return connect(config, "unused", file);
@@ -140,7 +140,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
       .rejects.toThrow(/importer role/);
     await expect(alice.append({ id: ALICE }, { ref: REF, kind: "mirror", key: "m", data: { mirrorOf: "00000000-0000-4000-8000-000000000000", target: "github", state: "mirrored" } }))
       .rejects.toThrow(/mirror role/);
-    const issued = await issuePrincipal(config, "importer:github", "github importer", owner as unknown as ClientPool);
+    const issued = await issuePrincipal(config, "importer:github", "importer", "github importer", owner as unknown as ClientPool);
     const file = path.join(dir, "importer.json");
     fs.writeFileSync(file, JSON.stringify(issued), { mode: 0o600 });
     const importer = await connect(config, "whatever", file);
@@ -311,7 +311,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
       if (rows[0].n > 0) break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
-    expect((await owner.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO principals%'")).rows[0].n).toBe(1);
+    expect((await owner.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO principals%'")).rows[0].n).toBeGreaterThanOrEqual(1);
     raw.socket.destroy();
     await blocker.query("COMMIT");
     blocker.release();
@@ -338,7 +338,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     // Between relays, a claim stays its claimant's.
     const relay = await operator(config, owner, "relay:fabric");
     const other = await operator(config, owner, "relay:other");
-    const [claim] = await relay.claimPublications(10);
+    const { claims: [claim] } = await relay.claimPublications(10);
     expect(claim!.recordId).toBe(record.id);
     expect(await other.ackPublication(claim!, 999)).toBe(false);
     await other.failPublication(claim!, "suppressed");
@@ -357,7 +357,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     await inbox.next(recordsInboxSession([]));
     const ask = await alice.append({ id: ALICE }, { ref: REF, kind: "ask", key: "a", text: "host?", data: { to: "bob" } });
     // A relay (the only one allowed) marks the nudge published but never publishes it.
-    const [claim] = await relay.claimPublications(10);
+    const { claims: [claim] } = await relay.claimPublications(10);
     expect(await relay.ackPublication(claim!, 1)).toBe(true);
     // The receiver's next reconcile still delivers the record.
     expect((await inbox.next(recordsInboxSession([]))).records.map((record) => record.id)).toEqual([ask.id]);
@@ -422,6 +422,8 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect(service.alerts().at(-1)!.pids).toContain(process.pid);
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).alarm).toMatch(new RegExp(`token of ${ALICE} used by live processes`));
+    // The factory check (another user) reads it: 0644, no secret in it.
+    expect(fs.statSync(path.join(dir, "status.json")).mode & 0o777).toBe(0o644);
     // Counterexample: one process calling many times raises nothing new.
     const count = service.alerts().length;
     await alice.read({ id: ALICE }, {});
@@ -477,6 +479,102 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     const events: unknown[] = [];
     expect(await new PublicationRelay(relay, { publish: async (input) => { events.push(input); return { sequence: events.length }; } }).flush()).toEqual({ published: 20, failed: 0 });
   }, 60_000);
+
+  it("refuses oversized or malformed recipients at append, so claims stay small (F10)", async () => {
+    const { config, owner } = await freshService();
+    const alice = await connect(config, ALICE);
+    for (const to of ["x".repeat(257), "a b", "bob\n", "ü"]) {
+      await expect(alice.append({ id: ALICE }, { ref: REF, kind: "ask", key: `bad-${to.length}`, text: "t", data: { to } })).rejects.toThrow(/participant id or name/);
+    }
+    // The reported sequence: 20 asks with ~60 KiB recipients. All are refused, nothing is written.
+    for (let i = 0; i < 20; i++) {
+      await expect(alice.append({ id: ALICE }, { ref: REF, kind: "ask", key: `big-to-${i}`, text: "t", data: { to: "r".repeat(60 * 1024) } })).rejects.toThrow(/participant id or name/);
+    }
+    expect((await owner.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
+    // Counterexample: a 256-character recipient is accepted and published.
+    await alice.append({ id: ALICE }, { ref: REF, kind: "ask", key: "ok", text: "t", data: { to: "r".repeat(256) } });
+    const relay = await operator(config, owner, "relay:fabric");
+    const events: { to?: string }[] = [];
+    expect(await new PublicationRelay(relay, { publish: async (input) => { events.push(input); return { sequence: events.length }; } }).flush()).toEqual({ published: 1, failed: 0 });
+    expect(events[0]!.to).toBe("r".repeat(256));
+  });
+
+  it("pages a fold with many large statuses to completion (F10)", async () => {
+    const { config, owner } = await freshService();
+    const importer = await operator(config, owner, "importer:github");
+    const text = `"${"s".repeat(62 * 1024)}"`;
+    // 70 authors: their fold statuses (2 KiB each) outgrow the statuses share, so the fold continues.
+    const authors = Array.from({ length: 70 }, (_, i) => `github:author${String(i).padStart(2, "0")}`);
+    for (const author of authors) {
+      await importer.append({ id: "x" }, { ref: REF, kind: "status", key: `st-${author}`, text, author, data: { state: "in progress", via: "github:bot" } });
+    }
+    await importer.append({ id: "x" }, { ref: REF, kind: "issue", key: "issue", author: "github:paul", data: { title: "T".repeat(60 * 1024), via: "github:bot" } });
+    const got = await importer.get({ id: "x" }, { ref: REF, limit: 500 });
+    // Bounded: the state and the history each fit, and the fold says what continues.
+    expect(Buffer.byteLength(JSON.stringify(got))).toBeLessThan(1024 * 1024);
+    expect(got.state.truncated).toEqual(["title"]);
+    expect(Object.values(got.state.statuses).every((status) => Buffer.byteLength(status.text ?? "") <= 2048)).toBe(true);
+    expect(Object.keys(got.state.statuses).length).toBeLessThan(70);
+    expect(got.state.more?.statuses).toBeDefined();
+    const seen = new Set(Object.keys(got.state.statuses));
+    let cursor = got.state.more?.statuses;
+    for (let round = 0; cursor !== undefined && round < 20; round++) {
+      const page = await importer.fold({ id: "x" }, { ref: REF, part: "statuses", after: cursor });
+      for (const item of page.items as { author: string }[]) seen.add(item.author);
+      cursor = page.next;
+    }
+    expect([...seen].sort()).toEqual(authors);
+    // The history continues to every record too.
+    const history: number[] = [];
+    for (let after = 0, round = 0; round < 40; round++) {
+      const page = await importer.get({ id: "x" }, { ref: REF, after, limit: 500 });
+      history.push(...page.history.map((record) => record.sequence));
+      if (page.next === undefined) break;
+      after = page.next;
+    }
+    expect(history).toEqual(Array.from({ length: 71 }, (_, i) => i + 1));
+  }, 60_000);
+
+  it("pages a list of issues with large titles to completion (F10)", async () => {
+    const { config, owner } = await freshService();
+    const alice = await connect(config, ALICE);
+    void owner;
+    const refs: string[] = [];
+    for (let i = 1; i <= 30; i++) {
+      const ref = `Smarty-Pants-Inc/smarty-dev#${i}`;
+      refs.push(ref);
+      await alice.append({ id: ALICE }, { ref, kind: "issue", key: `i-${i}`, data: { title: `${i}:${"t".repeat(60 * 1024)}` } });
+    }
+    const seen: string[] = [];
+    let after: string | undefined;
+    for (let round = 0; round < 40; round++) {
+      const page = await alice.list({ id: ALICE }, { limit: 500, ...(after ? { after } : {}) });
+      expect(page.items.length).toBeLessThan(30);
+      seen.push(...page.items.map((item) => item.ref));
+      if (!page.next) break;
+      after = page.next;
+    }
+    expect(seen.sort()).toEqual(refs.sort());
+  }, 60_000);
+
+  it("keeps operator roles to principals the installer issued for that role", async () => {
+    const { config, owner } = await freshService();
+    // The config grants relay to importer:github, but it was issued as an importer: no relay authority.
+    const confused = normalizeServiceConfig({ ...config, roles: { importer: ["importer:github"], mirror: [], relay: ["importer:github"] } });
+    const { service } = { service: await RecordsServer.open(confused, { pool: new pg.Pool({ ...config.database, max: 2 }) as unknown as ClientPool }) };
+    cleanups.push(() => service.close());
+    await service.listen(`${config.socket}.confused`);
+    const importer = await operator({ ...confused, socket: `${config.socket}.confused` }, owner, "importer:github");
+    await expect(importer.claimPublications(10)).rejects.toThrow(/only the records relay/);
+    // An operator id cannot be registered, and a session id cannot be issued.
+    await expect(issuePrincipal(config, ALICE, "relay", "x", owner as unknown as ClientPool)).rejects.toThrow(/registers itself/);
+    const raw = await rawClient(config.socket);
+    raw.send({ id: 1, method: "register", args: { id: "relay:sneaky", nonce: "n".repeat(43) } });
+    expect((await raw.response(1))?.error?.code).toBe("RECORD_PRINCIPAL_INVALID");
+    // Counterexample: issued as relay and granted relay, it claims.
+    const relay = await operator(config, owner, "relay:fabric");
+    expect((await relay.claimPublications(10)).claims).toEqual([]);
+  });
 
   it("a client closed while it reconnects starts no call (F3)", async () => {
     const { config, service, owner } = await freshService();

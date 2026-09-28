@@ -16,13 +16,13 @@
 # LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
 #
 # ROOT STEPS (one line each):
-#  0. mktemp -d /run/<org>-records-stage.XXXXXX (root, 0700; removed on exit); copy --node and the bundle into it once each; refuse (nothing changed) unless each staged copy's sha256 equals --node-sha256/--bundle-sha256
+#  0. mktemp -d /run/<org>-records-stage.XXXXXX (root, 0700; removed on exit); copy --node and the bundle into it once each; refuse (nothing changed) unless each staged copy's sha256 equals --node-sha256/--bundle-sha256; install -d -m 0700 -o root -g root the installer state dir /var/lib/<org>-records-installer (restart-pending, root-only temp files) and refuse unless it is no symlink, root-owned, 0700, with every ancestor root-owned and not group- or world-writable
 #  1. useradd the <org>-records system user (skipped if it exists)
-#  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records/restart-pending, root 0600); check <org>-records runs it with no modules
-#  3. create /var/lib/<org>-records/{,pg,status,credentials}, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes
-#  4. initdb the cluster as <org>-records if absent (an existing cluster keeps its own major, from PG_VERSION); write pg_hba.conf, pg_ident.conf, conf.d/records.conf; append include_dir to postgresql.conf
+#  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records-installer/restart-pending, root 0600; each line must be one of the two unit names, otherwise refused); check <org>-records runs it with no modules
+#  3. create /var/lib/<org>-records, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes; <org>-records itself creates /var/lib/<org>-records/{pg,status,credentials} (root names no path inside its home)
+#  4. initdb the cluster as <org>-records if absent (an existing cluster keeps its own major, from PG_VERSION); as <org>-records (never root), write pg_hba.conf, pg_ident.conf, conf.d/records.conf and append include_dir to postgresql.conf (each only when it changes, first listing <org>-records-pg.service in restart-pending before a config change)
 #  5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
-#  6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if its config changed or restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
+#  6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
 #  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
 #  8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
 #  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
@@ -30,7 +30,7 @@
 #  R1. systemctl stop both units; refuse (nothing deleted) unless is-active says inactive, failed or unknown for both; systemctl disable both
 #  R2. rm -f both unit files; systemctl daemon-reload
 #  R3. rm -rf /etc/<org>-records
-#  R4. rm -rf /var/lib/<org>-records (cluster data, credentials, status: take the printed pg_dump backup first)
+#  R4. rm -rf /var/lib/<org>-records (cluster data, credentials, status: take the printed pg_dump backup first); rm -rf /var/lib/<org>-records-installer
 #  R5. rm -rf /run/<org>-records /run/<org>-records-pg
 #  R6. rm -rf /opt/<org>-records
 #  R7. as <org-user>: rm -rf ~<org-user>/.config/<org>-records (relay credential; root never deletes in that home)
@@ -45,7 +45,8 @@
 # TEST ONLY: RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST=1 skips the root check so tests can run the real
 # (non-dry) path against PATH fakes; with it, RECORDS_PAUL_STEPS_TEST_ROOT=DIR prefixes every system path
 # (also /usr/lib/postgresql, where the PostgreSQL version is detected), and the PostgreSQL trust check expects
-# the test user's uid instead of root (0) and stops at that root instead of / (the writable checks stay).
+# the test user's uid instead of root (0) and stops at that root instead of / (the writable checks stay); so do the
+# installer state dir check and a records-owned file's owner check (the test user instead of <org>-records).
 # Never set either on a real host.
 set -Eeuo pipefail
 
@@ -200,6 +201,8 @@ if [[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} == 1 ]]; then
 	[[ -z $T || $T =~ ^/[A-Za-z0-9._/+-]*$ ]] || die "invalid RECORDS_PAUL_STEPS_TEST_ROOT"
 fi
 HOME_DIR="${T}/var/lib/${REC}"
+# S5: installer state (restart-pending, root temp files) lives in a root-only dir outside the records user's tree.
+STATE="${T}/var/lib/${REC}-installer"
 DATA="${HOME_DIR}/pg"
 PGSOCK="${T}/run/${REC}-pg"
 SVCSOCK="${T}/run/${REC}"
@@ -249,25 +252,35 @@ pg_derived() { # everything that names the PostgreSQL major or binaries
 # S4: nothing in PG_BIN runs unless each binary used and every ancestor directory (up to /) is a real file or
 # directory (no symlink), owned by root and not group- or world-writable. stat never follows a link.
 # TEST ONLY: in test mode the owner must be the test user and the walk stops at RECORDS_PAUL_STEPS_TEST_ROOT.
+# protected_chain SUFFIX PATH...: die unless each PATH and every ancestor (up to /; test mode: up to the test root)
+# is no symlink, owned by root (test mode: the test uid), and not group- or world-writable.
+TRUST_UID=0 TRUST_TOP=/
+if [[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} == 1 ]]; then TRUST_UID=$(id -u) TRUST_TOP=${T:-/}; fi
+protected_chain() {
+	local suffix=$1 p path s paths=()
+	shift
+	for p; do
+		path=$p
+		while :; do
+			paths+=("$path")
+			[[ $path != "$TRUST_TOP" && $path != / ]] || break
+			path=${path%/*} path=${path:-/}
+		done
+	done
+	for p in "${paths[@]}"; do
+		[[ ! -L $p && -e $p ]] || die "refused: ${p} is not root-owned and protected${suffix}"
+		s=$(stat -c '%u %a' -- "$p")
+		[[ ${s%% *} == "$TRUST_UID" ]] && ((!(8#${s#* } & 8#022))) ||
+			die "refused: ${p} is not root-owned and protected${suffix}"
+	done
+}
 pg_trusted() {
-	local want=0 top=/ p path s paths=()
-	if [[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} == 1 ]]; then want=$(id -u) top=${T:-/}; fi
+	local p paths=()
 	for p in initdb postgres pg_isready psql createdb pg_dump; do
 		[[ ! -e $PG_BIN/$p && ! -L $PG_BIN/$p ]] || paths+=("$PG_BIN/$p")
 	done
-	path=$PG_BIN
-	while :; do
-		paths+=("$path")
-		[[ $path != "$top" && $path != / ]] || break
-		path=${path%/*} path=${path:-/}
-	done
-	for p in "${paths[@]}"; do
-		[[ ! -L $p && -e $p ]] || die "refused: ${p} is not root-owned and protected; nothing was changed"
-		s=$(stat -c '%u %a' -- "$p")
-		[[ ${s%% *} == "$want" ]] && ((!(8#${s#* } & 8#022))) ||
-			die "refused: ${p} is not root-owned and protected; nothing was changed"
-	done
-	echo "OK: ${PG_BIN}, its binaries and every ancestor are owned by uid ${want}, not symlinks, not group- or world-writable"
+	protected_chain "; nothing was changed" "${paths[@]}" "$PG_BIN"
+	echo "OK: ${PG_BIN}, its binaries and every ancestor are owned by uid ${TRUST_UID}, not symlinks, not group- or world-writable"
 }
 if [[ -n $CLUSTER_MAJOR ]]; then
 	PG_MAJOR=$CLUSTER_MAJOR PG_BIN="${PG_BASE}/${CLUSTER_MAJOR}/bin"
@@ -478,10 +491,36 @@ step() { # N TITLE
 	STEP="$1 ($2)"
 	echo "## $1. $2"
 }
-_append() { printf '%s\n' "$2" >>"$1"; }
-CHANGED=0 CONTENT_CHANGED=0
+CHANGED=0 CONTENT_CHANGED=0 BEFORE_CONTENT_CHANGE=
+# BEFORE_CONTENT_CHANGE, when set, runs right before a write that changes content (e.g. marker_add).
+# The owner a records-owned file must have. TEST ONLY: the test user, who stands in for ${REC}.
+REC_OWNER="${REC}:${REC}"
+[[ ${RECORDS_PAUL_STEPS_ALLOW_NONROOT_TEST:-} != 1 ]] || REC_OWNER="$(id -un):$(id -gn)"
+# S5: a file inside a records-owned directory is read and written only as ${REC}: root never opens a path the
+# records user could swap for a symlink. A dry run only reads (as the invoking user) and prints.
+rec_read() { if ((DRY)); then cat -- "$1" 2>/dev/null || true; else as_rec cat -- "$1" 2>/dev/null || true; fi; }
 write_file() { # PATH MODE OWNER CONTENT; idempotent: writes only when content, mode or owner differ
-	local path=$1 mode=$2 owner=$3 content=$4 tmp
+	local path=$1 mode=$2 owner=$3 content=$4 tmp want
+	local rec=0
+	[[ $owner != "$REC:$REC" ]] || rec=1
+	if ((rec)); then
+		want="$(printf '%o' "$((8#$mode))") ${REC_OWNER}"
+		if [[ -f $path && ! -L $path ]] && [[ "$(rec_read "$path")" == "$content" ]]; then
+			if [[ $(stat -c '%a %U:%G' -- "$path") == "$want" ]]; then
+				printf '= unchanged %s\n' "$path"
+				return 0
+			fi
+			# ${REC} cannot chown: a wrong owner or mode is fixed by the rewrite below (no content change).
+			CHANGED=1
+		else
+			CHANGED=1 CONTENT_CHANGED=1
+			[[ -z $BEFORE_CONTENT_CHANGE ]] || $BEFORE_CONTENT_CHANGE
+		fi
+		printf '+ write %s (mode %s, owner %s, as %s)\n' "$path" "$mode" "$owner" "$REC"
+		((!DRY)) || printf '%s\n' "$content" | sed 's/^/    | /'
+		run runuser -u "$REC" -- sh -c 'umask 077 && cat > "$1.tmp.$$" && chmod "$2" "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"' sh "$path" "$mode" <<<"$content"
+		return 0
+	fi
 	if [[ -f $path && -r $path ]] && [[ "$(cat "$path")" == "$content" ]]; then
 		if [[ $(stat -c '%a %U:%G' "$path") == "$(printf '%o' "$((8#$mode))") $owner" ]]; then
 			printf '= unchanged %s\n' "$path"
@@ -493,15 +532,18 @@ write_file() { # PATH MODE OWNER CONTENT; idempotent: writes only when content, 
 		return 0
 	fi
 	CHANGED=1 CONTENT_CHANGED=1
+	[[ -z $BEFORE_CONTENT_CHANGE ]] || $BEFORE_CONTENT_CHANGE
 	printf '+ write %s (mode %s, owner %s)\n' "$path" "$mode" "$owner"
 	if ((DRY)); then
 		printf '%s\n' "$content" | sed 's/^/    | /'
+		echo "? via a temp file in ${STATE} (root-only), then + install -m ${mode} -o ${owner%%:*} -g ${owner#*:} ${STATE}/write.XXXXXX ${path}"
 		return 0
 	fi
-	# P3-3: the temp file lives next to its target, never in /tmp.
-	tmp=$(mktemp "${path}.XXXXXX")
+	# S5: root targets are root-owned files in root-owned directories; the temp file lives in the root-only
+	# ${STATE}, never next to the target (P3-3: never in /tmp either).
+	tmp=$(mktemp "${STATE}/write.XXXXXX")
 	printf '%s\n' "$content" >"$tmp"
-	if ! install -m "$mode" -o "${owner%%:*}" -g "${owner#*:}" "$tmp" "$path"; then
+	if ! run install -m "$mode" -o "${owner%%:*}" -g "${owner#*:}" "$tmp" "$path"; then
 		rm -f "$tmp"
 		die "cannot install ${path}"
 	fi
@@ -552,9 +594,10 @@ rollback_steps() {
 	rb systemctl daemon-reload
 	rb_step R3 "remove ${CONF_DIR}"
 	rb rm -rf "$CONF_DIR"
-	rb_step R4 "remove ${HOME_DIR} (record database, credentials, status)"
+	rb_step R4 "remove ${HOME_DIR} (record database, credentials, status) and ${STATE}"
 	[[ $RB_MODE == print ]] || echo "!! ${DELETE_WARNING}"
 	rb rm -rf "$HOME_DIR"
+	rb rm -rf "$STATE"
 	rb_step R5 "remove the runtime directories"
 	rb rm -rf "$SVCSOCK" "$PGSOCK"
 	rb_step R6 "remove ${OPT}"
@@ -577,13 +620,13 @@ rollback_steps() {
 
 root_steps() {
 	cat <<'EOF'
-  0. mktemp -d /run/<org>-records-stage.XXXXXX (root, 0700; removed on exit); copy --node and the bundle into it once each; refuse (nothing changed) unless each staged copy's sha256 equals --node-sha256/--bundle-sha256
+  0. mktemp -d /run/<org>-records-stage.XXXXXX (root, 0700; removed on exit); copy --node and the bundle into it once each; refuse (nothing changed) unless each staged copy's sha256 equals --node-sha256/--bundle-sha256; install -d -m 0700 -o root -g root the installer state dir /var/lib/<org>-records-installer (restart-pending, root-only temp files) and refuse unless it is no symlink, root-owned, 0700, with every ancestor root-owned and not group- or world-writable
   1. useradd the <org>-records system user (skipped if it exists)
-  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records/restart-pending, root 0600); check <org>-records runs it with no modules
-  3. create /var/lib/<org>-records/{,pg,status,credentials}, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes
-  4. initdb the cluster as <org>-records if absent (an existing cluster keeps its own major, from PG_VERSION); write pg_hba.conf, pg_ident.conf, conf.d/records.conf; append include_dir to postgresql.conf
+  2. if no /usr/lib/postgresql/<N>/bin has initdb and postgres: always write /etc/postgresql-common/createcluster.d/zz-<org>-records.conf (create_main_cluster = false), then apt-get install postgresql (distro; no repository added); N is the cluster's PG_VERSION, else the highest /usr/lib/postgresql/<N> (16 or newer; nothing is run to find it); refuse unless the PostgreSQL binaries and every ancestor directory are root-owned, not symlinks and not group- or world-writable; install the verified staged node (0755) and service-main.mjs (0644) root-owned in /opt/<org>-records (first listing <org>-records.service in /var/lib/<org>-records-installer/restart-pending, root 0600; each line must be one of the two unit names, otherwise refused); check <org>-records runs it with no modules
+  3. create /var/lib/<org>-records, /run/<org>-records-pg, /run/<org>-records and /etc/<org>-records with fixed owners and modes; <org>-records itself creates /var/lib/<org>-records/{pg,status,credentials} (root names no path inside its home)
+  4. initdb the cluster as <org>-records if absent (an existing cluster keeps its own major, from PG_VERSION); as <org>-records (never root), write pg_hba.conf, pg_ident.conf, conf.d/records.conf and append include_dir to postgresql.conf (each only when it changes, first listing <org>-records-pg.service in restart-pending before a config change)
   5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
-  6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if its config changed or restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
+  6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
   7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
   8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
   9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
@@ -603,10 +646,10 @@ IDEMPOTENCY: a second run with the same flags
   2. apt-get skipped (PostgreSQL ${PG_MAJOR:-<N>} found); the verified node and service-main.mjs installed only when content differs (restart-pending written first)
   3. unchanged: the same directories, owners and modes are reapplied
   4. initdb skipped (cluster exists; an existing cluster keeps its own major); pg_hba.conf, pg_ident.conf, records.conf rewritten only when content
-     differs; include_dir appended only once; PostgreSQL restarted only when its config changed
+     differs; include_dir appended only once; a config change first lists the pg unit in restart-pending
   5. skipped: service.json exists (never overwritten)
   6. units rewritten only when content differs; daemon-reload and enable --now leave running units unchanged
-     (a running unit is restarted when restart-pending lists it, also after an interrupted run, or PostgreSQL's config changed)
+     (a running unit is restarted when restart-pending lists it: its config or unit changed, now or in an interrupted run)
   7. createdb and CREATE ROLE skipped (exist); migrate applies only unapplied migrations; enable --now unchanged
      (a running service is restarted when restart-pending lists it: node, the bundle or its unit changed, now or in an interrupted run)
   8. an id that holds another role refused; a role added to service.json only when missing; a credential issued (--reissue) only when absent; the relay
@@ -673,6 +716,37 @@ done
 # S4: before step 0, and before anything in PG_BIN runs. A fresh install is checked in step 2, after apt.
 if [[ -n $PG_MAJOR ]]; then pg_trusted; fi
 
+# F3: a unit whose node, bundle, unit file or PostgreSQL config is replaced is listed here BEFORE the replacement and removed only
+# after its restart (or its fresh start), so a rerun after an interruption still restarts it though bytes match.
+MARKER="${STATE}/restart-pending"
+# S5: the marker holds only unit names; anything else (or a non-regular file) is refused, never copied forward.
+marker_check() {
+	local l
+	[[ -e $MARKER || -L $MARKER ]] || return 0
+	[[ -f $MARKER && ! -L $MARKER ]] || die "refused: ${MARKER} holds unexpected content"
+	while IFS= read -r l || [[ -n $l ]]; do
+		[[ $l == "$PG_UNIT" || $l == "$SVC_UNIT" ]] || die "refused: ${MARKER} holds unexpected content"
+	done <"$MARKER"
+}
+marker_has() { marker_check; [[ -f $MARKER ]] && grep -qxF "$1" "$MARKER"; }
+marker_set() { # CONTENT: rewrite the marker (root, 0600), or remove it when empty; its temp file is in root-only ${STATE}
+	local tmp
+	if [[ -z $1 ]]; then run rm -f "$MARKER"; return; fi
+	tmp=$(mktemp "${STATE}/restart-pending.XXXXXX")
+	printf '%s\n' "$1" >"$tmp"
+	if ! run install -m 0600 -o root -g root "$tmp" "$MARKER"; then rm -f "$tmp"; die "cannot write ${MARKER}"; fi
+	rm -f "$tmp"
+}
+marker_add() { # UNIT
+	if ((DRY)); then echo "? add ${1} to ${MARKER} (root, 0600; restart pending until it restarts)"; return 0; fi
+	marker_has "$1" && return 0
+	marker_set "$( [[ ! -f $MARKER ]] || cat "$MARKER"; echo "$1")"
+}
+marker_clear() { # UNIT
+	if ((DRY)); then echo "? remove ${1} from ${MARKER} (rm it when empty)"; return 0; fi
+	marker_has "$1" || return 0
+	marker_set "$(grep -vxF "$1" "$MARKER" || true)"
+}
 # P1-1: the sources are read once each into a fresh root-only directory; only staged copies whose sha256 is
 # the approved one go further. Every later step uses the staged, then installed, copies, never the sources.
 step 0 "Stage and verify node and the bundle"
@@ -700,6 +774,18 @@ else
 	[[ $got_node == "$NODE_SHA" ]] || die "refused: staged node sha256 ${got_node} != approved ${NODE_SHA}; nothing was changed"
 	[[ $got_main == "$BUNDLE_SHA" ]] || die "refused: staged bundle sha256 ${got_main} != approved ${BUNDLE_SHA}; nothing was changed"
 	echo "OK: the staged node and bundle match the approved sha256"
+	STEP="0 (Stage and verify node and the bundle)"
+fi
+# S5: installer state lives only here: root-owned, 0700, outside the records user's tree, every ancestor protected.
+run install -d -m 0700 -o root -g root "$STATE"
+if ((DRY)); then
+	echo "? refuse unless ${STATE} is no symlink, owned by root, mode 0700, and every ancestor is root-owned and not group- or world-writable"
+else
+	[[ -d $STATE && ! -L $STATE && $(stat -c '%u %a' -- "$STATE") == "${TRUST_UID} 700" ]] ||
+		die "refused: ${STATE} is not a root-owned 0700 directory"
+	protected_chain "" "$STATE"
+	echo "OK: ${STATE} is root-only (0700) and every ancestor is protected"
+	marker_check
 fi
 
 step 1 "OS user ${REC}"
@@ -741,29 +827,6 @@ create_main_cluster = false"
 	fi
 fi
 
-# F3: a unit whose node, bundle or unit file is replaced is listed here BEFORE the replacement and removed only
-# after its restart (or its fresh start), so a rerun after an interruption still restarts it though bytes match.
-MARKER="${HOME_DIR}/restart-pending"
-marker_has() { [[ -f $MARKER ]] && grep -qxF "$1" "$MARKER"; }
-marker_set() { # CONTENT: rewrite the marker (root, 0600), or remove it when empty
-	local tmp
-	if [[ -z $1 ]]; then run rm -f "$MARKER"; return; fi
-	[[ -d $HOME_DIR ]] || run install -d -m 0755 -o "$REC" -g "$REC" "$HOME_DIR"
-	tmp=$(mktemp "${MARKER}.XXXXXX")
-	printf '%s\n' "$1" >"$tmp"
-	if ! run install -m 0600 -o root -g root "$tmp" "$MARKER"; then rm -f "$tmp"; die "cannot write ${MARKER}"; fi
-	rm -f "$tmp"
-}
-marker_add() { # UNIT
-	if ((DRY)); then echo "? add ${1} to ${MARKER} (root, 0600; restart pending until it restarts)"; return 0; fi
-	marker_has "$1" && return 0
-	marker_set "$( [[ ! -f $MARKER ]] || cat "$MARKER"; echo "$1")"
-}
-marker_clear() { # UNIT
-	if ((DRY)); then echo "? remove ${1} from ${MARKER} (rm it when empty)"; return 0; fi
-	marker_has "$1" || return 0
-	marker_set "$(grep -vxF "$1" "$MARKER" || true)"
-}
 # Only the two verified staged files are installed; nothing under ${OPT} comes from the sources directly.
 run install -d -m 0755 -o root -g root "$OPT"
 if cmp -s "${STAGE}/node" "$OPT_NODE"; then
@@ -798,9 +861,10 @@ fi
 
 step 3 "Directories"
 run install -d -m 0755 -o "$REC" -g "$REC" "$HOME_DIR"
-run install -d -m 0700 -o "$REC" -g "$REC" "$DATA"
-run install -d -m 0755 -o "$REC" -g "$REC" "$STATUS_DIR"
-run install -d -m 0700 -o "$REC" -g "$REC" "$CRED_DIR"
+# S5: inside its home, ${REC} creates its own directories; root never names a path it could swap for a symlink.
+run runuser -u "$REC" -- install -d -m 0700 "$DATA"
+run runuser -u "$REC" -- install -d -m 0755 "$STATUS_DIR"
+run runuser -u "$REC" -- install -d -m 0700 "$CRED_DIR"
 run install -d -m 0700 -o "$REC" -g "$REC" "$PGSOCK"
 run install -d -m 2750 -o "$REC" -g "$ORG_GROUP" "$SVCSOCK"
 run install -d -m 0750 -o root -g "$REC" "$CONF_DIR"
@@ -813,18 +877,19 @@ else
 	FRESH=1
 	run runuser -u "$REC" -- "$PG_BIN/initdb" -D "$DATA" -U postgres --auth-local=peer --auth-host=reject -E UTF8 --locale=C
 fi
-CHANGED=0
+# F3/S3: PG_UNIT is listed in restart-pending before each config change, cleared only after its restart.
+BEFORE_CONTENT_CHANGE="marker_add $PG_UNIT"
 write_file "$DATA/pg_hba.conf" 0600 "$REC:$REC" "$(render_hba)"
 write_file "$DATA/pg_ident.conf" 0600 "$REC:$REC" "$(render_ident)"
-run install -d -m 0700 -o "$REC" -g "$REC" "$DATA/conf.d"
+run runuser -u "$REC" -- install -d -m 0700 "$DATA/conf.d"
 write_file "$DATA/conf.d/records.conf" 0600 "$REC:$REC" "$(render_conf)"
-if [[ -r $DATA/postgresql.conf ]] && grep -qxF "include_dir = 'conf.d'" "$DATA/postgresql.conf"; then
+if rec_read "$DATA/postgresql.conf" | grep -qxF "include_dir = 'conf.d'"; then
 	echo "= include_dir already in postgresql.conf"
 else
-	run _append "$DATA/postgresql.conf" "include_dir = 'conf.d'"
-	CHANGED=1
+	marker_add "$PG_UNIT"
+	run runuser -u "$REC" -- sh -c 'printf "%s\n" "$2" >> "$1"' sh "$DATA/postgresql.conf" "include_dir = 'conf.d'"
 fi
-PG_CONF_CHANGED=$CHANGED
+BEFORE_CONTENT_CHANGE=
 
 step 5 "Service config"
 if [[ -f $CFG ]]; then
@@ -848,12 +913,12 @@ PG_WAS_ACTIVE=0
 if was_active "$PG_UNIT"; then PG_WAS_ACTIVE=1; fi
 run systemctl enable --now "$PG_UNIT"
 if ((DRY)); then
-	((FRESH)) || echo "? if ${PG_UNIT} was already active and its config changed or ${MARKER} lists it: + systemctl restart ${PG_UNIT}"
+	((FRESH)) || echo "? if ${PG_UNIT} was already active and ${MARKER} lists it (its config or unit changed, now or in an interrupted run): + systemctl restart ${PG_UNIT}"
 	marker_clear "$PG_UNIT"
 else
 	PG_PENDING=0
 	if marker_has "$PG_UNIT"; then PG_PENDING=1; fi
-	if (((PG_CONF_CHANGED || PG_PENDING) && !FRESH && PG_WAS_ACTIVE)); then run systemctl restart "$PG_UNIT"; fi
+	if ((PG_PENDING && !FRESH && PG_WAS_ACTIVE)); then run systemctl restart "$PG_UNIT"; fi
 	marker_clear "$PG_UNIT"
 fi
 PSQL=(runuser -u "$REC" -- "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -h "$PGSOCK" -p "$PORT" -U postgres)
@@ -943,9 +1008,10 @@ for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 		if [[ $relay_dir == "~"* ]]; then ((DRY)) || die "no home directory for ${ORG_USER}"; fi
 		run runuser -u "$ORG_USER" -- install -d -m 0700 "$relay_dir"
 		deliver=(runuser -u "$ORG_USER" -- sh -c 'umask 077 && cat > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"' sh "${relay_dir}/relay.json")
-		RUN_CMD="$(show "${deliver[@]}") < $(show "$cred")"
+		# S5: the records user reads its own credential; root never opens a path in its directory.
+		RUN_CMD="runuser -u ${REC} -- cat $(show "$cred") | $(show "${deliver[@]}")"
 		printf '+ %s\n' "$RUN_CMD"
-		if ((!DRY)); then "${deliver[@]}" <"$cred"; fi
+		if ((!DRY)); then as_rec cat -- "$cred" | "${deliver[@]}"; fi
 		RUN_CMD=""
 		cat <<EOF
   -> ${id} (relay): Fabric of ${ORG_USER} uses it with "records": { "enabled": true, "socket": "${SOCKET}", "relayCredentialFile": "${relay_dir}/relay.json" }.

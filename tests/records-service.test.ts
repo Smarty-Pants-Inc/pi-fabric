@@ -703,6 +703,50 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
   });
 
+  it("concurrent reissues of one principal publish a valid token (Astra round 2 F2/S2)", async () => {
+    const { config, owner } = await freshService();
+    const pool = owner as unknown as ClientPool;
+    const dirOut = path.join(dir, `f2c-${databases}`);
+    const out = path.join(dirOut, "relay.json");
+    await issueCredentialFile(config, "relay:fabric", "relay", out, { pool });
+    // The reported ordering, forced: A commits, then B runs completely, then A publishes. The
+    // per-principal lock makes B wait for A instead, so the file published last holds the live token.
+    let releaseA!: () => void;
+    const aCommitted = new Promise<void>((resolve) => { releaseA = resolve; });
+    let aReached!: () => void;
+    const aAtCommit = new Promise<void>((resolve) => { aReached = resolve; });
+    const a = issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true, afterCommit: async () => { aReached(); await aCommitted; } });
+    await aAtCommit;
+    const b = issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    releaseA();
+    await Promise.all([a, b]);
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
+    expect(fs.readdirSync(dirOut)).toEqual(["relay.json"]);
+  });
+
+  it("recovers a reissue interrupted after its commit and before publishing (Astra round 2 F2/S2)", async () => {
+    const { config, owner } = await freshService();
+    const pool = owner as unknown as ClientPool;
+    const dirOut = path.join(dir, `f2r-${databases}`);
+    const out = path.join(dirOut, "relay.json");
+    await issueCredentialFile(config, "relay:fabric", "relay", out, { pool });
+    // Interrupted after the commit: the database holds the pending token, the file still the old one.
+    await expect(issueCredentialFile(config, "relay:fabric", "relay", out, { pool, reissue: true, afterCommit: async () => { throw new Error("killed"); } })).rejects.toThrow("killed");
+    expect(fs.existsSync(`${out}.pending`)).toBe(true);
+    await expect((await connect(config, "unused", out)).claimPublications(10)).rejects.toThrow(/not known to this service/);
+    // The next run (a plain issue here, as the installer's rerun with the file present) publishes it.
+    await expect(issueCredentialFile(config, "relay:fabric", "relay", out, { pool })).rejects.toThrow(/exists; pass --reissue/);
+    expect(fs.existsSync(`${out}.pending`)).toBe(false);
+    expect((await (await connect(config, "unused", out)).claimPublications(10)).claims).toEqual([]);
+    // Counterexample: a pending file whose token the database does not hold is discarded, not published.
+    const published = fs.readFileSync(out, "utf8");
+    fs.writeFileSync(`${out}.pending`, JSON.stringify({ id: "relay:fabric", token: "stale", role: "relay", issuedBy: "installer" }), { mode: 0o600 });
+    await expect(issueCredentialFile(config, "relay:fabric", "relay", out, { pool })).rejects.toThrow(/exists/);
+    expect(fs.readFileSync(out, "utf8")).toBe(published);
+    expect(fs.existsSync(`${out}.pending`)).toBe(false);
+  });
+
   it("a client closed while it reconnects starts no call (F3)", async () => {
     const { config, service, owner } = await freshService();
     const alice = await connect(config, ALICE);

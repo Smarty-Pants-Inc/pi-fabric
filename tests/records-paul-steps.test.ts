@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
@@ -181,9 +181,17 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.out).toContain("? runuser -u test-org-records -- /opt/test-org-records/node /opt/test-org-records/service-main.mjs  (must exit 2");
 		expect(r.out).toMatch(new RegExp(`^\\+ runuser -u test-org-records -- ${reEsc(q(`${hostPgBin}/initdb`))} -D`, "m"));
 		expect(r.out).toMatch(/^\+ runuser -u test-org-records -- \S+\/initdb'? -D \/var\/lib\/test-org-records\/pg -U postgres --auth-local=peer --auth-host=reject -E UTF8 --locale=C$/m);
-		expect(r.out).toContain("+ install -d -m 0700 -o test-org-records -g test-org-records /var/lib/test-org-records/pg\n");
+		// S5: inside its home the records user creates its own directories; root names no path there.
+		expect(r.out).toContain("+ runuser -u test-org-records -- install -d -m 0700 /var/lib/test-org-records/pg\n");
 		expect(r.out).toContain("+ install -d -m 0755 -o test-org-records -g test-org-records /var/lib/test-org-records\n");
-		expect(r.out).toContain("+ install -d -m 0700 -o test-org-records -g test-org-records /var/lib/test-org-records/credentials\n");
+		expect(r.out).toContain("+ runuser -u test-org-records -- install -d -m 0700 /var/lib/test-org-records/credentials\n");
+		expect(r.out).not.toMatch(/^\+ (install|chown|chmod) .*\/var\/lib\/test-org-records\//m);
+		// S5: the root-only installer state dir comes in step 0, before step 1.
+		expect(r.out.indexOf("+ install -d -m 0700 -o root -g root /var/lib/test-org-records-installer\n")).toBeLessThan(r.out.indexOf("## 1. "));
+		expect(r.out).toContain("? refuse unless /var/lib/test-org-records-installer is no symlink, owned by root, mode 0700, and every ancestor");
+		// S5: records-owned files are written as the records user; root files via a temp in the state dir.
+		expect(r.out).toContain(`+ runuser -u test-org-records -- sh -c 'umask 077 && cat > "$1.tmp.$$" && chmod "$2" "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"' sh /var/lib/test-org-records/pg/pg_hba.conf 0600\n`);
+		expect(r.out).toContain("? via a temp file in /var/lib/test-org-records-installer (root-only), then + install -m 0644 -o root -g root /var/lib/test-org-records-installer/write.XXXXXX /etc/systemd/system/test-org-records.service\n");
 		expect(r.out).toContain("+ install -d -m 0700 -o test-org-records -g test-org-records /run/test-org-records-pg\n");
 		expect(r.out).toContain("+ install -d -m 2750 -o test-org-records -g nobodyuser /run/test-org-records\n");
 		expect(r.out).not.toContain("/etc/test-org-records/credentials");
@@ -227,13 +235,13 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		// F12: the org user creates and writes its own file; root only feeds the token on stdin.
 		expect(r.out).toContain("+ runuser -u nobodyuser -- install -d -m 0700 '~nobodyuser/.config/test-org-records'\n");
 		expect(r.out).toContain(
-			`+ runuser -u nobodyuser -- sh -c 'umask 077 && cat > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"' sh '~nobodyuser/.config/test-org-records/relay.json' < ${relayCred}\n`,
+			`+ runuser -u nobodyuser -- sh -c 'umask 077 && cat > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"' sh '~nobodyuser/.config/test-org-records/relay.json'\n`.replace("+ ", `+ runuser -u test-org-records -- cat ${relayCred} | `),
 		);
 		expect(r.out).not.toMatch(/^\+ (install|chown|chmod) .*nobodyuser\/\.config/m);
 		expect(r.out).toContain('"relayCredentialFile": "~nobodyuser/.config/test-org-records/relay.json"');
 		// The mirror's credential stays with the records user.
 		expect(r.out).toContain(`--id mirror:github --role mirror --out /var/lib/test-org-records/credentials/${sha("mirror:github")}.json --reissue\n`);
-		expect(r.out).not.toContain(`< /var/lib/test-org-records/credentials/${sha("mirror:github")}.json`);
+		expect(r.out).not.toContain(`cat /var/lib/test-org-records/credentials/${sha("mirror:github")}.json |`);
 		expect(readFileSync(log, "utf8")).toBe("");
 	});
 
@@ -278,6 +286,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		"systemctl daemon-reload",
 		"rm -rf /etc/test-org-records",
 		"rm -rf /var/lib/test-org-records",
+		"rm -rf /var/lib/test-org-records-installer",
 		"rm -rf /run/test-org-records /run/test-org-records-pg",
 		"rm -rf /opt/test-org-records",
 		"runuser -u nobodyuser -- rm -rf '~nobodyuser/.config/test-org-records'",
@@ -323,6 +332,11 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		try {
 			writeFileSync(join(failing, "useradd"), `#!/bin/sh\necho "useradd $*" >> "${log}"\nexit 3\n`);
 			chmodSync(join(failing, "useradd"), 0o755);
+			// Root-side install -d really creates the installer state dir (owner flags dropped), unlogged.
+			writeFileSync(join(failing, "install"), `#!/bin/bash\nargs=(); while (($#)); do case $1 in -o|-g) shift 2 ;; *) args+=("$1"); shift ;; esac; done\nexec /usr/bin/install "\${args[@]}"\n`);
+			chmodSync(join(failing, "install"), 0o755);
+			mkdirSync(join(failing, "root/var/lib"), { recursive: true, mode: 0o755 });
+			for (const d of ["root", "root/var", "root/var/lib"]) chmodSync(join(failing, d), 0o755);
 			const src = sources(failing);
 			const r = run(["--org", "test-org", "--org-user", me, ...src.args], { ...testEnv(failing), RECORDS_PAUL_STEPS_TEST_ROOT: join(failing, "root") });
 			expect(r.out).toContain("OK: the staged node and bundle match the approved sha256");
@@ -635,8 +649,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(r.out).toMatch(
 				new RegExp(`^\\? runuser -u test-org-records -- /opt/test-org-records/node -e '.*\\.id !== id \\|\\| c\\.role !== role \\|\\| c\\.issuedBy !== "installer".*' ${cred} ${id} (importer|relay) {2}\\(stored \\.id, \\.role, \\.issuedBy must equal`, "m"),
 			);
-		expect(r.out).toContain(`sh '~nobodyuser/.config/test-org-records/relay.json' < ${rel}\n`);
-		expect(r.out).not.toContain(`< ${imp}`);
+		expect(r.out).toContain(`+ runuser -u test-org-records -- cat ${rel} | runuser -u nobodyuser -- sh -c `);
+		expect(r.out).not.toContain(`cat ${imp} |`);
 		expect(readFileSync(log, "utf8")).toBe("");
 	});
 
@@ -709,6 +723,9 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 				{ ...testEnv(bin), RECORDS_PAUL_STEPS_TEST_ROOT: `${t}/root` },
 			);
 		writeFileSync(L, "");
+		// The installer state dir's ancestors must not be group-writable (the host umask may be 002).
+		mkdirSync(join(t, "root/var/lib"), { recursive: true });
+		for (const d of ["root", "root/var", "root/var/lib"]) chmodSync(join(t, d), 0o755);
 		protect(join(t, "root"));
 		prep?.(join(t, "root"), t);
 		const r = again();
@@ -957,7 +974,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			writeFileSync(join(tt, "bin/systemctl"), `#!/bin/bash\necho "systemctl $*" >> "${tt}/calls.log"\n[ "$1" = restart ] && [ -e "${tt}/fail-restart" ] && exit 1\nexit 0\n`);
 		});
 		try {
-			const marker = `${t}/root/var/lib/test-org-records/restart-pending`;
+			const marker = `${t}/root/var/lib/test-org-records-installer/restart-pending`;
 			expect(r.code).toBe(1);
 			expect(r.err).toMatch(/FAILED at step 7 .*systemctl restart test-org-records\.service/);
 			expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n");
@@ -976,6 +993,89 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(third.code, third.err).toBe(0);
 			expect(readFileSync(L, "utf8")).not.toContain("systemctl restart");
 			expect(existsSync(marker)).toBe(false);
+			// S5: the marker lives in the root-only installer state dir (0700), outside the records user's tree.
+			const state = `${t}/root/var/lib/test-org-records-installer`;
+			expect(statSync(state).mode & 0o777).toBe(0o700);
+			expect(existsSync(`${t}/root/var/lib/test-org-records/restart-pending`)).toBe(false);
+			// A marker with anything but the two unit names is refused before step 1, never copied forward.
+			writeFileSync(marker, "test-org-records.service\n/etc/shadow\n");
+			writeFileSync(L, "");
+			const bad = again();
+			expect(bad.code).toBe(1);
+			expect(bad.err).toContain(`refused: ${marker} holds unexpected content`);
+			expect(bad.out).not.toContain("## 1. ");
+			expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n/etc/shadow\n");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("F3/S3: a config-only change on an existing active cluster lists the pg unit before the write; a failed restart keeps it for the rerun", () => {
+		const { t, r, again, L } = relayRun("plain", "tree17", (root) => existingCluster(root, "17"));
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			const marker = `${t}/root/var/lib/test-org-records-installer/restart-pending`;
+			const hba = join(dataDir(`${t}/root`), "pg_hba.conf");
+			expect(existsSync(marker)).toBe(false);
+			// Units unchanged from the first run; only pg_hba.conf is older. The fake restart of the pg unit fails.
+			writeFileSync(hba, "# older pg_hba.conf\n");
+			writeFileSync(join(t, "fail-restart"), "");
+			writeFileSync(join(t, "bin/systemctl"), `#!/bin/bash\necho "systemctl $*" >> "${L}"\n[ "$1 $2" = "restart test-org-records-pg.service" ] && [ -e "${t}/fail-restart" ] && exit 1\nexit 0\n`);
+			writeFileSync(L, "");
+			const failed = again();
+			expect(failed.code).toBe(1);
+			expect(failed.err).toMatch(/FAILED at step 6 .*systemctl restart test-org-records-pg\.service/);
+			expect(readFileSync(marker, "utf8")).toBe("test-org-records-pg.service\n");
+			expect(readFileSync(hba, "utf8")).not.toBe("# older pg_hba.conf\n");
+			// Rerun with identical inputs: the config now matches, but the marker forces the restart and is cleared.
+			rmSync(join(t, "fail-restart"));
+			writeFileSync(L, "");
+			const second = again();
+			expect(second.code, second.err + second.out).toBe(0);
+			expect(second.out).not.toContain(`+ write ${hba}`);
+			expect(readFileSync(L, "utf8")).toContain("systemctl restart test-org-records-pg.service\n");
+			expect(existsSync(marker)).toBe(false);
+			// Counterexample: no config change and no marker, so no restart of the pg unit.
+			writeFileSync(L, "");
+			const third = again();
+			expect(third.code, third.err).toBe(0);
+			expect(readFileSync(L, "utf8")).not.toContain("systemctl restart test-org-records-pg.service");
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("S5: a symlinked pg_hba.conf in the records-owned data dir is replaced by the records user; root writes only via its state dir", () => {
+		let outsideFile = "";
+		const { t, r, calls } = relayRun("plain", "tree17", (root, tt) => {
+			existingCluster(root, "17");
+			outsideFile = join(tt, "outside/protected.conf");
+			writeFileSync(outsideFile, "protected\n");
+			symlinkSync(outsideFile, join(dataDir(root), "pg_hba.conf"));
+		});
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			const root = join(t, "root");
+			const hba = join(dataDir(root), "pg_hba.conf");
+			// The outside file is unchanged; the link became the records user's own regular file.
+			expect(readFileSync(outsideFile, "utf8")).toBe("protected\n");
+			expect(lstatSync(hba).isSymbolicLink()).toBe(false);
+			expect(statSync(hba).mode & 0o777).toBe(0o600);
+			expect(readFileSync(hba, "utf8")).toContain("local all all reject");
+			// No root-side command names a path under the data dir (or the records home below it).
+			expect(calls.filter((c) => !c.startsWith("runuser ") && c.includes(`${root}/var/lib/test-org-records/`))).toEqual([]);
+			expect(calls).toContain(`runuser sh -c umask 077 && cat > "$1.tmp.$$" && chmod "$2" "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1" sh ${hba} 0600`);
+			expect(calls).toContain(`runuser sh -c printf "%s\\n" "$2" >> "$1" sh ${dataDir(root)}/postgresql.conf include_dir = 'conf.d'`);
+			// Root-owned targets are installed from a temp file in the root-only state dir.
+			const state = reEsc(`${root}/var/lib/test-org-records-installer/write.`);
+			for (const [mode, owner, target] of [
+				["0644", "-o root -g root", `${root}/etc/systemd/system/test-org-records-pg.service`],
+				["0644", "-o root -g root", `${root}/etc/systemd/system/test-org-records.service`],
+				["0640", "-o root -g test-org-records", `${root}/etc/test-org-records/service.json`],
+			] as const)
+				expect(calls).toEqual(expect.arrayContaining([expect.stringMatching(new RegExp(`^install -m ${mode} ${owner} ${state}\\w{6} ${reEsc(target)}$`))]));
+			expect(readdirSync(join(root, "var/lib/test-org-records-installer"))).toEqual([]);
 		} finally {
 			rmSync(t, { recursive: true, force: true });
 		}

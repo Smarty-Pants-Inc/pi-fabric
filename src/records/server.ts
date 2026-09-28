@@ -144,28 +144,67 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, r
 };
 
 /**
- * Issue (or, with reissue, rotate) an operator credential into `out`, never losing a token: the
- * new credential is written to a 0600 temp file beside `out` FIRST, the database is changed
- * second, and the temp file is renamed over `out` last. A database failure removes the temp file
- * and leaves `out` and the old token as they were. Without reissue an existing `out` is refused
- * before the database is touched.
+ * Issue (or, with reissue, rotate) an operator credential into `out`, never publishing a revoked
+ * token and never losing a committed one. Under a per-principal advisory lock held until the file
+ * is published (so concurrent issues for one principal run one at a time):
+ *  1. a leftover `<out>.pending` from an interrupted run is published if the database holds its
+ *     token, and discarded otherwise;
+ *  2. the new credential goes to `<out>.pending` (0600, fixed name), and is fsynced;
+ *  3. the database is changed;
+ *  4. `<out>.pending` is renamed over `out`, and the directory fsynced.
+ * A database failure removes `<out>.pending` and leaves `out` and its token as they were. Without
+ * reissue an existing `out` is refused before the database is touched.
  */
 export const issueCredentialFile = async (
   config: RecordsServiceConfig, id: string, role: OperatorRole, out: string,
-  options: { name?: string; reissue?: boolean; pool?: ClientPool } = {},
+  options: { name?: string; reissue?: boolean; pool?: ClientPool; afterCommit?: () => Promise<void> } = {},
 ): Promise<void> => {
-  if (!options.reissue && fs.existsSync(out)) throw new Error(`${out} exists; pass --reissue to rotate its token`);
-  fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
-  const token = newToken();
-  const temp = `${out}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  fs.writeFileSync(temp, `${JSON.stringify({ id, token, role, issuedBy: "installer" })}\n`, { mode: 0o600, flag: "wx" });
+  const owner = options.pool ?? await openPool(config.database);
+  const lock = await owner.connect();
+  const pending = `${out}.pending`;
   try {
-    await issuePrincipal(config, id, role, options.name, options.pool, options.reissue === true, token);
-  } catch (error) {
-    fs.rmSync(temp, { force: true });
-    throw error;
+    await lock.query("SET ROLE fabric_records_writer");
+    await lock.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [`fabric-records:issue:${id}`]);
+    fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
+    const storedHash = async (): Promise<string | undefined> =>
+      (await lock.query<{ token_hash: string }>("SELECT token_hash FROM principals WHERE id = $1 AND issued_by = 'operator' AND role = $2", [id, role])).rows[0]?.token_hash;
+    const publish = (): void => {
+      fs.renameSync(pending, out);
+      const dir = fs.openSync(path.dirname(out), "r");
+      try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+    };
+    // 1. Recover an interrupted run: its pending token is the live one exactly when the database holds it.
+    if (fs.existsSync(pending)) {
+      let token: unknown;
+      try { token = (JSON.parse(fs.readFileSync(pending, "utf8")) as { token?: unknown }).token; } catch { token = undefined; }
+      if (typeof token === "string" && hashToken(token) === await storedHash()) publish();
+      else fs.rmSync(pending, { force: true });
+    }
+    if (!options.reissue && fs.existsSync(out)) throw new Error(`${out} exists; pass --reissue to rotate its token`);
+    // 2. The new credential is on disk before the database can make it the live one.
+    const token = newToken();
+    const fd = fs.openSync(pending, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify({ id, token, role, issuedBy: "installer" })}\n`);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    // 3. The database change.
+    try {
+      await issuePrincipal(config, id, role, options.name, owner, options.reissue === true, token);
+    } catch (error) {
+      fs.rmSync(pending, { force: true });
+      throw error;
+    }
+    await options.afterCommit?.();
+    // 4. Publish.
+    publish();
+  } finally {
+    await lock.query("SELECT pg_advisory_unlock_all()").catch(() => undefined);
+    lock.release();
+    if (!options.pool) await owner.end?.();
   }
-  fs.renameSync(temp, out);
 };
 
 type Handler = (principal: RecordsPrincipal, args: Record<string, unknown>, signal: AbortSignal, peer?: PeerInfo) => Promise<unknown>;

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { COMMENT_CUT_REASON, cutsCommentList } from "../core/comment-cut.js";
 import { REPLY_TOOL_NAME } from "../core/reply-tool-identity.js";
 
 /** The tool a structured Pi run replies through (smarty-dev#967). */
@@ -17,6 +18,15 @@ export default function replyTool(pi: ExtensionAPI): void {
   if (!schemaFile || !replyFile) return;
   const parameters = JSON.parse(fs.readFileSync(schemaFile, "utf8")) as Record<string, unknown>;
   let replied = false;
+  // smarty-dev#1469: a directive actor never cuts an issue or PR comment list. This hook loads only
+  // for directive runs, so Mains and task agents are not affected.
+  pi.on("tool_call", (event) => {
+    if (event.toolName !== "bash") return undefined;
+    const command = (event.input as { command?: unknown }).command;
+    return typeof command === "string" && cutsCommentList(command)
+      ? { block: true, reason: COMMENT_CUT_REASON }
+      : undefined;
+  });
   pi.registerTool({
     name: REPLY_TOOL,
     label: "Reply",

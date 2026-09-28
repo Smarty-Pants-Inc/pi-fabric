@@ -617,6 +617,26 @@ interface FabricActorValidityFacts {
 type FabricActorValidityDecision = boolean | { valid: boolean; reason?: string };
 type FabricActorBindingScope = "session" | "project";
 interface FabricActorRunBinding { model?: string; thinking?: FabricThinking }
+type FabricActorActivationFilterScalar = string | number | boolean | null;
+/** One test on a payload field; exactly one of equals, in, exists. A missing field never matches. */
+interface FabricActorActivationFilterPredicate {
+  /** Dotted path (arrays fan out); a list gives alternatives, the first path with a value is used. */
+  path: string | string[];
+  equals?: FabricActorActivationFilterScalar;
+  in?: FabricActorActivationFilterScalar[];
+  exists?: true;
+}
+/** A SKIP rule: it matches when every given field matches, unless every unless predicate matches. */
+interface FabricActorActivationSkipRule {
+  id: string;
+  /** Item sources such as "mesh:ops.owner" or "host:tool_error"; a trailing * matches a prefix. */
+  source?: string[];
+  topic?: string[];
+  kind?: string[];
+  where?: FabricActorActivationFilterPredicate[];
+  unless?: FabricActorActivationFilterPredicate[];
+}
+type FabricActorActivationFilter = Array<"hold" | "never-message-events" | FabricActorActivationSkipRule>;
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
 interface FabricActorRequestBase {
   /** Fixed at creation; ask/tell cannot change language. Global templates resolve inheritance on import. */
@@ -630,6 +650,8 @@ interface FabricActorRequestBase {
   coalesce?: boolean;
   /** Dotted path into a mesh event's data; a queued event with the same value is replaced. */
   coalesceKey?: string;
+  /** Skip-only rules checked before a queued mesh or host event runs the model. */
+  activationFilter?: FabricActorActivationFilter;
   runner?: FabricAgentRunner;
   model?: string;
   thinking?: FabricThinking;
@@ -661,6 +683,7 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   coalesce: boolean;
   coalesceKey?: string;
   runner: FabricAgentRunner;
+  activationFilterError?: string;
   validWhile?: { version: 1; source: string };
 };
 interface FabricActorInfo {
@@ -682,6 +705,12 @@ interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  activationFilter?: FabricActorActivationFilter;
+  /** Events the activation filter skipped without a model run. */
+  filteredCount?: number;
+  lastFilteredAt?: number;
+  /** The stored filter cannot be read: it is kept but not applied (every event is delivered). */
+  activationFilterError?: string;
   model?: string;
   thinking?: FabricThinking;
   binding?: FabricActorRunBinding & { scope: "session"; sessionId: string; updatedAt?: number };
@@ -801,6 +830,7 @@ interface FabricAgentsApi {
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;
   setDeliveryPolicy(args: {
     id: string;

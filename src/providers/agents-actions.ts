@@ -166,6 +166,17 @@ const lifecycleEventSchema = {
   enum: [...FABRIC_LIFECYCLE_EVENTS],
 };
 
+const activationFilterSchema = {
+  type: "array",
+  maxItems: 32,
+  description: "Skip-only rules checked before a queued mesh or host event runs the model: preset names (hold, never-message-events) or rule objects { id, source?, topic?, kind?, where?, unless? }. A skipped event is logged as 'filtered: <rule id>' and counted; it never acts or replies.",
+  items: {
+    anyOf: [
+      { type: "string", enum: ["hold", "never-message-events"] },
+      { type: "object" },
+    ],
+  },
+};
 export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "run",
@@ -378,6 +389,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         triggerTurn: { type: "boolean" },
         coalesce: { type: "boolean" },
         coalesceKey: { type: "string", description: "Dotted path into a mesh event's data (such as payload.number). A queued event of the same topic with the same value there is replaced by the newer one." },
+        activationFilter: activationFilterSchema,
         residency: residencySchema,
         runner: runProperties.runner,
         kernel: runProperties.kernel,
@@ -624,6 +636,21 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         scope: { type: "string", enum: ["project", "global"] },
       },
       required: ["id", "coalesceKey"],
+      additionalProperties: false,
+    },
+    risk: "agent",
+  },
+  {
+    name: "setActivationFilter",
+    description: "Set or clear (null or []) the actor's skip-only activation filter: preset names (hold, never-message-events) or rule objects. Invalid rules are rejected. It applies from the next queued event on.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        activationFilter: { anyOf: [activationFilterSchema, { type: "null" }] },
+        scope: { type: "string", enum: ["project", "global"] },
+      },
+      required: ["id", "activationFilter"],
       additionalProperties: false,
     },
     risk: "agent",

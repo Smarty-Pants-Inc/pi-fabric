@@ -55,6 +55,15 @@ export interface FabricControlAcceptance {
   replacedMessageId?: string;
   result?: unknown;
   error?: string;
+  /** The owner proves the handler did not run for this command, so a new command cannot deliver twice. */
+  notRun?: true;
+}
+
+/** An owner's rejection; `notRun` only when the owner proved the handler did not run. */
+class FabricControlRejection extends Error {
+  constructor(message: string, readonly notRun: boolean) {
+    super(message);
+  }
 }
 
 export interface FabricControlResult {
@@ -262,15 +271,16 @@ export class FabricControlPlane {
     try {
       sent = await send();
     } catch (error) {
-      // ponytail: one retry, for messages only. An expired rejection is answered before the
-      // handler runs (see #acceptCommand and #executeClaimedCommand), so the message was not
-      // delivered and a new command cannot deliver it twice. An owner that picks commands up
-      // late (a fleet relaunch) expired 4 of 2,802 commands, and a manual retry 6 s later
-      // worked (smarty-dev#816). A second expiry means the owner is stuck: report it.
+      // ponytail: one retry, for messages only, and only when the owner proves the handler did
+      // not run (notRun: no claim and no outcome for the command; see #acceptCommand). The
+      // expiry text alone proves nothing: an owner restarted past the deadline, or an older
+      // owner, answers it without reading its claim (review/astra F1 on #121). An owner that
+      // picks commands up late (a fleet relaunch) expired 4 of 2,802 commands, and a manual
+      // retry 6 s later worked (smarty-dev#816). A second expiry means the owner is stuck.
       if (
         (operation !== "steer" && operation !== "followUp") ||
-        !(error instanceof Error) ||
-        error.message !== CONTROL_COMMAND_EXPIRED
+        !(error instanceof FabricControlRejection) ||
+        !error.notRun
       ) throw error;
       sent = await send();
     }
@@ -398,7 +408,10 @@ export class FabricControlPlane {
       }
       const acknowledged = await acceptance;
       if (!acknowledged.accepted) {
-        throw new Error(acknowledged.error || "Remote Fabric owner rejected command for " + targetId);
+        throw new FabricControlRejection(
+          acknowledged.error || "Remote Fabric owner rejected command for " + targetId,
+          acknowledged.notRun === true,
+        );
       }
       return { commandId, acceptance: acknowledged };
     } catch (error) {
@@ -524,6 +537,7 @@ export class FabricControlPlane {
         ? { result: event.data.result }
         : {}),
       ...(typeof event.data.error === "string" ? { error: event.data.error } : {}),
+      ...(event.data.accepted !== true && event.data.notRun === true ? { notRun: true as const } : {}),
     });
   }
 
@@ -555,12 +569,21 @@ export class FabricControlPlane {
       // is history: a restarting owner replays the retained log from its start, and
       // answering every past command added one locked publish each, thousands per
       // relaunch wave (smarty-dev#367). Only a sender that may still wait gets an answer.
-      if (answerable) {
-        await this.#publishAcknowledgement(command, {
-          accepted: false,
-          error: CONTROL_COMMAND_EXPIRED,
-        });
-      }
+      if (!answerable) return;
+      // An owner restarted past the deadline may have run it before: answer this host's record
+      // first, like a duplicate. Only no claim and no outcome proves it did not run here; a
+      // runtime that admitted it in time and claims it now expires it before the handler
+      // (see #executeClaimedCommand), since the deadline has passed (review/astra F1 on #121).
+      const seen = this.#seenRecord(key);
+      const own = seen?.hostId === this.options.hostId && seen.commandId === command.commandId &&
+        seen.targetId === command.targetId;
+      await this.#publishAcknowledgement(
+        command,
+        !seen
+          ? { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true }
+          : (own ? seen.acceptance : undefined) ??
+            { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" },
+      );
       return;
     }
 
@@ -689,8 +712,9 @@ export class FabricControlPlane {
       let acceptance: FabricControlAcceptance;
       try {
         // The claim can wait for a lock, or this process can pause after it commits: the deadline
-        // may have passed since admission. An expired command is recorded, not run.
-        if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED };
+        // may have passed since admission. An expired command is recorded, not run: notRun, as
+        // this runtime holds the claim and the handler did not run.
+        if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
         else acceptance = this.#handler
           ? await this.#handler(command, from, controller.signal)
           : { accepted: false, error: "Fabric owner has no control handler" };
@@ -855,6 +879,7 @@ export class FabricControlPlane {
             ? { result: acceptance.result }
             : {}),
           ...(acceptance.error ? { error: acceptance.error } : {}),
+          ...(!acceptance.accepted && acceptance.notRun ? { notRun: true } : {}),
         },
       })
       .catch((error: unknown) => {

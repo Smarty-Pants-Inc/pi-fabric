@@ -1054,18 +1054,120 @@ describe("FabricControlPlane", () => {
       if (!rejection) await new Promise((resolve) => setTimeout(resolve, 1_300));
       receiver.start(receive);
       const settled = await outcome;
-      const commands = new MeshStore(meshRoot, 64 * 1024, 1_000)
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const commands = store
         .read({ topic: "fabric.control.command", limit: 100 })
         .filter((event) => event.kind === operation);
-      return { ...settled, receive, commands };
+      const acks = store.read({ topic: "fabric.control.ack", limit: 100 })
+        .map((event) => event.data as { commandId: string });
+      return { ...settled, receive, commands, acks };
     };
 
+    const settle = <T>(promise: Promise<T>) => promise.then(
+      (value) => ({ value, error: undefined as Error | undefined }),
+      (error: Error) => ({ value: undefined as T | undefined, error: error as Error | undefined }),
+    );
+
+    // review/astra F1 on #121: the owner delivers, then dies before its acknowledgement; a new
+    // runtime of the same host replays the command past its deadline while the sender still waits.
+    const restartPastDeadline = async (crash: "acknowledgement" | "outcome") => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const sender = plane(meshRoot, "host:sender");                     // a 1 s deadline, 2 s grace
+      const firstOwner = plane(meshRoot, "host:receiver");
+      const receive = vi.fn((command: { commandId: string }) =>
+        ({ accepted: true, messageId: "delivered:" + command.commandId }));
+      let crashed = true;
+      const publish = MeshStore.prototype.publish;
+      vi.spyOn(MeshStore.prototype, "publish").mockImplementation(async function (this: MeshStore, input) {
+        if (crashed && input.topic === "fabric.control.ack") throw new Error("owner crashed");
+        return publish.call(this, input);
+      });
+      const put = MeshStore.prototype.put;
+      vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function (this: MeshStore, input) {
+        // "outcome": the claim commits, the handler runs, the outcome is never recorded.
+        if (crashed && crash === "outcome" && this.root.includes("control-seen") && input.ifVersion !== 0) {
+          throw new Error("owner crashed");
+        }
+        return put.call(this, input);
+      });
+      sender.start(() => ({ accepted: false }));
+      firstOwner.start(receive);
+      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { message: "once" }));
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 900, interval: 10 });
+      await firstOwner.close();
+      crashed = false;
+      await new Promise((resolve) => setTimeout(resolve, 1_300));         // past the deadline
+      const restarted = plane(meshRoot, "host:receiver");                 // fresh process state
+      restarted.start(receive);
+      const settled = await outcome;
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const commands = store.read({ topic: "fabric.control.command", limit: 100 })
+        .filter((event) => event.kind === "followUp");
+      const acks = store.read({ topic: "fabric.control.ack", limit: 100 }).map((event) => event.data);
+      return { ...settled, receive, commands, acks };
+    };
+
+    it("answers a delivered message's recorded outcome after an owner restart past the deadline, without a retry", async () => {
+      const { value, error, receive, commands, acks } = await restartPastDeadline("acknowledgement");
+      expect(error).toBeUndefined();
+      expect(commands).toHaveLength(1);
+      const first = commands[0]!.data as { commandId: string };
+      expect(value).toMatchObject({ acknowledged: true, messageId: "delivered:" + first.commandId });
+      expect(acks).toEqual([expect.objectContaining({ commandId: first.commandId, accepted: true })]);
+      expect(acks[0]).not.toHaveProperty("notRun");
+      expect(receive).toHaveBeenCalledTimes(1);
+    }, 15_000);
+
+    it("reports a claimed message without an outcome as indeterminate after a restart past the deadline, without a retry", async () => {
+      const { error, receive, commands, acks } = await restartPastDeadline("outcome");
+      expect(error?.message).toBe("Fabric control outcome is indeterminate after owner restart");
+      expect(commands).toHaveLength(1);
+      expect(acks).toHaveLength(1);
+      expect(acks[0]).not.toHaveProperty("notRun");
+      expect(receive).toHaveBeenCalledTimes(1);
+    }, 15_000);
+
+    // An owner before #121 answers the same text without reading its claim: never retried.
+    it("does not retry an expiry acknowledgement without notRun, as an older owner sends", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const sender = plane(meshRoot, "host:sender");
+      sender.start(() => ({ accepted: false }));
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { message: "old" }));
+      let command: { commandId: string } | undefined;
+      await vi.waitFor(() => {
+        command = store.read({ topic: "fabric.control.command", limit: 10 })[0]?.data as { commandId: string };
+        expect(command).toBeDefined();
+      }, { timeout: 900, interval: 10 });
+      await store.publish({
+        topic: "fabric.control.ack",
+        kind: "rejected",
+        from: identity("host:receiver"),
+        to: "host:sender",
+        data: { version: 1, commandId: command!.commandId, targetId: "agent:target", accepted: false, error: "Fabric control command expired" },
+      });
+      const { error } = await outcome;
+      expect(error?.message).toBe("Fabric control command expired");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(store.read({ topic: "fabric.control.command", limit: 10 }).filter((event) => event.kind === "followUp"))
+        .toHaveLength(1);
+    }, 15_000);
+
     it("retries a message once with a new command, and the owner delivers it once", async () => {
-      const { value, error, receive, commands } = await run("followUp");
+      const { value, error, receive, commands, acks } = await run("followUp");
       expect(error).toBeUndefined();
       expect(commands).toHaveLength(2);
+      const first = commands[0]!.data as { commandId: string };
       const retry = commands[1]!.data as { commandId: string };
-      expect((commands[0]!.data as { commandId: string }).commandId).not.toBe(retry.commandId);
+      expect(first.commandId).not.toBe(retry.commandId);
+      // The owner had no claim and no outcome for the first command: it proves it did not run.
+      expect(acks.find((ack) => ack.commandId === first.commandId))
+        .toMatchObject({ accepted: false, error: "Fabric control command expired", notRun: true });
+      expect(acks.find((ack) => ack.commandId === retry.commandId)).toMatchObject({ accepted: true });
       expect(value).toMatchObject({ acknowledged: true, messageId: "delivered:" + retry.commandId });
       expect(receive).toHaveBeenCalledTimes(1);
     }, 15_000);

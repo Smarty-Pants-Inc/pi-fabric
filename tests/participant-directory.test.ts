@@ -867,13 +867,16 @@ describe("ParticipantDirectory", () => {
   });
 
   // smarty-dev#266: a stopped mesh lock holder expired every lease; sessions() said [].
+  // smarty-dev#883: no caller exercises expiry, so the lease is long enough that a starved Windows
+  // runner cannot outlast it between start() and the first read; the 150 ms lock timeout and 100 ms
+  // heartbeat still detect the stall quickly.
   const stallDirectory = (name: string, source: () => FabricParticipantRecord[]) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
     roots.push(root);
     const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: "main", sessionId: name };
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 150 });
     const directory = new ParticipantDirectory(mesh, {
-      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 300,
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 10_000,
     });
     directory.registerSource(source);
     directories.push(directory);

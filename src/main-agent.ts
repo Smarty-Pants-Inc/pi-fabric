@@ -47,6 +47,8 @@ export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDep
   coalesced?: true;
   /** The id of the held followUp it replaced; that one is never delivered. */
   replacedMessageId?: string;
+  /** Main is idle but its held followUps are past mesh.followUpStallSeconds (smarty-dev#1826). */
+  stalled?: true;
 }
 
 export interface FabricMainModelSwitchResult {
@@ -209,6 +211,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext | undefined;
   #flushMs = 0;
+  #stallS = 600;
   #suspended = false;
   #closed = false;
   #wake: ReturnType<typeof setInterval> | undefined;
@@ -321,7 +324,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     return {
       queued: true, messageId: item.id, routed: "main",
       ...(replaced ? { coalesced: true as const, replacedMessageId: replaced.id } : {}),
-      ...this.queueDepth(item.from.id),
+      ...(request.delivery === "followUp" ? this.#depthReport(item.from.id) : this.queueDepth(item.from.id)),
     };
   }
 
@@ -338,6 +341,21 @@ export class MainAgentController implements FabricMainAgentTarget {
       pendingFollowUps: mine.length,
       oldestAgeS: oldest ? Math.max(0, Math.floor((Date.now() - oldest.sentAt) / 1000)) : 0,
     };
+  }
+
+  /**
+   * The sender's queue depth, and `stalled` when Main is idle and its oldest held followUp, from
+   * any sender, is past the stall threshold: no boundary will release the queue, which goes oldest
+   * first, so every sender's items wait behind that one (smarty-dev#1826: one malformed item held
+   * 4 to 8 followUps for 5.5 h, oldest 20520 s, and every sender saw an ack).
+   */
+  #depthReport(fromId: string): FabricFollowUpQueueDepth & { stalled?: true } {
+    const depth = this.queueDepth(fromId);
+    // ponytail: only an idle Main counts. A long busy turn legitimately holds items until its next
+    // boundary, so their age alone says nothing about a stuck queue.
+    const stalled = this.#stallS > 0 && this.#context?.isIdle() === true && this.queueDepth().oldestAgeS >= this.#stallS &&
+      this.#held.length > 0;
+    return stalled ? { ...depth, stalled: true } : depth;
   }
 
   /** Quotas for a new held item; one that replaces a held item frees that item's share first. */
@@ -468,9 +486,10 @@ export class MainAgentController implements FabricMainAgentTarget {
    * flushMs at the next boundary between tool calls (turn_end, the hook the shell and
    * completion inboxes use). flushMs 0 keeps Pi's followUp queue, as before.
    */
-  attachFollowUpDrain(context: ExtensionContext, flushMs: number, journal?: string): void {
+  attachFollowUpDrain(context: ExtensionContext, flushMs: number, journal?: string, stallSeconds = 600): void {
     this.closeFollowUpDrain();
     if (!this.local) return;
+    this.#stallS = stallSeconds;
     this.#context = context;
     this.#closed = false;
     this.#journal = journal;

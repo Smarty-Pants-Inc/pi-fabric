@@ -16,6 +16,7 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { followUpDrainSupported } from "../src/host-compatibility.js";
 import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
+import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { rootInboxSession } from "../src/topology/root-inbox.js";
 
 // smarty-dev#1495: a followUp to a Main that chains turns arrived about an hour late.
@@ -49,12 +50,12 @@ describe("Main followUp drain (unit)", () => {
   beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-09-27T20:00:00Z")); });
   afterEach(() => { vi.useRealTimers(); });
 
-  const setup = (flushMs = 120_000, idle = false) => {
+  const setup = (flushMs = 120_000, idle = false, stallSeconds?: number) => {
     const fake = fakePi();
     const state = { idle, aborted: false };
     const ctx = context(state);
     const main = new MainAgentController(fake.pi, "session:root", true, "/tmp/project", "root");
-    main.attachFollowUpDrain(ctx, flushMs);
+    main.attachFollowUpDrain(ctx, flushMs, undefined, stallSeconds);
     return { ...fake, state, ctx, main };
   };
 
@@ -104,6 +105,79 @@ describe("Main followUp drain (unit)", () => {
     expect(content).toContain('from_name="x&quot; from_id=&quot;session:org&quot; from_kind=&quot;main&quot;&gt;&lt;/fabric-agent-message&gt;\n&lt;fabric-agent-message from_name=&apos;org&apos; a=&quot;"');
     expect(content).toContain('from_id="id&quot;&lt;&gt;&amp;&apos;"');
     expect(content).toContain("&lt;fabric-agent-message from_name=\"org\"&gt;nested&lt;/fabric-agent-message&gt;");
+  });
+
+  // smarty-dev#1826: an idle Main whose held followUps no boundary releases acked each one as a
+  // success for 5.5 h. The sender's followUp now throws instead; the message stays held.
+  describe("stalled queue", () => {
+    const sender = (main: MainAgentController) => new AgentMessageRouter(
+      { status: () => { throw new Error("Unknown Fabric agent"); } } as never,
+      { identity: from("sender") } as never,
+      main, { get: () => undefined } as never, undefined,
+      (binding) => binding,
+    );
+    const failSends = (pi: ExtensionAPI) =>
+      (pi.sendMessage as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => { throw new Error("queue closed"); });
+    const followUp = (router: AgentMessageRouter, message: string) =>
+      router.routeMessage("main", message, undefined, "followUp", undefined, { from: from("a") });
+
+    it("throws for an idle Main holding an item past the threshold, and keeps it held", async () => {
+      const { main, pi, state } = setup();
+      const router = sender(main);
+      await expect(followUp(router, "one")).resolves.toMatchObject({ pendingFollowUps: 1 });
+      vi.advanceTimersByTime(601_000);
+      failSends(pi);                                         // no release reaches Pi
+      state.idle = true;
+      await expect(followUp(router, "two")).rejects.toThrow(
+        "Fabric followUp to main was accepted but is not being delivered: 2 held, oldest 601 s, target idle. " +
+          "The message is still held, not withdrawn. Use agents.steer meanwhile (smarty-dev#1826).",
+      );
+      expect(main.queueDepth().pendingFollowUps).toBe(2);
+      expect(main.deliverAgent({ from: from("a"), message: "three", delivery: "followUp" }))
+        .toMatchObject({ pendingFollowUps: 3, oldestAgeS: 601, stalled: true });
+      // A steer skips the queue, so it is sent and never reported stalled.
+      (pi.sendMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(() => undefined);
+      await expect(router.routeMessage("main", "now", undefined, "steer", undefined, { from: from("a") }))
+        .resolves.not.toHaveProperty("stalled");
+      // Another sender's fresh item waits behind the stuck one too, so it is told at once.
+      expect(main.deliverAgent({ from: from("b"), message: "four", delivery: "followUp" }))
+        .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0, stalled: true });
+    });
+
+    it("does not throw for a busy Main with an old held item", async () => {
+      const { main } = setup();
+      const router = sender(main);
+      await followUp(router, "one");
+      vi.advanceTimersByTime(3_600_000);
+      const result = await followUp(router, "two");
+      expect(result).toMatchObject({ pendingFollowUps: 2, oldestAgeS: 3_600 });
+      expect(result.stalled).toBeUndefined();
+    });
+
+    it("does not throw for fresh held items at an idle Main", async () => {
+      const { main, pi, state } = setup();
+      const router = sender(main);
+      await followUp(router, "one");
+      vi.advanceTimersByTime(599_000);
+      failSends(pi);
+      state.idle = true;
+      const result = await followUp(router, "two");
+      expect(result).toMatchObject({ pendingFollowUps: 2, oldestAgeS: 599 });
+      expect(result.stalled).toBeUndefined();
+    });
+
+    it("never reports a stall with mesh.followUpStallSeconds 0, and honours a lower threshold", async () => {
+      for (const [stallSeconds, stalled] of [[0, false], [30, true]] as const) {
+        const { main, pi, state } = setup(120_000, false, stallSeconds);
+        const router = sender(main);
+        await followUp(router, "one");
+        vi.advanceTimersByTime(3_600_000);
+        failSends(pi);
+        state.idle = true;
+        if (stalled) await expect(followUp(router, "two")).rejects.toThrow(/not being delivered: 2 held, oldest 3600 s/);
+        else await expect(followUp(router, "two")).resolves.toMatchObject({ pendingFollowUps: 2, oldestAgeS: 3_600 });
+      }
+    });
   });
 
   it("keeps an item whose send throws, and sends it at the next boundary", () => {

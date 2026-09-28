@@ -330,6 +330,22 @@ const lifecycleSubscription = (
     ...overrides,
   });
 
+  // smarty-dev#1826: tell to Main is a followUp, so a stalled queue fails it the same way.
+  it("throws for tell and followUp to a Main whose held queue is stalled", async () => {
+    const { provider, mainAgent, mainDeliveries } = setup();
+    mainAgent.deliverAgent = (request) => {
+      mainDeliveries.push(request);
+      return { queued: true, messageId: "held", routed: "main", pendingFollowUps: 4, oldestAgeS: 20_520, stalled: true } as never;
+    };
+    for (const method of ["tell", "followUp"]) {
+      await expect(provider.invoke(method, { id: "main", message: "still there?" }, context)).rejects.toThrow(
+        "Fabric followUp to main was accepted but is not being delivered: 4 held, oldest 20520 s, target idle. " +
+          "The message is still held, not withdrawn.",
+      );
+    }
+    expect(mainDeliveries.map((request) => request.delivery)).toEqual(["followUp", "followUp"]);
+  });
+
   describe("AgentsProvider lifecycle coalescing", () => {
     it("coalesces a burst of followUp lifecycle events into one wake delivery", async () => {
       const { provider, mainDeliveries } = setup();

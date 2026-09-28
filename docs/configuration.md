@@ -197,7 +197,8 @@ where absent values do not participate. Orchestration programs (`agents.run` / `
     "actorPollMs": 250,
     "actorQueueLimit": 32,
     "eventContextChars": 40000,
-    "followUpFlushMs": 120000
+    "followUpFlushMs": 120000,
+    "followUpStallSeconds": 600
   },
   "actors": {
     "maxSessionBytes": 20971520
@@ -551,6 +552,8 @@ call override → session binding → project default → Fabric default
 ```
 
 `mesh.followUpFlushMs` (default 120000) bounds how late an agent `followUp` reaches a busy Main. Fabric holds such a followUp while Main works. At the next boundary between tool calls, it sends every followUp that has waited this long as one batched steer, oldest first, behind any steer already queued. When the run is about to settle (`agent_before_settle`), it hands the rest to Pi's followUp queue, so Pi continues the run for them unless the user cancelled. `0` keeps Pi's own followUp queue, which Pi reads only when Main has no more work. Pi hosts older than 0.87.0 have no `agent_before_settle` and always keep Pi's queue.
+
+`mesh.followUpStallSeconds` (default 600) makes a stuck followUp queue visible to its sender. When Main is idle and the oldest followUp that Fabric still holds for it, from any sender, is at least this old, no boundary will release the queue: the owner marks its acknowledgement `stalled: true`, and `agents.followUp` and `agents.tell` to that Main throw `Fabric followUp to <target> was accepted but is not being delivered: <n> held, oldest <age> s, target idle.` The message stays held, not withdrawn; use `agents.steer` meanwhile. A busy Main is never reported stalled, because a long turn holds followUps until its next boundary. `0` disables the check. Owners older than this setting never report `stalled`.
 
 `mesh.eventContextChars` bounds the sanitized JSON context attached to each host-event activation. Fabric extracts images first. It stores redacted image descriptors in the mailbox and registry, then sends the raw images to the actor out of band. The character limit never truncates image base64 because base64 is not part of that JSON context.
 

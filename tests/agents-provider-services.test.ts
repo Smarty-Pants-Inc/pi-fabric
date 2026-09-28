@@ -297,6 +297,22 @@ describe("agents provider message routing service boundaries", () => {
     });
   });
 
+  // smarty-dev#1826: the owner passes a stalled Main queue on; the sender throws, older owners never send it.
+  it("passes a stalled Main queue to the sender, which throws", async () => {
+    const { router, main, actors, participants, control } = routing();
+    main.deliverAgent.mockReturnValueOnce({ queued: true, messageId: "held", routed: "main", pendingFollowUps: 8, oldestAgeS: 900, stalled: true });
+    await expect(router.acceptControl({ ...command("followUp"), targetId: "main" }, actors.identity)).resolves.toEqual({
+      accepted: true, messageId: "held", pendingFollowUps: 8, oldestAgeS: 900, stalled: true,
+    });
+    participants.get.mockReturnValue({ ...participant(), id: "session:peer", rootId: "session:peer" });
+    control.request.mockResolvedValueOnce({ queued: true, messageId: "m", routed: "mesh", acknowledged: true, pendingFollowUps: 8, oldestAgeS: 900, stalled: true });
+    await expect(router.routeMessage("session:peer", "hi", undefined, "followUp")).rejects.toThrow(
+      "Fabric followUp to session:peer was accepted but is not being delivered: 8 held, oldest 900 s, target idle.",
+    );
+    control.request.mockResolvedValueOnce({ queued: true, messageId: "m", routed: "mesh", acknowledged: true, pendingFollowUps: 8, oldestAgeS: 900 });
+    await expect(router.routeMessage("session:peer", "hi", undefined, "followUp")).resolves.toMatchObject({ pendingFollowUps: 8 });
+  });
+
   it("rejects a remote followUp to a full Main queue with the reason", async () => {
     const { router, main, actors } = routing();
     main.deliverAgent.mockImplementationOnce(() => { throw new Error("Main's followUp queue is full (50 of yours)"); });

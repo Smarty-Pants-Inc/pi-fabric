@@ -6,6 +6,7 @@ import { BunProcessRuntime, NodeProcessRuntime } from "./node-process-runtime.js
 import { repairFabricGuestCode } from "./guest-code-repair.js";
 import { typeCheckFabricCode } from "./type-checker.js";
 import { guestTypeDeclarations } from "./guest-types.js";
+import { withRecordsDeclarations } from "../records/guest-types.js";
 import { buildDynamicGuestDeclarations } from "./dynamic-guest-types.js";
 import { buildCoreOverrideGuestDeclarations, type FabricCoreOverrideTypeSource } from "./core-override-guest-types.js";
 
@@ -34,11 +35,11 @@ export class TypeScriptKernelRuntime implements FabricKernelRuntime {
     const coreOverrides = fullCodeMode
       ? buildCoreOverrideGuestDeclarations(overrides)
       : undefined;
-    const checked = typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode, {
+    const checked = typeCheckFabricCode(code, withRecordsDeclarations(guestTypeDeclarations(fullCodeMode, {
       excludeGlobals: unavailable,
       dynamic: buildDynamicGuestDeclarations(sources),
       ...(coreOverrides ? { coreOverrides } : {}),
-    }), includeTypeCorrectness);
+    })), includeTypeCorrectness);
     return { code, checked };
   }
 

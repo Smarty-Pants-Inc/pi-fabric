@@ -20,6 +20,19 @@ const printed = (what: string) => {
 	return r.out;
 };
 const sha = (id: string) => createHash("sha256").update(id).digest("hex");
+const fileSha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("hex");
+const Z = "0".repeat(64);
+const repo = resolve(__dirname, "..");
+// A fake node and bundle, with their correct digests as install arguments.
+const sources = (dir: string) => {
+	mkdirSync(join(dir, "pkg/dist/records-service"), { recursive: true });
+	const bundle = join(dir, "pkg/dist/records-service/service-main.mjs");
+	writeFileSync(bundle, "process.exit(2);\n");
+	const node = join(dir, "node");
+	writeFileSync(node, "#!/bin/sh\nexit 0\n");
+	chmodSync(node, 0o755);
+	return { node, bundle, args: ["--node", node, "--package-root", join(dir, "pkg"), "--bundle-sha256", fileSha(bundle), "--node-sha256", fileSha(node)] };
+};
 // The host's own PostgreSQL, as the script detects it without --pg-bin (none: the <N> placeholder).
 const hostPgMajor = (() => {
 	try {
@@ -136,7 +149,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 	chmodSync(join(fake, "apt-cache"), 0o755);
 	const fakeEnv = { ...process.env, PATH: `${fake}:${process.env.PATH}` };
 	// The default --pg-bin; the dry run below must not pass --pg-bin.
-	const dryBase = ["--org", "test-org", "--org-user", "nobodyuser", "--node", process.execPath];
+	const dryBase = ["--org", "test-org", "--org-user", "nobodyuser", "--node", process.execPath, "--package-root", repo, "--bundle-sha256", Z, "--node-sha256", Z];
 
 	it("dry run prints every step and executes nothing", () => {
 		writeFileSync(log, "");
@@ -153,9 +166,14 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		// F13: exactly two files are staged, a node binary and the self-contained bundle.
 		const staged = r.out.split("\n").filter((l) => /^\+ install -m \S+ -o root -g root \S+ \/opt\//.test(l));
 		expect(staged).toEqual([
-			`+ install -m 0755 -o root -g root ${process.execPath} /opt/test-org-records/node`,
-			`+ install -m 0644 -o root -g root ${resolve(__dirname, "..")}/dist/records-service/service-main.mjs /opt/test-org-records/service-main.mjs`,
+			"+ install -m 0755 -o root -g root /run/test-org-records-stage.XXXXXX/node /opt/test-org-records/node",
+			"+ install -m 0644 -o root -g root /run/test-org-records-stage.XXXXXX/service-main.mjs /opt/test-org-records/service-main.mjs",
 		]);
+		// P1-1: staging and the digest check come before step 1; the sources are only read.
+		expect(r.out.indexOf("? STAGE=$(mktemp -d /run/test-org-records-stage.XXXXXX)")).toBeLessThan(r.out.indexOf("## 1. "));
+		expect(r.out).toContain(`? umask 077; cat ${process.execPath} > /run/test-org-records-stage.XXXXXX/node; `);
+		expect(r.out).toMatch(/^digest check: bundle (ok|MISMATCH|not readable), node MISMATCH {2}\(a real run refuses a MISMATCH\)$/m);
+		expect(r.out).toContain("? ss -Hltnp  (no TCP listener on :5433;");
 		expect(r.out).not.toMatch(/rsync|node_modules|\/package\b|chown -R|chmod -R/);
 		expect(r.out).toContain("? find /opt/test-org-records -type l  (must print nothing)\n");
 		expect(r.out).toContain("? runuser -u test-org-records -- /opt/test-org-records/node /opt/test-org-records/service-main.mjs  (must exit 2");
@@ -187,7 +205,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		);
 		const gh = `/var/lib/test-org-records/credentials/${sha("importer:github")}.json`;
 		expect(r.out).toContain(
-			`+ runuser -u test-org-records -- /opt/test-org-records/node /opt/test-org-records/service-main.mjs issue --config /etc/test-org-records/service.json --id importer:github --role importer --out ${gh}\n`,
+			`+ runuser -u test-org-records -- /opt/test-org-records/node /opt/test-org-records/service-main.mjs issue --config /etc/test-org-records/service.json --id importer:github --role importer --out ${gh} --reissue\n`,
 		);
 		expect(r.out).toContain(`"credentialFile": "${gh}"`);
 		expect(r.out).toContain("systemctl reload test-org-records.service");
@@ -203,7 +221,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.code, r.err).toBe(0);
 		expect(r.out).toContain("/etc/test-org-records/service.json relay relay:fabric\n");
 		const relayCred = `/var/lib/test-org-records/credentials/${sha("relay:fabric")}.json`;
-		expect(r.out).toContain(`--id relay:fabric --role relay --out ${relayCred}\n`);
+		expect(r.out).toContain(`--id relay:fabric --role relay --out ${relayCred} --reissue\n`);
 		// F12: the org user creates and writes its own file; root only feeds the token on stdin.
 		expect(r.out).toContain("+ runuser -u nobodyuser -- install -d -m 0700 '~nobodyuser/.config/test-org-records'\n");
 		expect(r.out).toContain(
@@ -212,7 +230,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.out).not.toMatch(/^\+ (install|chown|chmod) .*nobodyuser\/\.config/m);
 		expect(r.out).toContain('"relayCredentialFile": "~nobodyuser/.config/test-org-records/relay.json"');
 		// The mirror's credential stays with the records user.
-		expect(r.out).toContain(`--id mirror:github --role mirror --out /var/lib/test-org-records/credentials/${sha("mirror:github")}.json\n`);
+		expect(r.out).toContain(`--id mirror:github --role mirror --out /var/lib/test-org-records/credentials/${sha("mirror:github")}.json --reissue\n`);
 		expect(r.out).not.toContain(`< /var/lib/test-org-records/credentials/${sha("mirror:github")}.json`);
 		expect(readFileSync(log, "utf8")).toBe("");
 	});
@@ -224,8 +242,13 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		const block = src.slice(src.indexOf("# ROOT STEPS (one line each):"), src.indexOf("set -Eeuo pipefail"));
 		const listed = [...block.matchAll(/^# {2}(\d+)\. \S/gm)].map((m) => m[1]);
 		const printedSteps = [...r.out.matchAll(/^## (\d+)\. /gm)].map((m) => m[1]);
-		expect(printedSteps.length).toBe(9);
+		expect(printedSteps.length).toBe(10);
 		expect(listed).toEqual(printedSteps);
+		// --help prints the same ROOT STEPS (it cannot read the script's own file: no path comes from $0).
+		const help = run(["--help"], fakeEnv).out;
+		const helpSteps = help.slice(help.indexOf("WHAT IT CHANGES:"), help.indexOf("\nIDEMPOTENCY:")).split("\n").filter((l) => /^ {2}\d+\. /.test(l));
+		const headerSteps = block.split("\n").filter((l) => /^# {2}\d+\. /.test(l)).map((l) => l.slice(1).replaceAll("<N>", hostN));
+		expect(helpSteps).toEqual(headerSteps);
 		expect(src).toMatch(/^set -Eeuo pipefail$/m);
 		expect(src).toContain("trap 'on_error $LINENO' ERR");
 	});
@@ -238,14 +261,17 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.out.lastIndexOf("## ROLLBACK\n")).toBeGreaterThan(r.out.indexOf("## 9. "));
 		expect(tail).toContain("  userdel test-org-records\n");
 		expect(tail).toContain("  rm -rf /opt/test-org-records\n");
-		expect(tail).toContain("  systemctl disable --now test-org-records.service test-org-records-pg.service\n");
+		expect(tail).toContain("  systemctl stop test-org-records.service test-org-records-pg.service\n");
+		expect(tail).toContain("  systemctl is-active test-org-records.service test-org-records-pg.service  (each must be inactive, failed or unknown; otherwise nothing is deleted)\n");
+		expect(tail).toContain("  systemctl disable test-org-records.service test-org-records-pg.service\n");
 		expect(tail).toContain(`Take a backup first: runuser -u test-org-records -- ${hostPgBin}/pg_dump `);
 		expect(tail).toContain(`Optional, to remove them too: apt-get remove postgresql postgresql-${hostN}`);
 		expect(readFileSync(log, "utf8")).toBe("");
 	});
 
 	const rollbackOrder = [
-		"systemctl disable --now test-org-records.service test-org-records-pg.service",
+		"systemctl stop test-org-records.service test-org-records-pg.service",
+		"systemctl disable test-org-records.service test-org-records-pg.service",
 		"rm -f /etc/systemd/system/test-org-records.service /etc/systemd/system/test-org-records-pg.service",
 		"systemctl daemon-reload",
 		"rm -rf /etc/test-org-records",
@@ -262,12 +288,13 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.code, r.err).toBe(0);
 		const cmds = r.out.split("\n").filter((l) => l.startsWith("+ ")).map((l) => l.slice(2));
 		expect(cmds).toEqual(rollbackOrder);
+		expect(r.out).toContain("? systemctl is-active test-org-records.service test-org-records-pg.service  (each must be");
 		expect(r.out).toContain("This deletes the org's record database. Take a backup first: runuser -u test-org-records -- ");
 		expect(r.out).toContain(`apt-get remove postgresql postgresql-${hostN}`);
 		expect(r.out).not.toContain("## 1. ");
 		// The ROLLBACK section of an install lists the same commands.
 		const install = run([...dryBase, "--dry-run"], fakeEnv);
-		const listed = install.out.slice(install.out.lastIndexOf("## ROLLBACK\n")).split("\n").filter((l) => l.startsWith("  ")).map((l) => l.slice(2));
+		const listed = install.out.slice(install.out.lastIndexOf("## ROLLBACK\n")).split("\n").filter((l) => l.startsWith("  ") && !l.includes(" is-active ")).map((l) => l.slice(2));
 		expect(listed).toEqual(rollbackOrder);
 		expect(readFileSync(log, "utf8")).toBe("");
 	});
@@ -294,7 +321,11 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		try {
 			writeFileSync(join(failing, "useradd"), `#!/bin/sh\necho "useradd $*" >> "${log}"\nexit 3\n`);
 			chmodSync(join(failing, "useradd"), 0o755);
-			const r = run(["--org", "test-org", "--org-user", me, "--node", process.execPath], testEnv(failing));
+			const src = sources(failing);
+			const r = run(["--org", "test-org", "--org-user", me, ...src.args], { ...testEnv(failing), RECORDS_PAUL_STEPS_TEST_ROOT: join(failing, "root") });
+			expect(r.out).toContain("OK: the staged node and bundle match the approved sha256");
+			// The staging directory is removed on exit.
+			expect(readdirSync(join(failing, "root/run"))).toEqual([]);
 			expect(r.code).toBe(1);
 			expect(r.err).toMatch(/^records-paul-steps: FAILED at step 1 \(OS user test-org-records\) \(line \d+\): useradd --system .* test-org-records \(exit 3\)$/m);
 			expect(r.err).toContain("Nothing after this step ran. Fix the cause and rerun (the script is idempotent), or undo with --rollback.");
@@ -307,19 +338,131 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 	});
 
-	it.skipIf(process.getuid?.() === 0)("die inside a step names the step", () => {
-		// Step 2 dies: the non-default --pg-bin has no initdb. useradd (fake) succeeds in step 1.
+	it("fails clearly, before step 0, when a non-default --pg-bin has no initdb", () => {
 		writeFileSync(log, "");
-		const r = run(["--org", "test-org", "--org-user", me, "--node", process.execPath, "--pg-bin", "/nonexistent"], testEnv());
-		expect(r.code).toBe(1);
-		expect(r.err).toMatch(/^records-paul-steps: FAILED at step 2 \(Prerequisites: .*\) \(line \d+\): \/nonexistent\/initdb not found/m);
-		expect(readFileSync(log, "utf8")).toMatch(/^useradd .*\n$/);
-	});
-
-	it("fails clearly when a non-default --pg-bin has no initdb", () => {
-		const r = run([...base, "--dry-run"], fakeEnv);
+		const r = run([...dryBase, "--pg-bin", "/nonexistent", "--dry-run"], fakeEnv);
 		expect(r.code).not.toBe(0);
 		expect(r.err).toMatch(/\/nonexistent\/initdb not found/);
+		expect(r.out).not.toMatch(/^## \d/m);
+		expect(readFileSync(log, "utf8")).toBe("");
+	});
+
+	it("requires both sources and both digests, 64 lowercase hex, before anything runs", () => {
+		writeFileSync(log, "");
+		const drop = (flag: string) => {
+			const i = dryBase.indexOf(flag);
+			return [...dryBase.slice(0, i), ...dryBase.slice(i + 2)];
+		};
+		for (const flag of ["--bundle-sha256", "--node-sha256", "--package-root", "--node"]) {
+			const r = run([...drop(flag), "--dry-run"], fakeEnv);
+			expect(r.code, flag).toBe(1);
+			expect(r.err, flag).toContain(`${flag} ${flag === "--node" ? "BIN" : flag === "--package-root" ? "DIR" : "HEX"} is required`);
+			expect(r.out, flag).not.toMatch(/^## \d/m);
+		}
+		for (const bad of ["A".repeat(64), "0".repeat(63), `${"0".repeat(64)}0`, "sha256:abc"]) {
+			const r = run([...drop("--node-sha256"), "--node-sha256", bad, "--dry-run"], fakeEnv);
+			expect(r.code, bad).toBe(1);
+			expect(r.err, bad).toContain(`invalid digest '${bad}': use 64 lowercase hex characters`);
+		}
+		expect(run([...drop("--node"), "--node", "node", "--dry-run"], fakeEnv).err).toMatch(/path must be absolute/);
+		expect(readFileSync(log, "utf8")).toBe("");
+	});
+
+	it("--print-digests prints both sha256 lines and changes nothing", () => {
+		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-dig-"));
+		try {
+			const src = sources(t);
+			const r = run(["--print-digests", "--package-root", join(t, "pkg"), "--node", src.node]);
+			expect(r.code, r.err).toBe(0);
+			expect(r.out).toBe(`bundle-sha256 ${fileSha(src.bundle)}  ${src.bundle}\nnode-sha256 ${fileSha(src.node)}  ${src.node}\n`);
+			expect(run(["--print-digests", "--node", src.node]).code).toBe(1);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("refuses a staged copy that does not match its approved digest, before step 1, changing nothing", () => {
+		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-mismatch-"));
+		try {
+			const src = sources(t);
+			const root = join(t, "root");
+			const kept = join(root, "etc/test-org-records/service.json");
+			mkdirSync(dirname(kept), { recursive: true });
+			writeFileSync(kept, "{}\n");
+			const before = [fileSha(kept), fileSha(src.node), fileSha(src.bundle)];
+			const env = { ...testEnv(), RECORDS_PAUL_STEPS_TEST_ROOT: root };
+			for (const [flag, name] of [["--bundle-sha256", "bundle"], ["--node-sha256", "node"]] as const) {
+				writeFileSync(log, "");
+				const args = [...src.args];
+				args[args.indexOf(flag) + 1] = "f".repeat(64);
+				const r = run(["--org", "test-org", "--org-user", me, ...args], env);
+				expect(r.code).toBe(1);
+				const got = name === "node" ? before[1] : before[2];
+				expect(r.err).toContain(`refused: staged ${name} sha256 ${got} != approved ${"f".repeat(64)}; nothing was changed`);
+				expect(r.out).not.toContain("## 1. ");
+				expect(readFileSync(log, "utf8")).toBe("");
+				expect(readdirSync(join(root, "run"))).toEqual([]);
+				expect([fileSha(kept), fileSha(src.node), fileSha(src.bundle)]).toEqual(before);
+				expect(existsSync(join(root, "opt"))).toBe(false);
+			}
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it("a copy at <dir>/run/smarty-step.sh does the same dry run: no path comes from $0", () => {
+		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-copy-"));
+		try {
+			const src = sources(t);
+			mkdirSync(join(t, "run"));
+			const copy = join(t, "run/smarty-step.sh");
+			writeFileSync(copy, readFileSync(script));
+			const args = ["--org", "test-org", "--org-user", "nobodyuser", "--operator", "relay:relay:fabric", ...src.args, "--dry-run"];
+			const a = run(args, fakeEnv);
+			const b = spawnSync("bash", [copy, ...args], { encoding: "utf8", env: fakeEnv, cwd: t });
+			expect(a.code, a.err).toBe(0);
+			expect(b.status, b.stderr).toBe(0);
+			expect(a.out).toContain("digest check: bundle ok, node ok");
+			// Only the script's own name (${0##*/}, in messages) differs.
+			const same = (s: string) => s.replaceAll("smarty-step.sh", "NAME").replaceAll("records-paul-steps.sh", "NAME");
+			expect(same(b.stdout)).toBe(same(a.out));
+			expect(b.stderr).toBe(a.err);
+			// The --help of the copy lists the same steps.
+			const h = spawnSync("bash", [copy, "--help"], { encoding: "utf8", env: fakeEnv });
+			expect(same(h.stdout)).toBe(same(run(["--help"], fakeEnv).out));
+			const src2 = readFileSync(script, "utf8");
+			expect(src2).not.toMatch(/BASH_SOURCE|dirname|\$0\b|\$\{0[^#]/);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it("writes the createcluster.d drop-in only when createcluster.conf is absent", () => {
+		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-cc-"));
+		try {
+			const root = join(t, "root");
+			const env = { ...testEnv(), RECORDS_PAUL_STEPS_TEST_ROOT: root };
+			const dropIn = `+ write ${root}/etc/postgresql-common/createcluster.d/99-smarty-records.conf (mode 0644, owner root:root)\n    | # Written by records-paul-steps.sh`;
+			let r = run([...dryBase, "--dry-run"], env);
+			expect(r.code, r.err).toBe(0);
+			expect(r.out).toContain(dropIn);
+			expect(r.out).toContain("    | create_main_cluster = false\n");
+			expect(r.out.indexOf(dropIn)).toBeLessThan(r.out.indexOf("+ apt-get install -y postgresql"));
+			mkdirSync(join(root, "etc/postgresql-common"), { recursive: true });
+			writeFileSync(join(root, "etc/postgresql-common/createcluster.conf"), "create_main_cluster = true\n");
+			r = run([...dryBase, "--dry-run"], env);
+			expect(r.code, r.err).toBe(0);
+			expect(r.out).not.toContain("99-smarty-records.conf");
+			expect(r.out).toContain(`= ${root}/etc/postgresql-common/createcluster.conf exists: kept as is`);
+			expect(r.out).toContain("+ apt-get install -y postgresql\n");
+			// With PostgreSQL present, apt is not run and no drop-in is written.
+			rmSync(join(root, "etc"), { recursive: true });
+			pgTree(root, ["16"]);
+			r = run([...dryBase, "--dry-run"], env);
+			expect(r.out).not.toMatch(/99-smarty-records|apt-get install/);
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
 	});
 
 	it("fails clearly when apt has no candidate for the distro postgresql", () => {
@@ -462,7 +605,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 		expect(run([...base, "--operator", "mirror:fabric:dev1", "--print", "hba"]).code).toBe(0);
 		if (process.getuid?.() !== 0) {
-			const r = run(base);
+			const r = run(dryBase);
 			expect(r.code).not.toBe(0);
 			expect(r.err).toMatch(/must run as root/);
 		}
@@ -475,8 +618,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		const imp = `/var/lib/test-org-records/credentials/${sha("team:import_job")}.json`;
 		const rel = `/var/lib/test-org-records/credentials/${sha("team_import:job")}.json`;
 		expect(imp).not.toBe(rel);
-		expect(r.out).toContain(`--id team:import_job --role importer --out ${imp}\n`);
-		expect(r.out).toContain(`--id team_import:job --role relay --out ${rel}\n`);
+		expect(r.out).toContain(`--id team:import_job --role importer --out ${imp} --reissue\n`);
+		expect(r.out).toContain(`--id team_import:job --role relay --out ${rel} --reissue\n`);
 		for (const [cred, id] of [[imp, "team:import_job"], [rel, "team_import:job"]])
 			expect(r.out).toMatch(
 				new RegExp(`^\\? runuser -u test-org-records -- /opt/test-org-records/node -e '.*\\.id !== id \\|\\| c\\.role !== role \\|\\| c\\.issuedBy !== "installer".*' ${cred} ${id} (importer|relay) {2}\\(stored \\.id, \\.role, \\.issuedBy must equal`, "m"),
@@ -490,13 +633,13 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		const dir = mkdtempSync(join(tmpdir(), "records-paul-steps-link-"));
 		try {
 			symlinkSync(process.execPath, join(dir, "node"));
-			let r = run(["--org", "test-org", "--org-user", "nobodyuser", "--node", join(dir, "node"), "--dry-run"], testEnv());
+			let r = run(["--org", "test-org", "--org-user", "nobodyuser", "--node", join(dir, "node"), "--package-root", repo, "--bundle-sha256", Z, "--node-sha256", Z, "--dry-run"], testEnv());
 			expect(r.code).toBe(1);
 			expect(r.err).toContain(`${join(dir, "node")} is a symlink: refused`);
 			mkdirSync(join(dir, "pkg/dist/records-service"), { recursive: true });
 			writeFileSync(join(dir, "real.mjs"), "");
 			symlinkSync(join(dir, "real.mjs"), join(dir, "pkg/dist/records-service/service-main.mjs"));
-			r = run(["--org", "test-org", "--org-user", "nobodyuser", "--node", process.execPath, "--package", join(dir, "pkg"), "--dry-run"], testEnv());
+			r = run(["--org", "test-org", "--org-user", "nobodyuser", "--node", process.execPath, "--package-root", join(dir, "pkg"), "--bundle-sha256", Z, "--node-sha256", Z, "--dry-run"], testEnv());
 			expect(r.code).toBe(1);
 			expect(r.err).toContain("service-main.mjs is a symlink: refused");
 		} finally {
@@ -526,6 +669,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		for (const c of ["chown", "chmod"]) sh(bin, c, `${passUser}\necho "${c} $*" >> "${L}"`);
 		for (const c of ["useradd", "systemctl"]) sh(bin, c, `echo "${c} $*" >> "${L}"`);
 		sh(bin, "python3", `echo "python3 $*" >> "${L}"`);
+		// No TCP listener on the records port; a distro cluster on 5432 only warns.
+		sh(bin, "ss", `echo "ss $*" >> "${L}"; echo 'LISTEN 0 244 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=9,fd=6))'`);
 		// The service socket the success check tests with test -S: a real unix socket under the temp root.
 		mkdirSync(join(t, "root/run/test-org-records"), { recursive: true });
 		spawnSync(process.execPath, ["-e", "require('net').createServer().listen(process.argv[1], () => process.exit(0))", join(t, "root/run/test-org-records/records.sock")]);
@@ -545,9 +690,10 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			symlinkSync(outside, join(home, ".config/test-org-records"));
 		} else if (layout === "config-link") symlinkSync(outside, join(home, ".config"));
 		const before = statSync(outside);
+		const digests = ["--bundle-sha256", fileSha(join(t, "pkg/dist/records-service/service-main.mjs")), "--node-sha256", fileSha(join(t, "node"))];
 		const again = (ops = ["--operator", "relay:relay:fabric", "--operator", "importer:github"]) =>
 			run(
-				["--org", "test-org", "--org-user", me, "--node", join(t, "node"), ...(pgFrom === "pg-bin" ? ["--pg-bin", pg] : []), "--package", join(t, "pkg"), ...ops],
+				["--org", "test-org", "--org-user", me, "--node", join(t, "node"), ...(pgFrom === "pg-bin" ? ["--pg-bin", pg] : []), "--package-root", join(t, "pkg"), ...digests, ...ops],
 				{ ...testEnv(bin), RECORDS_PAUL_STEPS_TEST_ROOT: `${t}/root` },
 			);
 		writeFileSync(L, "");
@@ -616,7 +762,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(log2).not.toContain("issue --config");
 			expect(log2).not.toContain(`${home}/.config`);
 			expect(log2).not.toMatch(/runuser sh -c/);
-			expect(second.out).not.toMatch(/relay\.json|sha256|issue --config/);
+			expect(second.out).not.toMatch(/relay\.json|credentials\/[0-9a-f]{64}|issue --config/);
 		} finally {
 			rmSync(t, { recursive: true, force: true });
 		}
@@ -624,7 +770,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 
 	it.skipIf(process.getuid?.() === 0)("F18: one id with two roles in one invocation is refused before step 1", () => {
 		writeFileSync(log, "");
-		const r = run(["--org", "test-org", "--org-user", me, "--node", process.execPath, "--operator", "importer:x:y", "--operator", "relay:x:y"], testEnv());
+		const r = run(["--org", "test-org", "--org-user", me, ...dryBase.slice(4), "--operator", "importer:x:y", "--operator", "relay:x:y"], testEnv());
 		expect(r.code).toBe(1);
 		expect(r.err).toContain("refused: operator id 'x:y' is given with two roles (importer and relay); an id holds exactly one role");
 		expect(r.out).not.toContain("## 1. ");
@@ -744,6 +890,99 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		}
 	});
 
+	it.skipIf(process.getuid?.() === 0)("P1-1: installs the verified staged copies, restarts a running service on change, and removes the stage", () => {
+		const { t, r, calls, again, L } = relayRun("plain");
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			const stageRe = reEsc(`${t}/root/run/test-org-records-stage.`);
+			const opt = `${t}/root/opt/test-org-records`;
+			expect(calls).toEqual(
+				expect.arrayContaining([
+					expect.stringMatching(new RegExp(`^install -m 0755 -o root -g root ${stageRe}\\w{6}/node ${reEsc(opt)}/node$`)),
+					expect.stringMatching(new RegExp(`^install -m 0644 -o root -g root ${stageRe}\\w{6}/service-main\\.mjs ${reEsc(opt)}/service-main\\.mjs$`)),
+				]),
+			);
+			// No command names a source path after staging.
+			expect(calls.filter((c) => c.includes(`${t}/pkg`) || c.includes(`${t}/node `))).toEqual([]);
+			expect(fileSha(`${opt}/node`)).toBe(fileSha(join(t, "node")));
+			expect(fileSha(`${opt}/service-main.mjs`)).toBe(fileSha(join(t, "pkg/dist/records-service/service-main.mjs")));
+			expect(readdirSync(join(t, "root/run")).filter((n) => n.includes("stage"))).toEqual([]);
+			// The fake reports the service active before enable: the new binaries need a restart; the reload always follows a grant.
+			expect(calls).toContain("systemctl restart test-org-records.service");
+			expect(calls).toContain("systemctl reload test-org-records.service");
+			expect(r.out).toMatch(/^WARNING: PostgreSQL TCP listeners on other ports/m);
+			expect(r.out).toMatch(/^OK: no TCP listener on :5433$/m);
+			writeFileSync(L, "");
+			const second = again();
+			expect(second.code, second.err).toBe(0);
+			const calls2 = readFileSync(L, "utf8");
+			expect(calls2).not.toContain("systemctl restart test-org-records.service");
+			expect(calls2).toContain("systemctl reload test-org-records.service");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("P2-1: a TCP listener on the records port fails the success checks", () => {
+		const { t, again, bin } = relayRun("plain");
+		try {
+			writeFileSync(join(bin, "ss"), "#!/bin/bash\necho 'LISTEN 0 244 127.0.0.1:5433 0.0.0.0:*'\n");
+			const r = again();
+			expect(r.code).toBe(1);
+			expect(r.err).toContain("a TCP listener on 127.0.0.1:5433");
+			expect(r.err).toMatch(/FAILED at step 9 \(Verification\) .*check failed \(no TCP listener on :5433\)/);
+			expect(r.out).not.toContain("C10_RECORDS_INSTALLED org=");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("die inside a step names the step (apt left no PostgreSQL); the drop-in came first", () => {
+		writeFileSync(log, "");
+		const { t, r } = relayRun("plain", "tree16", (root) => rmSync(pgBase(root), { recursive: true }));
+		try {
+			expect(r.code).toBe(1);
+			expect(r.err).toMatch(/^records-paul-steps: FAILED at step 2 \(Prerequisites: .*\) \(line \d+\): apt-get install postgresql left no /m);
+			expect(readFileSync(log, "utf8")).toBe("apt-get install -y postgresql\n");
+			expect(readFileSync(join(t, "root/etc/postgresql-common/createcluster.d/99-smarty-records.conf"), "utf8")).toMatch(/^create_main_cluster = false$/m);
+			expect(readdirSync(join(t, "root/etc/postgresql-common/createcluster.d"))).toEqual(["99-smarty-records.conf"]);
+		} finally {
+			writeFileSync(log, "");
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("P2-4: rollback refuses to delete while a unit is still active", () => {
+		const { t, bin, L } = relayRun("plain");
+		try {
+			const root = join(t, "root");
+			const env = { ...testEnv(bin), RECORDS_PAUL_STEPS_TEST_ROOT: root };
+			const rb = ["--org", "test-org", "--org-user", me, "--rollback", "--yes-delete-records"];
+			for (const state of ["active", "deactivating", ""]) {
+				writeFileSync(L, "");
+				writeFileSync(join(bin, "systemctl"), `#!/bin/bash\necho "systemctl $*" >> "${L}"\n[ "$1" = is-active ] && { [ -n "${state}" ] && echo ${state}; exit 0; }\nexit 0\n`);
+				const r = run(rb, env);
+				expect(r.code, state).toBe(1);
+				expect(r.err).toContain(`refused: test-org-records.service is still ${state || "in an unknown state"}; nothing was deleted`);
+				expect(r.out).not.toContain("## R2.");
+				const calls = readFileSync(L, "utf8").trim().split("\n");
+				expect(calls).toEqual(["systemctl stop test-org-records.service test-org-records-pg.service", "systemctl is-active test-org-records.service"]);
+				for (const p of ["etc/test-org-records/service.json", "etc/systemd/system/test-org-records.service", "var/lib/test-org-records/credentials", "opt/test-org-records/node"])
+					expect(existsSync(join(root, p)), p).toBe(true);
+			}
+			// inactive, failed or unknown (an absent unit) let the rollback go on.
+			writeFileSync(join(bin, "systemctl"), `#!/bin/bash\necho "systemctl $*" >> "${L}"\n[ "$1" = is-active ] && { [ "$2" = test-org-records.service ] && echo failed || echo inactive; exit 3; }\nexit 0\n`);
+			writeFileSync(L, "");
+			const ok = run(rb, env);
+			expect(ok.code, ok.err).toBe(0);
+			expect(ok.out).toContain("= test-org-records.service is failed\n= test-org-records-pg.service is inactive\n");
+			expect(existsSync(join(root, "etc/test-org-records"))).toBe(false);
+			expect(readFileSync(L, "utf8")).toContain("systemctl disable test-org-records.service test-org-records-pg.service\n");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
 	const success = "C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=17/test-org-records unit=active peer-audit=ok";
 	const helpSuccess = `C10_RECORDS_INSTALLED org=test-org user=test-org-records cluster=${hostN}/test-org-records unit=active peer-audit=ok`;
 
@@ -764,7 +1003,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.out).toContain("  1. useradd the test-org-records system user");
 		expect(r.out.slice(r.out.indexOf("WHAT IT CHANGES:"))).not.toMatch(/<org>|<org-user>/);
 		// The rollback list is the one --rollback runs.
-		const listed = r.out.slice(r.out.indexOf("\nROLLBACK:")).split("\n").filter((l) => l.startsWith("  ") && !l.includes("records-paul-steps.sh")).map((l) => l.slice(2));
+		const listed = r.out.slice(r.out.indexOf("\nROLLBACK:")).split("\n").filter((l) => l.startsWith("  ") && !l.includes("records-paul-steps.sh") && !l.includes(" is-active ")).map((l) => l.slice(2));
 		expect(listed).toEqual(rollbackOrder);
 		expect(readFileSync(log, "utf8")).toBe("");
 	});
@@ -840,7 +1079,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		try {
 			rmSync(join(t, "root/run/test-org-records/records.sock"));
 			writeFileSync(join(t, "root/run/test-org-records/records.sock"), "not a socket");
-			const r = again();
+			// No --operator: the step 8 reload (which also waits for the socket) is not reached.
+			const r = again([]);
 			expect(r.code).toBe(1);
 			expect(r.err).toMatch(/FAILED at step 9 \(Verification\) .*check failed \(service socket\): test -S \S+\/root\/run\/test-org-records\/records\.sock$/m);
 			expect(r.out).not.toContain("C10_RECORDS_INSTALLED org=");

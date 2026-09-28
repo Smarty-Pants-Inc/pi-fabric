@@ -59,10 +59,15 @@ Database authority lives in one place: the org's **records service**.
 
 `scripts/records-paul-steps.sh` installs all of it in one idempotent run with `--dry-run`: the user, the cluster,
 pg_hba and ident, the units, the migration, and credential issuance. The service runs from a self-contained bundle
-(`dist/records-service/service-main.mjs`, every dependency inlined), which the installer copies with the node binary
-into root-owned `/opt/<org>-records`: no dependency tree and no symlinks, so nothing an agent can write is ever run
-as the records user. Everything written into the org user's home is written as that user. `--help` shows each root
-step, what a rerun does, the success line and the rollback.
+(`dist/records-service/service-main.mjs`, every dependency inlined). The installer takes the approved sha256 of
+that bundle and of the node binary as required arguments (`--bundle-sha256`, `--node-sha256`; `--print-digests`
+shows them for a build). Before it changes anything, it copies both once into a fresh root-only staging directory,
+verifies the staged copies, and installs and runs only those bytes, in root-owned `/opt/<org>-records`. So nothing
+an agent can write, before or during the install, is ever run as root or as the records user. Every path comes from
+its arguments (`--package-root`, `--node`), so the script also works when copied elsewhere, such as
+`/run/smarty-step.sh`. Everything written into the org user's home is written as that user. `--help` shows each
+root step, what a rerun does, the success line and the rollback. WAL accumulates until the WAL-G archive step; run
+it before sustained use and watch the disk.
 
 ## Configuration
 

@@ -119,15 +119,24 @@ export const OPERATOR_ROLES: readonly OperatorRole[] = ["importer", "mirror", "r
  * reserved operator namespace (never a session or actor id, which only registration creates),
  * and the role is recorded with it in the same statement.
  */
-export const issuePrincipal = async (config: RecordsServiceConfig, id: string, role: OperatorRole, name?: string, pool?: ClientPool): Promise<{ id: string; token: string }> => {
+export const issuePrincipal = async (config: RecordsServiceConfig, id: string, role: OperatorRole, name?: string, pool?: ClientPool, reissue = false): Promise<{ id: string; token: string }> => {
   if (!/^[A-Za-z0-9._@:-]{1,128}$/.test(id) || SELF_REGISTERED.test(id)) throw new Error(`invalid operator principal id ${JSON.stringify(id)}: a session or actor id registers itself`);
   if (!OPERATOR_ROLES.includes(role)) throw new Error(`invalid operator role ${JSON.stringify(role)}`);
   const owner = pool ?? await openPool(config.database);
   const store = new RecordStore(owner, { org: config.org, origin: config.origin });
   try {
     const token = newToken();
-    await store.transaction((client) => client.query(
-      "INSERT INTO principals (id, name, token_hash, issued_by, role) VALUES ($1, $2, $3, 'operator', $4)", [id, name ?? id, hashToken(token), role]));
+    // reissue: an issuance interrupted after its commit (the credential file never written) is
+    // recovered by rotating that operator principal's token. Only the same id AS AN OPERATOR WITH
+    // THE SAME ROLE is rotated; a registered principal or another role is never touched.
+    const written = await store.transaction(async (client) => {
+      const inserted = (await client.query(
+        "INSERT INTO principals (id, name, token_hash, issued_by, role) VALUES ($1, $2, $3, 'operator', $4) ON CONFLICT (id) DO NOTHING",
+        [id, name ?? id, hashToken(token), role])).rowCount === 1;
+      if (inserted || !reissue) return inserted;
+      return (await client.query<{ ok: boolean }>("SELECT principal_reissue($1, $2, $3) AS ok", [id, role, hashToken(token)])).rows[0]!.ok;
+    });
+    if (!written) throw new Error(`operator principal ${id} already exists${reissue ? " as another kind or role" : "; pass --reissue to rotate its token"}`);
     return { id, token };
   } finally {
     if (!pool) await owner.end?.();

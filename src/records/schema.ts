@@ -319,7 +319,20 @@ GRANT EXECUTE ON FUNCTION consumer_open(text, text, jsonb), consumer_save(text, 
   archive_claim(text, double precision), archive_record(text, pg_lsn, text) TO ${WRITER_ROLE};
 `;
 
-export const MIGRATIONS: readonly string[] = [v1];
+// v2: recover an operator issuance interrupted after its commit (the credential file never written):
+// rotate that operator principal's token, only for the same id as an operator with the same role.
+const v2 = `
+CREATE FUNCTION principal_reissue(p_id text, p_role text, p_token_hash text)
+  RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+BEGIN
+  UPDATE principals SET token_hash = p_token_hash WHERE id = p_id AND issued_by = 'operator' AND role = p_role;
+  RETURN FOUND;
+END $f$;
+REVOKE ALL ON FUNCTION principal_reissue(text, text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION principal_reissue(text, text, text) TO ${WRITER_ROLE};
+`;
+
+export const MIGRATIONS: readonly string[] = [v1, v2];
 
 /** A minimal client: pg's PoolClient satisfies it, and so does a test double. */
 export interface SqlClient {

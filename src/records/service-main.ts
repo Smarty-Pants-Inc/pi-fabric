@@ -24,7 +24,7 @@ process.on("SIGHUP", () => {
   else reloadPending = true;
 });
 
-const usage = "usage: service-main.js serve|migrate|issue --config FILE [--id ID --role importer|mirror|relay] [--name NAME] [--out FILE]";
+const usage = "usage: service-main.js serve|migrate|issue --config FILE [--id ID --role importer|mirror|relay [--reissue]] [--name NAME] [--out FILE]";
 
 const flag = (argv: string[], name: string): string | undefined => {
   const index = argv.indexOf(name);
@@ -53,7 +53,7 @@ const main = async (argv: string[]): Promise<number> => {
       return 2;
     }
     const name = flag(argv, "--name");
-    const credential = await issuePrincipal(config, id, role as OperatorRole, name);
+    const credential = await issuePrincipal(config, id, role as OperatorRole, name, undefined, argv.includes("--reissue"));
     fs.mkdirSync(path.dirname(out), { recursive: true });
     // O_EXCL: an existing credential file is never overwritten.
     // The role and provenance go with the token, so the installer can verify a file before reuse or delivery.

@@ -638,6 +638,28 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await relay.claimPublications(10)).claims).toEqual([]);
   });
 
+  it("reissue recovers an interrupted operator issuance, and touches nothing else", async () => {
+    const { config, owner } = await freshService();
+    const pool = owner as unknown as ClientPool;
+    const first = await issuePrincipal(config, "relay:fabric", "relay", "relay", pool);
+    // The credential file was never written (interrupted): a plain issue is refused...
+    await expect(issuePrincipal(config, "relay:fabric", "relay", "relay", pool)).rejects.toThrow(/pass --reissue/);
+    // ...and a reissue rotates the token: the new one works, the lost one no longer does.
+    const second = await issuePrincipal(config, "relay:fabric", "relay", "relay", pool, true);
+    expect(second.token).not.toBe(first.token);
+    const file = path.join(dir, `reissued-${databases}.json`);
+    fs.writeFileSync(file, JSON.stringify(second), { mode: 0o600 });
+    const relay = await connect(config, "unused", file);
+    expect((await relay.claimPublications(10)).claims).toEqual([]);
+    const lost = path.join(dir, `lost-${databases}.json`);
+    fs.writeFileSync(lost, JSON.stringify(first), { mode: 0o600 });
+    const stale = await connect(config, "unused", lost);
+    await expect(stale.claimPublications(10)).rejects.toThrow(/not known to this service/);
+    // A reissue never changes the role of an existing operator.
+    await expect(issuePrincipal(config, "relay:fabric", "importer", "x", pool, true)).rejects.toThrow(/another kind or role/);
+    expect((await owner.query("SELECT role FROM principals WHERE id = 'relay:fabric'")).rows[0].role).toBe("relay");
+  });
+
   it("a client closed while it reconnects starts no call (F3)", async () => {
     const { config, service, owner } = await freshService();
     const alice = await connect(config, ALICE);

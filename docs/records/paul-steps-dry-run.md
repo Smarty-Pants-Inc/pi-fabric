@@ -1,24 +1,33 @@
 # `records-paul-steps.sh` dry run
 
-Generated on Dev1 (no PostgreSQL installed yet) with:
+Generated on Dev1 (no PostgreSQL installed yet), from a copy of the script at `/run/user/1000/smarty-step.sh` (the root step runs it as `/run/smarty-step.sh`), with the digests of a clean `bun run build`:
 
 ```
-scripts/records-paul-steps.sh --org smarty-pants --org-user paul --operator relay:relay:fabric --operator importer:github --dry-run
+smarty-step.sh --org smarty-pants --org-user paul --operator relay:relay:fabric --package-root <package> --node <node> --bundle-sha256 a5a6bb0a9a4a28920a2b1a4686e9b664996715a4cd7559fae0105c5682705fbe --node-sha256 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c --dry-run
 ```
 
 ```
 # DRY RUN: nothing below is executed or written.
+## 0. Stage and verify node and the bundle
+? STAGE=$(mktemp -d /run/smarty-pants-records-stage.XXXXXX)  (root-only, 0700; removed on exit)
+? umask 077; cat <node> > /run/smarty-pants-records-stage.XXXXXX/node; cat <package>/dist/records-service/service-main.mjs > /run/smarty-pants-records-stage.XXXXXX/service-main.mjs  (each source read once)
+? sha256sum /run/smarty-pants-records-stage.XXXXXX/node /run/smarty-pants-records-stage.XXXXXX/service-main.mjs  (must equal 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c and a5a6bb0a9a4a28920a2b1a4686e9b664996715a4cd7559fae0105c5682705fbe; otherwise refused, nothing changed)
+digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
 ## 1. OS user smarty-pants-records
 + useradd --system --user-group --no-create-home --home-dir /var/lib/smarty-pants-records --shell /usr/sbin/nologin smarty-pants-records
 ## 2. Prerequisites: PostgreSQL <detected after install>, node and the package under /opt/smarty-pants-records
-  note: the distro package postgresql 16+257build1.1. It creates its own cluster service postgresql@<N>-main;
-        this setup does not need it and does not touch it (disable it yourself if you do not use it).
+  note: the distro package postgresql 16+257build1.1. Unless disabled, it creates a cluster postgresql@<N>-main;
+        an existing one stays as it is: this setup does not touch it (disable it yourself if you do not use it).
+  /etc/postgresql-common/createcluster.conf is absent: a drop-in stops apt from creating a new main cluster
++ install -d -m 0755 -o root -g root /etc/postgresql-common/createcluster.d
++ write /etc/postgresql-common/createcluster.d/99-smarty-records.conf (mode 0644, owner root:root)
+    | # Written by records-paul-steps.sh: no new distro main cluster on install (it would listen on TCP).
+    | create_main_cluster = false
 + apt-get install -y postgresql
 = PostgreSQL <detected after install>: the highest /usr/lib/postgresql/<N>/bin with initdb and postgres
-! <package>/dist/records-service/service-main.mjs not found: build the package (bun run build) before the real run
 + install -d -m 0755 -o root -g root /opt/smarty-pants-records
-+ install -m 0755 -o root -g root ~/.local/share/node-v24.18.0-linux-x64/bin/node /opt/smarty-pants-records/node
-+ install -m 0644 -o root -g root <package>/dist/records-service/service-main.mjs /opt/smarty-pants-records/service-main.mjs
++ install -m 0755 -o root -g root /run/smarty-pants-records-stage.XXXXXX/node /opt/smarty-pants-records/node
++ install -m 0644 -o root -g root /run/smarty-pants-records-stage.XXXXXX/service-main.mjs /opt/smarty-pants-records/service-main.mjs
 ? find /opt/smarty-pants-records -type l  (must print nothing)
 ? runuser -u smarty-pants-records -- /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs  (must exit 2, usage: it runs with no external modules)
 ? runuser -u smarty-pants-records -- test -x /usr/lib/postgresql/<N>/bin/initdb
@@ -59,6 +68,8 @@ scripts/records-paul-steps.sh --org smarty-pants --org-user paul --operator rela
     | # loudly and PostgreSQL keeps every WAL segment in pg_wal: no WAL is thrown away.
     | archive_command = '/bin/false'
     | archive_timeout = 60
+    | # LIMIT: WAL accumulates until the WAL-G archive step; run it before sustained use and watch disk.
+    | # (max_wal_size is deliberately not set: it cannot bound WAL that is waiting to be archived.)
 + _append /var/lib/smarty-pants-records/pg/postgresql.conf 'include_dir = '\''conf.d'\'''
 ## 5. Service config
 + write /etc/smarty-pants-records/service.json (mode 0640, owner root:smarty-pants-records)
@@ -131,21 +142,16 @@ scripts/records-paul-steps.sh --org smarty-pants --org-user paul --operator rela
 + runuser -u smarty-pants-records -- '/usr/lib/postgresql/<N>/bin/psql' -X -v ON_ERROR_STOP=1 -h /run/smarty-pants-records-pg -p 5433 -U postgres -d records -c 'DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='\''records_service'\'') THEN CREATE ROLE records_service LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT; END IF; END $$'
 + runuser -u smarty-pants-records -- /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs migrate --config /etc/smarty-pants-records/service.json
 + systemctl enable --now smarty-pants-records.service
+? if node, the bundle or smarty-pants-records.service changed and it was already active: + systemctl restart smarty-pants-records.service, then wait up to 30 s for /run/smarty-pants-records/records.sock
 ## 8. Operator principals
-? /opt/smarty-pants-records/node -e "$(records-paul-steps.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json relay relay:fabric check  (refused if relay:fabric holds another role)
-? /opt/smarty-pants-records/node -e "$(records-paul-steps.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json importer importer:github check  (refused if importer:github holds another role)
-+ /opt/smarty-pants-records/node -e "$(records-paul-steps.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json relay relay:fabric
-+ runuser -u smarty-pants-records -- /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs issue --config /etc/smarty-pants-records/service.json --id relay:fabric --role relay --out /var/lib/smarty-pants-records/credentials/a118e63f0db39cd54725abe706530715a3bd5e9e269bd9fc6ed418548a49c37a.json
+? /opt/smarty-pants-records/node -e "$(smarty-step.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json relay relay:fabric check  (refused if relay:fabric holds another role)
++ /opt/smarty-pants-records/node -e "$(smarty-step.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json relay relay:fabric
++ runuser -u smarty-pants-records -- /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs issue --config /etc/smarty-pants-records/service.json --id relay:fabric --role relay --out /var/lib/smarty-pants-records/credentials/a118e63f0db39cd54725abe706530715a3bd5e9e269bd9fc6ed418548a49c37a.json --reissue
 ? runuser -u smarty-pants-records -- /opt/smarty-pants-records/node -e 'const [f, id, role] = process.argv.slice(1); const c = JSON.parse(require("fs").readFileSync(f, "utf8")); if (c.id !== id || c.role !== role || c.issuedBy !== "installer") { console.error(`${f}: not ${id} as ${role} issued by the installer`); process.exit(1); }' /var/lib/smarty-pants-records/credentials/a118e63f0db39cd54725abe706530715a3bd5e9e269bd9fc6ed418548a49c37a.json relay:fabric relay  (stored .id, .role, .issuedBy must equal relay:fabric, relay, installer)
 + runuser -u paul -- install -d -m 0700 ~/.config/smarty-pants-records
 + runuser -u paul -- sh -c 'umask 077 && cat > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"' sh ~/.config/smarty-pants-records/relay.json < /var/lib/smarty-pants-records/credentials/a118e63f0db39cd54725abe706530715a3bd5e9e269bd9fc6ed418548a49c37a.json
   -> relay:fabric (relay): Fabric of paul uses it with "records": { "enabled": true, "socket": "/run/smarty-pants-records/records.sock", "relayCredentialFile": "~/.config/smarty-pants-records/relay.json" }.
-+ /opt/smarty-pants-records/node -e "$(records-paul-steps.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json importer importer:github
-+ runuser -u smarty-pants-records -- /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs issue --config /etc/smarty-pants-records/service.json --id importer:github --role importer --out /var/lib/smarty-pants-records/credentials/340b97e6eed75f259ce6f2053ff8b99b683ee61dccd69f42c5d732c33215ad79.json
-? runuser -u smarty-pants-records -- /opt/smarty-pants-records/node -e 'const [f, id, role] = process.argv.slice(1); const c = JSON.parse(require("fs").readFileSync(f, "utf8")); if (c.id !== id || c.role !== role || c.issuedBy !== "installer") { console.error(`${f}: not ${id} as ${role} issued by the installer`); process.exit(1); }' /var/lib/smarty-pants-records/credentials/340b97e6eed75f259ce6f2053ff8b99b683ee61dccd69f42c5d732c33215ad79.json importer:github importer  (stored .id, .role, .issuedBy must equal importer:github, importer, installer)
-  -> importer:github (importer): its component runs as smarty-pants-records (a sibling unit with User=smarty-pants-records, or inside
-     smarty-pants-records.service) with "credentialFile": "/var/lib/smarty-pants-records/credentials/340b97e6eed75f259ce6f2053ff8b99b683ee61dccd69f42c5d732c33215ad79.json".
-? if roles changed and smarty-pants-records.service is active: wait up to 30 s for /run/smarty-pants-records/records.sock (the service's SIGHUP handler is in place by then), then + systemctl reload smarty-pants-records.service
+? if smarty-pants-records.service is active: wait up to 30 s for /run/smarty-pants-records/records.sock (the service's SIGHUP handler is in place by then), then + systemctl reload smarty-pants-records.service  (always, so an interrupted earlier grant takes effect)
 ## 9. Verification
 ? stat -c '%A %U:%G %n' /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs /var/lib/smarty-pants-records /var/lib/smarty-pants-records/pg /var/lib/smarty-pants-records/status /var/lib/smarty-pants-records/credentials /run/smarty-pants-records-pg /run/smarty-pants-records /etc/smarty-pants-records
 ? runuser -u paul -- /usr/lib/postgresql/<N>/bin/psql -h /run/smarty-pants-records-pg -p 5433 -U postgres -d records -c 'select 1'  (expected to fail: agent cannot reach PostgreSQL)
@@ -154,15 +160,18 @@ scripts/records-paul-steps.sh --org smarty-pants --org-user paul --operator rela
 ? runuser -u smarty-pants-records -- '/usr/lib/postgresql/<N>/bin/pg_isready' -h /run/smarty-pants-records-pg -p 5433  (PostgreSQL ready)
 ? runuser -u smarty-pants-records -- python3 -c 'import ctypes; ctypes.CDLL(None).getsockopt'  (peer audit (python3 ctypes))
 ? test -S /run/smarty-pants-records/records.sock  (service socket)
+? ss -Hltnp  (no TCP listener on :5433; PostgreSQL TCP listeners on other ports only warn)
 
 Fabric: point the org's agents at the service socket in .pi/fabric.json:
   { "records": { "enabled": true, "socket": "/run/smarty-pants-records/records.sock" } }
 
 ## ROLLBACK
-To undo this install later, run (as root) 'records-paul-steps.sh --org smarty-pants --org-user paul --rollback --yes-delete-records',
+To undo this install later, run (as root) 'smarty-step.sh --org smarty-pants --org-user paul --rollback --yes-delete-records',
 which runs these commands in this order:
 This deletes the org's record database. Take a backup first: runuser -u smarty-pants-records -- /usr/lib/postgresql/<N>/bin/pg_dump -h /run/smarty-pants-records-pg -p 5433 -U postgres -Fc records > /root/smarty-pants-records-backup.dump
-  systemctl disable --now smarty-pants-records.service smarty-pants-records-pg.service
+  systemctl stop smarty-pants-records.service smarty-pants-records-pg.service
+  systemctl is-active smarty-pants-records.service smarty-pants-records-pg.service  (each must be inactive, failed or unknown; otherwise nothing is deleted)
+  systemctl disable smarty-pants-records.service smarty-pants-records-pg.service
   rm -f /etc/systemd/system/smarty-pants-records.service /etc/systemd/system/smarty-pants-records-pg.service
   systemctl daemon-reload
   rm -rf /etc/smarty-pants-records

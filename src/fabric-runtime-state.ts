@@ -335,6 +335,12 @@ export class FabricRuntimeState {
     return service.inbox?.next(session);
   }
 
+  /** The same, as the one message that brings the batch into the session; undefined when empty. */
+  async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<ReturnType<typeof recordsInboxMessage> | undefined> {
+    const batch = await this.nextRecordsInbox(recordsInboxSession(entries));
+    return batch?.records.length ? recordsInboxMessage(batch.records) : undefined;
+  }
+
   async #closeRecords(): Promise<void> {
     const opening = this.#records;
     this.#records = undefined;

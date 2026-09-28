@@ -1,6 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
-import { recordsInboxMessage, recordsInboxSession } from "./records/inbox.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
@@ -645,8 +644,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
       if (inbox?.events.length) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
-      const records = await state.nextRecordsInbox(recordsInboxSession(context.sessionManager.getEntries())).catch(() => undefined);
-      if (records?.records.length) pi.sendMessage(recordsInboxMessage(records.records), { deliverAs: "followUp", triggerTurn: true });
+      const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
+      if (records) pi.sendMessage(records, { deliverAs: "followUp", triggerTurn: true });
     }
   });
 
@@ -961,9 +960,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // Records addressed to this root reach it with its next turn (smarty-dev#754 C4).
   pi.on("before_agent_start", async (_event, context) => {
     if (!state.initialized) return;
-    const batch = await state.nextRecordsInbox(recordsInboxSession(context.sessionManager.getEntries())).catch(() => undefined);
-    if (!batch?.records.length) return;
-    return { message: recordsInboxMessage(batch.records) };
+    const message = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
+    if (!message) return;
+    return { message };
   });
 
   registerFabricActorHostEventObservers(pi, (eventName, event, context) => {

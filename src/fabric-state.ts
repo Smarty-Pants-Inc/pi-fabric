@@ -1,6 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RootInboxBatch, RootInboxSession } from "./topology/root-inbox.js";
-import type { RecordsInboxBatch, RecordsInboxSession } from "./records/inbox.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
@@ -260,8 +259,9 @@ export class FabricState {
   async nextRootInbox(session: RootInboxSession): Promise<RootInboxBatch | undefined> {
     return this.#current()?.nextRootInbox(session);
   }
-  async nextRecordsInbox(session: RecordsInboxSession): Promise<RecordsInboxBatch | undefined> {
-    return this.#current()?.nextRecordsInbox(session);
+  /** The records inbox message for this turn, if any (built in the lazy runtime; smarty-dev#754). */
+  async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
+    return this.#current()?.nextRecordsInboxMessage(entries);
   }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }
   participantsConfirmedAt(): number | undefined { return this.#current()?.participantsConfirmedAt(); }

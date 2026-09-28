@@ -7,6 +7,7 @@ import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext } from "./types.js";
+import { normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
@@ -165,7 +166,13 @@ export class GlobalActorRegistry {
    * the supplied fields are replaced; the rest are preserved. Re-validates any
    * changed field.
    */
-  update(idOrName: string, patch: Omit<Partial<FabricActorRequest>, "coalesceKey"> & { coalesceKey?: string | null }): GlobalActorDefinition {
+  update(
+    idOrName: string,
+    patch: Omit<Partial<FabricActorRequest>, "coalesceKey" | "activationFilter"> & {
+      coalesceKey?: string | null;
+      activationFilter?: FabricActorActivationFilter | null;
+    },
+  ): GlobalActorDefinition {
     this.#refresh(true);
     const existing = resolveDefinition(this.#actors, idOrName);
     if (!existing) throw new Error(`Unknown global actor: ${idOrName}`);
@@ -206,6 +213,13 @@ export class GlobalActorRegistry {
           ? { coalesceKey: patch.coalesceKey }
           : existing.coalesceKey !== undefined
             ? { coalesceKey: existing.coalesceKey }
+            : {}),
+      ...(patch.activationFilter === null
+        ? {}
+        : patch.activationFilter !== undefined
+          ? { activationFilter: patch.activationFilter }
+          : existing.activationFilter !== undefined
+            ? { activationFilter: existing.activationFilter }
             : {}),
       ...(patch.validWhile !== undefined
         ? { validWhile: patch.validWhile }
@@ -269,6 +283,7 @@ export class GlobalActorRegistry {
       ...(typeof def.extensions === "boolean" ? { extensions: def.extensions } : {}),
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
+      ...(def.activationFilter !== undefined ? { activationFilter: clone(def.activationFilter) } : {}),
       ...(def.validWhile ? { validWhile: clone(def.validWhile) } : {}),
     };
     return request;
@@ -322,6 +337,7 @@ export class GlobalActorRegistry {
     const extensions = typeof def.extensions === "boolean" ? def.extensions : undefined;
     validateActorInferenceContext(def.inferenceContext, runner);
     validateActorCoalesceKey(def.coalesceKey);
+    const activationFilter = def.activationFilter === undefined ? undefined : normalizeActorActivationFilter(def.activationFilter);
     const requires = normalizeRequirements(def.requires);
     const validWhile = def.validWhile?.version === 1 &&
       typeof def.validWhile.source === "string" &&
@@ -351,6 +367,7 @@ export class GlobalActorRegistry {
       ...(requires && requires.length > 0 ? { requires } : {}),
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
+      ...(activationFilter?.length ? { activationFilter } : {}),
       ...(validWhile ? { validWhile } : {}),
     };
   }
@@ -455,6 +472,7 @@ export class GlobalActorRegistry {
       try {
         validateActorInferenceContext(record.inferenceContext, runner);
         validateActorCoalesceKey(record.coalesceKey);
+        if (record.activationFilter !== undefined) normalizeActorActivationFilter(record.activationFilter);
         requires = normalizeRequirements(record.requires);
       } catch {
         continue;
@@ -488,6 +506,9 @@ export class GlobalActorRegistry {
         ...(requires && requires.length > 0 ? { requires } : {}),
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         ...(record.coalesceKey !== undefined ? { coalesceKey: record.coalesceKey } : {}),
+        ...(record.activationFilter !== undefined && record.activationFilter.length > 0
+          ? { activationFilter: normalizeActorActivationFilter(record.activationFilter) }
+          : {}),
         ...(validWhile ? { validWhile } : {}),
       };
       actors.set(def.id, def);

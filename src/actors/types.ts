@@ -5,6 +5,9 @@ import type { FabricLogLine, AgentRunRecord, AgentUsage } from "../agents/types.
 import type { FabricCapabilityRequirement } from "../components/types.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
+import type { FabricActorActivationFilter } from "./activation-filter.js";
+
+export type { FabricActorActivationFilter } from "./activation-filter.js";
 
 // Pi's extension event union is closed; every member we want the actor host
 // to observe must appear in FABRIC_ACTOR_PI_HOST_EVENTS below. `project_trust`
@@ -202,6 +205,11 @@ export interface FabricActorRequest {
    * same topic with the same value there is replaced by the newer one, in its queue place.
    */
   coalesceKey?: string;
+  /**
+   * Skip-only rules checked before a queued event runs the model: preset names ("hold",
+   * "never-message-events") or rule objects. A skipped event is logged and counted, never run.
+   */
+  activationFilter?: FabricActorActivationFilter;
   /** session actors stop with their Pi host; durable actors transfer to a resident host. */
   residency?: FabricParticipantResidency;
   runner?: FabricAgentRunner;
@@ -254,6 +262,10 @@ export interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  activationFilter?: FabricActorActivationFilter;
+  /** Events the activation filter skipped without a model run. */
+  filteredCount?: number;
+  lastFilteredAt?: number;
   residency?: FabricParticipantResidency;
   /** Effective value for this caller after session bindings overlay project defaults. */
   model?: string;

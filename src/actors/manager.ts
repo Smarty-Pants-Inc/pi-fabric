@@ -22,6 +22,7 @@ import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/
 import { readJsonlPage } from "../log-tail.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
+import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import type {
   FabricActorBindingScope,
   FabricActorDelivery,
@@ -91,6 +92,9 @@ interface ManagedActor {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  activationFilter?: FabricActorActivationFilter;
+  filteredCount?: number;
+  lastFilteredAt?: number;
   residency: FabricParticipantResidency;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
@@ -140,6 +144,15 @@ const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 const PRESENCE_RETRY_MS = 5_000;
 /** Recent (actor, event) deliveries, so an event offered again reaches only actors that missed it. */
 const DELIVERED_EVENT_MEMORY = 4_096;
+function loadedActivationFilter(value: unknown): { activationFilter?: FabricActorActivationFilter } {
+  if (value === undefined) return {};
+  try {
+    const filter = normalizeActorActivationFilter(value);
+    return filter.length > 0 ? { activationFilter: filter } : {};
+  } catch {
+    return {};
+  }
+}
 const COALESCE_KEY_LOAD_PATTERN = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
 
 // The value at a dotted path in a mesh event's data, when it is a string or a finite number.
@@ -475,6 +488,9 @@ export class ActorManager {
     }
     validateActorInferenceContext(request.inferenceContext, runner);
     validateActorCoalesceKey(request.coalesceKey);
+    const activationFilter = request.activationFilter === undefined
+      ? undefined
+      : normalizeActorActivationFilter(request.activationFilter);
     const kernel = this.agents.resolveKernel({
       ...(request.kernel !== undefined ? { kernel: request.kernel } : {}),
       runner,
@@ -504,6 +520,7 @@ export class ActorManager {
       triggerTurn: deliveryPolicy.triggerTurn,
       coalesce: request.coalesce ?? true,
       ...(request.coalesceKey ? { coalesceKey: request.coalesceKey } : {}),
+      ...(activationFilter?.length ? { activationFilter } : {}),
       residency,
       runner,
       ...(kernel ? { kernel } : {}),
@@ -700,6 +717,19 @@ export class ActorManager {
     return this.#publicInfo(actor);
   }
 
+  /**
+   * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
+   * queued work from the next item on; the filtered count is kept.
+   */
+  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
+    if (filter.length > 0) actor.activationFilter = filter;
+    else delete actor.activationFilter;
+    actor.updatedAt = Date.now();
+    await this.#publishPresence(actor);
+    return this.#publicInfo(actor);
+  }
 
   /**
    * Replace an existing actor's host-event subscriptions. Already-queued work
@@ -1035,6 +1065,7 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
       ...(actor.requirements.length > 0
         ? { requires: actor.requirements.map((requirement) => ({ ...requirement })) }
         : {}),
@@ -1554,6 +1585,15 @@ export class ActorManager {
         // A freed slot lets a catch-up that a full queue deferred continue at once.
         this.#meshMonitor.schedule();
         if (!item) break;
+        const filteredBy = this.#filteredBy(actor, item);
+        if (filteredBy) {
+          // smarty-dev#1579: a skip rule matched. No model run; the skip is logged and counted.
+          this.#recordFiltered(actor, item, filteredBy);
+          this.#persistQueue(actor.id);
+          actor.status = actor.queue.length > 0 ? "queued" : "idle";
+          await this.#publishPresence(actor);
+          continue;
+        }
         this.#inFlight.set(actor.id, item);
         const inferenceContext = actor.inferenceContext;
         actor.status = "running";
@@ -1995,6 +2035,30 @@ export class ActorManager {
     }
   }
 
+  // Only callerless mesh and host events are filtered: a caller always hears its own run.
+  #filteredBy(actor: ManagedActor, item: ActorQueueItem): string | undefined {
+    if (!actor.activationFilter || item.resolve || item.reject) return undefined;
+    if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return undefined;
+    return activationFilterSkip(actor.activationFilter, item.source, item.payload);
+  }
+
+  #recordFiltered(actor: ManagedActor, item: ActorQueueItem, ruleId: string): void {
+    const now = Date.now();
+    actor.filteredCount = (actor.filteredCount ?? 0) + 1;
+    actor.lastFilteredAt = now;
+    actor.updatedAt = now;
+    this.#recordMessage(actor, {
+      id: randomUUID(),
+      actorId: actor.id,
+      actorName: actor.name,
+      direction: "in",
+      source: item.source,
+      createdAt: now,
+      reason: `filtered: ${ruleId}`,
+      data: { filteredItemId: item.id },
+    });
+  }
+
   #recordStale(
     actor: ManagedActor,
     item: ActorQueueItem,
@@ -2277,6 +2341,9 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.activationFilter ? { activationFilter: actor.activationFilter } : {}),
+      ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
+      ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       requirements: actor.requirements,
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
@@ -2474,6 +2541,12 @@ export class ActorManager {
         ...(typeof record.coalesceKey === "string" && COALESCE_KEY_LOAD_PATTERN.test(record.coalesceKey)
           ? { coalesceKey: record.coalesceKey }
           : {}),
+        // An unreadable filter is dropped, never guessed: unsure means deliver.
+        ...loadedActivationFilter(record.activationFilter),
+        ...(typeof record.filteredCount === "number" && Number.isSafeInteger(record.filteredCount) && record.filteredCount > 0
+          ? { filteredCount: record.filteredCount }
+          : {}),
+        ...(typeof record.lastFilteredAt === "number" ? { lastFilteredAt: record.lastFilteredAt } : {}),
         requirements,
         ...(typeof record.capabilityDigest === "string"
           ? { capabilityDigest: record.capabilityDigest }
@@ -2787,6 +2860,9 @@ export class ActorManager {
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
+      ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
+      ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),
+      ...(actor.lastFilteredAt ? { lastFilteredAt: actor.lastFilteredAt } : {}),
       requirements: actor.requirements.map((requirement) => ({ ...requirement })),
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.missingCapabilities

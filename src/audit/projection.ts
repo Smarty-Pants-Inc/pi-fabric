@@ -147,6 +147,7 @@ const idOnlyAgentActions = new Set([
   "agents.setTools",
   "agents.setInferenceContext",
   "agents.setCoalesceKey",
+  "agents.setActivationFilter",
   "agents.setEvents",
   "agents.setDeliveryPolicy",
   "agents.clearMessages",

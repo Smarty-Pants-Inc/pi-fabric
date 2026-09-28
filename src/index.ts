@@ -561,7 +561,17 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   const inboxWake: {
     timer?: ReturnType<typeof setInterval> | undefined; context?: ExtensionContext | undefined;
     armed: boolean; reading: boolean; settling: boolean; preflightAt: number;
+    /**
+     * The event ids of a wake the host accepted but the session does not hold yet (#111 review
+     * F1): the host can hold it behind a prompt preflight, which the transcript and
+     * hasPendingMessages() do not show. No tick sends it again, and the turn that starts next
+     * does not inject it again: the held follow-up reaches that run. A settle clears it, so a
+     * wake the user cleared from the queue is delivered again then.
+     */
+    submitted?: readonly string[] | undefined;
   } = { armed: true, reading: false, settling: false, preflightAt: Number.NEGATIVE_INFINITY };
+  const sameIds = (a: readonly string[], b: readonly string[]): boolean =>
+    a.length === b.length && a.every((id, index) => id === b[index]);
   // ponytail: a prompt that input handlers consume, or whose preflight throws, has no agent_start;
   // the wake treats a preflight older than this as ended rather than tracking every exit.
   const PROMPT_PREFLIGHT_MAX_MS = 120_000;
@@ -580,14 +590,18 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       if (inboxWake.context === context) stopInboxWake();
       return;
     }
-    const idle = () => inboxWake.context === context && inboxWake.armed && !inboxWake.settling &&
+    const idle = () => inboxWake.context === context && inboxWake.armed && !inboxWake.settling && !inboxWake.submitted &&
       Date.now() - inboxWake.preflightAt > PROMPT_PREFLIGHT_MAX_MS && context.isIdle() && !context.hasPendingMessages();
     inboxWake.reading = true;
     try {
       if (!idle()) return;
       const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
-      if (inbox?.events.length && idle()) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+      if (inbox?.events.length && idle()) {
+        const message = rootInboxMessage(inbox.events);
+        inboxWake.submitted = message.details.ids;
+        pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
+      }
     } catch {
       // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
     } finally {
@@ -597,6 +611,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   pi.on("session_start", async (_event, context) => {
     stopInboxWake();
+    inboxWake.submitted = undefined;
     inboxWake.context = context;
     inboxWake.armed = true;
     entropyLifecycleEpoch += 1;
@@ -692,6 +707,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     inboxWake.context = context;
     inboxWake.armed = settledCompleted(event, context);
     inboxWake.preflightAt = Number.NEGATIVE_INFINITY;
+    // The run that took a held wake has ended: the settle below reconciles what the session holds.
+    inboxWake.submitted = undefined;
     if (!state.initialized) {
       await compactAtConfiguredThreshold(context, state.config);
       return;
@@ -1044,7 +1061,10 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (!state.initialized) return;
     const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
     if (!inbox?.events.length) return;
-    return { message: rootInboxMessage(inbox.events) };
+    const message = rootInboxMessage(inbox.events);
+    // A wake the host holds behind this prompt's preflight reaches this run as a follow-up.
+    if (inboxWake.submitted && sameIds(inboxWake.submitted, message.details.ids)) return;
+    return { message };
   });
 
   registerFabricActorHostEventObservers(pi, (eventName, event, context) => {

@@ -96,6 +96,9 @@ const openPool = async (options: RecordsServiceConfig["database"]): Promise<Clie
   const { default: pg } = await import("pg");
   const pool = new pg.Pool({ ...options, max: 8, idleTimeoutMillis: 30_000, application_name: "records-service" });
   pool.on("error", () => undefined);
+  // A checked-out client whose connection drops emits "error" too: without a listener that crashes
+  // the process. The failure still reaches the caller as its rejected query.
+  pool.on("connect", (client) => { client.on("error", () => undefined); });
   return pool as unknown as ClientPool;
 };
 
@@ -119,18 +122,111 @@ export const OPERATOR_ROLES: readonly OperatorRole[] = ["importer", "mirror", "r
  * reserved operator namespace (never a session or actor id, which only registration creates),
  * and the role is recorded with it in the same statement.
  */
-export const issuePrincipal = async (config: RecordsServiceConfig, id: string, role: OperatorRole, name?: string, pool?: ClientPool): Promise<{ id: string; token: string }> => {
+export const issuePrincipal = async (config: RecordsServiceConfig, id: string, role: OperatorRole, name?: string, pool?: ClientPool, reissue = false, presetToken?: string): Promise<{ id: string; token: string }> => {
   if (!/^[A-Za-z0-9._@:-]{1,128}$/.test(id) || SELF_REGISTERED.test(id)) throw new Error(`invalid operator principal id ${JSON.stringify(id)}: a session or actor id registers itself`);
   if (!OPERATOR_ROLES.includes(role)) throw new Error(`invalid operator role ${JSON.stringify(role)}`);
   const owner = pool ?? await openPool(config.database);
   const store = new RecordStore(owner, { org: config.org, origin: config.origin });
   try {
-    const token = newToken();
-    await store.transaction((client) => client.query(
-      "INSERT INTO principals (id, name, token_hash, issued_by, role) VALUES ($1, $2, $3, 'operator', $4)", [id, name ?? id, hashToken(token), role]));
+    const token = presetToken ?? newToken();
+    // reissue: an issuance interrupted after its commit (the credential file never written) is
+    // recovered by rotating that operator principal's token. Only the same id AS AN OPERATOR WITH
+    // THE SAME ROLE is rotated; a registered principal or another role is never touched.
+    const written = await store.transaction(async (client) => {
+      const inserted = (await client.query(
+        "INSERT INTO principals (id, name, token_hash, issued_by, role) VALUES ($1, $2, $3, 'operator', $4) ON CONFLICT (id) DO NOTHING",
+        [id, name ?? id, hashToken(token), role])).rowCount === 1;
+      if (inserted || !reissue) return inserted;
+      return (await client.query<{ ok: boolean }>("SELECT principal_reissue($1, $2, $3) AS ok", [id, role, hashToken(token)])).rows[0]!.ok;
+    });
+    if (!written) throw new Error(`operator principal ${id} already exists${reissue ? " as another kind or role" : "; pass --reissue to rotate its token"}`);
     return { id, token };
   } finally {
     if (!pool) await owner.end?.();
+  }
+};
+
+/**
+ * Issue (or, with reissue, rotate) an operator credential into `out`, never publishing a revoked
+ * token and never losing a committed one. Under a per-principal advisory lock held until the file
+ * is published (so concurrent issues for one principal run one at a time):
+ *  1. a leftover `<out>.pending` from an interrupted run is published if the database holds its
+ *     token, and discarded otherwise;
+ *  2. the new credential goes to `<out>.pending` (0600, fixed name), and is fsynced;
+ *  3. the database is changed;
+ *  4. `<out>.pending` is renamed over `out`, and the directory fsynced.
+ * A database failure that certainly did not commit removes `<out>.pending` and leaves `out` and its
+ * token as they were; after a failed COMMIT (outcome unknown) the pending file is kept and the call
+ * fails, so the next run's recovery publishes it if the database holds its token. Without
+ * reissue an existing `out` is refused before the database is touched.
+ */
+export const issueCredentialFile = async (
+  config: RecordsServiceConfig, id: string, role: OperatorRole, out: string,
+  options: { name?: string; reissue?: boolean; pool?: ClientPool; afterCommit?: () => Promise<void>; verifyOnly?: boolean } = {},
+): Promise<"published-pending" | "verified" | "issued"> => {
+  const owner = options.pool ?? await openPool(config.database);
+  const lock = await owner.connect();
+  const pending = `${out}.pending`;
+  try {
+    await lock.query("SET ROLE fabric_records_writer");
+    await lock.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [`fabric-records:issue:${id}`]);
+    fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
+    const storedHash = async (): Promise<string | undefined> =>
+      (await lock.query<{ token_hash: string }>("SELECT token_hash FROM principals WHERE id = $1 AND issued_by = 'operator' AND role = $2", [id, role])).rows[0]?.token_hash;
+    const publish = (): void => {
+      fs.renameSync(pending, out);
+      const dir = fs.openSync(path.dirname(out), "r");
+      try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+    };
+    // 1. Recover an interrupted run: its pending token is the live one exactly when the database holds it.
+    let recovered = false;
+    if (fs.existsSync(pending)) {
+      let token: unknown;
+      try { token = (JSON.parse(fs.readFileSync(pending, "utf8")) as { token?: unknown }).token; } catch { token = undefined; }
+      if (typeof token === "string" && hashToken(token) === await storedHash()) { publish(); recovered = true; }
+      else fs.rmSync(pending, { force: true });
+    }
+    // verify: the canonical file must hold the token the database holds; nothing is issued.
+    if (options.verifyOnly) {
+      let token: unknown;
+      try { token = (JSON.parse(fs.readFileSync(out, "utf8")) as { token?: unknown }).token; } catch { token = undefined; }
+      const live = await storedHash();
+      if (typeof token !== "string" || live === undefined || hashToken(token) !== live) {
+        throw new Error(`${out} does not hold the live token of ${id} (${role}); run the installer's issue with --reissue`);
+      }
+      return recovered ? "published-pending" : "verified";
+    }
+    if (!options.reissue && fs.existsSync(out)) throw new Error(`${out} exists; pass --reissue to rotate its token`);
+    // 2. The new credential is on disk before the database can make it the live one.
+    const token = newToken();
+    const fd = fs.openSync(pending, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify({ id, token, role, issuedBy: "installer" })}\n`);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    // 3. The database change.
+    try {
+      await issuePrincipal(config, id, role, options.name, owner, options.reissue === true, token);
+    } catch (error) {
+      // S2/F4: a failed COMMIT may have committed. Its pending token is kept for the next run's
+      // recovery (step 8's verify publishes it if the database holds it). It is removed only when
+      // the change certainly did not commit (an error before COMMIT was sent).
+      if ((error as { commitUncertain?: boolean }).commitUncertain === true) {
+        throw new Error(`issue ${id}: the database outcome is unknown (${error instanceof Error ? error.message : String(error)}); ${pending} kept; outcome unknown; rerun to reconcile`);
+      }
+      fs.rmSync(pending, { force: true });
+      throw error;
+    }
+    await options.afterCommit?.();
+    // 4. Publish.
+    publish();
+    return "issued";
+  } finally {
+    await lock.query("SELECT pg_advisory_unlock_all()").catch(() => undefined);
+    lock.release();
+    if (!options.pool) await owner.end?.();
   }
 };
 
@@ -146,7 +242,6 @@ export class RecordsServer {
   readonly watchdog: RecordsWatchdog;
   readonly statusFile: string | undefined;
   readonly #life = new AbortController();
-  readonly #principals = new Map<string, RecordsPrincipal>();
   readonly #handlers: Record<string, Handler>;
   #server: net.Server | undefined;
   readonly #connections = new Set<net.Socket>();
@@ -278,7 +373,6 @@ export class RecordsServer {
       return (await client.query<{ ok: boolean }>("SELECT principal_reenroll($1, $2, $3) AS ok", [id, hashToken(nonce), hashToken(token)])).rows[0]!.ok;
     }, "", signal);
     if (!enrolled) throw new RecordsServiceError(`records principal ${id} is already registered; use its credential`, "RECORD_PRINCIPAL_TAKEN");
-    this.#principals.clear();
     return { id, token };
   }
 
@@ -286,8 +380,8 @@ export class RecordsServer {
   async authenticate(token: unknown): Promise<RecordsPrincipal> {
     if (typeof token !== "string" || !token) throw new RecordsServiceError("records call needs a token", "RECORD_UNAUTHENTICATED");
     const hash = hashToken(token);
-    const cached = this.#principals.get(hash);
-    if (cached) return cached;
+    // No cache: every call reads the current token hash (one indexed lookup), so a reissued or
+    // removed token is refused at once by the running service, and a role reload applies at once.
     const row = await this.store.transaction(async (client) =>
       (await client.query<{ id: string; name: string | null; issued_by: string; role: string | null }>("SELECT id, name, issued_by, role FROM principals WHERE token_hash = $1", [hash])).rows[0], "", this.#life.signal);
     if (!row) throw new RecordsServiceError("records token is not known to this service", "RECORD_UNAUTHENTICATED");
@@ -296,7 +390,6 @@ export class RecordsServer {
       // A role needs the service config's grant AND the installer's issue for that role.
       importer: this.#holds(row, "importer"), mirror: this.#holds(row, "mirror"), relay: this.#holds(row, "relay"),
     };
-    this.#principals.set(hash, principal);
     return principal;
   }
 
@@ -407,10 +500,9 @@ export class RecordsServer {
     }).catch(() => undefined);
   }
 
-  /** Apply a new role policy (SIGHUP): cached principals are dropped and re-read. */
+  /** Apply a new role policy (SIGHUP); authentication reads it on the next call. */
   reloadRoles(roles: RecordsServiceConfig["roles"]): void {
     (this.config as { roles: RecordsServiceConfig["roles"] }).roles = roles;
-    this.#principals.clear();
   }
 
   /** How many client connections are open (status, and tests that must see a disconnect land). */

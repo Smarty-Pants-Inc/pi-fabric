@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { issuePrincipal, migrateService, normalizeServiceConfig, OPERATOR_ROLES, RecordsServer, type OperatorRole } from "./server.js";
+import { issueCredentialFile, migrateService, normalizeServiceConfig, OPERATOR_ROLES, RecordsServer, type OperatorRole } from "./server.js";
 
 /**
  * The records service's command line (C10), run as the org's `<org>-records` OS user:
@@ -24,7 +24,7 @@ process.on("SIGHUP", () => {
   else reloadPending = true;
 });
 
-const usage = "usage: service-main.js serve|migrate|issue --config FILE [--id ID --role importer|mirror|relay] [--name NAME] [--out FILE]";
+const usage = "usage: service-main.js serve|migrate|issue|verify --config FILE [--id ID --role importer|mirror|relay [--reissue]] [--name NAME] [--out FILE]";
 
 const flag = (argv: string[], name: string): string | undefined => {
   const index = argv.indexOf(name);
@@ -44,6 +44,20 @@ const main = async (argv: string[]): Promise<number> => {
     process.stdout.write(`records schema at version ${version}\n`);
     return 0;
   }
+  if (command === "verify") {
+    // The installer's first step for an existing credential: publish a pending token an interrupted
+    // reissue left (under the per-principal lock), then require the file to hold the live token.
+    const id = flag(argv, "--id");
+    const out = flag(argv, "--out");
+    const role = flag(argv, "--role");
+    if (!id || !out || !role || !(OPERATOR_ROLES as readonly string[]).includes(role)) {
+      process.stderr.write(`${usage}\n`);
+      return 2;
+    }
+    const result = await issueCredentialFile(config, id, role as OperatorRole, out, { verifyOnly: true });
+    process.stdout.write(`${result === "published-pending" ? "recovered the pending credential of" : "verified"} ${id} in ${out}\n`);
+    return 0;
+  }
   if (command === "issue") {
     const id = flag(argv, "--id");
     const out = flag(argv, "--out");
@@ -53,11 +67,8 @@ const main = async (argv: string[]): Promise<number> => {
       return 2;
     }
     const name = flag(argv, "--name");
-    const credential = await issuePrincipal(config, id, role as OperatorRole, name);
-    fs.mkdirSync(path.dirname(out), { recursive: true });
-    // O_EXCL: an existing credential file is never overwritten.
     // The role and provenance go with the token, so the installer can verify a file before reuse or delivery.
-    fs.writeFileSync(out, `${JSON.stringify({ ...credential, role, issuedBy: "installer" })}\n`, { mode: 0o600, flag: "wx" });
+    await issueCredentialFile(config, id, role as OperatorRole, out, { ...(name ? { name } : {}), reissue: argv.includes("--reissue") });
     process.stdout.write(`issued ${id} to ${out}\n`);
     return 0;
   }

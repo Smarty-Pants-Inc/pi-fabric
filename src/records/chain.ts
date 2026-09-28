@@ -44,7 +44,12 @@ export interface ChainBreak {
   expected: string | null;
   found: string | null;
 }
-export interface AnchorCheck { seq: number; hash: string; ok: boolean; found: string | null }
+/** An anchor that failed: the row at seq is missing (found null) or has another hash. */
+export interface AnchorFailure { seq: number; hash: string; found: string | null }
+/** The anchors a verify reports in full: only failures, at most this many (the rest are counted). */
+export const MAX_REPORTED_ANCHOR_FAILURES = 20;
+/** A request's anchor list: at most this many, each exactly {seq, hash} on the wire (#118 F2). */
+export const MAX_ANCHORS = 10_000;
 export interface RecordsVerifyResult {
   org: string;
   rows: number;
@@ -54,7 +59,10 @@ export interface RecordsVerifyResult {
   /** ok, and every row is covered by an anchor. */
   clean: boolean;
   break?: ChainBreak;
-  anchors: AnchorCheck[];
+  /** Every supplied anchor is checked; the result stays small whatever their number (F2). */
+  anchors: { checked: number; passed: number; failed: number };
+  /** The first failed anchors, in seq order (at most MAX_REPORTED_ANCHOR_FAILURES); `failed` counts them all. */
+  failedAnchors: AnchorFailure[];
   /** Rows after the latest supplied anchor: nothing off-host vouches for them yet. */
   unanchored?: { from: number; to: number };
   summary: string;
@@ -63,18 +71,28 @@ export interface RecordsVerifyResult {
 const HASH = /^[0-9a-f]{64}$/;
 const BATCH = 1000;
 
-/** Anchors as the adapter wrote them ({seq, hash}, extra fields ignored); checked strictly. */
+/**
+ * Anchors as the adapter wrote them ({seq, hash}, extra fields ignored); checked strictly. The
+ * empty-chain anchor records.anchor gives before the first record, exactly {seq: 0, hash: null},
+ * is valid and vouches for nothing, so it is dropped here (#118 F1). Any other null or malformed
+ * hash is refused, never skipped.
+ */
 export const parseAnchors = (value: unknown): { seq: number; hash: string }[] => {
   if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > 10_000) throw new RecordsArgumentError("anchors must be an array of {seq, hash} (at most 10000)");
-  return value.map((entry) => {
+  if (!Array.isArray(value) || value.length > MAX_ANCHORS) throw new RecordsArgumentError(`anchors must be an array of {seq, hash} (at most ${MAX_ANCHORS})`);
+  return value.flatMap((entry) => {
     const anchor = (typeof entry === "object" && entry !== null ? entry : {}) as { seq?: unknown; hash?: unknown };
+    if (anchor.seq === 0 && anchor.hash === null) return [];
     if (typeof anchor.seq !== "number" || !Number.isSafeInteger(anchor.seq) || anchor.seq < 1 || typeof anchor.hash !== "string" || !HASH.test(anchor.hash)) {
-      throw new RecordsArgumentError("each anchor needs seq (a positive integer) and hash (64 lowercase hex)");
+      throw new RecordsArgumentError("each anchor needs seq (a positive integer) and hash (64 lowercase hex), or is the empty-chain anchor {seq: 0, hash: null}");
     }
-    return { seq: anchor.seq, hash: anchor.hash };
+    return [{ seq: anchor.seq, hash: anchor.hash }];
   });
 };
+
+/** The anchors on the wire: only {seq, hash}, so MAX_ANCHORS of them fit one request line. */
+export const wireAnchors = (value: unknown): unknown =>
+  Array.isArray(value) ? value.map((entry) => typeof entry === "object" && entry !== null ? { seq: (entry as { seq?: unknown }).seq, hash: (entry as { hash?: unknown }).hash } : entry) : value;
 
 /**
  * Recompute the org's chain from one snapshot (the caller's REPEATABLE READ transaction), report
@@ -103,21 +121,26 @@ export const verifyChain = async (client: SqlClient, org: string, anchors: reado
     }
     if (batch.rows.length < BATCH) break;
   }
-  const checks = anchors.map((anchor) => {
+  let passed = 0;
+  let failed = 0;
+  const failedAnchors: AnchorFailure[] = [];
+  for (const anchor of [...anchors].sort((a, b) => a.seq - b.seq)) {
     const found = wanted.get(anchor.seq) ?? null;
-    return { seq: anchor.seq, hash: anchor.hash, ok: found === anchor.hash, found };
-  });
+    if (found === anchor.hash) { passed++; continue; }
+    failed++;
+    if (failedAnchors.length < MAX_REPORTED_ANCHOR_FAILURES) failedAnchors.push({ seq: anchor.seq, hash: anchor.hash, found });
+  }
   const latest = anchors.reduce((max, anchor) => Math.max(max, anchor.seq), 0);
   const unanchored = prev && prev.seq > latest ? { from: latest + 1, to: prev.seq } : undefined;
-  const ok = !first && checks.every((check) => check.ok);
+  const ok = !first && failed === 0;
   const lines = [
     ...(first ? [`chain broken at ${org} seq ${first.seq} (${first.reason}): expected ${first.expected ?? "none"}, found ${first.found ?? "none"}`] : []),
-    ...checks.filter((check) => !check.ok).map((check) => `anchor ${org} seq ${check.seq} fails: expected ${check.hash}, found ${check.found ?? "no row"}`),
+    ...(failedAnchors[0] ? [`anchor ${org} seq ${failedAnchors[0].seq} fails: expected ${failedAnchors[0].hash}, found ${failedAnchors[0].found ?? "no row"}${failed > 1 ? ` (${failed} of ${anchors.length} anchors fail)` : ""}`] : []),
     ...(unanchored ? [`unanchored: seq ${unanchored.from}..${unanchored.to}`] : []),
   ];
   return {
     org, rows, ...(prev ? { last: prev } : {}), ok, clean: ok && !unanchored,
-    ...(first ? { break: first } : {}), anchors: checks, ...(unanchored ? { unanchored } : {}),
+    ...(first ? { break: first } : {}), anchors: { checked: anchors.length, passed, failed }, failedAnchors, ...(unanchored ? { unanchored } : {}),
     summary: lines.length ? lines.join("\n") : `clean: ${rows} records, anchored through seq ${latest}`,
   };
 };

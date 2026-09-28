@@ -658,6 +658,55 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await again.append({ id: ALICE }, { ref: REF, kind: "status", key: "after-close", text: "must not land" })).sequence).toBe(1);
   });
 
+  it("verifies with the empty-chain anchor over the socket and the CLI, alone and beside a later anchor (#118 F1)", async () => {
+    const { config } = await freshService();
+    const alice = await connect(config, ALICE);
+    const empty = await alice.anchor({ id: "x" });
+    expect(empty).toMatchObject({ seq: 0, hash: null });
+    expect(await alice.verify({ id: "x" }, { anchors: [empty] })).toMatchObject({ ok: true, clean: true, rows: 0, anchors: { checked: 0, failed: 0 } });
+    await alice.append({ id: "x" }, { ref: REF, kind: "status", key: "s1", text: "one", data: { state: "in progress" } });
+    const later = await alice.anchor({ id: "x" });
+    expect(await alice.verify({ id: "x" }, { anchors: [empty] })).toMatchObject({ ok: true, clean: false, unanchored: { from: 1, to: 1 } });
+    expect(await alice.verify({ id: "x" }, { anchors: [empty, later] })).toMatchObject({ ok: true, clean: true, anchors: { checked: 1, passed: 1, failed: 0 } });
+    // A null or malformed hash that is not exactly the empty-chain anchor is refused, never skipped.
+    for (const bad of [{ seq: 1, hash: null }, { seq: 0, hash: "a".repeat(64) }, { seq: 0 }, { seq: 1, hash: "A".repeat(64) }]) {
+      await expect(alice.verify({ id: "x" }, { anchors: [empty, later, bad] })).rejects.toThrow(/anchor/);
+    }
+    // The CLI, as the adapter would run it: the anchor lines it printed, saved to a file.
+    const file = path.join(dir, `anchors-${databases}.jsonl`);
+    fs.writeFileSync(file, `${JSON.stringify(empty)}\n${JSON.stringify(later)}\n`);
+    const cfg = path.join(dir, `service-${databases}.json`);
+    fs.writeFileSync(cfg, JSON.stringify(config));
+    const main = path.resolve(__dirname, "../src/records/service-main.ts");
+    const cli = spawnSync("bun", [main, "verify", "--config", cfg, "--anchors", file], { encoding: "utf8" });
+    expect(cli.status, cli.stderr).toBe(0);
+    expect(JSON.parse(cli.stdout)).toMatchObject({ ok: true, clean: true });
+    const printed = spawnSync("bun", [main, "anchor", "--config", cfg], { encoding: "utf8" });
+    expect(JSON.parse(printed.stdout)).toMatchObject({ seq: 1, hash: later.hash });
+  });
+
+  it("answers 10000 anchors in one bounded response, all passing or all failing, and the connection stays usable (#118 F2)", async () => {
+    const { config } = await freshService();
+    const alice = await connect(config, ALICE);
+    for (let n = 1; n <= 3; n++) await alice.append({ id: "x" }, { ref: REF, kind: "status", key: `s${n}`, text: `${n}`, data: { state: "in progress" } });
+    const anchor = await alice.anchor({ id: "x" });
+    // As the adapter writes them (org and at included): the client sends only {seq, hash}.
+    const passing = Array.from({ length: 10_000 }, () => anchor);
+    const good = await alice.verify({ id: "x" }, { anchors: passing });
+    expect(good).toMatchObject({ ok: true, clean: true, anchors: { checked: 10_000, passed: 10_000, failed: 0 }, failedAnchors: [] });
+    const failing = Array.from({ length: 10_000 }, (_, n) => ({ seq: n + 1, hash: "f".repeat(64) }));
+    const bad = await alice.verify({ id: "x" }, { anchors: failing });
+    expect(bad).toMatchObject({ ok: false, clean: false, anchors: { checked: 10_000, passed: 0, failed: 10_000 } });
+    expect(bad.failedAnchors).toHaveLength(20);
+    expect(bad.failedAnchors[0]).toEqual({ seq: 1, hash: "f".repeat(64), found: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(bad.summary).toContain("(10000 of 10000 anchors fail)");
+    expect(Buffer.byteLength(JSON.stringify(bad))).toBeLessThan(16 * 1024);
+    // More than the bound is refused with a clear error, before it reaches the socket.
+    await expect(alice.verify({ id: "x" }, { anchors: [...passing, anchor] })).rejects.toThrow(/at most 10000/);
+    // The same connection still answers.
+    expect((await alice.read({ id: "x" }, { after: 0 })).frontier).toBe(3);
+  });
+
   it("closes promptly while an archive check is running", async () => {
     const { service } = await freshService({ admission: { targets: [{ name: "stuck", command: [process.execPath, "-e", "setTimeout(() => {}, 60000)"] }], alarmSeconds: 120, refuseSeconds: 300, refreshMs: 30_000 } });
     const tick = service.watchdog.tick().catch((error: unknown) => error);

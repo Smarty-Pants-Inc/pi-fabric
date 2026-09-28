@@ -49,7 +49,9 @@ interface FabricRecordsVerifyResult {
   /** No chain break and every anchor holds. */ ok: boolean;
   /** ok, and every record is covered by an anchor. */ clean: boolean;
   break?: { org: string; seq: number; reason: "prev_hash" | "gap"; expected: string | null; found: string | null };
-  anchors: { seq: number; hash: string; ok: boolean; found: string | null }[];
+  /** Every supplied anchor is checked; only the first 20 failures are listed. */
+  anchors: { checked: number; passed: number; failed: number };
+  failedAnchors: { seq: number; hash: string; found: string | null }[];
   unanchored?: { from: number; to: number };
   summary: string;
 }
@@ -62,8 +64,8 @@ interface FabricRecordsApi {
   list(args?: { org?: string; repo?: string; open?: boolean; owner?: string; hasOpenAsk?: boolean; updatedSince?: number; limit?: number; after?: string }): Promise<{ items: FabricRecordsListItem[]; next?: string }>;
   /** The last record's seq and chain hash; the backup adapter writes it to every target. */
   anchor(): Promise<FabricRecordsAnchor>;
-  /** Recompute the hash chain and check the anchors (as records.anchor gave them). */
-  verify(args?: { anchors?: { seq: number; hash: string }[] }): Promise<FabricRecordsVerifyResult>;
+  /** Recompute the hash chain and check the anchors (as records.anchor gave them, at most 10000; the empty-chain anchor {seq: 0, hash: null} is valid). */
+  verify(args?: { anchors?: ({ seq: number; hash: string } | { seq: 0; hash: null })[] }): Promise<FabricRecordsVerifyResult>;
   status(): Promise<{ org: string; origin: string; frontier: number; unpublished: number; admission: { state: "ok" | "alarm" | "refuse" | "disabled"; lagSeconds?: number; frontier?: string; insertLsn?: string }; statusFile: string }>;
 }
 

@@ -63,7 +63,7 @@ describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () 
     const anchor = await store.anchor(alice, {});
     expect(anchor).toMatchObject({ org: "smarty-pants", seq: 5, hash: expect.stringMatching(/^[0-9a-f]{64}$/) });
     const result = await store.verify(alice, { anchors: [anchor] });
-    expect(result).toMatchObject({ ok: true, clean: true, rows: 5, anchors: [{ seq: 5, ok: true }] });
+    expect(result).toMatchObject({ ok: true, clean: true, rows: 5, anchors: { checked: 1, passed: 1, failed: 0 }, failedAnchors: [] });
     expect(result.summary).toBe("clean: 5 records, anchored through seq 5");
     // Independently recomputed from the stored rows.
     const { rows } = await pool.query<ChainRow>(`SELECT ${CHAIN_SELECT} FROM records ORDER BY records.seq`);
@@ -108,7 +108,7 @@ describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () 
     }
     const result = await store.verify(alice, { anchors: [anchor] });
     expect(result.break).toBeUndefined();
-    expect(result).toMatchObject({ ok: false, clean: false, anchors: [{ seq: 5, ok: false, found: null }] });
+    expect(result).toMatchObject({ ok: false, clean: false, anchors: { failed: 1 }, failedAnchors: [{ seq: 5, found: null }] });
     expect(result.summary).toContain("anchor smarty-pants seq 5 fails");
   });
 
@@ -118,8 +118,8 @@ describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () 
     await tamper(pool, "UPDATE records SET text = 'forged' WHERE seq = 5");
     const result = await store.verify(alice, { anchors: [anchor] });
     expect(result.break).toBeUndefined();
-    expect(result).toMatchObject({ ok: false, clean: false, anchors: [{ seq: 5, hash: anchor.hash, ok: false, found: expect.stringMatching(/^[0-9a-f]{64}$/) }] });
-    expect(result.anchors[0]!.found).not.toBe(anchor.hash);
+    expect(result).toMatchObject({ ok: false, clean: false, anchors: { failed: 1 }, failedAnchors: [{ seq: 5, hash: anchor.hash, found: expect.stringMatching(/^[0-9a-f]{64}$/) }] });
+    expect(result.failedAnchors[0]!.found).not.toBe(anchor.hash);
   });
 
   it("catches a deletion of the anchored tail", async () => {
@@ -130,8 +130,9 @@ describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () 
     await tamper(pool, "DELETE FROM records WHERE seq >= 5");
     const result = await store.verify(alice, { anchors: [older, latest] });
     expect(result.break).toBeUndefined();
-    expect(result).toMatchObject({ ok: false, clean: false, rows: 4, anchors: [{ seq: 5, ok: false, found: null }, { seq: 6, ok: false, found: null }] });
-    expect(result.summary).toContain("anchor smarty-pants seq 6 fails: expected");
+    expect(result).toMatchObject({ ok: false, clean: false, rows: 4, anchors: { checked: 2, passed: 0, failed: 2 }, failedAnchors: [{ seq: 5, found: null }, { seq: 6, found: null }] });
+    expect(result.summary).toContain("anchor smarty-pants seq 5 fails: expected");
+    expect(result.summary).toContain("(2 of 2 anchors fail)");
   });
 
   it("reports an edit after the latest anchor as unanchored, not clean", async () => {
@@ -141,7 +142,7 @@ describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () 
     await store.append(alice, { ref: REF, kind: "comment", key: "k5", text: "record 5" });
     await tamper(pool, "UPDATE records SET text = 'forged' WHERE seq = 5");
     const result = await store.verify(alice, { anchors: [anchor] });
-    expect(result).toMatchObject({ ok: true, clean: false, unanchored: { from: 4, to: 5 }, anchors: [{ seq: 3, ok: true }] });
+    expect(result).toMatchObject({ ok: true, clean: false, unanchored: { from: 4, to: 5 }, anchors: { passed: 1, failed: 0 } });
     expect(result.summary).toBe("unanchored: seq 4..5");
     // With no anchor at all, nothing is vouched for.
     expect(await store.verify(alice, {})).toMatchObject({ ok: true, clean: false, unanchored: { from: 1, to: 5 } });
@@ -157,12 +158,15 @@ describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () 
   it("an empty org anchors at seq 0 and verifies clean", async () => {
     const { store } = await chain(0);
     expect(await store.anchor(alice, {})).toMatchObject({ seq: 0, hash: null });
+    const empty = await store.anchor(alice, {});
     expect(await store.verify(alice, {})).toMatchObject({ ok: true, clean: true, rows: 0 });
+    // The anchor it just gave is valid input (#118 F1).
+    expect(await store.verify(alice, { anchors: [empty] })).toMatchObject({ ok: true, clean: true, rows: 0 });
   });
 
   it("refuses malformed anchors", async () => {
     const { store } = await chain(1);
-    for (const anchors of [[{ seq: 0, hash: "a".repeat(64) }], [{ seq: 1, hash: "XYZ" }], "no", [{ seq: 1 }]]) {
+    for (const anchors of [[{ seq: 0, hash: "a".repeat(64) }], [{ seq: 1, hash: "XYZ" }], "no", [{ seq: 1 }], [{ seq: 1, hash: null }], [{ seq: 0 }]]) {
       await expect(store.verify(alice, { anchors })).rejects.toThrow(/anchor/);
     }
     await expect(store.verify(alice, { extra: 1 })).rejects.toThrow(/unknown field/);

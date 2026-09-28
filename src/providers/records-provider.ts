@@ -67,10 +67,13 @@ const descriptors: FabricActionDescriptor[] = [
   },
   {
     name: "verify",
-    description: "Recompute the org's hash chain and check each supplied anchor ({seq, hash} as records.anchor gave it): {ok, clean, break?: {org, seq, reason, expected, found}, anchors, unanchored?: {from, to}, summary}. ok means no break and every anchor holds; clean also needs every record covered by an anchor.",
+    description: "Recompute the org's hash chain and check each supplied anchor ({seq, hash} as records.anchor gave it): {ok, clean, break?: {org, seq, reason, expected, found}, anchors: {checked, passed, failed}, failedAnchors (the first 20), unanchored?: {from, to}, summary}. At most 10000 anchors; the empty-chain anchor {seq: 0, hash: null} is valid. ok means no break and every anchor holds; clean also needs every record covered by an anchor.",
     inputSchema: {
       type: "object", additionalProperties: false,
-      properties: { anchors: { type: "array", maxItems: 10_000, items: { type: "object", required: ["seq", "hash"], properties: { seq: { type: "integer", minimum: 1 }, hash: { type: "string", pattern: "^[0-9a-f]{64}$" } } } } },
+      properties: { anchors: { type: "array", maxItems: 10_000, items: { anyOf: [
+        { type: "object", required: ["seq", "hash"], properties: { seq: { type: "integer", minimum: 1 }, hash: { type: "string", pattern: "^[0-9a-f]{64}$" } } },
+        { type: "object", required: ["seq", "hash"], description: "the empty-chain anchor records.anchor gives before the first record", properties: { seq: { const: 0 }, hash: { type: "null" } } },
+      ] } } },
     },
     risk: "read", namespace: "coordination",
   },

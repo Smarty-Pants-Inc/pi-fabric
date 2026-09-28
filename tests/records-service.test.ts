@@ -707,6 +707,66 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await alice.read({ id: "x" }, { after: 0 })).frontier).toBe(3);
   });
 
+  it("never verifies clean while a row of another org or origin is in the table, and never serves it (#118 S2)", async () => {
+    const { config, owner } = await freshService();
+    const alice = await connect(config, ALICE);
+    for (let n = 1; n <= 3; n++) await alice.append({ id: "x" }, { ref: REF, kind: "status", key: `s${n}`, text: `${n}`, data: { state: "in progress" } });
+    const anchor = await alice.anchor({ id: "x" });
+    await alice.append({ id: "x" }, { ref: REF, kind: "comment", key: "tail", text: "the unanchored tail" });
+    const superuser = async (sql: string) => {
+      const client = await owner.connect();
+      try { await client.query("SET session_replication_role = replica"); await client.query(sql); } finally { await client.query("RESET session_replication_role"); client.release(); }
+    };
+    await superuser("UPDATE records SET org = 'elsewhere', text = 'forged' WHERE seq = 4");
+    const moved = await alice.verify({ id: "x" }, { anchors: [anchor] });
+    expect(moved).toMatchObject({ ok: false, clean: false, break: { seq: 4, reason: "org", expected: "smarty-pants", found: "elsewhere" } });
+    expect(moved.summary).toContain("unexpected org at seq 4");
+    // Readers keep to the same membership: the moved row is not served.
+    expect((await alice.read({ id: "x" }, { after: 0 })).records.map((record) => record.sequence)).toEqual([1, 2, 3]);
+    expect((await alice.get({ id: "x" }, { ref: REF })).history.map((record) => record.sequence)).toEqual([1, 2, 3]);
+    // Another origin in the table fails too.
+    await superuser("UPDATE records SET org = 'smarty-pants', origin = 'dev9' WHERE seq = 4");
+    expect(await alice.verify({ id: "x" }, { anchors: [anchor] })).toMatchObject({ ok: false, clean: false, break: { seq: 4, reason: "origin", found: "dev9" } });
+  });
+
+  it("answers a second verify with a retryable RECORD_BUSY while a scan runs, keeps no queue, and frees on cancel (#118 S3)", async () => {
+    const { config, service } = await freshService();
+    const alice = await connect(config, ALICE);
+    const bob = await connect(config, BOB);
+    await alice.append({ id: "x" }, { ref: REF, kind: "status", key: "s1", text: "1", data: { state: "in progress" } });
+    const real = service.store.verify.bind(service.store);
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    // The first scan stays pending until its caller cancels it.
+    service.store.verify = (_principal, _args, options = {}) => new Promise((_resolve, reject) => {
+      started();
+      options.signal?.addEventListener("abort", () => reject(options.signal!.reason), { once: true });
+    });
+    const cancel = new AbortController();
+    const first = alice.verify({ id: "x" }, {}, { signal: cancel.signal });
+    first.catch(() => undefined);
+    await running;
+    const anchors = Array.from({ length: 10_000 }, (_, n) => ({ seq: n + 1, hash: "a".repeat(64) }));
+    const crowd = await Promise.allSettled(Array.from({ length: 50 }, (_, n) => (n % 2 ? alice : bob).verify({ id: "x" }, { anchors })));
+    for (const outcome of crowd) {
+      expect(outcome.status).toBe("rejected");
+      expect((outcome as PromiseRejectedResult).reason).toMatchObject({ code: "RECORD_BUSY", retryable: true });
+    }
+    // Unrelated calls still work while the scan is pending.
+    expect((await bob.read({ id: "x" }, { after: 0 })).frontier).toBe(1);
+    cancel.abort(new Error("caller gone"));
+    await expect(first).rejects.toThrow(/caller gone/);
+    service.store.verify = real;
+    // The cancelled scan released the slot: the next verify runs.
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const result = await alice.verify({ id: "x" }, {}).catch((error: { code?: string }) => error);
+      if ((result as { code?: string }).code !== "RECORD_BUSY") { expect(result).toMatchObject({ ok: true, rows: 1 }); break; }
+      expect(Date.now()).toBeLessThan(deadline);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  });
+
   it("closes promptly while an archive check is running", async () => {
     const { service } = await freshService({ admission: { targets: [{ name: "stuck", command: [process.execPath, "-e", "setTimeout(() => {}, 60000)"] }], alarmSeconds: 120, refuseSeconds: 300, refreshMs: 30_000 } });
     const tick = service.watchdog.tick().catch((error: unknown) => error);

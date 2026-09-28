@@ -538,8 +538,9 @@ export class RecordStore implements RecordsBackend, RecordsOps {
   async page(args: PageArgs, signal?: AbortSignal): Promise<RecordsPage> {
     return this.transaction(async (client) => {
       const frontier = await client.query<{ seq: string }>("SELECT coalesce(max(seq), 0) AS seq FROM records WHERE origin = $1", [args.origin]);
-      const values: unknown[] = [args.origin, args.after, args.limit];
-      const where = ["origin = $1", "seq > $2"];
+      // Only this org's rows are served: the same membership records.verify checks (#118 S2).
+      const values: unknown[] = [args.origin, args.after, args.limit, this.org];
+      const where = ["origin = $1", "seq > $2", "org = $4"];
       if (args.ref) { values.push(args.ref); where.push(`ref = $${values.length}`); }
       if (args.kind) { values.push(args.kind); where.push(`kind = $${values.length}`); }
       if (args.to) { values.push([...args.to]); where.push(`data->>'to' = ANY($${values.length}::text[])`); }
@@ -636,7 +637,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
   async byIds(ids: readonly string[], signal?: AbortSignal): Promise<RecordEnvelope[]> {
     if (ids.length === 0) return [];
     return this.transaction(async (client) => {
-      const { rows } = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE id = ANY($1::uuid[]) ORDER BY seq`, [[...ids]]);
+      const { rows } = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE id = ANY($1::uuid[]) AND org = $2 ORDER BY seq`, [[...ids], this.org]);
       // A pending batch was cut to the budget when it was saved, so this fits the same budget.
       return withinBudget(rows.map(envelope));
     }, "READ ONLY", signal);
@@ -668,7 +669,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     const after = cursor ?? 0;
     const limit = optionalInteger("limit", input.limit, 1, MAX_PAGE) ?? 50;
     const historyPage = async (client: SqlClient, room: number): Promise<{ history: RecordEnvelope[]; next?: number }> => {
-      const history = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE ref = $1 AND seq > $2 ORDER BY seq LIMIT $3`, [ref, after, limit + 1]);
+      const history = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE ref = $1 AND seq > $2 AND org = $4 ORDER BY seq LIMIT $3`, [ref, after, limit + 1, this.org]);
       const page = history.rows.slice(0, limit).map(envelope);
       const rows = withinBudget(page, room, false);
       const next = history.rows.length > limit || rows.length < page.length ? (rows.at(-1)?.sequence ?? after) : undefined;
@@ -734,8 +735,8 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       if (!Number.isSafeInteger(seq) || seq < 0) throw new RecordsArgumentError("partAfter must be the previous page's next");
       // The fold's lists carry at most 2 KiB of each text; the whole records are in the history.
       const { rows } = await client.query<RecordRow>(
-        `SELECT ${RECORD_COLUMNS.replace("text,", "left(text, 2048) AS text,")} FROM records WHERE id IN (SELECT id FROM ${view} WHERE ref = $1) AND seq > $2 ORDER BY seq LIMIT $3`,
-        [ref, seq, pageLimit + 1]);
+        `SELECT ${RECORD_COLUMNS.replace("text,", "left(text, 2048) AS text,")} FROM records WHERE id IN (SELECT id FROM ${view} WHERE ref = $1) AND seq > $2 AND org = $4 ORDER BY seq LIMIT $3`,
+        [ref, seq, pageLimit + 1, this.org]);
       items = rows.map((row) => ({ cursor: String(row.seq), item: envelope(row) }));
     }
     const page = items.slice(0, pageLimit);
@@ -816,7 +817,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     if (!isObject(args)) throw new RecordsArgumentError("records.verify takes {anchors?}");
     checkKeys("verify", args, ["anchors"]);
     const anchors = parseAnchors(args.anchors);
-    return this.transaction((client) => verifyChain(client, this.org, anchors, options.signal), "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
+    return this.transaction((client) => verifyChain(client, this.org, this.origin, anchors, options.signal), "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
   }
 
   async close(): Promise<void> { await this.pool.end?.(); }

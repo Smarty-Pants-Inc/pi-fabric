@@ -7,7 +7,8 @@ import type { SqlClient } from "./schema.js";
  * previous record's canonical bytes, per org, in seq order; the first record's is NULL.
  *
  * Canonical bytes: the UTF-8 of the stored row as JSON with sorted keys, every column in its
- * PostgreSQL text form (NULL as null), created_at as UTC ISO 8601 with microseconds. Text forms,
+ * PostgreSQL text form (NULL as null), created_at as its exact epoch (numeric seconds with six
+ * decimals: era-complete, so an AD-to-BC edit changes it; Infinity and -Infinity spelled out). Text forms,
  * not parsed values, so the hash covers exactly what is stored: a jsonb number or a microsecond
  * that JavaScript would round still changes the bytes. Anyone with psql can recompute it.
  *
@@ -17,7 +18,7 @@ import type { SqlClient } from "./schema.js";
 
 /** Every records column, as text. A new column joins the chain only through a new chain version. */
 export const CHAIN_SELECT = `id::text AS id, org, origin, seq::text AS seq, ref, kind, author, author_name,
-  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+  extract(epoch FROM created_at)::text AS created_at,
   text, data::text AS data, supersedes::text AS supersedes, key, payload_hash, prev_hash`;
 
 export type ChainRow = Record<string, string | null>;
@@ -39,8 +40,11 @@ export interface RecordsAnchor { org: string; seq: number; hash: string | null; 
 export interface ChainBreak {
   org: string;
   seq: number;
-  /** prev_hash: the stored prev_hash is not the previous row's hash; gap: a seq is missing. */
-  reason: "prev_hash" | "gap";
+  /**
+   * prev_hash: the stored prev_hash is not the previous row's hash; gap: a seq is missing;
+   * org / origin: a row the service would serve belongs to another org or origin (#118 S2).
+   */
+  reason: "prev_hash" | "gap" | "org" | "origin";
   expected: string | null;
   found: string | null;
 }
@@ -99,17 +103,28 @@ export const wireAnchors = (value: unknown): unknown =>
  * its first break, check each anchor (the row at that seq exists with that hash), and name the
  * rows after the latest anchor. Rows are read in batches, so memory stays bounded.
  */
-export const verifyChain = async (client: SqlClient, org: string, anchors: readonly { seq: number; hash: string }[], signal?: AbortSignal): Promise<RecordsVerifyResult> => {
+export const verifyChain = async (client: SqlClient, org: string, origin: string, anchors: readonly { seq: number; hash: string }[], signal?: AbortSignal): Promise<RecordsVerifyResult> => {
   const wanted = new Map<number, string | null>(anchors.map((anchor) => [anchor.seq, null]));
   let first: ChainBreak | undefined;
   let prev: { seq: number; hash: string } | undefined;
   let rows = 0;
+  // Every row in the table, not only this org's: the chain covers exactly what the service could
+  // serve, and a row of another org or origin is a break, never silently left out (#118 S2).
+  let cursor: { seq: string; id: string } = { seq: "0", id: "00000000-0000-0000-0000-000000000000" };
   for (;;) {
     signal?.throwIfAborted();
-    const batch = await client.query<ChainRow>(`SELECT ${CHAIN_SELECT} FROM records WHERE org = $1 AND seq > $2 ORDER BY records.seq LIMIT ${BATCH}`, [org, prev?.seq ?? 0]);
+    const batch = await client.query<ChainRow>(
+      `SELECT ${CHAIN_SELECT} FROM records WHERE (records.seq, records.id) > ($1::bigint, $2::uuid) ORDER BY records.seq, records.id LIMIT ${BATCH}`, [cursor.seq, cursor.id]);
     for (const row of batch.rows) {
+      cursor = { seq: row.seq!, id: row.id! };
       const seq = Number(row.seq);
       const hash = rowHash(row);
+      if (row.org !== org || row.origin !== origin) {
+        const field = row.org !== org ? "org" : "origin";
+        first ??= { org, seq, reason: field, expected: field === "org" ? org : origin, found: row[field] ?? null };
+        rows++;
+        continue;
+      }
       if (!first) {
         const expectedSeq = (prev?.seq ?? 0) + 1;
         if (seq !== expectedSeq) first = { org, seq, reason: "gap", expected: String(expectedSeq), found: String(seq) };
@@ -134,7 +149,9 @@ export const verifyChain = async (client: SqlClient, org: string, anchors: reado
   const unanchored = prev && prev.seq > latest ? { from: latest + 1, to: prev.seq } : undefined;
   const ok = !first && failed === 0;
   const lines = [
-    ...(first ? [`chain broken at ${org} seq ${first.seq} (${first.reason}): expected ${first.expected ?? "none"}, found ${first.found ?? "none"}`] : []),
+    ...(first ? [first.reason === "org" || first.reason === "origin"
+      ? `unexpected ${first.reason} at seq ${first.seq}: expected ${first.expected}, found ${first.found ?? "none"}`
+      : `chain broken at ${org} seq ${first.seq} (${first.reason}): expected ${first.expected ?? "none"}, found ${first.found ?? "none"}`] : []),
     ...(failedAnchors[0] ? [`anchor ${org} seq ${failedAnchors[0].seq} fails: expected ${failedAnchors[0].hash}, found ${failedAnchors[0].found ?? "no row"}${failed > 1 ? ` (${failed} of ${anchors.length} anchors fail)` : ""}`] : []),
     ...(unanchored ? [`unanchored: seq ${unanchored.from}..${unanchored.to}`] : []),
   ];

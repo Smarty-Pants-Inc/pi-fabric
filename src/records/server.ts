@@ -169,7 +169,7 @@ export class RecordsServer {
   /** Each principal's processes, by pid, and when each last called. */
   readonly #seen = new Map<string, Map<number, { at: number; cmdline?: string }>>();
   readonly #alerts: TokenReuseAlert[] = [];
-  #verifying: Promise<unknown> = Promise.resolve();
+  #verifying = false;
 
   private constructor(readonly config: RecordsServiceConfig, pool: ClientPool, readonly options: { now?: () => number } = {}) {
     this.statusFile = config.statusFile;
@@ -212,11 +212,12 @@ export class RecordsServer {
       fold: (principal, args, signal) => store.fold(principal, args.args, { signal }),
       list: (principal, args, signal) => store.list(principal, args.args, { signal }),
       anchor: (principal, args, signal) => store.anchor(principal, args.args, { signal }),
-      // One verify at a time: each reads the whole chain, so callers queue instead of piling up.
-      verify: (principal, args, signal) => {
-        const run = this.#verifying.catch(() => undefined).then(() => store.verify(principal, args.args, { signal }));
-        this.#verifying = run.catch(() => undefined);
-        return run;
+      // One verify at a time, and no queue (#118 S3): a scan reads the whole table, so while one runs
+      // another caller gets a retryable RECORD_BUSY at once and nothing of its request is kept.
+      verify: async (principal, args, signal) => {
+        if (this.#verifying) throw new RecordsServiceError("records.verify is already running; retry in a few seconds", "RECORD_BUSY", true);
+        this.#verifying = true;
+        try { return await store.verify(principal, args.args, { signal }); } finally { this.#verifying = false; }
       },
       page: (_principal, args, signal) => store.page(pageArgs(ownArgs(args), store.origin), signal),
       byIds: (_principal, args, signal) => store.byIds(ids(args.ids), signal),

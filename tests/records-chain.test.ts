@@ -87,6 +87,23 @@ describe.skipIf(!postgresBin)("the records hash chain on a real PostgreSQL", () 
     }
   });
 
+  it("catches an era-only edit of an anchored row (AD to BC) and a non-finite created_at (#118 S1)", async () => {
+    const { pool, store } = await chain(5);
+    const anchor = await store.anchor(alice, {});
+    const plain = "to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')";
+    const before = (await pool.query<{ t: string }>(`SELECT ${plain} AS t FROM records WHERE seq = 5`)).rows[0]!.t;
+    await tamper(pool, "UPDATE records SET created_at = ((created_at AT TIME ZONE 'UTC')::text || ' BC')::timestamp AT TIME ZONE 'UTC' WHERE seq = 5");
+    // Only the era changed: the year, month, day and time read the same without it.
+    expect((await pool.query<{ t: string; bc: boolean }>(`SELECT ${plain} AS t, to_char(created_at, 'BC') = 'BC' AS bc FROM records WHERE seq = 5`)).rows[0]).toEqual({ t: before, bc: true });
+    expect(await store.verify(alice, { anchors: [anchor] })).toMatchObject({ ok: false, clean: false, anchors: { failed: 1 }, failedAnchors: [{ seq: 5 }] });
+    for (const value of ["infinity", "-infinity"]) {
+      const fresh = await chain(3);
+      const a3 = await fresh.store.anchor(alice, {});
+      await tamper(fresh.pool, `UPDATE records SET created_at = '${value}' WHERE seq = 2`);
+      expect(await fresh.store.verify(alice, { anchors: [a3] }), value).toMatchObject({ ok: false, break: { seq: 3, reason: "prev_hash" } });
+    }
+  });
+
   it("catches a mid-chain DELETE", async () => {
     const { pool, store } = await chain(5);
     const anchor = await store.anchor(alice, {});

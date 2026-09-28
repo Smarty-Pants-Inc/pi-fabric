@@ -256,8 +256,8 @@ export class FabricState {
 
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
   peerInfos(): FabricPeerInfo[] { return this.#current()?.peerInfos() ?? []; }
-  async nextRootInbox(session: RootInboxSession): Promise<RootInboxBatch | undefined> {
-    return this.#current()?.nextRootInbox(session);
+  async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
+    return this.#current()?.nextRootInbox(session, idle);
   }
   /** The records inbox message for this turn, if any (built in the lazy runtime; smarty-dev#754). */
   async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {

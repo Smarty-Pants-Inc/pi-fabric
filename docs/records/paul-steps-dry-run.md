@@ -3,7 +3,7 @@
 Generated on Dev1 (no PostgreSQL installed yet), from a copy of the script at `/run/user/1000/smarty-step.sh` (the root step runs it as `/run/smarty-step.sh`), with the digests of a clean `bun run build`:
 
 ```
-smarty-step.sh --org smarty-pants --org-user paul --operator relay:relay:fabric --package-root <package> --node <node> --bundle-sha256 eeffb4cdd569bfc5bfc6b2840ef6481dba2fbf84743499c8607f940c0564a55a --node-sha256 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c --dry-run
+smarty-step.sh --org smarty-pants --org-user paul --operator relay:relay:fabric --package-root <package> --node <node> --bundle-sha256 c567433b7473017ef20bf3a7cdfe48d3e3a06791fc058f24b76f7ce40df02123 --node-sha256 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c --dry-run
 ```
 
 ```
@@ -11,7 +11,7 @@ smarty-step.sh --org smarty-pants --org-user paul --operator relay:relay:fabric 
 ## 0. Stage and verify node and the bundle
 ? STAGE=$(mktemp -d /run/smarty-pants-records-stage.XXXXXX)  (root-only, 0700; removed on exit)
 ? umask 077; cat <node> > /run/smarty-pants-records-stage.XXXXXX/node; cat <package>/dist/records-service/service-main.mjs > /run/smarty-pants-records-stage.XXXXXX/service-main.mjs  (each source read once)
-? sha256sum /run/smarty-pants-records-stage.XXXXXX/node /run/smarty-pants-records-stage.XXXXXX/service-main.mjs  (must equal 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c and eeffb4cdd569bfc5bfc6b2840ef6481dba2fbf84743499c8607f940c0564a55a; otherwise refused, nothing changed)
+? sha256sum /run/smarty-pants-records-stage.XXXXXX/node /run/smarty-pants-records-stage.XXXXXX/service-main.mjs  (must equal 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c and c567433b7473017ef20bf3a7cdfe48d3e3a06791fc058f24b76f7ce40df02123; otherwise refused, nothing changed)
 digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
 + install -d -m 0700 -o root -g root /var/lib/smarty-pants-records-installer
 ? refuse unless /var/lib/smarty-pants-records-installer is no symlink, owned by root, mode 0700, and every ancestor is root-owned and not group- or world-writable

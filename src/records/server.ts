@@ -161,6 +161,31 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, r
 };
 
 /**
+ * Take an exclusive flock(2) on `file` (created 0600, never followed, owned by this user) and return its fd;
+ * closing the fd, or the process's death, releases it.
+ */
+// ponytail: util-linux flock(1) locks the open file description it inherits as fd 3, which this process keeps
+// open after the child exits; no native addon, and the wait does not block the event loop.
+const lockFile = async (file: string): Promise<number> => {
+  const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.uid !== process.getuid?.()) throw new Error(`${file} is not a regular file owned by this user`);
+    const { spawn } = await import("node:child_process");
+    const code = await new Promise<number | null>((resolve, reject) => {
+      const child = spawn("flock", ["-x", "3"], { stdio: ["ignore", "ignore", "inherit", fd] });
+      child.on("error", reject);
+      child.on("exit", (status) => resolve(status));
+    });
+    if (code !== 0) throw new Error(`cannot lock ${file} (flock exited ${code})`);
+    return fd;
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+};
+
+/**
  * Issue (or, with reissue, rotate) an operator credential into `out`, never publishing a revoked
  * token and never losing a committed one. Under a per-principal advisory lock held until the file
  * is published (so concurrent issues for one principal run one at a time):
@@ -172,8 +197,9 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, r
  *  3. the database is changed ON THE SESSION THAT HOLDS THE LOCK (S6): if that session is lost, its
  *     rotation is lost with it, so no other run can hold the lock while this change may still commit;
  *  4. `<out>.pending` is renamed over `out`, and the directory fsynced.
- * `<out>.pending` is removed or renamed only while the lock's session is alive and holds the lock,
- * and only while it holds this issuer's token (#119 F1); otherwise it is left for its owner.
+ * Every step runs under an exclusive flock(2) on `<out>.lock` (0600, this user's, never followed), taken
+ * before the database lock and released after publication or cleanup, or by the kernel when the process
+ * dies. A stale issuer (its session lost) therefore never touches a successor's `<out>.pending` (#119 F1).
  * A database failure that certainly did not commit removes `<out>.pending` and leaves `out` and its
  * token as they were; after a failed COMMIT (outcome unknown) the pending file is kept and the call
  * fails, so the next run's recovery publishes it if the database holds its token. Without
@@ -183,8 +209,22 @@ export const issueCredentialFile = async (
   config: RecordsServiceConfig, id: string, role: OperatorRole, out: string,
   options: { name?: string; reissue?: boolean; pool?: ClientPool; afterCommit?: () => Promise<void>; verifyOnly?: boolean } = {},
 ): Promise<"published-pending" | "verified" | "issued"> => {
-  const owner = options.pool ?? await openPool(config.database);
-  const lock = await owner.connect();
+  const outDir = path.dirname(out);
+  fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+  // #119 F1: every change to `<out>.pending` happens under this file lock, held from before recovery until
+  // after publication or cleanup. The kernel drops it only when this process closes it or dies, so an issuer
+  // whose database session is lost can still finish (or clean up) its own pending file, and a successor waits.
+  const fileLock = await lockFile(`${out}.lock`);
+  let owner: ClientPool | undefined;
+  let lock: Awaited<ReturnType<ClientPool["connect"]>>;
+  try {
+    owner = options.pool ?? await openPool(config.database);
+    lock = await owner.connect();
+  } catch (error) {
+    if (!options.pool) await owner?.end?.();
+    fs.closeSync(fileLock);
+    throw error;
+  }
   // A lost session rejects its query; the client's later "error" event must not crash the process.
   (lock as { on?: (event: string, listener: () => void) => unknown }).on?.("error", () => undefined);
   let lockBroken = false;
@@ -203,30 +243,10 @@ export const issueCredentialFile = async (
   const readToken = (file: string): unknown => {
     try { return (JSON.parse(fs.readFileSync(file, "utf8")) as { token?: unknown }).token; } catch { return undefined; }
   };
-  // #119 F1: `<out>.pending` is shared by every issuer of this principal. It is removed or renamed only while this
-  // session still holds the per-principal lock, and (outside recovery) only while it still holds THIS issuer's token.
-  // A lost session means another issuer may own the pathname now: the file is left alone.
-  const holdsLock = async (): Promise<boolean> => {
-    if (lockBroken) return false;
-    try {
-      return (await lock.query<{ held: boolean }>("SELECT count(*) > 0 AS held FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()")).rows[0]!.held;
-    } catch {
-      lockBroken = true;
-      return false;
-    }
-  };
-  // ponytail: check-then-act on a pathname; the lock check closes the window except for a session lost between the check and the call.
-  const ownsPending = async (token: string | undefined): Promise<boolean> =>
-    await holdsLock() && (token === undefined || readToken(pending) === token);
-  const lost = (what: string): Error => new Error(`issue ${id}: the per-principal lock was lost or ${pending} is another issuer's; ${what}; ${pending} left alone; rerun to reconcile`);
-  const dropPending = async (token: string): Promise<void> => {
-    if (await ownsPending(token)) fs.rmSync(pending, { force: true });
-  };
+  const dropPending = (): void => { fs.rmSync(pending, { force: true }); };
   try {
     await lock.query("SET ROLE fabric_records_writer");
     await lock.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [`fabric-records:issue:${id}`]);
-    const outDir = path.dirname(out);
-    fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
     // F5/#119 F2: every directory up to the first one this user does not own (a root-owned base) is fsynced on
     // EVERY issue, before the database change: a retry after a failed first issue syncs the directories it left.
     const uid = process.getuid?.();
@@ -237,8 +257,7 @@ export const issueCredentialFile = async (
     }
     const storedHash = async (): Promise<string | undefined> =>
       (await lock.query<{ token_hash: string }>("SELECT token_hash FROM principals WHERE id = $1 AND issued_by = 'operator' AND role = $2", [id, role])).rows[0]?.token_hash;
-    const publish = async (token: string | undefined): Promise<void> => {
-      if (!await ownsPending(token)) throw lost("not published");
+    const publish = (): void => {
       fs.renameSync(pending, out);
       fsyncDir(outDir);
     };
@@ -246,9 +265,8 @@ export const issueCredentialFile = async (
     let recovered = false;
     if (fs.existsSync(pending)) {
       const token = readToken(pending);
-      if (typeof token === "string" && hashToken(token) === await storedHash()) { await publish(token); recovered = true; }
-      else if (await ownsPending(undefined)) fs.rmSync(pending, { force: true });
-      else throw lost("not recovered");
+      if (typeof token === "string" && hashToken(token) === await storedHash()) { publish(); recovered = true; }
+      else dropPending();
     }
     // verify: the canonical file must hold the token the database holds; nothing is issued.
     if (options.verifyOnly) {
@@ -272,7 +290,7 @@ export const issueCredentialFile = async (
     try {
       for (const d of syncDirs) fsyncDir(d);
     } catch (error) {
-      await dropPending(token);
+      dropPending();
       throw error;
     }
     // 3. The database change, on the lock's session.
@@ -281,23 +299,24 @@ export const issueCredentialFile = async (
     } catch (error) {
       // S2/F4: a failed COMMIT may have committed. Its pending token is kept for the next run's
       // recovery (step 8's verify publishes it if the database holds it). It is removed only when
-      // the change certainly did not commit (an error before COMMIT was sent), and (#119 F1) only
-      // while this session still holds the lock and the file is still this issuer's.
+      // the change certainly did not commit (an error before COMMIT was sent); under the file lock
+      // the pending file is still this issuer's (#119 F1).
       if ((error as { commitUncertain?: boolean }).commitUncertain === true) {
         throw new Error(`issue ${id}: the database outcome is unknown (${error instanceof Error ? error.message : String(error)}); ${pending} kept; outcome unknown; rerun to reconcile`);
       }
-      await dropPending(token);
+      dropPending();
       throw error;
     }
     await options.afterCommit?.();
     // 4. Publish.
-    await publish(token);
+    publish();
     return "issued";
   } finally {
     // The session goes back to a caller's pool as it came: no lock, no role.
     if (!lockBroken) await lock.query("SELECT pg_advisory_unlock_all()").then(() => lock.query("RESET ROLE")).catch(() => { lockBroken = true; });
     lock.release(lockBroken);
     if (!options.pool) await owner.end?.();
+    fs.closeSync(fileLock);
   }
 };
 

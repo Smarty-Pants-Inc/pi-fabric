@@ -50,6 +50,8 @@ export interface FabricControlAcceptance {
   /** The owner's followUp queue for a Main target (smarty-dev#1495). */
   pendingFollowUps?: number;
   oldestAgeS?: number;
+  /** The owner's Main is idle and its held followUps are stuck (smarty-dev#1826). */
+  stalled?: true;
   /** The followUp replaced a held one with the same sender and data.coalesceKey. */
   coalesced?: true;
   replacedMessageId?: string;
@@ -73,6 +75,7 @@ export interface FabricControlResult {
   acknowledged: true;
   pendingFollowUps?: number;
   oldestAgeS?: number;
+  stalled?: true;
   coalesced?: true;
   replacedMessageId?: string;
 }
@@ -81,10 +84,12 @@ export interface FabricControlResult {
 const queueCount = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 
-const queueDepthOf = (source: Record<string, unknown>): { pendingFollowUps: number; oldestAgeS: number } | undefined => {
+const queueDepthOf = (source: Record<string, unknown>): { pendingFollowUps: number; oldestAgeS: number; stalled?: true } | undefined => {
   const pendingFollowUps = queueCount(source.pendingFollowUps);
   const oldestAgeS = queueCount(source.oldestAgeS);
-  return pendingFollowUps === undefined || oldestAgeS === undefined ? undefined : { pendingFollowUps, oldestAgeS };
+  return pendingFollowUps === undefined || oldestAgeS === undefined
+    ? undefined
+    : { pendingFollowUps, oldestAgeS, ...(source.stalled === true ? { stalled: true as const } : {}) };
 };
 
 /** The owner's coalesce report for a Main followUp (smarty-dev#1495), or nothing. */

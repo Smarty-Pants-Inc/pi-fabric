@@ -83,6 +83,31 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    const result = await this.#route(id, message, data, kind, context, options);
+    // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
+    // Older owners never report `stalled`, so their results pass unchanged.
+    if (kind === "followUp" && result?.stalled) {
+      throw new Error(
+        `Fabric followUp to ${id} was accepted but is not being delivered: target idle and its held queue stalled ` +
+          `(yours: ${result.pendingFollowUps ?? 0} held, oldest ${result.oldestAgeS ?? 0} s). The message is still held, not withdrawn. ` +
+          "Use agents.steer meanwhile (smarty-dev#1826).",
+      );
+    }
+    return result;
+  }
+
+  async #route(
+    id: string,
+    message: string,
+    data: unknown,
+    kind: "steer" | "followUp",
+    context?: FabricInvocationContext,
+    options: {
+      from?: MeshIdentity;
+      triggerTurn?: boolean;
+      binding?: FabricActorRunBinding;
+    } = {},
+  ): Promise<FabricAgentMessageResult> {
     id = this.#sessionTarget(id);
     const isMain = this.mainAgent.matches(id);
     const remoteRoot = isMain ? undefined : this.participants.get(id) ?? this.#recentlyLapsedRoot(id);
@@ -303,6 +328,7 @@ export class AgentMessageRouter {
         messageId: result.messageId,
         ...(result.pendingFollowUps === undefined ? {} : { pendingFollowUps: result.pendingFollowUps }),
         ...(result.oldestAgeS === undefined ? {} : { oldestAgeS: result.oldestAgeS }),
+        ...(result.stalled ? { stalled: true as const } : {}),
         ...(result.coalesced ? { coalesced: true as const, replacedMessageId: result.replacedMessageId! } : {}),
       };
     }

@@ -493,6 +493,8 @@ describe("FabricControlPlane", () => {
       { accepted: true, messageId: "m4" },
       { accepted: true, messageId: "m5", pendingFollowUps: 1, oldestAgeS: 9, coalesced: true, replacedMessageId: "m4" },
       { accepted: true, messageId: "m6", coalesced: "yes", replacedMessageId: 4 },
+      { accepted: true, messageId: "m7", pendingFollowUps: 4, oldestAgeS: 700, stalled: true },   // smarty-dev#1826
+      { accepted: true, messageId: "m8", pendingFollowUps: 4, oldestAgeS: 700, stalled: "yes" },
     ];
     sender.start(() => ({ accepted: false }));
     receiver.start(() => replies.shift() as never);
@@ -506,6 +508,10 @@ describe("FabricControlPlane", () => {
       queued: true, messageId: "m5", routed: "mesh", acknowledged: true, pendingFollowUps: 1, oldestAgeS: 9, coalesced: true, replacedMessageId: "m4",
     });
     await expect(send()).resolves.toEqual({ queued: true, messageId: "m6", routed: "mesh", acknowledged: true });
+    await expect(send()).resolves.toEqual({
+      queued: true, messageId: "m7", routed: "mesh", acknowledged: true, pendingFollowUps: 4, oldestAgeS: 700, stalled: true,
+    });
+    await expect(send()).resolves.toEqual({ queued: true, messageId: "m8", routed: "mesh", acknowledged: true, pendingFollowUps: 4, oldestAgeS: 700 });
   });
 
   it("returns an authenticated result with the caller's actor binding", async () => {

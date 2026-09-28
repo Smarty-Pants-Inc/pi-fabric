@@ -567,6 +567,7 @@ export class FabricRuntimeState {
       context,
       followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0,
       path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`),
+      this.#config.mesh.followUpStallSeconds,
     );
     this.#mesh = new MeshStore(
       meshRoot,

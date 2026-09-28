@@ -565,6 +565,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   } = { armed: true, reading: false, settling: false };
   // A host that declares promptPendingVisible has isPromptPending(); only a test's injected
   // capability on an older Pi lacks it.
+  const hostSettling = (context: ExtensionContext): boolean =>
+    (context as { isSettling?: () => boolean }).isSettling?.() ?? false;
   const promptPending = (context: ExtensionContext): boolean =>
     (context as { isPromptPending?: () => boolean }).isPromptPending?.() ?? false;
   const stopInboxWake = (): void => {
@@ -582,8 +584,11 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       if (inboxWake.context === context) stopInboxWake();
       return;
     }
+    // The host's whole settle counts, not only Fabric's handler (#111 review F4): a turn requested
+    // then is deferred past every agent_settled handler, where neither the transcript nor
+    // hasPendingMessages() shows it, and an earlier handler may still precede Fabric's disarm.
     const idle = () => inboxWake.context === context && inboxWake.armed && !inboxWake.settling &&
-      context.isIdle() && !promptPending(context) && !context.hasPendingMessages();
+      context.isIdle() && !hostSettling(context) && !promptPending(context) && !context.hasPendingMessages();
     inboxWake.reading = true;
     try {
       if (!idle()) return;

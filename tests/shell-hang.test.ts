@@ -19,8 +19,8 @@ const invokeBash = async (
   hangMs: number,
   signal?: AbortSignal,
   extra: Record<string, unknown> = {},
+  jobs = new FabricShellJobStore(),
 ) => {
-  const jobs = new FabricShellJobStore();
   stores.push(jobs);
   const provider = new PiToolsProvider(process.cwd(), undefined, undefined, {
     powerShellToolDefinitionFactory: undefined,
@@ -64,11 +64,13 @@ const invokeBash = async (
   return { result, jobs };
 };
 
-// A Windows shell chain costs more to start than a tight hang threshold allows,
-// and a detached shell there can be reaped before a probe observes it. The spill
+// A detached Windows shell can be reaped before a probe observes it. The spill
 // contract itself is asserted on every platform; only these probes are scoped.
 const windowsShell = process.platform === "win32";
-const SHORT_COMMAND_HANG_MS = windowsShell ? 2_000 : 80;
+// The pass-through test proves that a command which ends before the threshold is
+// returned unchanged. A tight threshold made it a race against a starved runner
+// (smarty-dev#883), so give it room far above any shell start stall.
+const SHORT_COMMAND_HANG_MS = 30_000;
 const PID_PROBE_EXACT = !windowsShell;
 
 describe("pi.bash auto-spill", () => {
@@ -146,5 +148,85 @@ describe("pi.bash auto-spill", () => {
     }
     expect(jobs.list().some((job) => job.status === "spilled")).toBe(true);
     expect(result.details?.elapsedMs ?? 1_000).toBeLessThan(2_000);
+  });
+
+  // An explicit handoff must stay fast: only the auto-spill waits for a late pid (smarty-dev#883).
+  // Every job's late-pid wait is made to take 1.5 s; the handoffs must not sit through it, and the
+  // auto-spill counterexample must.
+  describe("late pid wait", () => {
+    const LATE_PID_MS = 1_500;
+    const waits: unknown[] = [];
+    const slowPidWait = () => {
+      const begin = FabricShellJobStore.prototype.begin;
+      vi.spyOn(FabricShellJobStore.prototype, "begin").mockImplementation(function (this: FabricShellJobStore, ...args) {
+        const job = begin.apply(this, args);
+        vi.spyOn(job, "waitForPid").mockImplementation(() => {
+          waits.push(job.id);
+          return new Promise((resolve) => setTimeout(() => resolve(undefined), LATE_PID_MS));
+        });
+        return job;
+      });
+      waits.length = 0;
+    };
+
+    it.each([
+      ["background:true", { background: true }],
+      ["a monitor", { monitor: { delivery: "ui", timeoutMs: 10_000 } }],
+    ])("hands off with %s without waiting for a late pid", async (_label, extra) => {
+      slowPidWait();
+      const started = Date.now();
+      const { result } = await invokeBash("printf start; sleep 8", 120_000, undefined, extra);
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(result.details?.running).toBe(true);
+      expect(waits).toEqual([]);
+    });
+
+    // Ctrl+B twice calls spillWaiting(); the tool call must return at once, not sit in the wait.
+    it("hands off a manual Ctrl+B spill without waiting for a late pid", async () => {
+      slowPidWait();
+      const jobs = new FabricShellJobStore();
+      const pending = invokeBash("printf start; sleep 8", 120_000, undefined, {}, jobs);
+      await vi.waitFor(() => expect(jobs.waiting()).toHaveLength(1), { timeout: 5_000 });
+      const spilledAt = Date.now();
+      expect(jobs.spillWaiting()).toBe(1);
+      const { result } = await pending;
+      expect(Date.now() - spilledAt).toBeLessThan(1_000);
+      expect(result.details?.running).toBe(true);
+      expect(waits).toEqual([]);
+    });
+
+    it("auto-spill waits for a late pid (counterexample)", async () => {
+      slowPidWait();
+      const started = Date.now();
+      const { result } = await invokeBash("printf start; sleep 8", 120);
+      expect(result.details?.running).toBe(true);
+      expect(waits).toHaveLength(1);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(LATE_PID_MS);
+    });
+  });
+
+  // A real late pid write, through the PI_FABRIC_TEST_PID_DELAY_MS seam, past the 250 ms bounded read.
+  describe("real delayed pid write", () => {
+    afterEach(() => { delete process.env.PI_FABRIC_TEST_PID_DELAY_MS; });
+
+    it("auto-spill result carries the late pid", async () => {
+      process.env.PI_FABRIC_TEST_PID_DELAY_MS = "600";
+      const { result } = await invokeBash("printf start; sleep 8", 120);
+      expect(result.details?.running).toBe(true);
+      expect(result.details?.pid).toEqual(expect.any(Number));
+    });
+
+    it("manual spill returns at once and the late pid reaches the job record", async () => {
+      process.env.PI_FABRIC_TEST_PID_DELAY_MS = "600";
+      const jobs = new FabricShellJobStore();
+      const pending = invokeBash("printf start; sleep 8", 120_000, undefined, {}, jobs);
+      await vi.waitFor(() => expect(jobs.waiting()).toHaveLength(1), { timeout: 5_000 });
+      const spilledAt = Date.now();
+      jobs.spillWaiting();
+      const { result } = await pending;
+      expect(Date.now() - spilledAt).toBeLessThan(1_000);
+      const job = jobs.get(result.details!.taskId!)!;
+      await vi.waitFor(() => expect(job.info().pid).toEqual(expect.any(Number)), { timeout: 5_000 });
+    });
   });
 });

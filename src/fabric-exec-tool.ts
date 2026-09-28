@@ -986,6 +986,8 @@ export const createFabricExecTool = (
               : error.message,
           )
           .join("\n");
+        // Lazy: the guidance parses the guest declarations, which stay off
+        // the startup graph (loaded here only after a type check fails).
         const { typeErrorRecoveryHint } = await import("./type-error-guidance.js");
         const recoveryHint = typeErrorRecoveryHint(code, result.typeErrors, piTools);
         const bounded = await boundModelOutput(

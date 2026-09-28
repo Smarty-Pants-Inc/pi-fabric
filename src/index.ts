@@ -8,7 +8,6 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import * as piHost from "@earendil-works/pi-coding-agent";
 import { defaultCodePreviewSettings } from "./ui/code-preview.js";
 import {
   type FabricToolShellDecorator,
@@ -200,13 +199,15 @@ const inboxHeldBy = (context: ExtensionContext) => rootInboxSession(context.sess
 // published to an idle Main starts a turn about 60-75 s later. PI_FABRIC_INBOX_WAKE_MS overrides it.
 // The idle wake needs a Pi that queues a triggered message behind a live prompt preflight;
 // otherwise a wake can start a run that makes a prompt in its preflight fail (#107 review F2).
-// Pi declares it with HOST_CAPABILITIES; an older Pi lacks it, and the wake stays off. Tests
-// inject the capability under the global symbol below, since their Pi predates it.
+// Pi declares it on the extension API (pi.hostCapabilities, Smarty-Pants-Inc/pi#74), not through
+// a module export: Fabric ships its own copy of the Pi package, whose export describes that copy.
+// An older Pi lacks it, and the wake stays off. Tests inject the capability under the global
+// symbol below, since their Pi predates it.
 type HostCapabilities = { triggeredMessageQueuesBehindPreflight?: unknown };
 const TEST_HOST_CAPABILITIES = Symbol.for("pi-fabric.test.hostCapabilities");
-const hostQueuesTriggeredBehindPreflight = (): boolean => {
+const hostQueuesTriggeredBehindPreflight = (pi: ExtensionAPI): boolean => {
   const injected = (globalThis as Record<symbol, HostCapabilities | undefined>)[TEST_HOST_CAPABILITIES];
-  const declared = (piHost as { HOST_CAPABILITIES?: HostCapabilities }).HOST_CAPABILITIES;
+  const declared = (pi as { hostCapabilities?: HostCapabilities }).hostCapabilities;
   return (injected ?? declared)?.triggeredMessageQueuesBehindPreflight === true;
 };
 
@@ -621,7 +622,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
     await state.bootstrap(context);
     // Inert until Pi queues a triggered message behind a live prompt preflight.
-    if (hostQueuesTriggeredBehindPreflight()) {
+    if (hostQueuesTriggeredBehindPreflight(pi)) {
       inboxWake.timer = setInterval(() => void wakeIdleMain(), inboxWakeMs());
       inboxWake.timer.unref?.();
     }

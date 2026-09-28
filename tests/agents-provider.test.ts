@@ -2332,6 +2332,30 @@ describe("AgentsProvider steering", () => {
     await expect(provider.invoke("create", { name: "bad", instructions: "x", coalesceKey: "" }, context)).rejects.toThrow("Invalid actor coalesceKey");
   });
 
+  // smarty-dev#1579: the skip-only activation filter, set at creation or later, project or global.
+  it("creates an actor with an activationFilter and sets, clears and validates it", async () => {
+    const { provider } = setup();
+    const actor = (await provider.invoke("create", {
+      name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"],
+    }, context)) as { id: string; activationFilter?: unknown };
+    expect(actor.activationFilter).toEqual(["hold", "never-message-events"]);
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: null }, context)).resolves.not.toHaveProperty("activationFilter");
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"] }, context))
+      .resolves.toMatchObject({ activationFilter: ["hold"] });
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["holds"] }, context)).rejects.toThrow("Unknown activationFilter preset");
+    await expect(provider.invoke("setActivationFilter", { id: actor.id }, context)).rejects.toThrow("activationFilter is required");
+    await expect(provider.invoke("create", { name: "bad", instructions: "x", activationFilter: [{ id: "all" }] }, context)).rejects.toThrow("name a source, topic, kind or where");
+    const template = (await provider.invoke("create", {
+      name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"],
+    }, context)) as { id: string; activationFilter?: unknown };
+    expect(template.activationFilter).toEqual(["never-message-events"]);
+    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global" }, context))
+      .resolves.toMatchObject({ activationFilter: ["hold"] });
+    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: null, scope: "global" }, context))
+      .resolves.not.toHaveProperty("activationFilter");
+    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["x"], scope: "global" }, context)).rejects.toThrow("Unknown activationFilter preset");
+  });
+
   it("setSteeringMode routes to a local agent", async () => {
     const { provider, root } = setup();
     const handle = (await provider.invoke(

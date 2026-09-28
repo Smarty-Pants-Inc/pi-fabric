@@ -278,4 +278,24 @@ describe("agents provider message routing service boundaries", () => {
     expect(agents.stop).toHaveBeenCalledWith("child");
     expect(participants.scheduleRefresh).toHaveBeenCalledOnce();
   });
+
+  // smarty-dev#1495: the owner of a Main reports its followUp queue with the acknowledgement.
+  it("answers a remote followUp to Main with Main's queue depth", async () => {
+    const { router, main, actors } = routing();
+    main.deliverAgent.mockReturnValueOnce({ queued: true, messageId: "held", routed: "main", pendingFollowUps: 2, oldestAgeS: 75 });
+    await expect(router.acceptControl({ ...command("followUp"), targetId: "main" }, actors.identity)).resolves.toEqual({
+      accepted: true, messageId: "held", pendingFollowUps: 2, oldestAgeS: 75,
+    });
+    await expect(router.acceptControl({ ...command("steer"), targetId: "main" }, actors.identity)).resolves.toEqual({
+      accepted: true, messageId: "main-msg",
+    });
+  });
+
+  it("rejects a remote followUp to a full Main queue with the reason", async () => {
+    const { router, main, actors } = routing();
+    main.deliverAgent.mockImplementationOnce(() => { throw new Error("Main's followUp queue is full (50 of yours)"); });
+    await expect(router.acceptControl({ ...command("followUp"), targetId: "main" }, actors.identity)).resolves.toEqual({
+      accepted: false, error: "Main's followUp queue is full (50 of yours)",
+    });
+  });
 });

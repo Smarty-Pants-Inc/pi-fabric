@@ -355,17 +355,25 @@ describe("ActorMeshMonitor work-topic reconciliation, round 2", () => {
     const read = mesh.read.bind(mesh);
     vi.spyOn(mesh, "read").mockImplementation((input) => { ticksAtRead.push(ticks); return read(input); });
     const later: MeshEvent[] = [];
-    const again = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 20 }, { cursorPath, maxReplayAgeMs: 600_000, beforePoll: () => true, onEvent: (event) => { later.push(event); } });
+    // smarty-dev#883: wait for the eighth work event itself, not a wall-time poll, so a slow
+    // Windows runner only takes longer.
+    let eighth!: () => void;
+    const delivered = new Promise<void>((resolve) => { eighth = resolve; });
+    const again = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 20 }, { cursorPath, maxReplayAgeMs: 600_000, beforePoll: () => true, onEvent: (event) => {
+      later.push(event);
+      if (later.filter((seen) => seen.topic.startsWith("fleet.")).length === 8) eighth();
+    } });
     monitors.push(again);
     try {
       again.schedule();
-      await vi.waitFor(() => expect(later.filter((event) => event.topic.startsWith("fleet.")).length).toBe(8), { timeout: 10_000, interval: 5 });
+      await delivered;
+      expect(later.filter((event) => event.topic.startsWith("fleet.")).length).toBe(8);
     } finally {
       clearInterval(heartbeat);
     }
     expect(ticksAtRead.length).toBeGreaterThan(3);
     expect(ticksAtRead.at(-1)!).toBeGreaterThan(ticksAtRead[0]!);          // timers ran between pages
-  });
+  }, 60_000);
 });
 
 // review/astra round 3 on pi-fabric#97: the generation file and the events file are separate

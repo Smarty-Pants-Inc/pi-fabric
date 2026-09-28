@@ -1,0 +1,310 @@
+{
+  "_comment": "Queued-item envelopes (source + payload) copied from fleet actor run records (task.txt under ~/.local/share/smarty-dev/fabric-mesh/fleet/actors/*/*/runs/<run>/), long text trimmed. The label object is GET /repos/Smarty-Pants-Inc/smarty-dev/labels/hold (smarty-dev#1579).",
+  "holdLabel": {
+    "id": 12322387768,
+    "node_id": "LA_kwDOURg7fM8AAAAC3ni3OA",
+    "url": "https://api.github.com/repos/Smarty-Pants-Inc/smarty-dev/labels/hold",
+    "name": "hold",
+    "color": "B60205",
+    "default": false,
+    "description": "Paused: supervisors stay quiet and Mergify does not queue",
+    "archived_at": null,
+    "archived_by": null
+  },
+  "envelopes": {
+    "issues.field_added": {
+      "run": "cfcba54888434fe5be944f95c4519821",
+      "source": "mesh:github.smarty-dev",
+      "payload": {
+        "id": "5b4bd0dd-8d0d-44c6-9830-d0b486e7d5ce",
+        "sequence": 195507,
+        "topic": "github.smarty-dev",
+        "kind": "github.webhook",
+        "from": {
+          "id": "session:01a0e2e5-89c6-72f9-a472-ff3b9b08108b",
+          "name": "main",
+          "kind": "main",
+          "sessionId": "01a0e2e5-89c6-72f9-a472-ff3b9b08108b"
+        },
+        "data": {
+          "sequence": 161824,
+          "id": "1f0127c0-ba77-11f1-921d-0bead6099e39",
+          "event": "issues",
+          "repository": "Smarty-Pants-Inc/smarty-dev",
+          "received_at": "2026-09-27T13:27:01.875Z",
+          "source": "github",
+          "digest": "f22978ca2a452c8be5a310e5e7fa54fc18c391ff5fa834c71bcdef6a4acb8097",
+          "payload": {
+            "action": "field_added",
+            "url": "https://github.com/Smarty-Pants-Inc/smarty-dev/issues/1147",
+            "revision": null,
+            "after": null,
+            "issueSnapshot": {
+              "version": 1,
+              "id": 5597998797,
+              "number": 1147,
+              "updatedAt": "2026-09-27T13:27:00Z",
+              "sha256": "536dc3a1d075c211689dacd5678740694b0c7cbbcaa7823b716dca722fd9c4eb"
+            },
+            "sender": {
+              "id": 333979660,
+              "login": "smarty-fleet-write[bot]"
+            },
+            "number": 1147
+          },
+          "payloadProjected": true,
+          "storeId": "220bb630-33e5-4c00-81b1-128319040583"
+        },
+        "createdAt": 1790515621888
+      }
+    },
+    "issues.typed": {
+      "run": "e3489a9ac35a4ce8b32bee7d688d89ef",
+      "source": "mesh:github.smarty-net",
+      "payload": {
+        "id": "8cd00c9f-6bb2-4fb0-a8f4-dcb3041b9a0a",
+        "sequence": 184574,
+        "topic": "github.smarty-net",
+        "kind": "github.webhook",
+        "from": {
+          "id": "session:01a0e208-9d8a-7655-8a4b-3fbb48246388",
+          "name": "main",
+          "kind": "main",
+          "sessionId": "01a0e208-9d8a-7655-8a4b-3fbb48246388"
+        },
+        "data": {
+          "sequence": 155227,
+          "id": "f03089f0-ba57-11f1-9a4b-dd026f1b3a85",
+          "event": "issues",
+          "repository": "Smarty-Pants-Inc/smarty-net",
+          "received_at": "2026-09-27T09:43:48.809Z",
+          "source": "github",
+          "digest": "3d34e0322542ef990aab858fa83c48c0eed16211f9aca7e70428686e70bb7770",
+          "payload": {
+            "action": "typed",
+            "url": "https://github.com/Smarty-Pants-Inc/smarty-net/issues/62",
+            "revision": null,
+            "after": null,
+            "issueSnapshot": {
+              "version": 1,
+              "id": 5562419383,
+              "number": 62,
+              "updatedAt": "2026-09-27T09:43:47Z",
+              "sha256": "6280745385dad76ed000e57accede62a4ac8d0242d9d5ea6783461f2019bc67e"
+            },
+            "sender": {
+              "id": 333979660,
+              "login": "smarty-fleet-write[bot]"
+            },
+            "number": 62
+          },
+          "payloadProjected": true,
+          "storeId": "220bb630-33e5-4c00-81b1-128319040583"
+        },
+        "createdAt": 1790502228835
+      }
+    },
+    "issue_comment.deleted": {
+      "run": "1a9a805d1f2f43e8850907fba6ffe330",
+      "source": "mesh:github.smarty-dev",
+      "payload": {
+        "id": "8f9bda6c-1f45-4662-aa53-2c05d6f95a3d",
+        "sequence": 62285,
+        "topic": "github.smarty-dev",
+        "kind": "github.webhook",
+        "from": {
+          "id": "session:01a0d42b-ee75-727d-b872-bcb5107d6eb5",
+          "name": "main",
+          "kind": "main",
+          "sessionId": "01a0d42b-ee75-727d-b872-bcb5107d6eb5"
+        },
+        "data": {
+          "sequence": 40390,
+          "id": "70270ee2-b835-11f1-83e0-5c8a33cc85cc",
+          "event": "issue_comment",
+          "repository": "Smarty-Pants-Inc/smarty-dev",
+          "received_at": "2026-09-24T16:31:48.696Z",
+          "source": "github",
+          "digest": "55d5a413575aa22cea60a7dd154b6d136da89c85d80c872cc4052edc648cf290",
+          "payload": {
+            "action": "deleted",
+            "url": "https://github.com/Smarty-Pants-Inc/smarty-dev/pull/350#issuecomment-5818102618",
+            "revision": null,
+            "after": null,
+            "number": 350
+          },
+          "payloadProjected": true,
+          "storeId": "220bb630-33e5-4c00-81b1-128319040583"
+        },
+        "createdAt": 1790267509306
+      }
+    },
+    "host:tool_error": {
+      "run": "0399a1cdf83b428e83ff4828ed8d3310",
+      "source": "host:tool_error",
+      "payload": {
+        "event": "tool_error",
+        "session": {
+          "id": "01a0d12f-033f-775d-892c-2ad1e8be816f",
+          "cwd": "/home/paul/Projects/playful-dev/playful-chief"
+        },
+        "digest": {
+          "filesTouched": [
+            ".agents/skills/smarty-credentials/SKILL.md",
+            ".local/handoffs/2026-09-24/playful-org.md",
+            ".local/handoffs/CURRENT.md"
+          ]
+        },
+        "transcript": [
+          "call: fabric_exec try { return await agents.steer({ id:\"session:01a0d167-4a44-76a4-8e9f-f0b8c8015\u2026",
+          "result fabric_exec: Error: Timed out waiting for the remote Fabric owner to acknowledge session:01a0d167-4a44-76a4-8e9f-f0b8c8015c2d"
+        ],
+        "signal": {
+          "payload": {
+            "type": "tool_execution_end",
+            "toolCallId": "toolu_01RPZicg5acPRZbWGk62NwqR",
+            "toolName": "fabric_exec",
+            "result": {
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Runtime error: Pre-execution check: \u03c0.light is referenced in code but its key is missing from the payloads parameter"
+                }
+              ]
+            },
+            "isError": true
+          },
+          "idle": false,
+          "observedAt": 1790219916606
+        }
+      }
+    },
+    "ops.owner:actions.minutes": {
+      "run": "4b36493d0a2044a58e791b53af769add",
+      "source": "mesh:ops.owner",
+      "payload": {
+        "id": "0477e98d-0c8b-47b8-9c2a-75bdd3e76699",
+        "sequence": 178955,
+        "topic": "ops.owner",
+        "kind": "actions.minutes",
+        "from": {
+          "id": "factory-host:owner",
+          "name": "factory-owner",
+          "kind": "main"
+        },
+        "to": "aee159c1ea6e47a5aee356a77bd9070f",
+        "text": "Owner notice from the factory check (smarty-dev#1246), for your Main (root session session:01a0cda8-aebb-77c8-a2a3-fc03973f95cb): Smarty-Pants-Inc GitHub Actions minutes passed an alarm level or the h",
+        "data": {
+          "rootId": "session:01a0cda8-aebb-77c8-a2a3-fc03973f95cb",
+          "key": "actions-minutes:2026-09:80",
+          "line": "07:49Z ALARM past 80%: 2026-09 month-to-date ~43166 billed minutes of 50000 (86%), estimated from jobs; top: `smarty-pages` 18709, `smarty-code` 13348, `smarty-"
+        },
+        "createdAt": 1790495389391
+      }
+    },
+    "issue_comment.created": {
+      "run": "1531fd7796fe4f9fb3f506aef82f715b",
+      "source": "mesh:github.openchamber",
+      "payload": {
+        "id": "5833b343-50ac-4287-9700-c294f63cbfc6",
+        "sequence": 70683,
+        "topic": "github.openchamber",
+        "kind": "github.webhook",
+        "from": {
+          "id": "session:01a0d53b-c96d-75a1-ae16-14075ce17015",
+          "name": "main",
+          "kind": "main",
+          "sessionId": "01a0d53b-c96d-75a1-ae16-14075ce17015"
+        },
+        "data": {
+          "sequence": 49321,
+          "id": "9b95e1f0-b87d-11f1-8a34-41cf66da6bd9",
+          "event": "issue_comment",
+          "repository": "Smarty-Pants-Inc/openchamber",
+          "received_at": "2026-09-25T01:08:25.484Z",
+          "source": "github",
+          "digest": "a17cabcbbfec114dc817fcbe9a8dd549e646635a11dc1fd3768a04fb9728c54e",
+          "payload": {
+            "action": "created",
+            "url": "https://github.com/Smarty-Pants-Inc/openchamber/pull/168#issuecomment-5824965394",
+            "revision": null,
+            "after": null,
+            "number": 168
+          },
+          "payloadProjected": true,
+          "storeId": "220bb630-33e5-4c00-81b1-128319040583"
+        },
+        "createdAt": 1790298505499
+      }
+    },
+    "issues.unlabeled": {
+      "run": "f7581d3e0afd44f894a4aba39a4b10ae",
+      "source": "mesh:github.playground-client",
+      "payload": {
+        "id": "bfb9b394-efcf-4cce-9b7e-0b69278d09bc",
+        "sequence": 205263,
+        "topic": "github.playground-client",
+        "kind": "github.webhook",
+        "from": {
+          "id": "session:01a0e3a1-e979-70a1-8ff2-9ff20f82e310",
+          "name": "main",
+          "kind": "main",
+          "sessionId": "01a0e3a1-e979-70a1-8ff2-9ff20f82e310"
+        },
+        "data": {
+          "sequence": 171083,
+          "id": "cbacd420-ba99-11f1-9585-cbacc3b0dc9f",
+          "event": "issues",
+          "repository": "versehq/playground-client",
+          "received_at": "2026-09-27T17:35:14.440Z",
+          "source": "github",
+          "digest": "4f177449433a37346e09f650199c28bac0a77f35f983e35231bc85021a68b7b6",
+          "payload": {
+            "action": "unlabeled",
+            "url": "https://github.com/versehq/playground-client/issues/408",
+            "revision": null,
+            "after": null,
+            "issueSnapshot": {
+              "version": 1,
+              "id": 5599759253,
+              "number": 408,
+              "updatedAt": "2026-09-27T17:35:13Z",
+              "sha256": "93b11d54ce672f0346a11f99227107b046188ac2518356f06cb37a69cf4bab32"
+            },
+            "sender": {
+              "id": 333981238,
+              "login": "smarty-fleet-write-versehq[bot]"
+            },
+            "number": 408
+          },
+          "payloadProjected": true,
+          "storeId": "220bb630-33e5-4c00-81b1-128319040583"
+        },
+        "createdAt": 1790530514459
+      }
+    },
+    "ops.owner:idle.wait": {
+      "run": "6aeca225fc644667a7c09d8a2f9f4e90",
+      "source": "mesh:ops.owner",
+      "payload": {
+        "id": "5ca4686a-1be9-4d62-b040-871f68f8bd73",
+        "sequence": 178607,
+        "topic": "ops.owner",
+        "kind": "idle.wait",
+        "from": {
+          "id": "factory-host:owner",
+          "name": "factory-owner",
+          "kind": "main"
+        },
+        "to": "fce07d1b578c49deb4fc0040c6afeaf5",
+        "text": "Owner notice from the factory check (smarty-dev#653), for your Main (root session session:01a0cd9c-7c24-72d5-ae80-03d729baf983): an agent waits idle on work with a near ETA or an unfollowed merge. Ste",
+        "data": {
+          "rootId": "session:01a0cd9c-7c24-72d5-ae80-03d729baf983",
+          "key": "smarty-inbox:Smarty-Pants-Inc/smarty-dev#1243:merge:Smarty-Pants-Inc/smarty-dev#1253",
+          "line": "smarty-inbox is idle while Smarty-Pants-Inc/smarty-dev#1243 (https://github.com/Smarty-Pants-Inc/smarty-dev/issues/1243) has had no comment or PR since Smarty-P"
+        },
+        "createdAt": 1790495082855
+      }
+    }
+  }
+}

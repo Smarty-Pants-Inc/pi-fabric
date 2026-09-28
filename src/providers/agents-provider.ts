@@ -2,6 +2,7 @@ import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js"
 import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
+import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
@@ -256,6 +257,7 @@ const actorRequest = (
   }
   validateActorInferenceContext(args.inferenceContext, runner);
   validateActorCoalesceKey(args.coalesceKey);
+  const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
   const requestedKernel = checkedKernel(args.kernel);
   const kernelRequest = {
     runner,
@@ -289,6 +291,7 @@ const actorRequest = (
     ...(typeof args.triggerTurn === "boolean" ? { triggerTurn: args.triggerTurn } : {}),
     ...(typeof args.coalesce === "boolean" ? { coalesce: args.coalesce } : {}),
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
+    ...(activationFilter ? { activationFilter } : {}),
     ...(args.residency === "session" || args.residency === "durable"
       ? { residency: args.residency }
       : {}),
@@ -1097,6 +1100,12 @@ export class AgentsProvider implements FabricProvider {
         }
         if (args.scope === "global") return this.globalActors.update(String(args.id), { coalesceKey });
         return this.actorManager.setCoalesceKey(String(args.id), coalesceKey);
+      }
+      case "setActivationFilter": {
+        if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");
+        const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
+        if (args.scope === "global") return this.globalActors.update(String(args.id), { activationFilter });
+        return this.actorManager.setActivationFilter(String(args.id), activationFilter);
       }
       case "setEvents": {
         const events = Array.isArray(args.events)

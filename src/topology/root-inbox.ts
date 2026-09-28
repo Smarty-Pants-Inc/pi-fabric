@@ -181,9 +181,12 @@ export const rootInboxSession = (entries: readonly unknown[], lookback = 500): R
   holdsBatch: (ids) => sessionHoldsInboxBatch(entries, ids, lookback),
   holdsSteer: (fromId, key) => {
     for (let index = entries.length - 1; index >= Math.max(0, entries.length - lookback); index--) {
-      const entry = entries[index] as { type?: string; customType?: string; details?: { from?: { id?: unknown }; data?: unknown } } | undefined;
+      type Carried = { from?: { id?: unknown }; data?: unknown };
+      const entry = entries[index] as { type?: string; customType?: string; details?: Carried & { items?: unknown } } | undefined;
       if (entry?.type !== "custom_message" || entry.customType !== AGENT_MESSAGE_CUSTOM_TYPE) continue;
-      if (entry.details?.from?.id === fromId && workKey(entry.details.data) === key) return true;
+      // A batch of followUps (smarty-dev#1495) carries each one in items.
+      const carried: Carried[] = Array.isArray(entry.details?.items) ? entry.details.items as Carried[] : [entry.details ?? {}];
+      if (carried.some((item) => item?.from?.id === fromId && workKey(item.data) === key)) return true;
     }
     return false;
   },

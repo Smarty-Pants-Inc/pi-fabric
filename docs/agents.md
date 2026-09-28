@@ -360,7 +360,7 @@ const lineage = await agents.list({ scope: "lineage" });
 return { self: await agents.self(), lineage };
 ```
 
-For Main and one-shot agents, `steer` arrives after the tool calls in the current turn and before the next model call. `followUp` waits until the current run settles. For actors, both operations add a message to the serial mailbox. `agents.status({ id })` accepts any participant ID. It returns complete details for a local run or actor and a bounded directory summary for a remote participant. `agents.setSteeringMode` and `setFollowUpMode` continue to control local one-shot runs.
+For Main and one-shot agents, `steer` arrives after the tool calls in the current turn and before the next model call. `followUp` waits until the current run settles, or, for a busy Main, until the next tool boundary after it has waited `mesh.followUpFlushMs` (2 minutes by default). Each delivered message header carries `delivery` and `sent_at` (ISO UTC). A followUp to Main returns `pendingFollowUps` and `oldestAgeS`: how many of the caller's own followUps Fabric still holds for that Main, and the age of the oldest; switch to `steer` when they grow. A busy Main admits at most 50 held followUps or 256 KiB per sender, and 200 or 1 MiB in total; past that, the followUp is rejected with the reason. Held followUps are journalled under the mesh root until the session holds them, so a restart does not lose them. For actors, both operations add a message to the serial mailbox. `agents.status({ id })` accepts any participant ID. It returns complete details for a local run or actor and a bounded directory summary for a remote participant. `agents.setSteeringMode` and `setFollowUpMode` continue to control local one-shot runs.
 
 Local routing returns `"main"` or `"local"`. For cross-process `steer`, `followUp`, and `stop`, Fabric resolves the exact owner of the target. It sends a control command addressed to that owner and waits for an acknowledgement that matches the version, target, and owner identity. Success returns `routed: "mesh", acknowledged: true` after this verified acknowledgement. Unknown IDs, stale owners, rejection, and timeout throw an error. The owner records each command it admits, so a replayed command is answered from the record and not run again. Each host keeps these records and their outcomes in its own store under the mesh root (`control-seen/`) until the command has expired and left the event log. Each claim is also made in the shared state, so owners that run an older Fabric version for the same host cannot run the command again. That shared copy is kept while the command is in the retained event log, unless the fleet owner has ended support for runtimes before Fabric B8 (see [architecture](architecture.md)). The dashboard actions `s`, `u`, and `x` use the same route. Set `mesh.enabled` to use cross-process control. See [`references/agents.md`](../skillsets/typescript/fabric-exec/references/agents.md).
 
@@ -504,6 +504,30 @@ if (reviewer) await agents.setCoalesceKey({ id: reviewer.id, coalesceKey: "paylo
 ```
 
 Pass `coalesceKey` to `agents.create` for a new actor, or `null` to `agents.setCoalesceKey` to clear it.
+
+#### Activation filter
+
+An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Coalescing and queue order stay the same: the filter sees the item that would run, after coalescing.
+
+Each skip adds a record to the actor's message log: direction `in`, the event's `source`, and reason `filtered: <rule id>`. The actor status counts skips in `filteredCount` and `lastFilteredAt`.
+
+Two presets come ready to use. Each had zero false skips in 24 hours of supervisor runs (smarty-dev#1579):
+
+- `hold` skips a GitHub event (`github.*` topic) when the item's labels (`data.payload.issue.labels` or `data.payload.pull_request.labels`, whichever the event carries) include `hold`. The event that removes `hold` (action `unlabeled` with `label.name` `hold`) is always delivered. An event with no labels field is delivered. The factory's projected webhook payload has no labels today, so this rule skips only when the ingress adds them.
+- `never-message-events` skips `issues.field_added`, `issues.typed` and `issue_comment.deleted` GitHub events, `host:tool_error`, and `ops.owner` events of kind `actions.minutes`.
+
+A custom rule is an object: `{ id, source?, topic?, kind?, where?, unless? }`. `source` (`mesh:<topic>` or `host:<event>`), `topic` and `kind` are lists of names; a trailing `*` matches a prefix. `where` is a list of predicates that must all match. `unless` is the rule's exception: the rule skips only when some `unless` predicate is known to be false (its field is present and does not match). For example, a held comment (action `created`) rules out the unlabel exception although a comment has no `label` field. A predicate is `{ path, equals }`, `{ path, in: [...] }` or `{ path, exists: true }`. `path` is a dotted path into the queued payload: for a mesh event that is the event itself (`topic`, `kind`, `data.payload.action`); for a host event, the event data. An array on the path fans out, so `data.payload.issue.labels.name` reads each label's name. A list of paths gives alternatives: the first path with a value is used.
+
+Unsure means deliver. A `where` predicate whose field is missing does not match. An `unless` exception that no present field rules out stays open, so an `unlabeled` event with no label name is delivered. `exists: false` is not allowed. `agents.create` and `agents.setActivationFilter` reject an invalid rule, an unknown preset or a duplicate rule id. A rule must name a source, topic, kind or `where` predicate, so no rule can skip everything.
+
+```ts
+const supervisor = (await agents.actors()).find((actor) => actor.name === "dev-supervisor");
+if (supervisor) await agents.setActivationFilter({ id: supervisor.id, activationFilter: ["hold", "never-message-events"] });
+```
+
+Pass `activationFilter` to `agents.create` for a new actor, or `null` to `agents.setActivationFilter` to clear it. A change applies from the next queued event; the counter stays.
+
+A stored filter that this version cannot read (for example, one written by a newer version or edited by hand) never removes or rewrites its actor or global template. Fabric keeps the stored value unchanged, applies no filter (every event is delivered), logs a `PI_FABRIC_ACTIVATION_FILTER` warning, and shows the reason in `activationFilterError`. Set a valid filter to repair it.
 
 ### Native asynchronous vision handoff
 

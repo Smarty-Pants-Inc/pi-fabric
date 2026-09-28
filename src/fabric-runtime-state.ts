@@ -107,6 +107,7 @@ import {
   type FabricAgentMessageResult,
   type FabricMainAgentInfo,
 } from "./main-agent.js";
+import { followUpDrainSupported } from "./host-compatibility.js";
 import { AgentsProvider } from "./providers/agents-provider.js";
 import { CompactProvider } from "./providers/compact-provider.js";
 import { CacheProvider } from "./providers/cache-provider.js";
@@ -554,6 +555,12 @@ export class FabricRuntimeState {
       (configuredMeshRoot
         ? path.resolve(projectRoot, configuredMeshRoot)
         : path.join(projectRoot, ".pi", "fabric", "mesh"));
+    // Held followUps are journalled per session under the mesh root until the session holds them.
+    mainAgent.attachFollowUpDrain(
+      context,
+      followUpDrainSupported() ? this.#config.mesh.followUpFlushMs : 0,
+      path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`),
+    );
     this.#mesh = new MeshStore(
       meshRoot,
       this.#config.mesh.maxEventBytes,
@@ -1425,6 +1432,7 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
+    this.#mainAgent?.closeFollowUpDrain();
     this.#suppressResidentGuidanceSync = true;
     await this.#deactivateRepairs();
     clearActiveCompiledSurface();
@@ -1525,6 +1533,7 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
+    this.#mainAgent?.closeFollowUpDrain();
     await this.shellJobs.close();
     await this.#deactivateRepairs();
     if (!this.#registry) return;

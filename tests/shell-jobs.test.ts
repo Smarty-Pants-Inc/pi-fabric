@@ -184,7 +184,7 @@ describe("raceShellHang", () => {
         return "late";
       },
     });
-    expect(result).toEqual({ status: "spilled" });
+    expect(result).toEqual({ status: "spilled", auto: true });
     expect(job.spilled).toBe(true);
     expect(continued).toBe(false);
     job.abort.abort();
@@ -227,7 +227,7 @@ describe("raceShellHang", () => {
         return "nope";
       },
     });
-    await expect(pending).resolves.toEqual({ status: "spilled" });
+    await expect(pending).resolves.toEqual({ status: "spilled", auto: false });
     job.abort.abort();
   });
 
@@ -246,7 +246,7 @@ describe("raceShellHang", () => {
       },
     });
     expect(jobs.spillWaiting()).toBe(1);
-    await expect(pending).resolves.toEqual({ status: "spilled" });
+    await expect(pending).resolves.toEqual({ status: "spilled", auto: false });
     job.abort.abort();
   });
 });

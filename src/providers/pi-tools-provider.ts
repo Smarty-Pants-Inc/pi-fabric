@@ -550,9 +550,10 @@ export class PiToolsProvider implements FabricProvider {
     }
     spilled = true;
     const logPath = await job.persistLog();
-    // Only an auto-spill waits for a late pid (smarty-dev#883). An explicit background or monitor
-    // handoff returns at once, as before, with whatever the bounded read found.
-    const pid = background ? await job.readPid() : await job.waitForPid();
+    // Only the hang-timer auto-spill waits for a late pid (smarty-dev#883). An explicit background,
+    // monitor or manual Ctrl+B handoff returns at once with whatever the bounded read found; a
+    // later pid still reaches the job record through the late-pid watch.
+    const pid = outcome.auto ? await job.waitForPid() : await job.readPid();
     const elapsedMs = Date.now() - job.startedAt;
     const notice = formatShellHangNotice({
       elapsedMs,

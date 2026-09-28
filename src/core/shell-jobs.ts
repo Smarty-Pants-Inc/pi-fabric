@@ -379,13 +379,22 @@ class FabricShellJob implements FabricShellJobHandle {
   }
 }
 
+// Test-only seam (smarty-dev#883): PI_FABRIC_TEST_PID_DELAY_MS delays the shell's pid write, the
+// way a starved runner starts the shell late, so a real Pi session can prove the late-pid path.
+// Ignored unless set to a positive integer.
+const testPidDelay = (tool: PiShellToolName): string => {
+  const ms = Number(process.env.PI_FABRIC_TEST_PID_DELAY_MS);
+  if (!Number.isInteger(ms) || ms <= 0) return "";
+  return tool === "powershell" ? `Start-Sleep -Milliseconds ${ms}\n` : `sleep ${ms / 1000}\n`;
+};
+
 export const trackShellOperations = (
   inner: BashOperations,
   job: FabricShellJobHandle,
   tool: PiShellToolName,
 ): BashOperations => ({
   exec: (command, cwd, options) =>
-    inner.exec(wrapShellCommandForPid(command, job.pidPath, tool), cwd, {
+    inner.exec(testPidDelay(tool) + wrapShellCommandForPid(command, job.pidPath, tool), cwd, {
       ...options,
       onData: (data) => {
         job.append(data);
@@ -527,8 +536,10 @@ export const raceShellHang = async <T>(options: {
   hangMs: number;
   immediate?: boolean;
   job: FabricShellJobHandle;
-}): Promise<{ status: "done"; value: T } | { status: "error"; error: unknown } | { status: "spilled" }> => {
+}): Promise<{ status: "done"; value: T } | { status: "error"; error: unknown } | { status: "spilled"; auto: boolean }> => {
   const { job, parentSignal, hangMs } = options;
+  // True only when the hang timer spilled the job; a manual (Ctrl+B) or explicit handoff is not.
+  let auto = false;
   const onParentAbort = (): void => {
     if (job.spilled || job.finished || job.abort.signal.aborted) return;
     job.abort.abort(parentSignal?.reason ?? new Error("Command aborted"));
@@ -546,6 +557,7 @@ export const raceShellHang = async <T>(options: {
     const finish = (): void => resolve("spill");
     if (hangMs > 0) {
       hangTimer = setTimeout(() => {
+        auto = !job.spilled && !job.finished;
         job.spill();
         finish();
       }, hangMs);
@@ -579,7 +591,7 @@ export const raceShellHang = async <T>(options: {
         const message = result.error instanceof Error ? result.error.message : String(result.error);
         await job.finish(null, "\n\n[" + message + "]\n");
       });
-      return { status: "spilled" };
+      return { status: "spilled", auto };
     }
     detachParent();
     return first;

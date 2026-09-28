@@ -15,7 +15,7 @@ import {
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { followUpDrainSupported } from "../src/host-compatibility.js";
-import { FOLLOW_UP_LIMITS, followUpProcessToken, MainAgentController } from "../src/main-agent.js";
+import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
 import { rootInboxSession } from "../src/topology/root-inbox.js";
 
 // smarty-dev#1495: a followUp to a Main that chains turns arrived about an hour late.
@@ -191,14 +191,16 @@ describe("Main followUp drain (unit)", () => {
     expect(fs.existsSync(journal)).toBe(false);
   });
 
-  // A new process: a fresh token, as after a restart.
-  const newProcess = () => { delete (globalThis as Record<symbol, unknown>)[Symbol.for("pi-fabric.main-followups.process")]; };
   const busyContext = (entries: unknown[], idle = false) => ({
     isIdle: () => idle, hasPendingMessages: () => false, sessionManager: { getEntries: () => entries },
   }) as unknown as ExtensionContext;
+  // A boundary event shows Pi's pending queue (event.context.pendingMessages).
+  const boundary = (pending: unknown[], outcome = "completed") => ({ outcome, context: { pendingMessages: pending } });
+  const asQueued = (entry: { message: { details: Record<string, any> } }) => ({ role: "custom", customType: "pi-fabric-agent-message", details: entry.message.details });
 
-  // review/astra F3 on pi-fabric#102: a live reload keeps Pi's queue; a restart does not.
-  it("replays a handed-over followUp only after a process restart, not after a live reload", () => {
+  // dev-lead's owner rule on pi-fabric#102: replay skips an id that is in Pi's pending queue or
+  // in the session; a journal entry goes only when the session holds it, drain on or off.
+  it("replays a handoff only when neither Pi's queue nor the session holds it (reload vs restart)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-journal-"));
     roots.push(dir);
     const journal = path.join(dir, "root.json");
@@ -207,23 +209,28 @@ describe("Main followUp drain (unit)", () => {
     const main = new MainAgentController(first.pi, "session:root", true, dir, "root");
     main.attachFollowUpDrain(busyContext(entries), 120_000, journal);
     main.deliverAgent({ from: from("a"), message: "handed", delivery: "followUp" });
-    first.emit("agent_before_settle", { outcome: "completed" }, busyContext(entries));   // handed to Pi's queue
+    first.emit("agent_before_settle", boundary([]), busyContext(entries));        // handed to Pi's queue
     expect(first.sent).toHaveLength(1);
-    main.closeFollowUpDrain();                                                         // reload
+    main.closeFollowUpDrain();                                                     // live reload
     const reloaded = new MainAgentController(first.pi, "session:root", true, dir, "root");
     reloaded.attachFollowUpDrain(busyContext(entries, true), 120_000, journal);
-    expect(first.sent).toHaveLength(1);                                                // Pi still has it
-    expect(fs.existsSync(journal)).toBe(true);                                         // until the session holds it
+    expect(first.sent).toHaveLength(1);                                            // unknown until a boundary
+    first.emit("agent_before_settle", boundary([asQueued(first.sent[0]!)]), busyContext(entries));
+    expect(first.sent).toHaveLength(1);                                            // Pi's queue holds it
+    expect(fs.existsSync(journal)).toBe(true);                                     // until the session holds it
     reloaded.closeFollowUpDrain();
-    newProcess();                                                                      // restart: Pi's queue is gone
-    const second = fakePi();
-    new MainAgentController(second.pi, "session:root", true, dir, "root").attachFollowUpDrain(busyContext(entries, true), 120_000, journal);
-    expect(second.sent).toHaveLength(1);
-    expect(second.sent[0]!.message.details.id).toBe(first.sent[0]!.message.details.id);
+    const second = fakePi();                                                       // restart: Pi's queue is empty
+    new MainAgentController(second.pi, "session:root", true, dir, "root").attachFollowUpDrain(busyContext(entries), 120_000, journal);
+    expect(second.sent).toHaveLength(0);
+    second.emit("agent_before_settle", boundary([]), busyContext(entries));
+    expect(second.sent.map((entry) => entry.message.details.id)).toEqual([first.sent[0]!.message.details.id]);
+    entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: second.sent[0]!.message.details });
+    second.emit("agent_settled", { outcome: "completed" }, busyContext(entries, true));
+    expect(fs.existsSync(journal)).toBe(false);
   });
 
-  // review/astra F4 on pi-fabric#102: switching the drain off does not make Pi's queue durable.
-  it("with the drain off, keeps journalled followUps until the session holds them, across a restart", () => {
+  // dev-lead's probe: drain disabled, killed after the send and before the session write, restart.
+  it("with the drain off, a handoff killed before the session write is delivered once after a restart", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-journal-"));
     roots.push(dir);
     const journal = path.join(dir, "root.json");
@@ -233,19 +240,23 @@ describe("Main followUp drain (unit)", () => {
     main.attachFollowUpDrain(busyContext(entries), 120_000, journal);
     const { messageId } = main.deliverAgent({ from: from("a"), message: "pending", delivery: "followUp" });
     main.closeFollowUpDrain();
-    newProcess();
     const off = fakePi();                                  // reopened with flushMs 0, Main busy
     const disabled = new MainAgentController(off.pi, "session:root", true, dir, "root");
     disabled.attachFollowUpDrain(busyContext(entries), 0, journal);
+    off.emit("agent_before_settle", boundary([]), busyContext(entries));
     expect(off.sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
-    expect(fs.readFileSync(journal, "utf8")).toContain(messageId);   // only in Pi's memory: still journalled
-    newProcess();                                          // replaced before Main read it
+    expect(fs.readFileSync(journal, "utf8")).toContain(messageId);   // not deleted at send time
+    // SIGKILL: no close, the session never wrote it. Restart with the drain still off.
     const again = fakePi();
     const recovered = new MainAgentController(again.pi, "session:root", true, dir, "root");
     recovered.attachFollowUpDrain(busyContext(entries), 0, journal);
+    again.emit("turn_end", boundary([]), busyContext(entries));
+    again.emit("agent_before_settle", boundary([]), busyContext(entries));
     expect(again.sent.map((entry) => entry.message.details.id)).toEqual([messageId]);
     entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: again.sent[0]!.message.details });
+    again.emit("agent_before_settle", boundary([]), busyContext(entries));
     again.emit("agent_settled", { outcome: "completed" }, busyContext(entries, true));
+    expect(again.sent).toHaveLength(1);                    // delivered once
     expect(fs.existsSync(journal)).toBe(false);            // gone only once the session holds it
   });
 
@@ -879,5 +890,82 @@ describe("Main followUp journal across a live reload in a real Pi session", () =
     const delivered = session.messages.filter((message) => message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-agent-message");
     expect(delivered).toHaveLength(1);
     expect(fs.existsSync(journal)).toBe(false);          // confirmed from the session's entries
+  });
+});
+
+// dev-lead's probe on pi-fabric#102: drain disabled, the process killed after the handoff to Pi
+// and before the session wrote it, then a restart: the followUp is delivered exactly once.
+describe("Main followUp journal across a kill with the drain off, in real Pi sessions", () => {
+  const start = async (root: string, flushMs: number, journal: string, blockSettle: boolean) => {
+    const faux = fauxProvider();
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+    modelRuntime.registerNativeProvider(faux.provider);
+    const state: { main?: MainAgentController; ctx?: ExtensionContext; releaseTool?: () => void; releaseSettle?: () => void; settling: number } = { settling: 0 };
+    const loader = new DefaultResourceLoader({
+      cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [{
+        name: "drain",
+        factory: (pi: ExtensionAPI) => {
+          pi.registerTool({
+            name: "work", label: "work", description: "blocks until released", parameters: Type.Object({}),
+            execute: async () => {
+              await new Promise<void>((resolve) => { state.releaseTool = resolve; });
+              return { content: [{ type: "text", text: "done" }], details: {} };
+            },
+          });
+          pi.on("session_start", (_event, ctx) => {
+            state.ctx = ctx;
+            state.main = new MainAgentController(pi, "session:root", true, root, "root");
+            state.main.attachFollowUpDrain(ctx, flushMs, journal);
+            if (blockSettle) {
+              pi.on("agent_before_settle", async () => {
+                state.settling++;
+                if (state.settling === 1) await new Promise<void>((resolve) => { state.releaseSettle = resolve; });
+              });
+            }
+          });
+        },
+      }],
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({
+      cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+      sessionManager: SessionManager.inMemory(root), tools: ["work"],
+    });
+    sessions.push(session);
+    await session.bindExtensions({});
+    await waitFor(() => state.main !== undefined);
+    return { session, faux, state };
+  };
+  const agentMessages = (session: AgentSession) => session.messages.filter((message) =>
+    message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-agent-message");
+
+  it("delivers once after a restart", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-drain-kill-"));
+    roots.push(root);
+    const journal = path.join(root, "journal", "root.json");
+    // Process 1, drain on: Main is busy; the followUp is held and journalled.
+    const one = await start(root, 60_000, journal, true);
+    one.faux.setResponses([fauxAssistantMessage(fauxToolCall("work", {}), { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
+    const prompted = one.session.prompt("go");
+    await waitFor(() => one.state.releaseTool !== undefined);
+    const { messageId } = one.state.main!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" }, message: "exactly once", delivery: "followUp" });
+    one.state.main!.closeFollowUpDrain();                  // the drain is switched off (reload with flushMs 0)
+    one.state.main!.attachFollowUpDrain(one.state.ctx!, 0, journal);
+    one.state.releaseTool!();
+    await waitFor(() => one.state.releaseSettle !== undefined);   // handed to Pi's queue here
+    one.session.abort();                                   // Pi keeps it queued, the session has not written it
+    one.state.releaseSettle!();
+    await prompted.catch(() => undefined);
+    await waitFor(() => one.session.isIdle);
+    expect(agentMessages(one.session)).toHaveLength(0);
+    expect(fs.readFileSync(journal, "utf8")).toContain(messageId);
+    // SIGKILL: no shutdown, no close. Process 2 starts on the same session state, drain off.
+    const two = await start(root, 0, journal, false);
+    two.faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("read it"), fauxAssistantMessage("more")]);
+    await two.session.prompt("next task");
+    await waitFor(() => two.session.isIdle);
+    expect(agentMessages(two.session).map((message) => (message as { details?: { id?: string } }).details?.id)).toEqual([messageId]);
+    expect(fs.existsSync(journal)).toBe(false);
   });
 });

@@ -135,18 +135,25 @@ interface HeldAgentMessage {
   message: string;
   sentAt: number;
   data?: unknown;
-  /** The process that handed it to Pi's queue; unset while Fabric holds it. */
-  handedBy?: string;
+  /** Handed to Pi's queue; it may still be there after a reload. Unset while Fabric holds it. */
+  handed?: true;
 }
 
-// One token per process, kept on globalThis so it survives a live extension reload, which
-// rebuilds this module but keeps Pi's queues. A journalled handoff from this token is still in
-// Pi's queue; one from another token died with its process (review/astra F3 on pi-fabric#102).
-const PROCESS_TOKEN = Symbol.for("pi-fabric.main-followups.process");
-export const followUpProcessToken = (): string => {
-  const scope = globalThis as { [PROCESS_TOKEN]?: string };
-  return (scope[PROCESS_TOKEN] ??= randomUUID());
+/** The ids of the agent messages in a list of messages (Pi's pending queue at a boundary). */
+const agentMessageIds = (messages: readonly unknown[] | undefined): Set<string> => {
+  const ids = new Set<string>();
+  for (const message of messages ?? []) {
+    const value = message as { customType?: string; details?: { id?: unknown; items?: unknown } };
+    if (value?.customType !== "pi-fabric-agent-message") continue;
+    if (typeof value.details?.id === "string") ids.add(value.details.id);
+    if (Array.isArray(value.details?.items)) {
+      for (const item of value.details.items as Array<{ id?: unknown }>) if (typeof item?.id === "string") ids.add(item.id);
+    }
+  }
+  return ids;
 };
+
+type BoundaryEvent = { context?: { pendingMessages?: readonly unknown[] } };
 
 const itemBytes = (item: HeldAgentMessage): number =>
   Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data)));
@@ -172,6 +179,9 @@ export class MainAgentController implements FabricMainAgentTarget {
   readonly #held: HeldAgentMessage[] = [];
   // Handed to Pi, not yet in the session's entries. Kept in the journal until they are.
   readonly #sent: HeldAgentMessage[] = [];
+  // Replayed handoffs of an earlier controller: in Pi's queue after a live reload, lost after a
+  // restart. Only a boundary shows Pi's queue, so they wait for one (#reconcile).
+  readonly #unverified: HeldAgentMessage[] = [];
   #journal: string | undefined;
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext | undefined;
@@ -309,7 +319,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** Write the held and unconfirmed followUps (0600), or remove the journal when none are left. */
   #save(): void {
     if (!this.#journal) return;
-    const items = [...this.#sent, ...this.#held];
+    const items = [...this.#unverified, ...this.#sent, ...this.#held];
     if (!items.length) { fs.rmSync(this.#journal, { force: true }); return; }
     fs.mkdirSync(path.dirname(this.#journal), { recursive: true, mode: 0o700 });
     const temporary = `${this.#journal}.${process.pid}.tmp`;
@@ -323,7 +333,28 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
   }
 
-  /** Drop the handed-over followUps the session now holds. */
+  /**
+   * At a boundary, where Pi shows its pending queue: a replayed handoff the session holds is
+   * done, one still in Pi's queue awaits the session, and any other was lost and is held again.
+   */
+  #reconcile(event: BoundaryEvent): void {
+    const pending = event.context?.pendingMessages;
+    if (!this.#unverified.length || !Array.isArray(pending)) return;
+    const queued = agentMessageIds(pending);
+    const delivered = deliveredIds(this.#context);
+    for (const item of this.#unverified.splice(0)) {
+      if (delivered.has(item.id)) continue;
+      if (queued.has(item.id)) this.#sent.push(item);
+      else {
+        const { handed: _handed, ...held } = item;
+        this.#held.push(held);
+      }
+    }
+    this.#held.sort((a, b) => a.sentAt - b.sentAt);
+    this.#trySave();
+  }
+
+  /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
     if (!this.#sent.length) return;
     const delivered = deliveredIds(this.#context);
@@ -348,18 +379,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     } catch {
       return;                                            // no journal
     }
+    // The owner rule (dev-lead on pi-fabric#102): skip every id the session holds; a handoff
+    // may still sit in Pi's queue, so it waits for a boundary to check; the rest is held again.
     const delivered = deliveredIds(this.#context, Number.MAX_SAFE_INTEGER);
-    const token = followUpProcessToken();
     const seen = new Set<string>();
     for (const item of items.sort((a, b) => a.sentAt - b.sentAt)) {
       if (delivered.has(item.id) || seen.has(item.id)) continue;
       seen.add(item.id);
-      // Handed over by this process (a live reload): Pi's queue still has it; await confirmation.
-      if (item.handedBy === token) this.#sent.push(item);
-      else {
-        const { handedBy: _previous, ...held } = item;
-        this.#held.push(held);
-      }
+      (item.handed ? this.#unverified : this.#held).push(item);
     }
     this.#trySave();
   }
@@ -380,22 +407,25 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (typeof off === "function") this.#unsubscribe.push(off as () => void);
     };
     if (!(flushMs > 0) || typeof this.pi.on !== "function") {
-      // Drain off: what an earlier drain journalled goes to Pi's own queue once. The journal
-      // keeps each until the session holds it (review/astra F4 on pi-fabric#102); without
-      // hooks, the next start confirms it from the session's entries.
+      // Drain off: what an earlier drain journalled goes to Pi's own queue, under the same rule.
+      // Each stays in the journal until the session holds it (review/astra F4 on pi-fabric#102).
       this.#replay();
-      this.#release(true);
-      if (this.#sent.length && typeof this.pi.on === "function") {
-        const confirm = (_event: unknown, ctx: ExtensionContext) => { this.#context = ctx; this.#confirm(); };
-        on("turn_end", confirm);
-        on("agent_settled", confirm);
-      }
       this.#closed = true;                                 // holds nothing new
+      if (typeof this.pi.on !== "function") return;        // the next start confirms from the session
+      if (this.#held.length && context.isIdle()) this.#release(true);
+      on("turn_end", (event: BoundaryEvent, ctx) => { this.#context = ctx; this.#reconcile(event); this.#confirm(); });
+      on("agent_before_settle", (event: BoundaryEvent & { outcome?: string }, ctx) => {
+        this.#context = ctx;
+        this.#reconcile(event);
+        if (event.outcome === undefined || event.outcome === "completed") this.#release(true);
+      });
+      on("agent_settled", (_event, ctx) => { this.#context = ctx; this.#confirm(); });
       return;
     }
     this.#flushMs = flushMs;
-    on("turn_end", (event: { message?: { stopReason?: string } }, ctx) => {
+    on("turn_end", (event: BoundaryEvent & { message?: { stopReason?: string } }, ctx) => {
       this.#context = ctx;
+      this.#reconcile(event);
       if (ctx.signal?.aborted || ["aborted", "error"].includes(event.message?.stopReason ?? "")) {
         this.#suspended = true;
         return;
@@ -406,8 +436,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Main is about to go idle. Hand the held followUps to Pi's followUp queue here, the last
     // boundary where Pi still continues the run for a queued message and where Pi itself drops
     // that continuation when the user cancels (review/astra F1 on pi-fabric#102).
-    on("agent_before_settle", (event: { outcome?: string }, ctx) => {
+    on("agent_before_settle", (event: BoundaryEvent & { outcome?: string }, ctx) => {
       this.#context = ctx;
+      this.#reconcile(event);
       if (this.#suspended || (event.outcome !== undefined && event.outcome !== "completed")) return;
       this.#release(true);
     });
@@ -463,6 +494,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     else this.#release(true);
     this.#held.splice(0);
     this.#sent.splice(0);
+    this.#unverified.splice(0);
     this.#journal = undefined;
     this.#context = undefined;
   }
@@ -497,8 +529,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       return false;                                      // kept; the next boundary or release retries
     }
     this.#held.splice(0, count);
-    const token = followUpProcessToken();
-    for (const item of batch) item.handedBy = token;
+    for (const item of batch) item.handed = true;
     this.#sent.push(...batch);
     this.#trySave();
     return true;

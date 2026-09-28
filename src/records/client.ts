@@ -3,6 +3,10 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { errorFromWire, LineReader, type WireResponse } from "./protocol.js";
+import { MAX_ANCHORS, wireAnchors, type RecordsAnchor, type RecordsVerifyResult } from "./chain.js";
+import { RecordsArgumentError } from "./kinds.js";
+/** A verify request stays well inside the 1 MiB line (MAX_ANCHORS {seq, hash} anchors are ~0.85 MB). */
+const REQUEST_BUDGET_BYTES = 960 * 1024;
 import type {
   ClaimedPublication, ConsumerLag, ConsumerState, PageArgs, RecordEnvelope, RecordReceipt, RecordsBackend, RecordsCallOptions,
   RecordsGetPart, RecordsGetResult, RecordsListResult, RecordsOps, RecordsPage, RecordsPrincipal,
@@ -179,6 +183,18 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
   }
   list(_principal: RecordsPrincipal, args: unknown, options: RecordsCallOptions = {}): Promise<RecordsListResult> {
     return this.#call("list", { args }, options.signal) as Promise<RecordsListResult>;
+  }
+  anchor(_principal: RecordsPrincipal, args: unknown = {}, options: RecordsCallOptions = {}): Promise<RecordsAnchor> {
+    return this.#call("anchor", { args }, options.signal) as Promise<RecordsAnchor>;
+  }
+  verify(_principal: RecordsPrincipal, args: unknown = {}, options: RecordsCallOptions = {}): Promise<RecordsVerifyResult> {
+    // Only {seq, hash} goes on the wire, so MAX_ANCHORS of them fit one request line (#118 F2).
+    const raw = (args ?? {}) as Record<string, unknown>;
+    const sent = typeof raw === "object" && raw !== null && "anchors" in raw ? { ...raw, anchors: wireAnchors(raw.anchors) } : args;
+    if (Buffer.byteLength(JSON.stringify(sent)) > REQUEST_BUDGET_BYTES) {
+      return Promise.reject(new RecordsArgumentError(`records.verify: the anchors exceed ${REQUEST_BUDGET_BYTES} bytes; send at most ${MAX_ANCHORS} anchors of {seq, hash}`));
+    }
+    return this.#call("verify", { args: sent }, options.signal) as Promise<RecordsVerifyResult>;
   }
   status(signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.#call("status", {}, signal) as Promise<Record<string, unknown>>;

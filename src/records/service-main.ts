@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { issueCredentialFile, migrateService, normalizeServiceConfig, OPERATOR_ROLES, RecordsServer, type OperatorRole } from "./server.js";
+import { anchorService, verifyService, issueCredentialFile, migrateService, normalizeServiceConfig, OPERATOR_ROLES, RecordsServer, type OperatorRole } from "./server.js";
 
 /**
  * The records service's command line (C10), run as the org's `<org>-records` OS user:
@@ -9,6 +9,9 @@ import { issueCredentialFile, migrateService, normalizeServiceConfig, OPERATOR_R
  *   migrate --config FILE                               apply migrations as the cluster owner (install)
  *   issue   --config FILE --id ID --role importer|mirror|relay [--name N] --out FILE
  *                                                       issue an operator principal's credential
+ *   anchor  --config FILE                               print the org's anchor {org, seq, hash, at} (the backup adapter)
+ *   verify-chain --config FILE [--anchors FILE]         recompute the hash chain and check the anchors (a JSON array,
+ *                                                       or one anchor per line); exit 0 clean, 1 broken, 3 unanchored
  * Roles (importer, mirror) are granted in the config file's `roles`, by principal id.
  */
 /**
@@ -24,7 +27,7 @@ process.on("SIGHUP", () => {
   else reloadPending = true;
 });
 
-const usage = "usage: service-main.js serve|migrate|issue|verify --config FILE [--id ID --role importer|mirror|relay [--reissue]] [--name NAME] [--out FILE]";
+const usage = "usage: service-main.js serve|migrate|issue|verify|anchor|verify-chain --config FILE [--id ID --role importer|mirror|relay [--reissue]] [--name NAME] [--out FILE] [--anchors FILE]";
 
 const flag = (argv: string[], name: string): string | undefined => {
   const index = argv.indexOf(name);
@@ -43,6 +46,19 @@ const main = async (argv: string[]): Promise<number> => {
     const version = await migrateService(config);
     process.stdout.write(`records schema at version ${version}\n`);
     return 0;
+  }
+  if (command === "anchor") {
+    process.stdout.write(`${JSON.stringify(await anchorService(config))}\n`);
+    return 0;
+  }
+  if (command === "verify-chain") {
+    const file = flag(argv, "--anchors");
+    const text = file ? fs.readFileSync(file, "utf8").trim() : "";
+    const anchors: unknown = text.startsWith("[") ? JSON.parse(text) : text ? text.split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line)) : [];
+    const result = await verifyService(config, anchors);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.stderr.write(`${result.summary}\n`);
+    return result.clean ? 0 : result.ok ? 3 : 1;
   }
   if (command === "verify") {
     // The installer's first step for an existing credential: publish a pending token an interrupted

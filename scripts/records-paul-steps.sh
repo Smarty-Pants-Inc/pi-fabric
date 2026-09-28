@@ -24,7 +24,7 @@
 #  5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
 #  6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
 #  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
-#  8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent, else verify it (publish a <file>.pending the database holds; refuse a file without the live token) (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
+#  8. per --operator: refuse an id that holds another role; issue its credential with --reissue if absent, else verify it (publish a <file>.pending the database holds; refuse a file without the live token) (sha256(id).json, id, role and issuer checked) as <org>-records, then add the role to service.json; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
 #  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
 # ROLLBACK STEPS (--rollback; root; a real rollback needs --yes-delete-records; the PostgreSQL packages stay installed):
 #  R1. systemctl stop both units; refuse (nothing deleted) unless is-active says inactive, failed or unknown for both; systemctl disable both
@@ -628,7 +628,7 @@ root_steps() {
   5. write /etc/<org>-records/service.json if absent (never overwritten: it holds granted roles)
   6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
   7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
-  8. per --operator: refuse an id that holds another role; add the role to service.json, issue its credential with --reissue if absent, else verify it (publish a <file>.pending the database holds; refuse a file without the live token) (sha256(id).json, id, role and issuer checked) as <org>-records; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
+  8. per --operator: refuse an id that holds another role; issue its credential with --reissue if absent, else verify it (publish a <file>.pending the database holds; refuse a file without the live token) (sha256(id).json, id, role and issuer checked) as <org>-records, then add the role to service.json; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
   9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
 EOF
 }
@@ -981,11 +981,6 @@ for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 	# F14: the name is the sha256 of the whole id (injective in practice): team:import_job and
 	# team_import:job never share a file.
 	cred="$CRED_DIR/$(printf %s "$id" | sha256sum | cut -c1-64).json"
-	printf '+ %s -e "$(%s --print operator-edit-js)" %s\n' "$OPT_NODE" "${0##*/}" "$(show "$CFG" "$role" "$id")"
-	if ((!DRY)); then
-		result=$("$OPT_NODE" -e "$(render_operator_edit_js)" "$CFG" "$role" "$id") || die "could not grant ${role} to ${id} in ${CFG}"
-		echo "  ${result}: roles.${role} has ${id}"
-	fi
 	# Only a stat as root (no open); both branches run as ${REC}.
 	if [[ -e $cred || -L $cred || -e ${cred}.pending || -L ${cred}.pending ]]; then
 		# F2/S2: an existing credential is reused only if it holds the live token. verify first
@@ -1004,6 +999,12 @@ for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 		echo "? runuser -u ${REC} -- ${OPT_NODE} -e '${CHECK_ID_JS}' ${cred} ${id} ${role}  (stored .id, .role, .issuedBy must equal ${id}, ${role}, installer)"
 	else
 		as_rec "$OPT_NODE" -e "$CHECK_ID_JS" "$cred" "$id" "$role" || die "${cred} does not hold principal ${id} with role ${role} issued by the installer; refused"
+	fi
+	# smarty-dev#1720: issue (or verify), then grant. A failed issue stops above and leaves no grant.
+	printf '+ %s -e "$(%s --print operator-edit-js)" %s\n' "$OPT_NODE" "${0##*/}" "$(show "$CFG" "$role" "$id")"
+	if ((!DRY)); then
+		result=$("$OPT_NODE" -e "$(render_operator_edit_js)" "$CFG" "$role" "$id") || die "could not grant ${role} to ${id} in ${CFG}"
+		echo "  ${result}: roles.${role} has ${id}"
 	fi
 	if [[ $role == relay ]]; then
 		# The relay publishes nudges on the org's mesh, which only the org user can write: its credential

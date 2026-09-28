@@ -219,6 +219,9 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.out).toContain(
 			'+ /opt/test-org-records/node -e "$(records-paul-steps.sh --print operator-edit-js)" /etc/test-org-records/service.json importer importer:github\n',
 		);
+		// smarty-dev#1720: issue, then grant; a failed issue leaves no grant.
+		expect(r.out.indexOf("service-main.mjs issue --config")).toBeGreaterThan(-1);
+		expect(r.out.indexOf("service-main.mjs issue --config")).toBeLessThan(r.out.indexOf('--print operator-edit-js)" /etc/test-org-records/service.json importer importer:github\n'));
 		const gh = `/var/lib/test-org-records/credentials/${sha("importer:github")}.json`;
 		expect(r.out).toContain(
 			`+ runuser -u test-org-records -- /opt/test-org-records/node /opt/test-org-records/service-main.mjs issue --config /etc/test-org-records/service.json --id importer:github --role importer --out ${gh} --reissue\n`,

@@ -60,6 +60,24 @@ const descriptors: FabricActionDescriptor[] = [
     risk: "read", namespace: "coordination",
   },
   {
+    name: "anchor",
+    description: "The org's anchor: {org, seq, hash, at}, the last record's seq and its chain hash (SHA-256 of its canonical bytes). The backup adapter writes it to every backup target on each run; records.verify later checks the chain against those copies.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    risk: "read", namespace: "coordination",
+  },
+  {
+    name: "verify",
+    description: "Recompute the org's hash chain and check each supplied anchor ({seq, hash} as records.anchor gave it): {ok, clean, break?: {org, seq, reason, expected, found}, anchors: {checked, passed, failed}, failedAnchors (the first 20), unanchored?: {from, to}, summary}. At most 10000 anchors; the empty-chain anchor {seq: 0, hash: null} is valid. ok means no break and every anchor holds; clean also needs every record covered by an anchor.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      properties: { anchors: { type: "array", maxItems: 10_000, items: { anyOf: [
+        { type: "object", required: ["seq", "hash"], properties: { seq: { type: "integer", minimum: 1 }, hash: { type: "string", pattern: "^[0-9a-f]{64}$" } } },
+        { type: "object", required: ["seq", "hash"], description: "the empty-chain anchor records.anchor gives before the first record", properties: { seq: { const: 0 }, hash: { type: "null" } } },
+      ] } } },
+    },
+    risk: "read", namespace: "coordination",
+  },
+  {
     name: "status",
     description: "The record layer's state on this Node: org, origin, committed frontier, unpublished nudges, and C2 archive admission.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -80,7 +98,7 @@ const untilAborted = <T>(promise: Promise<T>, signal: AbortSignal | undefined): 
 
 export class RecordsProvider implements FabricProvider {
   readonly name = "records";
-  readonly description = "The org's durable record on its Node (PostgreSQL): append, read by cursor, get a ref's fold, list views";
+  readonly description = "The org's durable record on its Node (PostgreSQL): append, read by cursor, get a ref's fold, list views, anchor and verify the hash chain";
 
   constructor(readonly service: () => Promise<RecordsProviderService>) {}
 
@@ -109,6 +127,8 @@ export class RecordsProvider implements FabricProvider {
       case "read": return service.backend.read(principal, args, options);
       case "get": return service.backend.get(principal, args, options);
       case "fold": return service.backend.fold(principal, args, options);
+      case "anchor": return service.backend.anchor(principal, args, options);
+      case "verify": return service.backend.verify(principal, args, options);
       default: return service.backend.list(principal, args, options);
     }
   }

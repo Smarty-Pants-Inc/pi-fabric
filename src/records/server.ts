@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import type { RecordsAnchor, RecordsVerifyResult } from "./chain.js";
 import { AdmissionGate, WalGFrontierProvider, type AdmissionStatus } from "./admission.js";
 import { RecordsArgumentError } from "./kinds.js";
 import { LineReader, RecordsServiceError, wireError, type WireRequest, type WireResponse } from "./protocol.js";
@@ -112,6 +113,19 @@ export const migrateService = async (config: RecordsServiceConfig, pool?: Client
     if (!pool) await owner.end?.();
   }
 };
+
+/** The anchor and the chain check, straight from the database as the service's role (the CLI). */
+const withStore = async <T>(config: RecordsServiceConfig, pool: ClientPool | undefined, work: (store: RecordStore) => Promise<T>): Promise<T> => {
+  const owner = pool ?? await openPool(config.database);
+  try { return await work(new RecordStore(owner, { org: config.org, origin: config.origin })); } finally {
+    if (!pool) await owner.end?.();
+  }
+};
+const OPERATOR: RecordsPrincipal = { id: "operator" };
+export const anchorService = (config: RecordsServiceConfig, pool?: ClientPool): Promise<RecordsAnchor> =>
+  withStore(config, pool, (store) => store.anchor(OPERATOR, {}));
+export const verifyService = (config: RecordsServiceConfig, anchors: unknown, pool?: ClientPool): Promise<RecordsVerifyResult> =>
+  withStore(config, pool, (store) => store.verify(OPERATOR, { anchors }));
 
 /** Issue an operator principal's token (for the importer or the mirror). Prints nothing; returns it. */
 export type OperatorRole = "importer" | "mirror" | "relay";
@@ -250,6 +264,7 @@ export class RecordsServer {
   /** Each principal's processes, by pid, and when each last called. */
   readonly #seen = new Map<string, Map<number, { at: number; cmdline?: string }>>();
   readonly #alerts: TokenReuseAlert[] = [];
+  #verifying = false;
 
   private constructor(readonly config: RecordsServiceConfig, pool: ClientPool, readonly options: { now?: () => number } = {}) {
     this.statusFile = config.statusFile;
@@ -291,6 +306,14 @@ export class RecordsServer {
       get: (principal, args, signal) => store.get(principal, args.args, { signal }),
       fold: (principal, args, signal) => store.fold(principal, args.args, { signal }),
       list: (principal, args, signal) => store.list(principal, args.args, { signal }),
+      anchor: (principal, args, signal) => store.anchor(principal, args.args, { signal }),
+      // One verify at a time, and no queue (#118 S3): a scan reads the whole table, so while one runs
+      // another caller gets a retryable RECORD_BUSY at once and nothing of its request is kept.
+      verify: async (principal, args, signal) => {
+        if (this.#verifying) throw new RecordsServiceError("records.verify is already running; retry in a few seconds", "RECORD_BUSY", true);
+        this.#verifying = true;
+        try { return await store.verify(principal, args.args, { signal }); } finally { this.#verifying = false; }
+      },
       page: (_principal, args, signal) => store.page(pageArgs(ownArgs(args), store.origin), signal),
       byIds: (_principal, args, signal) => store.byIds(ids(args.ids), signal),
       // A consumer's cursor is always the caller's own.

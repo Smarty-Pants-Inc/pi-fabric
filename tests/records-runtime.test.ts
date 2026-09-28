@@ -105,6 +105,35 @@ describe.skipIf(!postgresBin)("records in a Fabric runtime", () => {
       expect(fs.readdirSync(path.join(cwd, "agent", "fabric", "records-credentials"))).toHaveLength(1);
       // The runtime's own ask is not delivered back to it (a consumer skips its own records).
       expect((await runtime.nextRecordsInbox(recordsInboxSession(entries)))?.records).toEqual([]);
+
+      // The hash chain (#754 R3) through guest code: clean as appended, then broken by a superuser edit.
+      const verify = async () => {
+        const run = await runtime.execution.execute({
+          code: "const anchor = await records.anchor(); return { anchor, result: await records.verify({ anchors: [{ seq: anchor.seq, hash: anchor.hash as string }] }) };",
+          context, signal: undefined, parentToolCallId: "records-verify", onPartial() {},
+        });
+        expect(run.success, run.error ?? JSON.stringify(run.typeErrors)).toBe(true);
+        return run.value as { anchor: { seq: number; hash: string }; result: { ok: boolean; clean: boolean; break?: unknown; summary: string } };
+      };
+      const clean = await verify();
+      expect(clean.anchor).toMatchObject({ org: "smarty-pants", seq: 2 });
+      expect(clean.result).toMatchObject({ ok: true, clean: true });
+      const superuser = new pg.Pool({ ...server.connection, max: 1 });
+      try {
+        await superuser.query("ALTER TABLE records DISABLE TRIGGER records_no_update_delete");
+        await superuser.query("UPDATE records SET text = 'forged' WHERE seq = 1");
+        await superuser.query("ALTER TABLE records ENABLE TRIGGER records_no_update_delete");
+      } finally { await superuser.end(); }
+      const broken = (await runtime.execution.execute({
+        // The guest type names every break reason, the membership ones included (a comparison with a
+        // reason missing from the type fails the type check).
+        code: `const result = await records.verify({ anchors: [${JSON.stringify({ seq: clean.anchor.seq, hash: clean.anchor.hash })}] });
+          const foreign = result.break?.reason === "org" || result.break?.reason === "origin";
+          return { ...result, foreign };`,
+        context, signal: undefined, parentToolCallId: "records-verify-2", onPartial() {},
+      })).value as { ok: boolean; break?: { seq: number; reason: string }; summary: string; foreign: boolean };
+      expect(broken).toMatchObject({ ok: false, break: { seq: 2, reason: "prev_hash" }, foreign: false });
+      expect(broken.summary).toMatch(/^chain broken at smarty-pants seq 2/);
     } finally {
       await runtime.shutdown();
       vi.unstubAllEnvs();

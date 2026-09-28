@@ -101,6 +101,8 @@ export class RecordsService {
       get: (principal, args, options) => client.get(principal, args, options),
       fold: (principal, args, options) => client.fold(principal, args, options),
       list: (principal, args, options) => client.list(principal, args, options),
+      anchor: (principal, args, options) => client.anchor(principal, args, options),
+      verify: (principal, args, options) => client.verify(principal, args, options),
     };
   }
 

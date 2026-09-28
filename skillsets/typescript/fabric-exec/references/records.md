@@ -31,6 +31,8 @@ const receipt = await records.append({
   continues: `records.fold({ ref, part, after: state.more[part] })`, then each page's `next`.
 - `records.list({ repo?, open?, owner?, hasOpenAsk?, updatedSince? })` is a view query, never a delivery path.
 - `records.status()` shows the frontier, unpublished nudges and archive admission.
+- `records.anchor()` gives `{ org, seq, hash }` of the last record; `records.verify({ anchors })` recomputes the hash
+  chain and checks those anchors: `ok` (no break, anchors hold), `clean` (also no `unanchored` rows), `summary`.
 
 ## Trust boundary
 

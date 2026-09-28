@@ -767,6 +767,150 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await again.append({ id: ALICE }, { ref: REF, kind: "status", key: "after-close", text: "must not land" })).sequence).toBe(1);
   });
 
+  it("verifies with the empty-chain anchor over the socket and the CLI, alone and beside a later anchor (#118 F1)", async () => {
+    const { config } = await freshService();
+    const alice = await connect(config, ALICE);
+    const empty = await alice.anchor({ id: "x" });
+    expect(empty).toMatchObject({ seq: 0, hash: null });
+    expect(await alice.verify({ id: "x" }, { anchors: [empty] })).toMatchObject({ ok: true, clean: true, rows: 0, anchors: { checked: 0, failed: 0 } });
+    await alice.append({ id: "x" }, { ref: REF, kind: "status", key: "s1", text: "one", data: { state: "in progress" } });
+    const later = await alice.anchor({ id: "x" });
+    expect(await alice.verify({ id: "x" }, { anchors: [empty] })).toMatchObject({ ok: true, clean: false, unanchored: { from: 1, to: 1 } });
+    expect(await alice.verify({ id: "x" }, { anchors: [empty, later] })).toMatchObject({ ok: true, clean: true, anchors: { checked: 1, passed: 1, failed: 0 } });
+    // A null or malformed hash that is not exactly the empty-chain anchor is refused, never skipped.
+    for (const bad of [{ seq: 1, hash: null }, { seq: 0, hash: "a".repeat(64) }, { seq: 0 }, { seq: 1, hash: "A".repeat(64) }]) {
+      await expect(alice.verify({ id: "x" }, { anchors: [empty, later, bad] })).rejects.toThrow(/anchor/);
+    }
+    // The CLI, as the adapter would run it: the anchor lines it printed, saved to a file.
+    const file = path.join(dir, `anchors-${databases}.jsonl`);
+    fs.writeFileSync(file, `${JSON.stringify(empty)}\n${JSON.stringify(later)}\n`);
+    const cfg = path.join(dir, `service-${databases}.json`);
+    fs.writeFileSync(cfg, JSON.stringify(config));
+    const main = path.resolve(__dirname, "../src/records/service-main.ts");
+    const cli = spawnSync("bun", [main, "verify-chain", "--config", cfg, "--anchors", file], { encoding: "utf8" });
+    expect(cli.status, cli.stderr).toBe(0);
+    expect(JSON.parse(cli.stdout)).toMatchObject({ ok: true, clean: true });
+    const printed = spawnSync("bun", [main, "anchor", "--config", cfg], { encoding: "utf8" });
+    expect(JSON.parse(printed.stdout)).toMatchObject({ seq: 1, hash: later.hash });
+  });
+
+  it("answers 10000 anchors in one bounded response, all passing or all failing, and the connection stays usable (#118 F2)", async () => {
+    const { config } = await freshService();
+    const alice = await connect(config, ALICE);
+    for (let n = 1; n <= 3; n++) await alice.append({ id: "x" }, { ref: REF, kind: "status", key: `s${n}`, text: `${n}`, data: { state: "in progress" } });
+    const anchor = await alice.anchor({ id: "x" });
+    // As the adapter writes them (org and at included): the client sends only {seq, hash}.
+    const passing = Array.from({ length: 10_000 }, () => anchor);
+    const good = await alice.verify({ id: "x" }, { anchors: passing });
+    expect(good).toMatchObject({ ok: true, clean: true, anchors: { checked: 10_000, passed: 10_000, failed: 0 }, failedAnchors: [] });
+    const failing = Array.from({ length: 10_000 }, (_, n) => ({ seq: n + 1, hash: "f".repeat(64) }));
+    const bad = await alice.verify({ id: "x" }, { anchors: failing });
+    expect(bad).toMatchObject({ ok: false, clean: false, anchors: { checked: 10_000, passed: 0, failed: 10_000 } });
+    expect(bad.failedAnchors).toHaveLength(20);
+    expect(bad.failedAnchors[0]).toEqual({ seq: 1, hash: "f".repeat(64), found: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(bad.summary).toContain("(10000 of 10000 anchors fail)");
+    expect(Buffer.byteLength(JSON.stringify(bad))).toBeLessThan(16 * 1024);
+    // More than the bound is refused with a clear error, before it reaches the socket.
+    await expect(alice.verify({ id: "x" }, { anchors: [...passing, anchor] })).rejects.toThrow(/at most 10000/);
+    // The same connection still answers.
+    expect((await alice.read({ id: "x" }, { after: 0 })).frontier).toBe(3);
+  });
+
+  it("never verifies clean while a row of another org or origin is in the table, and no reader serves it (#118 S2)", async () => {
+    const { config, owner } = await freshService();
+    const alice = await connect(config, ALICE);
+    const relay = await operator(config, owner, "relay:fabric");
+    const me = { id: "x" };
+    await alice.append(me, { ref: REF, kind: "issue", key: "i1", data: { title: "t", body: "the real body" } });
+    await alice.append(me, { ref: REF, kind: "status", key: "s1", text: "1", data: { state: "in progress" } });
+    const anchor = await alice.anchor(me);
+    // The unanchored tail: a newer issue body and status, which the folds and the list reduce over.
+    const tailIssue = await alice.append(me, { ref: REF, kind: "issue", key: "i2", data: { body: "tail body" } });
+    await alice.append(me, { ref: REF, kind: "status", key: "s2", text: "2", data: { state: "done" } });
+    const superuser = async (sql: string) => {
+      const client = await owner.connect();
+      try { await client.query("SET session_replication_role = replica"); await client.query(sql); } finally { await client.query("RESET session_replication_role"); client.release(); }
+    };
+    const readers = (): [string, () => Promise<unknown>][] => [
+      ["read", () => alice.read(me, { after: 0 })],
+      ["get", () => alice.get(me, { ref: REF })],
+      ["get history", () => alice.get(me, { ref: REF, after: 0 })],
+      ["fold statuses", () => alice.fold(me, { ref: REF, part: "statuses" })],
+      ["fold decisions", () => alice.fold(me, { ref: REF, part: "decisions" })],
+      ["list", () => alice.list(me, {})],
+      ["byIds", () => alice.byIds([tailIssue.id])],
+      ["relay claim", () => relay.claimPublications(10)],
+      ["anchor", () => alice.anchor(me)],
+      ["append", () => alice.append(me, { ref: REF, kind: "comment", key: `c-${Math.random()}`, text: "x" })],
+    ];
+    const refused = async () => {
+      for (const [name, call] of readers()) await expect(call(), name).rejects.toMatchObject({ code: "RECORD_INTEGRITY" });
+    };
+    // Before tampering every reader serves the tail's state.
+    expect((await alice.get(me, { ref: REF })).state).toMatchObject({ body: "tail body" });
+    for (const [name, call] of readers()) await expect(call(), name).resolves.toBeDefined();
+
+    await superuser("UPDATE records SET data = '{\"body\": \"forged body\"}'::jsonb WHERE key = 'i2'");
+    await superuser("UPDATE records SET data = '{\"state\": \"blocked\"}'::jsonb WHERE key = 's2'");
+    // A foreign org that sorts after the service's, then one that sorts before it.
+    for (const org of ["zz-elsewhere", "aa-elsewhere"]) {
+      await superuser(`UPDATE records SET org = '${org}' WHERE key IN ('i2', 's2')`);
+      const moved = await alice.verify(me, { anchors: [anchor] });
+      expect(moved).toMatchObject({ ok: false, clean: false, break: { reason: "org", expected: "smarty-pants", found: org } });
+      expect(moved.summary).toMatch(/^unexpected org at seq \d+/);
+      await refused();
+    }
+
+    // Another origin instead (org restored): verify fails and every reader still refuses.
+    await superuser("UPDATE records SET org = 'smarty-pants', origin = 'dev9' WHERE key IN ('i2', 's2')");
+    expect(await alice.verify(me, { anchors: [anchor] })).toMatchObject({ ok: false, clean: false, break: { reason: "origin", expected: "dev1", found: "dev9" } });
+    await refused();
+
+    // The counterexample: with the foreign rows gone, readers serve again (the membership guard
+    // alone does not block), and verify still reports the deletion as a gap after the anchor.
+    await superuser("DELETE FROM records WHERE origin = 'dev9'");
+    expect((await alice.get(me, { ref: REF })).state).toMatchObject({ body: "the real body" });
+    expect(await alice.verify(me, { anchors: [anchor] })).toMatchObject({ ok: false, anchors: { passed: 1 }, break: { reason: "gap" } });
+  });
+
+  it("answers a second verify with a retryable RECORD_BUSY while a scan runs, keeps no queue, and frees on cancel (#118 S3)", async () => {
+    const { config, service } = await freshService();
+    const alice = await connect(config, ALICE);
+    const bob = await connect(config, BOB);
+    await alice.append({ id: "x" }, { ref: REF, kind: "status", key: "s1", text: "1", data: { state: "in progress" } });
+    const real = service.store.verify.bind(service.store);
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    // The first scan stays pending until its caller cancels it.
+    service.store.verify = (_principal, _args, options = {}) => new Promise((_resolve, reject) => {
+      started();
+      options.signal?.addEventListener("abort", () => reject(options.signal!.reason), { once: true });
+    });
+    const cancel = new AbortController();
+    const first = alice.verify({ id: "x" }, {}, { signal: cancel.signal });
+    first.catch(() => undefined);
+    await running;
+    const anchors = Array.from({ length: 10_000 }, (_, n) => ({ seq: n + 1, hash: "a".repeat(64) }));
+    const crowd = await Promise.allSettled(Array.from({ length: 50 }, (_, n) => (n % 2 ? alice : bob).verify({ id: "x" }, { anchors })));
+    for (const outcome of crowd) {
+      expect(outcome.status).toBe("rejected");
+      expect((outcome as PromiseRejectedResult).reason).toMatchObject({ code: "RECORD_BUSY", retryable: true });
+    }
+    // Unrelated calls still work while the scan is pending.
+    expect((await bob.read({ id: "x" }, { after: 0 })).frontier).toBe(1);
+    cancel.abort(new Error("caller gone"));
+    await expect(first).rejects.toThrow(/caller gone/);
+    service.store.verify = real;
+    // The cancelled scan released the slot: the next verify runs.
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const result = await alice.verify({ id: "x" }, {}).catch((error: { code?: string }) => error);
+      if ((result as { code?: string }).code !== "RECORD_BUSY") { expect(result).toMatchObject({ ok: true, rows: 1 }); break; }
+      expect(Date.now()).toBeLessThan(deadline);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  });
+
   it("closes promptly while an archive check is running", async () => {
     const { service } = await freshService({ admission: { targets: [{ name: "stuck", command: [process.execPath, "-e", "setTimeout(() => {}, 60000)"] }], alarmSeconds: 120, refuseSeconds: 300, refreshMs: 30_000 } });
     const tick = service.watchdog.tick().catch((error: unknown) => error);

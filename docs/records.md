@@ -172,6 +172,30 @@ const health = await records.status();
   boards and alarms, newest update first, with up to 20 authors' statuses and 20 open asks per item (and their
   counts). It is never a delivery path.
 
+## The hash chain and anchors (#754 R3)
+
+The record is append-only and tamper-evident. Each record's `prev_hash` is the SHA-256 of the org's previous
+record's canonical bytes: the UTF-8 of the stored row as JSON with sorted keys, every column in its PostgreSQL text
+form (`created_at` as its exact epoch, `extract(epoch FROM created_at)::text`: seconds with six decimals, era-complete,
+`Infinity`/`-Infinity` spelled out), NULL as `null`. The append sets it inside its transaction,
+under the per-org lock; migration v3 backfilled the rows before it. The first record's `prev_hash` is NULL.
+
+- `records.anchor()` (or `service-main anchor --config FILE`) returns `{ org, seq, hash, at }` for the last record.
+  The backup adapter writes it to every backup target on each run: at least every 5 min on the admission target,
+  daily on the others. A copy off the host is what makes a rewrite of the whole chain detectable.
+- `records.verify({ anchors })` (or `service-main verify-chain --config FILE --anchors FILE`, exit 0 clean, 1 broken,
+  3 unanchored) recomputes the chain from one snapshot and reports the first `break` (`org`, `seq`, `reason`
+  `prev_hash` or `gap`, `expected`, `found`), checks each anchor (the row at that seq exists with that hash), and
+  reports `unanchored: { from, to }` for rows after the latest anchor. It scans the whole table: a row of another org
+  or origin is a break (`unexpected org at seq N`). While such a row is in the table, every other call that reads or
+  appends records (read, get, fold, list, byIds, anchor, append, the relay's claim) refuses with `RECORD_INTEGRITY`. One verify runs at a time;
+  another caller meanwhile gets a retryable `RECORD_BUSY` at once (no queue). It takes at most 10000 anchors; the
+  result counts them (`anchors: { checked, passed, failed }`) and lists only the first 20 failures (`failedAnchors`), so
+  it stays small. The empty-chain anchor `{ seq: 0, hash: null }` (before the first record) is valid and vouches for
+  nothing; any other null or malformed hash is refused. `ok` means no break and every anchor holds;
+  `clean` also needs no unanchored rows. An edit after the latest anchor that no later row covers shows only as
+  unanchored, so a result is clean only when it is anchored through the last row.
+
 ## Commit, then nudge
 
 Each append writes a `publication` row in its transaction. After the commit, a relay publishes it on the mesh topic

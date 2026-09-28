@@ -987,7 +987,7 @@ export const createFabricExecTool = (
           )
           .join("\n");
         const { typeErrorRecoveryHint } = await import("./type-error-guidance.js");
-        const recoveryHint = typeErrorRecoveryHint(code, result.typeErrors);
+        const recoveryHint = typeErrorRecoveryHint(code, result.typeErrors, piTools);
         const bounded = await boundModelOutput(
           `Type errors; code was not executed:\n${text}${
             recoveryHint ? `\n\n${recoveryHint}` : ""

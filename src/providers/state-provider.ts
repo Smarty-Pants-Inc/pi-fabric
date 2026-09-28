@@ -204,9 +204,13 @@ export class StateProvider implements FabricProvider {
   readonly #store: StateStore;
   readonly #identity: MeshIdentity;
 
-  constructor(store: MeshStore, identity: MeshIdentity) {
+  // Whether `pi` exists inside fabric_exec; selects the recovery hint wording.
+  readonly #piTools: () => boolean;
+
+  constructor(store: MeshStore, identity: MeshIdentity, piTools: () => boolean = () => true) {
     this.#store = new StateStore(store);
     this.#identity = identity;
+    this.#piTools = piTools;
   }
 
   get state(): StateStore {
@@ -242,7 +246,7 @@ export class StateProvider implements FabricProvider {
   async invalidArgumentsHint(actionName: string, args: Record<string, unknown>): Promise<string | undefined> {
     if (actionName !== "transition") return undefined;
     return ["label", "to", "summary"].some((key) => !Object.hasOwn(args, key))
-      ? (await import("../type-error-guidance.js")).STATE_KEY_VALUE_HINT
+      ? (await import("../type-error-guidance.js")).stateKeyValueHint(this.#piTools())
       : undefined;
   }
 

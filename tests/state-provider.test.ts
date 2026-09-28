@@ -14,9 +14,9 @@ import {
 import { StateProvider } from "../src/providers/state-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
-import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
+import { GUEST_TYPE_DECLARATIONS, guestTypeDeclarations } from "../src/runtime/guest-types.js";
 import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
-import { STATE_KEY_VALUE_HINT, typeErrorRecoveryHint } from "../src/type-error-guidance.js";
+import { stateKeyValueHint, typeErrorRecoveryHint } from "../src/type-error-guidance.js";
 
 const roots: string[] = [];
 const identity: MeshIdentity = {
@@ -1299,9 +1299,9 @@ describe("state.set key/value callers (FM-001)", () => {
     audits: [],
     maxResultChars: 10_000,
   });
-  const registry = () => {
+  const registry = (piTools = true) => {
     const registry = new ActionRegistry();
-    registry.register(new StateProvider(createStore(), identity));
+    registry.register(new StateProvider(createStore(), identity, () => piTools));
     return registry;
   };
 
@@ -1313,6 +1313,14 @@ describe("state.set key/value callers (FM-001)", () => {
     expect(error?.message).toContain("state.transition({ label, to, summary })");
     expect(error?.message).toContain("in a file (pi.write/pi.read");
     expect(error?.message).toContain("mesh.put/mesh.get only for a small value other agents must read");
+  });
+
+  it("names the native file tools in orchestration-only mode, where pi.* does not exist", async () => {
+    const error = await registry(false)
+      .invoke("state.set", { key: "x", value: 1 }, registryContext())
+      .then(() => undefined, (caught: Error) => caught);
+    expect(error?.message).toContain("in a file (your write/read tools, outside fabric_exec");
+    expect(error?.message).not.toContain("pi.");
   });
 
   it("leaves a correct transition call unchanged", async () => {
@@ -1328,6 +1336,17 @@ describe("state.set key/value callers (FM-001)", () => {
     const code = "return await state.transition({ key: 'x', value: 1 });";
     const { errors } = typeCheckFabricCode(code, GUEST_TYPE_DECLARATIONS);
     expect(errors.length).toBeGreaterThan(0);
-    expect(typeErrorRecoveryHint(code, errors)).toBe(STATE_KEY_VALUE_HINT);
+    expect(typeErrorRecoveryHint(code, errors)).toBe(stateKeyValueHint(true));
+    expect(stateKeyValueHint(true)).toContain("pi.write/pi.read");
+  });
+
+  it("adds the orchestration-only hint at type-check time without pi.*", () => {
+    const code = "return await state.transition({ key: 'x', value: 1 });";
+    const { errors } = typeCheckFabricCode(code, guestTypeDeclarations(false));
+    expect(errors.length).toBeGreaterThan(0);
+    const hint = typeErrorRecoveryHint(code, errors, false);
+    expect(hint).toBe(stateKeyValueHint(false));
+    expect(hint).toContain("your write/read tools, outside fabric_exec");
+    expect(hint).not.toContain("pi.");
   });
 });

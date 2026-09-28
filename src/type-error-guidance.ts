@@ -15,8 +15,9 @@ const UNKNOWN_PROPERTY_PATTERN = /'([^']+)' does not exist in type '([^']+)'/;
 
 // FM-001: state.set({key, value}) callers expect a key/value store. Not
 // mesh: its one shared state.json and lock serve the whole fleet (#816).
-export const STATE_KEY_VALUE_HINT =
-  "Recovery hint: state.* logs world-model transitions: state.transition({ label, to, summary }). Keep your own values between calls in a file (pi.write/pi.read, e.g. under the project's .local) or return them. Use mesh.put/mesh.get only for a small value other agents must read.";
+// `pi` exists inside fabric_exec only in full code mode (or Schema enforce).
+export const stateKeyValueHint = (piTools: boolean): string =>
+  `Recovery hint: state.* logs world-model transitions: state.transition({ label, to, summary }). Keep your own values between calls in a file (${piTools ? "pi.write/pi.read" : "your write/read tools, outside fabric_exec"}, e.g. under the project's .local) or return them. Use mesh.put/mesh.get only for a small value other agents must read.`;
 const PI_CALL_PATTERN = /\bpi\.(\w+)\s*\(/g;
 
 // fabric_exec envelope arguments that are commonly misplaced inside `code`.
@@ -122,9 +123,10 @@ const hasLiteralPayloadInterpolation = (
 export const typeErrorRecoveryHint = (
   code: string,
   errors: FabricTypeError[],
+  piTools = true,
 ): string | undefined => {
   if (errors.some((error) => error.message.includes("'FabricStateTransitionArgs'"))) {
-    return STATE_KEY_VALUE_HINT;
+    return stateKeyValueHint(piTools);
   }
   for (const error of errors) {
     const property = UNKNOWN_PROPERTY_PATTERN.exec(error.message)?.[1];

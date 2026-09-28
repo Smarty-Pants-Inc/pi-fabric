@@ -505,6 +505,30 @@ if (reviewer) await agents.setCoalesceKey({ id: reviewer.id, coalesceKey: "paylo
 
 Pass `coalesceKey` to `agents.create` for a new actor, or `null` to `agents.setCoalesceKey` to clear it.
 
+#### Activation filter
+
+An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Coalescing and queue order stay the same: the filter sees the item that would run, after coalescing.
+
+Each skip adds a record to the actor's message log: direction `in`, the event's `source`, and reason `filtered: <rule id>`. The actor status counts skips in `filteredCount` and `lastFilteredAt`.
+
+Two presets come ready to use. Each had zero false skips in 24 hours of supervisor runs (smarty-dev#1579):
+
+- `hold` skips a GitHub event (`github.*` topic) when the item's labels (`data.payload.issue.labels` or `data.payload.pull_request.labels`, whichever the event carries) include `hold`. The event that removes `hold` (action `unlabeled` with `label.name` `hold`) is always delivered. An event with no labels field is delivered. The factory's projected webhook payload has no labels today, so this rule skips only when the ingress adds them.
+- `never-message-events` skips `issues.field_added`, `issues.typed` and `issue_comment.deleted` GitHub events, `host:tool_error`, and `ops.owner` events of kind `actions.minutes`.
+
+A custom rule is an object: `{ id, source?, topic?, kind?, where?, unless? }`. `source` (`mesh:<topic>` or `host:<event>`), `topic` and `kind` are lists of names; a trailing `*` matches a prefix. `where` is a list of predicates that must all match. `unless` is the rule's exception: the rule skips only when some `unless` predicate is known to be false (its field is present and does not match). For example, a held comment (action `created`) rules out the unlabel exception although a comment has no `label` field. A predicate is `{ path, equals }`, `{ path, in: [...] }` or `{ path, exists: true }`. `path` is a dotted path into the queued payload: for a mesh event that is the event itself (`topic`, `kind`, `data.payload.action`); for a host event, the event data. An array on the path fans out, so `data.payload.issue.labels.name` reads each label's name. A list of paths gives alternatives: the first path with a value is used.
+
+Unsure means deliver. A `where` predicate whose field is missing does not match. An `unless` exception that no present field rules out stays open, so an `unlabeled` event with no label name is delivered. `exists: false` is not allowed. `agents.create` and `agents.setActivationFilter` reject an invalid rule, an unknown preset or a duplicate rule id. A rule must name a source, topic, kind or `where` predicate, so no rule can skip everything.
+
+```ts
+const supervisor = (await agents.actors()).find((actor) => actor.name === "dev-supervisor");
+if (supervisor) await agents.setActivationFilter({ id: supervisor.id, activationFilter: ["hold", "never-message-events"] });
+```
+
+Pass `activationFilter` to `agents.create` for a new actor, or `null` to `agents.setActivationFilter` to clear it. A change applies from the next queued event; the counter stays.
+
+A stored filter that this version cannot read (for example, one written by a newer version or edited by hand) never removes or rewrites its actor or global template. Fabric keeps the stored value unchanged, applies no filter (every event is delivered), logs a `PI_FABRIC_ACTIVATION_FILTER` warning, and shows the reason in `activationFilterError`. Set a valid filter to repair it.
+
 ### Native asynchronous vision handoff
 
 A vision handoff does not require a separate extension that watches events. Create one persistent actor, select a multimodal model, and subscribe to `input`. Fabric automatically detects and attaches images from the prompt. Passive `steer` sends the description to Main without starting an unrelated idle turn. Set `coalesce: false` to preserve separate image prompts while the vision actor is busy:

@@ -5,7 +5,7 @@ import {
   type AppendArgs, type RecordKind,
 } from "./kinds.js";
 import { WRITER_ROLE, type SqlClient } from "./schema.js";
-import { RESPONSE_BUDGET_BYTES, withinBudget } from "./protocol.js";
+import { RecordsServiceError, RESPONSE_BUDGET_BYTES, withinBudget } from "./protocol.js";
 
 /**
  * The record layer over the org's PostgreSQL database (smarty-dev#754 §1-5).
@@ -341,6 +341,8 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       // The per-org lock: commit order equals seq, and the key check below cannot race (C3, C4).
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`fabric-records:${this.org}`]);
       await client.query("SET LOCAL synchronous_commit = on");
+      // No new record, and so no new link, on top of a table that holds another org's or origin's row.
+      await this.#member(client);
       const existing = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE org = $1 AND author = $2 AND key = $3`, [this.org, author, args.key]);
       const found = existing.rows[0];
       if (found) {
@@ -380,6 +382,24 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       this.options.onCommitted?.();
     }
     return result.receipt;
+  }
+
+  /**
+   * The membership invariant every reader and the append share with records.verify (#118 S2):
+   * the table holds only this org's and origin's rows. Four index-only min/max probes. A row of
+   * another org or origin fails the call closed (views, folds and lists included), so nothing
+   * serves a row verify would reject; only records.verify still runs, to report it.
+   */
+  async #member(client: SqlClient): Promise<void> {
+    const { rows } = await client.query<{ min_org: string | null; max_org: string | null; min_origin: string | null; max_origin: string | null }>(
+      "SELECT min(org) AS min_org, max(org) AS max_org, min(origin) AS min_origin, max(origin) AS max_origin FROM records");
+    const row = rows[0];
+    if (!row || row.min_org === null) return;
+    if (row.min_org !== this.org || row.max_org !== this.org || row.min_origin !== this.origin || row.max_origin !== this.origin) {
+      throw new RecordsServiceError(
+        `records refused: the table holds a row of another org or origin than ${this.org}/${this.origin}; run records.verify for its seq (tamper evidence, #754)`,
+        "RECORD_INTEGRITY");
+    }
   }
 
   /**
@@ -537,6 +557,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
    */
   async page(args: PageArgs, signal?: AbortSignal): Promise<RecordsPage> {
     return this.transaction(async (client) => {
+      await this.#member(client);
       const frontier = await client.query<{ seq: string }>("SELECT coalesce(max(seq), 0) AS seq FROM records WHERE origin = $1", [args.origin]);
       // Only this org's rows are served: the same membership records.verify checks (#118 S2).
       const values: unknown[] = [args.origin, args.after, args.limit, this.org];
@@ -574,6 +595,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
    */
   async claimPublications(limit: number, signal?: AbortSignal, as = `relay:${this.origin}`): Promise<{ claims: ClaimedPublication[]; more: boolean }> {
     const all = await this.transaction(async (client) => {
+      await this.#member(client);
       const { rows } = await client.query<{ claim_id: string; record_id: string; seq: string; topic: string; recipient: string | null; kind: string; ref: string; author: string; key: string; text: string | null; created_at: Date }>(
         "SELECT * FROM publication_claim($1, $2, $3, $4)", [this.origin, limit, PUBLICATION_LEASE_SECONDS, as]);
       return rows.map((row) => ({
@@ -637,6 +659,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
   async byIds(ids: readonly string[], signal?: AbortSignal): Promise<RecordEnvelope[]> {
     if (ids.length === 0) return [];
     return this.transaction(async (client) => {
+      await this.#member(client);
       const { rows } = await client.query<RecordRow>(`SELECT ${RECORD_COLUMNS} FROM records WHERE id = ANY($1::uuid[]) AND org = $2 ORDER BY seq`, [[...ids], this.org]);
       // A pending batch was cut to the budget when it was saved, so this fits the same budget.
       return withinBudget(rows.map(envelope));
@@ -654,6 +677,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     if (part === undefined || !RECORD_FOLD_PARTS.includes(part)) throw new RecordsArgumentError(`part must be one of ${RECORD_FOLD_PARTS.join(", ")}`);
     const after = optionalString("after", input.after);
     return this.transaction(async (client) => {
+      await this.#member(client);
       const page = await this.#foldPart(client, ref, part, after, RESPONSE_BUDGET_BYTES);
       return { ref, part, items: page.items, ...(page.next !== undefined ? { next: page.next } : {}) };
     }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
@@ -678,9 +702,10 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     // With a history cursor: history only, never the state again (F10). A record always fits a
     // whole budget, so each such page holds at least one record and the cursor advances.
     if (cursor !== undefined) {
-      return this.transaction(async (client) => ({ ref, ...await historyPage(client, RESPONSE_BUDGET_BYTES) }), "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
+      return this.transaction(async (client) => { await this.#member(client); return { ref, ...await historyPage(client, RESPONSE_BUDGET_BYTES) }; }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
     }
     return this.transaction(async (client) => {
+      await this.#member(client);
       const issue = await client.query<{ data: Record<string, unknown>; open: boolean }>("SELECT data, open FROM current_issue WHERE ref = $1", [ref]);
       const fields = issue.rows[0]?.data ?? {};
       const truncated: string[] = [];
@@ -790,6 +815,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       ) i ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
       ORDER BY i.updated_us DESC, i.ref DESC LIMIT ${bind(limit + 1)}`;
     return this.transaction(async (client) => {
+      await this.#member(client);
       const { rows } = await client.query<{ ref: string; data: Record<string, unknown>; open: boolean; updated_at: Date; updated_us: string; statuses: RecordsListItem["statuses"]; status_count: number; open_asks: RecordsListItem["openAsks"]; open_ask_count: number }>(sql, values);
       const page = rows.slice(0, limit).map((row) => ({
         ref: row.ref,
@@ -808,7 +834,7 @@ export class RecordStore implements RecordsBackend, RecordsOps {
   async anchor(_principal: RecordsPrincipal, input: unknown = {}, options: RecordsCallOptions = {}): Promise<RecordsAnchor> {
     if (!isObject(input ?? {})) throw new RecordsArgumentError("records.anchor takes {}");
     checkKeys("anchor", (input ?? {}) as Record<string, unknown>, []);
-    const last = await this.transaction((client) => lastHash(client, this.org), "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
+    const last = await this.transaction(async (client) => { await this.#member(client); return lastHash(client, this.org); }, "ISOLATION LEVEL REPEATABLE READ READ ONLY", options.signal);
     return { org: this.org, seq: last?.seq ?? 0, hash: last?.hash ?? null, at: new Date().toISOString() };
   }
 

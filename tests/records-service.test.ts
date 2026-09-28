@@ -707,26 +707,61 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await alice.read({ id: "x" }, { after: 0 })).frontier).toBe(3);
   });
 
-  it("never verifies clean while a row of another org or origin is in the table, and never serves it (#118 S2)", async () => {
+  it("never verifies clean while a row of another org or origin is in the table, and no reader serves it (#118 S2)", async () => {
     const { config, owner } = await freshService();
     const alice = await connect(config, ALICE);
-    for (let n = 1; n <= 3; n++) await alice.append({ id: "x" }, { ref: REF, kind: "status", key: `s${n}`, text: `${n}`, data: { state: "in progress" } });
-    const anchor = await alice.anchor({ id: "x" });
-    await alice.append({ id: "x" }, { ref: REF, kind: "comment", key: "tail", text: "the unanchored tail" });
+    const relay = await operator(config, owner, "relay:fabric");
+    const me = { id: "x" };
+    await alice.append(me, { ref: REF, kind: "issue", key: "i1", data: { title: "t", body: "the real body" } });
+    await alice.append(me, { ref: REF, kind: "status", key: "s1", text: "1", data: { state: "in progress" } });
+    const anchor = await alice.anchor(me);
+    // The unanchored tail: a newer issue body and status, which the folds and the list reduce over.
+    const tailIssue = await alice.append(me, { ref: REF, kind: "issue", key: "i2", data: { body: "tail body" } });
+    await alice.append(me, { ref: REF, kind: "status", key: "s2", text: "2", data: { state: "done" } });
     const superuser = async (sql: string) => {
       const client = await owner.connect();
       try { await client.query("SET session_replication_role = replica"); await client.query(sql); } finally { await client.query("RESET session_replication_role"); client.release(); }
     };
-    await superuser("UPDATE records SET org = 'elsewhere', text = 'forged' WHERE seq = 4");
-    const moved = await alice.verify({ id: "x" }, { anchors: [anchor] });
-    expect(moved).toMatchObject({ ok: false, clean: false, break: { seq: 4, reason: "org", expected: "smarty-pants", found: "elsewhere" } });
-    expect(moved.summary).toContain("unexpected org at seq 4");
-    // Readers keep to the same membership: the moved row is not served.
-    expect((await alice.read({ id: "x" }, { after: 0 })).records.map((record) => record.sequence)).toEqual([1, 2, 3]);
-    expect((await alice.get({ id: "x" }, { ref: REF })).history.map((record) => record.sequence)).toEqual([1, 2, 3]);
-    // Another origin in the table fails too.
-    await superuser("UPDATE records SET org = 'smarty-pants', origin = 'dev9' WHERE seq = 4");
-    expect(await alice.verify({ id: "x" }, { anchors: [anchor] })).toMatchObject({ ok: false, clean: false, break: { seq: 4, reason: "origin", found: "dev9" } });
+    const readers = (): [string, () => Promise<unknown>][] => [
+      ["read", () => alice.read(me, { after: 0 })],
+      ["get", () => alice.get(me, { ref: REF })],
+      ["get history", () => alice.get(me, { ref: REF, after: 0 })],
+      ["fold statuses", () => alice.fold(me, { ref: REF, part: "statuses" })],
+      ["fold decisions", () => alice.fold(me, { ref: REF, part: "decisions" })],
+      ["list", () => alice.list(me, {})],
+      ["byIds", () => alice.byIds([tailIssue.id])],
+      ["relay claim", () => relay.claimPublications(10)],
+      ["anchor", () => alice.anchor(me)],
+      ["append", () => alice.append(me, { ref: REF, kind: "comment", key: `c-${Math.random()}`, text: "x" })],
+    ];
+    const refused = async () => {
+      for (const [name, call] of readers()) await expect(call(), name).rejects.toMatchObject({ code: "RECORD_INTEGRITY" });
+    };
+    // Before tampering every reader serves the tail's state.
+    expect((await alice.get(me, { ref: REF })).state).toMatchObject({ body: "tail body" });
+    for (const [name, call] of readers()) await expect(call(), name).resolves.toBeDefined();
+
+    await superuser("UPDATE records SET data = '{\"body\": \"forged body\"}'::jsonb WHERE key = 'i2'");
+    await superuser("UPDATE records SET data = '{\"state\": \"blocked\"}'::jsonb WHERE key = 's2'");
+    // A foreign org that sorts after the service's, then one that sorts before it.
+    for (const org of ["zz-elsewhere", "aa-elsewhere"]) {
+      await superuser(`UPDATE records SET org = '${org}' WHERE key IN ('i2', 's2')`);
+      const moved = await alice.verify(me, { anchors: [anchor] });
+      expect(moved).toMatchObject({ ok: false, clean: false, break: { reason: "org", expected: "smarty-pants", found: org } });
+      expect(moved.summary).toMatch(/^unexpected org at seq \d+/);
+      await refused();
+    }
+
+    // Another origin instead (org restored): verify fails and every reader still refuses.
+    await superuser("UPDATE records SET org = 'smarty-pants', origin = 'dev9' WHERE key IN ('i2', 's2')");
+    expect(await alice.verify(me, { anchors: [anchor] })).toMatchObject({ ok: false, clean: false, break: { reason: "origin", expected: "dev1", found: "dev9" } });
+    await refused();
+
+    // The counterexample: with the foreign rows gone, readers serve again (the membership guard
+    // alone does not block), and verify still reports the deletion as a gap after the anchor.
+    await superuser("DELETE FROM records WHERE origin = 'dev9'");
+    expect((await alice.get(me, { ref: REF })).state).toMatchObject({ body: "the real body" });
+    expect(await alice.verify(me, { anchors: [anchor] })).toMatchObject({ ok: false, anchors: { passed: 1 }, break: { reason: "gap" } });
   });
 
   it("answers a second verify with a retryable RECORD_BUSY while a scan runs, keeps no queue, and frees on cancel (#118 S3)", async () => {

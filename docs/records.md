@@ -179,7 +179,8 @@ under the per-org lock; migration v2 backfilled the rows before it. The first re
   3 unanchored) recomputes the chain from one snapshot and reports the first `break` (`org`, `seq`, `reason`
   `prev_hash` or `gap`, `expected`, `found`), checks each anchor (the row at that seq exists with that hash), and
   reports `unanchored: { from, to }` for rows after the latest anchor. It scans the whole table: a row of another org
-  or origin is a break (`unexpected org at seq N`), and readers never serve such a row. One verify runs at a time;
+  or origin is a break (`unexpected org at seq N`). While such a row is in the table, every other call that reads or
+  appends records (read, get, fold, list, byIds, anchor, append, the relay's claim) refuses with `RECORD_INTEGRITY`. One verify runs at a time;
   another caller meanwhile gets a retryable `RECORD_BUSY` at once (no queue). It takes at most 10000 anchors; the
   result counts them (`anchors: { checked, passed, failed }`) and lists only the first 20 failures (`failedAnchors`), so
   it stays small. The empty-chain anchor `{ seq: 0, hash: null }` (before the first record) is valid and vouches for

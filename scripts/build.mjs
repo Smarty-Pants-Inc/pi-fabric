@@ -48,6 +48,7 @@ const lazyEntryPoints = [
   "src/runtime/monty-runtime.ts",
   "src/runtime/quickjs-runtime.ts",
   "src/runtime/type-checker.ts",
+  "src/type-error-guidance.ts",
   "src/speculation/scanner.ts",
   "src/speculation/python-scanner.ts",
   "src/ui/dashboard.ts",

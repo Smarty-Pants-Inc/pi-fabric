@@ -7,7 +7,6 @@ import type {
 import type { MeshIdentity, MeshStore } from "../mesh/store.js";
 import { StateStore, type StateTransitionKind } from "../state/store.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
-import { STATE_KEY_VALUE_HINT } from "../type-error-guidance.js";
 
 const STATE_ENTITY_ID = "fabric-state";
 
@@ -240,10 +239,10 @@ export class StateProvider implements FabricProvider {
     return normalizeStateArgs(actionName, args);
   }
 
-  invalidArgumentsHint(actionName: string, args: Record<string, unknown>): string | undefined {
+  async invalidArgumentsHint(actionName: string, args: Record<string, unknown>): Promise<string | undefined> {
     if (actionName !== "transition") return undefined;
     return ["label", "to", "summary"].some((key) => !Object.hasOwn(args, key))
-      ? STATE_KEY_VALUE_HINT
+      ? (await import("../type-error-guidance.js")).STATE_KEY_VALUE_HINT
       : undefined;
   }
 

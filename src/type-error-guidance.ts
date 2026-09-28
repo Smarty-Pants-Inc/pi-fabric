@@ -13,9 +13,10 @@ const TUPLE_ARITY_PATTERN = /Tuple type .* of length '[0-9]+' has no element at 
 const MISSING_NAME_PATTERN = /^Cannot find name '([^']+)'/;
 const UNKNOWN_PROPERTY_PATTERN = /'([^']+)' does not exist in type '([^']+)'/;
 
-// FM-001: state.set({key, value}) callers expect a key/value store.
+// FM-001: state.set({key, value}) callers expect a key/value store. Not
+// mesh: its one shared state.json and lock serve the whole fleet (#816).
 export const STATE_KEY_VALUE_HINT =
-  "Recovery hint: state.* is a transition log, not key/value: state.transition({ label, to, summary }). For key/value use mesh.put({ key, value }) / mesh.get({ key }).";
+  "Recovery hint: state.* logs world-model transitions: state.transition({ label, to, summary }). Keep your own values between calls in a file (pi.write/pi.read, e.g. under the project's .local) or return them. Use mesh.put/mesh.get only for a small value other agents must read.";
 const PI_CALL_PATTERN = /\bpi\.(\w+)\s*\(/g;
 
 // fabric_exec envelope arguments that are commonly misplaced inside `code`.

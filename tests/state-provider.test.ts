@@ -1305,13 +1305,14 @@ describe("state.set key/value callers (FM-001)", () => {
     return registry;
   };
 
-  it("keeps the validator text and names the transition shape and mesh.put", async () => {
+  it("keeps the validator text and points values to files, not the shared mesh", async () => {
     const error = await registry()
       .invoke("state.set", { key: "x", value: 1 }, registryContext())
       .then(() => undefined, (caught: Error) => caught);
     expect(error?.message).toContain("must have required properties label, to, summary");
     expect(error?.message).toContain("state.transition({ label, to, summary })");
-    expect(error?.message).toContain("mesh.put({ key, value })");
+    expect(error?.message).toContain("in a file (pi.write/pi.read");
+    expect(error?.message).toContain("mesh.put/mesh.get only for a small value other agents must read");
   });
 
   it("leaves a correct transition call unchanged", async () => {

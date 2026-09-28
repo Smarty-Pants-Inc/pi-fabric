@@ -1031,4 +1031,235 @@ describe("FabricControlPlane", () => {
       sender.request("host:receiver", "agent:missing", "stop"),
     ).rejects.toThrow("target already settled");
   });
+
+  // smarty-dev#816: an owner that picked a command up after its deadline rejected it as expired
+  // (4 of 2,802 commands, mostly in a fleet relaunch); the sender's manual retry worked.
+  describe("when the owner rejects a command as expired", () => {
+    const run = async (operation: "followUp" | "stop", rejection?: string) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const sender = plane(meshRoot, "host:sender");                     // a 1 s deadline
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn((command: { commandId: string }) => rejection
+        ? { accepted: false, error: rejection }
+        : { accepted: true, messageId: "delivered:" + command.commandId });
+      sender.start(() => ({ accepted: false }));
+      const outcome = sender.request("host:receiver", "agent:target", operation, { message: "late" })
+        .then(
+          (value) => ({ value, error: undefined as Error | undefined }),
+          (error: Error) => ({ value: undefined, error: error as Error | undefined }),
+        );
+      // The owner polls only after the first command's deadline; later commands are on time.
+      if (!rejection) await new Promise((resolve) => setTimeout(resolve, 1_300));
+      receiver.start(receive);
+      const settled = await outcome;
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const commands = store
+        .read({ topic: "fabric.control.command", limit: 100 })
+        .filter((event) => event.kind === operation);
+      const acks = store.read({ topic: "fabric.control.ack", limit: 100 })
+        .map((event) => event.data as { commandId: string });
+      return { ...settled, receive, commands, acks, store };
+    };
+
+    const settle = <T>(promise: Promise<T>) => promise.then(
+      (value) => ({ value, error: undefined as Error | undefined }),
+      (error: Error) => ({ value: undefined as T | undefined, error: error as Error | undefined }),
+    );
+
+    // review/astra F1 on #121: the owner delivers, then dies before its acknowledgement; a new
+    // runtime of the same host replays the command past its deadline while the sender still waits.
+    const restartPastDeadline = async (crash: "acknowledgement" | "outcome") => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const sender = plane(meshRoot, "host:sender");                     // a 1 s deadline, 2 s grace
+      const firstOwner = plane(meshRoot, "host:receiver");
+      const receive = vi.fn((command: { commandId: string }) =>
+        ({ accepted: true, messageId: "delivered:" + command.commandId }));
+      let crashed = true;
+      const publish = MeshStore.prototype.publish;
+      vi.spyOn(MeshStore.prototype, "publish").mockImplementation(async function (this: MeshStore, input) {
+        if (crashed && input.topic === "fabric.control.ack") throw new Error("owner crashed");
+        return publish.call(this, input);
+      });
+      const put = MeshStore.prototype.put;
+      vi.spyOn(MeshStore.prototype, "put").mockImplementation(async function (this: MeshStore, input) {
+        // "outcome": the claim commits, the handler runs, the outcome is never recorded.
+        if (crashed && crash === "outcome" && this.root.includes("control-seen") && input.ifVersion !== 0) {
+          throw new Error("owner crashed");
+        }
+        return put.call(this, input);
+      });
+      sender.start(() => ({ accepted: false }));
+      firstOwner.start(receive);
+      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { message: "once" }));
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledTimes(1), { timeout: 900, interval: 10 });
+      await firstOwner.close();
+      crashed = false;
+      await new Promise((resolve) => setTimeout(resolve, 1_300));         // past the deadline
+      const restarted = plane(meshRoot, "host:receiver");                 // fresh process state
+      restarted.start(receive);
+      const settled = await outcome;
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const commands = store.read({ topic: "fabric.control.command", limit: 100 })
+        .filter((event) => event.kind === "followUp");
+      const acks = store.read({ topic: "fabric.control.ack", limit: 100 }).map((event) => event.data);
+      return { ...settled, receive, commands, acks };
+    };
+
+    it("answers a delivered message's recorded outcome after an owner restart past the deadline, without a retry", async () => {
+      const { value, error, receive, commands, acks } = await restartPastDeadline("acknowledgement");
+      expect(error).toBeUndefined();
+      expect(commands).toHaveLength(1);
+      const first = commands[0]!.data as { commandId: string };
+      expect(value).toMatchObject({ acknowledged: true, messageId: "delivered:" + first.commandId });
+      expect(acks).toEqual([expect.objectContaining({ commandId: first.commandId, accepted: true })]);
+      expect(acks[0]).not.toHaveProperty("notRun");
+      expect(receive).toHaveBeenCalledTimes(1);
+    }, 15_000);
+
+    it("reports a claimed message without an outcome as indeterminate after a restart past the deadline, without a retry", async () => {
+      const { error, receive, commands, acks } = await restartPastDeadline("outcome");
+      expect(error?.message).toBe("Fabric control outcome is indeterminate after owner restart");
+      expect(commands).toHaveLength(1);
+      expect(acks).toHaveLength(1);
+      expect(acks[0]).not.toHaveProperty("notRun");
+      expect(receive).toHaveBeenCalledTimes(1);
+    }, 15_000);
+
+    // review/astra F1 round 2 on #121: a runtime before smarty-dev#643 claims only the shared key.
+    const sharedKey = (commandId: string) =>
+      "topology/control-seen/" + createHash("sha256").update(`host:receiver\0${commandId}`).digest("hex");
+    const olderRuntimeClaims = (store: MeshStore, commandId: string, acceptance?: object) => store.put({
+      key: sharedKey(commandId), identity: identity("host:receiver"), ifVersion: 0, value: {
+        format: 1, hostId: "host:receiver", commandId, targetId: "agent:target", expiresAt: Date.now() + 60_000,
+        ...(acceptance ? { acceptance } : {}),
+      },
+    });
+
+    it.each([
+      ["its outcome", { accepted: true, messageId: "older:delivered" }],
+      ["no outcome yet", undefined],
+    ])("(e) does not report notRun or retry a message an older runtime claimed and delivered, with %s", async (_, recorded) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const sender = plane(meshRoot, "host:sender");                     // a 1 s deadline
+      sender.start(() => ({ accepted: false }));
+      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { message: "once" }));
+      let commandId = "";
+      await vi.waitFor(() => {
+        commandId = (store.read({ topic: "fabric.control.command", limit: 10 })[0]?.data as { commandId: string }).commandId;
+        expect(commandId).toBeTruthy();
+      }, { timeout: 900, interval: 10 });
+      await olderRuntimeClaims(store, commandId, recorded);               // it claims and delivers
+      const olderDeliveries = 1;
+      await new Promise((resolve) => setTimeout(resolve, 1_300));         // past the deadline
+      const receiver = plane(meshRoot, "host:receiver");
+      const receive = vi.fn(() => ({ accepted: true }));
+      receiver.start(receive);
+      const { value, error } = await outcome;
+      if (recorded) expect(value).toMatchObject({ acknowledged: true, messageId: "older:delivered" });
+      else expect(error?.message).toBe("Fabric control outcome is indeterminate after owner restart");
+      const acks = store.read({ topic: "fabric.control.ack", limit: 100 }).map((event) => event.data);
+      expect(acks).toHaveLength(1);
+      expect(acks[0]).not.toHaveProperty("notRun");
+      expect(store.read({ topic: "fabric.control.command", limit: 10 }).filter((event) => event.kind === "followUp"))
+        .toHaveLength(1);
+      expect(receive.mock.calls.length + olderDeliveries).toBe(1);
+    }, 15_000);
+
+    it("(f) loses the shared claim and does not report notRun when its cached read missed a later claim", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      await store.put({ key: "unrelated", identity: identity("host:other"), value: 1 }); // a state file to cache
+      const receiver = plane(meshRoot, "host:receiver", { readCacheMs: 60_000 });
+      const receive = vi.fn(() => ({ accepted: true }));
+      receiver.start(receive);
+      await new Promise((resolve) => setTimeout(resolve, 150));           // past its one-time legacy move
+      expect(receiver.mesh.get(sharedKey("command:warm"))).toBeUndefined(); // warm: no claim
+      await olderRuntimeClaims(store, "command:warm");                     // another runtime claims, delivers
+      const olderDeliveries = 1;
+      expect(receiver.mesh.get(sharedKey("command:warm"))).toBeUndefined(); // the cache still misses it
+      const requestedAt = Date.now() - 2_000;                             // past its deadline, still answerable
+      await store.publish({
+        topic: "fabric.control.command", kind: "followUp", from: identity("host:sender"), to: "host:receiver",
+        data: { version: 1, commandId: "command:warm", targetId: "agent:target", operation: "followUp", replyTo: "host:sender",
+          message: "m", requestedAt, deadlineAt: requestedAt + 1_000 },
+      });
+      await vi.waitFor(() => expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toHaveLength(1),
+        { timeout: 3_000, interval: 20 });
+      const ack = store.read({ topic: "fabric.control.ack", limit: 10 })[0]!.data;
+      expect(ack).toMatchObject({ accepted: false, error: "Fabric control outcome is indeterminate after owner restart" });
+      expect(ack).not.toHaveProperty("notRun");
+      expect(receive.mock.calls.length + olderDeliveries).toBe(1);
+    }, 15_000);
+
+    // An owner before #121 answers the same text without reading its claim: never retried.
+    it("does not retry an expiry acknowledgement without notRun, as an older owner sends", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const sender = plane(meshRoot, "host:sender");
+      sender.start(() => ({ accepted: false }));
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { message: "old" }));
+      let command: { commandId: string } | undefined;
+      await vi.waitFor(() => {
+        command = store.read({ topic: "fabric.control.command", limit: 10 })[0]?.data as { commandId: string };
+        expect(command).toBeDefined();
+      }, { timeout: 900, interval: 10 });
+      await store.publish({
+        topic: "fabric.control.ack",
+        kind: "rejected",
+        from: identity("host:receiver"),
+        to: "host:sender",
+        data: { version: 1, commandId: command!.commandId, targetId: "agent:target", accepted: false, error: "Fabric control command expired" },
+      });
+      const { error } = await outcome;
+      expect(error?.message).toBe("Fabric control command expired");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(store.read({ topic: "fabric.control.command", limit: 10 }).filter((event) => event.kind === "followUp"))
+        .toHaveLength(1);
+    }, 15_000);
+
+    it("retries a message once with a new command, and the owner delivers it once", async () => {
+      const { value, error, receive, commands, acks, store } = await run("followUp");
+      expect(error).toBeUndefined();
+      expect(commands).toHaveLength(2);
+      const first = commands[0]!.data as { commandId: string };
+      const retry = commands[1]!.data as { commandId: string };
+      expect(first.commandId).not.toBe(retry.commandId);
+      // The owner won the shared claim for the first command, so nothing ran it: it proves notRun,
+      // and records the expiry in that claim, where every runtime, new or old, finds it.
+      expect(acks.find((ack) => ack.commandId === first.commandId))
+        .toMatchObject({ accepted: false, error: "Fabric control command expired", notRun: true });
+      expect(store.get(sharedKey(first.commandId))?.value).toMatchObject({
+        hostId: "host:receiver", commandId: first.commandId,
+        acceptance: { accepted: false, error: "Fabric control command expired", notRun: true },
+      });
+      expect(acks.find((ack) => ack.commandId === retry.commandId)).toMatchObject({ accepted: true });
+      expect(value).toMatchObject({ acknowledged: true, messageId: "delivered:" + retry.commandId });
+      expect(receive).toHaveBeenCalledTimes(1);
+    }, 15_000);
+
+    it("does not retry a command that is not a message", async () => {
+      const { error, receive, commands } = await run("stop");
+      expect(error?.message).toBe("Fabric control command expired");
+      expect(commands).toHaveLength(1);
+      expect(receive).not.toHaveBeenCalled();
+    }, 15_000);
+
+    it("does not retry a message the owner rejected for another reason", async () => {
+      const { error, receive, commands } = await run("followUp", "target already settled");
+      expect(error?.message).toBe("target already settled");
+      expect(commands).toHaveLength(1);
+      expect(receive).toHaveBeenCalledTimes(1);
+    }, 15_000);
+  });
 });

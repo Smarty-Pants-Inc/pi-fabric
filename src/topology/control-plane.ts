@@ -8,6 +8,7 @@ const ACK_TOPIC = "fabric.control.ack";
 const CONTROL_SEEN_PREFIX = "topology/control-seen/";
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
+const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 // The sender keeps waiting this long past the command deadline. The owner admits a
@@ -54,6 +55,15 @@ export interface FabricControlAcceptance {
   replacedMessageId?: string;
   result?: unknown;
   error?: string;
+  /** The owner proves the handler did not run for this command, so a new command cannot deliver twice. */
+  notRun?: true;
+}
+
+/** An owner's rejection; `notRun` only when the owner proved the handler did not run. */
+class FabricControlRejection extends Error {
+  constructor(message: string, readonly notRun: boolean) {
+    super(message);
+  }
 }
 
 export interface FabricControlResult {
@@ -249,7 +259,7 @@ export class FabricControlPlane {
     input: FabricControlInput = {},
     ownerIdentityId = ownerHostId,
   ): Promise<FabricControlResult> {
-    const { commandId, acceptance } = await this.#requestAcceptance(
+    const send = () => this.#requestAcceptance(
       ownerHostId,
       targetId,
       operation,
@@ -257,6 +267,24 @@ export class FabricControlPlane {
       ownerIdentityId,
       { timeoutMs: this.#ackTimeoutMs },
     );
+    let sent;
+    try {
+      sent = await send();
+    } catch (error) {
+      // ponytail: one retry, for messages only, and only when the owner proves the handler did
+      // not run (notRun: no claim and no outcome for the command; see #acceptCommand). The
+      // expiry text alone proves nothing: an owner restarted past the deadline, or an older
+      // owner, answers it without reading its claim (review/astra F1 on #121). An owner that
+      // picks commands up late (a fleet relaunch) expired 4 of 2,802 commands, and a manual
+      // retry 6 s later worked (smarty-dev#816). A second expiry means the owner is stuck.
+      if (
+        (operation !== "steer" && operation !== "followUp") ||
+        !(error instanceof FabricControlRejection) ||
+        !error.notRun
+      ) throw error;
+      sent = await send();
+    }
+    const { commandId, acceptance } = sent;
     return {
       queued: true,
       messageId: acceptance.messageId ?? commandId,
@@ -380,7 +408,10 @@ export class FabricControlPlane {
       }
       const acknowledged = await acceptance;
       if (!acknowledged.accepted) {
-        throw new Error(acknowledged.error || "Remote Fabric owner rejected command for " + targetId);
+        throw new FabricControlRejection(
+          acknowledged.error || "Remote Fabric owner rejected command for " + targetId,
+          acknowledged.notRun === true,
+        );
       }
       return { commandId, acceptance: acknowledged };
     } catch (error) {
@@ -506,6 +537,7 @@ export class FabricControlPlane {
         ? { result: event.data.result }
         : {}),
       ...(typeof event.data.error === "string" ? { error: event.data.error } : {}),
+      ...(event.data.accepted !== true && event.data.notRun === true ? { notRun: true as const } : {}),
     });
   }
 
@@ -537,12 +569,46 @@ export class FabricControlPlane {
       // is history: a restarting owner replays the retained log from its start, and
       // answering every past command added one locked publish each, thousands per
       // relaunch wave (smarty-dev#367). Only a sender that may still wait gets an answer.
-      if (answerable) {
-        await this.#publishAcknowledgement(command, {
-          accepted: false,
-          error: "Fabric control command expired",
-        });
+      if (!answerable) return;
+      // An owner restarted past the deadline may have run it before, and a runtime before
+      // smarty-dev#643 claims only the shared key. No read proves it did not run (a read can be
+      // cached, and a claim can land after it): this runtime wins the shared claim first, with
+      // the same create-only put as admission, and records the expiry in it. Then no runtime,
+      // new or old, can claim or run it. Otherwise the claim holder's record answers, never
+      // notRun (review/astra F1 on #121). A runtime that admitted it in time and claims it now
+      // expires it before the handler (see #executeClaimedCommand).
+      const ownRecord = (record: FabricControlSeenRecord | undefined) =>
+        record?.hostId === this.options.hostId && record.commandId === command.commandId &&
+          record.targetId === command.targetId ? record : undefined;
+      const indeterminate = { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" };
+      const local = ownRecord(controlSeenRecord(this.#seen.get(key)?.value));
+      let acceptance: FabricControlAcceptance;
+      if (local) acceptance = local.acceptance ?? indeterminate;
+      else {
+        const expired = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true } as const;
+        try {
+          await this.mesh.put({
+            key,
+            value: {
+              format: 1,
+              hostId: this.options.hostId,
+              commandId: command.commandId,
+              targetId: command.targetId,
+              expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
+              ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
+              acceptance: expired,
+            } satisfies FabricControlSeenRecord,
+            identity: this.identity,
+            ifVersion: 0,
+          });
+          acceptance = expired;
+        } catch (error) {
+          if (isLockTimeout(error)) throw error;
+          acceptance = ownRecord(controlSeenRecord(this.mesh.get(key, { fresh: true })?.value))?.acceptance ??
+            indeterminate;
+        }
       }
+      await this.#publishAcknowledgement(command, acceptance);
       return;
     }
 
@@ -671,8 +737,9 @@ export class FabricControlPlane {
       let acceptance: FabricControlAcceptance;
       try {
         // The claim can wait for a lock, or this process can pause after it commits: the deadline
-        // may have passed since admission. An expired command is recorded, not run.
-        if (Date.now() > deadlineAt) acceptance = { accepted: false, error: "Fabric control command expired" };
+        // may have passed since admission. An expired command is recorded, not run: notRun, as
+        // this runtime holds the claim and the handler did not run.
+        if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
         else acceptance = this.#handler
           ? await this.#handler(command, from, controller.signal)
           : { accepted: false, error: "Fabric owner has no control handler" };
@@ -837,6 +904,7 @@ export class FabricControlPlane {
             ? { result: acceptance.result }
             : {}),
           ...(acceptance.error ? { error: acceptance.error } : {}),
+          ...(!acceptance.accepted && acceptance.notRun ? { notRun: true } : {}),
         },
       })
       .catch((error: unknown) => {

@@ -95,6 +95,7 @@ export const parseWorkerOptions = (
   const branch = optional(args, "branch");
   const worktree = optional(args, "worktree");
   const maxTokens = optional(args, "max-tokens");
+  const nice = optional(args, "nice");
   const carryOverSource = optional(args, "carry-over");
   const runnerSessionId = optional(args, "runner-session-id");
   const inheritedSessionPinsSource = optional(args, "inherited-session-pins");
@@ -195,6 +196,7 @@ export const parseWorkerOptions = (
     ...(branch ? { branch } : {}),
     ...(worktree ? { worktree } : {}),
     ...(maxTokens ? { maxTokens: Number(maxTokens) } : {}),
+    ...(nice ? { nice: Number(nice) } : {}),
     ...(carryOver ? { carryOver } : {}),
     ...(inheritedSessionPins && inheritedSessionPins.length > 0 ? { inheritedSessionPins } : {}),
   };

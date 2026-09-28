@@ -80,6 +80,7 @@ import {
   sweepTempRunRoots,
 } from "../storage/retention.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
+import { effectiveAgentNice, parseAgentNice } from "./priority.js";
 import {
   isFabricLifecycleEventType,
   type FabricLifecycleEventType,
@@ -694,6 +695,7 @@ export class AgentManager {
     if (request.inferenceContext === "activation" && (runner !== "pi" || !request.sessionFile || !request.actorId || request.sessionSeed)) {
       throw new Error("Activation inference context requires a persistent Pi actor session");
     }
+    parseAgentNice(request.nice);
     if (request.persona && runner !== "veda") {
       throw new Error(`The persona option is only supported by the Veda runner, not ${runner}`);
     }
@@ -808,6 +810,7 @@ export class AgentManager {
         request.timeoutMs,
       );
       const thinking = request.thinking ?? this.config.thinking;
+      const nice = effectiveAgentNice(this.config.nice ?? 0, request.nice);
       const recursive = runner === "pi" && request.recursive === true;
       const extensions = recursive ? true : (request.extensions ?? this.config.extensions);
       const inheritedSessionPins = runner === "pi" && extensions
@@ -877,6 +880,7 @@ export class AgentManager {
         ...(this.config.maxTokensPerChild > 0
           ? ["--max-tokens", String(this.config.maxTokensPerChild)]
           : []),
+        ...(nice > 0 ? ["--nice", String(nice)] : []),
         "--transport",
         adapter.kind,
         ...(recursive || inheritedFullCodeMode || requiresFabricKernel

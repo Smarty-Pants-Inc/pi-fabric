@@ -222,6 +222,8 @@ export interface FabricActorRequest {
   tools?: string[];
   transport?: FabricAgentTransport;
   timeoutMs?: number;
+  /** Unix niceness 0-19 for this actor's runs; only raises agents.nice. */
+  nice?: number;
   /**
    * Fabric capability for the actor. Defaults to true (today's behavior: a Pi
    * actor is recursively Fabric-equipped with the host-required fabric_exec
@@ -280,6 +282,7 @@ export interface FabricActorInfo {
   projectDefaults?: FabricActorProjectDefaults;
   tools?: string[];
   timeoutMs?: number;
+  nice?: number;
   extensions?: boolean;
   inferenceContext?: FabricActorInferenceContext;
   requirements?: FabricCapabilityRequirement[];

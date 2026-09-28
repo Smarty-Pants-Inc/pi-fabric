@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { parseAgentNice } from "../agents/priority.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { FabricCapabilityRequirement } from "../components/types.js";
@@ -232,6 +233,7 @@ export class GlobalActorRegistry {
       ...(patch.tools !== undefined ? { tools: patch.tools } : existing.tools ? { tools: existing.tools } : {}),
       ...(patch.transport !== undefined ? { transport: patch.transport } : existing.transport ? { transport: existing.transport } : {}),
       ...(patch.timeoutMs !== undefined ? { timeoutMs: patch.timeoutMs } : existing.timeoutMs ? { timeoutMs: existing.timeoutMs } : {}),
+      ...(patch.nice !== undefined ? { nice: parseAgentNice(patch.nice) } : existing.nice !== undefined ? { nice: existing.nice } : {}),
       ...(patch.extensions !== undefined
         ? { extensions: patch.extensions }
         : typeof existing.extensions === "boolean"
@@ -319,6 +321,7 @@ export class GlobalActorRegistry {
       ...(def.tools ? { tools: [...def.tools] } : {}),
       ...(def.transport ? { transport: def.transport } : {}),
       ...(def.timeoutMs ? { timeoutMs: def.timeoutMs } : {}),
+      ...(def.nice !== undefined ? { nice: def.nice } : {}),
       ...(typeof def.extensions === "boolean" ? { extensions: def.extensions } : {}),
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
@@ -375,6 +378,7 @@ export class GlobalActorRegistry {
     const transport =
       def.transport !== undefined && TRANSPORTS.has(def.transport) ? def.transport : undefined;
     const timeoutMs = typeof def.timeoutMs === "number" ? def.timeoutMs : undefined;
+    const nice = parseAgentNice(def.nice);
     const extensions = typeof def.extensions === "boolean" ? def.extensions : undefined;
     validateActorInferenceContext(def.inferenceContext, runner);
     validateActorCoalesceKey(def.coalesceKey);
@@ -404,6 +408,7 @@ export class GlobalActorRegistry {
       ...(tools ? { tools } : {}),
       ...(transport ? { transport } : {}),
       ...(timeoutMs ? { timeoutMs } : {}),
+      ...(nice !== undefined ? { nice } : {}),
       ...(extensions !== undefined ? { extensions } : {}),
       ...(requires && requires.length > 0 ? { requires } : {}),
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
@@ -512,6 +517,7 @@ export class GlobalActorRegistry {
       const transport: FabricAgentTransport | undefined =
         record.transport !== undefined && TRANSPORTS.has(record.transport) ? record.transport : undefined;
       const timeoutMs = typeof record.timeoutMs === "number" ? record.timeoutMs : undefined;
+      const nice = typeof record.nice === "number" && Number.isFinite(record.nice) ? parseAgentNice(record.nice) : undefined;
       const extensions = typeof record.extensions === "boolean" ? record.extensions : undefined;
       let requires: FabricCapabilityRequirement[] | undefined;
       try {
@@ -546,6 +552,7 @@ export class GlobalActorRegistry {
         ...(tools ? { tools } : {}),
         ...(transport ? { transport } : {}),
         ...(timeoutMs ? { timeoutMs } : {}),
+        ...(nice !== undefined ? { nice } : {}),
         ...(extensions !== undefined ? { extensions } : {}),
         ...(requires && requires.length > 0 ? { requires } : {}),
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),

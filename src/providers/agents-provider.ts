@@ -76,6 +76,7 @@ import { agentWaitBound, describeWaitBound } from "../agents/wait-bound.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { isFabricThinking } from "../thinking.js";
 import { normalizeAgentRunRequest } from "../agents/request.js";
+import { parseAgentNice } from "../agents/priority.js";
 import { ResidencyClient } from "../residency/client.js";
 import { ResidentActorClient } from "../residency/actor-client.js";
 import { AgentTranscriptReader } from "../ui/transcript.js";
@@ -311,6 +312,7 @@ const actorRequest = (
       ? { transport: args.transport }
       : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(args.nice !== undefined ? { nice: parseAgentNice(args.nice as number) } : {}), // non-numbers throw at runtime
     ...(typeof args.extensions === "boolean" ? { extensions: args.extensions } : {}),
     ...(args.inferenceContext !== undefined ? { inferenceContext: args.inferenceContext } : {}),
     ...(requires ? { requires } : {}),
@@ -1083,6 +1085,12 @@ export class AgentsProvider implements FabricProvider {
           return this.globalActors.update(String(args.id), { tools });
         }
         return this.actorManager.setTools(String(args.id), tools);
+      }
+      case "setNice": {
+        const nice = parseAgentNice(args.nice);
+        if (nice === undefined) throw new Error("nice is required (an integer 0-19)");
+        if (args.scope === "global") return this.globalActors.update(String(args.id), { nice });
+        return this.actorManager.setNice(String(args.id), nice);
       }
       case "setInferenceContext": {
         validateActorInferenceContext(args.inferenceContext);

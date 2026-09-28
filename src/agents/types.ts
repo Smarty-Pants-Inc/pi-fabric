@@ -83,6 +83,8 @@ export interface AgentRunRequest {
   handoffCompact?: HandoffCompactionRequest;
   /** Host-only parent /switch-account pins; not a model argument. */
   inheritedSessionPins?: InheritedSessionPin[];
+  /** Unix niceness 0-19; only raises agents.nice, never lowers it. */
+  nice?: number;
 }
 
 export interface AgentUsage {
@@ -215,6 +217,8 @@ export interface AgentWorkerOptions {
   tools: string[];
   grantedRisks: string[];
   maxTokens?: number;
+  /** Niceness applied to the spawned child (and IO priority on Linux). */
+  nice?: number;
   fabricExtensionPath?: string;
   model?: string;
   thinking?: string;

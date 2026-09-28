@@ -1248,6 +1248,24 @@ describe("ActorManager", () => {
     expect(run.mock.calls[1]![0].sessionFile).toBe(first.sessionFile);
   });
 
+  it("carries actor nice into each run, updates it with setNice, and restores it (smarty-dev#1579)", async () => {
+    const s = setup(true);
+    const run = vi.spyOn(s.agents, "run");
+    const actor = await s.actors.create({ name: "nice", instructions: "Keep quiet", extensions: false, tools: [], nice: 12 });
+    expect(actor.nice).toBe(12);
+    await s.actors.ask(actor.id, "first");
+    expect(run.mock.calls[0]![0].nice).toBe(12);
+    expect((await s.actors.setNice(actor.id, 99)).nice).toBe(19);
+    await s.actors.ask(actor.id, "second");
+    expect(run.mock.calls[1]![0].nice).toBe(19);
+    await s.actors.close();
+    const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+      actorRoot: path.join(s.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    expect(restored.status(actor.id).nice).toBe(19);
+  });
+
   it("uses event monitoring where supported and polling fallback on Windows", async () => {
     const { mesh } = setup();
     const tail = vi.spyOn(mesh, "tail");

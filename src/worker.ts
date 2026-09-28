@@ -12,6 +12,7 @@ import type {
   AgentRunRecord,
   AgentRunStatus,
 } from "./agents/types.js";
+import { applyChildPriority } from "./agents/priority.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -391,6 +392,13 @@ const main = async (): Promise<void> => {
         ? options.vedaBinary
         : options.piBinary;
 
+  // smarty-dev#1579: agents.nice lowers CPU and IO priority. This dedicated worker lowers its own
+  // spawning (main) thread before the fork, so the child, every thread it starts and its tools
+  // inherit it. Setting the child's pid after spawn races Linux per-thread priority.
+  if (options.nice) {
+    applyChildPriority(process.pid, options.nice, (message) =>
+      appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
+  }
   const child = spawnCli(childBinary, childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",

@@ -20,6 +20,8 @@ const unsupported = (participant: { id: string; status?: string }, kind: string)
 // its owner host, which acknowledges it when alive; a gone host leaves the outcome unknown.
 // ponytail: 5 min covers every lease flap seen in the fleet; a longer lapse reads as ended.
 const LAPSED_ROOT_REPLY_WINDOW_MS = 5 * 60_000;
+// A Pi session id (8-4-4-4-12). Actor and agent ids are 32 hex with no dashes, so they never match.
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Route messages using only the ownership, delivery, and binding ports needed here.
 // Says why a target cannot be resolved; the prefix stays "Unknown <label>: <id>".
 export const unknownParticipant = (
@@ -29,9 +31,10 @@ export const unknownParticipant = (
 ): Error => {
   const known = participants.lastKnown?.(id);
   if (!known) {
+    const hint = SESSION_UUID.test(id.trim()) ? `; use 'session:${id.trim()}' for a Main session` : "";
     return new Error(
       `Unknown ${label}: ${id} (no record on this mesh root: the session has ended, ` +
-        "has not joined yet, or uses another mesh root)",
+        `has not joined yet, or uses another mesh root${hint})`,
     );
   }
   const when = Number.isFinite(known.lapsedMs)
@@ -57,6 +60,17 @@ export class AgentMessageRouter {
     return known.participant;
   }
 
+  // A bare session UUID addresses its Main `session:<uuid>` when no participant has exactly
+  // that id (smarty-dev#1729). Only the same UUID is tried: never a guess across ids.
+  #sessionTarget(id: string): string {
+    const bare = id.trim();
+    if (!SESSION_UUID.test(bare) || this.participants.get(bare)) return id;
+    const session = `session:${bare}`;
+    return this.mainAgent.matches(session) || this.participants.get(session) || this.#recentlyLapsedRoot(session)
+      ? session
+      : id;
+  }
+
   async routeMessage(
     id: string,
     message: string,
@@ -69,6 +83,7 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    id = this.#sessionTarget(id);
     const isMain = this.mainAgent.matches(id);
     const remoteRoot = isMain ? undefined : this.participants.get(id) ?? this.#recentlyLapsedRoot(id);
     // Project members include peer roots, not just this host's Main and actors.

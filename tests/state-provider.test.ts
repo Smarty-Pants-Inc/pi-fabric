@@ -13,6 +13,10 @@ import {
 } from "../src/state/store.js";
 import { StateProvider } from "../src/providers/state-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
+import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
+import { STATE_KEY_VALUE_HINT, typeErrorRecoveryHint } from "../src/type-error-guidance.js";
 
 const roots: string[] = [];
 const identity: MeshIdentity = {
@@ -1285,5 +1289,44 @@ describe("StateProvider", () => {
     await expect(provider.invoke("bogus", {}, context)).rejects.toThrow(
       "Unknown state action: bogus",
     );
+  });
+});
+
+describe("state.set key/value callers (FM-001)", () => {
+  const registryContext = () => ({
+    ...context,
+    approve: async () => {},
+    audits: [],
+    maxResultChars: 10_000,
+  });
+  const registry = () => {
+    const registry = new ActionRegistry();
+    registry.register(new StateProvider(createStore(), identity));
+    return registry;
+  };
+
+  it("keeps the validator text and names the transition shape and mesh.put", async () => {
+    const error = await registry()
+      .invoke("state.set", { key: "x", value: 1 }, registryContext())
+      .then(() => undefined, (caught: Error) => caught);
+    expect(error?.message).toContain("must have required properties label, to, summary");
+    expect(error?.message).toContain("state.transition({ label, to, summary })");
+    expect(error?.message).toContain("mesh.put({ key, value })");
+  });
+
+  it("leaves a correct transition call unchanged", async () => {
+    const result = (await registry().invoke(
+      "state.set",
+      { label: "init", to: "drafted", summary: "first draft" },
+      registryContext(),
+    )) as { head: { to: string } };
+    expect(result.head.to).toBe("drafted");
+  });
+
+  it("adds the hint at type-check time for {key, value}", () => {
+    const code = "return await state.transition({ key: 'x', value: 1 });";
+    const { errors } = typeCheckFabricCode(code, GUEST_TYPE_DECLARATIONS);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(typeErrorRecoveryHint(code, errors)).toBe(STATE_KEY_VALUE_HINT);
   });
 });

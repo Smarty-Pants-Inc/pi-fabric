@@ -12,6 +12,10 @@ const PROMISE_ALL_PATTERN = /\bPromise\.all\s*\(/;
 const TUPLE_ARITY_PATTERN = /Tuple type .* of length '[0-9]+' has no element at index '[0-9]+'/;
 const MISSING_NAME_PATTERN = /^Cannot find name '([^']+)'/;
 const UNKNOWN_PROPERTY_PATTERN = /'([^']+)' does not exist in type '([^']+)'/;
+
+// FM-001: state.set({key, value}) callers expect a key/value store.
+export const STATE_KEY_VALUE_HINT =
+  "Recovery hint: state.* is a transition log, not key/value: state.transition({ label, to, summary }). For key/value use mesh.put({ key, value }) / mesh.get({ key }).";
 const PI_CALL_PATTERN = /\bpi\.(\w+)\s*\(/g;
 
 // fabric_exec envelope arguments that are commonly misplaced inside `code`.
@@ -118,6 +122,9 @@ export const typeErrorRecoveryHint = (
   code: string,
   errors: FabricTypeError[],
 ): string | undefined => {
+  if (errors.some((error) => error.message.includes("'FabricStateTransitionArgs'"))) {
+    return STATE_KEY_VALUE_HINT;
+  }
   for (const error of errors) {
     const property = UNKNOWN_PROPERTY_PATTERN.exec(error.message)?.[1];
     const typeText = UNKNOWN_PROPERTY_PATTERN.exec(error.message)?.[2];

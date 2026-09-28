@@ -13,6 +13,7 @@ const SHELL_HANG_SNAPSHOT_BYTES = 8_000;
 export const SHELL_TAIL_BYTES = 1024 * 1024;
 export const SHELL_LOG_BYTES = 8 * 1024 * 1024;
 export const SHELL_COMPLETED_HANDLES = 256;
+const SHELL_SPILL_PID_WAIT_MS = 10_000;
 const SHELL_COMPLETED_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const LOG_HEADER = "[Bounded shell log: starts with retained pre-spill tail; 8 MiB total cap, then further output is omitted. Not a full-output archive.]\n";
 const LOG_TRUNCATED = "\n[Shell log truncated: disk limit reached; subsequent output omitted.]\n";
@@ -105,6 +106,7 @@ export interface FabricShellJobHandle {
   snapshotText(maxBytes?: number): string;
   persistLog(): Promise<string>;
   readPid(): Promise<number | undefined>;
+  waitForPid(timeoutMs?: number): Promise<number | undefined>;
   spill(): void;
   whenSpill(): Promise<void>;
   finish(exitCode?: number | null, footer?: string): Promise<void>;
@@ -264,6 +266,18 @@ class FabricShellJob implements FabricShellJobHandle {
       return undefined;
     })();
     return this.#pidRead;
+  }
+
+  // A spilled result must carry the pid, but a starved runner can start the shell after the
+  // hang timer and the 250 ms bounded read (smarty-dev#883). Wait for the late watch until the
+  // shell writes its pid, the job ends, or the bound passes.
+  async waitForPid(timeoutMs = SHELL_SPILL_PID_WAIT_MS): Promise<number | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    await this.readPid();
+    while (this.pid === undefined && !this.finished && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return this.pid;
   }
 
   // A shell that starts slowly (Git Bash on Windows CI can take over a second) writes its pid

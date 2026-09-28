@@ -550,7 +550,7 @@ export class PiToolsProvider implements FabricProvider {
     }
     spilled = true;
     const logPath = await job.persistLog();
-    const pid = await job.readPid();
+    const pid = await job.waitForPid();
     const elapsedMs = Date.now() - job.startedAt;
     const notice = formatShellHangNotice({
       elapsedMs,

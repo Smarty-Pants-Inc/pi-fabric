@@ -64,11 +64,13 @@ const invokeBash = async (
   return { result, jobs };
 };
 
-// A Windows shell chain costs more to start than a tight hang threshold allows,
-// and a detached shell there can be reaped before a probe observes it. The spill
+// A detached Windows shell can be reaped before a probe observes it. The spill
 // contract itself is asserted on every platform; only these probes are scoped.
 const windowsShell = process.platform === "win32";
-const SHORT_COMMAND_HANG_MS = windowsShell ? 2_000 : 80;
+// The pass-through test proves that a command which ends before the threshold is
+// returned unchanged. A tight threshold made it a race against a starved runner
+// (smarty-dev#883), so give it room far above any shell start stall.
+const SHORT_COMMAND_HANG_MS = 30_000;
 const PID_PROBE_EXACT = !windowsShell;
 
 describe("pi.bash auto-spill", () => {

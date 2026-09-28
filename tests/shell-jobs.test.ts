@@ -77,6 +77,19 @@ describe("bounded shell lifecycle", () => {
     await job.finish(0);
   });
 
+  // smarty-dev#883: on a starved Windows runner the hang timer spilled before Git Bash wrote its
+  // pid, and the spilled result carried none. The spill path waits for the late pid.
+  it("waits for a pid written after the bounded read when a job spills", async () => {
+    const job = store().begin("bash", "slow start");
+    const late = setTimeout(() => fs.writeFileSync(job.pidPath, String(process.pid)), 600);
+    try {
+      await expect(job.waitForPid()).resolves.toBe(process.pid);
+    } finally {
+      clearTimeout(late);
+      await job.finish(0);
+    }
+  });
+
   it("bounds disk logs and retires spilled PID files while retaining readable logs", async () => {
     const job = store().begin("bash", "loud");
     fs.writeFileSync(job.pidPath, String(process.pid));

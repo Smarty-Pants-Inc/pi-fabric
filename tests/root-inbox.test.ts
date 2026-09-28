@@ -26,10 +26,10 @@ const setup = () => {
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 500);
   let offset = 0;
   const clock = { now: () => Date.now() + offset, advance: (ms: number) => { offset += ms; } };
-  const inbox = (steerGraceMs = 0) =>
-    new RootInbox(mesh, me, () => [me.id, "fabric-v2"], { now: clock.now, steerGraceMs });
-  const work = (text: string, to = me.id, topic = "fleet.work.pi-fabric.1", key = text) =>
-    mesh.publish({ topic, to, kind: "ack", from: peer, text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key } });
+  const inbox = (steerGraceMs = 0, wakeCooldownMs = 5 * 60_000) =>
+    new RootInbox(mesh, me, () => [me.id, "fabric-v2"], { now: clock.now, steerGraceMs, wakeCooldownMs });
+  const work = (text: string, to = me.id, topic = "fleet.work.pi-fabric.1", key = text, kind = "ack") =>
+    mesh.publish({ topic, to, kind, from: peer, text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key } });
   const texts = (events: MeshEvent[]) => events.map((event) => event.text);
   return { mesh, clock, inbox, work, texts };
 };
@@ -150,3 +150,124 @@ describe("RootInbox", () => {
     expect(sessionHoldsInboxBatch([], ["a"])).toBe(false);
   });
 });
+
+// smarty-dev#1595: an idle Main wakes for its inbox on a timer. Every wake is a model turn
+// (smarty-dev#1579): only addressed events, at most one wake per cooldown unless one is urgent.
+describe("RootInbox.wake", () => {
+  const idle = () => true;
+  const wakes = (mesh: MeshStore) => mesh.read({ after: 0, limit: 500 }).filter((event) => event.topic === "fabric.inbox.wake");
+
+  it("wakes once for an addressed event older than the grace, and publishes one wake event", async () => {
+    const { mesh, clock, inbox, work, texts } = setup();
+    const box = inbox(60_000);
+    await box.next(held);
+    await work("addressed");
+    expect(await box.wake(held, idle)).toBeUndefined();            // inside the steer grace
+    clock.advance(61_000);
+    const batch = await box.wake(notHeld, idle);
+    expect(texts(batch!.events)).toEqual(["addressed"]);
+    // A second tick before the turn holds it: no second delivery.
+    expect(await box.wake(notHeld, idle)).toBeUndefined();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(wakes(mesh).map((event) => [event.kind, event.from.id, event.data])).toEqual([
+      ["idle-wake", me.id, { count: 1, reason: "idle", ids: batch!.events.map((event) => event.id) }],
+    ]);
+  });
+
+  it("never wakes for a broadcast without `to`, or for an event to someone else", async () => {
+    const { mesh, clock, inbox, work } = setup();
+    const box = inbox(0, 0);
+    await box.next(held);
+    await mesh.publish({ topic: "fleet.work.pi-fabric.1", kind: "p0", from: peer, text: "to everyone" });
+    await work("to another", "session:other", "fleet.work.pi-fabric.1", "k", "p0");
+    clock.advance(1);
+    expect(await box.wake(held, idle)).toBeUndefined();
+    expect(wakes(mesh)).toEqual([]);
+  });
+
+  it("wakes none for a shadow copy whose steer the session holds", async () => {
+    const { clock, inbox, work } = setup();
+    const box = inbox(0, 0);
+    await box.next(held);
+    await work("steered", me.id, "fleet.work.pi-fabric.1", "k1");
+    clock.advance(1);
+    expect(await box.wake(withSteers([{ from: peer.id, data: { key: "k1" } }]), idle)).toBeUndefined();
+  });
+
+  it("coalesces: two events a minute apart give one wake, a p0 wakes at once, and after 5 min the next batch wakes", async () => {
+    const { clock, inbox, work, texts } = setup();
+    const box = inbox(0);
+    await box.next(held);
+    await work("first");
+    clock.advance(1);
+    expect(texts((await box.wake(held, idle))!.events)).toEqual(["first"]);
+    clock.advance(60_000);
+    await work("a minute later");
+    clock.advance(1);
+    expect(await box.wake(held, idle)).toBeUndefined();
+    // The held-back event is not pending, so a p0 behind it still wakes at once, with both.
+    await work("urgent", me.id, "fleet.work.pi-fabric.2", "urgent", "p0");
+    clock.advance(1);
+    expect(texts((await box.wake(held, idle))!.events)).toEqual(["a minute later", "urgent"]);
+    await work("steer kind", me.id, "fleet.work.pi-fabric.3", "s", "steer");
+    clock.advance(1);
+    expect(texts((await box.wake(held, idle))!.events)).toEqual(["steer kind"]);
+    await work("later");
+    clock.advance(4 * 60_000);
+    expect(await box.wake(held, idle)).toBeUndefined();
+    clock.advance(60_000);
+    expect(texts((await box.wake(held, idle))!.events)).toEqual(["later"]);
+  });
+
+  it("leaves the batch pending, with no wake counted, when a turn started during the read", async () => {
+    const { mesh, clock, inbox, work, texts } = setup();
+    const box = inbox(0);
+    await box.next(held);
+    await work("raced");
+    clock.advance(1);
+    expect(await box.wake(held, () => false)).toBeUndefined();
+    // The turn that started takes it at its own start, and the next idle wake is not held back.
+    expect(texts((await box.next(notHeld)).events)).toEqual(["raced"]);
+    expect(texts((await box.wake(notHeld, idle))!.events)).toEqual(["raced"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(wakes(mesh)).toHaveLength(1);
+  });
+
+  it("wakes at once for an urgent event behind a full ordinary batch, by count or by text (review F1)", async () => {
+    const { mesh, clock, inbox, work, texts } = setup();
+    const box = inbox(0);
+    await box.next(held);
+    await work("first");
+    clock.advance(1);
+    expect(await box.wake(held, idle)).toBeDefined();               // the cooldown starts here
+    for (let index = 1; index <= 20; index++) await work(`item ${index}`);
+    await work("urgent", me.id, "fleet.work.pi-fabric.2", "urgent", "p0");
+    clock.advance(1);
+    const first = await box.wake(held, idle);
+    expect(first!.events).toHaveLength(20);
+    // The settle of that run brings the next batch, with the urgent event: none is skipped.
+    expect(texts((await box.next(held)).events)).toEqual(["urgent"]);
+    for (let index = 1; index <= 4; index++) await work(`${index}${"x".repeat(9_000)}`);
+    await work("urgent steer", me.id, "fleet.work.pi-fabric.3", "s", "steer");
+    clock.advance(1);
+    expect((await box.wake(held, idle))!.events).toHaveLength(4);
+    expect(texts((await box.next(held)).events)).toEqual(["urgent steer"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(wakes(mesh).map((event) => (event.data as { reason: string }).reason)).toEqual(["idle", "p0", "p0"]);
+    // Without an urgent event, a full batch inside the cooldown still waits.
+    for (let index = 1; index <= 21; index++) await work(`plain ${index}`);
+    clock.advance(1);
+    expect(await box.wake(held, idle)).toBeUndefined();
+  });
+
+  it("starts at the moment it becomes available, so an event before the first read is not skipped (review F3)", async () => {
+    const { clock, inbox, work, texts } = setup();
+    await work("before the root existed");
+    const box = inbox(0);
+    box.start();
+    await work("after start, before the first tick");
+    clock.advance(1);
+    expect(texts((await box.wake(held, idle))!.events)).toEqual(["after start, before the first tick"]);
+  });
+});
+

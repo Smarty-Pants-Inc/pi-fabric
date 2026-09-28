@@ -16,7 +16,8 @@ import { afterEach, describe, expect, it } from "vitest";
 // this Main that no steer delivered reaches it with its next turn, once.
 const fabricEntry = path.resolve("dist/index.js");
 const built = fs.existsSync(fabricEntry);
-const ENV_KEYS = ["PI_FABRIC_MESH_ROOT", "PI_CODING_AGENT_DIR"] as const;
+const HOST_CAPABILITIES_KEY = Symbol.for("pi-fabric.test.hostCapabilities");
+const ENV_KEYS = ["PI_FABRIC_MESH_ROOT", "PI_CODING_AGENT_DIR", "PI_FABRIC_INBOX_WAKE_MS", "PI_FABRIC_INBOX_WAKE_COOLDOWN_MS"] as const;
 
 describe.skipIf(!built)("the root inbox in a real Pi session", () => {
   const roots: string[] = [];
@@ -29,14 +30,29 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       else process.env[key] = value;
     }
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+    delete (globalThis as Record<symbol, unknown>)[HOST_CAPABILITIES_KEY];
   });
 
-  const start = async (tokensPerSecond = 1_000) => {
+  // `wake`: the idle wake ticks every 100 ms with no cooldown (smarty-dev#1595); otherwise it
+  // keeps its 15 s default and stays out of these short tests.
+  const start = async (tokensPerSecond = 1_000, wake = false, extra: { extensions?: (root: string) => string[]; warm?: boolean; wakeMs?: string; config?: unknown; optIn?: boolean } = {}) => {
+    if (wake) {
+      process.env.PI_FABRIC_INBOX_WAKE_MS = extra.wakeMs ?? "100";
+      process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS = "0";
+    } else {
+      delete process.env.PI_FABRIC_INBOX_WAKE_MS;
+      delete process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS;
+    }
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-inbox-session-")));
     roots.push(root);
     const agentDir = path.join(root, "agent");
     fs.mkdirSync(agentDir, { recursive: true });
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({}));
+    // The idle wake needs a Pi that queues a triggered message behind a live preflight. This Pi
+    // predates that capability, so a test injects it; `optIn: false` leaves it absent.
+    const capabilities = globalThis as Record<symbol, unknown>;
+    if (wake && extra.optIn !== false) capabilities[HOST_CAPABILITIES_KEY] = { triggeredMessageQueuesBehindPreflight: true };
+    else delete capabilities[HOST_CAPABILITIES_KEY];
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify(extra.config ?? {}));
     const meshRoot = path.join(root, "mesh");
     process.env.PI_FABRIC_MESH_ROOT = meshRoot;
     process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -45,7 +61,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     modelRuntime.registerNativeProvider(faux.provider);
     const loader = new DefaultResourceLoader({
       cwd: root, agentDir, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      additionalExtensionPaths: [fabricEntry],
+      additionalExtensionPaths: [fabricEntry, ...(extra.extensions?.(root) ?? [])],
     });
     await loader.reload();
     const { session } = await createAgentSession({
@@ -57,19 +73,20 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const inboxMessages = () => session.messages.filter((message) =>
       message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-inbox");
     // A peer's shadow record from two minutes ago, whose steer never arrived.
-    const missedWork = (text: string) => {
+    const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`) => {
       const log = path.join(meshRoot, "events.jsonl");
       const lines = fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : [];
       const sequence = (lines.length ? (JSON.parse(lines.at(-1)!) as { sequence: number }).sequence : 0) + 1;
       fs.appendFileSync(log, `${JSON.stringify({
         id: randomUUID(), sequence, topic: "fleet.work.pi-fabric.1", kind: "handoff",
         from: { id: "session:peer", name: "main", kind: "main", sessionId: "peer" },
-        to: `session:${session.sessionManager.getSessionId()}`,
+        ...(to ? { to } : {}),
         text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key: text }, createdAt: Date.now() - 120_000,
       })}\n`);
       fs.writeFileSync(path.join(meshRoot, "sequence"), String(sequence));
     };
     // The first turn activates Fabric; its settle starts the inbox at the present.
+    if (extra.warm === false) return { session, faux, inboxMessages, missedWork };
     faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })), fauxAssistantMessage("ready")]);
     await session.prompt("start");
     expect(inboxMessages()).toEqual([]);
@@ -141,4 +158,137 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(inboxMessages()).toHaveLength(1);
     expect(JSON.stringify(inboxMessages()[0])).toContain("Arrived while you worked.");
   }, 60_000);
+
+  // smarty-dev#1595: an idle Main reads its inbox on a timer and wakes for it, with the settle's call.
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const until = async (done: () => boolean, ms = 10_000) => {
+    const deadline = Date.now() + ms;
+    while (!done() && Date.now() < deadline) await sleep(50);
+  };
+
+  it("wakes an idle Main for an addressed work event with one new turn, and only once", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    faux.setResponses([fauxAssistantMessage("woken"), fauxAssistantMessage("extra")]);
+    missedWork("Published from a shell while you were idle.");
+    await until(() => inboxMessages().length > 0 && !session.isStreaming);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(JSON.stringify(inboxMessages()[0])).toContain("Published from a shell while you were idle.");
+    const last = session.messages.at(-1) as { role?: string; content?: unknown };
+    expect(last.role).toBe("assistant");
+    expect(JSON.stringify(last.content)).toContain("woken");
+    // More ticks: the batch is held, so it never comes again.
+    await sleep(1_000);
+    expect(inboxMessages()).toHaveLength(1);
+  }, 60_000);
+
+  it("never wakes for a broadcast without `to`, or for a shadow copy whose steer the session holds", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    faux.setResponses([fauxAssistantMessage("should not run")]);
+    await session.sendCustomMessage({
+      customType: "pi-fabric-agent-message", content: "Steered text.", display: true,
+      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text." } },
+    }, { triggerTurn: false });
+    missedWork("Steered text.");
+    missedWork("For everyone.", null);
+    await sleep(1_500);
+    expect(inboxMessages()).toEqual([]);
+    expect(session.isStreaming).toBe(false);
+  }, 60_000);
+
+  it("does not wake a busy Main: the event comes after the run settles, in a new run", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(40, true);
+    const order: string[] = [];
+    session.subscribe((event) => {
+      if (event.type === "agent_settled") order.push("settled");
+      if (event.type === "message_end" && (event.message as { customType?: string }).customType === "pi-fabric-inbox") order.push("inbox");
+    });
+    faux.setResponses([
+      () => { missedWork("Arrived while you were busy."); return fauxAssistantMessage("a long answer ".repeat(60)); },
+      fauxAssistantMessage("got it"),
+    ]);
+    await session.prompt("work");
+    await until(() => inboxMessages().length > 0 && !session.isStreaming);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(order.slice(0, 2)).toEqual(["settled", "inbox"]);
+  }, 60_000);
+
+  it("stays off after a cancelled run until the next turn starts", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(10, true);
+    faux.setResponses([
+      () => { missedWork("Waiting while you were stopped."); return fauxAssistantMessage("a long answer ".repeat(300)); },
+    ]);
+    const prompted = session.prompt("work");
+    await until(() => session.isStreaming);
+    await sleep(200);
+    await session.abort();
+    await prompted.catch(() => undefined);
+    // Many idle ticks after the cancel: none wakes the Main.
+    await sleep(1_500);
+    expect(session.isStreaming).toBe(false);
+    expect(inboxMessages()).toEqual([]);
+    faux.setResponses([fauxAssistantMessage("resumed")]);
+    await session.prompt("resume");
+    expect(inboxMessages()).toHaveLength(1);
+    // The wake is on again after that turn: a new event wakes the idle Main.
+    faux.setResponses([fauxAssistantMessage("woken again")]);
+    missedWork("After the resume.");
+    await until(() => inboxMessages().length > 1 && !session.isStreaming);
+    expect(inboxMessages()).toHaveLength(2);
+  }, 60_000);
+
+  // Review F2: Pi reports idle during a user prompt's preflight (input to agent_start). A wake
+  // there would start a run and the user's prompt would fail before it reaches the agent.
+  it("does not wake during a user prompt's preflight: the prompt runs, and the batch comes once after it", async () => {
+    const gate = globalThis as { inboxGate?: (() => Promise<void>) | undefined };
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true, {
+      extensions: (root) => {
+        const file = path.join(root, "gate.mjs");
+        fs.writeFileSync(file, "export default function (pi) { pi.on('before_agent_start', async () => { await globalThis.inboxGate?.(); }); }\n");
+        return [file];
+      },
+    });
+    // A later before_agent_start handler waits past the mesh read cache (2 s); the event arrives
+    // meanwhile, older than the grace.
+    gate.inboxGate = async () => { gate.inboxGate = undefined; missedWork("Arrived during your preflight."); await sleep(3_000); };
+    faux.setResponses([fauxAssistantMessage("answered the user"), fauxAssistantMessage("took the inbox")]);
+    try {
+      await session.prompt("the user's prompt");
+    } finally {
+      gate.inboxGate = undefined;
+    }
+    const users = session.messages.filter((message) => message.role === "user");
+    expect(JSON.stringify(users.at(-1))).toContain("the user's prompt");
+    await until(() => inboxMessages().length > 0 && !session.isStreaming);
+    await sleep(500);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(JSON.stringify(inboxMessages()[0])).toContain("Arrived during your preflight.");
+    // No run started inside the preflight: the user's prompt came first, then the inbox.
+    const userAt = session.messages.findIndex((message) => message.role === "user" && JSON.stringify(message).includes("the user's prompt"));
+    expect(userAt).toBeGreaterThan(-1);
+    expect(session.messages.indexOf(inboxMessages()[0]!)).toBeGreaterThan(userAt);
+  }, 60_000);
+
+  // Review F3: a fresh Main that announces itself at startup and has not had a turn yet: its inbox
+  // starts when it becomes available, so an event sent before the first tick still wakes it.
+  it("wakes a fresh Main, with no turn yet, for an event sent before its first tick", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true, { warm: false, wakeMs: "1500", config: { mesh: { announce: true } } });
+    faux.setResponses([fauxAssistantMessage("woken fresh")]);
+    missedWork("Sent right after you started.");
+    await until(() => inboxMessages().length > 0 && !session.isStreaming, 15_000);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(JSON.stringify(inboxMessages()[0])).toContain("Sent right after you started.");
+  }, 60_000);
+
+  it("is inert on a Pi without the preflight capability: an idle Main takes the event at its next turn", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true, { optIn: false });
+    faux.setResponses([fauxAssistantMessage("should not run"), fauxAssistantMessage("next turn")]);
+    missedWork("Waiting for your next turn.");
+    await sleep(3_000);
+    expect(inboxMessages()).toEqual([]);
+    expect(session.isStreaming).toBe(false);
+    faux.setResponses([fauxAssistantMessage("next turn")]);
+    await session.prompt("next");
+    expect(inboxMessages()).toHaveLength(1);
+  }, 60_000);
 });
+

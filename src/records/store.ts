@@ -295,6 +295,8 @@ export class RecordStore implements RecordsBackend, RecordsOps {
       await client.query("COMMIT");
       return result;
     } catch (error) {
+      // A failed COMMIT may still have committed (the reply was lost): callers must not assume either outcome.
+      if (committing && error instanceof Error) (error as Error & { commitUncertain?: boolean }).commitUncertain = true;
       if (!released) await client.query("ROLLBACK").catch(() => release(true));
       signal?.throwIfAborted();
       throw error;

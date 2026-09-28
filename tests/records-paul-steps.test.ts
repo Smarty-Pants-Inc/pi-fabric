@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -758,11 +758,29 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			await admin.end();
 			let t = "";
 			const closers: (() => Promise<unknown>)[] = [];
+			// F4: a proxy between the installer's cluster socket and the cluster. Armed, it forwards a
+			// COMMIT, then drops the reply and closes the client: PostgreSQL commits, the client sees an error.
+			// A separate process, because the installer runs synchronously.
+			const proxyDir = mkdtempSync(join(tmpdir(), "records-f4-proxy-"));
+			const arm = join(proxyDir, "armed");
+			const proxy = spawn(process.execPath, ["-e", `
+				const net = require("net"), fs = require("fs");
+				const [listen, upstream, arm] = process.argv.slice(1);
+				net.createServer((c) => {
+					const u = net.connect(upstream);
+					let cut = false;
+					c.on("data", (d) => { if (fs.existsSync(arm) && d.includes(Buffer.from("COMMIT\\0"))) cut = true; u.write(d); });
+					u.on("data", (d) => { if (cut) { c.destroy(); u.destroy(); fs.rmSync(arm, { force: true }); } else c.write(d); });
+					c.on("error", () => u.destroy()); u.on("error", () => c.destroy());
+					c.on("close", () => u.end()); u.on("close", () => c.end());
+				}).listen(listen, () => process.stdout.write("ready\\n"));
+			`, join(proxyDir, `.s.PGSQL.${server.port}`), join(server.socketDir, `.s.PGSQL.${server.port}`), arm], { stdio: ["ignore", "pipe", "inherit"] });
+			await new Promise<void>((ready) => proxy.stdout!.once("data", () => ready()));
 			try {
-				// The installer's cluster socket directory is this test's real cluster.
+				// The installer's cluster socket directory reaches this test's real cluster through the proxy.
 				const first = relayRun("plain", "tree17", (root) => {
 					mkdirSync(join(root, "run"), { recursive: true });
-					symlinkSync(server.socketDir, join(root, "run/test-org-records-pg"));
+					symlinkSync(proxyDir, join(root, "run/test-org-records-pg"));
 				}, { bundle: realBundle, port: server.port });
 				t = first.t;
 				expect(first.r.code, first.r.err + first.r.out).toBe(0);
@@ -804,14 +822,36 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 				const plain = again();
 				expect(plain.code, plain.err).toBe(0);
 				expect(plain.out).toContain(`verified relay:fabric in ${cred}`);
+				// F4: a reissue whose COMMIT commits but reports an error keeps <cred>.pending and fails;
+				// the installer rerun publishes the committed token, and the old one is refused.
+				const before = join(t, "before-f4.json");
+				cpSync(cred, before);
+				writeFileSync(arm, "");
+				const cut = spawnSync(`${t}/root/opt/test-org-records/node`, [`${t}/root/opt/test-org-records/service-main.mjs`, "issue", "--config", `${t}/root/etc/test-org-records/service.json`, "--id", "relay:fabric", "--role", "relay", "--out", cred, "--reissue"], { encoding: "utf8" });
+				expect(cut.status, cut.stderr).toBe(1);
+				expect(cut.stderr).toContain(`${cred}.pending kept; outcome unknown; rerun to reconcile`);
+				expect(existsSync(arm)).toBe(false);
+				const committed = tokenOf(`${cred}.pending`);
+				expect(readFileSync(cred, "utf8")).toBe(readFileSync(before, "utf8"));
+				expect(await claims(`${cred}.pending`)).toBe(0);
+				await expect(claims(before)).rejects.toThrow(/not known to this service/);
+				const reconciled = again();
+				expect(reconciled.code, reconciled.err + reconciled.out).toBe(0);
+				expect(reconciled.out).toContain(`recovered the pending credential of relay:fabric in ${cred}`);
+				expect(tokenOf(cred)).toBe(committed);
+				expect(tokenOf(relayFile)).toBe(committed);
+				expect(existsSync(`${cred}.pending`)).toBe(false);
+				expect(await claims(cred)).toBe(0);
 				// Counterexample: a canonical file whose token the database does not hold is refused, not reused or delivered.
 				cpSync(old, cred);
 				const dead = again();
 				expect(dead.code).toBe(1);
 				expect(dead.err).toContain(`${cred} does not hold the live token of relay:fabric; rerun issue with --reissue`);
-				expect(tokenOf(relayFile)).toBe(pendingToken);
+				expect(tokenOf(relayFile)).toBe(committed);
 			} finally {
 				for (const close of closers.reverse()) await close().catch(() => undefined);
+				proxy.kill();
+				rmSync(proxyDir, { recursive: true, force: true });
 				await server.stop();
 				if (t) rmSync(t, { recursive: true, force: true });
 			}

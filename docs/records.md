@@ -66,8 +66,9 @@ verifies the staged copies, and installs and runs only those bytes, in root-owne
 an agent can write, before or during the install, is ever run as root or as the records user. Every path comes from
 its arguments (`--package-root`, `--node`), so the script also works when copied elsewhere, such as
 `/run/smarty-step.sh`. Everything written into the org user's home is written as that user. `--help` shows each
-root step, what a rerun does, the success line and the rollback. Archiving is off until the WAL-G step, and WAL is
-bounded by `max_wal_size = 1GB` until then. PostgreSQL comes only from the distro package path, and its binaries and
+root step, what a rerun does, the success line and the rollback. Archiving is off until the WAL-G step. Until then
+`max_wal_size = 1GB` is PostgreSQL's soft checkpoint target, not a hard quota: `pg_wal` can pass it under heavy
+writes, and step 9 prints its size. PostgreSQL comes only from the distro package path, and its binaries and
 every ancestor directory must be root-owned and not group- or world-writable before anything there is run.
 
 ## Configuration
@@ -105,7 +106,8 @@ The service (`/etc/<org>-records/service.json`, written by the install script) h
 - `mirror.enabled` writes the GitHub mirror's outbox rows. With it off, no rows are written and the record is the
   only copy. A repository outside `mirror.repos` gets rows in state `skipped`.
 - `admission.targets` turns on C2 admission; without targets it is off. WAL-G is set up in its own authorized step.
-  Until then, the install's `archive_command` fails, so no WAL is thrown away and `pg_wal` grows.
+  Until then, archiving is off (`archive_mode = off`): WAL is recycled after each checkpoint, and nothing is copied
+  off this host.
 
 ## Guest API
 

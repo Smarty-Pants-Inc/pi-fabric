@@ -13,7 +13,7 @@
 # root-owned /opt/<org>-records/{node,service-main.mjs}; the units and every later command use only those copies.
 # Nothing derives a path from the script's own location: a copy at /run/smarty-step.sh behaves identically.
 #   sudo scripts/records-paul-steps.sh --org smarty-pants --org-user paul --rollback [--dry-run] [--yes-delete-records]
-# LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
+# LIMIT: archiving is off until the WAL-G step; max_wal_size = 1GB is a soft checkpoint target, not a hard WAL quota.
 #
 # ROOT STEPS (one line each):
 #  0. mktemp -d /run/<org>-records-stage.XXXXXX (root, 0700; removed on exit); copy --node and the bundle into it once each; refuse (nothing changed) unless each staged copy's sha256 equals --node-sha256/--bundle-sha256; install -d -m 0700 -o root -g root the installer state dir /var/lib/<org>-records-installer (restart-pending, root-only temp files) and refuse unless it is no symlink, root-owned, 0700, with every ancestor root-owned and not group- or world-writable
@@ -69,7 +69,7 @@ usage: records-paul-steps.sh --org <org> --org-user <orguser> --package-root DIR
                       (also --dry-run). Each source is read once into a root-only staging directory; unless the
                       staged copies match, nothing changes. Only the verified copies are installed and run.
   --print-digests     print 'bundle-sha256 <hex>  <path>' and 'node-sha256 <hex>  <path>' and exit; no root
-  LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
+  LIMIT: archiving is off until the WAL-G step; max_wal_size = 1GB is a soft checkpoint target, not a hard WAL quota.
   PostgreSQL          only the distro's /usr/lib/postgresql/<N>/bin (after apt-get install postgresql when none is
                       present); it and every ancestor must be root-owned, not symlinks, not group- or world-writable
   --rollback          undo the install in reverse order (keeps PostgreSQL installed). A real rollback deletes the
@@ -374,11 +374,11 @@ synchronous_commit = on
 fsync = on
 track_commit_timestamp = on
 # P2-5: bounded bootstrap WAL. The WAL-G step turns archiving on in its own
-# authorized change; until then no segment waits to be archived, so pg_wal stays near max_wal_size.
+# authorized change; until then no segment waits to be archived, so pg_wal usually stays near max_wal_size (a soft target).
 archive_mode = off
 max_wal_size = 1GB
 wal_keep_size = 0
-# LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
+# LIMIT: archiving is off until the WAL-G step; max_wal_size = 1GB is a soft checkpoint target, not a hard WAL quota.
 EOF
 }
 render_service_json() {
@@ -661,7 +661,7 @@ SUCCESS LINE: printed last by a real install, only after the step 9 checks pass;
   checks: systemctl is-active ${SVC_UNIT} and ${PG_UNIT}; pg_isready as ${REC};
           python3 ctypes getsockopt as ${REC} (peer audit); ${ORG_USER} cannot reach PostgreSQL; test -S ${SOCKET};
           ss -Hltnp shows no PostgreSQL TCP listener (:5432, :${PORT}); du -sh ${DATA}/pg_wal (info)
-LIMIT: archiving is off until the WAL-G step; WAL is bounded by max_wal_size = 1GB.
+LIMIT: archiving is off until the WAL-G step; max_wal_size = 1GB is a soft checkpoint target, not a hard WAL quota.
 
 ROLLBACK: as root; preview first with: ${0##*/} --org ${ORG} --org-user ${ORG_USER} --rollback --dry-run
   ${0##*/} --org ${ORG} --org-user ${ORG_USER} --rollback --yes-delete-records
@@ -810,7 +810,8 @@ else
 	CC="${T}/etc/postgresql-common"
 	[[ ! -e $CC/createcluster.conf ]] || echo "= ${CC}/createcluster.conf kept as is; the drop-in below overrides its create_main_cluster"
 	run install -d -m 0755 -o root -g root "$CC/createcluster.d"
-	# zz- sorts last: postgresql-common applies drop-ins in name order, so a later one cannot re-enable it.
+	# postgresql-common applies drop-ins in name order. zz- sorts after the usual names, but a drop-in that sorts
+	# later (for example zzz-) can still re-enable the main cluster. Step 9 fails on any PostgreSQL TCP listener.
 	write_file "$CC/createcluster.d/zz-${REC}.conf" 0644 root:root "# Written by records-paul-steps.sh: no new distro main cluster on install (it would listen on TCP).
 create_main_cluster = false"
 	run apt-get install -y postgresql
@@ -1086,7 +1087,7 @@ no_pg_tcp_listener() {
 }
 if ((DRY)); then
 	echo "? ss -Hltnp  (no PostgreSQL TCP listener: none on :5432 or :${PORT}, no postgres process on any port; else fail)"
-	echo "? du -sh ${DATA}/pg_wal  (info only: WAL size; bounded by max_wal_size = 1GB until the WAL-G step)"
+	echo "? du -sh ${DATA}/pg_wal  (info only: WAL size; max_wal_size = 1GB is a soft target, not a quota)"
 else
 	success_check "no PostgreSQL TCP listener on :5432 or :${PORT}" no_pg_tcp_listener
 	echo "WAL (info only): $(du -sh "$DATA/pg_wal" 2>/dev/null || echo "unknown ${DATA}/pg_wal")"

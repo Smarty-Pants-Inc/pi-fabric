@@ -96,6 +96,9 @@ const openPool = async (options: RecordsServiceConfig["database"]): Promise<Clie
   const { default: pg } = await import("pg");
   const pool = new pg.Pool({ ...options, max: 8, idleTimeoutMillis: 30_000, application_name: "records-service" });
   pool.on("error", () => undefined);
+  // A checked-out client whose connection drops emits "error" too: without a listener that crashes
+  // the process. The failure still reaches the caller as its rejected query.
+  pool.on("connect", (client) => { client.on("error", () => undefined); });
   return pool as unknown as ClientPool;
 };
 
@@ -152,7 +155,9 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, r
  *  2. the new credential goes to `<out>.pending` (0600, fixed name), and is fsynced;
  *  3. the database is changed;
  *  4. `<out>.pending` is renamed over `out`, and the directory fsynced.
- * A database failure removes `<out>.pending` and leaves `out` and its token as they were. Without
+ * A database failure that certainly did not commit removes `<out>.pending` and leaves `out` and its
+ * token as they were; after a failed COMMIT (outcome unknown) the pending file is kept and the call
+ * fails, so the next run's recovery publishes it if the database holds its token. Without
  * reissue an existing `out` is refused before the database is touched.
  */
 export const issueCredentialFile = async (
@@ -205,6 +210,12 @@ export const issueCredentialFile = async (
     try {
       await issuePrincipal(config, id, role, options.name, owner, options.reissue === true, token);
     } catch (error) {
+      // S2/F4: a failed COMMIT may have committed. Its pending token is kept for the next run's
+      // recovery (step 8's verify publishes it if the database holds it). It is removed only when
+      // the change certainly did not commit (an error before COMMIT was sent).
+      if ((error as { commitUncertain?: boolean }).commitUncertain === true) {
+        throw new Error(`issue ${id}: the database outcome is unknown (${error instanceof Error ? error.message : String(error)}); ${pending} kept; outcome unknown; rerun to reconcile`);
+      }
       fs.rmSync(pending, { force: true });
       throw error;
     }

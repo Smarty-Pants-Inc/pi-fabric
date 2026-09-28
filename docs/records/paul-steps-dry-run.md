@@ -139,7 +139,7 @@ scripts/records-paul-steps.sh --org smarty-pants --org-user paul --operator rela
 ? runuser -u smarty-pants-records -- /opt/smarty-pants-records/node -e 'const [f, id, role] = process.argv.slice(1); const c = JSON.parse(require("fs").readFileSync(f, "utf8")); if (c.id !== id || c.role !== role || c.issuedBy !== "installer") { console.error(`${f}: not ${id} as ${role} issued by the installer`); process.exit(1); }' /var/lib/smarty-pants-records/credentials/a118e63f0db39cd54725abe706530715a3bd5e9e269bd9fc6ed418548a49c37a.json relay:fabric relay  (stored .id, .role, .issuedBy must equal relay:fabric, relay, installer)
 + runuser -u paul -- install -d -m 0700 ~/.config/smarty-pants-records
 + runuser -u paul -- sh -c 'umask 077 && cat > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"' sh ~/.config/smarty-pants-records/relay.json < /var/lib/smarty-pants-records/credentials/a118e63f0db39cd54725abe706530715a3bd5e9e269bd9fc6ed418548a49c37a.json
-  -> relay:fabric (relay): Fabric of paul uses it with "records": { "relayCredentialFile": "~/.config/smarty-pants-records/relay.json" }.
+  -> relay:fabric (relay): Fabric of paul uses it with "records": { "enabled": true, "socket": "/run/smarty-pants-records/records.sock", "relayCredentialFile": "~/.config/smarty-pants-records/relay.json" }.
 + /opt/smarty-pants-records/node -e "$(records-paul-steps.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json importer importer:github
 + runuser -u smarty-pants-records -- /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs issue --config /etc/smarty-pants-records/service.json --id importer:github --role importer --out /var/lib/smarty-pants-records/credentials/340b97e6eed75f259ce6f2053ff8b99b683ee61dccd69f42c5d732c33215ad79.json
 ? runuser -u smarty-pants-records -- /opt/smarty-pants-records/node -e 'const [f, id, role] = process.argv.slice(1); const c = JSON.parse(require("fs").readFileSync(f, "utf8")); if (c.id !== id || c.role !== role || c.issuedBy !== "installer") { console.error(`${f}: not ${id} as ${role} issued by the installer`); process.exit(1); }' /var/lib/smarty-pants-records/credentials/340b97e6eed75f259ce6f2053ff8b99b683ee61dccd69f42c5d732c33215ad79.json importer:github importer  (stored .id, .role, .issuedBy must equal importer:github, importer, installer)
@@ -156,7 +156,7 @@ scripts/records-paul-steps.sh --org smarty-pants --org-user paul --operator rela
 ? test -S /run/smarty-pants-records/records.sock  (service socket)
 
 Fabric: point the org's agents at the service socket in .pi/fabric.json:
-  { "records": { "socket": "/run/smarty-pants-records/records.sock" } }
+  { "records": { "enabled": true, "socket": "/run/smarty-pants-records/records.sock" } }
 
 ## ROLLBACK
 To undo this install later, run (as root) 'records-paul-steps.sh --org smarty-pants --org-user paul --rollback --yes-delete-records',

@@ -745,7 +745,7 @@ for spec in ${OPERATORS[@]+"${OPERATORS[@]}"}; do
 		if ((!DRY)); then "${deliver[@]}" <"$cred"; fi
 		RUN_CMD=""
 		cat <<EOF
-  -> ${id} (relay): Fabric of ${ORG_USER} uses it with "records": { "relayCredentialFile": "${relay_dir}/relay.json" }.
+  -> ${id} (relay): Fabric of ${ORG_USER} uses it with "records": { "enabled": true, "socket": "${SOCKET}", "relayCredentialFile": "${relay_dir}/relay.json" }.
 EOF
 	else
 		cat <<EOF
@@ -798,7 +798,7 @@ success_check "service socket" test -S "$SOCKET"
 cat <<EOF
 
 Fabric: point the org's agents at the service socket in .pi/fabric.json:
-  { "records": { "socket": "${SOCKET}" } }
+  { "records": { "enabled": true, "socket": "${SOCKET}" } }
 EOF
 STEP=""
 cat <<EOF

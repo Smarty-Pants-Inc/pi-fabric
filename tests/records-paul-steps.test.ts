@@ -4,6 +4,7 @@ import { tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
+import { normalizeRecordsConfig } from "../src/records/config.js";
 
 const script = resolve(__dirname, "../scripts/records-paul-steps.sh");
 const base = ["--org", "test-org", "--org-user", "nobodyuser", "--pg-bin", "/nonexistent", "--node", "/usr/bin/node"];
@@ -766,6 +767,31 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		const listed = r.out.slice(r.out.indexOf("\nROLLBACK:")).split("\n").filter((l) => l.startsWith("  ") && !l.includes("records-paul-steps.sh")).map((l) => l.slice(2));
 		expect(listed).toEqual(rollbackOrder);
 		expect(readFileSync(log, "utf8")).toBe("");
+	});
+
+	it("F22: the printed .pi/fabric.json snippets enable records over the socket, with no DSN", () => {
+		const r = run([...dryBase, "--dry-run", "--operator", "relay:relay:fabric"], fakeEnv);
+		expect(r.code, r.err).toBe(0);
+		// Each printed `"records": { … }` object, cut at its balanced closing brace.
+		const snippets: Record<string, unknown>[] = [];
+		for (const match of r.out.matchAll(/"records": \{/g)) {
+			const start = match.index! + match[0].length - 1;
+			let depth = 0;
+			let end = start;
+			for (; end < r.out.length; end++) {
+				if (r.out[end] === "{") depth++;
+				else if (r.out[end] === "}" && --depth === 0) break;
+			}
+			snippets.push(JSON.parse(r.out.slice(start, end + 1)) as Record<string, unknown>);
+		}
+		expect(snippets.length).toBeGreaterThanOrEqual(2); // the agents' snippet and the relay's
+		for (const snippet of snippets) {
+			const config = normalizeRecordsConfig(snippet);
+			expect(config.enabled).toBe(true);
+			expect(config.socket).toBe("/run/test-org-records/records.sock");
+			expect(Object.keys(snippet).filter((key) => /connection|dsn|host|database|password/i.test(key))).toEqual([]);
+		}
+		expect(snippets.some((snippet) => typeof snippet.relayCredentialFile === "string")).toBe(true);
 	});
 
 	it("a dry run previews the success checks and never prints the success line", () => {

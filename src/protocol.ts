@@ -390,6 +390,14 @@ export interface FabricProvider {
    * repair; prepareArguments runs after it.
    */
   guardArguments?(actionName: string, args: Record<string, unknown>): Record<string, unknown>;
+  /**
+   * Static recovery text appended to a schema-validation failure. Must not
+   * echo argument values: the message enters durable traces.
+   */
+  invalidArgumentsHint?(
+    actionName: string,
+    args: Record<string, unknown>,
+  ): string | undefined | Promise<string | undefined>;
   prepareArguments?(
     actionName: string,
     args: Record<string, unknown>,

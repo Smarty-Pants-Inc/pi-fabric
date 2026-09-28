@@ -3,7 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager, HOST_STOP_REASON } from "../src/agents/manager.js";
-import { readStoppedRuns, STOPPED_AGENTS_ENTRY } from "../src/agents/stopped-runs.js";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
+import { readStoppedRuns, restoreStoppedRuns, STOPPED_AGENTS_ENTRY } from "../src/agents/stopped-runs.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
@@ -75,5 +77,53 @@ describe("task agents stopped by a reload (smarty-dev#1602)", () => {
     ]);
     expect(read.runs.map((r) => r.id)).toEqual(["a", "b", "c"]);
     expect(read.undelivered.map((r) => r.id)).toEqual(["b", "c"]);
+  });
+
+  describe("replay at the next session start", () => {
+    const stoppedRun = {
+      id: "old-run", name: "worker", task: "", status: "stopped", runner: "pi", transport: "process", cwd: process.cwd(),
+      startedAt: 1, updatedAt: 2, finishedAt: 2, turns: 1, toolCalls: 0, text: "",
+      error: `${HOST_STOP_REASON}; last error: Agent stopped; last event: none`,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    } as AgentRunResult;
+    // One runtime start: a real inbox on an idle UI session, and the session entries Pi keeps.
+    const start = (entries: unknown[], notifyOnComplete: boolean) => {
+      const sendMessage = vi.fn();
+      const notify = vi.fn();
+      const context = { isIdle: () => true, hasPendingMessages: () => false, hasUI: true, ui: { notify } } as unknown as ExtensionContext;
+      const inbox = new AgentCompletionInbox({ on: () => () => {}, sendMessage } as unknown as ExtensionAPI, context);
+      const next = manager();
+      const markDelivered = restoreStoppedRuns({
+        entries, notifyOnComplete,
+        restore: (runs) => next.restorePreviousRuns(runs),
+        enqueue: (run, delivered) => inbox.enqueue(run, delivered),
+        appendEntry: (data) => entries.push(entry(data)),
+      });
+      return { next, inbox, sendMessage, notify, markDelivered };
+    };
+
+    it("with notices off keeps the result queryable, with no notice and no Main turn", async () => {
+      const entries: unknown[] = [entry({ stopped: [stoppedRun] })];
+      const run = start(entries, false);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(run.notify).not.toHaveBeenCalled();
+      expect(run.sendMessage).not.toHaveBeenCalled();
+      await expect(run.next.wait("old-run")).resolves.toMatchObject({ status: "stopped", error: stoppedRun.error });
+      run.inbox.close();
+    });
+
+    it("with notices on delivers once, and not again at the start after", async () => {
+      const entries: unknown[] = [entry({ stopped: [stoppedRun] })];
+      const first = start(entries, true);
+      await vi.waitFor(() => expect(first.sendMessage).toHaveBeenCalledTimes(1));
+      expect(first.sendMessage.mock.calls[0]![1]).toMatchObject({ triggerTurn: true });
+      expect(first.notify).toHaveBeenCalledTimes(1);
+      first.inbox.close();
+      const second = start(entries, true);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(second.sendMessage).not.toHaveBeenCalled();
+      await expect(second.next.wait("old-run")).resolves.toMatchObject({ status: "stopped" });
+      second.inbox.close();
+    });
   });
 });

@@ -29,3 +29,30 @@ export const readStoppedRuns = (
   const all = [...runs.values()];
   return { runs: all, undelivered: all.filter((run) => !delivered.has(run.id)) };
 };
+
+/**
+ * Restore a previous runtime's stopped runs for wait/status/steer, and replay each undelivered
+ * one through the completion inbox only when completion notices are on. Returns the callback that
+ * marks a run delivered (notice flushed or result consumed), once per run.
+ */
+export const restoreStoppedRuns = (options: {
+  entries: readonly unknown[];
+  notifyOnComplete: boolean;
+  restore: (runs: AgentRunResult[]) => void;
+  enqueue: (run: AgentRunResult, delivered: () => void) => void;
+  appendEntry: (data: StoppedAgentsEntryData) => void;
+}): ((id: string) => void) => {
+  const { runs, undelivered } = readStoppedRuns(options.entries);
+  const pending = new Set(undelivered.map((run) => run.id));
+  const markDelivered = (id: string): void => {
+    if (!pending.delete(id)) return;
+    try {
+      options.appendEntry({ delivered: [id] });
+    } catch { /* a stale runtime: the next start delivers it */ }
+  };
+  options.restore(runs);
+  if (options.notifyOnComplete) {
+    for (const run of undelivered) options.enqueue(run, () => markDelivered(run.id));
+  }
+  return markDelivered;
+};

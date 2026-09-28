@@ -142,6 +142,11 @@ describe("Main followUp drain (unit)", () => {
       // Another sender's fresh item waits behind the stuck one too, so it is told at once.
       expect(main.deliverAgent({ from: from("b"), message: "four", delivery: "followUp" }))
         .toMatchObject({ pendingFollowUps: 1, oldestAgeS: 0, stalled: true });
+      // A non-triggering followUp goes straight to Pi and is never held, so it is not stalled (#123 F1).
+      (pi.sendMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(() => undefined);
+      const quiet = main.deliverAgent({ from: from("c"), message: "five", delivery: "followUp", triggerTurn: false });
+      expect(quiet).not.toHaveProperty("stalled");
+      expect(main.queueDepth().pendingFollowUps).toBe(4);
     });
 
     it("does not throw for a busy Main with an old held item", async () => {

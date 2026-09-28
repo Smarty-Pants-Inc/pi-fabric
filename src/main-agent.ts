@@ -294,7 +294,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     // chains turns reads it an hour late (smarty-dev#1495). Fabric holds a triggering
     // followUp for a busy Main instead: turn_end flushes the due ones as one steer, and
     // agent_settled releases the rest as a followUp. A non-triggering one never waited.
-    if (request.delivery === "followUp" && triggerTurn && this.#drainActive()) {
+    const held = request.delivery === "followUp" && triggerTurn && this.#drainActive();
+    if (held) {
       // smarty-dev#1495: a held followUp with the same sender and data.coalesceKey is replaced
       // in place, so a sender that notifies on each state change leaves one message, the newest.
       const key = followUpCoalesceKey(item.data);
@@ -324,7 +325,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     return {
       queued: true, messageId: item.id, routed: "main",
       ...(replaced ? { coalesced: true as const, replacedMessageId: replaced.id } : {}),
-      ...(request.delivery === "followUp" ? this.#depthReport(item.from.id) : this.queueDepth(item.from.id)),
+      // Only a followUp that waits in the held queue can be stalled; a non-triggering one went
+      // straight to Pi (#123 review F1).
+      ...(held ? this.#depthReport(item.from.id) : this.queueDepth(item.from.id)),
     };
   }
 

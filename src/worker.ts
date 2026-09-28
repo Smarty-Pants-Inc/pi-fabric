@@ -12,6 +12,7 @@ import type {
   AgentRunRecord,
   AgentRunStatus,
 } from "./agents/types.js";
+import { applyChildPriority } from "./agents/priority.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -441,6 +442,11 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  // smarty-dev#1579: agents.nice lowers the child's CPU and IO priority; its tools inherit it.
+  if (options.nice) {
+    applyChildPriority(child.pid, options.nice, (message) =>
+      appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
+  }
   let stderr = "";
   let outputBuffer = "";
   // Veda emits a single JSON document on stdout (progress goes to stderr, and

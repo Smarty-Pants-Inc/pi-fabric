@@ -218,6 +218,124 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     blocker.release();
   });
 
+  /** A raw protocol connection: send frames, read responses by id. */
+  const rawClient = async (socketPath: string) => {
+    const net = await import("node:net");
+    const socket = net.connect(socketPath);
+    socket.setEncoding("utf8");
+    await new Promise<void>((resolve, reject) => { socket.once("connect", () => resolve()); socket.once("error", reject); });
+    const responses = new Map<number, { ok: boolean; result?: unknown; error?: { code?: string; message: string } }>();
+    let buffer = "";
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+      let index: number;
+      while ((index = buffer.indexOf("\n")) >= 0) {
+        const response = JSON.parse(buffer.slice(0, index));
+        buffer = buffer.slice(index + 1);
+        responses.set(response.id, response);
+      }
+    });
+    socket.on("error", () => undefined);
+    cleanups.push(async () => socket.destroy());
+    const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    return {
+      socket, closed, responses,
+      send: (frame: unknown) => socket.write(`${typeof frame === "string" ? frame : JSON.stringify(frame)}\n`),
+      response: async (id: number) => {
+        for (let i = 0; i < 100 && !responses.has(id); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+        return responses.get(id);
+      },
+    };
+  };
+
+  it("survives malformed frames: only the bad connection ends, and another client keeps working (F8)", async () => {
+    const { config } = await freshService();
+    const alice = await connect(config, ALICE);
+    for (const frame of ["null", "[]", "42", "\"text\"", "{\"id\":\"1\",\"method\":\"read\"}", "{\"id\":1}", "{\"id\":1,\"method\":\"cancel\",\"args\":null}",
+      "{\"id\":1,\"method\":\"cancel\",\"args\":{\"target\":\"x\"}}", "{\"id\":1,\"method\":\"read\",\"args\":[1]}", "{\"id\":1,\"method\":\"saveConsumer\",\"token\":\"t\",\"args\":{\"after\":-1}}", "not json"]) {
+      const bad = await rawClient(config.socket);
+      bad.send(frame);
+      await Promise.race([bad.closed, new Promise((resolve) => setTimeout(resolve, 300))]);
+    }
+    // The service is alive, and a healthy client's call still works.
+    expect((await alice.append({ id: ALICE }, { ref: REF, kind: "comment", key: "after-garbage", text: "still here" })).sequence).toBe(1);
+  });
+
+  it("refuses a duplicate in-flight request id, so a disconnect still cancels the first call (F3)", async () => {
+    const { config, owner } = await freshService();
+    const alice = await connect(config, ALICE);
+    const token = JSON.parse(fs.readFileSync(path.join(dir, "credentials", ALICE.replaceAll(":", "_"), fs.readdirSync(path.join(dir, "credentials", ALICE.replaceAll(":", "_")))[0]!), "utf8")).token as string;
+    void alice;
+    const blocker = await owner.connect();
+    await blocker.query("BEGIN");
+    await blocker.query("SELECT pg_advisory_xact_lock(hashtextextended('fabric-records:smarty-pants', 0))");
+    const raw = await rawClient(config.socket);
+    raw.send({ id: 7, method: "append", token, args: { args: { ref: REF, kind: "status", key: "late", text: "must not land" } } });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // The reported sequence: the same id again, finishing first.
+    raw.send({ id: 7, method: "read", token, args: { args: {} } });
+    expect((await raw.response(7))?.error?.code).toBe("RECORD_DUPLICATE_REQUEST");
+    raw.socket.destroy();
+    await blocker.query("COMMIT");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect((await blocker.query("SELECT count(*)::int AS n FROM records")).rows[0].n).toBe(0);
+    blocker.release();
+    // Counterexample: distinct ids on one connection both run.
+    const ok = await rawClient(config.socket);
+    ok.send({ id: 1, method: "read", token, args: { args: {} } });
+    ok.send({ id: 2, method: "status", token, args: {} });
+    expect((await ok.response(1))?.ok).toBe(true);
+    expect((await ok.response(2))?.ok).toBe(true);
+  });
+
+  it("cancels a registration whose client disconnects before it commits (F3)", async () => {
+    const { config, owner } = await freshService();
+    const blocker = await owner.connect();
+    await blocker.query("BEGIN");
+    await blocker.query("LOCK TABLE principals IN ACCESS EXCLUSIVE MODE");
+    const raw = await rawClient(config.socket);
+    raw.send({ id: 1, method: "register", args: { id: BOB } });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    raw.socket.destroy();
+    await blocker.query("COMMIT");
+    blocker.release();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect((await owner.query("SELECT count(*)::int AS n FROM principals WHERE id = $1", [BOB])).rows[0].n).toBe(0);
+    // Counterexample: Bob can still register himself afterwards.
+    await connect(config, BOB);
+  });
+
+  it("completes a publication only through its own live claim (F9)", async () => {
+    const { config, owner } = await freshService();
+    const alice = await connect(config, ALICE);
+    const bob = await connect(config, BOB);
+    const record = await alice.append({ id: ALICE }, { ref: REF, kind: "ask", key: "a", text: "host?", data: { to: "bob" } });
+    const published = async () => (await owner.query("SELECT published_at IS NOT NULL AS p FROM publication WHERE record_id = $1", [record.id])).rows[0].p as boolean;
+    // The reported sequence: an ordinary principal acks an unclaimed row with a made-up claim.
+    expect(await bob.ackPublication({ claimId: "00000000-0000-4000-8000-000000000000", recordId: record.id }, 999)).toBe(false);
+    expect(await published()).toBe(false);
+    // Alice claims it; Bob cannot ack, fail or release her claim, even with its claim id.
+    const [claim] = await alice.claimPublications(10);
+    expect(claim!.recordId).toBe(record.id);
+    expect(await bob.ackPublication(claim!, 999)).toBe(false);
+    await bob.failPublication(claim!, "suppressed");
+    await bob.releasePublications(claim!.claimId, [record.id]);
+    expect((await owner.query("SELECT claimed_by, error FROM publication WHERE record_id = $1", [record.id])).rows[0]).toEqual({ claimed_by: ALICE, error: null });
+    expect(await bob.claimPublications(10)).toEqual([]);
+    // Counterexample: the claimant acks its own live claim.
+    expect(await alice.ackPublication(claim!, 5)).toBe(true);
+    expect(await published()).toBe(true);
+  });
+
+  it("honors an alarm claim only while its condition holds (F9)", async () => {
+    const { config } = await freshService();
+    const alice = await connect(config, ALICE);
+    // Nothing lags and the gate is not alarming: a claim cannot silence a future alarm.
+    expect(await alice.claimAlarm(`consumer-lag:${BOB}`, Date.now(), 10 * 60_000)).toBe(false);
+    expect(await alice.claimAlarm("archive-lag:refuse", Date.now(), 10 * 60_000)).toBe(false);
+    await expect(alice.claimAlarm("anything", Date.now(), 1)).rejects.toThrow(/unknown alarm key/);
+  });
+
   it("closes promptly while an archive check is running", async () => {
     const { service } = await freshService({ admission: { targets: [{ name: "stuck", command: [process.execPath, "-e", "setTimeout(() => {}, 60000)"] }], alarmSeconds: 120, refuseSeconds: 300, refreshMs: 30_000 } });
     const tick = service.watchdog.tick().catch((error: unknown) => error);

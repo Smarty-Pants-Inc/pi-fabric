@@ -67,12 +67,12 @@ export class PublicationRelay {
           sequence = event.sequence;
         } catch (error) {
           // Keep order: stop at the first failure; the row stays unpublished for the next flush.
-          await this.store.failPublication(row.recordId, String(error instanceof Error ? error.message : error), signal).catch(() => undefined);
-          await this.store.releasePublications(rows.slice(index + 1).map((rest) => rest.recordId), signal).catch(() => undefined);
+          await this.store.failPublication(row, String(error instanceof Error ? error.message : error), signal).catch(() => undefined);
+          await this.store.releasePublications(row.claimId, rows.slice(index + 1).map((rest) => rest.recordId), signal).catch(() => undefined);
           return { published, failed: 1 };
         }
-        await this.store.ackPublication(row.recordId, sequence, signal);
-        published++;
+        // False when the lease ran out and another relay took the row: it publishes again (at least once).
+        if (await this.store.ackPublication(row, sequence, signal)) published++;
       }
       if (rows.length < limit) return { published, failed: 0 };
     }

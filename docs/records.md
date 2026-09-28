@@ -25,7 +25,7 @@ Database authority lives in one place: the org's **records service**.
   belongs to the agents' group. Every call carries a **per-principal token**, and the service derives the caller's
   principal from it, never from the payload.
   - A Main (`session:<uuid>`) or an actor (its 32-hex id) registers its own participant id once. The first claim
-    wins, and a second is refused. The token is kept at 0600 in the agent directory
+    wins, and a second is refused. Nothing proves the first claimant is the id's owner (see Trust boundary). The token is kept at 0600 in the agent directory
     (`<agent dir>/fabric/records-credentials/`).
   - The operator issues other principals: the importer and the mirror (`service-main.js issue`).
 - **Roles in the service's config.** The `importer` and `mirror` roles are granted in the service's own
@@ -33,6 +33,9 @@ Database authority lives in one place: the org's **records service**.
 - **Nudges stay in Fabric.** Fabric keeps the publication relay, because the service cannot write the org's mesh. It
   also keeps the records inbox and the watchdog's wakes and alarms, and it talks to the service for everything else.
   A client that disconnects, or cancels a call, cancels that call on the service too.
+- **Claims are the claimant's.** A relay's publication claim can be acked, failed or released only by the principal
+  that took it, and only while its lease lasts. An alarm claim is honored only while its condition holds (the
+  consumer lags now; the archive gate is in that state now). A malformed frame ends only its own connection.
 
 `scripts/records-paul-steps.sh` installs all of it in one idempotent run with `--dry-run`: the user, the cluster,
 pg_hba and ident, the units, the migration, and credential issuance.
@@ -209,10 +212,11 @@ only the fields it carries (title, labels, body); one that changes nothing the f
   remove the append-only trigger, give itself the importer or mirror role, or claim another participant's id. The
   tests show these on a cluster started with the install's own pg_hba and ident.
 - **Not closed: impersonation between same-OS-user agents.** Agents that share the org's OS user can read one
-  another's memory, `/proc/<pid>/environ` and credential files. So a token proves "a process of this org holding
-  X's credential", not "agent X". Stealing a token is a deliberate act, not a configuration edit, and a second
-  registration of an id is refused loudly. Within one org, authorship stays **attribution, not authentication**
-  until agents run as separate OS users (#820).
+  another's memory, `/proc/<pid>/environ` and credential files. A process can also register a known session or
+  actor id before its owner first does: the service has no identity to check the claim against, and the owner then
+  gets `RECORD_PRINCIPAL_TAKEN`. So a token proves "a process of this org holding X's credential", not "agent X".
+  Within one org, authorship stays **attribution, not authentication** until agents run as separate OS users
+  (#820), which gives the service a peer identity (SO_PEERCRED) to bind enrollment to.
 - Across orgs, #820's per-org OS users are the boundary.
 
 ## Remote hosts (C10, later)

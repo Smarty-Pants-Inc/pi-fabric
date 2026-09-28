@@ -101,6 +101,8 @@ const AUTHOR_OWNED_SUPERSEDE = new Set<RecordKind>(["status", "comment", "decisi
 
 export interface ConsumerState { after: number; pending: { through: number; ids: string[] } | null }
 export interface ClaimedPublication {
+  /** The claim this row belongs to; only its claimant completes it. */
+  claimId: string;
   recordId: string; sequence: number; topic: string; recipient: string | null; kind: string; ref: string; from: string; key: string; text: string | null; createdAt: number;
 }
 export interface ConsumerLag { consumer: string; after: number; oldestAt: number; count: number }
@@ -118,9 +120,9 @@ export interface RecordsOps {
   openConsumer(consumer: string, names: readonly string[], signal?: AbortSignal): Promise<ConsumerState>;
   saveConsumer(consumer: string, after: number, pending: ConsumerState["pending"], signal?: AbortSignal): Promise<void>;
   claimPublications(limit: number, signal?: AbortSignal): Promise<ClaimedPublication[]>;
-  ackPublication(recordId: string, meshSequence: number, signal?: AbortSignal): Promise<void>;
-  failPublication(recordId: string, error: string, signal?: AbortSignal): Promise<void>;
-  releasePublications(recordIds: readonly string[], signal?: AbortSignal): Promise<void>;
+  ackPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, meshSequence: number, signal?: AbortSignal): Promise<boolean>;
+  failPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, error: string, signal?: AbortSignal): Promise<void>;
+  releasePublications(claimId: string, recordIds: readonly string[], signal?: AbortSignal): Promise<void>;
   unpublished(signal?: AbortSignal): Promise<number>;
   lagging(lagMs: number, now: number, signal?: AbortSignal): Promise<ConsumerLag[]>;
   claimAlarm(key: string, now: number, realarmMs: number, signal?: AbortSignal): Promise<boolean>;
@@ -501,28 +503,33 @@ export class RecordStore implements RecordsBackend, RecordsOps {
     await this.transaction((client) => client.query("SELECT consumer_save($1, $2, $3::jsonb)", [consumer, after, pending ? JSON.stringify(pending) : null]), "", signal);
   }
 
-  async claimPublications(limit: number, signal?: AbortSignal): Promise<ClaimedPublication[]> {
+  /**
+   * The claimant is the principal the relay runs as. In process it is this store's origin relay;
+   * the records service passes the authenticated caller (`as`).
+   */
+  async claimPublications(limit: number, signal?: AbortSignal, as = `relay:${this.origin}`): Promise<ClaimedPublication[]> {
     return this.transaction(async (client) => {
-      const { rows } = await client.query<{ record_id: string; seq: string; topic: string; recipient: string | null; kind: string; ref: string; author: string; key: string; text: string | null; created_at: Date }>(
-        "SELECT * FROM publication_claim($1, $2, $3)", [this.origin, limit, PUBLICATION_LEASE_SECONDS]);
+      const { rows } = await client.query<{ claim_id: string; record_id: string; seq: string; topic: string; recipient: string | null; kind: string; ref: string; author: string; key: string; text: string | null; created_at: Date }>(
+        "SELECT * FROM publication_claim($1, $2, $3, $4)", [this.origin, limit, PUBLICATION_LEASE_SECONDS, as]);
       return rows.map((row) => ({
-        recordId: row.record_id, sequence: Number(row.seq), topic: row.topic, recipient: row.recipient, kind: row.kind, ref: row.ref,
+        claimId: row.claim_id, recordId: row.record_id, sequence: Number(row.seq), topic: row.topic, recipient: row.recipient, kind: row.kind, ref: row.ref,
         from: row.author, key: row.key, text: row.text, createdAt: row.created_at.getTime(),
       }));
     }, "", signal);
   }
 
-  async ackPublication(recordId: string, meshSequence: number, signal?: AbortSignal): Promise<void> {
-    await this.transaction((client) => client.query("SELECT publication_ack($1, $2)", [recordId, meshSequence]), "", signal);
+  async ackPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, meshSequence: number, signal?: AbortSignal, as = `relay:${this.origin}`): Promise<boolean> {
+    return this.transaction(async (client) => (await client.query<{ ok: boolean }>(
+      "SELECT publication_ack($1, $2, $3, $4, $5) AS ok", [claim.recordId, claim.claimId, as, meshSequence, PUBLICATION_LEASE_SECONDS])).rows[0]!.ok, "", signal);
   }
 
-  async failPublication(recordId: string, error: string, signal?: AbortSignal): Promise<void> {
-    await this.transaction((client) => client.query("SELECT publication_fail($1, $2)", [recordId, error]), "", signal);
+  async failPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, error: string, signal?: AbortSignal, as = `relay:${this.origin}`): Promise<void> {
+    await this.transaction((client) => client.query("SELECT publication_fail($1, $2, $3, $4)", [claim.recordId, claim.claimId, as, error]), "", signal);
   }
 
-  async releasePublications(recordIds: readonly string[], signal?: AbortSignal): Promise<void> {
+  async releasePublications(claimId: string, recordIds: readonly string[], signal?: AbortSignal, as = `relay:${this.origin}`): Promise<void> {
     if (recordIds.length === 0) return;
-    await this.transaction((client) => client.query("SELECT publication_release($1::uuid[])", [[...recordIds]]), "", signal);
+    await this.transaction((client) => client.query("SELECT publication_release($1::uuid[], $2, $3)", [[...recordIds], claimId, as]), "", signal);
   }
 
   async unpublished(signal?: AbortSignal): Promise<number> {

@@ -160,14 +160,14 @@ export class RemoteRecords implements RecordsBackend, RecordsOps {
   claimPublications(limit: number, signal?: AbortSignal): Promise<ClaimedPublication[]> {
     return this.#call("claimPublications", { limit }, signal) as Promise<ClaimedPublication[]>;
   }
-  async ackPublication(recordId: string, meshSequence: number, signal?: AbortSignal): Promise<void> {
-    await this.#call("ackPublication", { recordId, meshSequence }, signal);
+  ackPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, meshSequence: number, signal?: AbortSignal): Promise<boolean> {
+    return this.#call("ackPublication", { claimId: claim.claimId, recordId: claim.recordId, meshSequence }, signal) as Promise<boolean>;
   }
-  async failPublication(recordId: string, error: string, signal?: AbortSignal): Promise<void> {
-    await this.#call("failPublication", { recordId, error }, signal);
+  async failPublication(claim: Pick<ClaimedPublication, "claimId" | "recordId">, error: string, signal?: AbortSignal): Promise<void> {
+    await this.#call("failPublication", { claimId: claim.claimId, recordId: claim.recordId, error }, signal);
   }
-  async releasePublications(recordIds: readonly string[], signal?: AbortSignal): Promise<void> {
-    await this.#call("releasePublications", { recordIds: [...recordIds] }, signal);
+  async releasePublications(claimId: string, recordIds: readonly string[], signal?: AbortSignal): Promise<void> {
+    await this.#call("releasePublications", { claimId, recordIds: [...recordIds] }, signal);
   }
   unpublished(signal?: AbortSignal): Promise<number> {
     return this.#call("unpublished", {}, signal) as Promise<number>;

@@ -107,7 +107,11 @@ CREATE TABLE publication (
   mesh_sequence bigint,
   attempts integer NOT NULL DEFAULT 0,
   error text,
-  claimed_at timestamptz
+  claimed_at timestamptz,
+  -- Who holds the claim: the relay's principal and a random claim id. Only that claim may ack,
+  -- fail or release the row, and only while its lease lasts.
+  claimed_by text,
+  claim_id uuid
 );
 CREATE INDEX publication_unpublished ON publication (origin, seq) WHERE published_at IS NULL;
 
@@ -219,34 +223,43 @@ BEGIN
   RETURN FOUND;
 END $f$;
 -- Unpublished nudges for one relay, in seq order; a claim expires, so a relay that died is replaced.
-CREATE FUNCTION publication_claim(p_origin text, p_limit integer, p_lease_seconds double precision)
-  RETURNS TABLE (record_id uuid, seq bigint, topic text, recipient text, kind text, ref text, author text, key text, text text, created_at timestamptz)
+CREATE FUNCTION publication_claim(p_origin text, p_limit integer, p_lease_seconds double precision, p_claimant text)
+  RETURNS TABLE (claim_id uuid, record_id uuid, seq bigint, topic text, recipient text, kind text, ref text, author text, key text, text text, created_at timestamptz)
   LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
-  WITH claimed AS (
-    UPDATE publication p SET claimed_at = clock_timestamp()
+  WITH claim AS (SELECT gen_random_uuid() AS id),
+  claimed AS (
+    UPDATE publication p SET claimed_at = clock_timestamp(), claimed_by = p_claimant, claim_id = (SELECT id FROM claim)
     WHERE p.record_id IN (
       SELECT q.record_id FROM publication q
       WHERE q.published_at IS NULL AND q.origin = p_origin
         AND (q.claimed_at IS NULL OR q.claimed_at <= clock_timestamp() - make_interval(secs => p_lease_seconds))
       ORDER BY q.seq LIMIT p_limit FOR UPDATE SKIP LOCKED)
-    RETURNING p.record_id, p.seq, p.topic, p.recipient)
-  SELECT c.record_id, c.seq, c.topic, c.recipient, r.kind, r.ref, r.author, r.key, r.text, r.created_at
+    RETURNING p.claim_id, p.record_id, p.seq, p.topic, p.recipient)
+  SELECT c.claim_id, c.record_id, c.seq, c.topic, c.recipient, r.kind, r.ref, r.author, r.key, r.text, r.created_at
   FROM claimed c JOIN records r ON r.id = c.record_id ORDER BY c.seq;
 $f$;
-CREATE FUNCTION publication_ack(p_record uuid, p_mesh_sequence bigint)
-  RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
-  UPDATE publication SET published_at = clock_timestamp(), mesh_sequence = p_mesh_sequence, attempts = attempts + 1, error = NULL, claimed_at = NULL
-  WHERE record_id = p_record AND published_at IS NULL;
-$f$;
-CREATE FUNCTION publication_fail(p_record uuid, p_error text)
-  RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
-  UPDATE publication SET attempts = attempts + 1, error = left(p_error, 500), claimed_at = NULL
-  WHERE record_id = p_record AND published_at IS NULL;
-$f$;
+-- Each completes only the caller's own live claim on the row; anything else changes nothing.
+CREATE FUNCTION publication_ack(p_record uuid, p_claim uuid, p_claimant text, p_mesh_sequence bigint, p_lease_seconds double precision)
+  RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+BEGIN
+  UPDATE publication SET published_at = clock_timestamp(), mesh_sequence = p_mesh_sequence, attempts = attempts + 1, error = NULL,
+    claimed_at = NULL, claimed_by = NULL, claim_id = NULL
+  WHERE record_id = p_record AND published_at IS NULL AND claim_id = p_claim AND claimed_by = p_claimant
+    AND claimed_at > clock_timestamp() - make_interval(secs => p_lease_seconds);
+  RETURN FOUND;
+END $f$;
+CREATE FUNCTION publication_fail(p_record uuid, p_claim uuid, p_claimant text, p_error text)
+  RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
+BEGIN
+  UPDATE publication SET attempts = attempts + 1, error = left(p_error, 500), claimed_at = NULL, claimed_by = NULL, claim_id = NULL
+  WHERE record_id = p_record AND published_at IS NULL AND claim_id = p_claim AND claimed_by = p_claimant;
+  RETURN FOUND;
+END $f$;
 -- A relay that stopped at a failure gives back the rest of its claim at once.
-CREATE FUNCTION publication_release(p_records uuid[])
+CREATE FUNCTION publication_release(p_records uuid[], p_claim uuid, p_claimant text)
   RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
-  UPDATE publication SET claimed_at = NULL WHERE record_id = ANY(p_records) AND published_at IS NULL;
+  UPDATE publication SET claimed_at = NULL, claimed_by = NULL, claim_id = NULL
+  WHERE record_id = ANY(p_records) AND published_at IS NULL AND claim_id = p_claim AND claimed_by = p_claimant;
 $f$;
 CREATE FUNCTION archive_claim(p_target text, p_window_seconds double precision)
   RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $f$
@@ -266,14 +279,14 @@ $f$;
 
 REVOKE ALL ON records, record_bounds, outbox, publication, consumers, archive_checks, alarms, principals FROM PUBLIC;
 REVOKE ALL ON FUNCTION consumer_open(text, text, jsonb), consumer_save(text, bigint, jsonb), alarm_claim(text, timestamptz, timestamptz),
-  publication_claim(text, integer, double precision), publication_ack(uuid, bigint), publication_fail(uuid, text), publication_release(uuid[]),
+  publication_claim(text, integer, double precision, text), publication_ack(uuid, uuid, text, bigint, double precision), publication_fail(uuid, uuid, text, text), publication_release(uuid[], uuid, text),
   archive_claim(text, double precision), archive_record(text, pg_lsn, text), records_append_only() FROM PUBLIC;
 GRANT SELECT, INSERT ON records, record_bounds, outbox, publication, principals TO ${WRITER_ROLE};
 GRANT SELECT ON consumers, archive_checks, alarms TO ${WRITER_ROLE};
 GRANT USAGE ON SEQUENCE outbox_seq_seq TO ${WRITER_ROLE};
 GRANT SELECT ON live_records, current_issue, current_statuses, open_asks, current_links, current_decisions, mirror_state TO ${WRITER_ROLE};
 GRANT EXECUTE ON FUNCTION consumer_open(text, text, jsonb), consumer_save(text, bigint, jsonb), alarm_claim(text, timestamptz, timestamptz),
-  publication_claim(text, integer, double precision), publication_ack(uuid, bigint), publication_fail(uuid, text), publication_release(uuid[]),
+  publication_claim(text, integer, double precision, text), publication_ack(uuid, uuid, text, bigint, double precision), publication_fail(uuid, uuid, text, text), publication_release(uuid[], uuid, text),
   archive_claim(text, double precision), archive_record(text, pg_lsn, text) TO ${WRITER_ROLE};
 `;
 

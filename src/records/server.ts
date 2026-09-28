@@ -178,13 +178,14 @@ export class RecordsServer {
       // A consumer's cursor is always the caller's own.
       openConsumer: (principal, args, signal) => store.openConsumer(principal.id, names(args.names), signal),
       saveConsumer: (principal, args, signal) => store.saveConsumer(principal.id, count(args.after), pending(args.pending), signal),
-      claimPublications: (_principal, args, signal) => store.claimPublications(Math.min(500, Math.max(1, count(args.limit))), signal),
-      ackPublication: (_principal, args, signal) => store.ackPublication(uuid(args.recordId), count(args.meshSequence), signal),
-      failPublication: (_principal, args, signal) => store.failPublication(uuid(args.recordId), String(args.error ?? "").slice(0, 500), signal),
-      releasePublications: (_principal, args, signal) => store.releasePublications(ids(args.recordIds), signal),
+      // A claim belongs to the principal that took it: only it acks, fails or releases its rows.
+      claimPublications: (principal, args, signal) => store.claimPublications(Math.min(500, Math.max(1, count(args.limit))), signal, principal.id),
+      ackPublication: (principal, args, signal) => store.ackPublication({ claimId: uuid(args.claimId), recordId: uuid(args.recordId) }, count(args.meshSequence), signal, principal.id),
+      failPublication: (principal, args, signal) => store.failPublication({ claimId: uuid(args.claimId), recordId: uuid(args.recordId) }, String(args.error ?? "").slice(0, 500), signal, principal.id),
+      releasePublications: (principal, args, signal) => store.releasePublications(uuid(args.claimId), ids(args.recordIds), signal, principal.id),
       unpublished: (_principal, _args, signal) => store.unpublished(signal),
       lagging: (_principal, args, signal) => store.lagging(count(args.lagMs), this.#now(), signal),
-      claimAlarm: (_principal, args, signal) => store.claimAlarm(`${String(args.key ?? "").slice(0, 200)}`, this.#now(), count(args.realarmMs), signal),
+      claimAlarm: (_principal, args, signal) => this.#claimAlarm(args.key, count(args.realarmMs), signal),
     };
   }
 
@@ -199,6 +200,28 @@ export class RecordsServer {
 
   #now(): number { return this.options.now?.() ?? Date.now(); }
 
+  /**
+   * An alarm claim is honored only while its condition holds (a consumer lags now; the archive
+   * gate is in that state now), with at least the default re-alarm window, so a caller cannot
+   * silence an alarm ahead of time or for longer than one window.
+   */
+  async #claimAlarm(key: unknown, realarmMs: number, signal: AbortSignal): Promise<boolean> {
+    if (typeof key !== "string") throw new RecordsArgumentError("alarm key must be a string");
+    const window = Math.max(realarmMs, 10 * 60_000);
+    const lag = /^consumer-lag:(.{1,200})$/.exec(key);
+    if (lag) {
+      const lagging = await this.store.lagging(this.config.consumerLagSeconds * 1000, this.#now(), signal);
+      if (!lagging.some((entry) => entry.consumer === lag[1])) return false;
+      return this.store.claimAlarm(key, this.#now(), window, signal);
+    }
+    const archive = /^archive-lag:(alarm|refuse)$/.exec(key);
+    if (archive) {
+      if (this.gate.status()?.state !== archive[1]) return false;
+      return this.store.claimAlarm(key, this.#now(), window, signal);
+    }
+    throw new RecordsArgumentError("unknown alarm key");
+  }
+
   get signal(): AbortSignal { return this.#life.signal; }
 
   async status(signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -211,14 +234,14 @@ export class RecordsServer {
   }
 
   /** Register a session's or actor's own participant id (the first claim wins). */
-  async register(id: unknown, name: unknown): Promise<{ id: string; token: string }> {
+  async register(id: unknown, name: unknown, signal: AbortSignal = this.#life.signal): Promise<{ id: string; token: string }> {
     if (typeof id !== "string" || !SELF_REGISTERED.test(id)) {
       throw new RecordsServiceError("only a session (session:<uuid>) or an actor (its 32-hex id) registers itself; other principals are issued by the operator", "RECORD_PRINCIPAL_INVALID");
     }
     const token = newToken();
     const inserted = await this.store.transaction(async (client) => (await client.query(
       "INSERT INTO principals (id, name, token_hash, issued_by) VALUES ($1, $2, $3, 'register') ON CONFLICT (id) DO NOTHING",
-      [id, typeof name === "string" ? name.slice(0, 128) : null, hashToken(token)])).rowCount === 1, "", this.#life.signal);
+      [id, typeof name === "string" ? name.slice(0, 128) : null, hashToken(token)])).rowCount === 1, "", signal);
     if (!inserted) throw new RecordsServiceError(`records principal ${id} is already registered; use its credential`, "RECORD_PRINCIPAL_TAKEN");
     return { id, token };
   }
@@ -258,16 +281,17 @@ export class RecordsServer {
     const calls = new Map<number, AbortController>();
     const send = (response: WireResponse) => { if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`); };
     const reader = new LineReader((line) => {
-      let request: WireRequest;
-      try {
-        request = JSON.parse(line) as WireRequest;
-      } catch {
-        socket.destroy();
+      // A malformed frame ends this connection only; nothing in it may throw past here.
+      const request = parseRequest(line);
+      if (!request) { socket.destroy(); return; }
+      if (request.method === "cancel") {
+        const target = object(request.args).target;
+        if (typeof target === "number") calls.get(target)?.abort(new Error("call cancelled by the client"));
         return;
       }
-      if (typeof request.id !== "number") { socket.destroy(); return; }
-      if (request.method === "cancel") {
-        calls.get(count(object(request.args).target))?.abort(new Error("call cancelled by the client"));
+      // An id already in flight would detach the first call from its cancellation: refused.
+      if (calls.has(request.id)) {
+        send({ id: request.id, ok: false, error: { message: `request id ${request.id} is already in flight`, code: "RECORD_DUPLICATE_REQUEST" } });
         return;
       }
       const call = new AbortController();
@@ -276,7 +300,9 @@ export class RecordsServer {
         .then((result) => send({ id: request.id, ok: true, result: result ?? null }), (error: unknown) => send({ id: request.id, ok: false, error: wireError(error) }))
         .finally(() => calls.delete(request.id));
     }, () => socket.destroy());
-    socket.on("data", (chunk: string) => reader.push(chunk));
+    socket.on("data", (chunk: string) => {
+      try { reader.push(chunk); } catch { socket.destroy(); }
+    });
     // A client that goes away cancels its calls: nothing it started commits later.
     socket.on("close", () => {
       this.#connections.delete(socket);
@@ -286,9 +312,10 @@ export class RecordsServer {
   }
 
   async #dispatch(request: WireRequest, signal: AbortSignal): Promise<unknown> {
+    // async: any throw below, argument checks included, becomes this call's error response.
     const args = object(request.args);
     if (request.method === "hello") return { org: this.store.org, origin: this.store.origin, protocol: 1 };
-    if (request.method === "register") return this.register(args.id, args.name);
+    if (request.method === "register") return this.register(args.id, args.name, signal);
     const handler = Object.hasOwn(this.#handlers, request.method) ? this.#handlers[request.method] : undefined;
     if (!handler) throw new RecordsServiceError(`unknown records method ${JSON.stringify(String(request.method).slice(0, 64))}`, "RECORD_UNKNOWN_METHOD");
     const principal = await this.authenticate(request.token);
@@ -344,6 +371,18 @@ const pageArgs = (args: Record<string, unknown>, origin: string): PageArgs => ({
   ...(Array.isArray(args.to) ? { to: names(args.to) } : {}),
   ...(typeof args.exceptAuthor === "string" ? { exceptAuthor: args.exceptAuthor } : {}),
 });
+
+/** A request envelope, or undefined for anything else (never throws). */
+const parseRequest = (line: string): WireRequest | undefined => {
+  let value: unknown;
+  try { value = JSON.parse(line); } catch { return undefined; }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const request = value as Record<string, unknown>;
+  if (typeof request.id !== "number" || !Number.isSafeInteger(request.id) || typeof request.method !== "string") return undefined;
+  if (request.token !== undefined && typeof request.token !== "string") return undefined;
+  if (request.args !== undefined && (typeof request.args !== "object" || request.args === null || Array.isArray(request.args))) return undefined;
+  return { id: request.id, method: request.method, ...(typeof request.token === "string" ? { token: request.token } : {}), ...(request.args !== undefined ? { args: request.args } : {}) };
+};
 
 /** A socket file left by a crashed service is removed; a live one is refused. */
 const removeStaleSocket = async (socketPath: string): Promise<void> => {

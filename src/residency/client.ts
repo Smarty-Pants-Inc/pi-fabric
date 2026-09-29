@@ -6,7 +6,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { resolveAgentCwd } from "../agents/manager.js";
+import { awaitAgentCwd } from "../agents/manager.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, processIsAlive, spawnDetached } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
@@ -232,7 +232,7 @@ export class ResidencyClient {
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
     const resolvedRequest = request.cwd === undefined
       ? request
-      : { ...request, cwd: resolveAgentCwd(this.options.config.cwd, request.cwd) };
+      : { ...request, cwd: await awaitAgentCwd(this.options.config.cwd, request.cwd, signal) };
     // Freeze inherited optional-tool authority before transferring to an existing host.
     const allowedTools = this.#inheritedToolAllowlist;
     const tools = allowedTools === undefined ? undefined

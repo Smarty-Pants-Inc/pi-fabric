@@ -150,7 +150,37 @@ export const resolveAgentCwd = (parentCwd: string, requestedCwd?: string): strin
     return canonical;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid Fabric agent cwd ${JSON.stringify(requested)}: ${reason}`);
+    const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
+    throw new Error(
+      `Invalid Fabric agent cwd ${JSON.stringify(requested)}: ${reason}` +
+        (missing ? ". The cwd does not exist; if another tool call in the same message creates it, call spawn in the next message" : ""),
+      { cause: error },
+    );
+  }
+};
+
+const AGENT_CWD_SETTLE_MS = 3_000;
+
+/**
+ * resolveAgentCwd, but a missing cwd is re-checked for up to AGENT_CWD_SETTLE_MS first.
+ * ponytail: Pi runs the tool calls of one message in parallel, so `git worktree add W` and a
+ * spawn with cwd W race; a short re-check lets the sibling finish (smarty-dev#1668). Only
+ * ENOENT waits; other failures, and an existing cwd, return at once.
+ */
+export const awaitAgentCwd = async (
+  parentCwd: string,
+  requestedCwd?: string,
+  signal?: AbortSignal,
+): Promise<string> => {
+  const deadline = Date.now() + AGENT_CWD_SETTLE_MS;
+  for (let wait = 50; ; wait = Math.min(wait * 2, 500)) {
+    try {
+      return resolveAgentCwd(parentCwd, requestedCwd);
+    } catch (error) {
+      const cause = (error as Error).cause as NodeJS.ErrnoException | undefined;
+      if (cause?.code !== "ENOENT" || signal?.aborted || Date.now() + wait > deadline) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, wait));
   }
 };
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
@@ -618,8 +648,8 @@ export class AgentManager {
     return () => this.#uiListeners.delete(listener);
   }
 
-  resolveCwd(requestedCwd?: string): string {
-    return resolveAgentCwd(this.cwd, requestedCwd);
+  resolveCwd(requestedCwd?: string, signal?: AbortSignal): Promise<string> {
+    return awaitAgentCwd(this.cwd, requestedCwd, signal);
   }
 
   #inheritedSessionPins(request: AgentRunRequest): InheritedSessionPin[] | undefined {
@@ -703,7 +733,7 @@ export class AgentManager {
     const pythonRuntime = kernel ? this.resolvePythonRuntime(request.pythonRuntime) : undefined;
     // Validate explicit execution targets before any model preparation or budget side effects.
     // With no override this deliberately preserves the manager cwd without canonicalizing it.
-    const selectedCwd = this.resolveCwd(request.cwd);
+    const selectedCwd = await this.resolveCwd(request.cwd, signal);
     const residency = request.residency ?? "session";
     if (residency !== "session" && residency !== "durable") {
       throw new Error(`Invalid Fabric agent residency: ${String(request.residency)}`);

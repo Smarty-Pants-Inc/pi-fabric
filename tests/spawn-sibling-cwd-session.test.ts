@@ -12,14 +12,14 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 
 // smarty-dev#1668: a model put `git worktree add W` (bash) and a durable spawn with cwd W
-// (fabric_exec) in one message. Pi ran them in parallel, so the spawn's cwd check ran before
-// W existed and failed with ENOENT. A real Pi session with the built Fabric extension must run
-// the fabric_exec call after its sibling.
+// (fabric_exec) in one message. Pi runs them in parallel, so the spawn's cwd check ran before
+// W existed and failed with ENOENT. The calls stay parallel; the durable spawn re-checks a
+// missing cwd briefly, so it sees W once the sibling creates it.
 const fabricEntry = path.resolve("dist/index.js");
 const built = fs.existsSync(fabricEntry);
 const ENV_KEYS = ["PI_FABRIC_MESH_ROOT", "PI_CODING_AGENT_DIR"] as const;
 
-describe.skipIf(!built || process.platform === "win32")("fabric_exec after a sibling tool call in one message", () => {
+describe.skipIf(!built || process.platform === "win32")("durable spawn beside the tool call that creates its cwd", () => {
   const roots: string[] = [];
   const sessions: AgentSession[] = [];
   const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
@@ -32,7 +32,7 @@ describe.skipIf(!built || process.platform === "win32")("fabric_exec after a sib
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("sees the directory the sibling bash call created before the durable cwd check", async () => {
+  it("spawns in the directory a parallel sibling bash call creates", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-seq-")));
     roots.push(root);
     const agentDir = path.join(root, "agent");

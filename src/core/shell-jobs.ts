@@ -123,6 +123,8 @@ class FabricShellJob implements FabricShellJobHandle {
   logPath?: string;
   spilled = false;
   finished = false;
+  /** The "finished" event went out; finish() sets finished before its awaits (smarty-dev#2216). */
+  announced = false;
   spilledAt?: number;
   finishedAt?: number;
   exitCode?: number | null;
@@ -340,6 +342,7 @@ class FabricShellJob implements FabricShellJobHandle {
     await unlink(this.pidPath).catch(() => undefined);
     if (this.logPath) closeScratch(this.#directory);
     else { try { fs.rmSync(this.#directory, { recursive: true, force: true }); } catch {} }
+    this.announced = true;
     this.onChange("finished", [output, footer?.slice(-1000)].filter(Boolean).join("\n"));
   }
 
@@ -501,6 +504,11 @@ export class FabricShellJobStore {
 
   live(): FabricShellJob[] {
     return [...this.#jobs.values()].filter((job) => !job.finished);
+  }
+
+  /** Jobs whose "finished" event is not sent yet: a reload would drop that notice (smarty-dev#2216). */
+  unannounced(): number {
+    return [...this.#jobs.values()].filter((job) => !job.announced).length;
   }
 
   spillWaiting(): number {

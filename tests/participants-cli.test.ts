@@ -132,4 +132,29 @@ describe("fabric-participants", () => {
     expect(resolveMeshRoot(env, project)).toBe(path.join(project, "mesh-here"));
     expect(resolveMeshRoot({ ...env, PI_FABRIC_MESH_ROOT: "/fleet/env" }, project)).toBe("/fleet/env");
   });
+
+  it("in a worktree reads config from cwd and resolves it against PI_FABRIC_PROJECT_ROOT, as Pi does (pi-fabric#157)", () => {
+    const project = scratch();
+    const worktree = scratch();
+    const agentDir = scratch();
+    fs.mkdirSync(path.join(project, ".pi"));
+    fs.writeFileSync(path.join(project, ".pi", "fabric.json"), JSON.stringify({ mesh: { root: "project-mesh" } }));
+    fs.mkdirSync(path.join(worktree, ".pi"));
+    fs.writeFileSync(path.join(worktree, ".pi", "fabric.json"), JSON.stringify({ mesh: { root: "worktree-mesh" } }));
+    const env = { PI_CODING_AGENT_DIR: agentDir, PI_FABRIC_PROJECT_ROOT: project };
+    // Pi: loadFabricConfig({ cwd: context.cwd }) then path.resolve(PI_FABRIC_PROJECT_ROOT, mesh.root).
+    expect(resolveMeshRoot(env, worktree)).toBe(path.join(project, "worktree-mesh"));
+  });
+
+  it("fails on a present state.json that is not a mesh state envelope, and lists [] for a valid empty one (pi-fabric#157)", async () => {
+    const root = scratch();
+    for (const text of ["{}", "null", "garbage", "[]", ""]) {
+      fs.writeFileSync(path.join(root, "state.json"), text);
+      const result = await run(["--mesh", root]);
+      expect(result, text).toMatchObject({ code: 2, out: "" });
+      expect(result.err).toContain("FABRIC_MESH_UNREADABLE");
+    }
+    fs.writeFileSync(path.join(root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
+    expect(await run(["--mesh", root])).toEqual({ code: 0, out: "[]\n", err: "" });
+  });
 });

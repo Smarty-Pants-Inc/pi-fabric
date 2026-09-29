@@ -163,7 +163,11 @@ describe("Main followUp delivered ids on every branch, at the controller", () =>
       const second = setup(manager, journal, true);
       second.emit("agent_before_settle", { outcome: "completed" });
       second.emit("turn_end");
-      if (storage === "unflushed") manager.appendMessage(fauxAssistantMessage("first assistant flushes all branches"));
+      if (storage === "unflushed") {
+        manager.appendMessage(fauxAssistantMessage("first assistant flushes all branches"));
+        // The receipt is the session file (review round 3 on pi-fabric#160): the next boundary sees the flush.
+        second.emit("turn_end");
+      }
       expect(second.sent).toHaveLength(0);
       expect(copies(manager, receipt.messageId)).toBe(1);
       if (storage !== "memory") expect(copies(SessionManager.open(manager.getSessionFile()!), receipt.messageId)).toBe(1);

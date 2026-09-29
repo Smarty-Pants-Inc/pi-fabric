@@ -225,13 +225,17 @@ if (task.includes("HANG_WITH_PROGRESS")) {
       ? { action: "message" }
       : {
           action: stopDirective ? "stop" : "message",
-          message: stopDirective ? "fake actor role complete" : "fake actor advice",
+          message: stopDirective
+            ? "fake actor role complete"
+            : task.includes("ECHO_MODEL") ? `model ${args.get("model")}` : "fake actor advice",
           ...(images.length > 0 ? { data: { imageCount: images.length } } : {}),
         }
     : undefined;
   const now = Date.now();
   const largeText = task.includes("LARGE_RESULT") ? "x".repeat(100_000) : undefined;
-  const text = largeText ?? (directive && !fail ? JSON.stringify(directive) : "fake worker complete");
+  const text = largeText ?? (directive && !fail
+    ? JSON.stringify(directive)
+    : task.includes("ECHO_MODEL") ? `model ${args.get("model")}` : "fake worker complete");
   const record = {
     id: args.get("id"),
     name: args.get("name"),

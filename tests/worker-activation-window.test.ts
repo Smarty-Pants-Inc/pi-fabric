@@ -23,8 +23,18 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
   vi.unstubAllEnvs();
-  for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  // Windows releases an exited child's cwd a moment after its close event;
+  // Node retries EBUSY/EPERM with backoff when maxRetries is set (smarty-dev#883).
+  for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
+// smarty-dev#883: these runs boot a worker and a child Node process. That
+// boot is CPU-bound, so its wall time grows with runner contention (1.1 s of
+// CPU took 16 s on a loaded Dev1). Every outcome below arrives as an event
+// (a child frame, exit or the fake model's reply), so the run timeout is only
+// a hang guard and must not decide a pass. Only the "timeout" scenario tests
+// the timeout itself.
+const HANG_GUARD_MS = 120_000;
+const TEST_GUARD_MS = HANG_GUARD_MS + 30_000;
 const user = (text: string) => ({ role: "user" as const, content: text, timestamp: 1 });
 const assistant = (content: string, input = 10) => ({
   role: "assistant" as const, content: [{ type: "text" as const, text: content }],
@@ -127,7 +137,7 @@ describe("activation projection", () => {
       } catch {} // Pi catches hook exceptions; a throw alone would reach the request.
       fs.writeFileSync(${JSON.stringify(requestCounter)}, 'REQUEST');
     `);
-    const result = spawnSync(process.execPath, [child], { encoding: "utf8" });
+    const result = spawnSync(process.execPath, [child], { encoding: "utf8", timeout: HANG_GUARD_MS });
     expect(result.status, result.stderr).toBe(78);
     expect(result.stderr).toContain("Fabric activation window failed");
     if (mode === "boundary") {
@@ -139,7 +149,7 @@ describe("activation projection", () => {
       expect(result.stderr).not.toContain("fabric_activation_window_ready");
     }
     expect(fs.existsSync(requestCounter)).toBe(false);
-  });
+  }, TEST_GUARD_MS);
 
   it("does not terminate an owner that accidentally loads the hook without worker binding", async () => {
     const { default: hook } = await import("../src/worker/activation-window.js");
@@ -154,7 +164,7 @@ describe("activation worker admission (offline transport fixture)", () => {
     const scenarioFile = path.join(dir, "scenario");
     fs.writeFileSync(scenarioFile, `activation:${scenario}`);
     vi.stubEnv("FAKE_MODEL_SCENARIO", scenarioFile);
-    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 1500 }, {
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: scenario === "timeout" ? 1500 : HANG_GUARD_MS }, {
       workerPath: path.resolve("src/worker.ts"), piBinary: path.resolve("tests/fixtures/fake-pi-model.mjs"), runRoot: path.join(dir, "runs"),
     });
     managers.push(manager);
@@ -165,11 +175,15 @@ describe("activation worker admission (offline transport fixture)", () => {
     expect(log).not.toContain('"type":"prompt"');
     expect(log).not.toContain('"type":"message_start"');
     if (scenario !== "timeout") expect(result.error).toMatch(/activation window|before.*admission|model selection/);
-    expect(log).toContain("--no-extensions");
-    expect(log).toContain("--no-tools");
-    expect(log).toContain("--no-auto-compaction");
+    // A timeout can fire before a slow worker launches the child; then no
+    // launch arguments are logged. Every other scenario must show them.
+    if (scenario !== "timeout" || log) {
+      expect(log).toContain("--no-extensions");
+      expect(log).toContain("--no-tools");
+      expect(log).toContain("--no-auto-compaction");
+    }
     expect(log).not.toContain("set_auto_compaction");
-  }, 10_000);
+  }, TEST_GUARD_MS);
 });
 
 // Required qualification target, not a live-model probe. CI must supply the
@@ -189,6 +203,11 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(after.entries.slice(0, before.entries.length)).toEqual(before.entries);
     expect(after.entries.some(entry => entry.type === "compaction")).toBe(false);
     return after;
+  };
+  // The run's event log shows how far the worker and child Pi got.
+  const explain = (result: { logFile?: string }) => {
+    const log = result.logFile && fs.existsSync(result.logFile) ? fs.readFileSync(result.logFile, "utf8") : "";
+    return `${JSON.stringify(result)}\n${log.slice(-12_000)}`;
   };
   const setup = async () => {
     const dir = root();
@@ -233,7 +252,7 @@ describe("native activation window (offline; opted-in success needs exact native
     fs.writeFileSync(path.join(dir, "task.txt"), "current tool result");
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     vi.stubEnv("PI_OFFLINE", "1");
-    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 15_000 }, {
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: HANG_GUARD_MS }, {
       workerPath: path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER ?? "src/worker.ts"),
       piBinary: nativeBinary!, runRoot: path.join(dir, "runs"),
     });
@@ -245,10 +264,10 @@ describe("native activation window (offline; opted-in success needs exact native
     const s = await setup();
     fs.writeFileSync(s.settingsFile, JSON.stringify({ compaction: { enabled: false }, enableInstallTelemetry: false }));
     const result = await s.manager.run({ task: "must not infer", model: "window-test/offline", actorId: "same-actor", sessionFile: path.join(s.dir, "actor.jsonl"), inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
-    expect(result, JSON.stringify(result)).toMatchObject({ status: "failed" });
+    expect(result, explain(result)).toMatchObject({ status: "failed" });
     expect(result.error).toContain("--no-auto-compaction");
     expect(s.requests).toHaveLength(0);
-  }, 25_000);
+  }, TEST_GUARD_MS);
 
   it("keeps the omitted full-history default on the actual native request path", async () => {
     const s = await setup();
@@ -257,12 +276,12 @@ describe("native activation window (offline; opted-in success needs exact native
     session.appendMessage(user("OLD_DEFAULT_HISTORY"));
     session.appendMessage(assistant("old reply"));
     const result = await s.manager.run({ task: "CURRENT_DEFAULT", model: "window-test/offline", actorId: "same-actor", sessionFile: journal, tools: [], extensions: false, transport: "process" });
-    expect(result, JSON.stringify(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
     expect(s.requests).toHaveLength(1);
     expect(JSON.stringify(s.requests)).toContain("OLD_DEFAULT_HISTORY");
     expect(JSON.stringify(s.requests)).toContain("CURRENT_DEFAULT");
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
-  }, 25_000);
+  }, TEST_GUARD_MS);
 
   it.skipIf(!selectedNativeBinary).each(["threshold", "overflow"])("retains LARGE old %s journal yet runs useful current inference, extensions:false/tools:[]", async mode => {
     const s = await setup();
@@ -274,7 +293,7 @@ describe("native activation window (offline; opted-in success needs exact native
       : assistant("old reply", 90_000));
     const before = readJournal(journal);
     const result = await s.manager.run({ task: "CURRENT_ACTIVATION", model: "window-test/offline", actorId: "same-actor", sessionFile: journal, inferenceContext: "activation", tools: [], extensions: false, transport: "process" });
-    expect(result, JSON.stringify(result)).toMatchObject({ status: "completed", text: "useful current result" });
+    expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
     expect(s.requests).toHaveLength(1);
     expect(JSON.stringify(s.requests)).not.toContain("OLD_PRIVATE_ACTIVATION");
     expect(JSON.stringify(s.requests)).toContain("CURRENT_ACTIVATION");
@@ -282,7 +301,7 @@ describe("native activation window (offline; opted-in success needs exact native
     const after = expectJournalAppended(journal, before);
     expect(after.bytes.toString("utf8")).toContain("CURRENT_ACTIVATION");
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
-  }, 25_000);
+  }, TEST_GUARD_MS);
 
   it.skipIf(!selectedNativeBinary)("blocks native manual compaction before any summary request and retains the full journal", async () => {
     const s = await setup();
@@ -321,7 +340,7 @@ describe("native activation window (offline; opted-in success needs exact native
       }
     });
     child.stdin.on("error", () => {});
-    const timeout = setTimeout(() => child.kill("SIGKILL"), 15_000);
+    const timeout = setTimeout(() => child.kill("SIGKILL"), HANG_GUARD_MS);
     child.stdin.write(`${JSON.stringify({ type: "get_state", id: "state" })}\n`);
     const exit = await new Promise<number | null>((resolve, reject) => {
       child.once("error", reject);
@@ -333,7 +352,7 @@ describe("native activation window (offline; opted-in success needs exact native
     expect(s.requests).toHaveLength(0);
     expectJournalAppended(journal, before);
     expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
-  }, 20_000);
+  }, TEST_GUARD_MS);
 
   it.skipIf(!selectedNativeBinary)("two real activations retain full journals and current tool pairs, without Fabric tool enablement", async () => {
     const s = await setup();
@@ -349,7 +368,7 @@ describe("native activation window (offline; opted-in success needs exact native
     ] as const) {
       const requestStart = s.requests.length;
       const result = await s.manager.run({ ...request, task });
-      expect(result, JSON.stringify(result)).toMatchObject({ status: "completed", text: "useful current result" });
+      expect(result, explain(result)).toMatchObject({ status: "completed", text: "useful current result" });
       const inputs = s.requests.slice(requestStart);
       expect(inputs).toHaveLength(2);
       expect(JSON.stringify(inputs)).not.toContain(excluded);
@@ -379,5 +398,5 @@ describe("native activation window (offline; opted-in success needs exact native
       expect(before.bytes.toString("utf8")).toContain(task);
       expect(fs.readFileSync(s.settingsFile, "utf8")).toBe(s.settings);
     }
-  }, 40_000);
+  }, 2 * HANG_GUARD_MS + 30_000);
 });

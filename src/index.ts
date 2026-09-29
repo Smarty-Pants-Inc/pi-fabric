@@ -7,6 +7,7 @@ import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  MessageUpdateEvent,
 } from "@earendil-works/pi-coding-agent";
 import { defaultCodePreviewSettings } from "./ui/code-preview.js";
 import {
@@ -109,7 +110,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
-import { readStoppedRuns } from "./agents/stopped-runs.js";
+import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -626,8 +627,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
   };
 
-  pi.on("session_start", async (_event, context) => {
+  pi.on("session_start", async (event, context) => {
+    fabricPrewarm = undefined;
     stopInboxWake();
+    // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
+    const reloadNotice = takeReloadStoppedNotice(context.sessionManager?.getSessionId?.() ?? "", event?.reason ?? "");
+    if (reloadNotice && context.hasUI) context.ui.notify(reloadNotice, "warning");
     inboxWake.context = context;
     inboxWake.armed = true;
     endEntropyLifecycle();
@@ -764,6 +769,22 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   };
 
 
+  // The first fabric_exec of a session paid Fabric's initialization and the TypeScript checker
+  // (5-10 s on a loaded host) after the model finished streaming it. Start both when the model
+  // starts streaming that call, the first sign of actual use (smarty-dev#2010).
+  let fabricPrewarm: Promise<void> | undefined;
+  const prewarmOnFabricExecStream = (event: MessageUpdateEvent, context: ExtensionContext): void => {
+    if (fabricPrewarm) return;
+    const update = event.assistantMessageEvent;
+    if (update.type !== "toolcall_start" && update.type !== "toolcall_delta") return;
+    const block = update.partial?.content?.[update.contentIndex];
+    if (block?.type !== "toolCall" || block.name !== "fabric_exec") return;
+    fabricPrewarm = (async () => {
+      await state.ensure(context);
+      await state.execution.prewarm(context);
+    })().catch(() => undefined);
+  };
+
   // Speculative PTC: follow fabric_exec argument streaming and pre-launch
   // literal-argument read calls so their latency hides behind generation.
   pi.on("message_start", () => {
@@ -771,6 +792,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("message_update", (event, context) => {
+    prewarmOnFabricExecStream(event, context);
     if (!state.initialized) return;
     state.speculationTap?.handleMessageUpdate(event, context);
   });

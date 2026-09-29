@@ -71,9 +71,17 @@ import {
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
+import { resolvePiModel } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
-import { agentWaitBound, describeWaitBound } from "../agents/wait-bound.js";
+import {
+  AGENT_WAIT_MAX_MS,
+  AgentWaitBoundError,
+  MAIN_AGENT_WAIT_MAX_MS,
+  agentWaitBound,
+  describeWaitBound,
+  isInteractiveMain,
+} from "../agents/wait-bound.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { isFabricThinking } from "../thinking.js";
 import { normalizeAgentRunRequest } from "../agents/request.js";
@@ -423,33 +431,24 @@ export class AgentsProvider implements FabricProvider {
   }
 
   /** Resolve a Pi participant selector only within this session's visible registry. */
-  #resolvePiModel(
+  async #resolvePiModel(
     model: string,
     context: FabricInvocationContext,
-  ): string {
-    let available: FabricModelCandidate[] = [];
-    try {
-      available = context.extensionContext.modelRegistry.getAvailable().map((candidate) => ({
-        provider: String(candidate.provider),
-        id: String(candidate.id),
-        ...(typeof candidate.name === "string" ? { name: candidate.name } : {}),
-      }));
-    } catch {
-      // The authoritative visible set is empty when registry discovery fails.
-    }
-    const resolved = resolveAvailablePiModel(model, {
+  ): Promise<string> {
+    // A model added to models.json after startup resolves after one shared refresh (smarty-dev#1830).
+    const resolved = await resolvePiModel({
+      selector: model,
+      registry: context.extensionContext.modelRegistry,
       aliases: this.modelsConfig().aliases,
-      available,
-      lastUsed: loadModelUsage(),
     });
     return `${resolved.provider}/${resolved.id}`;
   }
 
-  #resolvePiModelArgs(
+  async #resolvePiModelArgs(
     args: Record<string, unknown>,
     context: FabricInvocationContext,
     runnerOverride?: FabricAgentRunner,
-  ): Record<string, unknown> {
+  ): Promise<Record<string, unknown>> {
     const runner = runnerOverride ??
       (args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
         ? args.runner
@@ -457,17 +456,17 @@ export class AgentsProvider implements FabricProvider {
     if (runner !== "pi") return args;
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) return args;
-    const resolved = this.#resolvePiModel(model, context);
+    const resolved = await this.#resolvePiModel(model, context);
     return resolved === model ? args : { ...args, model: resolved };
   }
 
-  #resolvePiRunBinding(
+  async #resolvePiRunBinding(
     binding: FabricActorRunBinding,
     runner: FabricAgentRunner,
     context: FabricInvocationContext,
-  ): FabricActorRunBinding {
+  ): Promise<FabricActorRunBinding> {
     if (runner !== "pi" || !binding.model) return binding;
-    return { ...binding, model: this.#resolvePiModel(binding.model, context) };
+    return { ...binding, model: await this.#resolvePiModel(binding.model, context) };
   }
 
   async list(
@@ -514,7 +513,7 @@ export class AgentsProvider implements FabricProvider {
         "agents.handoff must be scheduled from inside fabric_exec and completed at its outer result boundary",
       );
     }
-    const handoffArgs = this.#resolvePiModelArgs(
+    const handoffArgs = await this.#resolvePiModelArgs(
       { ...args, model },
       context,
       "pi",
@@ -537,7 +536,7 @@ export class AgentsProvider implements FabricProvider {
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
     const request = runRequest(
-      this.#resolvePiModelArgs(
+      await this.#resolvePiModelArgs(
         {
           ...args,
           task: handoffTask(args),
@@ -601,7 +600,7 @@ export class AgentsProvider implements FabricProvider {
     switch (actionName) {
       case "run": {
         const handle = await this.manager.spawn(
-          runRequest(this.#resolvePiModelArgs(args, context), context, this.manager),
+          runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager),
           context.signal,
         );
         this.participants.scheduleRefresh();
@@ -623,7 +622,7 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = runRequest(this.#resolvePiModelArgs(args, context), context, this.manager);
+        const request = runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
         const durableCwd = request.residency === "durable" && request.cwd !== undefined
@@ -652,7 +651,19 @@ export class AgentsProvider implements FabricProvider {
       case "join":
       case "wait": {
         const id = String(args.id);
-        const timeoutMs = agentWaitBound(args.timeoutMs);
+        // smarty-dev#2119: an interactive Main waits at most 60 s, and the bound is a normal result.
+        const main = isInteractiveMain(context.extensionContext);
+        const timeoutMs = agentWaitBound(args.timeoutMs, main ? MAIN_AGENT_WAIT_MAX_MS : AGENT_WAIT_MAX_MS);
+        const atBound = (record: object) => {
+          // The wait ended so Main can see news: held followUps land at this tool boundary.
+          this.mainAgent.flushHeldAtNextBoundary?.();
+          return {
+            ...record,
+            waitTimedOut: true,
+            note: `Still running after ${describeWaitBound(timeoutMs)}; Main waits are capped at 60 s. It continues, and its ` +
+              "result arrives as a completion message: end the turn or do other work, then check agents.status.",
+          };
+        };
         if (this.residency?.hasAgent(id)) {
           const status = this.residency.statusAgent(id);
           context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
@@ -664,7 +675,8 @@ export class AgentsProvider implements FabricProvider {
             return await this.residency.waitAgent(id, signal);
           } catch (error) {
             if (!bound.aborted || context.signal?.aborted) throw error;
-            throw new Error(
+            if (main) return atBound(this.residency.statusAgent(id));
+            throw new AgentWaitBoundError(
               `agents.wait: durable agent ${status.name} is still running after ${describeWaitBound(timeoutMs)}. ` +
                 "It continues, and its result arrives as a completion message: end the turn now.",
             );
@@ -672,14 +684,19 @@ export class AgentsProvider implements FabricProvider {
         }
         const status = this.manager.status(id);
         context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
-        return waitWithProgress(
-          this.manager,
-          this.#transcripts,
-          id,
-          context,
-          this.agentToolPreviewEnabled,
-          { timeoutMs },
-        );
+        try {
+          return await waitWithProgress(
+            this.manager,
+            this.#transcripts,
+            id,
+            context,
+            this.agentToolPreviewEnabled,
+            { timeoutMs },
+          );
+        } catch (error) {
+          if (!main || !(error instanceof AgentWaitBoundError)) throw error;
+          return atBound(this.manager.status(id));
+        }
       }
       case "status": {
         const id = String(args.id);
@@ -928,7 +945,7 @@ export class AgentsProvider implements FabricProvider {
           : this.manager.cleanup(id, args.deleteBranch === true);
       }
       case "create": {
-        const createArgs = this.#resolvePiModelArgs(args, context);
+        const createArgs = await this.#resolvePiModelArgs(args, context);
         if (createArgs.scope === "global") {
           return this.globalActors.create(actorRequest(createArgs, context, this.manager, false));
         }
@@ -946,7 +963,7 @@ export class AgentsProvider implements FabricProvider {
         const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
         const requestedOverrides = actorRunBinding(args);
         const overrides = ownsActor
-          ? this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context)
+          ? await this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context)
           : requestedOverrides;
         context.activity?.({
           type: "entity",
@@ -1077,7 +1094,7 @@ export class AgentsProvider implements FabricProvider {
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
         const runner = target.actor?.runner ?? target.participant!.runner;
         const resolvedModel = model && ownsActor
-          ? this.#resolvePiModelArgs({ model }, context, runner).model as string
+          ? (await this.#resolvePiModelArgs({ model }, context, runner)).model as string
           : model || undefined;
         return this.actorManager.setModel(
           id,
@@ -1195,11 +1212,11 @@ export class AgentsProvider implements FabricProvider {
         const resolvedRequest = request.model
           ? {
               ...request,
-              model: this.#resolvePiModelArgs(
+              model: (await this.#resolvePiModelArgs(
                 { model: request.model },
                 context,
                 request.runner ?? this.manager.config.runner,
-              ).model as string,
+              )).model as string,
             }
           : request;
         const actor = await this.#createActor(resolvedRequest);

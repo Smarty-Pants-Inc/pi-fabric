@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Fabric mesh bridge (smarty-dev#2004); see src/mesh-bridge.ts for usage.
+import { main } from "../dist/mesh-bridge.js";
+
+main(process.argv.slice(2)).then(
+  (code) => { process.exitCode = code; },
+  (error) => { process.stderr.write(`mesh-bridge: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 2; },
+);

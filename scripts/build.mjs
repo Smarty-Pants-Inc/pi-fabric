@@ -6,6 +6,7 @@ const primaryEntryPoints = [
   "src/index.ts",
   "src/memory.ts",
   "src/mesh.ts",
+  "src/mesh-bridge.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/jev.ts",

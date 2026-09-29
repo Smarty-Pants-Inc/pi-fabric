@@ -30,7 +30,8 @@ describe.skipIf(!built || process.platform === "win32")("durable spawn beside th
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+    // The durable agent's resident host may still be writing its run files as it exits.
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
   });
 
   it("spawns only after a parallel sibling git worktree add finishes its checkout", async () => {

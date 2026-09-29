@@ -496,7 +496,10 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const mergedPool = await caches.observations.merge(
       poolLoaded.file,
       evidence.observationWindows,
+      signal,
     );
+    // Shutdown may land during the merge: never start the pool write after it.
+    if (!current()) return;
     if (!poolLoaded.error && (mergedPool.mergedSessions > 0 || !poolLoaded.file)) {
       await saveObservationPoolAsync(agentDir, mergedPool.file);
     }

@@ -66,6 +66,7 @@ vi.mock("../src/fabric-runtime-state.js", () => ({
 import piFabric from "../src/index.js";
 import { BackgroundEntropyCompiler } from "../src/entropy/compiler.js";
 import * as poolStore from "../src/entropy/pool-store.js";
+import { SessionObservationCache } from "../src/entropy/pool.js";
 
 type ExtensionHandler = (event: unknown, context: ExtensionContext) => unknown;
 
@@ -174,6 +175,47 @@ describe("entropy background scheduler", () => {
     expect(scanControl.calls).toBe(1);
     expect(compile).not.toHaveBeenCalled();
     expect(save).not.toHaveBeenCalled();
+  });
+
+  it("cancels an observation merge in flight at shutdown and never writes after it (smarty-dev#2010)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-entropy-background-"));
+    tempRoots.push(root);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    const file = path.join(root, "session.jsonl");
+    fs.writeFileSync(file, "");
+    const save = vi.spyOn(poolStore, "saveObservationPoolAsync");
+    const compile = vi.spyOn(BackgroundEntropyCompiler.prototype, "compile");
+    const original = SessionObservationCache.prototype.merge;
+    const mergeSignals: Array<AbortSignal | undefined> = [];
+    let releaseMerge!: () => void;
+    const mergeGate = new Promise<void>((resolve) => { releaseMerge = resolve; });
+    vi.spyOn(SessionObservationCache.prototype, "merge").mockImplementation(async function (
+      this: SessionObservationCache, pool, windows, signal,
+    ) {
+      mergeSignals.push(signal);
+      await mergeGate;
+      // Resolve with a result, as a merge that ignored cancellation would.
+      return original.call(this, pool, windows);
+    });
+    const harness = createHarness();
+    await piFabric(harness.pi);
+    const context = {
+      mode: "code", cwd: root, hasUI: false, isProjectTrusted: () => true,
+      ui: { setStatus: vi.fn(), notify: vi.fn() },
+      sessionManager: { getBranch: () => [], getSessionId: () => "merge-session", getSessionFile: () => file },
+    } as unknown as ExtensionContext;
+    await harness.command()("repairs", context);
+    await emit(harness.handlers, "tool_execution_end", { toolName: "fabric_exec", isError: false }, context);
+    await emit(harness.handlers, "turn_end", {}, context);
+    await vi.waitFor(() => expect(scanControl.calls).toBe(1), { timeout: 1_000 });
+    scanControl.resolvers.shift()!();
+    await vi.waitFor(() => expect(mergeSignals).toHaveLength(1), { timeout: 1_000 });
+    await emit(harness.handlers, "session_shutdown", {}, context);
+    expect(mergeSignals[0]?.aborted).toBe(true);
+    releaseMerge();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(save).not.toHaveBeenCalled();
+    expect(compile).not.toHaveBeenCalled();
   });
 
   it("returns turn hooks immediately, coalesces pending turns, and ends them on shutdown", async () => {

@@ -140,3 +140,18 @@ describe("incremental observation pool", () => {
     expect(reads).toBeGreaterThan(initialReads);
   });
 });
+
+describe("observation merge cancellation (smarty-dev#2010)", () => {
+  it("stops a large merge when its signal aborts and keeps the previous cache entry", async () => {
+    const cache = new SessionObservationCache();
+    const observations = Array.from({ length: 20_000 }, (_, index) => ({ ref: "pi.read", key: "path", value: `file-${index}` }));
+    const first = await cache.merge(undefined, [{ file: "session", observations: observations.slice(0, 10) }]);
+    const controller = new AbortController();
+    const merging = cache.merge(first.file, [{ file: "session", observations }], controller.signal);
+    controller.abort();
+    await expect(merging).rejects.toThrow(/abort/i);
+    // The aborted pass published nothing: a later merge of the same prefix is unchanged.
+    const again = await cache.merge(first.file, [{ file: "session", observations: observations.slice(0, 10) }]);
+    expect(again.file).toEqual(first.file);
+  });
+});

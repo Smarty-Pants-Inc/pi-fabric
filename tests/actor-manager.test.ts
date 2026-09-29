@@ -1418,7 +1418,11 @@ describe("ActorManager", () => {
         thinking: "medium",
       },
     });
+    // The owner stays the owner whoever reads it; binding.sessionId is the reader's overlay.
+    expect(owner.actors.status(actor.id).ownerSessionId).toBe("test");
+    expect(peer.list().find((entry) => entry.id === actor.id)?.ownerSessionId).toBe("test");
     expect(peer.status(actor.id)).toMatchObject({
+      ownerSessionId: "test",
       model: "provider/session-b",
       thinking: "low",
       binding: {

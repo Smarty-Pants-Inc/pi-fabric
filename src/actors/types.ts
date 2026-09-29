@@ -127,8 +127,10 @@ export interface FabricActorRunBinding {
   thinking?: FabricThinking;
 }
 
+/** The reading session's own model/thinking overlay; it pins that session's activations. */
 interface FabricActorBindingView extends FabricActorRunBinding {
   scope: "session";
+  /** The session that holds this overlay: the caller, not the actor's owner (see ownerSessionId). */
   sessionId: string;
   updatedAt?: number;
 }
@@ -251,6 +253,8 @@ export interface FabricActorInfo {
   /** Length of those instructions, in UTF-16 code units (JavaScript string length). */
   instructionsLength?: number;
   rootId?: string;
+  /** The session that owns and runs the actor (from its `session:<id>` root), whoever reads it. */
+  ownerSessionId?: string;
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
   project?: string;
   status: FabricActorStatus;

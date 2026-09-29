@@ -300,6 +300,45 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
     expect(Date.now() - started).toBeLessThan(30_000);
   });
 
+  // Astra round 2: the execution deadline may expire during the diagnosis wait;
+  // it must settle the recorded pipe failure, not replace it with a timeout.
+  it.skipIf(process.platform === "win32")("keeps the pipe failure when the deadline expires during its diagnosis", async () => {
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+        queueMicrotask(() => channel.push(`${JSON.stringify({ type: "call", id: 1, ref: "schema.status", args: {} })}\n`));
+      },
+    });
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(), stderr: new PassThrough(),
+      stdio: [null, null, null, channel], kill: vi.fn(),
+    });
+    vi.mocked(childProcess.spawn).mockReturnValue(child as unknown as ReturnType<typeof childProcess.spawn>);
+    let signalBroken!: () => void;
+    const broken = new Promise<void>((resolve) => { signalBroken = resolve; });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const pending = run("return 1", (_ref, _args, signal) => new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        // The pipe breaks with 500 ms left, less than the 2 s diagnosis bound.
+        queueMicrotask(() => {
+          vi.advanceTimersByTime(500);
+          channel.emit("error", new Error("read ECONNRESET"));
+          signalBroken();
+        });
+      }), { timeoutMs: 1000 });
+      await broken;
+      vi.advanceTimersByTime(3000);
+      const result = await pending;
+      expect(result).toMatchObject({ terminationReason: "runtime_error" });
+      expect(result.error).toContain("CPython IPC failed: read ECONNRESET");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("bounds non-cooperative host calls after guest failure", async () => {
     const started = Date.now();
     const result = await run('await asyncio.gather(schema.status(), memory.sessions())', async (ref) => {

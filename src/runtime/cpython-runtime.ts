@@ -214,9 +214,12 @@ export class CPythonRuntime implements FabricKernelRuntime {
       };
       const scheduleDeadline = (): void => {
         if (deadline) clearTimeout(deadline);
-        deadline = setTimeout(() => void finish({
-          value: undefined, terminationReason: "timed_out", error: `Execution timed out after ${deadlineAt - startedAt}ms`,
-        }), Math.max(0, deadlineAt - Date.now()));
+        // A recorded pipe failure is the real cause; the deadline only ends its diagnosis wait.
+        deadline = setTimeout(() => pipeError
+          ? fail(`${pipeError}; CPython process did not report its exit`)
+          : void finish({
+            value: undefined, terminationReason: "timed_out", error: `Execution timed out after ${deadlineAt - startedAt}ms`,
+          }), Math.max(0, deadlineAt - Date.now()));
         deadline.unref?.();
       };
       const send = (message: unknown): void => {

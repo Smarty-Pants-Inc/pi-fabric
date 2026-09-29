@@ -36,6 +36,7 @@
     }
   },
   "bin": {
+    "fabric-participants": "./bin/fabric-participants",
     "mesh-bridge": "./bin/mesh-bridge"
   },
   "files": [

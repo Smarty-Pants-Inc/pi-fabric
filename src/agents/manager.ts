@@ -174,8 +174,10 @@ const readText = (file: string): string | undefined => {
  * True while `git worktree add` is still creating the linked worktree `dir`. Git writes
  * `<gitdir>/locked` ("initializing") before it creates `dir`, holds `<gitdir>/index.lock`
  * during the checkout, and removes the lock when it finishes; a failed add removes `dir`.
- * ponytail: "initializing" is git's message (localized); a lock with any reason and no
- * index yet also counts, so a `--lock` worktree still spawns once its checkout is done.
+ * Only git's own add-time reason counts: a `git worktree lock` with no reason (an empty file)
+ * or another reason is a finished worktree. git writes "initializing" before W exists, so a
+ * half-written lock is never seen beside W/.git.
+ * ponytail: a localized git writes a translated reason; index.lock still covers its checkout.
  */
 const gitWorktreeInitializing = (dir: string): boolean => {
   const dotGit = readText(path.join(dir, ".git"));
@@ -183,9 +185,7 @@ const gitWorktreeInitializing = (dir: string): boolean => {
   if (!match) return false;
   const gitdir = path.resolve(dir, match[1]!);
   if (fs.existsSync(path.join(gitdir, "index.lock"))) return true;
-  const lock = readText(path.join(gitdir, "locked"));
-  if (lock === undefined) return false;
-  return lock.trim() === "" || lock.trim() === "initializing" || !fs.existsSync(path.join(gitdir, "index"));
+  return readText(path.join(gitdir, "locked"))?.trim() === "initializing";
 };
 
 const isEmptyDirectory = (dir: string): boolean => {

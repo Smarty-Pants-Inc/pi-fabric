@@ -59,16 +59,35 @@ describe.skipIf(process.platform === "win32")("awaitAgentCwd beside a parallel g
     expect(await added).not.toBe(0);
   }, 60_000);
 
-  it("resolves a plain directory and a finished locked worktree at once", async () => {
+  it("resolves a plain directory and finished locked worktrees at once", async () => {
     const { root, repo } = slowRepository("cat");
     const plain = path.join(root, "plain");
     fs.mkdirSync(plain);
-    const locked = path.join(root, "locked");
-    git(repo, "worktree", "add", "-q", "--lock", "--reason", "kept", "-b", "locked", locked);
+    const addLocked = path.join(root, "add-locked");
+    git(repo, "worktree", "add", "-q", "--lock", "--reason", "kept", "-b", "add-locked", addLocked);
+    // `git worktree lock` with no reason leaves an empty `locked` file (review/astra round 3).
+    const noReason = path.join(root, "no-reason");
+    git(repo, "worktree", "add", "-q", "-b", "no-reason", noReason);
+    git(repo, "worktree", "lock", noReason);
+    const reason = path.join(root, "reason");
+    git(repo, "worktree", "add", "-q", "-b", "reason", reason);
+    git(repo, "worktree", "lock", "--reason", "x", reason);
+    expect(fs.readFileSync(path.join(repo, ".git/worktrees/no-reason/locked"), "utf8")).toBe("");
     const started = Date.now();
-    expect(await awaitAgentCwd(root, plain)).toBe(plain);
-    expect(await awaitAgentCwd(root, locked)).toBe(locked);
+    for (const dir of [plain, addLocked, noReason, reason]) expect(await awaitAgentCwd(root, dir)).toBe(dir);
     expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  it("waits while git's own initializing lock is present", async () => {
+    const { root, repo } = slowRepository("cat");
+    const target = path.join(root, "init");
+    git(repo, "worktree", "add", "-q", "-b", "init", target);
+    const lock = path.join(repo, ".git/worktrees/init/locked");
+    fs.writeFileSync(lock, "initializing");
+    setTimeout(() => fs.rmSync(lock), 700);
+    const started = Date.now();
+    expect(await awaitAgentCwd(root, target)).toBe(target);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(650);
   });
 
   it("still fails a cwd that never appears, with the next-message hint", async () => {

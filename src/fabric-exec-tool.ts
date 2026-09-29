@@ -174,6 +174,11 @@ export const createFabricExecTool = (
   defineTool({
     name: "fabric_exec",
     label: "Fabric",
+    // Pi runs the tool calls of one message in parallel unless one of them is sequential.
+    // A program often depends on a sibling call (`git worktree add W` then a spawn with
+    // cwd W): parallel runs failed that spawn with ENOENT (smarty-dev#1668).
+    // ponytail: a batch with fabric_exec loses sibling overlap; batch Fabric work in one program.
+    executionMode: "sequential",
     description: python
       ? monty
         ? "Execute Python through Fabric's configured Monty sandbox. Monty runs a Python subset with VM resource limits, no native filesystem/network/environment access, and only host-mediated tools. Each invocation starts fresh. This is the exclusive model tool path in full code mode and Schema enforce mode."

@@ -211,12 +211,41 @@ switch (behavior) {
     process.stdin.pause();
     break;
   }
+  case "image-tool-result": {
+    // smarty-dev#1907: a child `read` of a PNG returns base64 far above the event-line cap.
+    const content = [
+      { type: "text", text: "Read image file [image/png]" },
+      { type: "image", data: "A".repeat(5 * 1024 * 1024 + 4), mimeType: "image/png" },
+    ];
+    emit({ type: "agent_start" });
+    emit({ type: "tool_execution_start", toolName: "read", toolCallId: "read-1", args: { path: "shot.png" } });
+    emit({ type: "tool_execution_end", toolName: "read", toolCallId: "read-1", result: { content }, isError: false });
+    emit({ type: "message_end", message: { role: "toolResult", toolCallId: "read-1", toolName: "read", content } });
+    emit({ type: "message_end", message: { role: "assistant", content: "image reviewed", usage: { input: 10, output: 5 } } });
+    emit({ type: "agent_end", messages: [], willRetry: false });
+    process.stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`, () => process.exit(0));
+    break;
+  }
+  case "oversized-final":
+  case "oversized-error": {
+    // smarty-dev#1907 review: the dropped event is the run's last assistant result.
+    emit({ type: "agent_start" });
+    emit({ type: "message_end", message: { role: "assistant", content: "progress only", stopReason: "toolUse" } });
+    const message = { role: "assistant", content: "x".repeat(4 * 1024 * 1024 + 1_024) };
+    if (behavior === "oversized-error") Object.assign(message, { stopReason: "error", errorMessage: "provider failed" });
+    emit({ type: "message_end", message });
+    emit({ type: "agent_end", messages: [], willRetry: false });
+    process.stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`, () => process.exit(0));
+    break;
+  }
   case "oversized-event": {
     const event = {
       type: "message_end",
       message: { role: "assistant", content: "x".repeat(4 * 1024 * 1024 + 1_024) },
     };
-    process.stdout.write(`${JSON.stringify(event)}\n`, () => process.exit(0));
+    emit(event);
+    emit({ type: "message_end", message: { role: "assistant", content: "after oversized" } });
+    process.stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`, () => process.exit(0));
     break;
   }
   case "fabric-session-env":

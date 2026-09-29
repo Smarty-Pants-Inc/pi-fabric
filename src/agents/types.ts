@@ -145,6 +145,8 @@ export interface AgentRunRecord {
   replyVia?: "tool";
   value?: unknown;
   error?: string;
+  /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
+  warnings?: string[];
   stderr?: string;
   exitCode?: number | null;
   usage: AgentUsage;

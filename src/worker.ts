@@ -460,6 +460,11 @@ const main = async (): Promise<void> => {
   const outputDecoder = new StringDecoder("utf8");
   const stderrDecoder = new StringDecoder("utf8");
   let terminalStatus: AgentRunStatus | undefined;
+  // A dropped assistant message_end may hold the run's answer or its error.
+  // Until a later assistant message_end is processed, the run must not
+  // complete with the earlier (stale) text.
+  // smarty-dev#1907.
+  let lostResult: string | undefined;
   let terminalError: string | undefined;
   let sawAgentError = false;
   let retryPending = false;
@@ -1024,6 +1029,7 @@ const main = async (): Promise<void> => {
       if (typeof message !== "object" || message === null || Array.isArray(message)) return;
       const messageRecord = message as Record<string, unknown>;
       if (messageRecord.role !== "assistant") return;
+      lostResult = undefined;
       const text = extractText(messageRecord);
       if (text) {
         record.text = latestRunText(text);
@@ -1223,21 +1229,46 @@ const main = async (): Promise<void> => {
   const steerTimer = options.steerFile ? setInterval(pollSteer, 200) : undefined;
   steerTimer?.unref?.();
 
-  const failOversizedEvent = (line: string): void => {
-    const prefix = line.slice(0, MAX_EVENT_LINE_CHARS);
+  // smarty-dev#1907: an event line above the cap is dropped, not fatal. The run
+  // keeps its child; the warning names the event and its size, and a bounded
+  // prefix is kept as evidence. Memory stays bounded: the rest of the line is
+  // counted, never buffered.
+  let oversized: { chars: number; prefix: string } | undefined;
+  let oversizedCount = 0;
+  const startOversizedEvent = (text: string): void => {
+    oversized = { chars: text.length, prefix: text.slice(0, MAX_EVENT_LINE_CHARS) };
+  };
+  const finishOversizedEvent = (): void => {
+    if (!oversized) return;
+    const { chars, prefix } = oversized;
+    oversized = undefined;
+    oversizedCount += 1;
     let artifactPath: string | undefined;
     try {
-      artifactPath = path.join(path.dirname(options.logFile), "oversized-event-prefix.txt");
+      artifactPath = path.join(
+        path.dirname(options.logFile),
+        oversizedCount === 1 ? "oversized-event-prefix.txt" : `oversized-event-prefix-${oversizedCount}.txt`,
+      );
       fs.writeFileSync(artifactPath, prefix, { encoding: "utf8", mode: 0o600 });
     } catch {
       artifactPath = undefined;
     }
-    terminalStatus = "failed";
-    terminalError = artifactPath
-      ? `Agent emitted an oversized event line; first ${prefix.length} characters saved to: ${artifactPath}`
-      : "Agent emitted an oversized event line";
-    outputBuffer = "";
-    killChild();
+    const head = prefix.slice(0, 4096);
+    const type = /^\{"type":"([^"]{1,64})"/.exec(head)?.[1] ?? "unknown";
+    const tool = /"toolName":"([^"]{1,128})"/.exec(head)?.[1];
+    const role = /"role":"([^"]{1,64})"/.exec(head)?.[1];
+    const warning =
+      `Dropped an oversized agent event line (${type}${tool ? `, tool ${tool}` : ""}, ` +
+      `${chars} characters > ${MAX_EVENT_LINE_CHARS})` +
+      (artifactPath ? `; first ${prefix.length} characters saved to: ${artifactPath}` : "");
+    appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
+    process.stderr.write(`[pi-fabric] ${warning}\n`);
+    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    if (type === "message_end" && (role === undefined || role === "assistant")) lostResult = warning;
+    update();
+  };
+  const discardOversized = (text: string): void => {
+    if (oversized) oversized.chars += text.length;
   };
 
   child.stdout?.on("data", (chunk: Buffer) => {
@@ -1249,18 +1280,28 @@ const main = async (): Promise<void> => {
     outputBuffer += eventProjection ? eventProjection.write(decoded) : decoded;
     while (true) {
       const newline = outputBuffer.indexOf("\n");
+      if (oversized) {
+        // Still inside a dropped line: count it up to its end, keep nothing.
+        discardOversized(newline < 0 ? outputBuffer : outputBuffer.slice(0, newline));
+        outputBuffer = newline < 0 ? "" : outputBuffer.slice(newline + 1);
+        if (newline < 0) break;
+        finishOversizedEvent();
+        continue;
+      }
       if (newline < 0) {
-        // Redundant Pi lifecycle history has already been elided while streaming.
-        // Keep the cap on authoritative messages and all other event fields;
-        // broad base64/text redaction must not bypass this safety boundary.
-        if (outputBuffer.length > MAX_EVENT_LINE_CHARS) failOversizedEvent(outputBuffer);
+        // Redundant Pi lifecycle history and large image data have already been
+        // elided while streaming. The cap still bounds every other event field.
+        if (outputBuffer.length > MAX_EVENT_LINE_CHARS) {
+          startOversizedEvent(outputBuffer);
+          outputBuffer = "";
+        }
         break;
       }
       if (newline > MAX_EVENT_LINE_CHARS) {
-        // The retained record still exceeds the cap. Preserve bounded evidence;
-        // do not use broad text redaction to keep an anomalous run alive.
-        failOversizedEvent(outputBuffer.slice(0, newline));
-        return;
+        startOversizedEvent(outputBuffer.slice(0, newline));
+        outputBuffer = outputBuffer.slice(newline + 1);
+        finishOversizedEvent();
+        continue;
       }
       const line = outputBuffer.slice(0, newline).replace(/\r$/, "");
       outputBuffer = outputBuffer.slice(newline + 1);
@@ -1379,6 +1420,10 @@ const main = async (): Promise<void> => {
         // Unparseable stdout; the generic failed-record path reports stderr.
       }
     }
+  } else if (oversized) {
+    discardOversized(outputBuffer);
+    outputBuffer = "";
+    finishOversizedEvent();
   } else if (outputBuffer.trim()) {
     processEvent(outputBuffer);
   }
@@ -1400,6 +1445,10 @@ const main = async (): Promise<void> => {
       terminalStatus = "failed";
       terminalError = error;
     }
+  }
+  if (lostResult && !terminalStatus) {
+    terminalStatus = "failed";
+    terminalError = `Agent's final assistant result was lost: ${lostResult}`;
   }
   record.finishedAt = Date.now();
   record.updatedAt = record.finishedAt;

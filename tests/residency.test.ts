@@ -243,6 +243,30 @@ describe("durable cwd validation", () => {
   });
 });
 
+// smarty-dev#883: a timed-out start left its launcher (and Pi child) running
+// with no owner. The client must end the launcher it spawned.
+describe.skipIf(process.platform === "win32")("resident host start timeout", () => {
+  it("ends the launcher and its child when the start budget runs out", async () => {
+    const state = await rootHarness("resident-start-timeout");
+    const client = new ResidencyClient({
+      config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent,
+      hostPath: path.resolve("tests/fixtures/stalled-launcher.mjs"), startupTimeoutMs: 300,
+    });
+    try {
+      await expect(client.ensureHost()).rejects.toThrow(/Timed out after \d+ms starting Fabric resident host/);
+      const log = fs.readFileSync(path.join(state.config.residencyRoot, "launcher.log"), "utf8");
+      const launcher = (JSON.parse(log.trim().split("\n")[0]!) as { pid: number }).pid;
+      const child = Number(fs.readFileSync(path.join(state.config.residencyRoot, "stalled-child.pid"), "utf8"));
+      const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      // SIGTERM went to the whole group before the rejection; wait for both exits.
+      await waitFor(() => !alive(launcher) && !alive(child), 30_000);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+});
+
 // Known Windows limitation: cross-spawn of the pi binary through bun's
 // node_modules shims hangs before the child starts, so the launcher never
 // reaches its spawn trace. Durable residency E2E stays POSIX-only until that

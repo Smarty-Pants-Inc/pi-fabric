@@ -563,6 +563,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "read",
   },
   {
+    name: "instructions",
+    description:
+      "Read a live actor's current instruction text with its sha256 instructionsDigest and instructionsLength. Use it to check the text before and after agents.setInstructions. Writes nothing.",
+    inputSchema: idSchema,
+    risk: "read",
+  },
+  {
     name: "actors",
     description:
       'List persistent actors. Default scope "project" lists live actors in this Fabric session; scope "global" lists project-independent templates in the global registry.',
@@ -794,11 +801,15 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "export",
     description:
-      "Write a live project actor's definition to the global registry as a project-independent template, without any history (no messages, session, or run logs). This is a write, not a read: remove the template with agents.remove({ id, scope: \"global\" }). Read a live actor's instructions digest with agents.actorStatus. Throws on a name collision unless overwrite is true.",
+      "Write a live project actor's definition to the global registry as a project-independent template, without any history (no messages, session, or run logs). This is a write, not a read: it requires write: true, and throws without it. Read a live actor's instructions with agents.instructions. Remove a template with agents.remove({ id, scope: \"global\" }). Throws on a name collision unless overwrite is true.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
+        write: {
+          type: "boolean",
+          description: "Must be true: confirms the write of a global template",
+        },
         overwrite: { type: "boolean" },
       },
       required: ["id"],

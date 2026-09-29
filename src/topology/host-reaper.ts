@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { type FabricHostLease, readHostLeases, removeHostLease } from "./host-leases.js";
+import { readParticipantFiles, removeParticipantFileIf } from "./participant-files.js";
 
 /** A host's records are removed when its lease expired this long ago (smarty-dev#367). */
 export const DEAD_HOST_RECORDS_MS = 6 * 60 * 60 * 1000;
@@ -28,7 +29,8 @@ const leaseGone = (entry: MeshStateEntry, cutoff: number, leases: ReadonlyMap<st
 const fileLeases = (mesh: { root?: string }): ReadonlyMap<string, FabricHostLease> =>
   typeof mesh.root === "string" ? readHostLeases(mesh.root) : new Map();
 
-interface DeadRecord { entry: MeshStateEntry; hostId: string }
+/** `file`: the record's own file (smarty-dev#2004), not a shared-state entry. */
+interface DeadRecord { entry: MeshStateEntry; hostId: string; file?: true }
 
 /**
  * Records left in the shared state by hosts that are gone: host leases that expired longer ago
@@ -52,11 +54,16 @@ export const deadHostRecords = (
     hosts.set(id, gone);
     if (gone) dead.push({ entry, hostId: id });
   }
-  for (const entry of mesh.listAll(PARTICIPANT_PREFIX, fresh)) {
-    const owner = record(entry.value)?.ownerHostId;
-    if (typeof owner !== "string" || owner === options.ownHostId) continue;
-    const gone = hosts.get(owner);
-    if (gone === true || (gone === undefined && entry.updatedAt <= cutoff)) dead.push({ entry, hostId: owner });
+  const files = typeof mesh.root === "string" ? readParticipantFiles(mesh.root) : [];
+  for (const [entries, file] of [[mesh.listAll(PARTICIPANT_PREFIX, fresh), false], [files, true]] as const) {
+    for (const entry of entries) {
+      const owner = record(entry.value)?.ownerHostId;
+      if (typeof owner !== "string" || owner === options.ownHostId) continue;
+      const gone = hosts.get(owner);
+      if (gone === true || (gone === undefined && entry.updatedAt <= cutoff)) {
+        dead.push({ entry, hostId: owner, ...(file ? { file: true as const } : {}) });
+      }
+    }
   }
   return dead.slice(0, MAX_REAP_BATCH);
 };
@@ -68,14 +75,15 @@ export const deadHostRecords = (
  * Returns how many it removed.
  */
 export const reapDeadHostRecords = async (
-  mesh: Pick<MeshStore, "listAll" | "writeBatch"> & { root?: string },
+  mesh: Pick<MeshStore, "listAll" | "writeBatch" | "exclusive"> & { root?: string },
   identity: MeshIdentity,
   options: { ownHostId: string; now?: number; deadAfterMs?: number },
 ): Promise<number> => {
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
-  const dead = deadHostRecords(mesh, options);
-  if (dead.length === 0) return 0;
-  const results = await mesh.writeBatch({
+  const found = deadHostRecords(mesh, options);
+  if (found.length === 0) return 0;
+  const dead = found.filter((item) => !item.file);
+  const results = dead.length === 0 ? [] : await mesh.writeBatch({
     identity,
     ops: dead.map(({ entry, hostId }) => ({
       kind: "delete" as const,
@@ -90,13 +98,27 @@ export const reapDeadHostRecords = async (
       },
     })),
   });
-  // A reaped host's file lease goes too, once it is as old.
+  let removed = results.filter((result) => result.applied).length;
   if (typeof mesh.root === "string") {
+    // Participant files, each checked again just before its removal: its host must still be gone
+    // (or have no record, where the orphan rule held at selection), and the file unchanged since.
+    // Under the file's own lock, so a takeover since the scan keeps its file (review/astra F1 on #142).
+    // ponytail: a host renewing only its lease file is not fenced; it has been gone for hours.
+    for (const { entry, hostId } of found.filter((item) => item.file)) {
+      const hostGone = (): boolean => {
+        const host = mesh.listAll(hostKey(hostId), { fresh: true }).find((candidate) => candidate.key === hostKey(hostId));
+        return !host || leaseGone(host, cutoff, fileLeases(mesh));
+      };
+      const gone = await removeParticipantFileIf({ root: mesh.root, exclusive: (operation) => mesh.exclusive(operation) }, entry.key, (current) =>
+        current.version === entry.version && current.updatedAt === entry.updatedAt && hostGone()).catch(() => false);
+      if (gone) removed += 1;
+    }
+    // A reaped host's file lease goes too, once it is as old.
     const leases = readHostLeases(mesh.root);
-    for (const hostId of new Set(dead.map((item) => item.hostId))) {
+    for (const hostId of new Set(found.map((item) => item.hostId))) {
       const lease = leases.get(hostId);
       if (lease && lease.expiresAt <= cutoff) removeHostLease(mesh.root, hostId);
     }
   }
-  return results.filter((result) => result.applied).length;
+  return removed;
 };

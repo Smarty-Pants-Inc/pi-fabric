@@ -24,6 +24,13 @@ import {
   writeHostLease,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
+import {
+  participantFilesOnly,
+  readParticipantFile,
+  readParticipantFiles,
+  removeParticipantFileIf,
+  writeParticipantFileIf,
+} from "./participant-files.js";
 
 const PARTICIPANT_PREFIX = "topology/participants/";
 /** Project-scoped monotonic counter backing Linear-style peer labels. Never shrinks. */
@@ -62,6 +69,34 @@ const DEAD_HOST_SWEEP_MS = 15 * 60 * 1_000;
 const keyFor = (prefix: string, id: string): string =>
   prefix + createHash("sha256").update(id).digest("hex");
 
+// A record may be in its own file and in the shared state (smarty-dev#2004): during a mixed
+// rollout a newer runtime writes both and an older one only the state. The later write wins; on a
+// tie, the file. An older runtime takes over a key only after its owner lapsed, so its write is the
+// later one.
+// A mirror (a bridged remote record, only ever in the state) never outranks a native file at the
+// same key, whatever the times: a local record keeps precedence (#132).
+const mirrored = (entry: MeshStateEntry): boolean =>
+  isObject(entry.value) && entry.value.remoteHost !== undefined;
+const newer = (file: MeshStateEntry | undefined, state: MeshStateEntry | undefined): MeshStateEntry | undefined =>
+  !file ? state : !state || mirrored(state) ? file : state.updatedAt > file.updatedAt ? state : file;
+
+// The merged entries, and the state mirrors a native file shadowed (still checked for a collision,
+// so a refused mirror is reported whichever copy of the native won).
+const mergeParticipantEntries = (
+  files: readonly MeshStateEntry[],
+  state: readonly MeshStateEntry[],
+): { entries: MeshStateEntry[]; shadowed: MeshStateEntry[] } => {
+  const byKey = new Map<string, MeshStateEntry>();
+  const shadowed: MeshStateEntry[] = [];
+  for (const entry of files) byKey.set(entry.key, entry);
+  for (const entry of state) {
+    const file = byKey.get(entry.key);
+    if (file && mirrored(entry)) shadowed.push(entry);
+    byKey.set(entry.key, newer(file, entry)!);
+  }
+  return { entries: [...byKey.values()], shadowed };
+};
+
 const isMeshLockTimeout = (error: unknown): error is Error =>
   error instanceof Error &&
   ((error as Error & { code?: unknown }).code === "FABRIC_MESH_LOCK_TIMEOUT" ||
@@ -95,6 +130,8 @@ const capabilities = new Set([
 interface ParsedDirectory {
   hosts: MeshStateEntry[];
   participants: FabricParticipantRecord[];
+  /** State mirrors a native participant file shadowed: still checked for a collision. */
+  shadowed: FabricParticipantRecord[];
   legacySessions: MeshStateEntry[];
   legacyActors: MeshStateEntry[];
 }
@@ -344,7 +381,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #heartbeatMs: number;
   readonly #leaseMs: number;
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
-  #parsedCache: { token: object; value: ParsedDirectory } | undefined;
+  #parsedCache: { token: object; files: readonly MeshStateEntry[]; value: ParsedDirectory } | undefined;
   #parsedEntries = new Map<string, { version: number; updatedAt: number; entry: MeshStateEntry }>();
   readonly #reportedCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
@@ -492,6 +529,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const hosts = this.#liveHosts(parsed.hosts);
     const byId = new Map<string, FabricParticipantInfo>();
     const refused: string[] = [];
+    for (const mirror of parsed.shadowed) this.#collides(mirror, hosts);
     for (const participant of parsed.participants) {
       const owner = hosts.get(participant.ownerHostId);
       if (!ownerMatches(participant, owner, this.options.hostId)) continue;
@@ -561,21 +599,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // second, but by a few writers. The copies are frozen, since every caller now shares them.
   #parsed(read: { fresh: boolean }): ParsedDirectory {
     if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
+      const merged = mergeParticipantEntries(this.#participantFiles(read), this.mesh.listAll(PARTICIPANT_PREFIX, read));
       return {
         hosts: this.mesh.listAll(HOST_PREFIX, read),
-        participants: this.mesh.listAll(PARTICIPANT_PREFIX, read)
-          .flatMap((entry) => {
-            const participant = participantFromEntry(entry);
-            if (!participant) this.#reportMalformedMirror(entry);
-            return participant ?? [];
-          }),
+        participants: this.#participantsOf(merged.entries),
+        shadowed: merged.shadowed.flatMap((entry) => participantFromEntry(entry) ?? []),
         legacySessions: this.mesh.listAll(LEGACY_SESSION_PREFIX, read),
         legacyActors: this.mesh.listAll(LEGACY_ACTOR_PREFIX, read),
       };
     }
     const token = this.mesh.stateToken(read);
+    // Participant files are a second source (smarty-dev#2004): their listing is the same array
+    // while no file changed, so it keys the cache with the state token.
+    const files = this.#participantFiles(read);
     const cached = this.#parsedCache;
-    if (cached?.token === token) return cached.value;
+    if (cached?.token === token && cached.files === files) return cached.value;
     const previous = this.#parsedEntries;
     const next = new Map<string, { version: number; updatedAt: number; entry: MeshStateEntry }>();
     const copies = (prefix: string): MeshStateEntry[] => this.mesh.listAllShared(prefix, read).map((shared) => {
@@ -588,16 +626,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
     });
     const value: ParsedDirectory = {
       hosts: copies(HOST_PREFIX),
-      participants: copies(PARTICIPANT_PREFIX).flatMap((entry) => {
-        const participant = participantFromEntry(entry);
-        if (!participant) this.#reportMalformedMirror(entry);
-        return participant ?? [];
-      }),
+      ...((): Pick<ParsedDirectory, "participants" | "shadowed"> => {
+        const merged = mergeParticipantEntries(files, copies(PARTICIPANT_PREFIX));
+        return {
+          participants: this.#participantsOf(merged.entries),
+          shadowed: merged.shadowed.flatMap((entry) => participantFromEntry(entry) ?? []),
+        };
+      })(),
       legacySessions: copies(LEGACY_SESSION_PREFIX),
       legacyActors: copies(LEGACY_ACTOR_PREFIX),
     };
     this.#parsedEntries = next;
-    this.#parsedCache = { token, value };
+    this.#parsedCache = { token, files, value };
     return value;
   }
 
@@ -688,7 +728,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // list, which also knows legacy roots, so the answer is the same.
     if (this.options.enabled) {
       const read = { fresh: options.fresh === true };
-      const entry = this.mesh.get(keyFor(PARTICIPANT_PREFIX, target), read);
+      const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, target), read);
       const participant = entry ? participantFromEntry(entry) : undefined;
       if (participant?.id === target && (
         participant.remoteHost === undefined ||
@@ -870,12 +910,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshScheduled = false;
     await this.#refreshing?.catch(() => undefined);
     if (!this.options.enabled) return;
-    const owned = this.mesh
-      .listAll(PARTICIPANT_PREFIX)
-      .filter((entry) => {
-        const participant = participantFromEntry(entry);
-        return participant !== undefined && isLocal(participant, this.options.hostId);
-      });
+    const own = (entry: MeshStateEntry): boolean => {
+      const participant = participantFromEntry(entry);
+      return participant !== undefined && isLocal(participant, this.options.hostId);
+    };
+    await Promise.allSettled(readParticipantFiles(this.mesh.root, { maxAgeMs: 0 }).filter(own)
+      .map((entry) => removeParticipantFileIf(this.mesh, entry.key, own)));
+    const owned = this.mesh.listAll(PARTICIPANT_PREFIX).filter(own);
     await Promise.allSettled(owned.map((entry) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
     const legacySessionKey = this.#legacySessionKey();
     if (legacySessionKey) {
@@ -925,8 +966,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // each separate put rewrote the whole shared state file under the mesh lock.
     const ops: MeshBatchOperation[] = [];
     let changed = false;
+    // Before the fleet owner's switch to files, the shared state stays the record every runtime
+    // reads, and each committed record is also written to its file. After it, records are written
+    // only to their files, and this host removes its records from the shared state, and its
+    // pre-directory session entry too: every runtime then reads the records (smarty-dev#2004).
+    const filesOnly = participantFilesOnly(this.mesh.get(LIVENESS_POLICY_KEY)?.value);
     const legacySessionKey = this.#legacySessionKey();
-    if (legacySessionKey && this.#quiescing) {
+    if (legacySessionKey && (this.#quiescing || filesOnly)) {
       const legacy = this.mesh.get(legacySessionKey);
       if (legacy?.updatedBy.id === this.options.identity.id) {
         ops.push({ kind: "delete", key: legacy.key, ifVersion: legacy.version, onConflict: "skip" });
@@ -956,12 +1002,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ops.push({ kind: "put", key: legacySessionKey, value: legacyValue });
     }
 
-    const existing = this.mesh
-      .listAll(PARTICIPANT_PREFIX)
-      .flatMap((entry) => {
-        const participant = participantFromEntry(entry);
-        return participant && isLocal(participant, this.options.hostId) ? [{ entry, participant }] : [];
-      });
+    const ownParticipant = (entry: MeshStateEntry | undefined): FabricParticipantRecord | undefined => {
+      const participant = entry && participantFromEntry(entry);
+      return participant && isLocal(participant, this.options.hostId) ? participant : undefined;
+    };
+    const stateEntries = this.mesh.listAll(PARTICIPANT_PREFIX);
+    const stateByKey = new Map(stateEntries.map((entry) => [entry.key, entry]));
+    const fileEntries = readParticipantFiles(this.mesh.root);
+    const filesByKey = new Map(fileEntries.map((entry) => [entry.key, entry]));
+    const existing = stateEntries.flatMap((entry) => {
+      const participant = ownParticipant(entry);
+      return participant ? [{ entry, participant }] : [];
+    });
     const existingById = new Map(existing.map((item) => [item.participant.id, item]));
     const legacyRoots = new Map(
       this.mesh
@@ -984,12 +1036,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // ACTIVITY_REFRESH_MS.
     const withoutTime = (value: unknown): string =>
       JSON.stringify({ ...(isObject(value) ? value : {}), ...QUIET_FIELDS });
+    const activityOf = (current: FabricParticipantRecord, record: FabricParticipantRecord): boolean =>
+      JSON.stringify({ ...current, updatedAt: undefined }) !== JSON.stringify({ ...record, updatedAt: undefined });
     let activity = false;
+    // Records whose files to write: now (files only), or once the shared state committed them.
+    const fileWrites: FabricParticipantRecord[] = [];
+    const activityWrites: FabricParticipantRecord[] = [];
+    const statePuts = new Map<string, FabricParticipantRecord>();
     for (const record of desired.values()) {
-      const current = existingById.get(record.id);
-      if (current && JSON.stringify(current.participant) === JSON.stringify(record)) continue;
       const key = keyFor(PARTICIPANT_PREFIX, record.id);
-      const occupied = current?.entry ?? this.mesh.get(key);
+      const current = existingById.get(record.id);
+      const currentFile = ownParticipant(filesByKey.get(key));
+      if (filesOnly
+        ? currentFile && JSON.stringify(currentFile) === JSON.stringify(record)
+        : current && JSON.stringify(current.participant) === JSON.stringify(record)) continue;
+      const stateEntry = stateByKey.get(key) ?? (filesOnly ? undefined : this.mesh.get(key));
+      const occupied = newer(filesByKey.get(key), stateEntry);
       const occupiedParticipant = occupied && participantFromEntry(occupied);
       const legacyOwner = record.kind === "actor" ? legacyActorOwners.get(record.id) : undefined;
       if (!occupiedParticipant && legacyOwner && legacyOwner !== this.options.identity.id) {
@@ -999,26 +1061,23 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (
         occupiedParticipant &&
         occupiedParticipant.remoteHost === undefined &&
-        occupiedParticipant.ownerHostId !== this.options.hostId
-      ) {
-        const ownerEntry = this.mesh.get(keyFor(HOST_PREFIX, occupiedParticipant.ownerHostId));
-        const owner = ownerEntry && this.#liveHosts([ownerEntry]).get(occupiedParticipant.ownerHostId);
-        if (
-          owner &&
-          owner.expiresAt >= now &&
-          owner.identity.id === occupiedParticipant.ownerIdentityId
-        ) {
-          continue;
-        }
+        occupiedParticipant.ownerHostId !== this.options.hostId &&
+        this.#ownerLive(occupiedParticipant)
+      ) continue;
+      if (filesOnly) {
+        // A file write does not take the mesh lock, so it does not count as a shared change.
+        if (!currentFile || withoutTime(currentFile) !== withoutTime(record)) fileWrites.push(record);
+        else if (activityOf(currentFile, record)) activityWrites.push(record);
+        continue;
       }
       if (!current || withoutTime(current.participant) !== withoutTime(record)) changed = true;
-      else activity ||= JSON.stringify({ ...current.participant, updatedAt: undefined }) !==
-        JSON.stringify({ ...record, updatedAt: undefined });
+      else activity ||= activityOf(current.participant, record);
+      statePuts.set(key, record);
       ops.push({
         kind: "put",
         key,
         value: record,
-        ...(occupied ? { ifVersion: occupied.version } : {}),
+        ...(stateEntry ? { ifVersion: stateEntry.version } : {}),
         // Another host took the key meanwhile: leave it. Any other conflict fails the
         // whole heartbeat (nothing written) so the next one retries.
         onConflict: (latest) => {
@@ -1027,10 +1086,40 @@ export class ParticipantDirectory implements FabricParticipantSource {
         },
       });
     }
+    for (const entry of fileEntries) {
+      const participant = ownParticipant(entry);
+      if (participant && !desired.has(participant.id)) {
+        await removeParticipantFileIf(this.mesh, entry.key, (current) => ownParticipant(current) !== undefined);
+      }
+    }
     for (const { entry, participant } of existing) {
-      if (desired.has(participant.id)) continue;
+      if (!filesOnly && desired.has(participant.id)) continue;
       changed = true;
       ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
+    }
+    if (filesOnly) {
+      if (activityWrites.length > 0 && now - this.#recordsWrittenAt >= ACTIVITY_REFRESH_MS) {
+        fileWrites.push(...activityWrites);
+        this.#recordsWrittenAt = now;
+      }
+      // This host's file lease goes first: a contender that sees a file of ours finds its owner
+      // live, even before our first shared host record (review/astra round 2 F1 on #142).
+      if (fileWrites.length > 0 && !this.#quiescing) this.#renewFileLease();
+      // Written before the state removals below commit, so a reader always finds each record.
+      for (const record of fileWrites) {
+        // Under the key's lock, the file as it is now: absent, ours, or its owner gone by a fresh
+        // (uncached) read of that owner's liveness. A live owner keeps it (review/astra F1 on #142).
+        // The shared state's entry for the key counts too: a runtime that writes only the state may
+        // hold it (review/astra round 4 on #142).
+        await this.#writeFile(record, (current) => {
+          const taken = (entry: MeshStateEntry | undefined): boolean => {
+            if (!entry || ownParticipant(entry) !== undefined) return false;
+            const holder = participantFromEntry(entry);
+            return holder !== undefined && holder.remoteHost === undefined && this.#ownerLive(holder);
+          };
+          return !taken(current) && !taken(this.mesh.get(keyFor(PARTICIPANT_PREFIX, record.id), { fresh: true }));
+        });
+      }
     }
     if (activity && now - this.#recordsWrittenAt >= ACTIVITY_REFRESH_MS) changed = true;
     if (!full && !changed) return false;                       // nothing to publish
@@ -1038,14 +1127,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // (smarty-dev#816). Under the fleet owner's policy, a renewal that changes nothing writes
     // only the file, plus the shared host record every STATE_LEASE_RENEW_MS.
     if (!this.#quiescing) {
-      const leaseAt = Date.now();
-      writeHostLease(this.mesh.root, {
-        id: this.options.hostId,
-        rootId: this.options.rootId,
-        identityId: this.options.identity.id,
-        updatedAt: leaseAt,
-        expiresAt: leaseAt + this.#leaseMs,
-      });
+      const leaseAt = this.#renewFileLease();
       if (!changed && fileLeasesOnly(this.mesh.get(LIVENESS_POLICY_KEY)?.value)) {
         const own = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
         const host = own && hostFromEntry(own);
@@ -1082,9 +1164,63 @@ export class ParticipantDirectory implements FabricParticipantSource {
         expiresAt: leaseAt + this.#leaseMs,
       }),
     });
-    await this.mesh.writeBatch({ identity: this.options.identity, ops });
-    this.#recordsWrittenAt = Date.now();
+    const results = await this.mesh.writeBatch({ identity: this.options.identity, ops });
+    if (!filesOnly) this.#recordsWrittenAt = Date.now();
+    // Each record the shared state committed goes to its file too, for runtimes that read files.
+    for (const result of results) {
+      if (!result.applied || !statePuts.has(result.key)) continue;
+      // The copy is the committed state entry itself, with its own version and commit time, and
+      // only while the state still holds exactly that write: a copy delayed past a newer owner's
+      // state write (an older runtime's takeover) is dropped, and never looks newer than it
+      // (review/astra round 4 on #142).
+      await writeParticipantFileIf(this.mesh, result.key, () => {
+        const committed = this.mesh.get(result.key, { fresh: true });
+        return committed?.version === result.version && ownParticipant(committed) !== undefined ? committed : undefined;
+      }).catch(() => undefined);                            // the state holds it; the next refresh retries
+    }
     return true;
+  }
+
+  #renewFileLease(): number {
+    const leaseAt = Date.now();
+    writeHostLease(this.mesh.root, {
+      id: this.options.hostId,
+      rootId: this.options.rootId,
+      identityId: this.options.identity.id,
+      updatedAt: leaseAt,
+      expiresAt: leaseAt + this.#leaseMs,
+    });
+    return leaseAt;
+  }
+
+  // Whether a participant's owner host is live now, by a fresh read: its shared host record (not
+  // the store's read cache) with its file lease, or, before its first shared record, its file lease
+  // alone, which a host writes before any participant file (review/astra round 2 F1 on #142).
+  #ownerLive(participant: FabricParticipantRecord, now = Date.now()): boolean {
+    const lease = readHostLease(this.mesh.root, participant.ownerHostId);
+    const entry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId), { fresh: true });
+    const host = entry ? hostFromEntry(entry) : undefined;
+    if (host) {
+      return host.identity.id === participant.ownerIdentityId &&
+        hostLeaseExpiry(lease ? new Map([[host.id, lease]]) : new Map(), host) >= now;
+    }
+    return lease !== undefined && lease.identityId === participant.ownerIdentityId &&
+      lease.rootId === participant.rootId && lease.expiresAt >= now;
+  }
+
+  // A files-only write, decided under the key's lock: stamped now, the time of that decision.
+  #writeFile(
+    record: FabricParticipantRecord,
+    allowed: (current: MeshStateEntry | undefined) => boolean,
+  ): Promise<boolean> {
+    const key = keyFor(PARTICIPANT_PREFIX, record.id);
+    return writeParticipantFileIf(this.mesh, key, (current) => allowed(current) ? {
+      key,
+      value: record,
+      version: (current?.version ?? 0) + 1,
+      updatedAt: Date.now(),
+      updatedBy: this.options.identity,
+    } : undefined);
   }
 
   /**
@@ -1101,7 +1237,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         record.label = published;
         continue;
       }
-      const existingEntry = this.mesh.get(keyFor(PARTICIPANT_PREFIX, record.id));
+      const existingEntry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, record.id));
       const existing = existingEntry ? participantFromEntry(existingEntry) : undefined;
       // Only this mesh's own record keeps a label: a mirror at the key never names a local root.
       if (existing?.label && existing.remoteHost === undefined) {
@@ -1140,6 +1276,31 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
     }
     return undefined;
+  }
+
+  // Participant entries from their files and the shared state, the later of each key's two.
+  #participantEntries(read: { fresh?: boolean } = {}): MeshStateEntry[] {
+    return this.#mergedEntries(read).entries;
+  }
+
+  #mergedEntries(read: { fresh?: boolean } = {}): ReturnType<typeof mergeParticipantEntries> {
+    return mergeParticipantEntries(this.#participantFiles(read), this.mesh.listAll(PARTICIPANT_PREFIX, read));
+  }
+
+  #participantFiles(read: { fresh?: boolean }): readonly MeshStateEntry[] {
+    return readParticipantFiles(this.mesh.root, { maxAgeMs: read.fresh ? 0 : this.mesh.readCacheMs });
+  }
+
+  #participantsOf(entries: readonly MeshStateEntry[]): FabricParticipantRecord[] {
+    return entries.flatMap((entry) => {
+      const participant = participantFromEntry(entry);
+      if (!participant) this.#reportMalformedMirror(entry);
+      return participant ?? [];
+    });
+  }
+
+  #participantEntry(key: string, read: { fresh?: boolean } = {}): MeshStateEntry | undefined {
+    return newer(readParticipantFile(this.mesh.root, key), this.mesh.get(key, read));
   }
 
   #legacySessionKey(): string | undefined {

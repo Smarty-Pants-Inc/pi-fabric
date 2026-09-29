@@ -130,7 +130,10 @@ const staticClosure = (roots) => {
 
 const startupFiles = staticClosure([join(dist, "index.js")]);
 const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLength(readFileSync(file)), 0);
-if (startupBytes > 1150 * 1024 || startupFiles.size > 44) {
+// 45 files: src/topology/participant-files.ts is eager (the directory and the dashboard) and also
+// imported by the lazy mesh bridge, so it is a shared chunk instead of part of index.js; the bytes
+// are the same (smarty-dev#2004).
+if (startupBytes > 1150 * 1024 || startupFiles.size > 45) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
 const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter"];

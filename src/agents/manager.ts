@@ -160,25 +160,80 @@ export const resolveAgentCwd = (parentCwd: string, requestedCwd?: string): strin
 };
 
 const AGENT_CWD_SETTLE_MS = 3_000;
+const AGENT_WORKTREE_SETTLE_MS = 30_000;
+
+const readText = (file: string): string | undefined => {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+};
 
 /**
- * resolveAgentCwd, but a missing cwd is re-checked for up to AGENT_CWD_SETTLE_MS first.
+ * True while `git worktree add` is still creating the linked worktree `dir`. Git writes
+ * `<gitdir>/locked` ("initializing") before it creates `dir`, holds `<gitdir>/index.lock`
+ * during the checkout, and removes the lock when it finishes; a failed add removes `dir`.
+ * ponytail: "initializing" is git's message (localized); a lock with any reason and no
+ * index yet also counts, so a `--lock` worktree still spawns once its checkout is done.
+ */
+const gitWorktreeInitializing = (dir: string): boolean => {
+  const dotGit = readText(path.join(dir, ".git"));
+  const match = dotGit?.match(/^gitdir:\s*(.+?)\s*$/m);
+  if (!match) return false;
+  const gitdir = path.resolve(dir, match[1]!);
+  if (fs.existsSync(path.join(gitdir, "index.lock"))) return true;
+  const lock = readText(path.join(gitdir, "locked"));
+  if (lock === undefined) return false;
+  return lock.trim() === "" || lock.trim() === "initializing" || !fs.existsSync(path.join(gitdir, "index"));
+};
+
+const isEmptyDirectory = (dir: string): boolean => {
+  try {
+    return fs.readdirSync(dir).length === 0;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * resolveAgentCwd, but it waits for a sibling tool call that is still creating the cwd.
  * ponytail: Pi runs the tool calls of one message in parallel, so `git worktree add W` and a
- * spawn with cwd W race; a short re-check lets the sibling finish (smarty-dev#1668). Only
- * ENOENT waits; other failures, and an existing cwd, return at once.
+ * spawn with cwd W race (smarty-dev#1668). A missing cwd is re-checked for up to
+ * AGENT_CWD_SETTLE_MS. A linked worktree whose checkout is still running is awaited for up to
+ * AGENT_WORKTREE_SETTLE_MS, so the agent never starts on a partial tree; a failed add removes
+ * the directory and the spawn fails. A plain directory spawns as soon as it exists.
  */
 export const awaitAgentCwd = async (
   parentCwd: string,
   requestedCwd?: string,
   signal?: AbortSignal,
 ): Promise<string> => {
-  const deadline = Date.now() + AGENT_CWD_SETTLE_MS;
+  const started = Date.now();
+  let appeared = false;
   for (let wait = 50; ; wait = Math.min(wait * 2, 500)) {
+    let resolved: string | undefined;
     try {
-      return resolveAgentCwd(parentCwd, requestedCwd);
+      resolved = resolveAgentCwd(parentCwd, requestedCwd);
     } catch (error) {
       const cause = (error as Error).cause as NodeJS.ErrnoException | undefined;
-      if (cause?.code !== "ENOENT" || signal?.aborted || Date.now() + wait > deadline) throw error;
+      if (cause?.code !== "ENOENT" || signal?.aborted || Date.now() + wait > started + AGENT_CWD_SETTLE_MS) {
+        throw error;
+      }
+      appeared = true;
+    }
+    if (resolved !== undefined) {
+      // Git creates W and writes W/.git a moment apart: an empty directory that just appeared
+      // gets one more look before it counts as a plain directory.
+      const pending = gitWorktreeInitializing(resolved) || (appeared && isEmptyDirectory(resolved));
+      if (!pending) return resolved;
+      appeared = false;
+      if (signal?.aborted || Date.now() + wait > started + AGENT_WORKTREE_SETTLE_MS) {
+        throw new Error(
+          `Invalid Fabric agent cwd ${JSON.stringify(requestedCwd)}: a git worktree is still being created there` +
+            "; call spawn after the git worktree add finishes",
+        );
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, wait));
   }

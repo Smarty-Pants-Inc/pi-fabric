@@ -44,7 +44,10 @@ const fakePi = () => {
   return { pi, emit, commands, sent };
 };
 
-const fakeContext = (sessionId: string, state: { idle: boolean; pending: boolean }) => {
+const fakeContext = (
+  sessionId: string,
+  state: { idle: boolean; pending: boolean; promptPending?: boolean; settling?: boolean },
+) => {
   const notices: string[] = [];
   const reload = vi.fn(async () => {});
   return {
@@ -55,6 +58,8 @@ const fakeContext = (sessionId: string, state: { idle: boolean; pending: boolean
     ui: { notify: (message: string) => notices.push(message) },
     isIdle: () => state.idle,
     hasPendingMessages: () => state.pending,
+    isPromptPending: () => state.promptPending ?? false,
+    isSettling: () => state.settling ?? false,
     sessionManager: { getSessionId: () => sessionId },
   };
 };
@@ -145,6 +150,38 @@ describe("installSelfReload", () => {
     expect(sent).toHaveLength(1);
   });
 
+  it("never reloads under a prompt in preflight or during settle handlers (review/astra on #158)", async () => {
+    vi.useFakeTimers();
+    let busy = 1;
+    const { next, emit, commands, sent, selfReload } = setup({ busy: () => busy });
+    // Pi keeps isIdle() true while a user's prompt is in preflight.
+    const state = { idle: true, pending: false, promptPending: false, settling: false };
+    const context = fakeContext("s-preflight", state);
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    emit("agent_settled", context);
+    busy = 0; // an actor run ended with no Main turn: only the retry tick can reload
+    state.promptPending = true;
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(sent).toEqual([]);
+    state.promptPending = false;
+    state.settling = true;
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(sent).toEqual([]);
+    // The command re-checks both, too.
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    state.settling = false;
+    state.promptPending = true;
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).not.toHaveBeenCalled();
+    // The counterexample: once the prompt has started or settled, the tick reloads.
+    state.promptPending = false;
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(1);
+  });
+
   it("the command defers when a turn or a queued message arrived meanwhile", async () => {
     const { next, commands, selfReload } = setup();
     const state = { idle: true, pending: true };
@@ -202,5 +239,12 @@ describe("installSelfReload", () => {
     devReload.sessionStart("startup", main as never);
     dev.emit("agent_settled", main);
     expect(dev.sent).toEqual([]);
+    // An install then swaps the profile to another release: a dev-path load still never follows
+    // (a reload would load the dev path again and report dev -> dev; review/astra on #158).
+    activate(release("ccc"));
+    dev.emit("turn_end", main);
+    dev.emit("agent_settled", main);
+    expect(dev.sent).toEqual([]);
+    expect(main.notices).toEqual([]);
   });
 });

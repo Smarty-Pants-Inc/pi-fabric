@@ -65,21 +65,24 @@ export const releaseLabel = (root: string): string => path.basename(root);
 
 /**
  * Watches the profile settings.json for a different active Fabric release. A turn end costs one
- * stat; the file is read only when its mtime moves. The release active when this runtime started
- * is the baseline: a Fabric loaded from elsewhere (-e, a project package) never chases the profile.
+ * stat; the file is read only when its mtime moves. Only a runtime loaded from the release the
+ * profile activated at load follows it: one loaded from elsewhere (-e, a project package) never does.
  */
 export class ActiveReleaseWatch {
   readonly #settingsPath: string;
   readonly #loaded: string;
   #mtimeMs = -1;
-  #baseline: string | undefined;
+  #disabled = false;
   #target: string | undefined;
+  #active: string | undefined;
 
   constructor(loaded: string, settingsPath = path.join(resolveAgentDir(), "settings.json")) {
     this.#loaded = loaded;
     this.#settingsPath = settingsPath;
     this.#read();
-    this.#baseline = this.#target ?? loaded;
+    // Loaded from outside the profile (pi -e, a project package): a reload would load the same
+    // outside path again, so this runtime never follows the profile (review/astra on pi-fabric#158).
+    this.#disabled = this.#active !== loaded;
     this.#target = undefined;
   }
 
@@ -87,6 +90,7 @@ export class ActiveReleaseWatch {
 
   /** The newly active release root to reload onto, or undefined. */
   check(): string | undefined {
+    if (this.#disabled) return undefined;
     let mtimeMs: number;
     try { mtimeMs = fs.statSync(this.#settingsPath).mtimeMs; } catch { return this.#target; }
     if (mtimeMs !== this.#mtimeMs) this.#read(mtimeMs);
@@ -95,8 +99,8 @@ export class ActiveReleaseWatch {
 
   #read(mtimeMs?: number): void {
     try { this.#mtimeMs = mtimeMs ?? fs.statSync(this.#settingsPath).mtimeMs; } catch { this.#mtimeMs = -1; }
-    const active = activeFabricRoot(this.#settingsPath);
-    this.#target = active && active !== this.#loaded && active !== this.#baseline ? active : undefined;
+    const active = (this.#active = activeFabricRoot(this.#settingsPath));
+    this.#target = active && active !== this.#loaded ? active : undefined;
   }
 }
 
@@ -130,6 +134,11 @@ export const autoReloadOptedOut = (configured: boolean): boolean =>
 export const selfReloadEligible = (mode: string, environment: NodeJS.ProcessEnv = process.env): boolean =>
   (mode === "tui" || mode === "rpc") && !environment.PI_FABRIC_ACTOR_ID?.trim() && !environment.PI_FABRIC_PARENT_RUN?.trim();
 
+const hostSettling = (context: ExtensionContext): boolean =>
+  (context as { isSettling?: () => boolean }).isSettling?.() ?? false;
+const promptPending = (context: ExtensionContext): boolean =>
+  (context as { isPromptPending?: () => boolean }).isPromptPending?.() ?? false;
+
 export interface SelfReloadDeps {
   /** Task agents this Main started that are still running, plus in-flight runs of actors it hosts. */
   busy(): number;
@@ -148,8 +157,13 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
   let watch: ActiveReleaseWatch | undefined;
   let noticed: string | undefined;
   let retry: ReturnType<typeof setInterval> | undefined;
+  // Pi keeps isIdle() true while a prompt is in preflight and while agent_settled handlers run; a
+  // reload then would pull the runner out from under that prompt (review/astra on pi-fabric#158).
+  // Pi runs this extension command before it marks a preflight, so the command's own prompt does not count.
+  const hostIdle = (context: ExtensionContext): boolean =>
+    context.isIdle() && !hostSettling(context) && !promptPending(context);
   const safe = (context: ExtensionContext): boolean =>
-    deps.busy() === 0 && context.isIdle() && !context.hasPendingMessages();
+    deps.busy() === 0 && hostIdle(context) && !context.hasPendingMessages();
   const stopRetry = (): void => {
     if (retry) clearInterval(retry);
     retry = undefined;
@@ -182,6 +196,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     retry = setInterval(() => {
       try {
         if (!context.isIdle()) return stopRetry(); // a new run settles and re-checks
+        if (!hostIdle(context)) return; // a prompt is starting: its settle re-checks, or the next tick
         if (request(context)) stopRetry();
       } catch {
         stopRetry(); // stale context: the session was replaced or reloaded
@@ -221,7 +236,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
         watch = undefined;
         return undefined;
       }
-      // A session switch in this runtime keeps the baseline taken when the runtime loaded.
+      // A session switch in this runtime keeps the watch (and its profile check) taken at load.
       if (watch?.loaded !== loaded) watch = new ActiveReleaseWatch(loaded, deps.settingsPath);
       const done = takeSelfReload(context.sessionManager.getSessionId(), reason);
       return done ? { old: releaseLabel(done.old), new: releaseLabel(loaded) } : undefined;

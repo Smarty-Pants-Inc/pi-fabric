@@ -6,6 +6,8 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
 const CONTROL_SEEN_PREFIX = "topology/control-seen/";
+// The participant directory's host records (topology/participant-directory.ts).
+const HOST_PREFIX = "topology/hosts/";
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
 const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
@@ -528,7 +530,8 @@ export class FabricControlPlane {
       !pending ||
       event.data.version !== 1 ||
       event.data.targetId !== pending.targetId ||
-      event.from.id !== pending.ownerIdentityId
+      event.from.id !== pending.ownerIdentityId ||
+      !this.#bridgeMatches(pending.ownerHostId, event.data)
     ) {
       return;
     }
@@ -544,6 +547,18 @@ export class FabricControlPlane {
       ...(typeof event.data.error === "string" ? { error: event.data.error } : {}),
       ...(event.data.accepted !== true && event.data.notRun === true ? { notRun: true as const } : {}),
     });
+  }
+
+  // smarty-dev#2004: an owner mirrored from remote host R answers only through R's mesh bridge,
+  // which stamps data.bridge.from = R; a native owner's answer never carries a bridge stamp. So a
+  // faulty bridge cannot answer for another link's owner, or for one of this mesh's own.
+  #bridgeMatches(ownerHostId: string, data: Record<string, unknown>): boolean {
+    const host = this.mesh.get(HOST_PREFIX + createHash("sha256").update(ownerHostId).digest("hex"))?.value;
+    const remoteHost = isObject(host) && host.id === ownerHostId && typeof host.remoteHost === "string"
+      ? host.remoteHost
+      : undefined;
+    if (!Object.prototype.hasOwnProperty.call(data, "bridge")) return remoteHost === undefined;
+    return remoteHost !== undefined && isObject(data.bridge) && data.bridge.from === remoteHost;
   }
 
   async #acceptCommand(event: MeshEvent): Promise<void> {

@@ -56,7 +56,8 @@ export const FABRIC_ACTOR_ACTIVATION_PRESETS: Readonly<Record<"hold" | "never-me
     {
       id: "hold",
       topic: ["github.*"],
-      where: [{ path: ["data.payload.issue.labels.name", "data.payload.pull_request.labels.name"], equals: "hold" }],
+      // data.payload.labels: the factory ingress projection's label names (smarty-dev#2004).
+      where: [{ path: ["data.payload.issue.labels.name", "data.payload.pull_request.labels.name", "data.payload.labels"], equals: "hold" }],
       unless: [
         { path: "data.payload.action", equals: "unlabeled" },
         { path: "data.payload.label.name", equals: "hold" },

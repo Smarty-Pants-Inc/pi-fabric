@@ -8,17 +8,23 @@
 // command), foreground wrappers (nohup, setsid, env, nice, command, exec, time) and `bash -c`
 // scripts. Heredoc bodies, quoted arguments and comments are data. A wait hidden in a script file
 // or a program passes; an unknown loop list counts once. Revisit if agents route around it.
+// A sleep or `flock -w` whose length is not a literal (`sleep $((t-now))`) is unbounded: only a
+// literal `timeout N` or the tool's own timeout bounds it (acceptance audit on #854).
+// ponytail: `flock` without -w counts 0. Agents take the shared write locks this way hundreds of
+// times a day and the lock is almost always free; only an explicit wait is counted.
 
 export const FOREGROUND_WAIT_LIMIT_S = 300;
 
 type Token = { op: string } | { word: string; quoted?: string };
 
 const UNIT_SECONDS: Record<string, number> = { "": 1, s: 1, m: 60, h: 3_600, d: 86_400 };
-const DURATION = /^(\d+(?:\.\d+)?)([smhd]?)$/;
+const DURATION = /^(\d+(?:\.\d*)?|\.\d+)([smhd]?)$/;
 const duration = (word: string): number | undefined => {
   const match = DURATION.exec(word);
   return match ? Number(match[1]) * (UNIT_SECONDS[match[2]!] ?? 1) : undefined;
 };
+// A wait operand: a literal duration, or unbounded (`$X`, `$((t-now))`, `infinity`).
+const waitLength = (word: string | undefined): number => duration(word ?? "") ?? Number.POSITIVE_INFINITY;
 
 const tokenize = (text: string): Token[] => {
   const tokens: Token[] = [];
@@ -76,11 +82,34 @@ const tokenize = (text: string): Token[] => {
         const open = c === "`" ? "`" : c === "(" ? "(" : text[index + 1]!;
         const close = open === "`" ? "`" : open === "(" ? ")" : "}";
         const start = index;
+        const arithmetic = c === "(" || (c === "$" && text[index + 2] === "(");   // `<<` is a shift there
         index += c === "$" ? 2 : 1;
         let depth = 1;
         while (index < text.length && depth > 0) {
           const d = text[index]!;
           if (d === "\\") { index += 2; continue; }
+          // A heredoc body inside $(…) is data, apostrophes included.
+          if (open === "(" && !arithmetic && d === "<" && text[index + 1] === "<" && text[index + 2] !== "<") {
+            const header = /^<<-?[ \t]*(['"]?)([^\s'";&|()<>]+)\1/.exec(text.slice(index));
+            const lineEnd = text.indexOf("\n", index);
+            if (header && lineEnd >= 0) {
+              index = lineEnd + 1;
+              while (index < text.length) {
+                const end = text.indexOf("\n", index);
+                const line = text.slice(index, end < 0 ? text.length : end);
+                index = end < 0 ? text.length : end + 1;
+                if (line.trim() === header[2]) break;
+              }
+              continue;
+            }
+          }
+          // Quoted text inside $(…) is data: jq's '"\(.merged)"' must not close the substitution.
+          if (open !== "`" && (d === "'" || d === "\"")) {
+            index += 1;
+            while (index < text.length && text[index] !== d) index += d === "\"" && text[index] === "\\" ? 2 : 1;
+            index += 1;
+            continue;
+          }
           if (open !== "`" && d === open) depth += 1;
           else if (d === close) depth -= 1;
           index += 1;
@@ -255,12 +284,35 @@ class WaitEstimator {
   }
 
   #simple(tokens: Token[]): number {
-    let rest = tokens.filter((token) => "word" in token && !/^[<>0-9&]*[<>]/.test(token.word)) as Array<{ word: string; quoted?: string }>;
+    // Redirections are not operands: `2>&1` and `>/dev/null` carry their target, while a bare
+    // operator (`>`, `2>`, `&>`, `<`, `<<<`, `>&`) takes the next word as its target.
+    let rest: Array<{ word: string; quoted?: string }> = [];
+    for (let at = 0; at < tokens.length; at += 1) {
+      const token = tokens[at]!;
+      if (!("word" in token)) continue;
+      if (!/^[<>0-9&]*[<>]/.test(token.word) || token.quoted !== undefined) { rest.push(token); continue; }
+      if (/^[0-9&]*[<>]+[&|]?$/.test(token.word)) at += 1;
+    }
     while (rest.length > 0 && /^\w+=/.test(rest[0]!.word)) rest = rest.slice(1);
     const name = rest[0]?.word;
     if (name === undefined) return 0;
     const args = rest.slice(1);
-    if (name === "sleep") return args.reduce((sum, arg) => sum + (duration(arg.word) ?? 0), 0);
+    if (name === "sleep") return args.filter((arg) => !arg.word.startsWith("-")).reduce((sum, arg) => sum + waitLength(arg.word), 0);
+    if (name === "flock") {
+      // flock [options] LOCK (COMMAND… | -c SCRIPT): options come first; -w/--wait/--timeout wait for the lock.
+      let at = 0;
+      let wait = 0;
+      while (at < args.length && args[at]!.word.startsWith("-")) {
+        const flag = args[at]!.word;
+        const inline = /^(?:-[a-zA-Z]*w|--(?:wait|timeout)=)(.+)$/.exec(flag);
+        if (inline) { wait = waitLength(inline[1]); at += 1; continue; }
+        if (/^(?:-[a-zA-Z]*w|--wait|--timeout)$/.test(flag)) { wait = waitLength(args[at + 1]?.word); at += 2; continue; }
+        at += /^(?:-[a-zA-Z]*E|--conflict-exit-code)$/.test(flag) ? 2 : 1;
+      }
+      const command = args.slice(at + 1);
+      const script = command[0]?.word === "-c" || command[0]?.word === "--command" ? command[1] : undefined;
+      return wait + (script ? WaitEstimator.script(script.quoted ?? script.word) : this.#simple(command));
+    }
     if (name === "wait") {
       const waited = this.#background;
       this.#background = 0;

@@ -24,13 +24,13 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 ## Agents
 
-`agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, at most 60. A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
+`agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
 ### Background completion inbox
 
 `agents.spawn` returns immediately; independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.
 
-`agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop. Fabric refuses a foreground `bash` call, native or through `pi.bash`, whose sleeps add up to more than 5 minutes: a long `sleep`, a sleep in a counted `for` loop, or a sleep in a `while` or `until` loop without a `timeout`. A session that waits in the foreground takes no steer or ask. Start the poll detached, or wait for a completion message or a mesh event, and end the turn.
+`agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop. Fabric refuses a foreground `bash` call, native or through `pi.bash`, whose sleeps add up to more than 5 minutes: a long `sleep`, a sleep in a counted `for` loop, a sleep in a `while` or `until` loop without a `timeout`, a sleep whose length is not a literal (`sleep $((t-now))`), or a `flock -w` wait. The tool call's own `timeout` or a literal `timeout N` bounds the estimate. A session that waits in the foreground takes no steer or ask. Start the poll detached, or wait for a completion message or a mesh event, and end the turn.
 
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results: Fabric does not start a turn to deliver them, and they join Main's next turn, whatever starts it (typed input, a peer message or another trigger). Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
 
@@ -691,7 +691,7 @@ const actor = await agents.import({ name: template.name });            // create
 await agents.import({ name: "security-reviewer", as: "security-reviewer-2" }); // rename it if the name exists
 
 // Copy a tuned project actor to the global library without its history.
-await agents.export({ id: actor.id, overwrite: true });
+await agents.export({ id: actor.id, write: true, overwrite: true }); // a global write: write: true is required
 
 // Change the default instruction and continuation policy of a template.
 await agents.setInstructions({ id: template.id, instructions: "Be brief.", scope: "global" });
@@ -703,7 +703,7 @@ return agents.setDeliveryPolicy({
 });
 ```
 
-`agents.setInstructions` can also change a live project actor. Its default scope is `"project"`. The new instruction applies to the next queued actor message. Only definitions cross the project⇄global boundary. Import and export never move history. Slash commands provide the same operations. `/fabric global` lists templates. `/fabric import <name> [as <new>]` creates one in the project. `/fabric export <id> [--overwrite]` promotes a project actor. The dashboard shows global templates with live actors. From there, you can import, export, delete, edit instructions, and change delivery policy without code. Existing persisted actors and templates continue to load as passive. New active delivery definitions must explicitly set `triggerTurn`.
+`agents.setInstructions` can also change a live project actor. Its default scope is `"project"`. The new instruction applies to the next queued actor message. `agents.instructions({ id })` reads the live text with its sha256 `instructionsDigest`; it writes nothing. `agents.export` requires `write: true`, so a caller cannot create a template by mistake. Only definitions cross the project⇄global boundary. Import and export never move history. Slash commands provide the same operations. `/fabric global` lists templates. `/fabric import <name> [as <new>]` creates one in the project. `/fabric export <id> [--overwrite]` promotes a project actor. The dashboard shows global templates with live actors. From there, you can import, export, delete, edit instructions, and change delivery policy without code. Existing persisted actors and templates continue to load as passive. New active delivery definitions must explicitly set `triggerTurn`.
 
 ## Councils
 

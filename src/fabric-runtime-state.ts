@@ -1514,6 +1514,12 @@ export class FabricRuntimeState {
     this.prewalkDrift.clear();
   }
 
+  /** Best-effort ops event on the mesh, e.g. ops.fabric.reloaded (smarty-dev#2160). */
+  publishOpsEvent(topic: string, kind: string, data: Record<string, unknown>): Promise<void> {
+    if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return Promise.resolve();
+    return this.#mesh.publish({ topic, kind, from: this.#identity, data }).then(() => undefined, () => undefined);
+  }
+
   // Publish a best-effort mesh event to the durable `fabric.compact` topic so
   // other roots, agents, and actors can observe compaction transitions.
   // Activity-only sessions (mesh disabled) silently skip this.

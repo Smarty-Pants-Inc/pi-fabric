@@ -82,6 +82,8 @@ interface ProjectRoot {
   project?: string;
   cwd?: string;
   startedAt: number;
+  /** Set on a root mirrored from another host's mesh (smarty-dev#2045). */
+  remoteHost?: string;
 }
 
 /**
@@ -100,9 +102,12 @@ export const deliveryRoot = (rootId: string, liveRoots: readonly ProjectRoot[], 
 /**
  * The live project agent for a project: the root with role "project-agent" and that project, the
  * most recently started when several match. A root from a runtime that publishes neither field
- * counts when its cwd is the project checkout (smarty-dev#784).
+ * counts when its cwd is the project checkout (smarty-dev#784). A root mirrored from another host
+ * never counts: its role and project are the remote's own claims, and discovery grants no
+ * authority to lead a native project (smarty-dev#2045). Explicit messages to its id still work.
  */
-export const resolveProjectAgent = <T extends ProjectRoot>(roots: readonly T[], project: string): T => {
+export const resolveProjectAgent = <T extends ProjectRoot>(allRoots: readonly T[], project: string): T => {
+  const roots = allRoots.filter((root) => root.remoteHost === undefined);
   const tagged = roots.filter((root) => root.role === "project-agent" && root.project === project);
   const untagged = roots.filter((root) =>
     root.role === undefined && root.project === undefined && root.cwd !== undefined && canonical(root.cwd) === project);

@@ -16,6 +16,7 @@ import {
   RESIDENT_HOST_FORMAT,
   residentDeliveryPrefix,
   residentHostId,
+  residentResultPath,
   residentRoot,
   type ResidentHostConfig,
   type ResidentHostOwner,
@@ -231,7 +232,7 @@ describe("durable cwd validation", () => {
           recursive: true,
           residency: "durable",
         }),
-      ).rejects.toThrow(/Invalid Fabric agent cwd/);
+      ).rejects.toThrow(/Invalid Fabric agent cwd.*ENOENT.*call spawn in the next message/);
       expect(fs.existsSync(path.join(state.config.residencyRoot, "owner.json"))).toBe(false);
       expect(fs.existsSync(path.join(state.config.residencyRoot, "requests"))).toBe(false);
     } finally {
@@ -405,6 +406,67 @@ describe("durable completion receipts", () => {
     }
   });
 
+  // smarty-dev#1882: an idle resident host removes runs/; status must not fall back to the spawn handle.
+  it("reads the saved terminal record after the host removed the run directory", async () => {
+    const state = await rootHarness("saved-terminal-record");
+    const seeded = await seedCompletion(state);
+    const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
+    fs.mkdirSync(path.dirname(resultPath), { recursive: true });
+    fs.writeFileSync(resultPath, JSON.stringify(seeded.result));
+    fs.rmSync(path.join(state.config.residencyRoot, "runs"), { recursive: true, force: true });
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "completed", text: "authoritative full result", residency: "durable" });
+      expect(await client.waitAgent(seeded.id, AbortSignal.timeout(2_000))).toMatchObject({ status: "completed", text: "authoritative full result" });
+      await expect(client.cleanupAgent(seeded.id)).resolves.toEqual({ cleaned: true });
+      expect(fs.existsSync(resultPath)).toBe(false);
+      expect(client.hasAgent(seeded.id)).toBe(false);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  it("reports a run with no record, no run directory and no live host as failed, and a live run as running", async () => {
+    const state = await rootHarness("lost-terminal-record");
+    const seeded = await seedCompletion(state, "running");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      fs.rmSync(path.join(seeded.runDirectory, "status.json"));
+      expect(client.statusAgent(seeded.id).status).toBe("running");
+      fs.rmSync(path.join(state.config.residencyRoot, "runs"), { recursive: true, force: true });
+      expect(client.statusAgent(seeded.id)).toMatchObject({ status: "failed", error: expect.stringMatching(/record lost/) });
+      expect((await client.waitAgent(seeded.id, AbortSignal.timeout(2_000))).status).toBe("failed");
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  // review/astra on pi-fabric#136: while a host lives, a stopped attempt may still resume or retry.
+  it("treats a terminal status.json as settled only once no host owns the run or the host saved it", async () => {
+    const state = await rootHarness("settled-terminal-record");
+    const seeded = await seedCompletion(state, "stopped");
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    fs.writeFileSync(ownerPath, JSON.stringify({
+      format: RESIDENT_HOST_FORMAT, hostId: residentHostId(state.identity.id), pid: process.pid, token: "t", startedAt: 1, readyAt: 1,
+    }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.settledAgent(seeded.id)).toBeUndefined();
+      const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
+      fs.mkdirSync(path.dirname(resultPath), { recursive: true });
+      fs.writeFileSync(resultPath, JSON.stringify({ ...seeded.result, status: "completed" }));
+      expect(client.settledAgent(seeded.id)).toMatchObject({ status: "completed" });
+      fs.rmSync(resultPath);
+      fs.rmSync(ownerPath);
+      expect(client.settledAgent(seeded.id)).toMatchObject({ status: "stopped" });
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
   it("does not consume a result when a durable wait is aborted", async () => {
     const state = await rootHarness("aborted-completion-wait");
     const seeded = await seedCompletion(state, "running");
@@ -562,6 +624,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       hostPath,
     });
     await expect(reconnect.removeActor(actor.id)).resolves.toEqual({ removed: true });
+    // review/astra on pi-fabric#136: actor activations leave no saved durable task result.
+    const resultsDir = path.join(state.config.residencyRoot, "results");
+    expect(fs.existsSync(resultsDir) ? fs.readdirSync(resultsDir) : []).toEqual([]);
     const registry = JSON.parse(
       fs.readFileSync(path.join(state.config.actorRoot, "actors.json"), "utf8"),
     ) as { actors: Array<{ id: string }> };
@@ -905,6 +970,38 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     });
     await expect(reconnect.cleanupAgent(handle.id)).resolves.toEqual({ cleaned: true });
     expect(reconnect.hasAgent(handle.id)).toBe(false);
+    await reconnect.close();
+  });
+
+  // smarty-dev#1882: the host's exit removes runs/; a later session still reads the result.
+  it("returns a completed durable agent's result after its resident host exits", { timeout: 90_000 }, async () => {
+    const state = await rootHarness("resident-exit-status");
+    const client = new ResidencyClient({
+      config: state.config,
+      mesh: state.mesh,
+      participants: state.participants,
+      mainAgent: state.mainAgent,
+      hostPath,
+    });
+    const handle = await client.spawnAgent({ task: "STREAM_PREVIEW", transport: "process", residency: "durable" });
+    expect((await client.waitAgent(handle.id)).status).toBe("completed");
+    await client.close();
+    await state.participants.close();
+    // The real path: the host exits after 30 s idle and its close removes runs/.
+    const runsDir = path.join(state.config.residencyRoot, "runs");
+    await waitFor(() => !fs.existsSync(path.join(state.config.residencyRoot, "owner.json")), 60_000);
+    expect(fs.existsSync(path.join(runsDir, handle.id))).toBe(false);
+
+    const reconnect = new ResidencyClient({ ...client.options, hostPath });
+    expect(reconnect.statusAgent(handle.id)).toMatchObject({
+      id: handle.id,
+      status: "completed",
+      residency: "durable",
+      text: "stream preview complete",
+    });
+    expect(await reconnect.waitAgent(handle.id)).toMatchObject({ status: "completed", text: "stream preview complete" });
+    await expect(reconnect.cleanupAgent(handle.id)).resolves.toEqual({ cleaned: true });
+    expect(fs.existsSync(residentResultPath(state.config.residencyRoot, handle.id))).toBe(false);
     await reconnect.close();
   });
 

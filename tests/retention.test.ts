@@ -245,6 +245,61 @@ describe("temporal retention", () => {
     expect(sweepAt(3 * DAY).removedRuns).toEqual([run]);
   });
 
+  describe("a deadline crossed mid-walk (smarty-dev#2010 review)", () => {
+    const budgetSweep = (tempRoot: string, budgetMs?: number) => sweepTempRunRoots({
+      tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY,
+      ...(budgetMs !== undefined ? { budgetMs } : {}),
+    });
+    const completedRun = (directory: string): void => {
+      writeStatus(directory, { status: "completed", finishedAt: 1 });
+      fs.writeFileSync(path.join(directory, "task.txt"), "work");
+    };
+
+    it("stops removing an expired orphan root's runs at the budget and keeps the root", () => {
+      const tempRoot = temporaryDirectory();
+      const orphan = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
+      for (let index = 0; index < 40; index++) completedRun(path.join(orphan, `run-${index}`));
+      fs.writeFileSync(path.join(orphan, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+      let removed = 0;
+      const rm = fs.rmSync;
+      vi.spyOn(fs, "rmSync").mockImplementation((...args: Parameters<typeof fs.rmSync>) => { removed++; return rm(...args); });
+      // The clock passes the budget right after the fifth run is removed.
+      vi.spyOn(performance, "now").mockImplementation(() => (removed >= 5 ? 10_000 : 0));
+      expect(budgetSweep(tempRoot, 1_000)).toEqual({ removedRoots: [], removedRuns: [] });
+      expect(removed).toBe(5);
+      expect(fs.readdirSync(orphan).filter((name) => name.startsWith("run-"))).toHaveLength(35);
+      vi.restoreAllMocks();
+      expect(budgetSweep(tempRoot).removedRoots).toEqual([orphan]);
+    });
+
+    it("abandons a nested-run walk at the budget without removing the run", () => {
+      const tempRoot = temporaryDirectory();
+      const closed = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
+      const parent = path.join(closed, "parent");
+      let deepest = parent;
+      completedRun(parent);
+      for (let depth = 0; depth < 20; depth++) {
+        deepest = path.join(deepest, "nested", `child-${depth}`);
+        completedRun(deepest);
+      }
+      fs.writeFileSync(path.join(closed, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
+      let deepVisits = 0;
+      const exists = fs.existsSync;
+      vi.spyOn(fs, "existsSync").mockImplementation((file) => {
+        if ((String(file).match(/\/nested\//g) ?? []).length >= 10) deepVisits++;
+        return exists(file);
+      });
+      // The clock passes the budget once the walk reaches nesting depth 10.
+      vi.spyOn(performance, "now").mockImplementation(() => (deepVisits > 0 ? 10_000 : 0));
+      expect(budgetSweep(tempRoot, 1_000)).toEqual({ removedRoots: [], removedRuns: [] });
+      // The walk stopped at the crossing: it never went deeper, and the run was kept.
+      expect(deepVisits).toBe(1);
+      expect(fs.existsSync(deepest)).toBe(true);
+      vi.restoreAllMocks();
+      expect(budgetSweep(tempRoot).removedRuns).toEqual([parent]);
+    });
+  });
+
   it("keeps live roots and the current root out of orphan cleanup", () => {
     const tempRoot = temporaryDirectory();
     const liveRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "live");

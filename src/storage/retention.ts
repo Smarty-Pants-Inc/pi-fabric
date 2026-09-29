@@ -63,14 +63,21 @@ export const markRunRootClosed = (root: string, now = Date.now(), childrenStoppe
  * this file in its run directory. Every cleanup path refuses such a run, across restarts.
  */
 export const UNRESOLVED_WORKER_FILE = "unresolved-worker.json";
-/** True when this run, or any nested child run below it, is marked. */
-export const hasUnresolvedWorker = (runDirectory: string, depth = 0): boolean => {
+/** A sweep's wall-clock budget; walks stop when it returns true (smarty-dev#2010). */
+type Deadline = () => boolean;
+const noDeadline: Deadline = () => false;
+/**
+ * True when this run, or any nested child run below it, is marked. A walk cut short by the
+ * deadline also answers true: an unfinished check never authorizes deletion.
+ */
+export const hasUnresolvedWorker = (runDirectory: string, depth = 0, expired: Deadline = noDeadline): boolean => {
+  if (expired()) return true;
   if (fs.existsSync(path.join(runDirectory, UNRESOLVED_WORKER_FILE))) return true;
   if (depth >= 32) return false;
   const nested = path.join(runDirectory, "nested");
   try {
     return fs.readdirSync(nested, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(nested, entry.name), depth + 1));
+      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(nested, entry.name), depth + 1, expired));
   } catch {
     return false;
   }
@@ -89,9 +96,9 @@ const runFiles = new Set([
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
-const safeRunTree = (root: string, childrenStopped: boolean, depth = 0): boolean => {
-  if (depth > 32 || !ownedStat(root)?.isDirectory()) return false;
-  if (hasUnresolvedWorker(root)) return false;
+const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline): boolean => {
+  if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
+  if (hasUnresolvedWorker(root, 0, expired)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
@@ -102,6 +109,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0): boolean
   }
   try {
     for (const name of fs.readdirSync(root)) {
+      if (expired()) return false;
       const file = path.join(root, name);
       const stat = ownedStat(file);
       if (!stat) return false;
@@ -112,7 +120,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0): boolean
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1)) return false;
+        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired)) return false;
         continue;
       }
       return false;
@@ -155,7 +163,7 @@ const pruneClosedRunRoot = (
     const reference = terminal ? recordAgeReference(record!, ownedStat(directory)?.mtimeMs ?? now) : owner.closedAt!;
     const retention = terminal && !record?.actorId ? oneShotMs : orphanMs;
     if (now - reference < retention) continue;
-    if (!safeRunTree(directory, owner.childrenStopped === true)) continue;
+    if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) continue;
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
   return removed;
@@ -220,8 +228,20 @@ export const sweepTempRunRoots = (options: {
       try { writeOwner(root, { ...owner, orphanedAt: now }); } catch {}
       continue;
     }
-    if (now - owner.orphanedAt < options.orphanedTempRunRetentionMs || !safeRootContents(root, false)) continue;
-    try { fs.rmSync(root, { recursive: true, force: true }); result.removedRoots.push(root); } catch {}
+    if (now - owner.orphanedAt < options.orphanedTempRunRetentionMs) continue;
+    // Run by run, not one whole-root walk and removal: each run passes the same safety check
+    // before it goes, the deadline is checked between runs, and the root goes once empty.
+    let runs: fs.Dirent[];
+    try { runs = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
+    for (const run of runs) {
+      if (expired()) break;
+      if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
+      const directory = path.join(root, run.name);
+      if (!safeRunTree(directory, false, 0, expired)) continue;
+      // Reported as the root's removal once it is empty, as before.
+      try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
+    }
+    if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
   }
   return result;
 };

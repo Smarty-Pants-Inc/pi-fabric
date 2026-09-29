@@ -49,7 +49,8 @@ describe("Pi lifecycle event projection", () => {
       { type: "message_update", assistantMessageEvent: { delta: '\"messages\": [\"not a key\"]' } },
     ];
     const input = events.map((event) => JSON.stringify(event)).join("\n");
-    expect(project(input, 7)).toBe(input);
+    // Image data is the one field stubbed outside lifecycle history (smarty-dev#1907).
+    expect(project(input, 7)).toBe(input.replaceAll('"data":"base64"', '"elided":true,"bytes":4'));
   });
 
   it("handles escaped property names and long unrelated keys without retaining them", () => {
@@ -82,5 +83,48 @@ describe("Pi lifecycle event projection", () => {
   it("retains a complete final event without a newline", () => {
     expect(JSON.parse(project(JSON.stringify({ type: "agent_end", messages, willRetry: false }), 1)))
       .toEqual({ type: "agent_end", messages: [], willRetry: false });
+  });
+
+  describe("image data stub (smarty-dev#1907)", () => {
+    const image = (data: string) => ({ type: "image", data, mimeType: "image/png" });
+    const toolEnd = (data: string) => ({
+      type: "tool_execution_end", toolName: "read", toolCallId: "r1",
+      result: { content: [{ type: "text", text: 'Read "data" [image/png]' }, image(data)], details: { data: "x".repeat(70_000) } },
+      isError: false,
+    });
+
+    it.each([1, 7, 8191, 1 << 20])("stubs every image block in %i-character chunks", (size) => {
+      const big = "QUJD".repeat(64 * 1024) + "QQ==";
+      const small = "iVBORw0KGgo=";
+      const events = [toolEnd(big), { type: "message_end", message: { role: "toolResult", content: [image(small), image("")] } }];
+      const input = events.map((event) => JSON.stringify(event)).join("\n") + '\n{"type":"agent_settled"}\n';
+      const output = project(input, size);
+      expect(output.length).toBeLessThan(1_000 + 70_000);
+      const stub = (data: string) => ({ type: "image", mimeType: "image/png", elided: true, bytes: Buffer.from(data, "base64").length });
+      expect(output.trimEnd().split("\n").map((line) => JSON.parse(line))).toEqual([
+        { ...toolEnd(big), result: { ...toolEnd(big).result, content: [toolEnd(big).result.content[0], stub(big)] } },
+        { type: "message_end", message: { role: "toolResult", content: [stub(small), stub("")] } },
+        { type: "agent_settled" },
+      ]);
+    });
+
+    it("stubs only image objects, not other data fields or data before type", () => {
+      const big = "a".repeat(70_000);
+      const input = [
+        { type: "response", data: big },
+        { content: [{ data: big, type: "image", mimeType: "image/png" }] },
+        { content: [{ type: "text", data: big }] },
+        { content: [{ type: "image", data: null, mimeType: "image/png" }] },
+      ].map((event) => JSON.stringify(event)).join("\n");
+      expect(project(input, 5)).toBe(input);
+    });
+
+    it("does not turn a truncated stubbed value into a complete event", () => {
+      const input = JSON.stringify(toolEnd("a".repeat(70_000))).slice(0, -80);
+      expect(() => JSON.parse(project(input, 4096))).toThrow();
+      const output = project(input + '\n{"type":"agent_settled"}\n', 4096).trimEnd().split("\n");
+      expect(() => JSON.parse(output[0]!)).toThrow();
+      expect(JSON.parse(output[1]!)).toEqual({ type: "agent_settled" });
+    });
   });
 });

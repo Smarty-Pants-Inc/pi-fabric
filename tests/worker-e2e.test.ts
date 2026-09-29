@@ -340,13 +340,31 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(result.text).toBe("progress preserved");
   }, 30_000);
 
-  it("preserves a bounded prefix when an agent event exceeds the line limit", async () => {
+  it("stubs a >4 MiB image tool result for the parent and completes (smarty-dev#1907)", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "image-tool-result";
+    const result = await run("review the screenshot", 10_000);
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe("completed");
+    expect(result.text).toBe("image reviewed");
+    expect(result.warnings).toBeUndefined();
+    const log = fs.readFileSync(result.logFile!, "utf8");
+    expect(log.length).toBeLessThan(10_000);
+    const events = log.trim().split("\n").map((line) => JSON.parse(line));
+    const stub = { type: "image", elided: true, bytes: ((5 * 1024 * 1024 + 4) * 3) / 4, mimeType: "image/png" };
+    expect(events.find((event) => event.type === "tool_execution_end")?.result.content[1]).toEqual(stub);
+    expect(events.find((event) => event.message?.role === "toolResult")?.message.content[1]).toEqual(stub);
+  }, 30_000);
+
+  it("drops one oversized event line with a warning and keeps the run alive", async () => {
     process.env.FAKE_PI_BEHAVIOR = "oversized-event";
     const result = await run("do it", 10_000);
 
-    expect(result.status).toBe("failed");
-    expect(result.error).toContain("Agent emitted an oversized event line");
-    const artifactPath = result.error?.match(/saved to: (.+)$/)?.[1];
+    expect(result.status).toBe("completed");
+    expect(result.text).toBe("after oversized");
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings![0]).toContain("Dropped an oversized agent event line (message_end");
+    const artifactPath = result.warnings![0]!.match(/saved to: (.+)$/)?.[1];
     expect(artifactPath).toBeDefined();
     expect(path.dirname(artifactPath!)).toBe(path.dirname(result.logFile!));
 

@@ -33,6 +33,10 @@ const cuts: Array<[string, string]> = [
   ["a backslash continuation before | tail", `${LIST} ${LISTING} \\\n  | tail -n 15`],
   ["a backslash continuation before --jq", `${LIST} \\\n  --jq '.[-3:]'`],
   ["a curl read | tail", `curl -s https://api.github.com/repos/o/r/issues/7/comments | jq -c '.[]' | tail -n 5`],
+  // smarty-dev#967 round-5 census (run c54528a4): awk keeping the last line or a line range.
+  ["awk 'END{print}' keeps the last line", `${LIST} ${LISTING} | awk 'END{print}'`],
+  ["awk 'NR<=5' keeps the first lines", `${LIST} ${LISTING} | awk 'NR<=5'`],
+  ["awk 'NR>3' drops the first lines", `${LIST} ${LISTING} | awk 'NR>3 {print}'`],
   ["a cut read after an allowed one", `${GHR} gh api repos/o/r/issues/1/comments/77 --jq .body; ${LIST} ${LISTING} | tail -3`],
 ];
 
@@ -59,6 +63,8 @@ const allowed: Array<[string, string]> = [
   ["a log tail before ; and a curl read", `grep -n error app.log | tail -3; curl -s https://api.github.com/repos/o/r/issues/7/comments`],
   ["a log tail on the line before a curl read", `grep -n error app.log | tail -3\ncurl -s https://api.github.com/repos/o/r/issues/7/comments`],
   ["a tail on the next line", `${LIST} ${LISTING}\ngrep -n x notes.txt | tail -n 3`],
+  ["an awk field print keeps every comment", `${LIST} ${LISTING} | awk '{print $1}'`],
+  ["an awk field filter keeps every comment", `${LIST} ${LISTING} | awk -F: '$1>0'`],
   ["a tail in the next gh api", `${LIST} ${LISTING} > c.json || gh api repos/o/r/pulls/5 --jq .body | tail -3`],
 ];
 

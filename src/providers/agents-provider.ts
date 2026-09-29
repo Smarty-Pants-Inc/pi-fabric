@@ -74,7 +74,14 @@ import {
 import { resolvePiModel } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
-import { agentWaitBound, describeWaitBound } from "../agents/wait-bound.js";
+import {
+  AGENT_WAIT_MAX_MS,
+  AgentWaitBoundError,
+  MAIN_AGENT_WAIT_MAX_MS,
+  agentWaitBound,
+  describeWaitBound,
+  isInteractiveMain,
+} from "../agents/wait-bound.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { isFabricThinking } from "../thinking.js";
 import { normalizeAgentRunRequest } from "../agents/request.js";
@@ -644,7 +651,19 @@ export class AgentsProvider implements FabricProvider {
       case "join":
       case "wait": {
         const id = String(args.id);
-        const timeoutMs = agentWaitBound(args.timeoutMs);
+        // smarty-dev#2119: an interactive Main waits at most 60 s, and the bound is a normal result.
+        const main = isInteractiveMain(context.extensionContext);
+        const timeoutMs = agentWaitBound(args.timeoutMs, main ? MAIN_AGENT_WAIT_MAX_MS : AGENT_WAIT_MAX_MS);
+        const atBound = (record: object) => {
+          // The wait ended so Main can see news: held followUps land at this tool boundary.
+          this.mainAgent.flushHeldAtNextBoundary?.();
+          return {
+            ...record,
+            waitTimedOut: true,
+            note: `Still running after ${describeWaitBound(timeoutMs)}; Main waits are capped at 60 s. It continues, and its ` +
+              "result arrives as a completion message: end the turn or do other work, then check agents.status.",
+          };
+        };
         if (this.residency?.hasAgent(id)) {
           const status = this.residency.statusAgent(id);
           context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
@@ -656,7 +675,8 @@ export class AgentsProvider implements FabricProvider {
             return await this.residency.waitAgent(id, signal);
           } catch (error) {
             if (!bound.aborted || context.signal?.aborted) throw error;
-            throw new Error(
+            if (main) return atBound(this.residency.statusAgent(id));
+            throw new AgentWaitBoundError(
               `agents.wait: durable agent ${status.name} is still running after ${describeWaitBound(timeoutMs)}. ` +
                 "It continues, and its result arrives as a completion message: end the turn now.",
             );
@@ -664,14 +684,19 @@ export class AgentsProvider implements FabricProvider {
         }
         const status = this.manager.status(id);
         context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
-        return waitWithProgress(
-          this.manager,
-          this.#transcripts,
-          id,
-          context,
-          this.agentToolPreviewEnabled,
-          { timeoutMs },
-        );
+        try {
+          return await waitWithProgress(
+            this.manager,
+            this.#transcripts,
+            id,
+            context,
+            this.agentToolPreviewEnabled,
+            { timeoutMs },
+          );
+        } catch (error) {
+          if (!main || !(error instanceof AgentWaitBoundError)) throw error;
+          return atBound(this.manager.status(id));
+        }
       }
       case "status": {
         const id = String(args.id);

@@ -170,6 +170,24 @@ const pruneClosedRunRoot = (
 };
 /** Host-wide marker of the last temp-root sweep; a dotfile, so the root pattern never matches it. */
 export const RUN_ROOT_SWEEP_MARKER = ".pi-fabric-runs-sweep.json";
+/**
+ * Claim the host's next temp-root sweep: false when any process of this user swept within
+ * `minIntervalMs`. The claim is written before the walk, so processes that close together do not
+ * all sweep; a stale marker, or one dated in the future, does not suppress collection.
+ */
+export const claimTempRunSweep = (tempRoot: string, minIntervalMs: number, now = Date.now()): boolean => {
+  const marker = path.join(tempRoot, RUN_ROOT_SWEEP_MARKER);
+  const last = readJson<{ sweptAt?: unknown }>(marker)?.sweptAt;
+  if (time(last) && last <= now && now - last < minIntervalMs) return false;
+  try { writeJsonAtomic(marker, { sweptAt: now }); } catch {}
+  return true;
+};
+export interface TempRunSweepRequest {
+  tempRoot: string;
+  currentRoot?: string;
+  orphanedTempRunRetentionMs: number;
+  oneShotRunRetentionMs: number;
+}
 export const sweepTempRunRoots = (options: {
   tempRoot: string;
   currentRoot?: string;
@@ -193,13 +211,7 @@ export const sweepTempRunRoots = (options: {
     options.budgetMs !== undefined && performance.now() - startedAt >= options.budgetMs;
   const now = options.now ?? Date.now();
   const result: RetentionSweepResult = { removedRoots: [], removedRuns: [] };
-  if (options.minIntervalMs !== undefined) {
-    const marker = path.join(options.tempRoot, RUN_ROOT_SWEEP_MARKER);
-    const last = readJson<{ sweptAt?: unknown }>(marker)?.sweptAt;
-    if (time(last) && last <= now && now - last < options.minIntervalMs) return result;
-    // Claim before the walk, so processes that close together do not all sweep.
-    try { writeJsonAtomic(marker, { sweptAt: now }); } catch {}
-  }
+  if (options.minIntervalMs !== undefined && !claimTempRunSweep(options.tempRoot, options.minIntervalMs, now)) return result;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(options.tempRoot, { withFileTypes: true }); } catch { return result; }
   if (options.budgetMs !== undefined) {

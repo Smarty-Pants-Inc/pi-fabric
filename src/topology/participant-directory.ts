@@ -307,6 +307,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #leaseMs: number;
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
   #parsedCache: { token: object; value: ParsedDirectory } | undefined;
+  #parsedEntries = new Map<string, { version: number; updatedAt: number; entry: MeshStateEntry }>();
   #leaseRead: { at: number; leases: ReturnType<typeof readHostLeases> } | undefined;
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
@@ -505,23 +506,40 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   // The directory's records, parsed once per parse of the shared state. list() ran for every
   // dashboard rebuild, peer listing and ownership check, and each call cloned every participant
-  // and host record of the fleet state: most of an idle Pi's CPU (smarty-dev#557). The cached
-  // records are frozen, since every caller now shares them.
+  // and host record of the fleet state: most of an idle Pi's CPU (smarty-dev#557). A new parse
+  // copies only the entries whose version moved; the fleet state is rewritten several times a
+  // second, but by a few writers. The copies are frozen, since every caller now shares them.
   #parsed(read: { fresh: boolean }): ParsedDirectory {
-    const token = typeof this.mesh.stateToken === "function" ? this.mesh.stateToken(read) : undefined;
+    if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
+      return {
+        hosts: this.mesh.listAll(HOST_PREFIX, read),
+        participants: this.mesh.listAll(PARTICIPANT_PREFIX, read)
+          .flatMap((entry) => participantFromEntry(entry) ?? []),
+        legacySessions: this.mesh.listAll(LEGACY_SESSION_PREFIX, read),
+        legacyActors: this.mesh.listAll(LEGACY_ACTOR_PREFIX, read),
+      };
+    }
+    const token = this.mesh.stateToken(read);
     const cached = this.#parsedCache;
-    if (token !== undefined && cached?.token === token) return cached.value;
+    if (cached?.token === token) return cached.value;
+    const previous = this.#parsedEntries;
+    const next = new Map<string, { version: number; updatedAt: number; entry: MeshStateEntry }>();
+    const copies = (prefix: string): MeshStateEntry[] => this.mesh.listAllShared(prefix, read).map((shared) => {
+      const known = previous.get(shared.key);
+      const entry = known && known.version === shared.version && known.updatedAt === shared.updatedAt
+        ? known.entry
+        : deepFreeze(structuredClone(shared) as MeshStateEntry);
+      next.set(shared.key, { version: shared.version, updatedAt: shared.updatedAt, entry });
+      return entry;
+    });
     const value: ParsedDirectory = {
-      hosts: this.mesh.listAll(HOST_PREFIX, read).map(deepFreeze),
-      participants: this.mesh.listAll(PARTICIPANT_PREFIX, read)
-        .flatMap((entry) => {
-          const participant = participantFromEntry(entry);
-          return participant ? [deepFreeze(participant)] : [];
-        }),
-      legacySessions: this.mesh.listAll(LEGACY_SESSION_PREFIX, read).map(deepFreeze),
-      legacyActors: this.mesh.listAll(LEGACY_ACTOR_PREFIX, read).map(deepFreeze),
+      hosts: copies(HOST_PREFIX),
+      participants: copies(PARTICIPANT_PREFIX).flatMap((entry) => participantFromEntry(entry) ?? []),
+      legacySessions: copies(LEGACY_SESSION_PREFIX),
+      legacyActors: copies(LEGACY_ACTOR_PREFIX),
     };
-    this.#parsedCache = token === undefined ? undefined : { token, value };
+    this.#parsedEntries = next;
+    this.#parsedCache = { token, value };
     return value;
   }
 

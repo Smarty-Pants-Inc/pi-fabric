@@ -1166,23 +1166,31 @@ describe("ParticipantDirectory reads", () => {
       { heartbeatMs: 60_000, leaseMs: 120_000 });
     await reader.start();
     await peer.start();
-    const listAll = vi.spyOn(reader.mesh, "listAll");
+    const shared = vi.spyOn(reader.mesh, "listAllShared");
     const first = reader.list({ scope: "project" });
-    const calls = listAll.mock.calls.length;
+    const calls = shared.mock.calls.length;
     expect(first.map((participant) => participant.id)).toContain(writer.id);
     for (let i = 0; i < 5; i++) reader.list({ scope: "project" });
     reader.peers();
-    expect(listAll.mock.calls.length).toBe(calls);                 // no clone of the directory per call
+    expect(shared.mock.calls.length).toBe(calls);                  // no read of the directory per call
     // Callers get their own top-level objects; the shared parse is frozen.
     first[0]!.status = "changed";
     expect(reader.list({ scope: "project" })[0]!.status).not.toBe("changed");
-    expect(Object.isFrozen(reader.list({ scope: "project" })[0]!.capabilities)).toBe(true);
+    const capabilities = reader.list({ scope: "project" }).find((participant) => participant.id === writer.id)!.capabilities;
+    expect(Object.isFrozen(capabilities)).toBe(true);
 
     await store.put({ key: "topology/participants/" + createHash("sha256").update("session:writer:agent").digest("hex"),
       value: agentRecord("session:writer:agent", writer.id, writer.id, writer.id), identity: writer });
-    expect(reader.list({ scope: "project", fresh: true }).map((participant) => participant.id))
-      .toContain("session:writer:agent");
-    listAll.mockRestore();
+    const after = reader.list({ scope: "project", fresh: true });
+    expect(after.map((participant) => participant.id)).toContain("session:writer:agent");
+    // The write copied only the new entry: an unchanged record is the same parse.
+    expect(after.find((participant) => participant.id === writer.id)!.capabilities).toBe(capabilities);
+    // A changed record is read again.
+    const key = "topology/participants/" + createHash("sha256").update(writer.id).digest("hex");
+    const current = store.get(key)!;
+    await store.put({ key, value: { ...(current.value as FabricParticipantRecord), status: "busy" }, identity: writer, ifVersion: current.version });
+    expect(reader.list({ scope: "project", fresh: true }).find((participant) => participant.id === writer.id)!.status).toBe("busy");
+    shared.mockRestore();
   });
 });
 

@@ -894,6 +894,14 @@ export class MeshStore {
     return this.#readCachedState(options.fresh === true);
   }
 
+  /**
+   * listAll without the copies: the parsed entries themselves, which the caller must not change.
+   * For an index that copies only the entries whose version moved (smarty-dev#557).
+   */
+  listAllShared(prefix = "", options: MeshReadOptions = {}): readonly Readonly<MeshStateEntry>[] {
+    return this.#select(prefix, options);
+  }
+
   #select(prefix: string, options: MeshReadOptions): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
     return Object.values(this.#readCachedState(options.fresh === true).entries)

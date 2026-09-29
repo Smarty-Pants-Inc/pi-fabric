@@ -6,12 +6,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import {
-  normalizeModelAliases,
-  resolveAvailablePiModel,
-  type FabricModelCandidate,
-} from "../core/model-resolution.js";
-import { loadModelUsage } from "../core/model-usage.js";
+import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
+import { resolvePiModel, type PiModelRegistryView } from "../core/model-refresh.js";
 import {
   parseFabricOwnedModelGuidance,
   resolveFabricModelGuidance,
@@ -149,6 +145,7 @@ class ResidentHost {
   constructor(
     readonly config: ResidentHostConfig,
     readonly onIdle: () => void = () => {},
+    modelRegistry?: PiModelRegistryView,
   ) {
     this.hostId = residentHostId(config.rootId);
     this.identity = { id: this.hostId, name: "Fabric resident host", kind: "agent" };
@@ -189,9 +186,12 @@ class ResidentHost {
       readJson<Partial<ResidentHostConfig>>(guidanceConfigPath) ?? config;
     const currentModelGuidance = () =>
       parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
-    const resolveResidentPiModel = (selector?: string): string => {
+    // The session's visible models (synced at each ensureHost) plus, after a miss, this host's
+    // own refreshed Pi registry: the one shared resolver, so an already-running host resolves a
+    // model added to models.json after it started (pi-fabric#138).
+    const resolveResidentPiModel = async (selector?: string): Promise<string> => {
       const state = currentConfig().piModels ?? config.piModels;
-      const available: FabricModelCandidate[] = Array.isArray(state?.available)
+      const snapshot: FabricModelCandidate[] = Array.isArray(state?.available)
         ? state.available.flatMap((candidate) =>
             typeof candidate?.provider === "string" && typeof candidate.id === "string"
               ? [{
@@ -202,11 +202,12 @@ class ResidentHost {
               : [],
           )
         : [];
-      const query = selector?.trim() || state?.defaultModel?.trim() || "";
-      const resolved = resolveAvailablePiModel(query, {
+      const resolved = await resolvePiModel({
+        selector,
+        registry: modelRegistry,
         aliases: normalizeModelAliases(state?.aliases),
-        available,
-        lastUsed: loadModelUsage(),
+        defaultModel: state?.defaultModel,
+        snapshot,
       });
       return `${resolved.provider}/${resolved.id}`;
     };
@@ -458,12 +459,11 @@ class ResidentHost {
       if (!this.actors.owns(command.targetId)) {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
-      const result = this.actors.tell(
+      const binding = await this.actors.resolveActivationBinding(
         command.targetId,
-        message,
-        command.data,
         command.binding !== undefined ? { binding: command.binding } : {},
       );
+      const result = this.actors.tell(command.targetId, message, command.data, { binding });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       return { accepted: false, error: errorMessage(error) };
@@ -769,12 +769,13 @@ class ResidentHost {
 const runResidentHost = async (
   config: ResidentHostConfig,
   signal?: AbortSignal,
+  modelRegistry?: PiModelRegistryView,
 ): Promise<void> => {
   let finishIdle: (() => void) | undefined;
   const idle = new Promise<void>((resolve) => {
     finishIdle = resolve;
   });
-  const host = new ResidentHost(config, () => finishIdle?.());
+  const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry);
   await host.start();
   if (signal?.aborted) {
     await host.close();
@@ -795,11 +796,12 @@ const runResidentHost = async (
 export const runResidentHostFromConfigPath = async (
   configPath: string,
   signal?: AbortSignal,
+  modelRegistry?: PiModelRegistryView,
 ): Promise<void> => {
   let config: ResidentHostConfig | undefined;
   try {
     config = validateResidentHostConfig(readJson<unknown>(configPath), configPath);
-    await runResidentHost(config, signal);
+    await runResidentHost(config, signal, modelRegistry);
   } catch (error) {
     if (error instanceof ResidentHostAlreadyRunning) return;
     const residencyRoot = config?.residencyRoot ?? path.dirname(configPath);

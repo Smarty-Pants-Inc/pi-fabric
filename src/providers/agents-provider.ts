@@ -664,8 +664,7 @@ export class AgentsProvider implements FabricProvider {
             if (!bound.aborted || context.signal?.aborted) throw error;
             throw new Error(
               `agents.wait: durable agent ${status.name} is still running after ${describeWaitBound(timeoutMs)}. ` +
-                "It continues, and its result arrives as a completion message: end the turn now, or pass a larger " +
-                "timeoutMs (up to 60 min) to wait longer.",
+                "It continues, and its result arrives as a completion message: end the turn now.",
             );
           }
         }

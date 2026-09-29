@@ -27,6 +27,32 @@ describe("foreground wait guard", () => {
     expect(foregroundWaitRefusal(command)).toMatch(/Fabric refused this command: its foreground wait is about \d/);
   });
 
+  // Acceptance audit on #854 (issuecomment-5884709683): live commands that the first guard let run for
+  // 14-20 min. Verbatim from the session logs, with the tool timeout each was sent with.
+  it.each([
+    ["the org session's flock -w 1800 at 2026-09-28T19:14Z", "cd /home/paul/smarty/smarty-pants && flock -w 1800 ~/.local/share/smarty-dev/org-context/state/org-context-sync.lock -c \"date -u +%H:%M:%SZ; timeout 90 ~/.local/share/smarty-dev/factory/current/bin/smarty-hostd restart org-context-sync; echo rc=\\$?\"; sleep 5; pgrep -af \"org-context-sync.py\" | cut -c1-160; for p in $(pgrep -f \"setup/org-context-sync.py\"); do ps -o pid,lstart -p $p | tail -1; done", 1900, 1805],
+    ["lightweight-fleet's 18-min jq poll at 2026-09-28T20:43Z", "T=~/.local/share/smarty-dev/factory/current/bin/smarty-github-app-token; for i in $(seq 1 18); do M=$(env -u GITHUB_TOKEN -u GH_TOKEN $T run Smarty-Pants-Inc -- gh api repos/Smarty-Pants-Inc/smarty-dev/pulls/1801 --jq '\"\\(.merged) \\(.merge_commit_sha)\"' 2>/dev/null); case \"$M\" in true*) echo \"$(date -u +%H:%M:%SZ) $M\"; break;; esac; sleep 60; done; echo \"last: $M\"", 1200, 1080],
+    ["the org session's 14-min jq poll at 2026-09-28T20:50Z", "T=/home/paul/.local/share/smarty-dev/factory/current/bin/smarty-github-app-token; R=repos/Smarty-Pants-Inc/smarty-dev; for i in $(seq 1 14); do s=$(env -u GH_TOKEN -u GITHUB_TOKEN timeout 30 $T run Smarty-Pants-Inc -- gh api $R/pulls/1836 --jq '\"\\(.state) \\(.merged) \\(.merge_commit_sha)\"' 2>/dev/null); echo \"$(date -u +%H:%M) $s\"; case \"$s\" in *true*) break;; esac; sleep 60; done", 900, 840],
+    ["the org session's 20-min jq poll at 2026-09-29T05:17Z", "T=/home/paul/.local/share/smarty-dev/factory/current/bin/smarty-github-app-token; for i in $(seq 1 20); do m=$(env -u GH_TOKEN -u GITHUB_TOKEN timeout 30 $T run Smarty-Pants-Inc -- gh api repos/Smarty-Pants-Inc/smarty-dev/pulls/1973 --jq '\"\\(.merged) \\(.merge_commit_sha) \\([.labels[].name]|join(\",\"))\"'); case $m in true*) echo \"$(date -u +%H:%MZ) $m\"; break;; esac; sleep 60; done; echo \"last: $m\"", 1300, 1200],
+    ["smarty-knowledge-3-prefs's computed sleep at 2026-09-29T06:00Z", "now=$(date -u +%s); t=$(date -u -d \"06:20:30\" +%s); [ $t -gt $now ] && sleep $((t-now)); date -u +%H:%M:%S", 1500, 1500],
+  ])("refuses %s", (_name, command, toolTimeoutS, seconds) => {
+    expect(foregroundWaitSeconds(command, toolTimeoutS)).toBe(seconds);
+    expect(foregroundWaitRefusal(command, toolTimeoutS)).toMatch(/Fabric refused this command/);
+    expect(foregroundWaitRefusal(command)).toMatch(/Fabric refused this command/);
+  });
+  it.each([
+    ["a sleep of a variable", "sleep $X"],
+    ["a quoted computed sleep", "sleep \"$((deadline - $(date +%s)))\""],
+    ["sleep infinity", "sleep infinity"],
+    ["a flock that waits on a variable", "flock -w \"$WAIT\" /tmp/lock true"],
+    ["a flock -w with an inline value", "flock --wait=900 /tmp/lock true"],
+    ["a flock around a long sleep", "flock /tmp/lock sleep 900"],
+  ])("refuses %s unless a timeout bounds it", (_name, command) => {
+    expect(foregroundWaitRefusal(command)).toMatch(/Fabric refused this command/);
+    expect(foregroundWaitRefusal(`timeout 120 ${command}`)).toBeUndefined();
+    expect(foregroundWaitRefusal(command, 240)).toBeUndefined();           // the tool's timeout
+  });
+
   it("refuses a sleep in an unbounded loop, and allows it under a timeout", () => {
     expect(foregroundWaitRefusal("while ! test -f done; do sleep 5; done")).toMatch(/an unbounded wait/);
     expect(foregroundWaitRefusal("until gh api repos/x/y/pulls/1 --jq .merged | grep -q true; do sleep 60; done"))
@@ -56,6 +82,13 @@ describe("foreground wait guard", () => {
     ["an empty seq range", "for i in $(seq 5 1); do sleep 900; done", 0],
     ["a stepped brace range", "for i in {0..100..25}; do sleep 60; done", 300],
     ["a C-style loop with v=v+S", "for ((i=1; i<=4; i=i+1)); do sleep 60; done", 240],
+    ["a jq-interpolated poll that stays short", "for i in $(seq 1 4); do m=$(gh api x --jq '\"\\\\(.merged) \\\\(.sha)\"'); sleep 60; done", 240],
+    ["an apostrophe in a heredoc body inside $(...)", "body=$(cat <<'EOF'\nit's fine; sleep 900 is text\nEOF\n); sleep 10", 10],
+    ["a shift in arithmetic", "x=$((1<<3)); sleep 60", 60],
+    ["a flock without -w (a free lock)", "flock ~/.local/state/versehq-write.lock git push -q origin HEAD", 0],
+    ["a flock with a short wait", "flock -x -w 50 /tmp/lock -c 'sleep 30'", 80],
+    ["a nonblocking flock", "flock -n /tmp/lock true", 0],
+    ["fractional sleeps without a leading digit", "tmux send-keys -t q Escape; sleep .5; tmux send-keys -t q g; sleep 1.; sleep 0.25s", 1.75],
   ])("allows %s", (_name, command, seconds) => {
     expect(foregroundWaitSeconds(command)).toBe(seconds);
     expect(foregroundWaitRefusal(command)).toBeUndefined();

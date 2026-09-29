@@ -1066,8 +1066,7 @@ export class AgentManager {
         this.#detach(managed, "agents.wait reached its bound; the run continues");
         reject(new Error(
           `agents.wait: ${managed.name} is still running after ${describeWaitBound(timeoutMs)}. It continues, and its result ` +
-            "arrives as a completion message after this turn: end the turn now, or pass a larger timeoutMs " +
-            "(up to 60 min) to wait longer.",
+            "arrives as a completion message after this turn: end the turn now.",
         ));
       }, timeoutMs);
       timer.unref?.();

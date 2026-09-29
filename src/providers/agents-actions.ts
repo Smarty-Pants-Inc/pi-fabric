@@ -161,7 +161,7 @@ const waitSchema = {
   type: "object",
   properties: {
     id: { type: "string" },
-    timeoutMs: { type: "number", minimum: 1_000, maximum: AGENT_WAIT_MAX_MS },
+    timeoutMs: { type: "number", minimum: 1_000, description: `Clamped to ${AGENT_WAIT_MAX_MS / 60_000} min: a foreground wait over the bash guard's limit blocks steers (smarty-dev#854)` },
   },
   required: ["id"],
   additionalProperties: false,
@@ -206,7 +206,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "wait",
-    description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification. Bounded by timeoutMs (default 5 min, at most 60 min): a child still running then keeps running, the wait throws, and its result arrives as a completion message after the turn",
+    description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification. Bounded by timeoutMs (default and at most 5 min): a child still running then keeps running, the wait throws, and its result arrives as a completion message after the turn",
     effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
     inputSchema: waitSchema,
     risk: "read",

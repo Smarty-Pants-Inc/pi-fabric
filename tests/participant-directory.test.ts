@@ -361,6 +361,9 @@ describe("ParticipantDirectory.get", () => {
     await alpha.start();
     await beta.start();
     await new Promise((resolve) => setTimeout(resolve, 600));        // past alpha's 300 ms shared lease
+    // A heartbeat just now renews only the file lease; a stalled runner timer must not let it lapse
+    // before the read (pi-fabric#142 CI: failed once on ubuntu-latest).
+    await alpha.refresh();
     const listed = vi.spyOn(beta, "list");
     expect(beta.get("agent:alpha-child")).toMatchObject({ id: "agent:alpha-child", stale: false });
     expect(listed).not.toHaveBeenCalled();

@@ -260,6 +260,85 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
     expect(writes).toEqual(["execute"]);
   });
 
+  // Security review on #146: a broken pipe must end host authority at once,
+  // even when the child's "close" is held back (a descendant keeps stdout open).
+  it.skipIf(process.platform === "win32")("aborts issued host calls at a pipe error while the child's close is withheld", async () => {
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+        queueMicrotask(() => channel.push(`${JSON.stringify({ type: "call", id: 1, ref: "schema.status", args: {} })}\n`));
+      },
+    });
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(), stderr: new PassThrough(),
+      stdio: [null, null, null, channel], kill: vi.fn(),
+    });
+    vi.mocked(childProcess.spawn).mockReturnValue(child as unknown as ReturnType<typeof childProcess.spawn>);
+    const calls: string[] = [];
+    let abortedAtError: boolean | undefined;
+    const started = Date.now();
+    const result = await run("return 1", (ref, _args, signal) => {
+      calls.push(ref);
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        if (calls.length === 1) queueMicrotask(() => {
+          channel.emit("error", new Error("read ECONNRESET"));
+          abortedAtError = signal?.aborted;
+          // A late guest frame after the break is not admitted.
+          channel.emit("data", Buffer.from(`${JSON.stringify({ type: "call", id: 2, ref: "memory.sessions", args: {} })}\n`));
+        });
+      });
+    }, { timeoutMs: 60_000 });
+    expect(abortedAtError).toBe(true);
+    expect(calls).toEqual(["schema.status"]);
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(result).toMatchObject({ terminationReason: "runtime_error" });
+    expect(result.error).toContain("CPython IPC failed: read ECONNRESET");
+    expect(result.error).toContain("did not report its exit");
+    expect(Date.now() - started).toBeLessThan(30_000);
+  });
+
+  // Astra round 2: the execution deadline may expire during the diagnosis wait;
+  // it must settle the recorded pipe failure, not replace it with a timeout.
+  it.skipIf(process.platform === "win32")("keeps the pipe failure when the deadline expires during its diagnosis", async () => {
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+        queueMicrotask(() => channel.push(`${JSON.stringify({ type: "call", id: 1, ref: "schema.status", args: {} })}\n`));
+      },
+    });
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(), stderr: new PassThrough(),
+      stdio: [null, null, null, channel], kill: vi.fn(),
+    });
+    vi.mocked(childProcess.spawn).mockReturnValue(child as unknown as ReturnType<typeof childProcess.spawn>);
+    let signalBroken!: () => void;
+    const broken = new Promise<void>((resolve) => { signalBroken = resolve; });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const pending = run("return 1", (_ref, _args, signal) => new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        // The pipe breaks with 500 ms left, less than the 2 s diagnosis bound.
+        queueMicrotask(() => {
+          vi.advanceTimersByTime(500);
+          channel.emit("error", new Error("read ECONNRESET"));
+          signalBroken();
+        });
+      }), { timeoutMs: 1000 });
+      await broken;
+      vi.advanceTimersByTime(3000);
+      const result = await pending;
+      expect(result).toMatchObject({ terminationReason: "runtime_error" });
+      expect(result.error).toContain("CPython IPC failed: read ECONNRESET");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("bounds non-cooperative host calls after guest failure", async () => {
     const started = Date.now();
     const result = await run('await asyncio.gather(schema.status(), memory.sessions())', async (ref) => {
@@ -300,6 +379,17 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
     const result = await new CPythonRuntime(path.join(temp(), "missing-python")).execute("return 1", echo, options);
     expect(result.error).toContain("executor.cpython.binary");
     expect(spawn).not.toHaveBeenCalled();
+  });
+
+  // smarty-dev#883: bwrap without user namespaces exits before it reads the
+  // execute frame; the reset pipe raced "close" and hid the sandbox diagnosis.
+  it.skipIf(process.platform === "win32")("reports a child that exits at startup, not the pipe reset it leaves", async () => {
+    const dying = path.join(temp(), "dying-python");
+    fs.writeFileSync(dying, "#!/bin/sh\necho 'bwrap: setting up uid map: Permission denied' >&2\nexit 1\n", { mode: 0o755 });
+    const result = await new CPythonRuntime(dying).execute(`return "${"x".repeat(256 * 1024)}"`, echo, options);
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toMatch(/process exited before returning a result \(1\)/);
+    expect(result.error).toContain("setting up uid map");
   });
 
   it.each(['sys.version_info = (3, 9, 0)', 'sys.implementation.name = "pypy"'])("rejects unsupported interpreter identity before imports/RPC: %s", (override) => {

@@ -16,6 +16,7 @@ import type {
 import type { FabricState } from "../fabric-state.js";
 import type { FabricThinking } from "../thinking.js";
 import type { MeshEvent } from "../mesh/store.js";
+import { participantFilesCachedStamp, participantFilesStamp, readParticipantFiles } from "../topology/participant-files.js";
 import type { FabricDashboardMessageTarget } from "./dashboard.js";
 import type { ModelSource } from "./model-picker.js";
 import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapshot.js";
@@ -768,9 +769,17 @@ export class FabricUiController {
       const main = this.state.mainAgentInfo(context);
       const local = JSON.stringify([revision, main.status, main.model, main.thinking, main.pendingMessages,
         this.state.widgetDismissedAt]);
-      const remoteOf = (meshStamp: string | undefined): string =>
-        JSON.stringify([this.#meshOffset, meshStamp, this.state.globalActors.stamp?.()]);
-      const remote = remoteOf(this.state.config.mesh.enabled ? this.state.mesh.stateStamp?.() : undefined);
+      // Participant records live in files of their own too (smarty-dev#2004); a change to one
+      // moves the directory's stamp, not the shared state's. As for the state, the built stamp is
+      // the one of the listing the snapshot consumed (review/astra F3 on #142).
+      const participantsRoot = this.state.config.mesh.enabled && typeof this.state.mesh.root === "string"
+        ? this.state.mesh.root : undefined;
+      const remoteOf = (meshStamp: string | undefined, participantsStamp: string | undefined): string =>
+        JSON.stringify([this.#meshOffset, meshStamp, participantsStamp, this.state.globalActors.stamp?.()]);
+      const remote = remoteOf(
+        this.state.config.mesh.enabled ? this.state.mesh.stateStamp?.() : undefined,
+        participantsRoot ? participantFilesStamp(participantsRoot) : undefined,
+      );
       const unchanged =
         !force && !this.#dashboardOpen && !this.#conversationOpen && revision !== undefined &&
         local === this.#builtLocal && now - this.#builtAt < REMOTE_MAX_AGE_MS &&
@@ -784,6 +793,7 @@ export class FabricUiController {
         // payload older than the file keeps the gate open (review/astra F2 on #84).
         const remoteRebuild = !force && !this.#dashboardOpen && !this.#conversationOpen && remote !== this.#builtRemote;
         if (remoteRebuild && this.state.config.mesh.enabled) this.state.mesh.cachedStateStamp?.(true);
+        if (remoteRebuild && participantsRoot) readParticipantFiles(participantsRoot);   // revalidate the listing
         this.#builtLocal = local;
         this.#builtAt = now;
         if (force || this.#dashboardOpen) this.#snapshotCache.clear();
@@ -796,7 +806,10 @@ export class FabricUiController {
           this.#dashboardOpen ? undefined : this.#snapshotCache,
           this.#activityView !== undefined,
         );
-        this.#builtRemote = remoteOf(this.state.config.mesh.enabled ? this.state.mesh.cachedStateStamp?.() : undefined);
+        this.#builtRemote = remoteOf(
+          this.state.config.mesh.enabled ? this.state.mesh.cachedStateStamp?.() : undefined,
+          participantsRoot ? participantFilesCachedStamp(participantsRoot) : undefined,
+        );
       }
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log

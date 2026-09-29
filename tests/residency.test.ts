@@ -1146,6 +1146,30 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     // The real path: the host exits after 30 s idle and its close removes runs/.
     const runsDir = path.join(state.config.residencyRoot, "runs");
     await waitFor(() => !fs.existsSync(path.join(state.config.residencyRoot, "owner.json")), 60_000);
+    // owner.json goes last: nothing may write under mesh/ once it is gone, or a new host
+    // started in that window, and every cleanup that trusts the marker, races the old one.
+    const snapshot = (): Map<string, string> => {
+      const files = new Map<string, string>();
+      const walk = (directory: string): void => {
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+          const file = path.join(directory, entry.name);
+          if (entry.isDirectory()) walk(file);
+          else {
+            try {
+              const stat = fs.statSync(file);
+              files.set(file, `${stat.size}:${stat.mtimeMs}`);
+            } catch { /* removed meanwhile */ }
+          }
+        }
+      };
+      walk(path.join(state.root, "mesh"));
+      return files;
+    };
+    const released = snapshot();
+    await delay(2_000);
+    const late = [...snapshot()].filter(([file, stamp]) => released.get(file) !== stamp)
+      .map(([file]) => path.relative(state.root, file));
+    expect(late).toEqual([]);
     expect(fs.existsSync(path.join(runsDir, handle.id))).toBe(false);
 
     const reconnect = new ResidencyClient({ ...client.options, hostPath });

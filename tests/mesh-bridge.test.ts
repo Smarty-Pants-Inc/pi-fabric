@@ -17,6 +17,7 @@ import { runBridge, transportCommand } from "../src/mesh-bridge.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { readParticipantFiles, writeParticipantFile } from "../src/topology/participant-files.js";
 
 // Two scratch meshes: "dev1" (the hub, in-process) and "forge" (reached through the agent over
 // a stdio pair, as the ssh transport does).
@@ -279,6 +280,40 @@ describe("mesh bridge", () => {
     expect(far.read({ after: 0 })[0]!.data).toEqual({ bridge: { from: "dev1", id: "1" } });
   });
   // Security review F1: a claim the hub refuses gets no routing either.
+  // smarty-dev#2004: under the participants-files policy a native root is only in its own file.
+  it("exports a native root that is only in its file, and never mirrors a spoof over it", async () => {
+    const { hub, far, bridge } = setup();
+    const keyOf = (id: string) => `topology/participants/${hash(id)}`;
+    const toFile = async (id: string) => {                      // its file, then off the shared state
+      writeParticipantFile(hub.root, hub.get(keyOf(id))!);
+      await hub.delete({ key: keyOf(id) });
+    };
+    const lane = await addRoot(hub, "lane");
+    const org = await addRoot(hub, "org");
+    await toFile(lane.identity.id);
+    await toFile(org.identity.id);
+    await addRoot(far, "thief", 15_000, { id: org.identity.id, hostId: sid("thief") });   // claims org's id
+    await bridge.start();
+    await bridge.step();
+    expect(far.get(keyOf(lane.identity.id))!.value).toMatchObject({ id: lane.identity.id, remoteHost: "dev1" });
+    expect(hub.get(keyOf(org.identity.id))).toBeUndefined();     // no mirror at a native's key
+    expect(hub.get(`topology/hosts/${hash(sid("thief"))}`)).toBeUndefined();
+    expect(readParticipantFiles(hub.root, { maxAgeMs: 0 }).map((item) => item.key).sort())
+      .toEqual([keyOf(lane.identity.id), keyOf(org.identity.id)].sort());
+  });
+
+  // Security pass S3 on #142: an unreadable or invalid native file still guards its key.
+  it("never mirrors over a native participant file it cannot read", async () => {
+    const { hub, far, bridge } = setup();
+    const forge = await addRoot(far, "forge-main");
+    const key = `topology/participants/${hash(forge.identity.id)}`;
+    fs.mkdirSync(path.join(hub.root, "participants"), { recursive: true });
+    fs.writeFileSync(path.join(hub.root, "participants", `${hash(forge.identity.id)}.json`), "{ not json");
+    await bridge.start();
+    await bridge.step();
+    expect(hub.get(key)).toBeUndefined();
+  });
+
   it("exports nothing to a remote host, root or alias that collides with a hub record", async () => {
     const { hub, far, bridge } = setup();
     const lane = await addRoot(hub, "lane");

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   FABRIC_RUN_ROOT_PREFIX,
   markRunRootActive,
@@ -9,6 +9,7 @@ import {
   hasUnresolvedWorker,
   markUnresolvedWorker,
   pruneActorRunArchives,
+  RUN_ROOT_SWEEP_MARKER,
   sweepTempRunRoots,
 } from "../src/storage/retention.js";
 
@@ -173,6 +174,75 @@ describe("temporal retention", () => {
 
     expect(result.removedRoots).toEqual([runRoot]);
     expect(fs.existsSync(runRoot)).toBe(false);
+  });
+
+  it("sweeps a host at most once per interval, and again once the marker is stale (smarty-dev#2010)", () => {
+    const tempRoot = temporaryDirectory();
+    const deadRoot = (name: string): string => {
+      const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + name);
+      fs.mkdirSync(runRoot);
+      fs.writeFileSync(
+        path.join(runRoot, ".fabric-owner.json"),
+        JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }),
+      );
+      return runRoot;
+    };
+    const sweepAt = (now: number) => sweepTempRunRoots({
+      tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY, minIntervalMs: HOUR,
+    });
+    const first = deadRoot("first");
+    expect(sweepAt(DAY).removedRoots).toEqual([first]);
+    const second = deadRoot("second");
+    // Another process swept within the hour: this one skips the walk.
+    expect(sweepAt(DAY + HOUR - 1).removedRoots).toEqual([]);
+    expect(fs.existsSync(second)).toBe(true);
+    expect(sweepAt(DAY + HOUR).removedRoots).toEqual([second]);
+    // A marker from the future (clock skew, tampering) does not suppress collection.
+    fs.writeFileSync(path.join(tempRoot, RUN_ROOT_SWEEP_MARKER), JSON.stringify({ sweptAt: 10 * DAY }));
+    const third = deadRoot("third");
+    expect(sweepAt(2 * DAY).removedRoots).toEqual([third]);
+  });
+
+  it("collects expired actor runs with worker reply and overflow files, still vetoed by unknown files (smarty-dev#2010)", () => {
+    const tempRoot = temporaryDirectory();
+    const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "actor");
+    markRunRootActive(runRoot, 1);
+    const actorRun = path.join(runRoot, "actor-run");
+    writeStatus(actorRun, { status: "completed", actorId: "actor-1", finishedAt: DAY });
+    for (const name of ["task.txt", "events.jsonl", "reply.json", "relaunches.jsonl", "oversized-event-prefix.txt", "oversized-event-prefix-2.txt"]) {
+      fs.writeFileSync(path.join(actorRun, name), "x");
+    }
+    const unknown = path.join(runRoot, "unknown");
+    writeStatus(unknown, { status: "completed", actorId: "actor-1", finishedAt: DAY });
+    fs.writeFileSync(path.join(unknown, "reply.json.bak"), "not ours");
+    markRunRootClosed(runRoot, DAY + 1);
+    const result = sweepTempRunRoots({
+      tempRoot, now: 2 * DAY, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY,
+    });
+    expect(result.removedRuns).toEqual([actorRun]);
+    expect(fs.existsSync(unknown)).toBe(true);
+  });
+
+  it("skips a closed root younger than the shortest retention, and stops at the budget", () => {
+    const tempRoot = temporaryDirectory();
+    const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "young");
+    markRunRootActive(runRoot, DAY);
+    const run = path.join(runRoot, "run");
+    writeStatus(run, { status: "completed", finishedAt: DAY });
+    markRunRootClosed(runRoot, DAY + 1);
+    const read = vi.spyOn(fs, "readdirSync");
+    const sweepAt = (now: number, budgetMs?: number) => sweepTempRunRoots({
+      tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY,
+      ...(budgetMs !== undefined ? { budgetMs } : {}),
+    });
+    expect(sweepAt(DAY + 6 * HOUR - 1).removedRuns).toEqual([]);
+    // Only the temp root and the empty-root check were listed: the young root's runs were not walked.
+    expect(read.mock.calls.filter(([dir]) => String(dir) === runRoot).length).toBeLessThanOrEqual(1);
+    read.mockRestore();
+    // A spent budget visits nothing; an unbounded sweep collects the run once it is due.
+    expect(sweepAt(3 * DAY, 0).removedRuns).toEqual([]);
+    expect(fs.existsSync(run)).toBe(true);
+    expect(sweepAt(3 * DAY).removedRuns).toEqual([run]);
   });
 
   it("keeps live roots and the current root out of orphan cleanup", () => {

@@ -997,7 +997,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // from the current prompt (skill references) rides
     // the message channel so provider prefix caches never cold-prefill.
     const guidance = [
-      fabricExecutionKernelGuidance(effectiveFullCodeMode, config.executor.kernel, config.executor.pythonRuntime, config.executor.runtime),
+      fabricExecutionKernelGuidance(effectiveFullCodeMode, config.executor.kernel, config.executor.pythonRuntime),
       resolvedGuidance.slotText,
       fabricSchemaGuidance(schemaMode),
       overrideGuidance,

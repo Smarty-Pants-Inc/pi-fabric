@@ -14,11 +14,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
-const toolFor = (kernel: "typescript" | "python", pythonRuntime: "cpython" | "monty" = "cpython", mode: { fullCodeMode?: boolean; schema?: "off" | "enforce" } = {}) => {
+const toolFor = (kernel: "typescript" | "python", pythonRuntime: "cpython" | "monty" = "cpython", mode: { fullCodeMode?: boolean; schema?: "off" | "enforce"; runtime?: "quickjs" | "node-process" } = {}) => {
   const state = {
     bootstrapped: true,
     config: normalizeFabricConfig({
-      executor: { kernel, pythonRuntime }, ui: { toolDisplay: "full" },
+      executor: { kernel, pythonRuntime, ...(mode.runtime ? { runtime: mode.runtime } : {}) }, ui: { toolDisplay: "full" },
       ...(mode.fullCodeMode !== undefined ? { fullCodeMode: mode.fullCodeMode } : {}),
       ...(mode.schema ? { schema: { mode: mode.schema } } : {}),
     }),
@@ -127,13 +127,17 @@ describe("exclusive kernel tool surface", () => {
   });
 
   // smarty-dev#459: host globals (process, fetch, btoa, TextEncoder, crypto, ...) were unguided.
+  // The line is a fabric_exec tool guideline, so a peer-delivered turn that skips
+  // before_agent_start still carries it; it is said once, not also in the system section.
   it("names the missing host globals only for the QuickJS TypeScript kernel, and the hint repeats that line", () => {
     for (const fullCodeMode of [true, false]) {
       const line = hostGlobalsGuidance(fullCodeMode);
-      expect(fabricExecutionKernelGuidance(fullCodeMode, "typescript", "monty", "quickjs")).toContain(line);
-      expect(fabricExecutionKernelGuidance(fullCodeMode, "typescript", "monty", "node-process")).not.toContain("no host globals");
-      expect(fabricExecutionKernelGuidance(fullCodeMode, "python", "monty")).not.toContain("no host globals");
-      expect(fabricExecutionKernelGuidance(fullCodeMode, "python", "cpython")).not.toContain("no host globals");
+      const rules = (tool: ToolDefinition<any, any, any>) => tool.promptGuidelines!.join("\n");
+      expect(rules(toolFor("typescript", "cpython", { fullCodeMode }))).toContain(line);
+      expect(rules(toolFor("typescript", "cpython", { fullCodeMode, runtime: "node-process" }))).not.toContain("no host globals");
+      expect(rules(toolFor("python", "monty", { fullCodeMode }))).not.toContain("no host globals");
+      expect(rules(toolFor("python", "cpython", { fullCodeMode }))).not.toContain("no host globals");
+      expect(fabricExecutionKernelGuidance(fullCodeMode, "typescript", "monty")).not.toContain("no host globals");
       for (const name of ["process", "fetch", "btoa", "TextEncoder", "crypto", "Bun"]) {
         const hint = typeErrorRecoveryHint(`return ${name}`, [{ line: 2, column: 8, message: `Cannot find name '${name}'.` }], fullCodeMode);
         expect(hint).toBe(`Recovery hint: ${line}`);
@@ -167,11 +171,12 @@ describe("exclusive kernel tool surface", () => {
       const rules = tool.promptGuidelines!.join("\n");
       expect(rules).toContain("`pi` and `extensions` do not exist inside `fabric_exec`");
       expect(rules).not.toMatch(/\bpi\.[a-z]/);
+      expect(rules).toContain(hostGlobalsGuidance(false));
       const event = { systemPrompt: "Base", prompt: "inspect", systemPromptOptions: { skills: [] } };
       const prompt = await handlers.get("before_agent_start")![0]!(event, {});
       expect(prompt.systemPrompt).toContain("orchestration-only mode");
       expect(prompt.systemPrompt).not.toContain("full code mode: `fabric_exec` is the only way");
-      expect(prompt.systemPrompt).toContain(hostGlobalsGuidance(false));
+      expect(prompt.systemPrompt).not.toContain("no host globals");
       // The executor type-checks with the same mode: no `pi` in the guest declarations.
       const recovery = typeErrorRecoveryHint("return 1", [{ line: 2, column: 8, message: "Cannot find name 'process'." }], false);
       expect(recovery).toContain("native `bash` tool");

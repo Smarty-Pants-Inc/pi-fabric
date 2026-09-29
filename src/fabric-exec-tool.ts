@@ -23,6 +23,7 @@ import {
   readFabricExecutionRenderDetails,
 } from "./audit/index.js";
 import { DEFAULT_FABRIC_CONFIG } from "./config.js";
+import { hostGlobalsGuidance } from "./core/system-guidance.js";
 import type { FabricState } from "./fabric-state.js";
 import { formatFailureProgress } from "./failure-progress.js";
 import {
@@ -165,6 +166,9 @@ export const createFabricExecTool = (
   // applyFabricMode re-creates the tool after bootstrap.
   const modeConfig = state.bootstrapped ? state.config : state.provisionalConfig?.();
   const piTools = !modeConfig || modeConfig.fullCodeMode || modeConfig.schema?.mode === "enforce";
+  // Tool guidelines ride every request, including a peer-delivered turn that skips
+  // before_agent_start, so the QuickJS host-globals line lives here (smarty-dev#459).
+  const quickjs = !python && (modeConfig?.executor?.runtime ?? "quickjs") === "quickjs";
   const repeatGuard = new FabricRepeatGuard(FABRIC_REPEAT_WARN, FABRIC_REPEAT_BLOCK);
   return decorateShell(
   defineTool({
@@ -194,6 +198,7 @@ export const createFabricExecTool = (
         "For edits/writes, pass named payloads through top-level `payloads`; each `π.key` must exactly match a key there; prefer `pi.edit`/`pi.write`. `pi.bash`: no stdin.",
         "Use `display.name` and objective `display.description`; Fabric pairs them with verified outcomes in deterministic compaction.",
       ] : orchestrationGuidelines(python)),
+      ...(quickjs ? [hostGlobalsGuidance(piTools)] : []),
       ...(monty ? ["Monty requires acyclic JSON host arguments. For underscore-prefixed provider/tool names, use `await tools.call(ref=..., args={...})`, not direct attributes. Use `payloads['key']` for private/non-identifier payload keys."] : []),
     ],
     // The model-facing schema is intentionally flat: one large `code` string

@@ -41,6 +41,17 @@ const refused: Array<[string, string]> = [
   ["a quoted prefix, then an unquoted glob", `rm -rf "/tmp/"tmp.*`],
   // fix-1993 allowed this as remote; the unquoted glob expands on Dev1 first, and m5/m4max are shared too.
   ["ssh with an unquoted glob", `ssh m5 rm -rf /tmp/tmp.*`],
+  // Round 1 on PR #148: review/astra 1, security S1: an assignment's quotes do not protect a later unquoted use.
+  ["a single-quoted glob in a variable, expanded unquoted", `P='/tmp/tmp.*'; rm -rf $P`],
+  ["a double-quoted glob in a variable, expanded unquoted", `P="/tmp/tmp.*"; rm -rf \${P}`],
+  ["an escaped glob in a variable, expanded unquoted", `P=/tmp/tmp.\\*; rm -rf $P`],
+  ["a quoted glob built from a variable", `T=/tmp; P="$T/tmp.*"; rm -rf $P`],
+  ["an unknown value expanded unquoted next to a /tmp path", `L=$(cat .local/list); ls /tmp; rm -rf $L`],
+  // review/astra 2, security S2: a local nested shell inherits the cwd.
+  ["cd /tmp, then sh -c with a relative glob", `cd /tmp && sh -c 'rm -rf tmp.*'`],
+  ["cd /tmp, then bash -c with a relative glob", `cd /tmp; bash -c "rm -rf *"`],
+  ["cd /tmp, then eval", `cd /tmp && eval 'rm -rf tmp.*'`],
+  ["cd /tmp, then a substitution", `cd /tmp && echo $(rm -rf tmp.*)`],
 ];
 
 const allowed: Array<[string, string]> = [
@@ -70,6 +81,20 @@ const allowed: Array<[string, string]> = [
   ["a relative glob", `rm -f ./*.log`],
   ["a glob under the home cache", `rm -rf ~/.cache/wt-*`],
   ["echo of the command, unquoted", `echo rm -rf /tmp/tmp.*`],
+  // Round 1 on PR #148: a quoted use of a glob value is one literal name.
+  ["a quoted glob value, used quoted", `P='/tmp/tmp.*'; rm -f "$P"`],
+  ["single-quoted variable text is literal", `P='/tmp/*'; rm -f '$P'`],
+  ["an unknown value, quoted", `L=$(cat .local/list); ls /tmp; rm -rf "$L"`],
+  ["an unknown value, unquoted, no /tmp in the command", `L=$(cat .local/list); rm -rf $L`],
+  // review/astra 3: a recorded mktemp dir is owned, even when mktemp names /tmp.
+  ["a recorded mktemp -p /tmp dir", `D=$(mktemp -d -p /tmp); rm -rf "$D"`],
+  ["a recorded mktemp -p /tmp dir, unquoted", `D=$(mktemp -d -p /tmp); rm -rf $D`],
+  ["a glob inside a recorded mktemp dir", `D=$(mktemp -d -p /tmp); rm -rf "$D"/*`],
+  ["a mktemp template under /tmp", `D=$(mktemp -d /tmp/wt.XXXXXX); rm -rf "$D"`],
+  // review/astra 2: a nested shell under an exact owned dir; a child cd does not leak to the parent.
+  ["cd to an exact dir, then sh -c with a glob", `cd /tmp/tmp.AbC123 && sh -c 'rm -rf *'`],
+  ["a child cd /tmp does not move the parent", `cd ~/w && sh -c 'cd /tmp' && rm -rf tmp.*`],
+  ["ssh does not inherit the local cwd", `cd /tmp && ssh m4max 'rm -rf build/*'`],
 ];
 
 describe("tmp-wipe guard (smarty-dev#1998)", () => {
@@ -79,6 +104,15 @@ describe("tmp-wipe guard (smarty-dev#1998)", () => {
 
   it.each(allowed)("allows %s", (_label, command) => {
     expect(wipesTmp(command)).toBe(false);
+  });
+
+  // Security S3: assignment expansion is bounded (the text is only read, never run).
+  it("reads a doubling assignment chain in bounded time", () => {
+    let script = "A=xxxxxxxxxxxxxxxx";
+    for (let i = 0; i < 40; i++) script += `; A=$A$A$A$A`;
+    const start = Date.now();
+    expect(wipesTmp(`${script}; rm -rf "$A"`)).toBe(false);
+    expect(Date.now() - start).toBeLessThan(2000);
   });
 
   it("does not change the kill-by-pattern verdict", () => {

@@ -21,8 +21,9 @@
 
 // `names[i]` is the placeholder `${name}` that stands for `subs[i]` in `text`: a script run by
 // bash -c, eval, ssh, env -S or a heredoc sees which operand came from which substitution.
-// `pattern` is `text` with each quoted or escaped glob character (* ? [ ]) replaced by \u0001, so an
-// unquoted glob stays visible to the /tmp rule (smarty-dev#1998).
+// `pattern` is `text` with each quoted or escaped glob character (* ? [ ]) masked (GLOB_MASK), a
+// double-quoted `$` as QUOTED and a single-quoted or escaped `$` as LITERAL, so the /tmp rule sees which
+// globs and expansions are live (smarty-dev#1998, round 1 on PR #148).
 type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string };
 type Expansion = { subs: string[]; names: string[]; text?: string; dynamic?: boolean };
 
@@ -176,6 +177,7 @@ function tokenize(source: string): Token[] {
     const w = current();
     const before = w.text.length;
     let bare = false;
+    const kind = c === "\"" ? QUOTED : (c === "$" && text[index + 1] === "(") || c === "`" ? "$" : LITERAL;
     if (c === "'") {
       const end = text.indexOf("'", index + 1);
       w.text += text.slice(index + 1, end < 0 ? text.length : end);
@@ -201,7 +203,7 @@ function tokenize(source: string): Token[] {
       bare = true;
     }
     const added = w.text.slice(before);
-    w.pattern += bare ? added : added.replace(/[*?[\]]/g, "\u0001");
+    w.pattern += bare ? added : mask(added).replaceAll("$", kind);
   }
   endWord();
   return tokens;
@@ -232,6 +234,22 @@ const VARIABLE = /\$\{?([A-Za-z_][A-Za-z0-9_]*|[0-9@*])/g;
 // smarty-dev#1998: deletes whose operand may be another agent's /tmp entry.
 const DELETERS = new Set(["rm", "unlink", "shred"]);
 const TMP_ROOTS = [["tmp"], ["var", "tmp"], ["private", "tmp"], ["private", "var", "tmp"]];
+// A quoted glob character maps to a private-use character, so a variable's literal value can restore it.
+const GLOBS = "*?[]";
+const GLOB_MASK = "\uE000\uE001\uE002\uE003";
+const mask = (text: string): string => text.replace(/[*?[\]]/g, (c) => GLOB_MASK[GLOBS.indexOf(c)]!);
+const unmask = (text: string): string => text.replace(/[\uE000-\uE003]/g, (c) => GLOBS[GLOB_MASK.indexOf(c)]!);
+const QUOTED = "\u0002";
+const LITERAL = "\u0003";
+// A `$NAME` (live) or quoted `"$NAME"` reference in a pattern.
+const REFERENCE = /([$\u0002])\{?([A-Za-z_][A-Za-z0-9_]*|[0-9@*])\}?/g;
+const MENTIONS_TMP = /(^|[^\w.-])\/(private\/)?(var\/)?tmp(\/|\b)/;
+// Security S3 on PR #148: a longer assignment value is unknown, so a doubling chain stays linear.
+const MAX_VALUE = 4096;
+
+// Local nested scripts (sh -c, eval, substitutions) inherit the cwd and variables; ssh gets neither.
+// `owned` holds the placeholders of `mktemp` substitutions; `root` is the whole tool-call command.
+type Context = { root: string; owned: Set<string>; cwd?: string | undefined; values: ReadonlyMap<string, string>; unknown: ReadonlySet<string> };
 
 /**
  * True when `pattern` (a word's pattern after variable expansion) names /tmp or /var/tmp itself, or has an
@@ -302,7 +320,8 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
  * Scans a shell script. `names` holds the variables and placeholders whose value comes from a name
  * lookup in the calling script (review/astra F8 on #105: per operand, never the whole script).
  */
-function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), tmpIn: ReadonlySet<string> = new Set()): Verdict {
+function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), tmpIn: ReadonlySet<string> = new Set(),
+  context: Context = { root: script, owned: new Set(), values: new Map(), unknown: new Set() }): Verdict {
   const verdict: Verdict = { blocked: false, lookup: false, wipe: false, tmpList: false };
   if (depth > 6) return verdict;
   // Variables whose value comes from a name lookup (`P=$(pgrep …)`, `for p in $(pgrep …)`,
@@ -313,23 +332,33 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
   let command: Command = { words: [], redirects: [], heredocs: [] };
 
   // smarty-dev#1998: variables and placeholders that hold a /tmp glob's matches, the literal values of
-  // earlier assignments, and the directory of the last `cd` (undefined when unknown).
+  // earlier assignments (quoted globs restored), variables whose value is a non-mktemp substitution,
+  // and the directory of the last `cd` (undefined when unknown).
   const tmpNames = new Set(tmpIn);
-  const values = new Map<string, string>();
-  let cwd: string | undefined;
+  const values = new Map(context.values);
+  const unknown = new Set(context.unknown);
+  let cwd = context.cwd;
 
-  const nested = (text: string, extra: Iterable<string> = [], tmpExtra: Iterable<string> = []): Verdict => {
-    const inner = scan(text, depth + 1, new Set([...tainted, ...extra]), new Set([...tmpNames, ...tmpExtra]));
+  const nested = (text: string, extra: Iterable<string> = [], tmpExtra: Iterable<string> = [], local = true): Verdict => {
+    const inner = scan(text, depth + 1, new Set([...tainted, ...extra]), new Set([...tmpNames, ...tmpExtra]),
+      local ? { ...context, cwd, values, unknown } : { ...context, cwd: undefined, values: new Map(), unknown: new Set() });
     verdict.blocked ||= inner.blocked;
     verdict.lookup ||= inner.lookup;
     verdict.wipe ||= inner.wipe;
     return inner;
   };
   const fromLookup = (text: string): boolean => [...text.matchAll(VARIABLE)].some((match) => tainted.has(match[1]!));
+  // An unquoted `$P` expands with its value's globs live; a quoted `"$P"` is one literal name.
   const expand = (pattern: string): string =>
-    pattern.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name: string) => values.get(name) ?? whole);
+    pattern.replace(REFERENCE, (whole, how: string, name: string) => {
+      const value = values.get(name);
+      return value === undefined ? whole : how === "$" ? value : mask(value);
+    });
   const tmpOperand = (pattern: string): boolean =>
-    [...pattern.matchAll(VARIABLE)].some((match) => tmpNames.has(match[1]!)) || tmpGlob(expand(pattern), cwd);
+    [...pattern.matchAll(REFERENCE)].some((match) => tmpNames.has(match[2]!)) || tmpGlob(expand(pattern), cwd);
+  // Round 1 on PR #148: an unquoted expansion of an unknown value, in a command that names /tmp.
+  const unknownOperand = (pattern: string): boolean =>
+    [...pattern.matchAll(REFERENCE)].some((match) => match[1] === "$" && unknown.has(match[2]!)) && MENTIONS_TMP.test(context.root);
 
   const runPipeline = (): void => {
     let pipeFeed = false;
@@ -344,12 +373,13 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       let captured = false;
       for (const expansion of expansions) expansion.subs.forEach((sub, k) => {
         const inner = nested(sub);
+        if (/^\s*mktemp(\s|$)/.test(sub)) context.owned.add(expansion.names[k]!);
         if (inner.tmpList) tmpNames.add(expansion.names[k]!);
         if (!inner.lookup) return;
         captured = true;
         tainted.add(expansion.names[k]!);
       });
-      const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[] }> = [];
+      const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
       const { words, fedByXargs } = unwrap(stage.words, envScripts);
       // review/astra F6 on #105: an `env -S` script, with the placeholders of its word.
@@ -364,15 +394,23 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
         if (assigned && fromLookup(assigned[2]!)) tainted.add(assigned[1]!);
         const value = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word.pattern);
         if (value) {
-          if (tmpOperand(value[2]!)) tmpNames.add(value[1]!);
-          values.set(value[1]!, expand(value[2]!));
+          const [, variable, raw] = value as unknown as [string, string, string];
+          if (tmpOperand(raw)) tmpNames.add(variable);
+          // An assignment does not glob: its quotes protect only the assignment, so keep the literal value.
+          const literal = unmask(expand(raw.replaceAll(QUOTED, "$")));
+          const subs = [...literal.matchAll(/\$\{(__pk_sub_\d+)\}/g)].map((match) => match[1]!);
+          if (literal.length > MAX_VALUE || subs.some((sub) => !context.owned.has(sub))) unknown.add(variable);
+          else unknown.delete(variable);
+          if (literal.length > MAX_VALUE) values.delete(variable);
+          else values.set(variable, literal);
         }
       }
       if (name === "for" && args[0] && args.slice(2).some((arg) => fromLookup(arg.text))) tainted.add(args[0].text);
       if (name === "for" && args[0] && args.slice(2).some((arg) => tmpOperand(arg.pattern))) tmpNames.add(args[0].text);
       if (name === "read" && pipeFeed) for (const arg of args) if (!arg.text.startsWith("-")) tainted.add(arg.text);
       if (name === "read" && pipeTmp) for (const arg of args) if (!arg.text.startsWith("-")) tmpNames.add(arg.text);
-      let listsTmp = stage.words.some((word) => tmpOperand(word.pattern));
+      // mktemp creates one exact path; naming /tmp there does not list other agents' entries.
+      let listsTmp = name !== "mktemp" && stage.words.some((word) => tmpOperand(word.pattern));
       if (name === "cd") {
         const target = args.find((arg) => !arg.text.startsWith("-"));
         const dir = target && expand(target.pattern);
@@ -382,7 +420,7 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       if (DELETERS.has(name)) {
         const end = args.findIndex((arg) => arg.text === "--");
         const operands = args.filter((arg, i) => (end >= 0 && i > end) || (!(arg.text.startsWith("-") && arg.text.length > 1) && (end < 0 || i < end)));
-        if (operands.some((arg) => tmpOperand(arg.pattern)) || (fedByXargs && pipeTmp)) verdict.wipe = true;
+        if (operands.some((arg) => tmpOperand(arg.pattern) || unknownOperand(arg.pattern)) || (fedByXargs && pipeTmp)) verdict.wipe = true;
       }
       if (name === "find") {
         const roots: Word[] = [];
@@ -404,7 +442,7 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
         if (!probe && (byLookup || xargsFeed)) verdict.blocked = true;
       }
       // review/astra F6 on #105: a heredoc script as the shell receives it, placeholders included.
-      if (SHELLS.has(name) || name === "ssh") for (const heredoc of heredocs) scripts.push({ text: heredoc.text });
+      if (SHELLS.has(name) || name === "ssh") for (const heredoc of heredocs) scripts.push({ text: heredoc.text, remote: name === "ssh" });
       if (SHELLS.has(name)) {
         const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg.text));
         const payload = flag >= 0 ? args[flag + 1] : undefined;
@@ -425,10 +463,10 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       if (name === "ssh") {
         let i = 0;
         while (args[i]?.text.startsWith("-")) i += SSH_VALUE_OPTIONS.has(args[i]!.text) ? 2 : 1;
-        scripts.push({ text: args.slice(i + 1).map((arg) => arg.text).join(" ") });
+        scripts.push({ text: args.slice(i + 1).map((arg) => arg.text).join(" "), remote: true });
       }
       for (const inner of scripts) {
-        const result = nested(inner.text, inner.extra, inner.tmpExtra);
+        const result = nested(inner.text, inner.extra, inner.tmpExtra, !inner.remote);
         lookup = result.lookup || lookup;
         listsTmp = result.tmpList || listsTmp;
       }

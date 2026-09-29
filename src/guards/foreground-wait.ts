@@ -284,7 +284,15 @@ class WaitEstimator {
   }
 
   #simple(tokens: Token[]): number {
-    let rest = tokens.filter((token) => "word" in token && !/^[<>0-9&]*[<>]/.test(token.word)) as Array<{ word: string; quoted?: string }>;
+    // Redirections are not operands: `2>&1` and `>/dev/null` carry their target, while a bare
+    // operator (`>`, `2>`, `&>`, `<`, `<<<`, `>&`) takes the next word as its target.
+    let rest: Array<{ word: string; quoted?: string }> = [];
+    for (let at = 0; at < tokens.length; at += 1) {
+      const token = tokens[at]!;
+      if (!("word" in token)) continue;
+      if (!/^[<>0-9&]*[<>]/.test(token.word) || token.quoted !== undefined) { rest.push(token); continue; }
+      if (/^[0-9&]*[<>]+[&|]?$/.test(token.word)) at += 1;
+    }
     while (rest.length > 0 && /^\w+=/.test(rest[0]!.word)) rest = rest.slice(1);
     const name = rest[0]?.word;
     if (name === undefined) return 0;

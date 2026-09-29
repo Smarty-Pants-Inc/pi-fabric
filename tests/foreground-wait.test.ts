@@ -22,6 +22,8 @@ describe("foreground wait guard", () => {
     ["a stepped seq loop", "for i in $(seq 0 60 600); do sleep 60; done", 660],
     ["a C-style loop that counts down", "for ((n=20; n>0; n--)); do sleep 30; done", 600],
     ["a long sleep under timeout 0", "timeout 0 sleep 900", 900],
+    ["a long sleep with a spaced redirection", "sleep 900 > /dev/null", 900],
+    ["a long sleep with a spaced input redirection", "sleep 900 < /dev/null 2> err.log", 900],
   ])("refuses %s", (_name, command, seconds) => {
     expect(foregroundWaitSeconds(command)).toBe(seconds);
     expect(foregroundWaitRefusal(command)).toMatch(/Fabric refused this command: its foreground wait is about \d/);
@@ -47,6 +49,7 @@ describe("foreground wait guard", () => {
     ["a flock that waits on a variable", "flock -w \"$WAIT\" /tmp/lock true"],
     ["a flock -w with an inline value", "flock --wait=900 /tmp/lock true"],
     ["a flock around a long sleep", "flock /tmp/lock sleep 900"],
+    ["a computed sleep with a spaced redirection", "sleep $((t-now)) > /dev/null 2>&1"],
   ])("refuses %s unless a timeout bounds it", (_name, command) => {
     expect(foregroundWaitRefusal(command)).toMatch(/Fabric refused this command/);
     expect(foregroundWaitRefusal(`timeout 120 ${command}`)).toBeUndefined();
@@ -88,6 +91,12 @@ describe("foreground wait guard", () => {
     ["a flock without -w (a free lock)", "flock ~/.local/state/versehq-write.lock git push -q origin HEAD", 0],
     ["a flock with a short wait", "flock -x -w 50 /tmp/lock -c 'sleep 30'", 80],
     ["a nonblocking flock", "flock -n /tmp/lock true", 0],
+    // review/astra F1 on #137: a spaced redirection target is not a sleep operand.
+    ["a sleep with a spaced output redirection", "sleep 1 > /dev/null", 1],
+    ["a sleep with an attached redirection", "sleep 1 2>/dev/null", 1],
+    ["a sleep with both streams redirected", "sleep 1 >/dev/null 2>&1", 1],
+    ["a sleep with spaced numbered and appending redirections", "sleep 2 2> err.log >> out.log < /dev/null", 2],
+    ["a sleep with &> and a here-string", "sleep 3 &> /dev/null; cat <<< $X", 3],
     ["fractional sleeps without a leading digit", "tmux send-keys -t q Escape; sleep .5; tmux send-keys -t q g; sleep 1.; sleep 0.25s", 1.75],
   ])("allows %s", (_name, command, seconds) => {
     expect(foregroundWaitSeconds(command)).toBe(seconds);

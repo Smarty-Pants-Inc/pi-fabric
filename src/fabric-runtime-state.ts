@@ -6,12 +6,8 @@ import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
-import {
-  resolveAvailablePiModel,
-  type FabricModelCandidate,
-} from "./core/model-resolution.js";
-import { loadModelUsage } from "./core/model-usage.js";
-import { resolveWithModelRefresh } from "./core/model-refresh.js";
+import type { FabricModelCandidate } from "./core/model-resolution.js";
+import { resolvePiModel } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -650,32 +646,28 @@ export class FabricRuntimeState {
         ...(defaultModel ? { defaultModel } : {}),
       };
     };
-    const resolveVisiblePiModel = (selector: string | undefined, exact: boolean) => {
-      const models = visiblePiModels();
-      const state = piModelState(models);
-      const query = selector?.trim() || state.defaultModel || "";
-      const resolved = resolveAvailablePiModel(query, {
-        aliases: state.aliases,
-        available: state.available,
-        lastUsed: loadModelUsage(),
-        exact,
+    // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
+    const resolveParticipantPiModel = async (selector?: string) => {
+      const defaultModel = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
+      const resolved = await resolvePiModel({
+        selector,
+        registry: context.modelRegistry,
+        aliases: modelsConfig.aliases,
+        defaultModel,
       });
-      const model = models.find(
+      const model = visiblePiModels().find(
         (candidate) =>
           String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
           String(candidate.id).toLowerCase() === resolved.id.toLowerCase(),
       );
       if (!model) {
         throw new Error(
-          `Model ${JSON.stringify(query)} is not available to this Pi session. ` +
+          `Model ${JSON.stringify(selector?.trim() || defaultModel || "")} is not available to this Pi session. ` +
             'Use agents.models({ runner: "pi" }) to list the models visible to this session.',
         );
       }
       return { key: `${resolved.provider}/${resolved.id}`, model };
     };
-    // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
-    const resolveParticipantPiModel = (selector?: string) =>
-      resolveWithModelRefresh(context.modelRegistry, (exact) => resolveVisiblePiModel(selector, exact));
     const completionInbox = new AgentCompletionInbox(this.pi, context);
     this.#completionInbox = completionInbox;
     let markStoppedDelivered = (_id: string): void => {};

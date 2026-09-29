@@ -71,7 +71,7 @@ import {
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
-import { resolveWithModelRefresh } from "../core/model-refresh.js";
+import { resolvePiModel } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
 import { agentWaitBound, describeWaitBound } from "../agents/wait-bound.js";
@@ -424,37 +424,15 @@ export class AgentsProvider implements FabricProvider {
   }
 
   /** Resolve a Pi participant selector only within this session's visible registry. */
-  #resolvePiModel(
+  async #resolvePiModel(
     model: string,
     context: FabricInvocationContext,
   ): Promise<string> {
     // A model added to models.json after startup resolves after one shared refresh (smarty-dev#1830).
-    return resolveWithModelRefresh(
-      context.extensionContext.modelRegistry,
-      (exact) => this.#resolveVisiblePiModel(model, context, exact),
-    );
-  }
-
-  #resolveVisiblePiModel(
-    model: string,
-    context: FabricInvocationContext,
-    exact: boolean,
-  ): string {
-    let available: FabricModelCandidate[] = [];
-    try {
-      available = context.extensionContext.modelRegistry.getAvailable().map((candidate) => ({
-        provider: String(candidate.provider),
-        id: String(candidate.id),
-        ...(typeof candidate.name === "string" ? { name: candidate.name } : {}),
-      }));
-    } catch {
-      // The authoritative visible set is empty when registry discovery fails.
-    }
-    const resolved = resolveAvailablePiModel(model, {
+    const resolved = await resolvePiModel({
+      selector: model,
+      registry: context.extensionContext.modelRegistry,
       aliases: this.modelsConfig().aliases,
-      available,
-      lastUsed: loadModelUsage(),
-      exact,
     });
     return `${resolved.provider}/${resolved.id}`;
   }

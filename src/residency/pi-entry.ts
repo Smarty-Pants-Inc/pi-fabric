@@ -14,7 +14,7 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
     controller = new AbortController();
-    host = runResidentHostFromConfigPath(configPath, controller.signal)
+    host = runResidentHostFromConfigPath(configPath, controller.signal, ctx.modelRegistry)
       .catch(() => undefined)
       .finally(() => ctx.shutdown());
   });

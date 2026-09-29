@@ -635,6 +635,25 @@ export class ActorManager {
   }
 
   /**
+   * Resolve the binding a direct activation will pin, awaiting a model registry refresh when the
+   * model is missing. A resident owner awaits this before the synchronous `tell`, so an override
+   * naming a model added after it started runs, and an unavailable one fails at once (pi-fabric#138).
+   */
+  async resolveActivationBinding(
+    id: string,
+    options: ActorMessageBindingOptions = {},
+  ): Promise<FabricActorRunBinding> {
+    this.#syncActorsFromRegistry();
+    const actor = this.#requireActor(id);
+    if (options.binding !== undefined && options.overrides !== undefined) {
+      throw new Error("Actor activation cannot carry both overrides and a resolved binding");
+    }
+    return this.#resolvedRunBinding(actor, options.binding !== undefined
+      ? this.#validatedRunBinding(options.binding)
+      : this.#runBinding(actor, options.overrides));
+  }
+
+  /**
    * Change an actor model binding. Session scope is the default and is writable
    * by passive project sessions because it never mutates the shared definition.
    * Project scope changes the shared default and therefore remains owner-gated.

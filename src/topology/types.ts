@@ -52,6 +52,11 @@ export interface FabricParticipantRecord {
   actorQueued?: number;
   actorMessages?: number;
   controlProtocol: "v1" | "legacy";
+  /**
+   * Set on a root that the mesh bridge mirrors from another host's mesh (smarty-dev#2004):
+   * the name of that host. A routing target only, never a local owner.
+   */
+  remoteHost?: string;
 }
 
 export interface FabricParticipantInfo extends FabricParticipantRecord {
@@ -67,6 +72,8 @@ export interface FabricHostRecord {
   startedAt: number;
   updatedAt: number;
   expiresAt: number;
+  /** Set on a host lease that the mesh bridge mirrors from another host's mesh (smarty-dev#2004). */
+  remoteHost?: string;
 }
 
 export interface FabricParticipantListOptions {
@@ -96,6 +103,8 @@ export interface FabricPeerInfo {
   updatedAt: number;
   pendingMessages: boolean;
   local: false;
+  /** The remote host of a peer mirrored by the mesh bridge (smarty-dev#2004). */
+  host?: string;
 }
 
 export interface FabricParticipantSource {

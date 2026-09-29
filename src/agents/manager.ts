@@ -150,7 +150,92 @@ export const resolveAgentCwd = (parentCwd: string, requestedCwd?: string): strin
     return canonical;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid Fabric agent cwd ${JSON.stringify(requested)}: ${reason}`);
+    const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
+    throw new Error(
+      `Invalid Fabric agent cwd ${JSON.stringify(requested)}: ${reason}` +
+        (missing ? ". The cwd does not exist; if another tool call in the same message creates it, call spawn in the next message" : ""),
+      { cause: error },
+    );
+  }
+};
+
+const AGENT_CWD_SETTLE_MS = 3_000;
+const AGENT_WORKTREE_SETTLE_MS = 30_000;
+
+const readText = (file: string): string | undefined => {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * True while `git worktree add` is still creating the linked worktree `dir`. Git writes
+ * `<gitdir>/locked` ("initializing") before it creates `dir`, holds `<gitdir>/index.lock`
+ * during the checkout, and removes the lock when it finishes; a failed add removes `dir`.
+ * Only git's own add-time reason counts: a `git worktree lock` with no reason (an empty file)
+ * or another reason is a finished worktree. git writes "initializing" before W exists, so a
+ * half-written lock is never seen beside W/.git.
+ * ponytail: a localized git writes a translated reason; index.lock still covers its checkout.
+ */
+const gitWorktreeInitializing = (dir: string): boolean => {
+  const dotGit = readText(path.join(dir, ".git"));
+  const match = dotGit?.match(/^gitdir:\s*(.+?)\s*$/m);
+  if (!match) return false;
+  const gitdir = path.resolve(dir, match[1]!);
+  if (fs.existsSync(path.join(gitdir, "index.lock"))) return true;
+  return readText(path.join(gitdir, "locked"))?.trim() === "initializing";
+};
+
+const isEmptyDirectory = (dir: string): boolean => {
+  try {
+    return fs.readdirSync(dir).length === 0;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * resolveAgentCwd, but it waits for a sibling tool call that is still creating the cwd.
+ * ponytail: Pi runs the tool calls of one message in parallel, so `git worktree add W` and a
+ * spawn with cwd W race (smarty-dev#1668). A missing cwd is re-checked for up to
+ * AGENT_CWD_SETTLE_MS. A linked worktree whose checkout is still running is awaited for up to
+ * AGENT_WORKTREE_SETTLE_MS, so the agent never starts on a partial tree; a failed add removes
+ * the directory and the spawn fails. A plain directory spawns as soon as it exists.
+ */
+export const awaitAgentCwd = async (
+  parentCwd: string,
+  requestedCwd?: string,
+  signal?: AbortSignal,
+): Promise<string> => {
+  const started = Date.now();
+  let appeared = false;
+  for (let wait = 50; ; wait = Math.min(wait * 2, 500)) {
+    let resolved: string | undefined;
+    try {
+      resolved = resolveAgentCwd(parentCwd, requestedCwd);
+    } catch (error) {
+      const cause = (error as Error).cause as NodeJS.ErrnoException | undefined;
+      if (cause?.code !== "ENOENT" || signal?.aborted || Date.now() + wait > started + AGENT_CWD_SETTLE_MS) {
+        throw error;
+      }
+      appeared = true;
+    }
+    if (resolved !== undefined) {
+      // Git creates W and writes W/.git a moment apart: an empty directory that just appeared
+      // gets one more look before it counts as a plain directory.
+      const pending = gitWorktreeInitializing(resolved) || (appeared && isEmptyDirectory(resolved));
+      if (!pending) return resolved;
+      appeared = false;
+      if (signal?.aborted || Date.now() + wait > started + AGENT_WORKTREE_SETTLE_MS) {
+        throw new Error(
+          `Invalid Fabric agent cwd ${JSON.stringify(requestedCwd)}: a git worktree is still being created there` +
+            "; call spawn after the git worktree add finishes",
+        );
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, wait));
   }
 };
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
@@ -478,6 +563,7 @@ export class AgentManager {
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
+  readonly #onSettled: ((result: AgentRunResult) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
@@ -531,6 +617,8 @@ export class AgentManager {
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onResultConsumed?: (id: string) => void;
       onStoppedAtClose?: (results: AgentRunResult[]) => void;
+      /** Every terminal result, foreground or background, before its run directory can be removed. */
+      onSettled?: (result: AgentRunResult) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       preparePiModel?: (model: string | undefined) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
@@ -555,6 +643,7 @@ export class AgentManager {
     this.#onBackgroundComplete = options.onBackgroundComplete;
     this.#onResultConsumed = options.onResultConsumed;
     this.#onStoppedAtClose = options.onStoppedAtClose;
+    this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
     this.#preparePiModel = options.preparePiModel;
     this.#resolveHandoffCompactionBudget = options.resolveHandoffCompactionBudget;
@@ -618,8 +707,8 @@ export class AgentManager {
     return () => this.#uiListeners.delete(listener);
   }
 
-  resolveCwd(requestedCwd?: string): string {
-    return resolveAgentCwd(this.cwd, requestedCwd);
+  resolveCwd(requestedCwd?: string, signal?: AbortSignal): Promise<string> {
+    return awaitAgentCwd(this.cwd, requestedCwd, signal);
   }
 
   #inheritedSessionPins(request: AgentRunRequest): InheritedSessionPin[] | undefined {
@@ -703,7 +792,7 @@ export class AgentManager {
     const pythonRuntime = kernel ? this.resolvePythonRuntime(request.pythonRuntime) : undefined;
     // Validate explicit execution targets before any model preparation or budget side effects.
     // With no override this deliberately preserves the manager cwd without canonicalizing it.
-    const selectedCwd = this.resolveCwd(request.cwd);
+    const selectedCwd = await this.resolveCwd(request.cwd, signal);
     const residency = request.residency ?? "session";
     if (residency !== "session" && residency !== "durable") {
       throw new Error(`Invalid Fabric agent residency: ${String(request.residency)}`);
@@ -1832,6 +1921,7 @@ export class AgentManager {
     this.#invalidateUiList();
     finishAgentSettlement(managed, result);
     managed.task = "";
+    try { this.#onSettled?.(result); } catch { /* must not break the manager */ }
     this.#notifyBackgroundComplete(managed, result);
   }
 

@@ -142,6 +142,8 @@ interface FabricPeerInfo {
   updatedAt: number;
   pendingMessages: boolean;
   local: false;
+  /** The remote host of a peer mirrored by the mesh bridge. */
+  host?: string;
 }
 type FabricParticipantKind = "root" | "agent" | "actor";
 type FabricParticipantResidency = "session" | "durable";
@@ -179,6 +181,8 @@ interface FabricParticipantInfo {
   actorQueued?: number;
   actorMessages?: number;
   controlProtocol: "v1" | "legacy";
+  /** The remote host of a root mirrored by the mesh bridge; never a local owner. */
+  remoteHost?: string;
   residency: FabricParticipantResidency;
   local: boolean;
   stale: boolean;

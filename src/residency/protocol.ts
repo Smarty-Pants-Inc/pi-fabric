@@ -64,6 +64,13 @@ export const isResidentHostId = (id: string): boolean => /^resident:[0-9a-f]{24}
 export const residentRoot = (meshRoot: string, rootId: string): string =>
   path.join(meshRoot, "residency", digest(rootId));
 
+/**
+ * A durable run's terminal record. It outlives the run directory, which the resident host
+ * removes when it goes idle, so status after a restart still reads the result (smarty-dev#1882).
+ */
+export const residentResultPath = (residencyRoot: string, id: string): string =>
+  path.join(residencyRoot, "results", `${id}.json`);
+
 export const residentDeliveryPrefix = (rootId: string): string =>
   `${RESIDENT_DELIVERY_PREFIX}${digest(rootId).slice(0, 32)}/`;
 

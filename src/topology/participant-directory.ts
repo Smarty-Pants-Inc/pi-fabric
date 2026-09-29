@@ -418,6 +418,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       const committed = await operation;
       if (!committed) return;
+      // A committed heartbeat certifies a view after it (confirmedAt, peer-settle): no listing
+      // after it may use lease files read before it (review/astra F1 on pi-fabric#140).
+      this.#leaseRead = undefined;
       this.#refreshedAt = Date.now();
       this.#refreshError = undefined;
       if (full) this.#sweepDeadHosts();
@@ -451,7 +454,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     const read = { fresh: options.fresh === true };
     const parsed = this.#parsed(read);
-    const hosts = this.#liveHosts(parsed.hosts, !read.fresh);
+    const hosts = this.#liveHosts(parsed.hosts, !read.fresh, now);
     const byId = new Map<string, FabricParticipantInfo>();
     for (const participant of parsed.participants) {
       const owner = hosts.get(participant.ownerHostId);
@@ -547,19 +550,27 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // lease and its file lease (smarty-dev#816).
   // A listing reuses the lease files it read within a fifth of a heartbeat (1 s by default):
   // the dashboard lists the directory three times per rebuild, and each read stats every host's
-  // lease file (smarty-dev#557). A lease is renewed every heartbeat and lasts three, so a read
-  // this recent never shows a live host as lapsed. Fresh reads, and single lookups, read the files.
-  #liveHosts(entries: Iterable<MeshStateEntry>, reuse = false): Map<string, FabricHostRecord> {
-    const now = Date.now();
+  // lease file (smarty-dev#557). A lease that was valid at that read but has lapsed by `now` is
+  // not trusted: the host may have renewed its file since, so its own file is read again before
+  // the lapse counts (review/astra F1 on pi-fabric#140). A committed heartbeat drops
+  // the recent read. Fresh reads, and single lookups, read the files.
+  #liveHosts(entries: Iterable<MeshStateEntry>, reuse = false, now = Date.now()): Map<string, FabricHostRecord> {
+    const readAt = Date.now();
     const recent = this.#leaseRead;
-    const leases = reuse && recent && now - recent.at >= 0 && now - recent.at < this.#heartbeatMs / 5
-      ? recent.leases
-      : readHostLeases(this.mesh.root);
-    if (reuse && leases !== recent?.leases) this.#leaseRead = { at: now, leases };
+    const cached = reuse && recent !== undefined && readAt - recent.at >= 0 && readAt - recent.at < this.#heartbeatMs / 5;
+    const leases = cached ? recent.leases : readHostLeases(this.mesh.root);
+    if (reuse && !cached) this.#leaseRead = { at: readAt, leases };
     const hosts = new Map<string, FabricHostRecord>();
     for (const entry of entries) {
       const host = hostFromEntry(entry);
-      if (host) hosts.set(host.id, { ...host, expiresAt: hostLeaseExpiry(leases, host) });
+      if (!host) continue;
+      let expiresAt = hostLeaseExpiry(leases, host);
+      // A lease already lapsed when the files were read stays lapsed until the next read.
+      if (cached && expiresAt < now && expiresAt >= recent.at) {
+        const lease = readHostLease(this.mesh.root, host.id);
+        expiresAt = hostLeaseExpiry(lease ? new Map([[host.id, lease]]) : new Map(), host);
+      }
+      hosts.set(host.id, { ...host, expiresAt });
     }
     return hosts;
   }

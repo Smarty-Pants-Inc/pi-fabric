@@ -6,7 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, STATE_LEASE_RENEW_MS } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, readHostLeases, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -1191,6 +1191,68 @@ describe("ParticipantDirectory reads", () => {
     await store.put({ key, value: { ...(current.value as FabricParticipantRecord), status: "busy" }, identity: writer, ifVersion: current.version });
     expect(reader.list({ scope: "project", fresh: true }).find((participant) => participant.id === writer.id)!.status).toBe("busy");
     shared.mockRestore();
+  });
+});
+
+// review/astra F1 on pi-fabric#140: a listing reuses the lease files it read for heartbeat/5.
+// Under file-only renewals those files are the only liveness evidence, so a reused read must
+// never turn a renewed peer into an absent one.
+describe("ParticipantDirectory lease reads", () => {
+  const reader: MeshIdentity = { id: "session:reader", name: "main", kind: "main", sessionId: "reader" };
+  const peer: MeshIdentity = { id: "session:peer", name: "main", kind: "main", sessionId: "peer" };
+  const timing = { heartbeatMs: 60_000, leaseMs: 120_000 };            // leases are reused for 12 s
+  const setup = async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    await store.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: peer });
+    const readerDirectory = createDirectory(meshRoot, reader, reader.id, () => [rootRecord(reader.id, reader.id, "reader")], timing);
+    const peerDirectory = createDirectory(meshRoot, peer, peer.id, () => [rootRecord(peer.id, peer.id, "peer")], timing);
+    await readerDirectory.start();
+    await peerDirectory.start();
+    const fileLease = readHostLeases(meshRoot).get(peer.id)!;
+    const shared = store.listAll("topology/hosts/").find((entry) => (entry.value as { id?: string }).id === peer.id)!;
+    // The peer's effective expiry: the later of its file lease and its shared-state record.
+    const lease = { expiresAt: Math.max(fileLease.expiresAt, (shared.value as { expiresAt: number }).expiresAt) };
+    const renew = (at: number) => writeHostLease(meshRoot, { ...fileLease, updatedAt: at, expiresAt: at + timing.leaseMs });
+    const seesPeer = () => readerDirectory.peers().some((candidate) => candidate.id === peer.id);
+    return { readerDirectory, lease, renew, seesPeer };
+  };
+  afterEach(() => vi.restoreAllMocks());
+
+  it("keep a peer whose file lease was renewed after the read and before its old expiry", async () => {
+    const { lease, renew, seesPeer } = await setup();
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(lease.expiresAt - 5_000);
+    expect(seesPeer()).toBe(true);                                   // fills the lease read
+    renew(lease.expiresAt - 2_000);                                  // file-only renewal
+    clock.mockReturnValue(lease.expiresAt + 1);                      // old expiry passed, read reused
+    expect(seesPeer()).toBe(true);
+    clock.mockReturnValue(lease.expiresAt + 5_000);
+    expect(seesPeer()).toBe(true);
+  });
+
+  it("drop a peer whose lease lapsed and was not renewed", async () => {
+    const { lease, seesPeer } = await setup();
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(lease.expiresAt - 5_000);
+    expect(seesPeer()).toBe(true);
+    clock.mockReturnValue(lease.expiresAt + 1);
+    expect(seesPeer()).toBe(false);
+  });
+
+  it("read the lease files again after this host's heartbeat commits", async () => {
+    const { readerDirectory, lease, renew, seesPeer } = await setup();
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(lease.expiresAt + 1_000);
+    expect(seesPeer()).toBe(false);                                  // lapsed when read: the read is reused
+    renew(lease.expiresAt + 1_500);                                  // the peer comes back
+    clock.mockReturnValue(lease.expiresAt + 2_000);
+    const confirmed = readerDirectory.confirmedAt();
+    await readerDirectory.refresh();                                  // a confirming heartbeat
+    expect(readerDirectory.confirmedAt()).toBeGreaterThan(confirmed);
+    expect(seesPeer()).toBe(true);                                   // no view older than the commit
   });
 });
 

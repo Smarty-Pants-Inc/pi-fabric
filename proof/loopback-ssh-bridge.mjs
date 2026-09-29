@@ -11,7 +11,7 @@ import { randomUUID } from "node:crypto";
 const [scratch, fabricDist, bridgeBin, sshHost, sshKey, sshPort, knownHosts] = process.argv.slice(2);
 const { MeshStore } = await import(path.join(path.dirname(fabricDist), "../src/mesh/store.ts"));
 const fleetAgent = process.env.PI_CODING_AGENT_DIR;
-const MODEL = process.env.PROOF_MODEL ?? "cliproxyapi-anthropic/claude-opus-5-5";
+const MODEL = process.env.PROOF_MODEL ?? "cliproxyapi/gpt-6.1-sol"; // smarty-dev#2236: Claude P0
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = { startedAt: new Date().toISOString(), fabricDist, bridgeBin, sshHost };
@@ -38,7 +38,7 @@ const side = (name) => {
 const startPi = (s) => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(PI_|HERDR|FABRIC)/.test(k)));
   env.PI_CODING_AGENT_DIR = s.agentDir;
-  const child = spawn("pi", ["--mode", "rpc", "-ne", "-e", fabricDist, "--model", MODEL, "--thinking", "low", "--session-dir", path.join(s.root, "sessions")],
+  const child = spawn("nice", ["-n", "19", "pi", "--mode", "rpc", "-ne", "-e", fabricDist, "--model", MODEL, "--thinking", "low", "--session-dir", path.join(s.root, "sessions")],
     { cwd: s.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
   children.add(child);
   const file = path.join(s.root, "rpc-stdout.jsonl");

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # smarty-dev#2045 lane C, step 1: the mesh bridge over REAL ssh on one host (loopback), with no global
-# configuration change. Everything lives in one `mktemp -d`: a private sshd on a free high port
+# configuration change. Everything lives in one lane-local `mktemp -d`: a private sshd on a free high port
 # (its own HostKey, AuthorizedKeysFile and forced command), the bridge's dedicated key, a private
 # known_hosts. ~/.ssh and the system sshd are never read or written.
 #
@@ -15,7 +15,8 @@ evidence=${2:-}
 bridge_bin=$bridge_checkout/bin/mesh-bridge
 [[ -f $bridge_checkout/dist/index.js && -f $bridge_checkout/dist/mesh-bridge.js ]] || { echo "build $bridge_checkout first" >&2; exit 2; }
 
-T=$(mktemp -d -t mesh-bridge-loopback-XXXXXX)
+mkdir -p "$here/.local"
+T=$(mktemp -d "$here/.local/mesh-bridge-loopback-XXXXXX")
 chmod 700 "$T"
 sshd_pid=
 cleanup() { [[ -n $sshd_pid ]] && kill "$sshd_pid" 2>/dev/null || true; }
@@ -41,7 +42,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 UsePAM no
 PermitRootLogin no
-# The scratch dir is under /tmp (mode 1777), which StrictModes would reject; the dir itself is 0700.
+# The lane checkout can be group-writable; the private scratch directory itself is 0700.
 StrictModes no
 LogLevel VERBOSE
 EOF
@@ -60,10 +61,13 @@ for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
 } > "$T/run/forced-command-check.txt"
 if grep -q '^uid=' "$T/run/forced-command-check.txt"; then echo "forced command NOT enforced" >&2; exit 1; fi
 
-status=0
-bun "$here/proof/loopback-ssh-bridge.mjs" "$T/run" "$bridge_checkout/dist/index.js" "$bridge_bin" 127.0.0.1 "$T/bridge_key" "$port" "$T/known_hosts" \
-  2>&1 | tee "$T/run/driver.log" || status=$?
-status=${PIPESTATUS[0]:-$status}
+set +e
+nice -n 19 bun "$here/proof/loopback-ssh-bridge.mjs" "$T/run" "$bridge_checkout/dist/index.js" "$bridge_bin" 127.0.0.1 "$T/bridge_key" "$port" "$T/known_hosts" \
+  2>&1 | tee "$T/run/driver.log"
+statuses=("${PIPESTATUS[@]}")
+set -e
+status=${statuses[0]}
+[[ $status -ne 0 ]] || status=${statuses[1]}
 cleanup; sshd_pid=
 cp "$T/sshd.log" "$T/sshd_config" "$T/authorized_keys" "$T/known_hosts" "$T/run/"
 if [[ -n $evidence ]]; then

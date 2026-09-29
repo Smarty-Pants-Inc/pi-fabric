@@ -229,7 +229,9 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       if (!safe(context)) {
         // A run that started after the settle can end with no Main turn: keep checking (round 2 note).
         if (auto) armRetry(context);
-        return say("Fabric reloads after its task agents and actor runs finish.");
+        return say(autoReloadOptedOut(deps.autoReloadConfigured())
+          ? "Fabric is busy (task agents, actor runs, shell jobs or Jev runs); run this again when they finish."
+          : "Fabric reloads after its task agents, actor runs, shell jobs and Jev runs finish.");
       }
       const sessionId = context.sessionManager.getSessionId();
       if (auto && attemptedSelfReload(sessionId, target)) return;

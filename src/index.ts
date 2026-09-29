@@ -1182,7 +1182,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   // Registered after Fabric's own agent_settled handler, so the inbox follow-up goes first.
   const selfReload = installSelfReload(pi, {
-    busy: () => state.initialized ? state.agents.runningCount() + state.actors.inFlightCount() : 0,
+    busy: () => state.initialized
+      ? state.agents.runningCount() + state.actors.inFlightCount() + state.backgroundWorkCount()
+      : 0,
     autoReloadConfigured: () => state.provisionalConfig().autoReload,
     moduleUrl: import.meta.url,
   });

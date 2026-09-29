@@ -263,6 +263,10 @@ export class JevProgramManager {
       if (run.info.state !== "running") this.#runs.delete(id);
     }
   }
+  /** Runs starting or running: a reload cancels them (smarty-dev#2160). */
+  runningCount(): number {
+    return this.#starting + [...this.#runs.values()].filter(r => r.info.state === "running").length;
+  }
   stopAll(): void {
     for (const run of this.#runs.values()) if (run.info.state === "running") run.controller.abort(new Error("Jev provider closed"));
   }

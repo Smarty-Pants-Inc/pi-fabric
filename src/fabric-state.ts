@@ -317,6 +317,9 @@ export class FabricState {
   dispatchHostEvent(event: FabricActorHostEvent, payload: unknown, context: ExtensionContext): number {
     return this.#current()?.dispatchHostEvent(event, payload, context) ?? 0;
   }
+  backgroundWorkCount(): number {
+    return this.#current()?.backgroundWorkCount() ?? 0;
+  }
   publishOpsEvent(topic: string, kind: string, data: Record<string, unknown>): Promise<void> {
     return this.#current()?.publishOpsEvent(topic, kind, data) ?? Promise.resolve();
   }

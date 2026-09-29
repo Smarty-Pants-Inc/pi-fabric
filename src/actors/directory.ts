@@ -125,6 +125,8 @@ export class ActorDirectory extends ActorManager {
   override dispatchObservedHostEvent(...args: Parameters<ActorManager["dispatchObservedHostEvent"]>): number { return super.dispatchObservedHostEvent(...args) + this.#secondary.dispatchObservedHostEvent(...args); }
   override stop(...args: Parameters<ActorManager["stop"]>): ReturnType<ActorManager["stop"]> { return this.#isPrimary(args[0]) ? super.stop(...args) : this.#secondary.stop(...args); }
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
+  /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
+  override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
   override haltAll(): { halted: number } { const first = super.haltAll(); const second = this.#secondary.haltAll(); return { halted: first.halted + second.halted }; }
   override remove(...args: Parameters<ActorManager["remove"]>): ReturnType<ActorManager["remove"]> { return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args); }
   override async close(): Promise<void> { await Promise.all([super.close(), this.#secondary.close()]); }

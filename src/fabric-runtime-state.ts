@@ -21,6 +21,7 @@ import { buildActorContext } from "./actors/context.js";
 import { actorDeliveryNotice } from "./actors/delivery-policy.js";
 import { prepareFabricActorHostPayload } from "./actors/host-event-payload.js";
 import type { JevObservationHost } from "./jev/observation.js";
+import type { JevProgramManager } from "./jev/manager.js";
 import { resolveJevModelRoute } from "./jev/routes.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
 import { CapturedToolCatalog, type CapturedToolEntry } from "./capture/catalog.js";
@@ -195,6 +196,7 @@ export class FabricRuntimeState {
   #shellInbox: ShellEventInbox | undefined;
   #actors: ActorDirectory | undefined;
   #jevObservationHost: JevObservationHost | undefined;
+  #jevPrograms: JevProgramManager | undefined;
   #globalActors: GlobalActorRegistry | undefined;
   #rootInbox: RootInbox | undefined;
   #records: Promise<RecordsService> | undefined;
@@ -985,12 +987,14 @@ export class FabricRuntimeState {
           });
           // A program may pin jev.evaluate itself. Cancel at owner retirement,
           // not only at provider.close(), which waits for those pins to drain.
+          this.#jevPrograms = provider.manager;
           const stop = () => { observationHost?.close(); provider.manager.stopAll(); };
           component.signal.addEventListener("abort", stop, { once: true });
           component.defer(async () => {
             component.signal.removeEventListener("abort", stop);
             observationHost?.close();
             if (this.#jevObservationHost === observationHost) this.#jevObservationHost = undefined;
+            if (this.#jevPrograms === provider.manager) this.#jevPrograms = undefined;
             await provider.manager.close();
           }, { label: "jev-program-owner", kind: "transactional", resources: ["jev:programs"], ordering: "ordered" });
           return provider;
@@ -1512,6 +1516,20 @@ export class FabricRuntimeState {
     this.#externalProviders.clear();
     this.prewalk.cancel();
     this.prewalkDrift.clear();
+  }
+
+  /**
+   * Session-owned work a reload would cancel besides task agents and actor runs: live shell jobs
+   * (background, monitors, auto-detached) and running Jev programs, observers included (smarty-dev#2160).
+   */
+  backgroundWorkCount(): number {
+    return this.#shellJobs.live().length + (this.#jevPrograms?.runningCount() ?? 0);
+  }
+
+  /** Best-effort ops event on the mesh, e.g. ops.fabric.reloaded (smarty-dev#2160). */
+  publishOpsEvent(topic: string, kind: string, data: Record<string, unknown>): Promise<void> {
+    if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return Promise.resolve();
+    return this.#mesh.publish({ topic, kind, from: this.#identity, data }).then(() => undefined, () => undefined);
   }
 
   // Publish a best-effort mesh event to the durable `fabric.compact` topic so

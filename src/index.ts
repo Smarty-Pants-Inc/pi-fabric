@@ -111,6 +111,7 @@ import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
 import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
+import { installSelfReload, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -667,7 +668,22 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     applyFabricMode();
     // Results of task agents the last reload/shutdown stopped reach the spawner now (smarty-dev#1602).
     const stoppedUndelivered = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []).undelivered.length > 0;
-    if (stoppedUndelivered || state.shouldEagerlyActivate(context)) await state.ensure(context);
+    // A self-reload (smarty-dev#2160) re-arms the actors this Main hosts and reports on the mesh.
+    const selfReloaded = selfReload.sessionStart(event?.reason ?? "", context);
+    if (selfReloaded && context.hasUI) {
+      const notice = `Fabric reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
+      context.ui.notify(notice, "info");
+      // The TUI's own "Reloaded ..." status line replaces an info notice; the footer keeps it
+      // until the user's next input.
+      context.ui.setStatus(SELF_RELOAD_STATUS, notice);
+    }
+    if (stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+    if (selfReloaded) {
+      await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
+        ...selfReloaded,
+        sessionId: context.sessionManager.getSessionId(),
+      });
+    }
   });
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget
@@ -1163,6 +1179,15 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     suspendToolCapture,
     refreshCodePreviewSettings,
     refreshToolDisplay: () => toolDisplay.refresh(),
+  });
+
+  // Registered after Fabric's own agent_settled handler, so the inbox follow-up goes first.
+  const selfReload = installSelfReload(pi, {
+    busy: () => state.initialized
+      ? state.agents.runningCount() + state.actors.inFlightCount() + state.backgroundWorkCount()
+      : 0,
+    autoReloadConfigured: () => state.provisionalConfig().autoReload,
+    moduleUrl: import.meta.url,
   });
 }
 

@@ -97,27 +97,34 @@ const setup = (
   return { catalog, service, runner };
 };
 
+// This routing test does not assert elapsed time. Like cpython-runtime.test.ts,
+// bound interpreter startup under CI load separately from Vitest's hang guard.
+const CPYTHON_HANG_GUARD_MS = 60_000;
+
 describe("captured core overrides through Fabric execution", () => {
-  it.each(["quickjs", "node-process", "bun-process", "monty", "cpython"] as const)("preserves override fields that spell core aliases (%s)", async (backend) => {
-    if ((backend === "monty" || backend === "cpython") && !availablePythonBackends[backend]) return;
-    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-canonical-override-"));
-    const calls: Array<Record<string, unknown>> = [];
-    const override = makeOverride("write", Type.Object({ path: Type.String(), text: Type.String() }, { additionalProperties: false }), calls);
-    const { catalog, service } = setup(cwd, [override]);
-    const python = backend === "monty" || backend === "cpython";
-    service.config.executor.kernel = python ? "python" : "typescript";
-    if (python) service.config.executor.pythonRuntime = backend;
-    else service.config.executor.runtime = backend;
-    try {
-      const result = await service.execute({
-        code: python ? 'return await pi.write(path="virtual.txt", text="canonical")'
-          : 'return await pi.write({path: "virtual.txt", text: "canonical"});',
-        signal: undefined, parentToolCallId: "canonical-override", context: makeContext(cwd), onPartial() {},
-      });
-      expect(result.success, result.error).toBe(true);
-      expect(calls).toEqual([{ path: "virtual.txt", text: "canonical" }]);
-      expect(fs.existsSync(path.join(cwd, "virtual.txt"))).toBe(false);
-    } finally { catalog.clear(); rmTempSync(cwd); }
+  (["quickjs", "node-process", "bun-process", "monty", "cpython"] as const).forEach((backend) => {
+    it(`preserves override fields that spell core aliases (${backend})`, async () => {
+      if ((backend === "monty" || backend === "cpython") && !availablePythonBackends[backend]) return;
+      const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-canonical-override-"));
+      const calls: Array<Record<string, unknown>> = [];
+      const override = makeOverride("write", Type.Object({ path: Type.String(), text: Type.String() }, { additionalProperties: false }), calls);
+      const { catalog, service } = setup(cwd, [override]);
+      const python = backend === "monty" || backend === "cpython";
+      service.config.executor.kernel = python ? "python" : "typescript";
+      if (python) service.config.executor.pythonRuntime = backend;
+      else service.config.executor.runtime = backend;
+      if (backend === "cpython") service.config.executor.timeoutMs = CPYTHON_HANG_GUARD_MS;
+      try {
+        const result = await service.execute({
+          code: python ? 'return await pi.write(path="virtual.txt", text="canonical")'
+            : 'return await pi.write({path: "virtual.txt", text: "canonical"});',
+          signal: undefined, parentToolCallId: "canonical-override", context: makeContext(cwd), onPartial() {},
+        });
+        expect(result.success, result.error).toBe(true);
+        expect(calls).toEqual([{ path: "virtual.txt", text: "canonical" }]);
+        expect(fs.existsSync(path.join(cwd, "virtual.txt"))).toBe(false);
+      } finally { catalog.clear(); rmTempSync(cwd); }
+    }, backend === "cpython" ? CPYTHON_HANG_GUARD_MS + 30_000 : undefined);
   });
 
   it("fails closed instead of bypassing a bash override that does not support cwd", async () => {

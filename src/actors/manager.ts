@@ -1373,6 +1373,15 @@ export class ActorManager {
   }
 
   /**
+   * Actors with a run in flight or a queue being drained in this runtime: a reload would stop
+   * them (smarty-dev#1830, #2160).
+   */
+  inFlightCount(): number {
+    return [...new Set([...this.#actors.values(), ...this.#draining.values()])]
+      .filter((actor) => actor.abortController !== undefined || actor.draining).length;
+  }
+
+  /**
    * Interrupt every non-stopped actor: abort its in-flight run (if any) and
    * reject every queued message so subsequent execution is cancelled. Unlike
    * stop(), actors stay alive and idle — they keep their identity, session,

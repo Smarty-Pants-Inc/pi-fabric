@@ -3,6 +3,20 @@ import { describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 
+describe("self-reload busy gate (smarty-dev#2160)", () => {
+  it("counts a live background shell job until it finishes", async () => {
+    const runtime = new FabricRuntimeState({} as ExtensionAPI, new CapturedToolCatalog());
+    try {
+      expect(runtime.backgroundWorkCount()).toBe(0);
+      const job = runtime.shellJobs.begin("bash", "npm test");
+      job.spill(); // detached from its tool call: the turn can settle while it runs
+      expect(runtime.backgroundWorkCount()).toBe(1);
+      await job.finish(0);
+      expect(runtime.backgroundWorkCount()).toBe(0);
+    } finally { await runtime.shutdown(); }
+  });
+});
+
 describe("shell store runtime reinitialization", () => {
   it("retires old job handles and creates a writable store on each initialization attempt", async () => {
     const runtime = new FabricRuntimeState({} as ExtensionAPI, new CapturedToolCatalog());

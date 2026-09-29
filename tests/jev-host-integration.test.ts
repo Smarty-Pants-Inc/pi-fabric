@@ -64,11 +64,15 @@ describe("Main lifecycle to Jev observer integration", () => {
       }), { deliverAs: "steer", triggerTurn: false });
       expect(JSON.stringify(sendMessage.mock.calls)).not.toContain("private unselected");
 
+      expect(runtime.backgroundWorkCount()).toBe(0);
       const interrupted = await spawn("while(true) await program.nextEvent();");
+      // A running observer blocks a self-reload, which would cancel it (smarty-dev#2160).
+      expect(runtime.backgroundWorkCount()).toBe(1);
       const interruptedWait = wait(interrupted.id);
       expect(runtime.haltAdvisors()).toBeGreaterThanOrEqual(1);
       expect(runtime.advisorsHalted).toBe(true);
       expect(await interruptedWait).toMatchObject({ state: "cancelled" });
+      expect(runtime.backgroundWorkCount()).toBe(0);
       emit("turn_end", { type: "turn_end", turnIndex: 1 });
       expect(sendMessage).toHaveBeenCalledTimes(1);
       emit("input", { type: "input", source: "interactive", text: "continue" });

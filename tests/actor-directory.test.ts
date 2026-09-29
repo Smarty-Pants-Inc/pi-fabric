@@ -97,6 +97,21 @@ describe("ActorDirectory", () => {
     ]);
   });
 
+  it("counts in-flight runs of both scopes for the self-reload busy gate (smarty-dev#2160)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-directory-"));
+    roots.push(root);
+    const alpha = open(root, "alpha");
+    const supervisor = await alpha.directory.create({ scope: "session", name: "session supervisor", instructions: "HANG" });
+    expect(alpha.directory.inFlightCount()).toBe(0);
+    alpha.directory.tell(supervisor.id, "check the Main");
+    await vi.waitFor(() => expect(alpha.directory.status(supervisor.id).status).toBe("running"), { timeout: 5_000 });
+    expect(alpha.directory.inFlightCount()).toBe(1);
+    const project = await alpha.directory.create({ scope: "project", name: "project guardian", instructions: "HANG" });
+    alpha.directory.tell(project.id, "check the release");
+    await vi.waitFor(() => expect(alpha.directory.status(project.id).status).toBe("running"), { timeout: 5_000 });
+    expect(alpha.directory.inFlightCount()).toBe(2);
+  });
+
   it("does not write to or delete durable roots from a transient participant runtime", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-directory-"));
     roots.push(root);

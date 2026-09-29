@@ -333,6 +333,12 @@ In orchestration-only mode:
 
 `fullCodeMode` defaults to `true`. Set the flag in `.pi/fabric.json` for one project, or globally in `~/.pi/agent/fabric.json` for every project. `/fabric settings` toggles it as well.
 
+## Self-reload onto a newer release (`autoReload`)
+
+A top-level Main (TUI or RPC; not a task agent, an actor or `pi -p`) watches the Pi profile's `settings.json`. When its `packages` list activates a different local `pi-fabric` package than the one this Main loaded, the Main reloads itself after a run settles, once nothing a reload would stop is still running: no task agent it started, no actor it hosts with a run in flight or a queue draining (both actor scopes), no live Fabric shell job (`pi.bash`/`pi.powershell` in the background, a monitor, or a command the hang threshold detached), and no running Jev program or observer. A long-lived monitor or observer therefore holds the reload until it ends; stop it, or run `/reload`, to move sooner. While it is busy, it re-checks every 5 seconds while idle. After the reload the pane shows `Fabric reloaded: <old> → <new>` (the release directory names; also in the footer until the next input), actors are re-armed, and the mesh gets `ops.fabric.reloaded` with `{ old, new, sessionId }`. A Fabric loaded from anywhere other than the release the profile activated at load (for example `pi -e` or a project package) never follows the profile, even after a later swap. The reload waits until no prompt is in preflight and no `agent_settled` handler is running.
+
+Opt out per session with `PI_FABRIC_NO_AUTO_RELOAD=1`, or with `"autoReload": false` in `fabric.json`. An opted-out Main shows once that a newer release is active; `/reload` or `/fabric-release-reload` loads it.
+
 ## Captured extension tools
 
 When `fullCodeMode` is enabled, Fabric intercepts Pi's `ExtensionRunner.getAllRegisteredTools()` registry chokepoint. This captures tools that other extensions register at startup or later through `pi.registerTool()`. Whether an extension loads before or after Fabric makes no difference.

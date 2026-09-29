@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import { isCompactToolResult } from "./transcript-sanitization.js";
 import { NativeReaderEventReplay } from "./conversation-native-reader-replay.js";
 import { NativeReaderCheckpoint } from "./conversation-native-reader-checkpoint.js";
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
@@ -42,6 +41,17 @@ import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 // is ever dropped. Repeated loadOlder() calls walk the user through all of
 // history. Files that cannot be read are reported through the bounded
 // `unavailable`/`error` snapshot fields instead of throwing.
+
+// ponytail: duplicate this tiny wire guard to avoid a new static shared chunk
+// in the eager native-reader graph; keep identical to transcript-sanitization.
+const isCompactToolResult = (value: unknown): boolean => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  const keys = Object.keys(result);
+  return keys.length === 2 && keys.includes("elided") && keys.includes("bytes") &&
+    result.elided === true && typeof result.bytes === "number" &&
+    Number.isInteger(result.bytes) && result.bytes >= 0;
+};
 
 export type NativeAgentMessage = SessionMessageEntry["message"];
 

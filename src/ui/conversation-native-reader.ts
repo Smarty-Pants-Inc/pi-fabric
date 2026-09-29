@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { isCompactToolResult } from "./tool-result-marker.js";
+import { isCompactToolResult } from "./transcript-sanitization.js";
 import { NativeReaderEventReplay } from "./conversation-native-reader-replay.js";
 import { NativeReaderCheckpoint } from "./conversation-native-reader-checkpoint.js";
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";

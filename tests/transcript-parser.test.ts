@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { missingToolStartIds, toolLifecycleContext, TranscriptAccumulator } from "../src/ui/transcript-parser.js";
-import { isCompactToolResult } from "../src/ui/tool-result-marker.js";
+import { isCompactToolResult } from "../src/ui/transcript-sanitization.js";
 
 const start = (id: string) => ({ type: "tool_execution_start", toolCallId: id, toolName: "bash", args: { command: id } });
 const end = (id: string, result: unknown, isError = false) => ({ type: "tool_execution_end", toolCallId: id, toolName: "bash", result, isError });

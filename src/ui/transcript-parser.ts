@@ -1,11 +1,11 @@
 import type { FabricLogLine } from "../agents/types.js";
-import { isCompactToolResult } from "./tool-result-marker.js";
 import type { FabricAgentTranscript, FabricTranscriptEntry } from "./transcript.js";
 import { unwrapActorEnvelopeText } from "./conversation-transcript.js";
 import {
   clip,
   compactRedactedValue,
   contentText,
+  isCompactToolResult,
   messageError,
   recordOf,
   redact,

@@ -356,6 +356,19 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(events.find((event) => event.message?.role === "toolResult")?.message.content[1]).toEqual(stub);
   }, 30_000);
 
+  it.each(["oversized-final", "oversized-error"])(
+    "does not complete with stale text when the final assistant event is dropped (%s)",
+    async (behavior) => {
+      process.env.FAKE_PI_BEHAVIOR = behavior;
+      const result = await run("do it", 10_000);
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("Agent's final assistant result was lost: Dropped an oversized agent event line (message_end");
+      expect(result.warnings).toHaveLength(1);
+    },
+    30_000,
+  );
+
   it("drops one oversized event line with a warning and keeps the run alive", async () => {
     process.env.FAKE_PI_BEHAVIOR = "oversized-event";
     const result = await run("do it", 10_000);

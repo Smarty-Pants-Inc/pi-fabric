@@ -460,6 +460,11 @@ const main = async (): Promise<void> => {
   const outputDecoder = new StringDecoder("utf8");
   const stderrDecoder = new StringDecoder("utf8");
   let terminalStatus: AgentRunStatus | undefined;
+  // A dropped assistant message_end may hold the run's answer or its error.
+  // Until a later assistant message_end is processed, the run must not
+  // complete with the earlier (stale) text.
+  // smarty-dev#1907.
+  let lostResult: string | undefined;
   let terminalError: string | undefined;
   let sawAgentError = false;
   let retryPending = false;
@@ -1024,6 +1029,7 @@ const main = async (): Promise<void> => {
       if (typeof message !== "object" || message === null || Array.isArray(message)) return;
       const messageRecord = message as Record<string, unknown>;
       if (messageRecord.role !== "assistant") return;
+      lostResult = undefined;
       const text = extractText(messageRecord);
       if (text) {
         record.text = latestRunText(text);
@@ -1250,6 +1256,7 @@ const main = async (): Promise<void> => {
     const head = prefix.slice(0, 4096);
     const type = /^\{"type":"([^"]{1,64})"/.exec(head)?.[1] ?? "unknown";
     const tool = /"toolName":"([^"]{1,128})"/.exec(head)?.[1];
+    const role = /"role":"([^"]{1,64})"/.exec(head)?.[1];
     const warning =
       `Dropped an oversized agent event line (${type}${tool ? `, tool ${tool}` : ""}, ` +
       `${chars} characters > ${MAX_EVENT_LINE_CHARS})` +
@@ -1257,6 +1264,7 @@ const main = async (): Promise<void> => {
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
     process.stderr.write(`[pi-fabric] ${warning}\n`);
     record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    if (type === "message_end" && (role === undefined || role === "assistant")) lostResult = warning;
     update();
   };
   const discardOversized = (text: string): void => {
@@ -1437,6 +1445,10 @@ const main = async (): Promise<void> => {
       terminalStatus = "failed";
       terminalError = error;
     }
+  }
+  if (lostResult && !terminalStatus) {
+    terminalStatus = "failed";
+    terminalError = `Agent's final assistant result was lost: ${lostResult}`;
   }
   record.finishedAt = Date.now();
   record.updatedAt = record.finishedAt;

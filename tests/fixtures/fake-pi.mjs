@@ -226,6 +226,18 @@ switch (behavior) {
     process.stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`, () => process.exit(0));
     break;
   }
+  case "oversized-final":
+  case "oversized-error": {
+    // smarty-dev#1907 review: the dropped event is the run's last assistant result.
+    emit({ type: "agent_start" });
+    emit({ type: "message_end", message: { role: "assistant", content: "progress only", stopReason: "toolUse" } });
+    const message = { role: "assistant", content: "x".repeat(4 * 1024 * 1024 + 1_024) };
+    if (behavior === "oversized-error") Object.assign(message, { stopReason: "error", errorMessage: "provider failed" });
+    emit({ type: "message_end", message });
+    emit({ type: "agent_end", messages: [], willRetry: false });
+    process.stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`, () => process.exit(0));
+    break;
+  }
   case "oversized-event": {
     const event = {
       type: "message_end",

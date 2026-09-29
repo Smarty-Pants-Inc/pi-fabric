@@ -119,6 +119,44 @@ describe("Pi lifecycle event projection", () => {
       expect(project(input, 5)).toBe(input);
     });
 
+    // Feed a line far past the worker's 4 MiB cap in chunks. The projection must
+    // hold at most a few KiB at any time, then recover on the next line.
+    const bounded = (prefix: string, filler: string, suffix: string) => {
+      const projection = new PiEventProjection();
+      let fed = 0;
+      let emitted = 0;
+      const write = (text: string) => {
+        fed += text.length;
+        emitted += projection.write(text).length;
+        expect(fed - emitted).toBeLessThan(4096 + 8192 + prefix.length);
+      };
+      write(prefix);
+      for (let i = 0; i < 640; i++) write(filler.repeat(8192 / filler.length));
+      write(suffix + "\n");
+      const next = projection.write(JSON.stringify({ type: "message_end", content: [image("QUJD")] }) + "\n");
+      expect(JSON.parse(next)).toEqual({ type: "message_end", content: [{ type: "image", elided: true, bytes: 3, mimeType: "image/png" }] });
+      expect(projection.end()).toBe("");
+    };
+
+    it("bounds a long key in an image object and recovers on the next line", () => {
+      bounded('{"content":[{"type":"image","', "k", '":0,"data":"QUJD"}]}');
+    });
+
+    it("bounds whitespace before image data and recovers on the next line", () => {
+      bounded('{"content":[{"type":"image","data":', " ", '"QUJD"}]}');
+    });
+
+    it("bounds nesting depth past the line cap and recovers on the next line", () => {
+      bounded('{"content":', "[", "");
+    });
+
+    it("passes a line through unprojected once nesting exceeds the bound", () => {
+      const deep = "[".repeat(300) + JSON.stringify(image("QUJD")) + "]".repeat(300);
+      expect(project(deep, 7)).toBe(deep);
+      const shallow = "[".repeat(200) + JSON.stringify(image("QUJD")) + "]".repeat(200);
+      expect(project(shallow, 7)).toContain('"elided":true');
+    });
+
     it("does not turn a truncated stubbed value into a complete event", () => {
       const input = JSON.stringify(toolEnd("a".repeat(70_000))).slice(0, -80);
       expect(() => JSON.parse(project(input, 4096))).toThrow();

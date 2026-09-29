@@ -33,8 +33,15 @@ interface Frame {
 // precedes "data" in the object, which is Pi's field order ({type, data,
 // mimeType}). Another order passes through to the worker's line cap, which
 // drops that one event with a warning. Only a key token is ever held.
+// Held bytes (a key plus the whitespace before its value) and nesting depth are
+// bounded. Past a bound the rest of the line passes through unprojected, so the
+// worker's line cap drops it as one named event; nothing grows without limit.
+const MAX_HELD_CHARS = 4096;
+const MAX_DEPTH = 256;
+
 class ImageDataProjection {
   #stack: Frame[] = [];
+  #passthrough = false;
   #inString = false;
   #escaped = false;
   #role: "key" | "type" | "data" | "other" = "other";
@@ -61,6 +68,12 @@ class ImageDataProjection {
         if (this.#dropping) parts.push("!");
         start = i;
         this.#reset();
+        continue;
+      }
+      if (this.#passthrough) continue;
+      if (this.#holding && this.#held.length + i - start > MAX_HELD_CHARS) {
+        this.#flush(parts);
+        this.#passthrough = true;
         continue;
       }
       const top = this.#stack[this.#stack.length - 1];
@@ -130,6 +143,10 @@ class ImageDataProjection {
       // Any other token starts or ends a value: a held non-string data value is kept.
       if (this.#holding) this.#flush(parts);
       this.#awaitingValue = false;
+      if ((char === "{" || char === "[") && this.#stack.length >= MAX_DEPTH) {
+        this.#passthrough = true;
+        continue;
+      }
       if (char === "{") {
         this.#stack.push({ object: true, image: false });
         this.#expectKey = true;
@@ -144,8 +161,13 @@ class ImageDataProjection {
         this.#key = "";
       }
     }
-    if (this.#holding) this.#held += text.slice(start);
-    else if (!this.#dropping) parts.push(text.slice(start));
+    if (this.#holding) {
+      this.#held += text.slice(start);
+      if (this.#held.length > MAX_HELD_CHARS) {
+        this.#flush(parts);
+        this.#passthrough = true;
+      }
+    } else if (!this.#dropping) parts.push(text.slice(start));
     return parts.join("");
   }
 
@@ -164,6 +186,7 @@ class ImageDataProjection {
 
   #reset(): void {
     this.#stack = [];
+    this.#passthrough = false;
     this.#inString = false;
     this.#escaped = false;
     this.#role = "other";

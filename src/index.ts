@@ -957,7 +957,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("before_agent_start", async (event, context) => {
-    const config = state.bootstrapped ? state.config : DEFAULT_FABRIC_CONFIG;
+    const config = state.provisionalConfig();
     const fullCodeMode = config.fullCodeMode;
     const schemaMode = config.schema.mode;
     const effectiveFullCodeMode = fullCodeMode || schemaMode === "enforce";

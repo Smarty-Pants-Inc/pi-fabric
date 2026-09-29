@@ -13,8 +13,10 @@ import {
 import type { FabricOwnedModelGuidance } from "./components/model-guidance.js";
 import type { FabricComponentGraph } from "./components/types.js";
 import {
+  DEFAULT_FABRIC_CONFIG,
   loadFabricConfig,
   loadFabricConfigForScope,
+  loadGlobalFabricConfig,
   type FabricConfig,
   type FabricResultFormat,
   type FabricSchemaMode,
@@ -66,6 +68,7 @@ export class FabricState {
   #recordsWake: (() => Promise<void>) | undefined;
   #activationGeneration: number | undefined;
   #config: FabricConfig | undefined;
+  #provisionalConfig: FabricConfig | undefined;
   #kernelReloadRequired = false;
 
   #cwd: string | undefined;
@@ -112,6 +115,25 @@ export class FabricState {
   // preferences while the runtime is intentionally inactive.
   get bootstrapped(): boolean {
     return this.#config !== undefined;
+  }
+
+  // The configuration that decides the model-facing mode (full code or orchestration-only)
+  // before bootstrap. A turn can start before session_start's bootstrap finishes (a peer
+  // message right after /reload), and the executor then type-checks with the loaded config:
+  // guidance built from the full-code default advertised `pi` that the program did not have
+  // (smarty-dev#459). ponytail: read the global config and environment synchronously at load
+  // instead of making every turn wait for bootstrap; peer-delivered turns emit no
+  // before_agent_start to wait in. Only a project-level fullCodeMode can differ, until bootstrap.
+  provisionalConfig(): FabricConfig {
+    if (this.bootstrapped) return this.config;
+    if (!this.#provisionalConfig) {
+      try {
+        this.#provisionalConfig = this.#managedHost?.config() ?? loadGlobalFabricConfig(resolveAgentDir());
+      } catch {
+        this.#provisionalConfig = DEFAULT_FABRIC_CONFIG;
+      }
+    }
+    return this.#provisionalConfig;
   }
 
   get activated(): boolean {

@@ -489,7 +489,16 @@ describe("tools discovery proxy", () => {
     expect(value.search).toBe("extensions.fovea_focus");
     expect(value.err).toContain("tools.read is not available");
     expect(value.err).toContain("pi.read");
-    expect(value.err).toContain("pi.read");
+  });
+  it("names the native tool instead of pi in orchestration-only mode (smarty-dev#459)", async () => {
+    const result = await new QuickJsRuntime().execute(
+      'let err = ""; try { tools.bash({ command: "ls" }); } catch (e) { err = String(e); } return err;',
+      vi.fn(),
+      { ...options, piTools: false },
+    );
+    expect(result.value).toContain("tools.bash is not available");
+    expect(result.value).toContain("call the native bash tool directly, outside fabric_exec");
+    expect(result.value).not.toContain("pi.bash(");
   });
   it("passes list envelope requests through to the host verbatim", async () => {
     const hostCall = vi.fn(async (ref: string, args: Record<string, unknown>) => {

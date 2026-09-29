@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { hostGlobalsGuidance } from "../src/core/system-guidance.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { createFabricExecTool } from "../src/fabric-exec-tool.js";
 import type { FabricState } from "../src/fabric-state.js";
@@ -35,9 +36,13 @@ describe("prewalk prompt isolation", () => {
 
   it("keeps coding guidance outcome-oriented and context-bounded", () => {
     const state = { bootstrapped: true, config: normalizeFabricConfig({}) } as FabricState;
-    const visibleGuidelines = createFabricExecTool(
+    const allGuidelines = createFabricExecTool(
       state, defaultCodePreviewSettings(), new Map(), (tool) => tool,
     ).promptGuidelines ?? [];
+    // The QuickJS host-globals line moved here from the system section (net zero); it is
+    // not coding guidance, so it stays outside this budget.
+    expect(allGuidelines.at(-1)).toBe(hostGlobalsGuidance(true));
+    const visibleGuidelines = allGuidelines.slice(0, -1);
     const guidelines = visibleGuidelines.join("\n");
     const visibleGuidelineChars = visibleGuidelines.reduce((total, line) => total + line.length, 0);
 

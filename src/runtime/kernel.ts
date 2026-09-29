@@ -31,6 +31,8 @@ export interface FabricSandboxOptions {
   ): number | undefined;
   /** Declared core override fields must not be consumed as built-in aliases. */
   piToolCanonicalFields?: Record<string, string[]>;
+  /** False in orchestration-only mode, where the guest has no usable `pi`; guides runtime hints. */
+  piTools?: boolean;
   transpiledCode?: string;
   transpiledSourceMap?: string;
 }

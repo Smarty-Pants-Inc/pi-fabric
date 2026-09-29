@@ -286,7 +286,9 @@ describe("temporal retention", () => {
       let deepVisits = 0;
       const exists = fs.existsSync;
       vi.spyOn(fs, "existsSync").mockImplementation((file) => {
-        if ((String(file).match(/\/nested\//g) ?? []).length >= 10) deepVisits++;
+        // Native separators: count "nested" path components below the parent run.
+        const relative = path.relative(parent, String(file));
+        if (!relative.startsWith("..") && relative.split(path.sep).filter((part) => part === "nested").length >= 10) deepVisits++;
         return exists(file);
       });
       // The clock passes the budget once the walk reaches nesting depth 10.

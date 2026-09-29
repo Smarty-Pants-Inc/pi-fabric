@@ -176,6 +176,7 @@ export interface FabricRuntimeStateOptions {
 
 // ponytail: 10 min covers a reload wave's gap; a longer downtime is future-only by design.
 const MAIN_ACTOR_MESH_REPLAY_MS = 10 * 60_000;
+const PI_MODEL_REFRESH_INTERVAL_MS = 10_000;
 
 // A detached callback can outlive its ctx (reload, session replacement). Reading a stale
 // ctx throws, and a throw there is uncaught and exits Pi, so the notice is dropped.
@@ -649,7 +650,7 @@ export class FabricRuntimeState {
         ...(defaultModel ? { defaultModel } : {}),
       };
     };
-    const resolveParticipantPiModel = (selector?: string) => {
+    const resolveVisiblePiModel = (selector?: string) => {
       const models = visiblePiModels();
       const state = piModelState(models);
       const query = selector?.trim() || state.defaultModel || "";
@@ -670,6 +671,36 @@ export class FabricRuntimeState {
         );
       }
       return { key: `${resolved.provider}/${resolved.id}`, model };
+    };
+    // ponytail: a models.json edit must not need a fleet reload before agents can spawn with
+    // the new model (smarty-dev#1830). On a miss, reload the registry once and resolve again.
+    // Concurrent misses share one refresh, and refreshes run at most once per 10 s, so a typo
+    // in a loop fails fast instead of rereading models.json on every call. Actor model pins
+    // (resolvePiModel below) stay synchronous and see the refreshed registry afterwards.
+    let piModelRefresh: Promise<unknown> | undefined;
+    let lastPiModelRefreshAt = Number.NEGATIVE_INFINITY;
+    const refreshPiModels = (): Promise<unknown> | undefined => {
+      if (piModelRefresh) return piModelRefresh;
+      if (Date.now() - lastPiModelRefreshAt < PI_MODEL_REFRESH_INTERVAL_MS) return undefined;
+      lastPiModelRefreshAt = Date.now();
+      piModelRefresh = Promise.resolve()
+        .then(() => context.modelRegistry.refresh?.())
+        .catch(() => undefined)
+        .finally(() => {
+          piModelRefresh = undefined;
+        });
+      return piModelRefresh;
+    };
+    const resolveParticipantPiModel = async (selector?: string) => {
+      try {
+        return resolveVisiblePiModel(selector);
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes("is not available to this Pi session")) throw error;
+        const refresh = refreshPiModels();
+        if (!refresh) throw error;
+        await refresh;
+        return resolveVisiblePiModel(selector);
+      }
     };
     const completionInbox = new AgentCompletionInbox(this.pi, context);
     this.#completionInbox = completionInbox;
@@ -705,7 +736,7 @@ export class FabricRuntimeState {
         }).appendText || undefined;
       },
       resolveHandoffCompactionBudget: async (modelKey, cwd) => {
-        const { model } = resolveParticipantPiModel(modelKey);
+        const { model } = await resolveParticipantPiModel(modelKey);
         // Load host settings only for an actual compacted handoff. Project
         // trust does not transfer implicitly to a different working directory.
         const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
@@ -720,7 +751,7 @@ export class FabricRuntimeState {
         };
       },
       preparePiModel: async (modelKey) => {
-        const resolved = resolveParticipantPiModel(modelKey);
+        const resolved = await resolveParticipantPiModel(modelKey);
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
@@ -809,7 +840,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
+            resolvePiModel: (model) => resolveVisiblePiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
             // A /reload or restart of this session resumes its actors' mesh stream where the
             // last runtime stopped, so events published in between still reach them
@@ -828,7 +859,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
+            resolvePiModel: (model) => resolveVisiblePiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);

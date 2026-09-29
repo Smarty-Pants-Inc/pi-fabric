@@ -84,6 +84,15 @@ const refused: Array<[string, string]> = [
   ["F5: a loop listing both shared roots feeds read", `for t in /tmp /var/tmp; do find "$t" -maxdepth 1 -name 'tmp.*' -mmin +60; done | while read -r d; do rm -rf "$d"; done`],
   ["F5: a brace group listing both shared roots feeds read", `{ ls -d /tmp/tmp.*; ls -d /var/tmp/tmp.*; } | while read -r d; do rm -rf "$d"; done`],
   ["F5: a subshell listing a shared root feeds read", `(ls -d /tmp/tmp.*) | while read -r d; do rm -rf "$d"; done`],
+  // Round 4 F6: independent owned sources may clear fallback, not an actual shared feed.
+  ["F6: a redirected shared listing survives an intermediary cat", `T=/tmp; while read -r d; do rm -rf "$d"; done < <(find "$T" -maxdepth 1 -name 'tmp.*' | cat)`],
+  ["F6: a compound shared listing survives an intermediary cat", `{ ls -d /tmp/tmp.*; } | cat | xargs rm -rf`],
+  ["F6: a piped shared listing survives cat before read", `ls -d /tmp/tmp.* | cat | while read -r d; do rm -rf "$d"; done`],
+  ["F6: an own-file loop does not clear a later shared redirect", `while read -r d; do rm -f "$d"; done < .local/owned-files.txt; while read -r d; do rm -rf "$d"; done < <(ls -d /tmp/tmp.*)`],
+  ["F6: an own-file loop does not clear an earlier shared redirect", `while read -r d; do rm -rf "$d"; done < <(ls -d /tmp/tmp.*); while read -r d; do rm -f "$d"; done < .local/owned-files.txt`],
+  ["F6: an output-only redirect does not clear an unsafe pipe", `ls -d /tmp/tmp.* | xargs rm -rf > .local/cleanup.log`],
+  ["F6: an fd3 input redirect does not clear actual shared stdin", `find /tmp -name tmp.* -print0 | xargs -0 rm -rf 3< .local/mine.list`],
+  ["F6: grouped cat without operands preserves actual shared stdin", `ls -d /tmp/tmp.* | { cat; } | xargs rm -rf`],
 ];
 
 const allowed: Array<[string, string]> = [
@@ -149,6 +158,16 @@ const allowed: Array<[string, string]> = [
   ["F5: a loop listing exact own dirs feeds read", `for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do find "$t" -maxdepth 1 -name '*.json'; done | while read -r f; do rm -f "$f"; done`],
   ["F5: a brace group listing exact own dirs feeds read", `{ ls -d /tmp/tmp.AbC123/*.json; ls -d /var/tmp/tmp.Def456/*.json; } | while read -r f; do rm -f "$f"; done`],
   ["F5: a subshell listing an exact own dir feeds read", `(ls -d /tmp/tmp.AbC123/*.json) | while read -r f; do rm -f "$f"; done`],
+  // F6: the reviewer example and explicit owned sources after an unrelated shared-root diagnostic.
+  ["F6: reviewer exact-directory pipeline after ls /tmp", `ls /tmp; find /tmp/tmp.AbC123 -name '*.log' -print0 | xargs -0 rm -f`],
+  ["F6: an assigned own root feeds a pipeline after ls /tmp", `T=/tmp/tmp.AbC123; ls /tmp; find "$T" -name '*.log' -print0 | xargs -0 rm -f`],
+  ["F6: an assigned own root feeds redirected xargs after ls /tmp", `ls /tmp; T=/tmp/tmp.AbC123; xargs -0 rm -f < <(find "$T" -name '*.log' -print0)`],
+  ["F6: an own list-file redirect after ls /tmp", `ls /tmp; while read -r f; do rm -f "$f"; done < .local/owned-files.txt`],
+  ["F6: an assigned own root feeds a redirected loop after ls /tmp", `ls /tmp; T=/tmp/tmp.AbC123; while read -r f; do rm -f "$f"; done < <(find "$T" -name '*.log')`],
+  ["F6: an own list-file pipeline after ls /tmp", `ls /tmp; cat .local/owned-files.txt | xargs rm -f`],
+  ["F6: a nested own list-file loop after ls /tmp", `ls /tmp; for i in once; do while read f; do rm -f "$f"; done < .local/mine.list; done`],
+  ["F6: an own list-file loop inside if after ls /tmp", `ls /tmp; if true; then while read f; do rm -f "$f"; done < .local/mine.list; fi`],
+  ["F6: a non-emitting for header preserves an exact-directory output after ls /tmp", `ls /tmp; for suffix in log tmp; do find /tmp/tmp.AbC123 -name "*.$suffix" -print0; done | xargs -0 rm -f`],
 ];
 
 describe("tmp-wipe guard (smarty-dev#1998)", () => {

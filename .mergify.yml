@@ -41,8 +41,22 @@ queue_rules:
 
 # GitHub suspended smarty-agents (2026-09-25); the review agent queues as the write App's bot,
 # which has no collaborator permission (smarty-dev#562). Humans with write access still can.
+# This block is the fleet template (smarty-dev#1513), copied from smarty-dev's .mergify.yml.
 commands_restrictions:
   queue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+  # smarty-land's emergency dequeue posts as the actor that queued, the write App bot on the fleet host.
+  dequeue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+  # The stuck-work check's R4 posts one `@mergifyio refresh` per head as the write App (smarty-dev#868);
+  # without this Mergify answers "Command disallowed" (#251 F278).
+  refresh:
     conditions:
       - or:
           - sender-permission >= write

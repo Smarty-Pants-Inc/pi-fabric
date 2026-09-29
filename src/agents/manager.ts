@@ -563,6 +563,7 @@ export class AgentManager {
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
+  readonly #onSettled: ((result: AgentRunResult) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
@@ -616,6 +617,8 @@ export class AgentManager {
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onResultConsumed?: (id: string) => void;
       onStoppedAtClose?: (results: AgentRunResult[]) => void;
+      /** Every terminal result, foreground or background, before its run directory can be removed. */
+      onSettled?: (result: AgentRunResult) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       preparePiModel?: (model: string | undefined) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
@@ -640,6 +643,7 @@ export class AgentManager {
     this.#onBackgroundComplete = options.onBackgroundComplete;
     this.#onResultConsumed = options.onResultConsumed;
     this.#onStoppedAtClose = options.onStoppedAtClose;
+    this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
     this.#preparePiModel = options.preparePiModel;
     this.#resolveHandoffCompactionBudget = options.resolveHandoffCompactionBudget;
@@ -1918,6 +1922,7 @@ export class AgentManager {
     this.#invalidateUiList();
     finishAgentSettlement(managed, result);
     managed.task = "";
+    try { this.#onSettled?.(result); } catch { /* must not break the manager */ }
     this.#notifyBackgroundComplete(managed, result);
   }
 

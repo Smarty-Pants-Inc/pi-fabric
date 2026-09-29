@@ -30,6 +30,7 @@ import {
   RESIDENT_HOST_FORMAT,
   residentDeliveryPrefix,
   residentHostId,
+  residentResultPath,
   type ResidentAgentMetadata,
   type ResidentCommand,
   type ResidentCommandResponse,
@@ -236,6 +237,13 @@ class ResidentHost {
         }).appendText || undefined;
       },
       onLifecycle: (event) => void this.lifecycle?.publish(event).catch(() => undefined),
+      onSettled: (result) => {
+        // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
+        if (result.actorId) return;
+        const file = residentResultPath(config.residencyRoot, result.id);
+        fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+        atomicWrite(file, result);
+      },
       onBackgroundComplete: (result) => {
         if (!config.agents.notifyOnComplete) return;
         const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
@@ -655,6 +663,7 @@ class ResidentHost {
         await this.agents.wait(command.id);
         await this.agents.cleanup(command.id, command.deleteBranch);
         fs.rmSync(path.join(this.#agentsPath, `${command.id}.json`), { force: true });
+        fs.rmSync(residentResultPath(this.config.residencyRoot, command.id), { force: true });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,

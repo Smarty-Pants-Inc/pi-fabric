@@ -32,6 +32,15 @@ const refused: Array<[string, string]> = [
   ["ssh", `ssh m4max 'rm -rf /tmp/tmp.*'`],
   ["a heredoc to bash", `bash <<'EOF'\nrm -rf /tmp/tmp.*\nEOF`],
   ["after other commands", `cd ~/w && make && rm -rf /tmp/tmp.* 2>/dev/null; echo done`],
+  // From fix-1993's check (smarty-dev ec08fcac, #2093).
+  ["a trailing redirection", `rm -rf /tmp/tmp.* 2>/dev/null`],
+  ["rm -f -- /var/tmp/x?", `rm -f -- /var/tmp/x?`],
+  ["sudo rm -r /tmp/[ab]*", `sudo rm -r /tmp/[ab]*`],
+  ["a glob dir with a concrete leaf", `cd ~ && rm -rf /tmp/pytest-*/x`],
+  ["/bin/rm", `/bin/rm -rf /tmp/*.log`],
+  ["a quoted prefix, then an unquoted glob", `rm -rf "/tmp/"tmp.*`],
+  // fix-1993 allowed this as remote; the unquoted glob expands on Dev1 first, and m5/m4max are shared too.
+  ["ssh with an unquoted glob", `ssh m5 rm -rf /tmp/tmp.*`],
 ];
 
 const allowed: Array<[string, string]> = [
@@ -54,6 +63,13 @@ const allowed: Array<[string, string]> = [
   ["$TMPDIR contents", `rm -rf "$TMPDIR"/*`],
   ["cd elsewhere, then a relative glob", `cd /tmp && cd ~/w && rm -rf tmp.*`],
   ["rm of a list file's names", `cat .local/mine.txt | xargs rm -rf`],
+  // From fix-1993's check (smarty-dev ec08fcac, #2093).
+  ["an exact dir held in a variable", `D=/tmp/tmp.X1; rm -rf "$D"`],
+  ["a single-quoted star", `rm -rf '/tmp/tmp.*'`],
+  ["a double-quoted star mid-name", `rm -rf "/tmp/a*b"`],
+  ["a relative glob", `rm -f ./*.log`],
+  ["a glob under the home cache", `rm -rf ~/.cache/wt-*`],
+  ["echo of the command, unquoted", `echo rm -rf /tmp/tmp.*`],
 ];
 
 describe("tmp-wipe guard (smarty-dev#1998)", () => {

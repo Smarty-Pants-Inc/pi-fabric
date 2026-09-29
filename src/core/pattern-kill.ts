@@ -360,9 +360,26 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
   const unknownOperand = (pattern: string): boolean =>
     [...pattern.matchAll(REFERENCE)].some((match) => match[1] === "$" && unknown.has(match[2]!)) && MENTIONS_TMP.test(context.root);
 
+  // Security F1/N5 on PR #148: a lookup or /tmp listing fed by a redirect (`done < <(…)`, `<<< "$(…)"`,
+  // a heredoc) may reach any read, mapfile or xargs of this script. ponytail: whole script, not per stage.
+  const tokens = tokenize(script);
+  const fed = { lookup: false, tmp: false };
+  const cdTmp = tmpGlob(".", cwd) || tokens.some((token, i) => {
+    const next = tokens[i + 1];
+    return "word" in token && token.word.text === "cd" && !!next && "word" in next && tmpGlob(next.word.pattern, cwd);
+  });
+  for (const token of tokens) {
+    const subs = "redirect" in token ? token.redirect.subs : "heredoc" in token && !token.heredoc.quoted ? expandHeredoc(token.heredoc.body).subs : [];
+    for (const sub of subs) {
+      const inner = scan(sub, depth + 1, tainted, tmpNames, { ...context, cwd, values, unknown });
+      fed.lookup ||= inner.lookup;
+      fed.tmp ||= inner.tmpList || cdTmp;
+    }
+  }
+
   const runPipeline = (): void => {
-    let pipeFeed = false;
-    let pipeTmp = false;
+    let pipeFeed = fed.lookup;
+    let pipeTmp = fed.tmp;
     stages.forEach((stage, position) => {
       const piped = position < stages.length - 1;
       // Substitutions in words and redirection targets run; so do those of an unquoted heredoc
@@ -374,7 +391,8 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       for (const expansion of expansions) expansion.subs.forEach((sub, k) => {
         const inner = nested(sub);
         if (/^\s*mktemp(\s|$)/.test(sub)) context.owned.add(expansion.names[k]!);
-        if (inner.tmpList) tmpNames.add(expansion.names[k]!);
+        // Security F3: after `cd /tmp`, any captured output (`$(ls)`) may list /tmp.
+        if (inner.tmpList || (tmpGlob(".", cwd) && !/^\s*mktemp(\s|$)/.test(sub))) tmpNames.add(expansion.names[k]!);
         if (!inner.lookup) return;
         captured = true;
         tainted.add(expansion.names[k]!);
@@ -389,9 +407,17 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       let lookup = LOOKUPS.has(name);
       if (KILL_BY_NAME.has(name)) verdict.blocked = true;
       // Assignments and loop variables that take lookup output.
-      for (const word of stage.words) {
+      for (const [i, word] of stage.words.entries()) {
         const assigned = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word.text);
         if (assigned && fromLookup(assigned[2]!)) tainted.add(assigned[1]!);
+        // Security F2: `NAME=(…)` globs its elements at once; the words after it are its elements.
+        const array = /^([A-Za-z_][A-Za-z0-9_]*)=\(/.exec(word.pattern);
+        if (array) {
+          const elements = [word.pattern.slice(array[0].length), ...stage.words.slice(i + 1).map((w) => w.pattern)];
+          if (elements.some(tmpOperand)) tmpNames.add(array[1]!);
+          values.delete(array[1]!);
+          break;
+        }
         const value = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word.pattern);
         if (value) {
           const [, variable, raw] = value as unknown as [string, string, string];
@@ -407,10 +433,14 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       }
       if (name === "for" && args[0] && args.slice(2).some((arg) => fromLookup(arg.text))) tainted.add(args[0].text);
       if (name === "for" && args[0] && args.slice(2).some((arg) => tmpOperand(arg.pattern))) tmpNames.add(args[0].text);
-      if (name === "read" && pipeFeed) for (const arg of args) if (!arg.text.startsWith("-")) tainted.add(arg.text);
-      if (name === "read" && pipeTmp) for (const arg of args) if (!arg.text.startsWith("-")) tmpNames.add(arg.text);
+      const reads = name === "read" || name === "mapfile" || name === "readarray";
+      if (reads && pipeFeed) for (const arg of args) if (!arg.text.startsWith("-")) tainted.add(arg.text);
+      if (reads && pipeTmp) for (const arg of args) if (!arg.text.startsWith("-")) tmpNames.add(arg.text);
       // mktemp creates one exact path; naming /tmp there does not list other agents' entries.
-      let listsTmp = name !== "mktemp" && stage.words.some((word) => tmpOperand(word.pattern));
+      // Security F3: after `cd /tmp`, a piped stage may list the cwd (`ls`, `find` without a root).
+      let listsTmp = name !== "mktemp" && (stage.words.some((word) => tmpOperand(word.pattern)) || (piped && tmpGlob(".", cwd)));
+      // Security F1: `xargs -a <(ls /tmp/…)` reads its input from a /tmp listing.
+      const xargsTmp = fedByXargs && (pipeTmp || stage.words.some((word) => tmpOperand(word.pattern)));
       if (name === "cd") {
         const target = args.find((arg) => !arg.text.startsWith("-"));
         const dir = target && expand(target.pattern);
@@ -420,7 +450,7 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       if (DELETERS.has(name)) {
         const end = args.findIndex((arg) => arg.text === "--");
         const operands = args.filter((arg, i) => (end >= 0 && i > end) || (!(arg.text.startsWith("-") && arg.text.length > 1) && (end < 0 || i < end)));
-        if (operands.some((arg) => tmpOperand(arg.pattern) || unknownOperand(arg.pattern)) || (fedByXargs && pipeTmp)) verdict.wipe = true;
+        if (operands.some((arg) => tmpOperand(arg.pattern) || unknownOperand(arg.pattern)) || xargsTmp) verdict.wipe = true;
       }
       if (name === "find") {
         const roots: Word[] = [];
@@ -455,7 +485,7 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
           positional.forEach((arg, k) => { if (fromLookup(arg.text)) extra.push(String(k), "@", "*"); });
           positional.forEach((arg, k) => { if (tmpOperand(arg.pattern)) tmpExtra.push(String(k), "@", "*"); });
           if (xargsFeed) extra.push(..."123456789@*".split(""), "{}");
-          if (fedByXargs && pipeTmp) tmpExtra.push(..."123456789@*".split(""), "{}");
+          if (xargsTmp) tmpExtra.push(..."123456789@*".split(""), "{}");
           scripts.push({ text: payload.text, extra, tmpExtra });
         }
       }
@@ -478,7 +508,7 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
     stages = [];
   };
 
-  for (const token of tokenize(script)) {
+  for (const token of tokens) {
     if ("word" in token) { command.words.push(token.word); continue; }
     if ("redirect" in token) { command.redirects.push(token.redirect); continue; }
     if ("heredoc" in token) { command.heredocs.push(token.heredoc); continue; }

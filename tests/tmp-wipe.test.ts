@@ -52,6 +52,23 @@ const refused: Array<[string, string]> = [
   ["cd /tmp, then bash -c with a relative glob", `cd /tmp; bash -c "rm -rf *"`],
   ["cd /tmp, then eval", `cd /tmp && eval 'rm -rf tmp.*'`],
   ["cd /tmp, then a substitution", `cd /tmp && echo $(rm -rf tmp.*)`],
+  // Round 2 on PR #148, security F1: a /tmp listing fed through a redirect to read or xargs.
+  ["a while loop fed by a process substitution", `while read -r d; do rm -rf "$d"; done < <(find /tmp -maxdepth 1 -name 'tmp.*' -mmin -60)`],
+  ["xargs fed by a process substitution", `xargs -0 rm -rf < <(find /tmp -maxdepth 1 -name 'tmp.*' -print0)`],
+  ["xargs fed by a here-string", `xargs rm -rf <<< "$(ls -d /tmp/tmp.*)"`],
+  ["xargs -a with a process substitution", `xargs -a <(ls -d /tmp/tmp.*) rm -rf`],
+  // Security F2: an array assigned from a /tmp glob, and mapfile/readarray.
+  ["an array of a /tmp glob", `dirs=(/tmp/tmp.*); rm -rf "\${dirs[@]}"`],
+  ["a spaced array of a /tmp glob", `dirs=( /tmp/tmp.* ); rm -rf "\${dirs[@]}"`],
+  ["mapfile from a /tmp listing", `mapfile -t dirs < <(ls -d /tmp/tmp.*); rm -rf "\${dirs[@]}"`],
+  ["readarray from a /tmp listing", `readarray -t dirs < <(ls -d /tmp/tmp.*); rm -rf "\${dirs[@]}"`],
+  // Security F3: after cd /tmp, a listing without a path lists /tmp.
+  ["cd /tmp, then ls | head | xargs rm", `cd /tmp && ls -t | head -6 | xargs rm -rf`],
+  ["cd /tmp, then rm of an ls substitution", `cd /tmp && rm -rf $(ls | grep '^tmp\\.')`],
+  ["cd /tmp, then find without a root | xargs rm", `cd /tmp && find -maxdepth 1 -name 'tmp.*' | xargs rm -rf`],
+  ["cd /tmp, then a loop fed by ls in a process substitution", `cd /tmp && while read d; do rm -rf "$d"; done < <(ls)`],
+  ["an array of a /tmp listing", `dirs=($(ls -d /tmp/tmp.*)); rm -rf "\${dirs[@]}"`],
+  ["xargs --arg-file with a process substitution", `xargs --arg-file=<(ls -d /tmp/tmp.*) rm -rf`],
 ];
 
 const allowed: Array<[string, string]> = [
@@ -95,6 +112,12 @@ const allowed: Array<[string, string]> = [
   ["cd to an exact dir, then sh -c with a glob", `cd /tmp/tmp.AbC123 && sh -c 'rm -rf *'`],
   ["a child cd /tmp does not move the parent", `cd ~/w && sh -c 'cd /tmp' && rm -rf tmp.*`],
   ["ssh does not inherit the local cwd", `cd /tmp && ssh m4max 'rm -rf build/*'`],
+  // Round 2 on PR #148: F1 a loop over an own list file, F2 an array below the own dir, F3 ls in an own dir.
+  ["a while loop over an own list file", `while read -r f; do rm -f "$D/$f"; done < "$D/list"`],
+  ["an array of a glob below the own dir", `files=("$D"/*.json); rm -f "\${files[@]}"`],
+  ["cd to the own dir, then ls | xargs rm", `cd "$D" && ls | xargs rm -f`],
+  ["cd to an exact tmp dir, then ls | xargs rm", `cd /tmp/tmp.AbC123 && ls | xargs rm -f`],
+  ["cd /tmp, then a recorded mktemp dir", `cd /tmp && D=$(mktemp -d) && rm -rf "$D"`],
 ];
 
 describe("tmp-wipe guard (smarty-dev#1998)", () => {

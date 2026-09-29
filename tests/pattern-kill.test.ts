@@ -32,6 +32,9 @@ const refused: Array<[string, string]> = [
   ["a captured PID list", `P=$(pgrep -f server); kill $P`],
   ["a for loop over pgrep", `for p in $(pgrep -f server); do kill "$p"; done`],
   ["a while loop fed by pgrep", `pgrep -f server | while read p; do kill $p; done`],
+  // Security N5 on pi-fabric#148: the same lookup fed through a redirect.
+  ["a while loop fed by a pgrep process substitution", `while read p; do kill "$p"; done < <(pgrep x)`],
+  ["xargs kill fed by a pgrep here-string", `xargs kill <<< "$(pgrep x)"`],
   ["bash -c 'pkill …'", `bash -c 'pkill -f server'`],
   ["bash -lc 'kill $(pgrep …)'", `bash -lc 'kill $(pgrep -f server)'`],
   ["sh -c with pgrep | xargs kill", `sh -c "pgrep -f x | xargs kill"`],

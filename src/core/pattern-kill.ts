@@ -390,21 +390,49 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
   }
 }
 
+/** Bash read/mapfile option values are not destinations; omitted destinations use shell defaults. */
+function readDestinations(name: string, args: Word[]): string[] {
+  const read = name === "read";
+  const valueOptions = read ? "adinNptu" : "nOsuCcd";
+  let array: string | undefined;
+  let index = 0;
+  while (index < args.length) {
+    const flag = args[index]!.text;
+    if (flag === "--") { index += 1; break; }
+    if (!flag.startsWith("-") || flag.length === 1) break;
+    index += 1;
+    for (let at = 1; at < flag.length; at++) {
+      if (!valueOptions.includes(flag[at]!)) continue;
+      const value = flag.slice(at + 1) || args[index++]?.text;
+      if (value === undefined) return [];
+      if (read && flag[at] === "a") array = value;
+      break;
+    }
+  }
+  const destinations = read && array !== undefined ? [array] : args.slice(index).map((arg) => arg.text);
+  if (destinations.length === 0) destinations.push(read ? "REPLY" : "MAPFILE");
+  // read -a ignores scalar names; mapfile takes only one array name. Array elements taint the base.
+  return (read ? destinations : destinations.slice(0, 1)).flatMap((destination) => {
+    const match = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[.*\])?$/.exec(destination);
+    return match ? [match[1]!] : [];
+  });
+}
+
 /**
  * Scans a shell script. `names` holds the variables and placeholders whose value comes from a name
  * lookup in the calling script (review/astra F8 on #105: per operand, never the whole script).
  */
 function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), tmpIn: ReadonlySet<string> = new Set(),
-  context: Context = { root: script, owned: new Set(), values: new Map(), unknown: new Set() }): Verdict {
+  context: Context = { root: script, owned: new Set(), values: new Map(), unknown: new Set() }, stdin?: Feed): Verdict {
   if (depth > 6) return { blocked: false, lookup: false, wipe: false, tmpList: false };
   // Security F4/F5: collect with the state at each command, then replay from the same entry state.
   // F6: retain fallback for unresolved feeds, but late redirects belong only to their own scope.
   const tokens = tokenize(script);
   const scopes = sourceScopes(tokens);
   const sources = new Map<Word, Feed | undefined>();
-  const first = scanPass(tokens, scopes, sources, depth, names, tmpIn, context, { lookup: false, tmp: false });
+  const first = scanPass(tokens, scopes, sources, depth, names, tmpIn, context, { lookup: false, tmp: false }, stdin);
   if (!first.lookup && !first.tmpList) return first;
-  const second = scanPass(tokens, scopes, sources, depth, names, tmpIn, context, { lookup: first.lookup, tmp: first.tmpList });
+  const second = scanPass(tokens, scopes, sources, depth, names, tmpIn, context, { lookup: first.lookup, tmp: first.tmpList }, stdin);
   return {
     blocked: first.blocked || second.blocked, lookup: first.lookup || second.lookup,
     wipe: first.wipe || second.wipe, tmpList: first.tmpList || second.tmpList,
@@ -413,7 +441,7 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
 }
 
 function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed | undefined>,
-  depth: number, names: ReadonlySet<string>, tmpIn: ReadonlySet<string>, context: Context, fed: Feed): Verdict {
+  depth: number, names: ReadonlySet<string>, tmpIn: ReadonlySet<string>, context: Context, fed: Feed, stdin?: Feed): Verdict {
   const verdict: Verdict = { blocked: false, lookup: false, wipe: false, tmpList: false };
   // Variables whose value comes from a name lookup (`P=$(pgrep …)`, `for p in $(pgrep …)`,
   // `pgrep … | while read p`), and the placeholders of lookup substitutions. A `kill` of one is a
@@ -430,9 +458,10 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   const unknown = new Set(context.unknown);
   let cwd = context.cwd;
 
-  const nested = (text: string, extra: Iterable<string> = [], tmpExtra: Iterable<string> = [], local = true): Verdict => {
+  const nested = (text: string, extra: Iterable<string> = [], tmpExtra: Iterable<string> = [], local = true, input?: Feed): Verdict => {
     const inner = scan(text, depth + 1, new Set([...tainted, ...extra]), new Set([...tmpNames, ...tmpExtra]),
-      local ? { ...context, cwd, values, unknown } : { ...context, cwd: undefined, values: new Map(), unknown: new Set() });
+      local ? { ...context, cwd, values, unknown } : { ...context, cwd: undefined, values: new Map(), unknown: new Set() },
+      local ? input : undefined);
     verdict.blocked ||= inner.blocked;
     verdict.lookup ||= inner.lookup;
     verdict.wipe ||= inner.wipe;
@@ -457,8 +486,13 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     .some((match) => !context.owned.has(match[2]!));
   const lateTargets = new Set([...scopes.inputs.values()].map((scope) => scope.target));
   const compoundKnown = new Map<number, boolean>();
-  const recordOutput = (scope: number, known: boolean): void => {
+  const compoundFeeds = new Map<number, Feed>();
+  const recordOutput = (scope: number, known: boolean, feed?: Feed): void => {
     compoundKnown.set(scope, (compoundKnown.get(scope) ?? true) && known);
+    if (feed) {
+      const previous = compoundFeeds.get(scope);
+      compoundFeeds.set(scope, { lookup: feed.lookup || (previous?.lookup ?? false), tmp: feed.tmp || (previous?.tmp ?? false) });
+    }
   };
   const inputSource = (word: Word): Feed | undefined => {
     const lookup = fromLookup(word.text);
@@ -469,18 +503,26 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   };
 
   const runPipeline = (): void => {
-    let pipeFeed = fed.lookup;
-    let pipeTmp = fed.tmp;
+    // F7: an inherited fd is separate from replay's whole-script fallback. Substitutions never
+    // receive it implicitly; only an inline local receiver gets the actual stage's stdin.
+    let actual = stdin;
+    let pipeFeed = stdin?.lookup ?? fed.lookup;
+    let pipeTmp = stdin?.tmp ?? fed.tmp;
     stages.forEach((stage, position) => {
       const piped = position < stages.length - 1;
+      // An actual incoming pipe exists even when its unresolved producer is represented only
+      // by replay fallback. Known owned/recorded output sets an explicit empty feed instead.
+      if (position > 0 && actual === undefined) actual = { lookup: pipeFeed, tmp: pipeTmp };
       // `do while read` / `then while read` can open a more specific scope after the first word.
       let scope: InputScope | undefined;
       for (const word of stage.words) scope = scopes.inputs.get(word) ?? scope;
       if (scope && (position === 0 || (scope.start && stage.words.includes(scope.start)))) {
         // Defer this body's stdin in the collection pass; its late source is evaluated in place.
-        const source = sources.has(scope.target) ? sources.get(scope.target) ?? fed : { lookup: false, tmp: false };
-        pipeFeed = source.lookup;
-        pipeTmp = source.tmp;
+        const source = sources.has(scope.target) ? sources.get(scope.target) : { lookup: false, tmp: false };
+        const input = source ?? { lookup: pipeFeed || fed.lookup, tmp: pipeTmp || fed.tmp };
+        if (source !== undefined) actual = source;
+        pipeFeed = input.lookup;
+        pipeTmp = input.tmp;
       }
       // Substitutions in words and redirection targets run; so do those of an unquoted heredoc
       // body, where quotes and `#` are literal (review/astra F2 on #105). A lookup's placeholder
@@ -503,7 +545,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         captured = true;
         tainted.add(expansion.names[k]!);
       });
-      const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean }> = [];
+      const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
       const { words, fedByXargs, argFile } = unwrap(stage.words, envScripts);
       // review/astra F6 on #105: an `env -S` script, with the placeholders of its word.
@@ -554,18 +596,23 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         verdict.tmpList ||= source?.tmp ?? false;
         if (!closing) {
           const input = source ?? unresolved;
+          if (source !== undefined) actual = source;
           pipeFeed = input.lookup;
           pipeTmp = input.tmp;
         }
       }
+      // xargs' argument file is not its child's stdin; without -a xargs disconnects that fd.
+      const receiverStdin = fedByXargs && !argFile ? { lookup: false, tmp: false } : actual;
       if (argFile) {
         const source = inputSource(argFile) ?? unresolved;
         pipeFeed = source.lookup;
         pipeTmp = source.tmp;
       }
       const reads = name === "read" || name === "mapfile" || name === "readarray";
-      if (reads && pipeFeed) for (const arg of args) if (!arg.text.startsWith("-")) tainted.add(arg.text);
-      if (reads && pipeTmp) for (const arg of args) if (!arg.text.startsWith("-")) tmpNames.add(arg.text);
+      if (reads) for (const destination of readDestinations(name, args)) {
+        if (pipeFeed) tainted.add(destination);
+        if (pipeTmp) tmpNames.add(destination);
+      }
       // mktemp creates one exact path; naming /tmp there does not list other agents' entries.
       // Security F3: after `cd /tmp`, a piped stage may list the cwd (`ls`, `find` without a root).
       const roots: Word[] = [];
@@ -584,7 +631,9 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       let listsTmp = name !== "mktemp" && (stage.words.some((word) => tmpOperand(word.pattern)) ||
         (piped && !independent && tmpGlob(".", cwd)));
       // An explicit producer does not read stdin. Do not clear an earlier real pipeline stage.
-      if (position === 0 && piped && independent && !listsTmp && !lookup) { pipeFeed = false; pipeTmp = false; }
+      if (position === 0 && piped && independent && !listsTmp && !lookup) {
+        pipeFeed = false; pipeTmp = false; actual = { lookup: false, tmp: false };
+      }
       // Security F1: `xargs -a <(ls /tmp/…)` reads its input from a /tmp listing.
       const xargsTmp = fedByXargs && (pipeTmp || stage.words.some((word) => tmpOperand(word.pattern)));
       if (name === "cd") {
@@ -612,7 +661,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         if (!probe && (byLookup || xargsFeed)) verdict.blocked = true;
       }
       // review/astra F6 on #105: a heredoc script as the shell receives it, placeholders included.
-      if (SHELLS.has(name) || name === "ssh") for (const heredoc of heredocs) scripts.push({ text: heredoc.text, remote: name === "ssh" });
+      if (SHELLS.has(name) || name === "ssh") for (const heredoc of heredocs) scripts.push({ text: heredoc.text, remote: name === "ssh", heredoc: true });
       if (SHELLS.has(name)) {
         const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg.text));
         const payload = flag >= 0 ? args[flag + 1] : undefined;
@@ -636,7 +685,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         scripts.push({ text: args.slice(i + 1).map((arg) => arg.text).join(" "), remote: true });
       }
       for (const inner of scripts) {
-        const result = nested(inner.text, inner.extra, inner.tmpExtra, !inner.remote);
+        const result = nested(inner.text, inner.extra, inner.tmpExtra, !inner.remote,
+          inner.heredoc ? undefined : receiverStdin);
         lookup = result.lookup || lookup;
         listsTmp = result.tmpList || listsTmp;
       }
@@ -644,22 +694,39 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // A recorded PID file is an explicit pipeline source, not the whole-script lookup fallback.
       // Preserve `pgrep …; cat run.pid | xargs kill` without clearing a real lookup in this pipeline.
       if (position === 0 && piped && name === "cat" && !captured &&
-        args.some((arg) => !arg.text.startsWith("-")) && !args.some((arg) => arg.text === "-" || fromLookup(arg.text))) pipeFeed = false;
-      if (piped && lookup) pipeFeed = true;
+        args.some((arg) => !arg.text.startsWith("-")) && !args.some((arg) => arg.text === "-" || fromLookup(arg.text))) {
+        pipeFeed = false;
+        if (actual) actual = { ...actual, lookup: false };
+      }
+      if (piped && lookup) { pipeFeed = true; actual = { lookup: true, tmp: actual?.tmp ?? false }; }
       if (listsTmp) verdict.tmpList = true;
-      if (piped && listsTmp) pipeTmp = true;
+      if (piped && listsTmp) { pipeTmp = true; actual = { lookup: actual?.lookup ?? false, tmp: true }; }
       let known = independent && !lookup && !listsTmp;
       if (stage.closed !== undefined) {
         known = compoundKnown.get(stage.closed) === true;
+        const output = compoundFeeds.get(stage.closed);
+        // Compound stages span command lists: recover their real output, not replay's fallback.
+        // Even known-safe inherited stdin cannot erase a group's newly generated unsafe output.
+        if (piped && output && (output.lookup || output.tmp)) {
+          actual = { lookup: output.lookup || (actual?.lookup ?? false), tmp: output.tmp || (actual?.tmp ?? false) };
+          pipeFeed ||= output.lookup;
+          pipeTmp ||= output.tmp;
+        }
         // Only a wholly explicit producer group may replace fallback at its outgoing pipe.
         // A group containing operand-free cat is unresolved and retains its real inherited feed.
-        if (known && piped) { pipeFeed = false; pipeTmp = false; }
+        if (known && piped) { pipeFeed = false; pipeTmp = false; actual = { lookup: false, tmp: false }; }
         const parent = scopes.parents.get(stage.closed);
-        if (parent !== undefined) recordOutput(parent, known);
+        if (parent !== undefined) recordOutput(parent, known, output);
       } else {
         const member = stage.words[0] && scopes.members.get(stage.words[0]);
         // for/select headers do not emit output; their body producers determine the compound source.
-        if (member !== undefined && name && name !== "for" && name !== "select") recordOutput(member, known);
+        if (member !== undefined && name && name !== "for" && name !== "select") {
+          const output = lookup || listsTmp || known || actual ? {
+            lookup: lookup || (!independent && (actual?.lookup ?? false)),
+            tmp: listsTmp || (!independent && (actual?.tmp ?? false)),
+          } : undefined;
+          recordOutput(member, known, output);
+        }
       }
       verdict.sourceKnown = known;
     });

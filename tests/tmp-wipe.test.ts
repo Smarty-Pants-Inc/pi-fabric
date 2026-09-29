@@ -93,6 +93,21 @@ const refused: Array<[string, string]> = [
   ["F6: an output-only redirect does not clear an unsafe pipe", `ls -d /tmp/tmp.* | xargs rm -rf > .local/cleanup.log`],
   ["F6: an fd3 input redirect does not clear actual shared stdin", `find /tmp -name tmp.* -print0 | xargs -0 rm -rf 3< .local/mine.list`],
   ["F6: grouped cat without operands preserves actual shared stdin", `ls -d /tmp/tmp.* | { cat; } | xargs rm -rf`],
+  // Round 5 F7/F8: these shell commands are test data only, never executed.
+  ["F7.01: inline sh inherits shared stdin for xargs rm", `ls -d /tmp/tmp.* | sh -c 'xargs rm -rf'`],
+  ["F7.02: inline sh inherits shared stdin for a read loop", `ls -d /tmp/tmp.* | sh -c 'while read -r d; do rm -rf "$d"; done'`],
+  ["F7.03: unsafe inner xargs after an unrelated owned diagnostic", `sh -c 'ls -d /tmp/tmp.AbC123/*.json; ls -d /tmp/tmp.* | xargs rm -rf'`],
+  ["F7.04: unsafe inner read loop after an unrelated owned diagnostic", `sh -c 'ls -d /tmp/tmp.AbC123/*.json; ls -d /tmp/tmp.* | while read -r d; do rm -rf "$d"; done'`],
+  ["F8.01: implicit read destination REPLY receives shared stdin", `ls -d /tmp/tmp.* | while read -r; do rm -rf "$REPLY"; done`],
+  ["F8.02: read defaults to REPLY after delimiter and timeout options", `while read -r -d '' -t 1; do rm -rf "$REPLY"; done < <(find /tmp -maxdepth 1 -name 'tmp.*' -print0)`],
+  ["F8.03: read destination after prompt count fd and -- options", `REPLY=/tmp/tmp.AbC123; ls -d /tmp/tmp.* | while read -r -p REPLY -n 1 -u 0 -- p; do rm -rf "$p"; done`],
+  ["F8.04: read -a array receives shared stdin", `read -r -d '' -a dirs < <(ls -d /tmp/tmp.*); rm -rf "\${dirs[@]}"`],
+  ["F8.05: mapfile defaults to MAPFILE after option arguments and --", `mapfile -t -n 1 -O 0 -s 0 -C : -c 1 -- < <(ls -d /tmp/tmp.*); rm -rf "\${MAPFILE[@]}"`],
+  ["F8.06: readarray defaults to MAPFILE after delimiter and --", `readarray -d '' -t -- < <(find /tmp -maxdepth 1 -name 'tmp.*' -print0); rm -rf "\${MAPFILE[@]}"`],
+  ["F7.05: brace shared producer feeds inline sh xargs rm", `{ ls -d /tmp/tmp.*; } | sh -c 'xargs rm -rf'`],
+  ["F7.06: inherited safe stdin does not suppress a shared inner brace producer", `cat .local/mine.list | sh -c "{ ls -d /tmp/tmp.*; } | xargs rm -rf"`],
+  ["F8.07: plain mapfile -t defaults to shared MAPFILE", `mapfile -t < <(ls -d /tmp/tmp.*); rm -rf "\${MAPFILE[@]}"`],
+  ["F8.08: plain readarray defaults to shared MAPFILE", `readarray < <(ls -d /tmp/tmp.*); rm -rf "\${MAPFILE[@]}"`],
 ];
 
 const allowed: Array<[string, string]> = [
@@ -168,6 +183,21 @@ const allowed: Array<[string, string]> = [
   ["F6: a nested own list-file loop after ls /tmp", `ls /tmp; for i in once; do while read f; do rm -f "$f"; done < .local/mine.list; done`],
   ["F6: an own list-file loop inside if after ls /tmp", `ls /tmp; if true; then while read f; do rm -f "$f"; done < .local/mine.list; fi`],
   ["F6: a non-emitting for header preserves an exact-directory output after ls /tmp", `ls /tmp; for suffix in log tmp; do find /tmp/tmp.AbC123 -name "*.$suffix" -print0; done | xargs -0 rm -f`],
+  // Paired F7/F8 allowances: exact owned sources or a recorded operand unrelated to the feed.
+  ["F7.01: inline sh inherits owned stdin for xargs rm", `ls -d /tmp/tmp.AbC123/*.json | sh -c 'xargs rm -rf'`],
+  ["F7.02: inline sh inherits owned stdin for a read loop", `ls -d /tmp/tmp.AbC123/*.json | sh -c 'while read -r d; do rm -rf "$d"; done'`],
+  ["F7.03: independent owned inner xargs overrides actual shared outer stdin", `ls -d /tmp/tmp.* | sh -c 'find /tmp/tmp.AbC123 -name "*.json" -print0 | xargs -0 rm -rf'`],
+  ["F7.04: independent owned inner read loop overrides actual shared outer stdin", `ls -d /tmp/tmp.* | sh -c 'while read -r d; do rm -rf "$d"; done < <(find /tmp/tmp.AbC123 -name "*.json")'`],
+  ["F8.01: implicit read destination REPLY receives owned stdin", `ls -d /tmp/tmp.AbC123/*.json | while read -r; do rm -rf "$REPLY"; done`],
+  ["F8.02: read defaults to owned REPLY after delimiter and timeout options", `while read -r -d '' -t 1; do rm -rf "$REPLY"; done < <(find /tmp/tmp.AbC123 -maxdepth 1 -name '*.json' -print0)`],
+  ["F8.03: read prompt option argument REPLY is not a destination", `REPLY=/tmp/tmp.AbC123; ls -d /tmp/tmp.* | while read -r -p REPLY -n 1 -u 0 -- p; do rm -rf "$REPLY"; done`],
+  ["F8.04: read -a array receives owned stdin", `read -r -d '' -a dirs < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${dirs[@]}"`],
+  ["F8.05: mapfile defaults to owned MAPFILE after option arguments and --", `mapfile -t -n 1 -O 0 -s 0 -C : -c 1 -- < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
+  ["F8.06: readarray defaults to owned MAPFILE after delimiter and --", `readarray -d '' -t -- < <(find /tmp/tmp.AbC123 -maxdepth 1 -name '*.json' -print0); rm -rf "\${MAPFILE[@]}"`],
+  ["F7.05: brace owned find producer feeds inline sh xargs rm", `{ find /tmp/tmp.AbC123 -name "*.json"; } | sh -c 'xargs rm -rf'`],
+  ["F7.06: inherited safe stdin survives inner group cat after a shared diagnostic", `cat .local/mine.list | sh -c "ls /tmp; { cat; } | xargs rm -rf"`],
+  ["F8.07: plain mapfile -t defaults to owned MAPFILE", `mapfile -t < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
+  ["F8.08: plain readarray defaults to owned MAPFILE", `readarray < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
 ];
 
 describe("tmp-wipe guard (smarty-dev#1998)", () => {

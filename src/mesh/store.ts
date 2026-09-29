@@ -416,6 +416,11 @@ export class MeshStore {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
+  /** The reuse window of reads (MeshStoreOptions.readCacheMs), for readers of files beside the state. */
+  get readCacheMs(): number {
+    return this.#readCacheMs;
+  }
+
   async publish(input: {
     topic: string;
     kind?: string;
@@ -953,6 +958,14 @@ export class MeshStore {
    * writable now, for a heartbeat that renewed only its file lease. It also drops this store's
    * cached view, so a read after the confirmation cannot return an earlier snapshot.
    */
+  /**
+   * Runs an operation under the mesh lock without touching the state: for a rare step that must
+   * be serialized fleet-wide, such as recovering a per-key lock whose holder died.
+   */
+  async exclusive<T>(operation: () => T): Promise<T> {
+    return this.#withLock(operation);
+  }
+
   async confirmWritable(): Promise<void> {
     await this.#withLock(() => {
       this.#stateCache = undefined;

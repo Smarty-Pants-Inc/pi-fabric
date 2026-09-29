@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager, HOST_STOP_REASON } from "../src/agents/manager.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
-import { readStoppedRuns, restoreStoppedRuns, STOPPED_AGENTS_ENTRY } from "../src/agents/stopped-runs.js";
+import {
+  readStoppedRuns, rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, takeReloadStoppedNotice,
+} from "../src/agents/stopped-runs.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
@@ -125,5 +127,29 @@ describe("task agents stopped by a reload (smarty-dev#1602)", () => {
       await expect(second.next.wait("old-run")).resolves.toMatchObject({ status: "stopped" });
       second.inbox.close();
     });
+  });
+});
+
+describe("notice after a reload stopped task agents (smarty-dev#1882)", () => {
+  const run = (id: string, name: string) => ({ id, name, status: "stopped" }) as AgentRunResult;
+
+  it("a real close records the stopped names; the reloaded session start shows them once", async () => {
+    const sessionId = `reload-notice-${Date.now()}`;
+    const first = manager({ onStoppedAtClose: (results) => rememberStoppedAtClose(sessionId, results) });
+    await first.spawn({ task: "HANG", runner: "pi", extensions: false, name: "reload-victim" });
+    await first.close();
+    expect(takeReloadStoppedNotice(sessionId, "reload")).toBe(
+      'The last /reload stopped 1 task agent: reload-victim; spawn with residency: "durable" to keep agents across reloads.',
+    );
+    expect(takeReloadStoppedNotice(sessionId, "reload")).toBeUndefined();
+  });
+
+  it("counts and names several, and shows nothing for another session or a non-reload start", () => {
+    rememberStoppedAtClose("s1", [run("a", "alpha"), run("b", "beta")]);
+    expect(takeReloadStoppedNotice("s2", "reload")).toBeUndefined();
+    expect(takeReloadStoppedNotice("s1", "reload")).toMatch(/^The last \/reload stopped 2 task agents: alpha, beta; /);
+    rememberStoppedAtClose("s1", [run("a", "alpha")]);
+    expect(takeReloadStoppedNotice("s1", "new")).toBeUndefined();
+    expect(takeReloadStoppedNotice("s1", "reload")).toBeUndefined();
   });
 });

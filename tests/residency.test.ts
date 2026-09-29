@@ -1089,6 +1089,32 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     await reconnect.close();
   });
 
+  // smarty-dev#883: on SIGTERM, Pi exited before the host's close stopped its
+  // durable workers, which ran on as orphans and kept writing.
+  it("stops its durable workers before a SIGTERM'd resident host exits", { timeout: 60_000 }, async () => {
+    const state = await rootHarness("resident-sigterm");
+    const client = new ResidencyClient({
+      config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath,
+    });
+    try {
+      const handle = await client.spawnAgent({ task: "HANG", transport: "process", residency: "durable" });
+      const workerPid = (): number | undefined => execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" })
+        .split("\n").filter((line) => line.includes(handle.id) && line.includes(fakeWorker))
+        .map((line) => Number(line.trim().split(/\s+/)[0]))[0];
+      await waitFor(() => workerPid() !== undefined, 30_000);
+      const worker = workerPid()!;
+      const host = (JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner).pid;
+      const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      process.kill(host, "SIGTERM");
+      await waitFor(() => !alive(host), 30_000);
+      // The worker's exit is part of the host's close, so it is already gone.
+      expect(alive(worker)).toBe(false);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
   // smarty-dev#1882: the host's exit removes runs/; a later session still reads the result.
   it("returns a completed durable agent's result after its resident host exits", { timeout: 90_000 }, async () => {
     const state = await rootHarness("resident-exit-status");

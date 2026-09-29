@@ -15,6 +15,9 @@ const NEXT_COMMAND_ALL = new RegExp(NEXT_COMMAND.source, "g");
 const CUT = new RegExp([
   // `| tail`, `| head`, `| sed -n`; `tail -n +1` and `tail +1` keep every line.
   String.raw`\|\s*(?:tail(?!\s+(?:-n\s*|--lines[=\s]\s*)?\+1\b)|head|sed\s+-n)\b`,
+  // smarty-dev#967 round-5 census: an awk that keeps a subset of lines (`END{print}` keeps the last one,
+  // `NR<=N` / `NR>N` keep a range). A plain field filter such as `awk -F: '$1>0'` keeps every comment.
+  String.raw`\|\s*awk\b[^|]*(?:\bEND\b|\bNR\s*(?:[<>]=?|==|!=))`,
   // jq negative slice `.[-N:]` and negative index `.[-N]`.
   String.raw`\.\[\s*-\d*\s*:\s*-?\d*\s*\]`,
   String.raw`\.\[\s*-\d+\s*\]`,

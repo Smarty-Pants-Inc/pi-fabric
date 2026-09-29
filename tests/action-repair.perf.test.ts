@@ -10,7 +10,7 @@ const AGENTS_ACTIONS = [
   "run", "handoff", "spawn", "wait", "status", "list", "members", "self",
   "main", "peers", "subscribe", "subscriptions", "unsubscribe", "models",
   "switchModel", "stop", "cleanup", "create", "ask", "tell", "steer",
-  "followUp", "setSteeringMode", "setFollowUpMode", "compact", "actorStatus",
+  "followUp", "setSteeringMode", "setFollowUpMode", "compact", "actorStatus", "instructions",
   "actors", "messages", "setModel", "setThinking", "setTools", "setEvents",
   "setDeliveryPolicy", "clearMessages", "remove", "setInstructions", "import",
   "export", "log",

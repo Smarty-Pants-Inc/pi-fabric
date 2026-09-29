@@ -57,6 +57,13 @@ const loadWorkerEventProjection = async (): Promise<WorkerEventProjectionModule>
   return import(sourceModulePath) as Promise<WorkerEventProjectionModule>;
 };
 
+type WorkerRunLogModule = typeof import("./worker/run-log.js");
+const loadWorkerRunLog = async (): Promise<WorkerRunLogModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/run-log.js");
+  const sourceModulePath = "./worker/run-log.ts";
+  return import(sourceModulePath) as Promise<WorkerRunLogModule>;
+};
+
 type WorkerModelControlModule = typeof import("./worker/model-control.js");
 
 const loadWorkerModelControl = async (): Promise<WorkerModelControlModule> => {
@@ -211,7 +218,9 @@ const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
 let crashContext: { statusFile: string; record: AgentRunRecord } | undefined;
 let runRecordHelpers: WorkerRunRecordModule | undefined;
 let terminalWritten = false;
+let flushRunLog: (() => void) | undefined;
 const writeCrashStatus = (error: unknown): void => {
+  flushRunLog?.();
   if (!crashContext || !runRecordHelpers || terminalWritten) return;
   try {
     runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
@@ -232,7 +241,7 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -240,6 +249,7 @@ const main = async (): Promise<void> => {
     loadWorkerModelControl(),
     loadWorkerEventProjection(),
     loadWorkerRecovery(),
+    loadWorkerRunLog(),
   ]);
   runRecordHelpers = loadedRunRecordHelpers;
   const {
@@ -295,13 +305,15 @@ const main = async (): Promise<void> => {
   // Other processes tail this file while the run is live (transcript reader,
   // dashboards, preview trees). The previous buffered createWriteStream visibly
   // stalled mid-run — append synchronously so events are durable immediately.
-  const appendLog = (text: string): void => {
+  const runLog = createRunLogWriter((text) => {
     try {
       fs.appendFileSync(options.logFile, text, { encoding: "utf8", mode: 0o600 });
     } catch {
       // Event logging is best-effort and must not fail the child run.
     }
-  };
+  });
+  const appendLog = runLog.raw;
+  flushRunLog = runLog.flush;
   const sessionStream =
     options.runner === "claude" && options.sessionFile
       ? fs.createWriteStream(options.sessionFile, { flags: "a", mode: 0o600 })
@@ -912,16 +924,20 @@ const main = async (): Promise<void> => {
   const processEvent = (line: string): void => {
     if (process.env.PI_FABRIC_INJECT_CRASH === "stream") throw new Error("simulated stream crash");
     if (!line.trim()) return;
-    appendLog(`${line}\n`);
     sessionStream?.write(`${line}\n`);
     let event: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(line);
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        runLog.event(line, undefined);
+        return;
+      }
       event = parsed as Record<string, unknown>;
     } catch {
+      runLog.event(line, undefined);
       return;
     }
+    runLog.event(line, event);
     if (options.runner === "claude") {
       processClaudeEvent(event);
       return;
@@ -1427,6 +1443,7 @@ const main = async (): Promise<void> => {
   } else if (outputBuffer.trim()) {
     processEvent(outputBuffer);
   }
+  runLog.flush();
   record.exitCode = exitCode;
   record.stderr = stderr.slice(-MAX_STDERR_CHARS);
   if (

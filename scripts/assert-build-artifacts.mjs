@@ -66,6 +66,7 @@ const lazy = [
   "worker/reply-tool.js",
   "worker/options.js",
   "worker/recovery-watchdog.js",
+  "worker/run-log.js",
   "worker/run-record.js",
   "worker/session-export.js",
 ];

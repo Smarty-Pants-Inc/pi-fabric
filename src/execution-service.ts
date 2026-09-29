@@ -156,18 +156,17 @@ export class FabricExecutionService {
     this.#capabilityView = view;
   }
 
-  async execute(options: FabricExecutionOptions): Promise<FabricExecutionResult> {
-    const startedAt = performance.now();
-    const traceRecorder = new FabricExecutionTraceRecorder();
-    this.activity?.start(
-      options.parentToolCallId,
-      options.display,
-      options.display?.name?.trim() ? undefined
-        : fabricExecTitleHintCached(options.code, this.config.executor.kernel)
-          ?? (this.config.executor.kernel === "python" ? "Python program" : undefined),
-    );
-    const effectiveFullCodeMode =
-      this.config.fullCodeMode || this.config.schema.mode === "enforce";
+  #effectiveFullCodeMode(): boolean {
+    return this.config.fullCodeMode || this.config.schema.mode === "enforce";
+  }
+
+  #coreOverrides(): { name: string; inputSchema: unknown }[] {
+    return this.capturedTools?.list().map((entry) => ({
+      name: entry.name, inputSchema: entry.definition.parameters,
+    })) ?? [];
+  }
+
+  async #acquireRuntime(): Promise<FabricKernelRuntime> {
     const python = this.config.executor.kernel === "python";
     const enforce = this.config.schema.mode === "enforce";
     const monty = python && this.config.executor.pythonRuntime === "monty";
@@ -191,35 +190,76 @@ export class FabricExecutionService {
       this.#runtime = runtime;
       this.#runtimeKind = runtimeKind;
     }
+    return runtime;
+  }
+
+  /** TypeScript alone consumes live schemas as compiler declarations; Python compiles in CPython. */
+  async #prepareTypeScript(
+    runtime: TypeScriptKernelRuntime,
+    source: string,
+    unavailable: string[],
+    coreOverrides: { name: string; inputSchema: unknown }[],
+    options: Pick<FabricExecutionOptions, "context" | "signal" | "parentToolCallId">,
+  ): Promise<{ code: string; checked: FabricTypeCheckResult }> {
+    const guestTypeSources = await this.registry.guestTypeSources({
+      cwd: options.context.cwd,
+      signal: options.signal,
+      parentToolCallId: options.parentToolCallId,
+      nestedToolCallId: `${options.parentToolCallId}_typedecls`,
+      extensionContext: options.context,
+      update() {},
+      ...(this.#capabilityView ? { capabilityView: this.#capabilityView } : {}),
+    });
+    return runtime.prepare(source, this.#effectiveFullCodeMode(), unavailable, guestTypeSources, coreOverrides);
+  }
+
+  /**
+   * Load the kernel and build the guest type checker for the current declarations, so the first
+   * fabric_exec of a session does not pay them after the model finishes streaming it
+   * (smarty-dev#2010). Idempotent; a later execute() reuses both through their caches.
+   */
+  async prewarm(context: ExtensionContext): Promise<void> {
+    if (this.config.executor.kernel === "python") return;
+    const runtime = await this.#acquireRuntime();
+    await this.#prepareTypeScript(
+      runtime as TypeScriptKernelRuntime,
+      "return undefined;",
+      this.registry.unavailableProviders().map((entry) => entry.name),
+      this.#coreOverrides(),
+      { context, signal: undefined, parentToolCallId: "fabric_prewarm" },
+    );
+  }
+
+  async execute(options: FabricExecutionOptions): Promise<FabricExecutionResult> {
+    const startedAt = performance.now();
+    const traceRecorder = new FabricExecutionTraceRecorder();
+    this.activity?.start(
+      options.parentToolCallId,
+      options.display,
+      options.display?.name?.trim() ? undefined
+        : fabricExecTitleHintCached(options.code, this.config.executor.kernel)
+          ?? (this.config.executor.kernel === "python" ? "Python program" : undefined),
+    );
+    const effectiveFullCodeMode = this.#effectiveFullCodeMode();
+    const python = this.config.executor.kernel === "python";
+    const monty = python && this.config.executor.pythonRuntime === "monty";
+    const runtime = await this.#acquireRuntime();
     let code = options.code;
     let checked: FabricTypeCheckResult = { errors: [] };
     const unavailable = new Map(
       this.registry.unavailableProviders().map((entry) => [entry.name, entry.reason]),
     );
-    const coreOverrides = this.capturedTools?.list().map((entry) => ({
-      name: entry.name, inputSchema: entry.definition.parameters,
-    })) ?? [];
+    const coreOverrides = this.#coreOverrides();
     const piToolCanonicalFields = Object.fromEntries(coreOverrides
       .filter((entry) => PI_CORE_TOOL_NAME_SET.has(entry.name))
       .map((entry) => [entry.name, Object.keys((entry.inputSchema as { properties?: object }).properties ?? {})]));
     if (!python) {
-      // TypeScript alone consumes live schemas as compiler declarations. Python
-      // compiles in CPython; both kernels share authoritative registry validation.
-      const guestTypeSources = await this.registry.guestTypeSources({
-        cwd: options.context.cwd,
-        signal: options.signal,
-        parentToolCallId: options.parentToolCallId,
-        nestedToolCallId: `${options.parentToolCallId}_typedecls`,
-        extensionContext: options.context,
-        update() {},
-        ...(this.#capabilityView ? { capabilityView: this.#capabilityView } : {}),
-      });
-      ({ code, checked } = (runtime as TypeScriptKernelRuntime).prepare(
+      ({ code, checked } = await this.#prepareTypeScript(
+        runtime as TypeScriptKernelRuntime,
         options.code,
-        effectiveFullCodeMode,
         [...unavailable.keys()],
-        guestTypeSources,
         coreOverrides,
+        options,
       ));
     }
     if (checked.errors.length > 0) {

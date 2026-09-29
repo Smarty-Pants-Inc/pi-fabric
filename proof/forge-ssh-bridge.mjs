@@ -28,6 +28,39 @@ import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 
+// BEGIN WORK INGRESS HELPER — extracted by .local/work-wake-probe.mjs without running this driver.
+const workInboxIngress = (messages, expected) => {
+  const xml = (s) => s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  for (const message of messages) {
+    // Only the native custom message at the RPC message's top level counts.
+    if (message?.role !== "custom" || message.customType !== "pi-fabric-inbox") continue;
+    const text = typeof message.content === "string" ? message.content :
+      Array.isArray(message.content) && message.content.every((c) => c.type === "text" && typeof c.text === "string")
+        ? message.content.map((c) => c.text).join("") : "";
+    const envelope = /^<fabric-inbox count="(\d+)">\nWork events addressed to you that no steer or follow-up delivered \(a shadow copy can repeat a message you already saw\):\n([\s\S]*)\n<\/fabric-inbox>$/.exec(text);
+    if (!envelope) continue;
+    // Bodies from rootInboxMessage are XML-escaped. Raw nested tags are never native events.
+    const events = [...envelope[2].matchAll(/(?:^|\n)<event ([^<>\n]+)>([^<]*)<\/event>(?=\n|$)/g)];
+    if (events.length !== Number(envelope[1]) || events.map((m) => m[0].replace(/^\n/, "")).join("\n") !== envelope[2]) continue;
+    for (const [, header, body] of events) {
+      const attrs = {}; let remainder = header;
+      while (remainder) {
+        const attr = /^([a-z_]+)=("(?:[^"\\]|\\.)*")(?: |$)/.exec(remainder);
+        if (!attr || Object.hasOwn(attrs, attr[1])) break;
+        try { attrs[attr[1]] = JSON.parse(attr[2]); } catch { break; }
+        remainder = remainder.slice(attr[0].length);
+      }
+      if (remainder || typeof attrs.id !== "string" || !attrs.id || !/^\d+$/.test(attrs.sequence ?? "") || !Number.isFinite(Date.parse(attrs.at))) continue;
+      if ((expected.id !== undefined && attrs.id !== expected.id) || attrs.from_id !== expected.from.id || attrs.from_name !== expected.from.name ||
+          attrs.topic !== xml(expected.topic) || attrs.kind !== xml(expected.kind) || attrs.key !== expected.key || body !== xml(expected.text)) continue;
+      return { role: message.role, customType: message.customType, eventId: attrs.id, header, senderId: attrs.from_id,
+        topic: attrs.topic, kind: attrs.kind, key: attrs.key, body };
+    }
+  }
+  return undefined;
+};
+// END WORK INGRESS HELPER
+
 const exec = promisify(execFile);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const quote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
@@ -90,11 +123,15 @@ const child = (exe, args, options, name) => {
   });
   return p;
 };
-const cleanEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(PI_|HERDR|FABRIC)/.test(key)));
-const piArgs = (fabric, sessionDir) => ["--mode", "rpc", "-ne", "-e", fabric, "--model", cfg.model, "--thinking", "medium", "--session-dir", sessionDir];
+// The fresh proof client is not a second owner of its parent's fleet lane.
+const cleanEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(PI_|HERDR|FABRIC|SMARTY_ROLE$)/.test(key)));
+// ponytail: each proof call performs one explicit native provider operation, not
+// general work-agent work. Keep context/profile/trust/mesh, but exclude unrelated
+// skill reads: --tools allowlists extension tools too; --no-skills only disables discovery.
+const piArgs = (fabric, sessionDir) => ["--mode", "rpc", "-ne", "-e", fabric, "--tools", "fabric_exec", "--no-skills", "--model", cfg.model, "--thinking", "medium", "--session-dir", sessionDir];
 const rpc = (p, name) => {
   const listeners = new Set(), ingress = [], waits = new Set();
-  let buffer = "", failure;
+  let buffer = "", failure, promptCount = 0, runSequence = 0, activeRun;
   const fail = (error) => {
     failure ??= error;
     for (const cancel of [...waits]) cancel(failure);
@@ -126,8 +163,12 @@ const rpc = (p, name) => {
     while ((at = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, at); buffer = buffer.slice(at + 1);
       let record; try { record = JSON.parse(line); } catch { continue; }
+      // Native RPC has no run ID: number starts locally, keeping the run alive
+      // through settled (agent_end precedes awaited native settle handlers).
+      if (record.type === "agent_start") activeRun = ++runSequence;
       if (record.type === "message_end") remember(record.message);
       for (const listener of [...listeners]) listener(record);
+      if (record.type === "agent_settled") activeRun = undefined;
     }
   });
   p.once("close", () => { fail(new Error(`${name}: child closed`)); stdout.end(); stderr.end(); });
@@ -148,7 +189,10 @@ const rpc = (p, name) => {
     };
     const timer = setTimeout(() => done(new Error(`${name} RPC ${type} deadline`)), ms);
     listeners.add(on); waits.add(done); pending.add(done);
-    try { p.stdin.write(`${JSON.stringify({ id, type, ...fields })}\n`, (error) => { if (error) done(error); }); }
+    try {
+      if (type === "prompt") promptCount++;
+      p.stdin.write(`${JSON.stringify({ id, type, ...fields })}\n`, (error) => { if (error) done(error); });
+    }
     catch (error) { done(error); }
   });
   const idle = async () => { const state = await request("get_state"); return !state.isStreaming; };
@@ -157,10 +201,11 @@ const rpc = (p, name) => {
     await waitFor(`${name} idle`, idle, Math.min(ms, 60_000));
     const token = randomUUID();
     const wrapped = `const value = await (async () => { ${code}\n})(); return { proofToken: ${JSON.stringify(token)}, value };`;
+    const message = `Call fabric_exec exactly once with exactly the code below, byte for byte, resultFormat "json", timeoutMs ${Math.min(ms, 120_000)}. Do not call any other tool or communicate with any other root. Then reply only OK.\n${wrapped}`;
     return new Promise((resolve, reject) => {
       const error = unavailable();
       if (error) return reject(error);
-      let toolId, settled = false;
+      let owningRun, toolId, receipt, ended = false, settled = false;
       const done = (error, value) => {
         if (settled) return;
         settled = true; clearTimeout(timer); listeners.delete(on); waits.delete(done); pending.delete(done);
@@ -168,10 +213,38 @@ const rpc = (p, name) => {
       };
       const on = (record) => {
         if (settled) return;
-        if (record.type === "tool_execution_start" && record.toolName === "fabric_exec" && record.args?.code === wrapped) toolId = record.toolCallId;
-        if (record.type !== "tool_execution_end" || !toolId || record.toolCallId !== toolId) return;
+        if ((record.type === "message_start" || record.type === "message_end") && record.message?.role === "user") {
+          const content = record.message.content;
+          const text = typeof content === "string" ? content : Array.isArray(content) && content.every((c) => c.type === "text")
+            ? content.map((c) => c.text).join("") : undefined;
+          if (text === message) {
+            if (!activeRun || (owningRun !== undefined && owningRun !== activeRun)) return done(new Error(`${name}: prompt run identity mismatch`));
+            owningRun = activeRun;
+          }
+        }
+        // A queued prompt can follow an earlier run's settle, or a native inbox
+        // reply with no tools. Neither owns this exact user prompt.
+        if (owningRun === undefined) return;
+        if (activeRun !== owningRun) return done(new Error(`${name}: owning run changed before settlement`));
+        if (record.type === "agent_end") ended = true;
+        if (record.type === "agent_settled") {
+          if (record.outcome !== "completed" || !ended || !receipt) return done(new Error(`${name}: owning run settled without one completed execution`));
+          results.toolExecutions ??= [];
+          results.toolExecutions.push({ side: name, token, toolCallId: toolId, run: owningRun, isError: false }); save();
+          return done(null, receipt.value);
+        }
+        if (record.type === "tool_execution_start") {
+          if (ended || toolId !== undefined || record.toolName !== "fabric_exec" || record.args?.code !== wrapped ||
+              typeof record.toolCallId !== "string" || !record.toolCallId) return done(new Error(`${name}: wrong or duplicate tool execution`));
+          toolId = record.toolCallId;
+          return;
+        }
+        if (record.type !== "tool_execution_end") return;
+        if (ended || receipt || !toolId || record.toolCallId !== toolId || record.toolName !== "fabric_exec")
+          return done(new Error(`${name}: wrong or duplicate tool execution end`));
         if (record.isError || record.result?.isError || record.result?.details?.success === false) return done(new Error(`${name}: fabric_exec failed`));
-        const text = (record.result?.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+        const content = record.result?.content;
+        const text = Array.isArray(content) ? content.filter((c) => c?.type === "text" && typeof c.text === "string").map((c) => c.text).join("\n") : "";
         let parsed;
         // resultFormat=json; permit host rendering around the JSON, not model prose.
         for (let a = text.indexOf("{"); a >= 0 && !parsed; a = text.indexOf("{", a + 1)) {
@@ -180,13 +253,11 @@ const rpc = (p, name) => {
           }
         }
         if (!parsed) return done(new Error(`${name}: actual tool result lacks proof token / valid JSON`));
-        results.toolExecutions ??= [];
-        results.toolExecutions.push({ side: name, token, toolCallId: toolId, isError: false }); save();
-        done(null, parsed.value);
+        receipt = parsed; // Commit exactly once only after the owning run settles.
       };
       const timer = setTimeout(() => done(new Error(`${name}: tool execution deadline`)), Math.max(1, ms - (Date.now() - started)));
       listeners.add(on); waits.add(done); pending.add(done);
-      request("prompt", { message: `Call fabric_exec exactly once with exactly the code below, byte for byte, resultFormat "json", timeoutMs ${Math.min(ms, 120_000)}. Do not call any other tool or communicate with any other root. Then reply only OK.\n${wrapped}` }, ms).catch((error) => done(error));
+      request("prompt", { message }, ms).catch((error) => done(error));
     });
   };
   const received = async (needle, delivery, senderId) => {
@@ -204,7 +275,12 @@ const rpc = (p, name) => {
     }
     return undefined;
   };
-  return { p, execute, idle, received, request };
+  const receivedWork = async (expected) => {
+    // Same authoritative RPC path as received(): no model prompt, mesh read, or embedded tool output.
+    const data = await request("get_messages");
+    return workInboxIngress(data?.messages ?? [], expected);
+  };
+  return { p, execute, idle, received, receivedWork, request, promptCount: () => promptCount };
 };
 
 const cleanup = async () => {
@@ -329,6 +405,34 @@ try {
       check(`${direction}-${operation}`, { ack, ingress: await waitFor(`${direction} ${operation} native ingress`, () => receiver.received(needle, operation, sender === piA ? a.id : b.id), 120_000) });
     }
   }
+  // Complete all previous turns before publishing: no remote owner prompt may
+  // trigger before_agent_start reconciliation during this independent idle wake.
+  await Promise.all([piA, piB].map((pi) => waitFor("idle before work wake", pi.idle, 120_000)));
+  const work = { topic: "fleet.work.smarty-dev.2045", kind: "p0", to: b.id,
+    text: `${runId}-work-wake: reply only OK; do not use tools or communicate with other roots.`,
+    data: { ref: "smarty-dev#2045", key: `${runId}-work-${randomUUID()}`, runId } };
+  const remotePrompts = piB.promptCount();
+  const workWake = await piA.execute(`return await mesh.publish(${JSON.stringify(work)});`);
+  assert(typeof workWake?.id === "string" && workWake.from?.id === a.id && workWake.to === b.id && workWake.topic === work.topic &&
+    workWake.kind === work.kind && workWake.text === work.text && workWake.data?.key === work.data.key && workWake.data?.runId === runId,
+    "native local work publication lacks exact fresh-root attribution / run marker");
+  const expectedWork = { ...work, from: workWake.from, key: work.data.key };
+  // >=120s is essential: actual RootInbox steer grace is 60s, plus idle timer and bridge latency.
+  // No steer/followUp carries this unique key. RPC get_messages cannot start a model turn.
+  const workIngress = await waitFor("remote idle Main native work inbox ingress", () => piB.receivedWork(expectedWork), 180_000);
+  assert(piB.promptCount() === remotePrompts, "remote owner prompt occurred before independent work ingress assertion");
+  check("factoryWorkIdleNativeIngress", { originalEventId: workWake.id, work, ingress: workIngress,
+    remotePromptsBefore: remotePrompts, remotePromptsAtIngress: piB.promptCount(), noCorrespondingSteer: true });
+  // Only AFTER native ingress has been asserted may Main be prompted to read its mesh.
+  const workRead = await waitFor("remote Main native bridged work read", async () => {
+    const events = await piB.execute(`const self=(await agents.main()).id; const events=await mesh.read({topic:${JSON.stringify(work.topic)},to:self,limit:500}); return events.filter(e=>e.data?.key===${JSON.stringify(work.data.key)}).map(e=>({id:e.id,topic:e.topic,kind:e.kind,to:e.to,from:e.from,text:e.text,key:e.data?.key,runId:e.data?.runId,bridge:e.data?.bridge}));`);
+    return events.find((e) => e.id === workIngress.eventId && e.topic === work.topic && e.kind === work.kind && e.to === b.id &&
+      e.from?.id === a.id && e.from?.name === workWake.from.name && e.from?.kind === workWake.from.kind && e.text === work.text &&
+      e.key === work.data.key && e.runId === runId && e.bridge?.id === workWake.id && e.bridge.from === cfg.localName);
+  }, 180_000);
+  const correlatedIngress = await piB.receivedWork({ ...expectedWork, id: workRead.id });
+  assert(correlatedIngress?.eventId === workRead.id, "native inbox remote event ID does not correlate with native bridged read");
+  check("factoryWorkBridgedRead", { ...workRead, ingress: correlatedIngress });
   const prNeedle = `${runId}-pr.wake`, laneNeedle = `${runId}-lane-followUp`;
   const prWake = await store.publish({ topic: "ops.owner", kind: "pr.wake", from: { id: "factory-host:owner", name: "factory-owner", kind: "main" }, to: b.id,
     text: prNeedle, data: { rootId: b.id, repo: "Smarty-Pants-Inc/smarty-dev", pr: 2045 } });

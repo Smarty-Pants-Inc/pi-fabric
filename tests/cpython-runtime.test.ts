@@ -170,7 +170,7 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
   it("kills synchronous infinite loops and preserves pre-timeout logs", async () => {
     // smarty-dev#883: a wall deadline also measured interpreter startup, so a
     // loaded runner timed out before the guest printed. The deadline runs on a
-    // controlled clock, advanced only once the runtime has read the guest's output.
+    // controlled clock, advanced only once the guest has printed and entered its loop.
     const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
     // Watch the guest's stdout from spawn on, so no early chunk is missed.
     let started!: () => void;
@@ -181,17 +181,13 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
       child.stdout?.on("data", (chunk: Buffer) => { output += chunk; if (output.includes("started")) started(); });
       return child;
     }) as typeof actual.spawn);
-    let looping!: () => void;
-    const inLoop = new Promise<void>((resolve) => { looping = resolve; });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
-      const pending = run('print("started", flush=True)\nawait tools.call(ref="loop", args={})\nwhile True:\n    pass', async () => {
-        await printed;
-        // Reply on the next turn; the guest then enters its loop.
-        setImmediate(looping);
-        return null;
-      }, { timeoutMs: 1500 });
-      await inLoop;
+      const pending = run('print("started", flush=True)\nwhile True:\n    pass', echo, { timeoutMs: 1500 });
+      // Once "started" arrives, the guest has returned from print and has no
+      // await point left before its loop. A run that ends first (a startup
+      // error) settles pending, so the race shows that error instead of hanging.
+      await Promise.race([printed, pending]);
       vi.advanceTimersByTime(1500);
       const result = await pending;
       expect(result.terminationReason).toBe("timed_out");

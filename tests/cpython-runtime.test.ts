@@ -302,6 +302,17 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  // smarty-dev#883: bwrap without user namespaces exits before it reads the
+  // execute frame; the reset pipe raced "close" and hid the sandbox diagnosis.
+  it.skipIf(process.platform === "win32")("reports a child that exits at startup, not the pipe reset it leaves", async () => {
+    const dying = path.join(temp(), "dying-python");
+    fs.writeFileSync(dying, "#!/bin/sh\necho 'bwrap: setting up uid map: Permission denied' >&2\nexit 1\n", { mode: 0o755 });
+    const result = await new CPythonRuntime(dying).execute(`return "${"x".repeat(256 * 1024)}"`, echo, options);
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toMatch(/process exited before returning a result \(1\)/);
+    expect(result.error).toContain("setting up uid map");
+  });
+
   it.each(['sys.version_info = (3, 9, 0)', 'sys.implementation.name = "pypy"'])("rejects unsupported interpreter identity before imports/RPC: %s", (override) => {
     const result = childProcess.spawnSync(binary, ["-I", "-B", "-c", `import sys\n${override}\nexec(${JSON.stringify(CPYTHON_CHILD_SOURCE)})`]);
     expect(result.status).toBe(1);

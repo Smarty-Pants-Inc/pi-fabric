@@ -191,6 +191,19 @@ export class CPythonRuntime implements FabricKernelRuntime {
       };
       const abort = (): void => void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
       const fail = (message: string): void => void finish({ value: undefined, terminationReason: "runtime_error", error: message });
+      // A child that dies at startup (bwrap without user namespaces) resets its
+      // pipes before "close" reports its exit status and stderr. Let that
+      // diagnosis settle the run instead of racing it with a bare EPIPE or
+      // ECONNRESET; a live child is killed so "close" always follows.
+      let pipeError: string | undefined;
+      const failPipe = (message: string): void => {
+        if (settled || finishing || pipeError) return;
+        pipeError = message;
+        if (child.pid && process.platform !== "win32") {
+          try { process.kill(-child.pid, "SIGKILL"); } catch { /* The process group may already have exited. */ }
+        }
+        child.kill("SIGKILL");
+      };
       const scheduleDeadline = (): void => {
         if (deadline) clearTimeout(deadline);
         deadline = setTimeout(() => void finish({
@@ -209,7 +222,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
             fail("CPython IPC frame or write buffer exceeds its 16 MiB frame limit");
             return;
           }
-          channel.write(frame, (error) => { if (error && !settled && !finishing) fail(`CPython IPC failed: ${error.message}`); });
+          channel.write(frame, (error) => { if (error) failPipe(`CPython IPC failed: ${error.message}`); });
         } catch (error) { fail(`CPython IPC serialization failed: ${errorText(error)}`); }
       };
       const handleMessage = (message: unknown): void => {
@@ -296,7 +309,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         channel = socket;
         if (socket instanceof net.Socket) socket.setNoDelay(true);
         socket.on("data", onData);
-        socket.on("error", (error) => { if (!settled && !finishing) fail(`CPython IPC failed: ${error.message}`); });
+        socket.on("error", (error) => failPipe(`CPython IPC failed: ${error.message}`));
       };
       child.stdout?.on("data", (chunk: Buffer) => appendLog(0, decoders[0]!.write(chunk)));
       child.stderr?.on("data", (chunk: Buffer) => appendLog(1, decoders[1]!.write(chunk)));
@@ -304,13 +317,13 @@ export class CPythonRuntime implements FabricKernelRuntime {
       child.on("close", (exitCode, signal) => {
         if (settled || finishing) return;
         const diagnostics = [...logs, ...partialLogs].join("\n").slice(-4000);
-        fail(`CPython ${this.enforce ? "sandbox " : ""}process exited before returning a result (${signal ?? exitCode}).${this.enforce ? " Verify OS sandbox availability/user namespaces; no unsandboxed fallback is permitted." : ""}${diagnostics ? `\n${diagnostics}` : ""}`);
+        fail(`${pipeError ? `${pipeError}; ` : ""}CPython ${this.enforce ? "sandbox " : ""}process exited before returning a result (${signal ?? exitCode}).${this.enforce ? " Verify OS sandbox availability/user namespaces; no unsandboxed fallback is permitted." : ""}${diagnostics ? `\n${diagnostics}` : ""}`);
       });
       options.signal?.addEventListener("abort", abort, { once: true });
       if (options.signal?.aborted) { abort(); return; }
       if (command.seccomp) {
         const filterPipe = child.stdio[4] as Duplex;
-        filterPipe.on("error", (error) => { if (!settled) fail(`CPython sandbox filter failed: ${error.message}`); });
+        filterPipe.on("error", (error) => failPipe(`CPython sandbox filter failed: ${error.message}`));
         filterPipe.end(command.seccomp);
       }
       scheduleDeadline();

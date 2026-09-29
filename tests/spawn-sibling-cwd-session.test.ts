@@ -29,8 +29,20 @@ const residentHostPids = (root: string): number[] =>
     .filter((entry) => path.basename(entry) === "owner.json")
     .map((entry) => { try { return JSON.parse(fs.readFileSync(path.join(root, entry), "utf8")).pid; } catch { return undefined; } })
     .filter((pid): pid is number => Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid);
-// SIGTERM lets the host close its agents and release its files. Wait for the
-// exit itself; SIGKILL only if the host hangs.
+// Everything the durable spawn started that can write under root: the
+// resident host (named by owner.json; its argv does not name root), and the
+// processes whose argv does: its launcher, which appends a child-exit trace
+// after the host exits (pi-exit-2010, #145), and the durable agent's worker,
+// which outlives the host and still writes agent/ (#146 CI).
+const rootProcesses = (root: string): number[] => {
+  const named = execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" }).split("\n")
+    .filter((line) => line.includes(root))
+    .map((line) => Number(line.trim().split(/\s+/)[0]));
+  return [...new Set([...residentHostPids(root), ...named])]
+    .filter((pid) => Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid);
+};
+// SIGTERM lets each close and release its files. Wait for every exit;
+// SIGKILL only if one hangs.
 const stopProcess = async (pid: number): Promise<void> => {
   try { process.kill(pid, "SIGTERM"); } catch { return; }
   const killAt = Date.now() + 30_000;
@@ -45,19 +57,19 @@ describe.skipIf(!built || process.platform === "win32")("durable spawn beside th
   const sessions: AgentSession[] = [];
   const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   afterEach(async () => {
+    // Snapshot first, while owner.json still names the host.
+    const started = roots.flatMap(rootProcesses);
     for (const session of sessions.splice(0)) session.dispose();
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    // smarty-dev#883: the durable spawn started a detached resident host that
-    // writes under root until it exits (ENOTEMPTY on CI). Stop it and wait
-    // for its exit, then remove the files; the retry only covers the
-    // filesystem settling after that exit.
-    for (const root of roots.splice(0)) {
-      await Promise.all(residentHostPids(root).map(stopProcess));
-      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-    }
+    // smarty-dev#883: the durable spawn started detached processes that write
+    // under root until they exit (ENOTEMPTY on CI). Stop them and wait for
+    // their exits, then remove the files; the retry only covers the
+    // filesystem settling after that.
+    await Promise.all(started.map(stopProcess));
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }, 60_000);
 
   it("spawns only after a parallel sibling git worktree add finishes its checkout", async () => {
@@ -119,7 +131,8 @@ describe.skipIf(!built || process.platform === "win32")("durable spawn beside th
     expect(results[1]![1]).toMatch(/^spawned \d+$/);
     expect(Number(results[1]![1].split(" ")[1])).toBeGreaterThanOrEqual(addedAt);
     expect(fs.readFileSync(path.join(worktree, "slow.txt"), "utf8")).toBe("complete\n");
-    // The durable spawn must have started a resident host; afterEach stops it.
+    // The durable spawn must have started a resident host; afterEach stops it
+    // and every other process it started.
     expect(residentHostPids(root).length).toBeGreaterThan(0);
   }, 120_000);
 });

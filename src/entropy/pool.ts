@@ -132,11 +132,15 @@ export const observationWindowDigest = (
 const COOPERATIVE_OBSERVATION_CHUNK = 256;
 const COOPERATIVE_DIGEST_CHUNK = 512;
 
-const yieldToLoop = (): Promise<void> =>
-  new Promise((resolve) => setImmediate(resolve));
+/** Yield to the event loop, then stop if the caller's lifecycle ended (smarty-dev#2010). */
+const yieldToLoop = async (signal?: AbortSignal): Promise<void> => {
+  await new Promise((resolve) => setImmediate(resolve));
+  signal?.throwIfAborted();
+};
 
 const digestFromIdentityCountsAsync = async (
   counts: Readonly<Record<string, number>>,
+  signal?: AbortSignal,
 ): Promise<string> => {
   const hash = createHash("sha256");
   hash.update("[");
@@ -157,7 +161,7 @@ const digestFromIdentityCountsAsync = async (
       processed += size;
       if (processed >= COOPERATIVE_DIGEST_CHUNK) {
         processed = 0;
-        await yieldToLoop();
+        await yieldToLoop(signal);
       }
     }
   }
@@ -381,6 +385,7 @@ export class SessionObservationCache {
   async merge(
     pool: EntropyObservationPoolFile | undefined,
     windows: readonly EntropyObservationWindow[],
+    signal?: AbortSignal,
   ): Promise<MergedObservationPool> {
     const summarized: SummarizedObservationWindow[] = [];
     for (const window of windows) {
@@ -396,18 +401,18 @@ export class SessionObservationCache {
           const identity = observationIdentity(observation);
           counts[identity] = (counts[identity] ?? 0) + (observation.count ?? 1);
           digestCounts[identity] = (digestCounts[identity] ?? 0) + 1;
-          if ((index + 1) % COOPERATIVE_OBSERVATION_CHUNK === 0) await yieldToLoop();
+          if ((index + 1) % COOPERATIVE_OBSERVATION_CHUNK === 0) await yieldToLoop(signal);
         }
         const digest = append && start === window.observations.length
           ? cached!.summary.digest
-          : await digestFromIdentityCountsAsync(digestCounts);
+          : await digestFromIdentityCountsAsync(digestCounts, signal);
         cached = { observations: window.observations, counts, digestCounts, summary: { counts, digest } };
       }
       this.#windows.delete(window.file);
       this.#windows.set(window.file, cached!);
       while (this.#windows.size > 16) this.#windows.delete(this.#windows.keys().next().value!);
       summarized.push({ file: window.file, summary: cached!.summary });
-      await yieldToLoop();
+      await yieldToLoop(signal);
     }
     return mergeObservationSummaries(pool, summarized);
   }

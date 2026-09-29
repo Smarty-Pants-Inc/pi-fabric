@@ -37,6 +37,14 @@ export const unknownParticipant = (
         `has not joined yet, or uses another mesh root${hint})`,
     );
   }
+  const remote = known.participant.remoteHost;
+  if (remote) {
+    const when = Number.isFinite(known.lapsedMs) ? ` ${Math.round(known.lapsedMs / 1000)} s ago` : "";
+    return new Error(
+      `Unknown ${label}: ${id} (its lease mirrored from remote host ${remote} lapsed${when}: ` +
+        "the mesh bridge to that host is down, or the session has ended)",
+    );
+  }
   const when = Number.isFinite(known.lapsedMs)
     ? `its lease lapsed ${Math.round(known.lapsedMs / 1000)} s ago`
     : "its host is gone or was replaced";
@@ -57,6 +65,9 @@ export class AgentMessageRouter {
     if (this.participants.writeStalled?.()) return undefined;
     const known = this.participants.lastKnown?.(id);
     if (!known || known.participant.kind !== "root" || known.lapsedMs > LAPSED_ROOT_REPLY_WINDOW_MS) return undefined;
+    // A mirrored lease lapses when the mesh bridge stops: nothing would carry the reply, so the
+    // sender gets the lapse error at once instead of an acknowledgement timeout (smarty-dev#2004).
+    if (known.participant.remoteHost) return undefined;
     return known.participant;
   }
 

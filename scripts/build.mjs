@@ -6,6 +6,7 @@ const primaryEntryPoints = [
   "src/index.ts",
   "src/memory.ts",
   "src/mesh.ts",
+  "src/mesh-bridge.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/jev.ts",
@@ -69,6 +70,7 @@ const lazyEntryPoints = [
   "src/worker/model-control.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
+  "src/worker/run-log.ts",
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
 ];

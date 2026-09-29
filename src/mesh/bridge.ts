@@ -105,11 +105,19 @@ export interface BridgeSide {
   publish(event: BridgePublish): Promise<{ sequence: number }>;
   /** Replace this side's mirror of the peer's presence. */
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void>;
-  /** Original ids of events the peer bridged into this side after a sequence. */
-  bridgedIds(after: number): Promise<string[]>;
+  /** Original ids of events the peer bridged into this side after a sequence, one bounded page. */
+  bridgedIds(after: number): Promise<BridgedIds>;
   /** End the transport and fail pending calls (a remote side only). */
   close?(error?: Error): void;
+  /** The peer's records this side holds now (the hub side only): the link's current authority. */
+  owned?(): Promise<Pick<BridgePresence, "hosts" | "participants">>;
+  /** Fence every mirror write, wait for one in flight, then delete this link's mirrors. */
+  withdraw?(): Promise<void>;
 }
+
+export interface BridgedIds { ids: string[]; through: number; done: boolean }
+/** One bridgedIds page holds at most this many ids (about 2 MiB on the wire). */
+const BRIDGED_IDS_PAGE = 50_000;
 
 const remoteHostOf = (value: unknown): string | undefined =>
   isObject(value) && typeof value.remoteHost === "string" ? value.remoteHost : undefined;
@@ -205,7 +213,8 @@ export class StoreBridgeSide implements BridgeSide {
         continue;
       }
       reserved.add(participant.id).add(participant.ownerIdentityId).add(participant.rootId);
-      for (const alias of [participant.label, participant.sessionId]) if (typeof alias === "string" && alias) reserved.add(alias);
+      // Labels are minted per mesh and collide by design; they are never addresses across.
+      if (typeof participant.sessionId === "string" && participant.sessionId) reserved.add(participant.sessionId);
       const owner = live.get(participant.ownerHostId);
       if (
         mark === undefined && participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
@@ -224,7 +233,54 @@ export class StoreBridgeSide implements BridgeSide {
     return { sequence: published.sequence };
   }
 
-  async mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void> {
+  #fenced = false;
+  #inflight: Promise<void> = Promise.resolve();
+
+  /**
+   * Mirror the peer's presence. Calls run one at a time; after withdraw() no call writes again,
+   * and each write checks the fence, so a mirror in flight cannot restore a record or lease after
+   * the withdrawal (security review round 2, F3).
+   */
+  mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void> {
+    if (this.#fenced) return Promise.resolve();
+    const run = this.#inflight.then(() => this.#mirror(presence, false));
+    this.#inflight = run.catch(() => undefined);
+    return run;
+  }
+
+  async withdraw(): Promise<void> {
+    this.#fenced = true;
+    await this.#inflight;
+    await this.#mirror({ hosts: [], participants: [] }, true);
+  }
+
+  async owned(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
+    const now = this.now();
+    const leases = readHostLeases(this.store.root);
+    const hosts: BridgeHost[] = [];
+    for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
+      if (remoteHostOf(entry.value) !== this.peer) continue;
+      const host = hostOf(entry.key, entry.value);
+      if (!host || entry.updatedBy.id !== host.identity.id) continue;
+      const expiresAt = hostLeaseExpiry(leases, host);
+      if (expiresAt > now) hosts.push({ record: host, expiresAt });
+    }
+    const live = new Map(hosts.map((host) => [host.record.id, host.record]));
+    const participants: FabricParticipantRecord[] = [];
+    for (const entry of this.store.listAll(PARTICIPANT_PREFIX, { fresh: true })) {
+      if (remoteHostOf(entry.value) !== this.peer) continue;
+      const participant = participantOf(entry.key, entry.value);
+      const owner = participant && live.get(participant.ownerHostId);
+      if (
+        participant && owner && participant.kind === "root" && entry.updatedBy.id === participant.ownerIdentityId &&
+        owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId
+      ) participants.push(participant);
+    }
+    return { hosts, participants };
+  }
+
+  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean): Promise<void> {
+    const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
     const own = new Set((await this.presence()).reserved);
     const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
@@ -265,14 +321,19 @@ export class StoreBridgeSide implements BridgeSide {
         (typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS ||
           !key.startsWith(HOST_PREFIX))
       ) continue;
+      if (halted()) return;
       await this.#put(key, value, identity, existing?.version);
     }
+    // A lease renews only a host record this link holds now, as written: never another owner's.
     for (const lease of leases) {
-      const entry = mirrored.get(keyFor(HOST_PREFIX, lease.id));
-      if (entry && remoteHostOf(entry.value) !== this.peer) continue;
+      if (halted()) return;
+      const entry = this.store.get(keyFor(HOST_PREFIX, lease.id), { fresh: true });
+      const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
+      if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) continue;
       writeHostLease(this.store.root, { ...lease, updatedAt: now });
     }
     for (const [key, { value, version }] of mirrored) {
+      if (halted()) return;
       if (wanted.has(key) || remoteHostOf(value) !== this.peer) continue;
       if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
         removeHostLease(this.store.root, value.id);
@@ -296,7 +357,7 @@ export class StoreBridgeSide implements BridgeSide {
     }
   }
 
-  async bridgedIds(after: number): Promise<string[]> {
+  async bridgedIds(after: number): Promise<BridgedIds> {
     const ids: string[] = [];
     let cursor = after;
     while (true) {
@@ -305,10 +366,12 @@ export class StoreBridgeSide implements BridgeSide {
         const stamp = bridgeStampOf(event);
         if (stamp?.from === this.peer) ids.push(stamp.id);
       }
-      if (page.length < this.store.maxReadEvents) return ids;
+      if (page.length < this.store.maxReadEvents) return { ids, through: page.at(-1)?.sequence ?? cursor, done: true };
       cursor = page.at(-1)!.sequence;
+      if (ids.length >= BRIDGED_IDS_PAGE) return { ids, through: cursor, done: false };
     }
   }
+
 }
 
 const ignoreConflict = (error: unknown): void => {
@@ -430,7 +493,7 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unk
     case "hello": return { version: BRIDGE_PROTOCOL_VERSION };
     case "latestSequence": return side.latestSequence();
     case "read": return side.read(numberArg(request.args, "after"));
-    case "presence": return { ...(await side.presence()), reserved: [] };
+    case "presence": return { ...boundPresence(await side.presence()).presence, reserved: [] };
     case "publish": return side.publish(checkBridgePublish(request.args));
     case "mirror": return side.mirror(presenceArg(request.args));
     case "bridgedIds": return side.bridgedIds(numberArg(request.args, "after"));
@@ -511,7 +574,7 @@ export class RemoteBridgeSide implements BridgeSide {
   presence(): Promise<BridgePresence> { return this.#call("presence"); }
   publish(event: BridgePublish): Promise<{ sequence: number }> { return this.#call("publish", event); }
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void> { return this.#call("mirror", presence); }
-  bridgedIds(after: number): Promise<string[]> { return this.#call("bridgedIds", { after }); }
+  bridgedIds(after: number): Promise<BridgedIds> { return this.#call("bridgedIds", { after }); }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -553,16 +616,32 @@ export interface BridgeStepResult {
   dropped: number;
 }
 
-// Ids and unique aliases only: a free-form name is never an address (security review F1).
-const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
+// Where the hub routes to: the peer's canonical ids only. A label, session id or name is never
+// an address across, since a hub recipient's session name is not in any record the bridge can
+// reserve (security review round 2, F1).
+const remoteAddresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   const names = new Set<string>();
   for (const { record } of presence.hosts) names.add(record.id).add(record.identity.id);
+  for (const participant of presence.participants) names.add(participant.id).add(participant.rootId);
+  return names;
+};
+
+// Where the hub accepts events from the peer: its own natives, by id or unique alias.
+const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
+  const names = remoteAddresses(presence);
   for (const participant of presence.participants) {
-    names.add(participant.id).add(participant.rootId);
     for (const alias of [participant.label, participant.sessionId]) if (alias) names.add(alias);
   }
   return names;
 };
+
+/**
+ * A root's canonical id (`session:<session id>`); its host id and identity id are the same. An
+ * admitted remote id must have this form, so it never equals a hub session name.
+ * ponytail: a hub user who names a session exactly like another host's `session:<uuid>` could
+ * still collide; session names are not in any record the bridge can see.
+ */
+const CANONICAL_ID = /^session:[A-Za-z0-9-]{8,128}$/;
 
 /**
  * The remote's presence as this link admits it: hosts and roots none of whose ids or aliases
@@ -570,18 +649,52 @@ const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Se
  * admitted host. Mirroring, routing and sender checks all use this snapshot, never the peer's
  * raw claims (security review F1/F2).
  */
-export const admitPresence = (claimed: BridgePresence, reserved: ReadonlySet<string>): Pick<BridgePresence, "hosts" | "participants"> => {
+export const admitPresence = (
+  claimed: Pick<BridgePresence, "hosts" | "participants">,
+  reserved: ReadonlySet<string>,
+): Pick<BridgePresence, "hosts" | "participants"> => {
   const hosts = claimed.hosts.filter(({ record }) =>
-    ![record.id, record.identity.id, record.rootId].some((id) => reserved.has(id)));
+    [record.id, record.identity.id, record.rootId].every((id) => CANONICAL_ID.test(id) && !reserved.has(id)));
   const admitted = new Map(hosts.map(({ record }) => [record.id, record]));
   const participants = claimed.participants.filter((participant) => {
     const owner = admitted.get(participant.ownerHostId);
-    return participant.kind === "root" && owner !== undefined &&
+    return participant.kind === "root" && owner !== undefined && CANONICAL_ID.test(participant.id) &&
       owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId &&
-      ![participant.id, participant.rootId, participant.ownerIdentityId, participant.label, participant.sessionId]
+      ![participant.id, participant.rootId, participant.ownerIdentityId, participant.sessionId]
         .some((id) => typeof id === "string" && reserved.has(id));
   });
   return { hosts, participants };
+};
+
+/**
+ * A presence snapshot that fits one frame (security review round 2, F4): whole hosts with their
+ * roots, in order, until the budget. Hosts past it are left out, so their mirrors lapse and
+ * senders get the normal lapsed error; the bridge logs how many.
+ */
+export const boundPresence = (
+  presence: Pick<BridgePresence, "hosts" | "participants">,
+  budget = BRIDGE_PAGE_BYTES,
+): { presence: Pick<BridgePresence, "hosts" | "participants">; dropped: number } => {
+  const roots = new Map<string, FabricParticipantRecord[]>();
+  for (const participant of presence.participants) {
+    roots.set(participant.ownerHostId, [...(roots.get(participant.ownerHostId) ?? []), participant]);
+  }
+  const hosts: BridgeHost[] = [];
+  const participants: FabricParticipantRecord[] = [];
+  let bytes = 0;
+  let dropped = 0;
+  for (const host of presence.hosts) {
+    const own = roots.get(host.record.id) ?? [];
+    const size = Buffer.byteLength(JSON.stringify([host, own]), "utf8");
+    if (bytes + size > budget) {
+      dropped += 1;
+      continue;
+    }
+    bytes += size;
+    hosts.push(host);
+    participants.push(...own);
+  }
+  return { presence: { hosts, participants }, dropped };
 };
 
 const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
@@ -594,7 +707,6 @@ const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<
 export class MeshBridge {
   #cursor: CursorFile | undefined;
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
-  #presence: { local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> } | undefined;
   #presenceAt = Number.NEGATIVE_INFINITY;
   #stopped = false;
   #wake: (() => void) | undefined;
@@ -635,10 +747,10 @@ export class MeshBridge {
       this.#save();
     }
     const [toRemote, toLocal] = await Promise.all([
-      remote.bridgedIds(this.#cursor.toRemote.mark),
-      local.bridgedIds(this.#cursor.toLocal.mark),
+      allBridgedIds(remote, this.#cursor.toRemote.mark),
+      allBridgedIds(local, this.#cursor.toLocal.mark),
     ]);
-    this.#seen = { toRemote: new Set(toRemote), toLocal: new Set(toLocal) };
+    this.#seen = { toRemote, toLocal };
   }
 
   #save(): void {
@@ -646,32 +758,46 @@ export class MeshBridge {
     writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600 });
   }
 
-  /** Mirror each side's live roots into the other, and keep both views for routing. */
+  /** Mirror each side's live roots into the other. */
   async syncPresence(): Promise<void> {
     const [local, claimed] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
     const remote = admitPresence(claimed, new Set(local.reserved));
     if (this.#stopped) return;
-    await Promise.all([this.options.remote.mirror(local), this.options.local.mirror(remote)]);
-    this.#presence = { local, remote };
+    const outbound = boundPresence(local);
+    if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
+    // Both settle before a failure is reported, so no local write outlives this pass.
+    const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote)]);
+    for (const result of results) if (result.status === "rejected") throw result.reason;
     this.#presenceAt = Date.now();
+  }
+
+  /**
+   * Who may be reached and who may speak across, read after the mirror step and again for every
+   * page: only the peer's records this side holds now, still clear of every reserved hub id. A
+   * claim refused or lost in this pass is never trusted (security review round 2, F1/F2).
+   */
+  async #authority(): Promise<{ local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> }> {
+    const { local } = this.options;
+    if (!local.owned) throw new Error("The hub side of a bridge must report the records it holds");
+    const [presence, owned] = await Promise.all([local.presence(), local.owned()]);
+    return { local: presence, remote: admitPresence(owned, new Set(presence.reserved)) };
   }
 
   /** One pass: presence when due, then every new event in both directions. */
   async step(): Promise<BridgeStepResult> {
     if (!this.#cursor) await this.start();
-    if (!this.#presence || Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS)) {
+    if (Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS)) {
       await this.syncPresence();
     }
-    if (this.#stopped || !this.#presence) return { toRemote: 0, toLocal: 0, dropped: 0 };
-    const { local, remote } = this.#presence;
-    const toRemote = await this.#forward("toRemote", this.options.local, this.options.remote, {
-      recipients: addresses(remote),
+    if (this.#stopped) return { toRemote: 0, toLocal: 0, dropped: 0 };
+    const toRemote = await this.#forward("toRemote", this.options.local, this.options.remote, async () => {
+      const { remote } = await this.#authority();
+      return { recipients: remoteAddresses(remote) };
     });
-    const toLocal = await this.#forward("toLocal", this.options.remote, this.options.local, {
-      recipients: addresses(local),
+    const toLocal = await this.#forward("toLocal", this.options.remote, this.options.local, async () => {
+      const { local, remote } = await this.#authority();
       // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
-      senders: senders(remote),
-      reserved: new Set(local.reserved),
+      return { recipients: addresses(local), senders: senders(remote), reserved: new Set(local.reserved) };
     });
     return { toRemote: toRemote.forwarded, toLocal: toLocal.forwarded, dropped: toRemote.dropped + toLocal.dropped };
   }
@@ -680,7 +806,7 @@ export class MeshBridge {
     direction: "toRemote" | "toLocal",
     source: BridgeSide,
     target: BridgeSide,
-    rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> },
+    authority: () => Promise<{ recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }>,
   ): Promise<{ forwarded: number; dropped: number }> {
     const cursor = this.#cursor![direction];
     const seen = this.#seen[direction];
@@ -689,6 +815,7 @@ export class MeshBridge {
     while (true) {
       const start = cursor.after;
       const page = await source.read(start);
+      const rules = await authority();
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
@@ -781,11 +908,24 @@ export class MeshBridge {
     await within(this.options.remote.mirror({ hosts: [], participants: [] }));
     this.options.remote.close?.(new Error("Bridge stopped"));
     await within(this.#running);
-    await this.options.local.mirror({ hosts: [], participants: [] }).catch((error: unknown) => {
+    const { local } = this.options;
+    await (local.withdraw ? local.withdraw() : local.mirror({ hosts: [], participants: [] })).catch((error: unknown) => {
       this.#log(`local withdrawal failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   }
 }
+
+const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<string>> => {
+  const ids = new Set<string>();
+  let cursor = after;
+  for (;;) {
+    const page = await side.bridgedIds(cursor);
+    if (!page || !Array.isArray(page.ids) || typeof page.through !== "number") throw new Error("Bridge ids page is invalid");
+    for (const id of page.ids) if (typeof id === "string") ids.add(id);
+    if (page.done || page.through <= cursor) return ids;
+    cursor = page.through;
+  }
+};
 
 const isPermanent = (error: unknown): boolean =>
   error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message);

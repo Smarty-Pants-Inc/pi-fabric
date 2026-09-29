@@ -6,6 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  type BridgeSide,
   MeshBridge,
   RemoteBridgeSide,
   serveBridgeAgent,
@@ -34,14 +35,17 @@ const scratch = (): string => {
 const hash = (id: string): string => createHash("sha256").update(id).digest("hex");
 
 /** A live root session on a mesh, as the participant directory writes it. */
+/** A root's canonical id, as Fabric mints it (`session:<session id>`); its host id is the same. */
+const sid = (name: string): string => `session:${name}-00000000`;
+
 const addRoot = async (
   store: MeshStore, name: string, expiresIn = 15_000,
-  claims: { hostId?: string; id?: string; label?: string; sessionId?: string } = {},
+  claims: { hostId?: string; id?: string; label?: string; sessionId?: string; cwd?: string } = {},
 ) => {
   const now = Date.now();
-  const hostId = claims.hostId ?? `host:${name}`;
+  const hostId = claims.hostId ?? claims.id ?? sid(name);
   const sessionId = claims.sessionId ?? name;
-  const identity: MeshIdentity = { id: claims.id ?? `session:${name}`, name: "main", kind: "main", sessionId };
+  const identity: MeshIdentity = { id: claims.id ?? sid(name), name: "main", kind: "main", sessionId };
   await store.put({
     key: `topology/hosts/${hash(hostId)}`,
     identity,
@@ -53,7 +57,7 @@ const addRoot = async (
     value: {
       format: 1, id: identity.id, kind: "root", rootId: identity.id, ownerHostId: hostId, ownerIdentityId: identity.id,
       name, label: claims.label ?? name.toUpperCase(), status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
-      sessionId, startedAt: now, updatedAt: now, controlProtocol: "v1",
+      sessionId, startedAt: now, updatedAt: now, controlProtocol: "v1", ...(claims.cwd ? { cwd: claims.cwd } : {}),
     },
   });
   return { hostId, identity };
@@ -67,6 +71,9 @@ interface SetupOptions {
   realPipe?: boolean;
   callTimeoutMs?: number;
   stopMs?: number;
+  /** Wrap the hub's view of the remote (to hold or fail its calls). */
+  wrapRemote?: (remote: RemoteBridgeSide) => BridgeSide;
+  local?: (hub: MeshStore, remoteName: string) => StoreBridgeSide;
 }
 
 const setup = (cursorPath?: string, options: SetupOptions = {}) => {
@@ -95,7 +102,8 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
   const logs: string[] = [];
   const bridge = new MeshBridge({
     localName: "dev1", remoteName,
-    local: new StoreBridgeSide(hub, remoteName), remote,
+    local: options.local?.(hub, remoteName) ?? new StoreBridgeSide(hub, remoteName),
+    remote: options.wrapRemote?.(remote) ?? remote,
     cursorPath: cursorPath ?? path.join(scratch(), "cursor.json"),
     presenceMs: 0,
     ...(options.stopMs ? { stopMs: options.stopMs } : {}),
@@ -155,7 +163,7 @@ describe("mesh bridge", () => {
     const gone = await addRoot(far, "gone", -1);
     await bridge.start();
     await bridge.step();
-    expect(hub.get(`topology/hosts/${hash("host:same")}`)!.value).not.toHaveProperty("remoteHost");
+    expect(hub.get(`topology/hosts/${hash(sid("same"))}`)!.value).not.toHaveProperty("remoteHost");
     expect(hub.get(`topology/hosts/${hash(gone.hostId)}`)).toBeUndefined();
   });
 
@@ -194,10 +202,10 @@ describe("mesh bridge", () => {
     await addRoot(hub, "lane");
     await addRoot(far, "forge-main");
     await bridge.start();
-    await hub.publish({ topic: "fleet.work.smarty-dev.2004", kind: "ask", from: factory, to: "FORGE-MAIN", text: "w" });
-    await hub.publish({ topic: "ops.owner", kind: "pr.wake", from: factory, to: "session:forge-main", data: { rootId: "session:forge-main" } });
-    await hub.publish({ topic: "ops.owner", kind: "drift", from: factory, to: "session:forge-main" });
-    await hub.publish({ topic: "github.pull_request", kind: "opened", from: factory, to: "session:forge-main" });
+    await hub.publish({ topic: "fleet.work.smarty-dev.2004", kind: "ask", from: factory, to: sid("forge-main"), text: "w" });
+    await hub.publish({ topic: "ops.owner", kind: "pr.wake", from: factory, to: sid("forge-main"), data: { rootId: sid("forge-main") } });
+    await hub.publish({ topic: "ops.owner", kind: "drift", from: factory, to: sid("forge-main") });
+    await hub.publish({ topic: "github.pull_request", kind: "opened", from: factory, to: sid("forge-main") });
     await hub.publish({ topic: "fleet.work.smarty-dev.1", kind: "ask", from: factory, to: "someone-local", text: "stays" });
     expect(await bridge.step()).toMatchObject({ toRemote: 2 });
     expect(far.read({ after: 0, limit: 100 }).map((e) => `${e.topic}/${e.kind}`))
@@ -274,20 +282,21 @@ describe("mesh bridge", () => {
     const lane = await addRoot(hub, "lane");
     const org = await addRoot(hub, "org");
     // The remote claims the hub's host id, the hub root's label and session id, and a name.
-    await addRoot(far, "thief", 15_000, { hostId: lane.hostId, id: "session:thief" });
+    await addRoot(far, "thief", 15_000, { hostId: lane.hostId, id: sid("thief") });
     await addRoot(far, "alias", 15_000, { label: "ORG", sessionId: "org" });
-    await addRoot(far, "fabric-v2", 15_000, { sessionId: "0f2a", label: "FV-1" });
+    // A hub Main whose session name is "fabric-v2" is in no record: the remote claims it as label and session id.
+    await addRoot(far, "fabric-v2", 15_000, { sessionId: "fabric-v2", label: "fabric-v2" });
     await bridge.start();
     await bridge.step();
     await hub.publish({ topic: "fabric.control.command", kind: "steer", from: org.identity, to: lane.hostId, data: command(lane.identity.id, org.hostId) });
     await hub.publish({ topic: "fleet.work.x.1", kind: "ask", from: lane.identity, to: "ORG", text: "local" });
     await hub.publish({ topic: "fleet.work.x.2", kind: "ask", from: lane.identity, to: "org", text: "local" });
     await hub.publish({ topic: "fleet.work.x.3", kind: "ask", from: lane.identity, to: "fabric-v2", text: "a name, not an address" });
-    await hub.publish({ topic: "fleet.work.x.4", kind: "ask", from: lane.identity, to: "session:fabric-v2", text: "crosses" });
+    await hub.publish({ topic: "fleet.work.x.4", kind: "ask", from: lane.identity, to: sid("fabric-v2"), text: "crosses" });
     await bridge.step();
     expect(far.read({ after: 0, limit: 100 }).map((e) => e.topic)).toEqual(["fleet.work.x.4"]);
-    expect(hub.get(`topology/participants/${hash("session:alias")}`)).toBeUndefined();
-    expect(hub.get(`topology/participants/${hash("session:thief")}`)).toBeUndefined();
+    expect(hub.get(`topology/participants/${hash(sid("alias"))}`)).toBeUndefined();
+    expect(hub.get(`topology/participants/${hash(sid("thief"))}`)).toBeUndefined();
   });
 
   // Security review F2: identities are bound to the link that mirrored them first.
@@ -378,8 +387,9 @@ describe("mesh bridge", () => {
   // Review F4: a page never passes one transport frame, over a real pipe.
   it("delivers, in order, a backlog larger than one transport frame over a real pipe", async () => {
     const { hub, far, bridge, logs } = setup(undefined, { maxEventBytes: 300 * 1024, realPipe: true });
-    const lane = await addRoot(hub, "lane");
-    const forgeRoot = await addRoot(far, "forge-main");
+    // The backlog takes a while to write on a busy host: leases outlast it.
+    const lane = await addRoot(hub, "lane", 300_000);
+    const forgeRoot = await addRoot(far, "forge-main", 300_000);
     await bridge.start();
     await bridge.step();
     const text = "x".repeat(240 * 1024);
@@ -401,4 +411,121 @@ describe("mesh bridge", () => {
     expect(page.events.map((e) => e.topic)).toEqual(["fleet.work.small"]);
     expect(page.through).toBe(2);
   });
+  // Security and review round 2, F1/F2: a claim refused or lost in this very pass is never trusted.
+  it("gives a claim lost while its presence reply was held no traffic and no voice, in the same pass", async () => {
+    for (const winner of ["peer", "native"] as const) {
+      const hub = new MeshStore(scratch(), 64 * 1024, 100);
+      const lane = await addRoot(hub, "lane");
+      const a = setup(undefined, { hub, remoteName: "forge" });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+      let asked!: () => void;
+      const presenceAsked = new Promise<void>((resolve) => (asked = resolve));
+      const b = setup(undefined, {
+        hub, remoteName: "ryzen2",
+        wrapRemote: (remote) => ({
+          latestSequence: () => remote.latestSequence(),
+          read: (after) => remote.read(after),
+          publish: (event) => remote.publish(event),
+          mirror: (presence) => remote.mirror(presence),
+          bridgedIds: (after) => remote.bridgedIds(after),
+          close: (error) => remote.close(error),
+          presence: async () => {
+            asked();
+            await held;
+            return remote.presence();
+          },
+        }),
+      });
+      await b.bridge.start();
+      await addRoot(b.far, "x"); // B claims X ...
+      const pass = b.bridge.step();
+      await presenceAsked; // ... B has read the hub; X is still free.
+      if (winner === "peer") {
+        await addRoot(a.far, "x");
+        await a.bridge.start();
+        await a.bridge.step();
+      } else {
+        await addRoot(hub, "x");
+      }
+      const x = sid("x");
+      await hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: x, data: command(x, lane.hostId) });
+      await b.far.publish({ topic: "fabric.control.ack", kind: "ack", from: { id: x, name: "main", kind: "main" }, to: lane.hostId, data: { version: 1, commandId: "c", targetId: x, accepted: true } });
+      await b.far.publish({ topic: "fleet.work.x.1", kind: "ask", from: { id: x, name: "main", kind: "main" }, to: lane.identity.id, text: "as x" });
+      release();
+      expect(await pass).toMatchObject({ toRemote: 0, toLocal: 0 });
+      expect(b.far.read({ after: 0, limit: 100 }).filter((e) => e.topic === "fabric.control.command")).toHaveLength(0);
+      expect(hub.read({ after: 0, limit: 100 }).filter((e) => e.topic !== "fabric.control.command")).toHaveLength(0);
+      expect(hub.get(`topology/participants/${hash(x)}`)!.value).toMatchObject(winner === "peer" ? { remoteHost: "forge" } : {});
+      if (winner === "native") expect(hub.get(`topology/participants/${hash(x)}`)!.value).not.toHaveProperty("remoteHost");
+    }
+  });
+
+  // Security review round 2, F3: no mirror write in flight outlives the withdrawal.
+  it("restores no record or lease when a suspended local mirror write resumes after stop", async () => {
+    const hub = new MeshStore(scratch(), 64 * 1024, 100);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let entered!: () => void;
+    const inPut = new Promise<void>((resolve) => (entered = resolve));
+    const put = hub.put.bind(hub);
+    let suspend = true;
+    hub.put = async (input) => {
+      if (suspend) {
+        suspend = false;
+        entered();
+        await held;
+      }
+      return put(input);
+    };
+    const { far, bridge, remote } = setup(undefined, { hub, stopMs: 200 });
+    const forgeRoot = await addRoot(far, "forge-main");
+    await bridge.start();
+    const pass = bridge.step().catch((error: Error) => error);
+    await inPut;
+    remote.close(new Error("transport failed"));
+    const stopped = bridge.stop();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    release();
+    await stopped;
+    await pass;
+    expect(hub.get(`topology/hosts/${hash(forgeRoot.hostId)}`)).toBeUndefined();
+    expect(hub.get(`topology/participants/${hash(forgeRoot.identity.id)}`)).toBeUndefined();
+    expect(readHostLeases(hub.root).has(forgeRoot.hostId)).toBe(false);
+  });
+
+  // Security review round 2, F4: presence both ways stays inside one frame, over a real pipe.
+  it("keeps presence replies and mirror requests inside one frame over a real pipe", async () => {
+    // Nine 1.9 MiB roots a side: about 17 MiB of presence, over the 16 MiB frame.
+    const { hub, far, bridge, remote, logs } = setup(undefined, { maxEventBytes: 2 * 1024 * 1024, realPipe: true });
+    const cwd = "c".repeat(1_900 * 1024);
+    for (let index = 0; index < 9; index++) {
+      await addRoot(far, `far${index}`, 60_000, { cwd });
+      await addRoot(hub, `hub${index}`, 60_000, { cwd });
+    }
+    await bridge.start();
+    await bridge.step();
+    const mirrored = (store: MeshStore) => store.listAll("topology/participants/").filter((e) => (e.value as { remoteHost?: string }).remoteHost).length;
+    expect(mirrored(hub)).toBeGreaterThan(0);
+    expect(mirrored(hub)).toBeLessThan(9);
+    expect(mirrored(far)).toBeGreaterThan(0);
+    expect(mirrored(far)).toBeLessThan(9);
+    expect(logs.join("\n")).toMatch(/hosts pass the frame budget/);
+    await expect(remote.latestSequence()).resolves.toBeTypeOf("number");
+  }, 300_000);
+
+  // Review round 2, F5: a transport that cannot start fails the bridge by name, within a bound.
+  it("fails with a named error when the transport cannot start", async () => {
+    const notExecutable = path.join(scratch(), "not-executable");
+    fs.writeFileSync(notExecutable, "#!/bin/sh\n", { mode: 0o600 });
+    const flags = new Map([
+      ["mesh", scratch()], ["name", "dev1"], ["remote", "forge"], ["cursor", path.join(scratch(), "c.json")],
+      ["call-timeout-ms", "60000"],
+    ]);
+    for (const command of [[path.join(scratch(), "no-such-ssh")], ...(process.platform === "win32" ? [] : [[notExecutable]])]) {
+      const started = Date.now();
+      await expect(runBridge(flags, command, new AbortController().signal)).resolves.toBe(1);
+      expect(Date.now() - started).toBeLessThan(10_000);
+    }
+  }, 30_000);
 });

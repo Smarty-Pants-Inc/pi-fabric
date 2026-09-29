@@ -30,11 +30,16 @@ existing events and mirrors root presence. There is no new store or protocol.
   - its recipient is native to the hub.
 - A remote identity is bound to the one link that mirrored it first (the `remoteHost` on its record).
   Each link reserves every id it did not mirror: native records (live or not) and other links'
-  mirrors. The remote's presence is admitted against that set before it is used. A remote host or
-  root with a reserved id, label or session id is neither mirrored nor routed to. A remote event
-  whose sender, or an ack whose `targetId`, is not bound to this link is dropped.
-- Routing uses only ids and unique aliases: host id, identity id, participant id, root id, session id
-  and label. A free-form `name` is never an address.
+  mirrors. It reserves host ids, identity ids, root ids, participant ids and session ids, but not
+  labels, which each mesh mints and which collide by design. A remote root must have a canonical id
+  (`session:<session id>`), so it can never equal a hub session name.
+- Authority comes from ownership after the mirror step, not from the peer's claims: for each page it
+  forwards, the bridge rereads the records this link holds now and checks them against the current
+  reservations. A claim refused or lost in the same pass (to another link or to a new native) gets no
+  traffic, and its events are dropped. A remote event whose sender, or an ack whose `targetId`, is
+  not bound to this link is dropped.
+- The hub routes to the remote only by canonical ids: host id, identity id, participant id and root
+  id. Labels, session ids and names are never addresses across.
 - A mirror never replaces a native record or another bridge's mirror. It writes by
   compare-and-swap only.
 - Each remote call has a deadline (`--call-timeout-ms`, default 30 s). A remote that misses it
@@ -43,6 +48,13 @@ existing events and mirrors root presence. There is no new store or protocol.
   (SIGTERM, then SIGKILL after 2 s).
 - A read page stays under 8 MiB of events, so it always fits one 16 MiB frame. An event that alone
   is over the budget is skipped and logged with its id and sequence, and the cursor moves on.
+  Presence snapshots (both the replies and the mirror requests) hold whole hosts with their roots
+  up to the same budget. Hosts past the budget are not mirrored, so they lapse, and the bridge logs
+  the count. A `bridgedIds` reply holds at most 50,000 ids per page.
+- Local mirror writes run one at a time behind a fence. On withdrawal, the bridge fences first,
+  waits for a write in flight, then deletes, so no record or lease comes back after stop.
+- A transport that cannot start (a missing or non-executable ssh) fails the bridge with a named
+  error and exit status 1.
 - The agent (the remote end) serves only the bridge operations. It applies the allow-list and
   stamps its pinned `--peer` name on everything it writes, whatever the hub sends.
 

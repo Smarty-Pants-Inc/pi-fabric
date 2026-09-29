@@ -82,13 +82,21 @@ export const runBridge = async (
   const argv = transportCommand(flags, command);
   const child = spawn(argv[0]!, argv.slice(1), { stdio: ["pipe", "pipe", "inherit"] });
   onChild?.(child.pid);
+  const remote = new RemoteBridgeSide(child.stdout, child.stdin, callTimeoutMs);
+  // A transport that cannot start (no ssh, not executable) emits error and close, never exit
+  // (review round 2, F5): either settles the child, and the error fails the bridge by name.
+  let spawnError: Error | undefined;
   const exited = new Promise<void>((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) resolve();
-    else child.once("exit", () => resolve());
+    child.once("exit", () => resolve());
+    child.once("close", () => resolve());
+    child.once("error", (error) => {
+      spawnError ??= new Error(`Bridge transport ${argv[0]} failed: ${error.message}`);
+      remote.close(spawnError);
+      resolve();
+    });
   });
-  child.on("error", (error) => remote.close(error));
   child.stdin.on("error", () => undefined);
-  const remote = new RemoteBridgeSide(child.stdout, child.stdin, callTimeoutMs);
   const bridge = new MeshBridge({
     localName, remoteName,
     local: new StoreBridgeSide(store(required(flags, "mesh")), remoteName),
@@ -115,19 +123,19 @@ export const runBridge = async (
       aborted,
     ]);
   } catch (error) {
-    if (!signal.aborted) {
-      log(`stopped: ${error instanceof Error ? error.message : String(error)}`);
+    if (!signal.aborted || spawnError) {
+      log(`stopped: ${(spawnError ?? (error instanceof Error ? error : new Error(String(error)))).message}`);
       code = 1;
     }
   }
   // The mirrors of the remote on this side go at once; the remote's lapse with their lease.
   await bridge.stop();
   remote.close();
-  child.kill("SIGTERM");
+  if (child.pid !== undefined) child.kill("SIGTERM");
   const timer = setTimeout(() => child.kill("SIGKILL"), CHILD_KILL_MS);
   await exited;
   clearTimeout(timer);
-  return code;
+  return spawnError ? 1 : code;
 };
 
 export const main = async (argv: string[]): Promise<number> => {

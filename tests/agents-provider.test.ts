@@ -137,6 +137,7 @@ const setup = (
       };
     },
     ...(options?.switchModel ? { switchModel: options.switchModel } : {}),
+    flushHeldAtNextBoundary: vi.fn(),
   };
   const actors = new ActorManager("test", identity, mesh, meshConfig, agents, () => {}, {
     actorRoot: path.join(root, "actors"),
@@ -1197,7 +1198,7 @@ describe("AgentsProvider runner support", () => {
 
   // smarty-dev#2119: an interactive Main's wait is capped at 60 s and the bound is a normal result.
   it("returns the live status at the bound in an interactive Main; a task agent's wait still throws", async () => {
-    const { provider } = setup();
+    const { provider, mainAgent } = setup();
     const mainContext = (mode: string) => ({
       ...context,
       extensionContext: { ...context.extensionContext, mode, sessionManager: { getSessionId: () => "test" } } as unknown as ExtensionContext,
@@ -1212,6 +1213,7 @@ describe("AgentsProvider runner support", () => {
         expect(Date.now() - started).toBeLessThan(1_400);
         expect(result).toMatchObject({ id: handle.id, status: "running", waitTimedOut: true });
         expect(result.note).toMatch(/Still running after 1 s; Main waits are capped at 60 s/);
+        expect(mainAgent.flushHeldAtNextBoundary).toHaveBeenCalledTimes(mode === "tui" ? 1 : 2);
         await expect(provider.invoke("wait", { id: handle.id }, mainContext(mode))).resolves.toMatchObject({ status: "completed" });
       }
       // Print mode is a script, not an interactive Main: the #854 error is unchanged.
@@ -1221,6 +1223,7 @@ describe("AgentsProvider runner support", () => {
       vi.stubEnv("PI_FABRIC_PARENT_RUN", "parent-run");
       const child = await provider.invoke("spawn", { task: "LIVE_WITH_PROGRESS", transport: "process" }, mainContext("rpc")) as { id: string };
       await expect(provider.invoke("wait", { id: child.id, timeoutMs: 1_000 }, mainContext("rpc"))).rejects.toThrow(/is still running after 1 s\. It continues/);
+      expect(mainAgent.flushHeldAtNextBoundary).toHaveBeenCalledTimes(2);           // print and task-agent waits flush nothing
     } finally {
       vi.unstubAllEnvs();
     }

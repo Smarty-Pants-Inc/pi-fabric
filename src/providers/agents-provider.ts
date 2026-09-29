@@ -654,12 +654,16 @@ export class AgentsProvider implements FabricProvider {
         // smarty-dev#2119: an interactive Main waits at most 60 s, and the bound is a normal result.
         const main = isInteractiveMain(context.extensionContext);
         const timeoutMs = agentWaitBound(args.timeoutMs, main ? MAIN_AGENT_WAIT_MAX_MS : AGENT_WAIT_MAX_MS);
-        const atBound = (record: object) => ({
-          ...record,
-          waitTimedOut: true,
-          note: `Still running after ${describeWaitBound(timeoutMs)}; Main waits are capped at 60 s. It continues, and its ` +
-            "result arrives as a completion message: end the turn or do other work, then check agents.status.",
-        });
+        const atBound = (record: object) => {
+          // The wait ended so Main can see news: held followUps land at this tool boundary.
+          this.mainAgent.flushHeldAtNextBoundary?.();
+          return {
+            ...record,
+            waitTimedOut: true,
+            note: `Still running after ${describeWaitBound(timeoutMs)}; Main waits are capped at 60 s. It continues, and its ` +
+              "result arrives as a completion message: end the turn or do other work, then check agents.status.",
+          };
+        };
         if (this.residency?.hasAgent(id)) {
           const status = this.residency.statusAgent(id);
           context.activity?.({ type: "entity", id, kind: "agent", name: status.name });

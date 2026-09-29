@@ -2325,6 +2325,32 @@ describe("AgentsProvider steering", () => {
     }
   });
 
+  // smarty-dev#1882: after its host exits, a finished durable agent has no participant; stop
+  // returns its terminal record. A durable agent that still runs keeps the participant route.
+  it("stops a finished durable agent with its terminal record, not Unknown participant", async () => {
+    const { agents, actors, globalActors, mainAgent, participants, control, lifecycle } = setup();
+    const id = "b".repeat(32);
+    let settled: unknown = { id, name: "durable", status: "completed", text: "done", residency: "durable" };
+    const acknowledged: string[] = [];
+    const residency = {
+      hasAgent: (candidate: string) => candidate === id,
+      settledAgent: (candidate: string) => candidate === id ? settled : undefined,
+      statusAgent: () => ({ id, name: "durable", status: "stopped", residency: "durable" }),
+      acknowledgeCompletion: (candidate: string) => acknowledged.push(candidate),
+    } as unknown as ResidencyClient;
+    const provider = new AgentsProvider(
+      agents, actors, globalActors, mainAgent, participants, control, lifecycle,
+      undefined, residency, false,
+    );
+    await expect(provider.invoke("stop", { id }, context)).resolves.toMatchObject({ status: "completed", text: "done" });
+    expect(acknowledged).toEqual([id]);
+    // review/astra on #136: a terminal-looking attempt that a live host may resume is not settled;
+    // stop takes the participant route and acknowledges nothing.
+    settled = undefined;
+    await expect(provider.invoke("stop", { id }, context)).rejects.toThrow("Unknown Fabric participant");
+    expect(acknowledged).toEqual([id]);
+  });
+
   // review/astra on #57: the remote-Main branch of status said only "Unknown Fabric Main participant".
   it("says why status cannot resolve a remote Main, by alias and by id, after a write stall check", async () => {
     let stalled: Error | undefined;

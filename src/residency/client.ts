@@ -21,6 +21,7 @@ import {
   isResidentHostId,
   residentDeliveryPrefix,
   residentHostId,
+  residentResultPath,
   sleepUnlessAborted,
   type ResidentAgentMetadata,
   type ResidentCommand,
@@ -261,8 +262,8 @@ export class ResidencyClient {
   statusAgent(id: string): AgentRunRecord | AgentHandleInfo {
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
-    const record = readJson<AgentRunRecord>(path.join(metadata.runDirectory, "status.json"));
-    if (!record || record.id !== metadata.id) return structuredClone(metadata.handle);
+    const record = this.#record(metadata);
+    if (!record) return structuredClone(metadata.handle);
     return {
       ...record,
       cwd: metadata.handle.cwd,
@@ -273,6 +274,21 @@ export class ResidencyClient {
       ...(metadata.handle.sessionId ? { sessionId: metadata.handle.sessionId } : {}),
       ...(metadata.handle.attachCommand ? { attachCommand: metadata.handle.attachCommand } : {}),
     };
+  }
+
+  /**
+   * The result of a durable run known to be settled: the host's saved terminal record, or any
+   * terminal status once no host owns the run. A worker's terminal status.json alone is not
+   * settlement while a host lives: a stopped or failed attempt can still resume or retry, so a
+   * stop must go to the host (review/astra on pi-fabric#136).
+   */
+  settledAgent(id: string): AgentRunResult | undefined {
+    const metadata = this.#metadata(id);
+    if (!metadata) return undefined;
+    const saved = readJson<AgentRunRecord>(residentResultPath(this.options.config.residencyRoot, id));
+    if (!(saved?.id === id && terminal(saved.status)) && this.#liveOwner()) return undefined;
+    const status = this.statusAgent(id);
+    return terminal(status.status) && "startedAt" in status ? status as AgentRunResult : undefined;
   }
 
   listAgents(): Array<AgentRunRecord | AgentHandleInfo> {
@@ -319,7 +335,7 @@ export class ResidencyClient {
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
     const logFile = path.join(metadata.runDirectory, "events.jsonl");
     const page = readJsonlPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before);
-    const status = readJson<AgentRunRecord>(path.join(metadata.runDirectory, "status.json"));
+    const status = this.#record(metadata);
     return {
       id,
       runDirectory: metadata.runDirectory,
@@ -404,6 +420,7 @@ export class ResidencyClient {
     }
     fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
     fs.rmSync(this.#metadataPath(metadata.id), { force: true });
+    fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
     this.options.onResultConsumed?.(metadata.id);
     return { cleaned: true };
   }
@@ -447,6 +464,37 @@ export class ResidencyClient {
       await delay(STATUS_POLL_MS);
     }
     throw new Error(`Timed out publishing durable Fabric ${kind} ${id} from ${this.hostId}`);
+  }
+
+  /**
+   * The run's live status, else the terminal record the host saved before an idle exit removed
+   * the run directory. With neither, no run directory and no live host, the run cannot still be
+   * running: report it failed rather than the stale spawn handle (smarty-dev#1882).
+   */
+  #record(metadata: ResidentAgentMetadata): AgentRunRecord | undefined {
+    const saved = readJson<AgentRunRecord>(residentResultPath(this.options.config.residencyRoot, metadata.id));
+    if (saved?.id === metadata.id && terminal(saved.status)) return saved;
+    const live = readJson<AgentRunRecord>(path.join(metadata.runDirectory, "status.json"));
+    if (live?.id === metadata.id) return live;
+    if (fs.existsSync(metadata.runDirectory) || this.#liveOwner()) return undefined;
+    const { handle } = metadata;
+    return {
+      id: handle.id,
+      name: handle.name,
+      task: "",
+      status: "failed",
+      runner: handle.runner,
+      transport: handle.transport,
+      cwd: handle.cwd,
+      ...(handle.model ? { model: handle.model } : {}),
+      startedAt: metadata.createdAt,
+      updatedAt: metadata.updatedAt,
+      turns: 0,
+      toolCalls: 0,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      error: "Durable run record lost: its resident host exited and removed the run directory " +
+        "before this Fabric version kept terminal results; the outcome is unknown.",
+    } as AgentRunRecord;
   }
 
   #metadataPath(id: string): string {

@@ -13,9 +13,10 @@ import {
   StoreBridgeSide,
 } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
-import { runBridge } from "../src/mesh-bridge.js";
+import { runBridge, transportCommand } from "../src/mesh-bridge.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 
 // Two scratch meshes: "dev1" (the hub, in-process) and "forge" (reached through the agent over
 // a stdio pair, as the ssh transport does).
@@ -596,5 +597,47 @@ describe("mesh bridge", () => {
       expect(spawned).toEqual([]);
       expect(Date.now() - started).toBeLessThan(5_000);
     }
+  });
+  // Security round 4, F2: one id names one owner, and any other owner denies at commit.
+  it("refuses a remote root whose host splits its id from the root's", async () => {
+    const { hub, far, bridge } = setup();
+    const h = sid("h");
+    await addRoot(far, "x", 15_000, { hostId: h });
+    await bridge.start();
+    await bridge.step();
+    expect(hub.get(`topology/hosts/${hash(h)}`)).toBeUndefined();
+    expect(hub.get(`topology/participants/${hash(sid("x"))}`)).toBeUndefined();
+  });
+
+  it("denies at commit an id a native Main registered, even when an old mirror of it survives", async () => {
+    const hub = new MeshStore(scratch(), 64 * 1024, 1_000);
+    const side = new StoreBridgeSide(hub, "forge");
+    const x = sid("x");
+    const h = sid("h");
+    // Mirrors an older bridge wrote in the split layout: host H owns root X.
+    const now = Date.now();
+    const hIdentity: MeshIdentity = { id: h, name: "main", kind: "main", sessionId: "h" };
+    await hub.put({ key: `topology/hosts/${hash(h)}`, identity: hIdentity, value: { format: 1, id: h, rootId: x, identity: hIdentity, startedAt: now, updatedAt: now, expiresAt: now + 60_000, remoteHost: "forge" } });
+    await hub.put({ key: `topology/participants/${hash(x)}`, identity: hIdentity, value: {
+      format: 1, id: x, kind: "root", rootId: x, ownerHostId: h, ownerIdentityId: h, name: "main", status: "idle", runner: "pi",
+      transport: "host", capabilities: ["steer"], sessionId: "x", startedAt: now, updatedAt: now, controlProtocol: "v1", remoteHost: "forge",
+    } });
+    // A native Main X registers through the real directory.
+    const native: MeshIdentity = { id: x, name: "main", kind: "main", sessionId: "x" };
+    const directory = new ParticipantDirectory(hub, { enabled: true, hostId: x, rootId: x, identity: native, heartbeatMs: 100, leaseMs: 5_000, reapDeadHosts: false });
+    await directory.start();
+    cleanups.push(() => void directory.close());
+    expect(hub.get(`topology/hosts/${hash(x)}`)!.value).not.toHaveProperty("remoteHost");
+    const event = { topic: "fleet.work.x.1", kind: "ask", from: native, to: sid("lane"), text: "forged", data: { bridge: { from: "forge", id: "e1" } } };
+    await expect(side.publish(event, [x])).rejects.toThrow(/no longer bound to bridge link forge/);
+    expect(hub.read({ after: 0, limit: 100 }).filter((e) => e.topic === "fleet.work.x.1")).toEqual([]);
+  });
+
+  it("builds the ssh transport from explicit flags and refuses an option as the host", () => {
+    const argv = transportCommand(new Map([["ssh", "forge"], ["ssh-key", "/k"], ["ssh-port", "2222"], ["ssh-known-hosts", "/kh"]]), []);
+    expect(argv.slice(-3)).toEqual(["forge", "mesh-bridge", "agent"]);
+    expect(argv).toEqual(expect.arrayContaining(["-p", "2222", "-i", "/k", "UserKnownHostsFile=/kh", "StrictHostKeyChecking=yes"]));
+    expect(() => transportCommand(new Map([["ssh", "-oProxyCommand=x"]]), [])).toThrow(/a host, not an option/);
+    expect(() => transportCommand(new Map([["ssh", "forge"], ["ssh-port", "22 -oX"]]), [])).toThrow(/port number/);
   });
 });

@@ -75,6 +75,14 @@ On the hub, run one bridge per remote host as the fleet user, under the service 
     mesh-bridge run --mesh ~/proj/.pi/fabric/mesh --name dev1 --remote forge \
       --cursor ~/.local/state/mesh-bridge/forge.json --ssh forge --ssh-key ~/.ssh/mesh-bridge
 
+`--ssh-port` and `--ssh-known-hosts FILE` (which also sets `StrictHostKeyChecking=yes`) reach a
+host without a global `~/.ssh/config` entry.
+
+When the bridge dies, the other side's copies stay live until their lease lapses, at most 15 s
+(about 13 s on average). A steer or followUp sent in that window is not delivered; it fails when
+its acknowledgement times out (the control plane's bounded wait), and nothing hangs. After the
+lapse, senders get the lease-lapsed error at once.
+
 The bridge exits with status 1 when the transport closes. The service manager restarts it, and it
 resumes from the cursor file. `-- COMMAND...` replaces ssh with any stdio transport (tests use a
 local agent process).

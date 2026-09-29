@@ -15,7 +15,7 @@ const MAX_EVENT_BYTES = 256 * 1024;
 const MAX_READ_EVENTS = 500;
 
 const USAGE = `usage:
-  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--call-timeout-ms MS] (--ssh HOST [--ssh-key KEY] | -- COMMAND...)
+  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--call-timeout-ms MS] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
   mesh-bridge agent --mesh ROOT --peer NAME`;
 
 const parseArgs = (argv: string[]): { mode: string; flags: Map<string, string>; command: string[] } => {
@@ -39,13 +39,21 @@ const required = (flags: Map<string, string>, name: string): string => {
 };
 
 /** The transport argv: ssh to the forced command, or an explicit command. */
-const transportCommand = (flags: Map<string, string>, command: string[]): string[] => {
+export const transportCommand = (flags: Map<string, string>, command: string[]): string[] => {
   if (command.length > 0) return command;
   const host = required(flags, "ssh");
   const key = flags.get("ssh-key");
+  const port = flags.get("ssh-port");
+  const knownHosts = flags.get("ssh-known-hosts");
+  if (port !== undefined && !/^[0-9]{1,5}$/.test(port)) throw new Error("--ssh-port must be a port number");
+  if (host.startsWith("-")) throw new Error("--ssh must be a host, not an option");
+  // Explicit flags, not an ssh option passthrough: a target needs no global ssh config, and no
+  // option can run a local command (ProxyCommand, LocalCommand).
   return [
     "ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
     ...(key ? ["-o", "IdentitiesOnly=yes", "-i", key] : []),
+    ...(port ? ["-p", port] : []),
+    ...(knownHosts ? ["-o", `UserKnownHostsFile=${knownHosts}`, "-o", "StrictHostKeyChecking=yes"] : []),
     // The forced command on the remote replaces whatever is asked for here.
     host, "mesh-bridge", "agent",
   ];

@@ -247,24 +247,45 @@ export class StoreBridgeSide implements BridgeSide {
     return { sequence: published.sequence };
   }
 
+  /**
+   * Whether this link holds `id` now. Run under the mesh lock that commits a bridged event, so it
+   * decides on the ownership at commit (security review rounds 3 and 4, F2). Any record for the
+   * id that is not this link's live mirror (a native, another link's, or a reserved id anywhere
+   * on this side) is a denial, never a gap to fill from another mirror: `id` must be this
+   * link's host, with a live lease, and its root, if present, must be this link's too.
+   */
   holds(id: string): boolean {
     const now = this.now();
-    const live = (host: FabricHostRecord | undefined): boolean =>
-      host !== undefined && hostLeaseExpiry(readHostLeases(this.store.root), host) > now;
-    const held = (prefix: string): unknown => {
-      const entry = this.store.get(keyFor(prefix, id), { fresh: true });
-      return entry && remoteHostOf(entry.value) === this.peer ? entry : undefined;
-    };
-    const hostEntry = held(HOST_PREFIX) as { key: string; value: unknown; updatedBy: MeshIdentity } | undefined;
-    const host = hostEntry ? hostOf(hostEntry.key, hostEntry.value) : undefined;
-    if (host && hostEntry!.updatedBy.id === host.identity.id && live(host)) return true;
-    const entry = held(PARTICIPANT_PREFIX) as { key: string; value: unknown; updatedBy: MeshIdentity } | undefined;
-    const participant = entry ? participantOf(entry.key, entry.value) : undefined;
-    if (!participant || entry!.updatedBy.id !== participant.ownerIdentityId) return false;
-    const ownerEntry = this.store.get(keyFor(HOST_PREFIX, participant.ownerHostId), { fresh: true });
-    const owner = ownerEntry && remoteHostOf(ownerEntry.value) === this.peer ? hostOf(ownerEntry.key, ownerEntry.value) : undefined;
-    return owner !== undefined && owner.identity.id === participant.ownerIdentityId && live(owner);
+    const hostEntry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
+    const participantEntry = this.store.get(keyFor(PARTICIPANT_PREFIX, id), { fresh: true });
+    if (!hostEntry || remoteHostOf(hostEntry.value) !== this.peer) return false;
+    if (participantEntry && remoteHostOf(participantEntry.value) !== this.peer) return false;
+    const host = hostOf(hostEntry.key, hostEntry.value);
+    if (!host || host.id !== id || host.identity.id !== id || host.rootId !== id || hostEntry.updatedBy.id !== id) return false;
+    if (hostLeaseExpiry(readHostLeases(this.store.root), host) <= now) return false;
+    if (participantEntry) {
+      const participant = participantOf(participantEntry.key, participantEntry.value);
+      if (!participant || participant.ownerHostId !== id || participant.ownerIdentityId !== id) return false;
+    }
+    return !this.#reservedNow().has(id);
   }
+
+  // Every id this side holds that is not this link's mirror, read now.
+  #reservedNow(): Set<string> {
+    const reserved = new Set<string>();
+    for (const prefix of [HOST_PREFIX, PARTICIPANT_PREFIX]) {
+      for (const entry of this.store.listAll(prefix, { fresh: true })) {
+        if (remoteHostOf(entry.value) === this.peer || !isObject(entry.value)) continue;
+        const value = entry.value;
+        for (const field of ["id", "rootId", "ownerHostId", "ownerIdentityId", "sessionId", "name"]) {
+          if (typeof value[field] === "string" && value[field]) reserved.add(value[field] as string);
+        }
+        if (isIdentity(value.identity)) reserved.add(value.identity.id);
+      }
+    }
+    return reserved;
+  }
+
 
   #fenced = false;
   #inflight: Promise<void> = Promise.resolve();
@@ -689,12 +710,15 @@ export const admitPresence = (
   claimed: Pick<BridgePresence, "hosts" | "participants">,
   reserved: ReadonlySet<string>,
 ): Pick<BridgePresence, "hosts" | "participants"> => {
+  // v1 bridges Main roots only, whose host id, identity id and root id are one id (security
+  // review round 4, F2): a host that splits them is refused, so one id names one owner.
   const hosts = claimed.hosts.filter(({ record }) =>
-    [record.id, record.identity.id, record.rootId].every((id) => CANONICAL_ID.test(id) && !reserved.has(id)));
+    record.identity.id === record.id && record.rootId === record.id &&
+    CANONICAL_ID.test(record.id) && !reserved.has(record.id));
   const admitted = new Map(hosts.map(({ record }) => [record.id, record]));
   const participants = claimed.participants.filter((participant) => {
     const owner = admitted.get(participant.ownerHostId);
-    return participant.kind === "root" && owner !== undefined && CANONICAL_ID.test(participant.id) &&
+    return participant.kind === "root" && owner !== undefined && participant.id === owner.id &&
       owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId &&
       ![participant.id, participant.rootId, participant.ownerIdentityId, participant.sessionId]
         .some((id) => typeof id === "string" && reserved.has(id));

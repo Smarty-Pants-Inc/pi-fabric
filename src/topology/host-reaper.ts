@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { type FabricHostLease, readHostLeases, removeHostLease } from "./host-leases.js";
-import { readParticipantFiles, removeParticipantFileIf } from "./participant-files.js";
+import { readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
 
 /** A host's records are removed when its lease expired this long ago (smarty-dev#367). */
 export const DEAD_HOST_RECORDS_MS = 6 * 60 * 60 * 1000;
@@ -81,6 +81,8 @@ export const reapDeadHostRecords = async (
 ): Promise<number> => {
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
   const found = deadHostRecords(mesh, options);
+  // Leftovers of per-key lock operations whose process died (security pass S5 on #142).
+  if (typeof mesh.root === "string") sweepParticipantLockLeftovers(mesh.root, 60 * 60 * 1000);
   if (found.length === 0) return 0;
   const dead = found.filter((item) => !item.file);
   const results = dead.length === 0 ? [] : await mesh.writeBatch({

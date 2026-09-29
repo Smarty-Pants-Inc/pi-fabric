@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, removeHostLease } from "../src/topology/host-leases.js";
 import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
 import * as participantFiles from "../src/topology/participant-files.js";
 import { readParticipantFiles, writeParticipantFile } from "../src/topology/participant-files.js";
@@ -181,6 +181,8 @@ describe("participant files", () => {
     const deadOwned = (root: string, updatedAt = Date.now()) => writeParticipantFile(root, {
       key: keyOf(shared), value: actor("session:dead"), version: 1, updatedAt, updatedBy: identityOf("dead"),
     });
+    const stateOwner = (root: string) =>
+      (new MeshStore(root, 64 * 1024, 1_000).get(keyOf(shared), { fresh: true })?.value as { ownerHostId?: string })?.ownerHostId;
     const owner = (root: string) =>
       (readParticipantFiles(root, { maxAgeMs: 0 }).find((entry) => entry.key === keyOf(shared))?.value as { ownerHostId?: string })?.ownerHostId;
     // Host B, in a process of its own, takes the record over and exits with its 60 s lease live.
@@ -302,6 +304,38 @@ describe("participant files", () => {
       expect(c.get(shared, Date.now(), { fresh: true })).toMatchObject({ ownerHostId: b.id, stale: false });
       expect(c.list({ scope: "project", fresh: true }).find((participant) => participant.id === shared))
         .toMatchObject({ ownerHostId: b.id });
+      await a.refresh();                                          // A resumes: B is live, A leaves it
+      expect(stateOwner(root)).toBe(b.id);
+      expect(c.get(shared, Date.now(), { fresh: true })).toMatchObject({ ownerHostId: b.id, stale: false });
+    });
+
+    // Security pass S1 on #142: the same with B a new runtime whose own copy failed.
+    it("a delayed copy past a new runtime's takeover whose copy failed leaves that owner; its copy is made again", async () => {
+      const root = meshRoot();
+      const hostKeyOf = (id: string) => "topology/hosts/" + createHash("sha256").update(id).digest("hex");
+      let b: ParticipantDirectory | undefined;
+      const write = participantFiles.writeParticipantFileIf;
+      vi.spyOn(participantFiles, "writeParticipantFileIf")
+        .mockImplementationOnce(async (...args) => {              // A's copy: A pauses past its lease
+          const mesh = new MeshStore(root, 64 * 1024, 1_000);
+          await mesh.delete({ key: hostKeyOf("session:a") });
+          removeHostLease(root, "session:a");
+          b = directory(root, "b", () => [actor("session:b")]);
+          await b.start();                                        // B takes K; its copy fails (below)
+          return write(...args);
+        })
+        .mockImplementationOnce(async () => { throw new Error("copy failed"); });
+      const a = directory(root, "a", () => [actor("session:a")]);
+      await a.start();
+      expect(stateOwner(root)).toBe("session:b");
+      expect(owner(root)).not.toBe("session:a");                 // A's delayed copy was dropped
+      const c = directory(root, "c", () => []);
+      await c.start();
+      expect(c.get(shared, Date.now(), { fresh: true })).toMatchObject({ ownerHostId: "session:b", stale: false });
+      await a.refresh();
+      expect(stateOwner(root)).toBe("session:b");                // A never takes K back from live B
+      await b!.refresh();
+      expect(owner(root)).toBe("session:b");                     // B's copy is made again
     });
 
     it("without a race, a record whose owner is gone is taken over", async () => {

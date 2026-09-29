@@ -6,7 +6,7 @@ import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { hostLeaseExpiry, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
-import { readParticipantFile, readParticipantFiles } from "../topology/participant-files.js";
+import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import type { MeshEvent, MeshIdentity, MeshStateEntry, MeshStore } from "./store.js";
 
 /**
@@ -244,7 +244,9 @@ export class StoreBridgeSide implements BridgeSide {
       ...checked,
       // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
       // ownership at commit: a native takeover before it refuses the event (security review
-      // round 3, F2). Every state writer takes the same lock.
+      // round 3, F2). Every state writer takes the same lock. Under the participants-files policy a
+      // native's first file is written without it; its host record, which reserves the root id,
+      // still goes through the lock, and a mirror never outranks a native file (#142 S2).
       data: () => {
         for (const id of held) {
           if (!this.holds(id)) throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
@@ -268,7 +270,8 @@ export class StoreBridgeSide implements BridgeSide {
     const participantEntry = this.store.get(keyFor(PARTICIPANT_PREFIX, id), { fresh: true });
     if (!hostEntry || remoteHostOf(hostEntry.value) !== this.peer) return false;
     if (participantEntry && remoteHostOf(participantEntry.value) !== this.peer) return false;
-    if (readParticipantFile(this.store.root, keyFor(PARTICIPANT_PREFIX, id))) return false;   // a native's own file
+    // A native's own file, readable or not (fail closed, security pass S3 on #142).
+    if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, id))) return false;
     const host = hostOf(hostEntry.key, hostEntry.value);
     if (!host || host.id !== id || host.identity.id !== id || host.rootId !== id || hostEntry.updatedBy.id !== id) return false;
     if (hostLeaseExpiry(readHostLeases(this.store.root), host) <= now) return false;
@@ -380,7 +383,7 @@ export class StoreBridgeSide implements BridgeSide {
       // Never replace a native record, or another bridge's mirror (anti-spoofing); a native may be
       // only in its own file (smarty-dev#2004).
       if (existing && remoteHostOf(existing.value) !== this.peer) continue;
-      if (key.startsWith(PARTICIPANT_PREFIX) && readParticipantFile(this.store.root, key)) continue;
+      if (key.startsWith(PARTICIPANT_PREFIX) && participantFilePresent(this.store.root, key)) continue;
       if (
         existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
         (typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS ||

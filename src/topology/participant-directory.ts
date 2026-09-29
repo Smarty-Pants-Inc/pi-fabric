@@ -1051,7 +1051,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
         ? currentFile && JSON.stringify(currentFile) === JSON.stringify(record)
         : current && JSON.stringify(current.participant) === JSON.stringify(record)) continue;
       const stateEntry = stateByKey.get(key) ?? (filesOnly ? undefined : this.mesh.get(key));
-      const occupied = newer(filesByKey.get(key), stateEntry);
+      // Before the switch the shared state arbitrates ownership (its compare-and-swap), so it
+      // decides occupancy: a stale file of this host never hides a newer owner there, and never
+      // skips the live-owner check below (security pass S1 on #142).
+      const occupied = filesOnly ? newer(filesByKey.get(key), stateEntry) : stateEntry ?? filesByKey.get(key);
       const occupiedParticipant = occupied && participantFromEntry(occupied);
       const legacyOwner = record.kind === "actor" ? legacyActorOwners.get(record.id) : undefined;
       if (!occupiedParticipant && legacyOwner && legacyOwner !== this.options.identity.id) {
@@ -1121,6 +1124,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
         });
       }
     }
+    if (!filesOnly) {
+      // A copy that failed (or was never made) is made again: each of this host's committed
+      // records whose file does not hold that commit (security pass S1 on #142).
+      for (const { entry } of existing) {
+        if (statePuts.has(entry.key) || !desired.has(participantFromEntry(entry)!.id)) continue;
+        if (filesByKey.get(entry.key)?.version !== entry.version) await this.#copyCommitted(entry.key, entry.version);
+      }
+    }
     if (activity && now - this.#recordsWrittenAt >= ACTIVITY_REFRESH_MS) changed = true;
     if (!full && !changed) return false;                       // nothing to publish
     // The file lease is renewed first and on every heartbeat, without the mesh lock
@@ -1168,17 +1179,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!filesOnly) this.#recordsWrittenAt = Date.now();
     // Each record the shared state committed goes to its file too, for runtimes that read files.
     for (const result of results) {
-      if (!result.applied || !statePuts.has(result.key)) continue;
-      // The copy is the committed state entry itself, with its own version and commit time, and
-      // only while the state still holds exactly that write: a copy delayed past a newer owner's
-      // state write (an older runtime's takeover) is dropped, and never looks newer than it
-      // (review/astra round 4 on #142).
-      await writeParticipantFileIf(this.mesh, result.key, () => {
-        const committed = this.mesh.get(result.key, { fresh: true });
-        return committed?.version === result.version && ownParticipant(committed) !== undefined ? committed : undefined;
-      }).catch(() => undefined);                            // the state holds it; the next refresh retries
+      if (result.applied && statePuts.has(result.key)) await this.#copyCommitted(result.key, result.version);
     }
     return true;
+  }
+
+  // The copy is the committed state entry itself, with its own version and commit time, and only
+  // while the state still holds exactly that write and it is this host's: a copy delayed past a
+  // newer owner's state write is dropped and never looks newer than it (review/astra round 4 and
+  // security pass S1 on #142). A failed copy is made again by a later refresh.
+  async #copyCommitted(key: string, version: number): Promise<void> {
+    await writeParticipantFileIf(this.mesh, key, () => {
+      const committed = this.mesh.get(key, { fresh: true });
+      const participant = committed && participantFromEntry(committed);
+      return committed?.version === version && participant && isLocal(participant, this.options.hostId)
+        ? committed : undefined;
+    }).catch(() => undefined);
   }
 
   #renewFileLease(): number {

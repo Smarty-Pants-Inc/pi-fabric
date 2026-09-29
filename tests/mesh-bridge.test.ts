@@ -302,6 +302,18 @@ describe("mesh bridge", () => {
       .toEqual([keyOf(lane.identity.id), keyOf(org.identity.id)].sort());
   });
 
+  // Security pass S3 on #142: an unreadable or invalid native file still guards its key.
+  it("never mirrors over a native participant file it cannot read", async () => {
+    const { hub, far, bridge } = setup();
+    const forge = await addRoot(far, "forge-main");
+    const key = `topology/participants/${hash(forge.identity.id)}`;
+    fs.mkdirSync(path.join(hub.root, "participants"), { recursive: true });
+    fs.writeFileSync(path.join(hub.root, "participants", `${hash(forge.identity.id)}.json`), "{ not json");
+    await bridge.start();
+    await bridge.step();
+    expect(hub.get(key)).toBeUndefined();
+  });
+
   it("exports nothing to a remote host, root or alias that collides with a hub record", async () => {
     const { hub, far, bridge } = setup();
     const lane = await addRoot(hub, "lane");

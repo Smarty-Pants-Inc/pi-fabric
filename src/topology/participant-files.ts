@@ -317,6 +317,46 @@ export const readParticipantFile = (meshRoot: string, key: string): MeshStateEnt
   return slot?.entry;
 };
 
+/**
+ * Whether anything may be at a record's file: true unless it is known absent (ENOENT). For
+ * guards that must fail closed, such as the bridge's native checks (security pass S3 on #142):
+ * an unreadable or invalid file still counts as a native's.
+ */
+export const participantFilePresent = (meshRoot: string, key: string): boolean => {
+  const file = fileOf(meshRoot, key);
+  if (!file) return false;
+  try {
+    fs.statSync(file);
+    return true;
+  } catch (error) {
+    return (error as { code?: unknown }).code !== "ENOENT";
+  }
+};
+
+/**
+ * Removes staging and tombstone directories of the per-key locks older than `olderThanMs`: a
+ * process that died between creating one and renaming or removing it leaves it (security pass S5).
+ */
+export const sweepParticipantLockLeftovers = (meshRoot: string, olderThanMs: number, now = Date.now()): void => {
+  const locks = path.join(meshRoot, DIR, ".locks");
+  let names: string[];
+  try {
+    names = fs.readdirSync(locks);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".tmp") && !name.endsWith(".dead")) continue;
+    try {
+      if (now - fs.statSync(path.join(locks, name)).mtimeMs > olderThanMs) {
+        fs.rmSync(path.join(locks, name), { recursive: true, force: true });
+      }
+    } catch {
+      // Removed meanwhile.
+    }
+  }
+};
+
 /** Changes whenever a participant file is added, replaced or removed (not on Windows: see above). */
 export const participantFilesStamp = (meshRoot: string): string | undefined => {
   try {

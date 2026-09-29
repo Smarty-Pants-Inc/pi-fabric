@@ -47,7 +47,9 @@ describe("dead sessions' actor presence with file leases (smarty-dev#816)", () =
 describe("dead sessions' actor presence (smarty-dev#448)", () => {
   it("selects only sessions with no lease, legacy entry or presence write within the window", async () => {
     const { mesh } = store();
-    const window = 300;                                        // stands in for the day
+    // ponytail: the clock is moved past the window, not slept past it. A 300 ms sleep failed on
+    // a loaded host (load 110), where the first writes alone took longer than the window.
+    const window = HOUR;                                       // stands in for the day
     const t0 = Date.now();
     await presence(mesh, "dead", "a1");
     await presence(mesh, "dead", "a2");
@@ -63,7 +65,8 @@ describe("dead sessions' actor presence (smarty-dev#448)", () => {
     await mesh.put({ key: "actors/dead/a3/extra", value: { id: "extra" }, identity: writer });   // not presence-shaped
     await mesh.put({ key: "actors/dead/mismatch", value: { id: "other" }, identity: writer });
     expect(deadSessionPresence(mesh, { ownSessionId: "mine", deadAfterMs: window })).toEqual([]);   // all recent
-    await new Promise((resolve) => setTimeout(resolve, window + 100));
+    const realNow = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + window + 1000);
     await mesh.put({ key: "sessions/legacy", value: { id: "session:legacy" }, identity: writer });   // a legacy session entry, now
     await presence(mesh, "rewritten", "a2");                    // one fresh presence write keeps the session
     const keys = deadSessionPresence(mesh, { ownSessionId: "mine", deadAfterMs: window }).map((entry) => entry.key).sort();

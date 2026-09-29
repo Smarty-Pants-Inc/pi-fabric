@@ -89,6 +89,26 @@ describe("AgentManager close storage", () => {
     await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
   });
 
+  it("starts the close sweep through a real JS runtime under a Bun-compiled Pi (smarty-dev#2010)", async () => {
+    const originalExecPath = process.execPath;
+    const originalOverride = process.env.PI_FABRIC_NODE_BINARY;
+    const { manager, tempRoot } = setup();
+    const sentinel = path.join(tempRoot, "pi-fabric-runs-bundled");
+    fs.mkdirSync(sentinel);
+    fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    // process.execPath is the Pi executable itself, which cannot run sweep-main.js.
+    process.execPath = "/usr/local/bin/pi";
+    process.env.PI_FABRIC_NODE_BINARY = originalExecPath;
+    try {
+      await manager.close();
+    } finally {
+      process.execPath = originalExecPath;
+      if (originalOverride === undefined) delete process.env.PI_FABRIC_NODE_BINARY;
+      else process.env.PI_FABRIC_NODE_BINARY = originalOverride;
+    }
+    await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
+  });
+
   it("preserves explicit caller roots with retainRuns:true", async () => {
     const caller = fs.mkdtempSync(path.join(os.tmpdir(), "caller-root-"));
     roots.push(caller);

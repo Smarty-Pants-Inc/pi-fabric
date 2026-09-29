@@ -38,6 +38,7 @@ import { removeTree } from "./rm.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
 import { ProcessTransport } from "./transports/process-transport.js";
+import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
 import type {
@@ -1503,7 +1504,7 @@ export class AgentManager {
       }
     }
     if (this.#budgetOwned) clearOwnedBudgetEnv();
-    if (this.#managedTempRoot) this.#startTempRunSweep();
+    if (this.#managedTempRoot) await this.#startTempRunSweep();
   }
 
   /**
@@ -1511,8 +1512,7 @@ export class AgentManager {
    * runs in a detached, niced process: neither this exit nor a live event loop waits for it, and
    * one unbounded sweep per interval per host keeps up with creation (smarty-dev#2010).
    */
-  #startTempRunSweep(): void {
-    if (!claimTempRunSweep(os.tmpdir(), RETENTION_SWEEP_INTERVAL_MS)) return;
+  async #startTempRunSweep(): Promise<void> {
     const request: TempRunSweepRequest = {
       tempRoot: os.tmpdir(),
       currentRoot: this.#runRoot,
@@ -1520,7 +1520,12 @@ export class AgentManager {
       oneShotRunRetentionMs: this.#retention.oneShotRunMs,
     };
     try {
-      const child = spawn(process.execPath, [this.#sweepPath, JSON.stringify(request)], {
+      // A Bun-compiled Pi's execPath is Pi itself: resolve a real node/bun (the override, then PATH)
+      // as every other detached launch does. Resolve before the claim, so a host that cannot run
+      // the sweep does not suppress the next attempt for a whole interval.
+      const [runtime, ...args] = await scriptSpawnArgs(this.#sweepPath, [JSON.stringify(request)]);
+      if (!claimTempRunSweep(os.tmpdir(), RETENTION_SWEEP_INTERVAL_MS)) return;
+      const child = spawn(runtime!, args, {
         detached: true, stdio: "ignore", windowsHide: true,
       });
       child.on("error", () => undefined);
@@ -1544,7 +1549,7 @@ export class AgentManager {
   async #runRetentionSweep(now = Date.now()): Promise<void> {
     if (this.#managedTempRoot) {
       heartbeatRunRoot(this.#runRoot, now);
-      this.#startTempRunSweep();
+      await this.#startTempRunSweep();
     }
     const expired = [...this.#runs.values()].filter((managed) => {
       if (!managed.settled || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;

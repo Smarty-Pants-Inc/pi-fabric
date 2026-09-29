@@ -700,6 +700,8 @@ interface FabricActorInfo {
   instructionsLength?: number;
   scope: "session" | "project";
   name: string;
+  /** The session that owns and runs the actor, whoever reads it; binding.sessionId is the reading session. */
+  ownerSessionId?: string;
   status: "idle" | "queued" | "running" | "stopped";
   runner: FabricAgentRunner;
   events: FabricActorHostEvent[];

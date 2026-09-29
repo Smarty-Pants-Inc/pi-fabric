@@ -2864,6 +2864,8 @@ export class ActorManager {
       scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
+      // binding.sessionId is the reader's overlay; this names the owner (lucky-asc-router report).
+      ownerSessionId: actor.rootId.startsWith("session:") ? actor.rootId.slice(8) : this.sessionId,
       ...(actor.project ? { project: actor.project } : {}),
       // The instruction text stays private; its digest lets a caller verify setInstructions
       // against a rendered role without reading the registry file (smarty-dev#918).

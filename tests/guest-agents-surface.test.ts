@@ -116,6 +116,20 @@ describe("guest agents surface", () => {
     expect(read.errors).toEqual([]);
   });
 
+  // review/astra F1 on #125: the owner session is part of the guest contract, not only the host's.
+  it("types ownerSessionId on actor status and actor listing", () => {
+    const read = typeCheckFabricCode(
+      `const id = "actor-1";
+       const owner: string | undefined = (await agents.actorStatus({ id })).ownerSessionId;
+       const listed: string | undefined = (await agents.actors())[0].ownerSessionId;
+       const owners: string[] = [owner ?? "", listed ?? ""];
+       return owners;`,
+      GUEST_TYPE_DECLARATIONS,
+      true, // report type-correctness errors too: a missing property is TS2339
+    );
+    expect(read.errors).toEqual([]);
+  });
+
   it("keeps the Python kernel's dynamic agents proxy in place", () => {
     expect(CPYTHON_CHILD_SOURCE).toContain('"agents"');
   });

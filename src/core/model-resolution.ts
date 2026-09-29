@@ -343,17 +343,25 @@ export const resolveAvailablePiModel = (
     aliases: FabricModelAliases;
     available: readonly FabricModelCandidate[];
     lastUsed?: FabricModelUsage;
+    /**
+     * Throw instead of fuzzy-matching a selector that names an exact model absent from
+     * `available` (a provider/id, or a bare ID that no visible ID or name contains), so the
+     * caller can refresh a stale registry before a similar old model wins (smarty-dev#1830).
+     */
+    exact?: boolean;
   },
 ): FabricModelCandidate => {
   const query = selector.trim();
+  const lower = query.toLowerCase();
   const alias = Object.keys(options.aliases).some(
-    (name) => name.toLowerCase() === query.toLowerCase(),
+    (name) => name.toLowerCase() === lower,
   );
   if (PROVIDER_MODEL_RE.test(query) && !alias) {
     const exact = options.available.find(
-      (model) => modelKey(model).toLowerCase() === query.toLowerCase(),
+      (model) => modelKey(model).toLowerCase() === lower,
     );
     if (exact) return exact;
+    if (options.exact) throw unavailablePiModelError(query);
     // Recover near-miss IDs without crossing provider/auth boundaries.
     const separator = query.indexOf("/");
     const provider = query.slice(0, separator).toLowerCase();
@@ -366,6 +374,12 @@ export const resolveAvailablePiModel = (
     throw unavailablePiModelError(query);
   }
 
+  if (options.exact && !alias && lower && !options.available.some((model) =>
+    model.id.toLowerCase().includes(lower) ||
+    model.name?.toLowerCase().includes(lower) ||
+    model.provider.toLowerCase().includes(lower))) {
+    throw unavailablePiModelError(query);
+  }
   const resolution = resolveFabricModel(query, options);
   if (resolution.kind === "resolved" || resolution.kind === "already-active") {
     return resolution.model;

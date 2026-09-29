@@ -25,6 +25,7 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
+import type { FabricActorMessage } from "../src/actors/types.js";
 
 const repo = process.cwd();
 const hostPath = path.resolve("dist/residency/launcher.js");
@@ -186,12 +187,24 @@ const stopResident = async (config: ResidentHostConfig): Promise<void> => {
     }
   })();
   if (owner?.pid) {
+    const alive = (): boolean => {
+      try {
+        process.kill(owner.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
     try {
       process.kill(owner.pid, "SIGTERM");
     } catch {
       // Process already exited.
     }
-    await waitFor(() => !fs.existsSync(ownerPath)).catch(() => undefined);
+    // The host still writes under mesh/ after it removes owner.json: wait for the process
+    // itself to exit, not only its marker, before the root is removed.
+    await waitFor(() => !alive(), 20_000).catch(() => {
+      try { process.kill(owner.pid, "SIGKILL"); } catch { /* exited */ }
+    });
   }
 };
 
@@ -209,7 +222,9 @@ afterEach(async () => {
     } catch {
       // No resident host was created.
     }
-    fs.rmSync(root, { recursive: true, force: true });
+    // A host that already removed owner.json (idle exit) may still be finishing its last mesh
+    // writes: retry ENOTEMPTY briefly instead of failing the suite on a loaded runner.
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
 
@@ -866,6 +881,97 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
           client.hostId,
         ),
       ).rejects.toThrow(/not available to this Pi session/);
+      await client.removeActor(actor.id);
+    } finally {
+      await control.close();
+      await client.close();
+      await state.participants.close();
+      await stopResident(state.config);
+    }
+  });
+
+  it("resolves a model added to models.json after the resident host started, with no restart", { timeout: 60_000 }, async () => {
+    // pi-fabric#138: the resident host runs in its own Pi process; its registry, not the
+    // session's snapshot from host start, must discover the new exact id on ask and tell.
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-resident-models-"));
+    roots.push(agentDir);
+    const modelsPath = path.join(agentDir, "models.json");
+    const writeModels = (ids: string[]) => fs.writeFileSync(modelsPath, JSON.stringify({
+      providers: {
+        "probe-late": {
+          baseUrl: "http://127.0.0.1:9/v1",
+          api: "openai-completions",
+          apiKey: "probe",
+          models: ids.map((id) => ({ id })),
+        },
+      },
+    }));
+    writeModels(["claude-late-5-5"]);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    const state = await rootHarness("resident-late-model");
+    state.config.piModels = {
+      available: [{ provider: "probe-late", id: "claude-late-5-5" }],
+      aliases: {},
+      defaultModel: "probe-late/claude-late-5-5",
+    };
+    const client = new ResidencyClient({
+      config: state.config,
+      mesh: state.mesh,
+      participants: state.participants,
+      mainAgent: state.mainAgent,
+      hostPath,
+    });
+    const control = new FabricControlPlane(state.mesh, state.identity, {
+      enabled: true,
+      hostId: state.identity.id,
+      pollMs: 20,
+      acknowledgementTimeoutMs: 5_000,
+    });
+    control.start(() => ({ accepted: false }));
+    const ownerPid = () =>
+      (JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner).pid;
+    try {
+      const actor = await client.createActor({
+        name: "late model witness",
+        instructions: "Reply with the model of each run.",
+        residency: "durable",
+        runner: "pi",
+        model: "probe-late/claude-late-5-5",
+      });
+      const pid = ownerPid();
+      writeModels(["claude-late-5-5", "claude-late-5-6"]);
+
+      const asked = await control.requestResult<FabricActorMessage>(
+        client.hostId,
+        actor.id,
+        "ask",
+        { message: "ECHO_MODEL ping", binding: { model: "probe-late/claude-late-5-6" } },
+        client.hostId,
+        { timeoutMs: 20_000 },
+      );
+      expect(asked).toMatchObject({ text: "model probe-late/claude-late-5-6" });
+
+      writeModels(["claude-late-5-5", "claude-late-5-6", "claude-late-5-7"]);
+      await new Promise((resolve) => setTimeout(resolve, 10_500)); // past the shared refresh throttle
+      await control.request(
+        client.hostId,
+        actor.id,
+        "followUp",
+        { message: "ECHO_MODEL pong", binding: { model: "probe-late/claude-late-5-7" } },
+        client.hostId,
+      );
+      await waitFor(() => state.mesh.read({ topic: "fabric.actor.output", limit: 50 })
+        .some((event) => event.text?.includes("model probe-late/claude-late-5-7")), 15_000);
+
+      // A model that is still not configured fails after the refresh, not with a fuzzy stand-in.
+      await expect(control.request(
+        client.hostId,
+        actor.id,
+        "followUp",
+        { message: "nope", binding: { model: "probe-missing/claude-late-5-9" } },
+        client.hostId,
+      )).rejects.toThrow(/not available to this Pi session/);
+      expect(ownerPid()).toBe(pid);
       await client.removeActor(actor.id);
     } finally {
       await control.close();

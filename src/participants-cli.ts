@@ -135,8 +135,9 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
     ...(options.kinds ? { kinds: options.kinds } : {}),
   });
   // The store reads a damaged state.json as an empty state. For a reader that keeps its last
-  // snapshot on failure, a damaged file must fail, not print a fleet of [].
-  if (participants.length === 0 && store.listAll().length === 0) {
+  // snapshot on failure, a damaged file must fail, not print []. The check is on the state alone:
+  // participant files (pi-fabric#142) still list without it, all stale for want of host records.
+  if (store.listAll().length === 0) {
     const file = path.join(root, "state.json");
     const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim() : "";
     try {

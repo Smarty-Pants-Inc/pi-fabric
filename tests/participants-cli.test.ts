@@ -5,6 +5,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { main, resolveMeshRoot } from "../src/participants-cli.js";
+import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -93,6 +95,29 @@ describe("fabric-participants", () => {
     const damaged = await run(["--mesh", root]);
     expect(damaged).toMatchObject({ code: 2, out: "" });
     expect(damaged.err).toContain("FABRIC_MESH_UNREADABLE");
+  });
+
+  it("lists a files-policy mesh (pi-fabric#142) and fails on its damaged state even with --include-stale", async () => {
+    const root = scratch();
+    const store = new MeshStore(root, 64 * 1024, 1_000);
+    const live = await addRoot(store, "files");
+    const key = `topology/participants/${hash(live)}`;
+    // Files-only: the record lives in its participant file, not in the shared state.
+    writeParticipantFile(root, store.get(key)!);
+    await store.delete({ key });
+    const policyIdentity: MeshIdentity = { id: live, name: "main", kind: "main" };
+    await store.put({ key: LIVENESS_POLICY_KEY, identity: policyIdentity, value: { version: 1, hostLeases: "files", participants: "files" } });
+    expect(store.get(key)).toBeUndefined();
+    const listed = await run(["--mesh", root]);
+    expect(listed.code).toBe(0);
+    expect(JSON.parse(listed.out)).toEqual([expect.objectContaining({ id: live, stale: false })]);
+
+    fs.writeFileSync(path.join(root, "state.json"), "{\"entries\": {");
+    for (const argv of [["--mesh", root], ["--mesh", root, "--include-stale"]]) {
+      const damaged = await run(argv);
+      expect(damaged).toMatchObject({ code: 2, out: "" });
+      expect(damaged.err).toContain("FABRIC_MESH_UNREADABLE");
+    }
   });
 
   it("resolves the mesh root as Fabric does: env, project config over agent config, default", () => {

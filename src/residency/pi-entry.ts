@@ -19,5 +19,11 @@ export default function (pi: ExtensionAPI): void {
       .finally(() => ctx.shutdown());
   });
 
-  pi.on("session_shutdown", () => controller?.abort());
+  // Pi awaits this handler before it exits (a SIGTERM exits right after), so
+  // wait for the host's close: it stops the durable workers it owns. Returning
+  // early let Pi exit first and orphaned them, still writing (smarty-dev#883).
+  pi.on("session_shutdown", async () => {
+    controller?.abort();
+    await host;
+  });
 }

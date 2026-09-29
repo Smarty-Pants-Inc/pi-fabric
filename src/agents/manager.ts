@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +38,7 @@ import { removeTree } from "./rm.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
 import { ProcessTransport } from "./transports/process-transport.js";
+import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
 import type {
@@ -76,8 +78,9 @@ import {
   heartbeatRunRoot,
   markRunRootActive,
   markRunRootClosed,
+  claimTempRunSweep,
   removeEmptyRunRoot,
-  sweepTempRunRoots,
+  type TempRunSweepRequest,
 } from "../storage/retention.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 import { effectiveAgentNice, parseAgentNice } from "./priority.js";
@@ -104,8 +107,6 @@ const MAX_RETAINED_RUN_HANDLES = 1_000;
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
-// Synchronous walk: bound it on exit and on a live Main's event loop (smarty-dev#2010).
-const RETENTION_SWEEP_BUDGET_MS = 1_000;
 
 export const effectiveAgentTimeoutMs = (
   configuredTimeoutMs: number,
@@ -547,6 +548,7 @@ export class AgentManager {
   readonly #managedTempRoot: boolean;
   readonly #retention: FabricRetentionConfig;
   readonly #workerPath: string;
+  readonly #sweepPath: string;
   readonly #fabricExtensionPath: string;
   readonly #piBinary: string;
   readonly #claudeBinary: string;
@@ -601,6 +603,8 @@ export class AgentManager {
     readonly config: FabricAgentConfig,
     options: {
       workerPath?: string;
+      /** The detached temp-root sweep entry (dist/storage/sweep-main.js). */
+      sweepPath?: string;
       fabricExtensionPath?: string;
       piBinary?: string;
       claudeBinary?: string;
@@ -635,6 +639,8 @@ export class AgentManager {
     this.#retention = options.retention ?? DEFAULT_FABRIC_CONFIG.retention;
     this.#workerPath =
       options.workerPath ?? fileURLToPath(new URL("../worker.js", import.meta.url));
+    this.#sweepPath =
+      options.sweepPath ?? fileURLToPath(new URL("../storage/sweep-main.js", import.meta.url));
     this.#fabricExtensionPath =
       options.fabricExtensionPath ?? fileURLToPath(new URL("../index.js", import.meta.url));
     this.#piBinary = resolvePiBinary(options.piBinary);
@@ -1498,18 +1504,37 @@ export class AgentManager {
       }
     }
     if (this.#budgetOwned) clearOwnedBudgetEnv();
-    if (this.#managedTempRoot) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      try {
-        sweepTempRunRoots({
-          tempRoot: os.tmpdir(),
-          currentRoot: this.#runRoot,
-          orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
-          oneShotRunRetentionMs: this.#retention.oneShotRunMs,
-          minIntervalMs: RETENTION_SWEEP_INTERVAL_MS,
-          budgetMs: RETENTION_SWEEP_BUDGET_MS,
-        });
-      } catch {}
+    if (this.#managedTempRoot) await this.#startTempRunSweep();
+  }
+
+  /**
+   * Walking every retained run on the host is slow (about 60 runs/s at load 130 on Dev1), so it
+   * runs in a detached, niced process: neither this exit nor a live event loop waits for it, and
+   * one unbounded sweep per interval per host keeps up with creation (smarty-dev#2010).
+   */
+  async #startTempRunSweep(): Promise<void> {
+    const request: TempRunSweepRequest = {
+      tempRoot: os.tmpdir(),
+      currentRoot: this.#runRoot,
+      orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
+      oneShotRunRetentionMs: this.#retention.oneShotRunMs,
+    };
+    try {
+      // A Bun-compiled Pi's execPath is Pi itself: resolve a real node/bun (the override, then PATH)
+      // as every other detached launch does. Resolve before the claim, so a host that cannot run
+      // the sweep does not suppress the next attempt for a whole interval.
+      const [runtime, ...args] = await scriptSpawnArgs(this.#sweepPath, [JSON.stringify(request)]);
+      if (!claimTempRunSweep(os.tmpdir(), RETENTION_SWEEP_INTERVAL_MS)) return;
+      const child = spawn(runtime!, args, {
+        detached: true, stdio: "ignore", windowsHide: true,
+      });
+      child.on("error", () => undefined);
+      if (child.pid) {
+        try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
+      }
+      child.unref();
+    } catch {
+      // The next close or interval sweeps.
     }
   }
 
@@ -1524,15 +1549,7 @@ export class AgentManager {
   async #runRetentionSweep(now = Date.now()): Promise<void> {
     if (this.#managedTempRoot) {
       heartbeatRunRoot(this.#runRoot, now);
-      sweepTempRunRoots({
-        tempRoot: os.tmpdir(),
-        currentRoot: this.#runRoot,
-        orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
-        oneShotRunRetentionMs: this.#retention.oneShotRunMs,
-        now,
-        minIntervalMs: RETENTION_SWEEP_INTERVAL_MS,
-        budgetMs: RETENTION_SWEEP_BUDGET_MS,
-      });
+      await this.#startTempRunSweep();
     }
     const expired = [...this.#runs.values()].filter((managed) => {
       if (!managed.settled || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;

@@ -288,6 +288,55 @@ describe("native conversation reader — RPC event streaming", () => {
     expect(transcript.streaming.active).toBe(false);
   });
 
+  it("still completes a legacy full-result execution end without a canonical message", () => {
+    const events = path.join(makeWorkspace(), "events.jsonl");
+    const result = { content: [{ type: "text", text: "legacy failure" }], details: { exitCode: 1 } };
+    fs.writeFileSync(events, jsonl([
+      { type: "tool_execution_start", toolCallId: "legacy", toolName: "bash", args: { command: "false" } },
+      { type: "tool_execution_end", toolCallId: "legacy", toolName: "bash", result, isError: true },
+    ]));
+    const transcript = new NativeConversationReader().read(source({ eventsFile: events }));
+    expect(transcript.streaming.tools[0]).toMatchObject({ result, status: "failed", isError: true });
+    expect(transcript.streaming.active).toBe(false);
+  });
+
+  it.each([false, true])("retains partial output across an elided end until the whole canonical message (isError=%s)", (isError) => {
+    const events = path.join(makeWorkspace(), "events.jsonl");
+    const partial = { content: [{ type: "text", text: "still visible" }], details: { progress: 1 } };
+    fs.writeFileSync(events, jsonl([
+      { type: "tool_execution_start", toolCallId: "call_1", toolName: "bash", args: { command: "run" } },
+      { type: "tool_execution_update", toolCallId: "call_1", partialResult: partial },
+    ]));
+    const reader = new NativeConversationReader();
+    const input = source({ eventsFile: events });
+    const running = reader.read(input);
+    fs.appendFileSync(events, jsonl([{ type: "tool_execution_end", toolCallId: "call_1", result: { elided: true, bytes: 120 }, isError }]));
+    const waiting = reader.read(input);
+    expect(waiting.streaming.tools[0]?.partial).toEqual(partial);
+    expect(waiting.streaming.tools[0]?.result).toBeUndefined();
+    expect(running.streaming.tools[0]?.status).toBe("running");
+    expect(waiting.messages).toEqual([]);
+    // Preserve the gap state through an offload/replay, too.
+    expect(reader.suspend()).toBe(true);
+    const message = toolResultMessage("call_1", "canonical output", 13, isError);
+    const line = JSON.stringify({ type: "message_end", message });
+    const cut = Math.floor(line.length / 2);
+    fs.appendFileSync(events, line.slice(0, cut));
+    const incomplete = reader.read(input);
+    expect(incomplete.streaming.tools[0]?.result).toBeUndefined();
+    expect(incomplete.streaming.tools[0]?.partial).toEqual(partial);
+    fs.appendFileSync(events, `${line.slice(cut)}\n`);
+    const completed = reader.read(input);
+    expect(completed.messages).toEqual([message]);
+    expect(completed.streaming.tools[0]).toMatchObject({
+      result: { content: message.content, details: message.details },
+      status: isError ? "failed" : "completed", isError,
+    });
+    expect(completed.streaming.tools[0]?.partial).toEqual(partial);
+    expect(completed.streaming.active).toBe(false);
+    expect(waiting.streaming.tools[0]?.result).toBeUndefined();
+  });
+
   it("assembles a live partial assistant from streaming deltas", () => {
     const directory = makeWorkspace();
     const events = path.join(directory, "events.jsonl");

@@ -942,6 +942,23 @@ export class NativeConversationReader {
           this.#partial = undefined;
           this.#partialArgsRaw.clear();
         }
+        if (message.role === "toolResult") {
+          const previous = this.#tools.get(message.toolCallId);
+          const tool = previous && previous.result === undefined
+            ? this.#toolFor({ toolCallId: message.toolCallId })
+            : undefined;
+          if (tool) {
+            this.#streamingDirty = true;
+            tool.result = {
+              content: message.content,
+              ...(message.details !== undefined ? { details: message.details } : {}),
+            };
+            tool.isError = message.isError === true;
+            tool.status = tool.isError ? "failed" : "completed";
+            tool.executionStarted = true;
+            tool.argsComplete = true;
+          }
+        }
         this.#foldMessage(message);
         return;
       }
@@ -976,8 +993,10 @@ export class NativeConversationReader {
         const tool = this.#toolFor(event);
         if (!tool) return;
         this.#streamingDirty = true;
-        const result = event.result as { content?: unknown[]; details?: unknown } | undefined;
-        if (result && typeof result === "object") {
+        const result = event.result as { content?: unknown[]; details?: unknown; elided?: boolean } | undefined;
+        // Leave the partial visible until the canonical message arrives. An
+        // empty result here would replace it with an empty final card for a frame.
+        if (result && typeof result === "object" && result.elided !== true) {
           tool.result = {
             ...(Array.isArray(result.content) ? { content: result.content } : {}),
             ...(result.details !== undefined ? { details: result.details } : {}),

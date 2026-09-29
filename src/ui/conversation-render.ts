@@ -475,7 +475,7 @@ export class FabricConversationTranscriptRenderer {
     const key = `${this.currentTargetId}\u0000${id}`;
     const args = tool?.args ?? callArgs;
     const value = result ?? tool?.result ?? tool?.partial;
-    const isPartial = !result && !tool?.result && !error;
+    const isPartial = !result && !tool?.result && !error && (!tool || tool.status === "running");
     const isError = result?.isError ?? tool?.isError ?? !!error;
     const started = tool ? tool.executionStarted ?? true : false;
     const argsComplete = !!result || !!tool?.result || !!tool?.argsComplete;

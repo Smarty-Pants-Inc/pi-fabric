@@ -1176,6 +1176,7 @@ export class MeshStore {
     let attempts = 0;
     let maxGapMs = 0;
     let lastAttemptAt = Date.now();
+    let retryCeilingMs = 20;
     while (true) {
       const attemptAt = Date.now();
       if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
@@ -1199,7 +1200,11 @@ export class MeshStore {
             code: "FABRIC_MESH_LOCK_TIMEOUT",
           });
         }
-        await delay(10);
+        // Equal-range jitter separates competing writers without hot 10 ms retries. Keep
+        // the floor at 10 ms, the ceiling at 250 ms, and never sleep past this wait's deadline.
+        const backoffMs = 10 + Math.floor(Math.random() * (retryCeilingMs - 10));
+        await delay(Math.min(backoffMs, Math.max(0, deadline - Date.now())));
+        retryCeilingMs = Math.min(250, retryCeilingMs * 2);
       }
     }
     try {

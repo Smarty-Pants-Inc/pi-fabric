@@ -97,7 +97,7 @@ describe("worker run log", () => {
     // Every other event is kept, in order.
     expect(lines.filter((line) => line.type === "turn_end")).toEqual([{ type: "turn_end", turnIndex: 0 }, { type: "turn_end", turnIndex: 1 }]);
     const kept = (events: Array<Record<string, unknown>>) => events
-      .filter((event) => !["message_update", "tool_execution_update", "turn_end"].includes(String(event.type)))
+      .filter((event) => !["message_update", "tool_execution_update", "tool_execution_end", "turn_end"].includes(String(event.type)))
       .filter((event) => !(event.type === "message_start" && (event.message as { role: string }).role === "toolResult"))
       .map((event) => JSON.stringify(event));
     expect(kept(lines)).toEqual(kept(run));
@@ -113,6 +113,79 @@ describe("worker run log", () => {
     const entries = readEntries(write(run, true).text);
     expect(entries).toEqual(readEntries(rawText));
     expect(entries.filter((entry) => entry.kind === "user").map((entry) => entry.text)).toEqual(["go", "again", "again"]);
+  });
+
+  it.each([false, true])("writes each final result once and replays both readers (isError=%s)", (isError) => {
+    const content = [
+      { type: "text", text: "unique final result 🦄" },
+      { type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+    ];
+    const details = { exitCode: isError ? 1 : 0, audits: [{ toolCallId: "nested", output: "unclipped" }] };
+    const result = { content, details };
+    const end = { type: "tool_execution_end", toolCallId: "call_1", toolName: "bash", result, isError, extra: "kept" };
+    const message = { ...toolResult, content, details, isError };
+    const events = [
+      { type: "tool_execution_start", toolCallId: "call_1", toolName: "bash", args: { command: "ls" } },
+      end,
+      { type: "message_start", message },
+      { type: "message_end", message },
+    ];
+    const { text, lines } = write(events, true);
+    expect(lines[1]).toEqual({ ...end, result: { elided: true, bytes: Buffer.byteLength(JSON.stringify(result), "utf8") } });
+    expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeGreaterThan(JSON.stringify(result).length);
+    expect(text.match(/unique final result/g)).toHaveLength(1);
+    expect(lines[2]).toEqual({ type: "message_end", message });
+    expect(end.result).toBe(result);
+    const rawText = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+    expect(readEntries(text)).toEqual(readEntries(rawText));
+    expect(readEntries(text)).toEqual([expect.objectContaining({
+      kind: "tool", toolName: "bash", status: isError ? "failed" : "completed", result,
+    })]);
+    const raw = readTranscript(rawText);
+    const written = readTranscript(text);
+    expect(written.messages).toEqual(raw.messages);
+    expect(written.streaming).toEqual(raw.streaming);
+    expect(written.streaming.tools[0]?.result).toEqual(result);
+  });
+
+  it.each([
+    { terminate: true }, // Real fabric_reply result shape: Pi's message omits terminate.
+    { opaque: { version: 2, values: [false, null, "kept"] }, customFlag: 0 },
+  ])("retains noncanonical result metadata without duplicating the body (%j)", (metadata) => {
+    const content = [{ type: "text", text: "Reply delivered." }];
+    const details = {};
+    const result = { content, details, ...metadata };
+    const end = { type: "tool_execution_end", toolCallId: "reply", toolName: "fabric_reply", result, isError: false };
+    const message = { role: "toolResult", toolCallId: "reply", toolName: "fabric_reply", content, details, isError: false, timestamp: 13 };
+    const events = [
+      { type: "tool_execution_start", toolCallId: "reply", toolName: "fabric_reply", args: { reply: "done" } },
+      end,
+      { type: "message_start", message },
+      { type: "message_end", message },
+    ];
+    const { text, lines } = write(events, true);
+    expect(lines[1]).toEqual({ ...end, result: { elided: true, bytes: Buffer.byteLength(JSON.stringify(result)) }, resultMetadata: metadata });
+    expect(lines[1]?.resultMetadata).not.toHaveProperty("content");
+    expect(lines[1]?.resultMetadata).not.toHaveProperty("details");
+    expect(text.match(/Reply delivered\./g)).toHaveLength(1);
+    expect(text.match(/"details"/g)).toHaveLength(1);
+    expect(end.result).toBe(result);
+    const rawText = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+    expect(readEntries(text)).toEqual(readEntries(rawText));
+    expect(readEntries(text)).toEqual([expect.objectContaining({ kind: "tool", toolName: "fabric_reply", status: "completed", result })]);
+    const raw = readTranscript(rawText);
+    const written = readTranscript(text);
+    expect(written.messages).toEqual(raw.messages);
+    expect(written.streaming).toEqual(raw.streaming);
+  });
+
+  it("does not elide other payloads or add a missing execution result", () => {
+    const events = [
+      { type: "custom_event", result: { content: toolResult.content } },
+      { type: "tool_execution_end", toolCallId: "missing", isError: true },
+      { type: "message_end", message: toolResult },
+    ];
+    expect(write(events, true).lines).toEqual(events);
   });
 
   it("streams a live partial within the flush interval", () => {

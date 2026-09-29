@@ -26,6 +26,8 @@ const createStore = (options?: MeshStoreOptions): MeshStore => {
 };
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -528,6 +530,65 @@ describe("MeshStore lock recovery", () => {
     if (owner !== undefined) fs.writeFileSync(path.join(lockPath, "owner"), owner);
     return lockPath;
   };
+
+  it("bounded lock backoff keeps the uncontended first attempt immediate", async () => {
+    vi.useFakeTimers();
+    const store = createStore();
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const operation = vi.fn(() => "done");
+    const result = store.exclusive(operation);
+    expect(operation).toHaveBeenCalledOnce();
+    expect(timers).not.toHaveBeenCalled();
+    await expect(result).resolves.toBe("done");
+  });
+
+  it("bounded lock backoff grows exponentially with jitter and caps contention waits", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 2_000 });
+    const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now()}\n`);
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const operation = vi.fn(() => "done");
+    const result = store.exclusive(operation);
+    expect(operation).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const waits = timers.mock.calls.map(([, wait]) => Number(wait));
+    expect(waits.slice(0, 6)).toEqual([15, 25, 45, 85, 130, 130]);
+    expect(waits.length).toBeLessThan(15); // fixed 10 ms retries took 100 probes here
+    expect(waits.every((wait) => wait >= 10 && wait <= 250)).toBe(true);
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`${process.pid}\n`);
+    fs.rmSync(lockPath, { recursive: true });
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(result).resolves.toBe("done");
+    expect(operation).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounded lock backoff applies the jitter floor and clamps the deadline, preserving diagnostics", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now() - 60_000}\n`);
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const operation = vi.fn();
+    const result = store.exclusive(operation).catch((error: unknown) => error as Error & { code: string });
+    await vi.advanceTimersByTimeAsync(100);
+    const error = await result;
+    expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect((error as Error).message).toMatch(/after 4 attempts, largest gap between attempts 42 ms$/);
+    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual([19, 39, 42]);
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.existsSync(lockPath)).toBe(true); // a live holder is never swept, even beyond stale age
+    expect(vi.getTimerCount()).toBe(0);
+
+    // Minimum randomness still sleeps at least 10 ms rather than spinning on contention.
+    vi.mocked(Math.random).mockReturnValue(0);
+    timers.mockClear();
+    const second = store.exclusive(operation).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    await second;
+    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual(Array(10).fill(10));
+  });
 
   it("sweeps a stale lock whose owner process is dead", async () => {
     const store = createStore();

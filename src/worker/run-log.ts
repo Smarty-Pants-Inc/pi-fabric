@@ -6,6 +6,8 @@
 //   - merge consecutive message_update deltas of one content block into one line,
 //   - keep only the latest tool_execution_update per tool call,
 //   - drop toolResult message_start (its message_end follows at once, same message),
+//   - elide tool_execution_end.result (canonical toolResult message_end holds its
+//     content/details; preserve other result fields in resultMetadata),
 //   - drop turn_end.message (the assistant message_end just before repeats it),
 // and flush what is held at least every RUN_LOG_FLUSH_MS, so live tails still
 // stream. Held lines are written before the next other line, so every other line
@@ -75,6 +77,19 @@ export const createRunLogWriter = (
       }
       flush();
       if (event?.type === "message_start" && isRecord(event.message) && event.message.role === "toolResult") return;
+      if (event?.type === "tool_execution_end" && event.result !== undefined) {
+        // Count the JSON payload's UTF-8 bytes, not JS UTF-16 code units.
+        // Never mutate the live event: the worker still consumes the raw result.
+        const bytes = Buffer.byteLength(JSON.stringify(event.result), "utf8");
+        // Pi's canonical message omits tool-specific fields such as terminate.
+        const { content: _content, details: _details, ...resultMetadata } = isRecord(event.result) ? event.result : {};
+        append(`${JSON.stringify({
+          ...event,
+          result: { elided: true, bytes },
+          ...(Object.keys(resultMetadata).length > 0 ? { resultMetadata } : {}),
+        })}\n`);
+        return;
+      }
       if (event?.type === "turn_end" && event.message !== undefined) {
         const { message: _repeated, ...rest } = event;
         append(`${JSON.stringify(rest)}\n`);

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { isCompactToolResult } from "./tool-result-marker.js";
 import { NativeReaderEventReplay } from "./conversation-native-reader-replay.js";
 import { NativeReaderCheckpoint } from "./conversation-native-reader-checkpoint.js";
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
@@ -942,6 +943,23 @@ export class NativeConversationReader {
           this.#partial = undefined;
           this.#partialArgsRaw.clear();
         }
+        if (message.role === "toolResult") {
+          const previous = this.#tools.get(message.toolCallId);
+          const tool = previous && previous.result === undefined
+            ? this.#toolFor({ toolCallId: message.toolCallId })
+            : undefined;
+          if (tool) {
+            this.#streamingDirty = true;
+            tool.result = {
+              content: message.content,
+              ...(message.details !== undefined ? { details: message.details } : {}),
+            };
+            tool.isError = message.isError === true;
+            tool.status = tool.isError ? "failed" : "completed";
+            tool.executionStarted = true;
+            tool.argsComplete = true;
+          }
+        }
         this.#foldMessage(message);
         return;
       }
@@ -977,7 +995,9 @@ export class NativeConversationReader {
         if (!tool) return;
         this.#streamingDirty = true;
         const result = event.result as { content?: unknown[]; details?: unknown } | undefined;
-        if (result && typeof result === "object") {
+        // Leave the partial visible until the canonical message arrives. An
+        // empty result here would replace it with an empty final card for a frame.
+        if (result && typeof result === "object" && !isCompactToolResult(result)) {
           tool.result = {
             ...(Array.isArray(result.content) ? { content: result.content } : {}),
             ...(result.details !== undefined ? { details: result.details } : {}),

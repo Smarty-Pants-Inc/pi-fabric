@@ -230,6 +230,33 @@ describe("conversation renderer retained-row cache", () => {
     expect(update).not.toHaveBeenCalled();
   });
 
+  it.each(["completed", "failed"] as const)("finalizes the retained partial card on an elided %s end until its canonical result arrives", (status) => {
+    const { renderer } = setup();
+    const updates = vi.spyOn(ToolExecutionComponent.prototype, "updateResult");
+    const partial = { content: [{ type: "text", text: "visible partial" }] };
+    const running = { ...tool("elided"), executionStarted: true, argsComplete: true, partial };
+    renderer.render(nativeTranscript([], { streaming: { active: true, tools: [running] } }), 80, options);
+    const component = updates.mock.instances[0];
+    expect(updates).toHaveBeenCalledTimes(1);
+    expect(updates.mock.calls[0]?.[1]).toBe(true);
+    // The native reader marks execution complete, but does not turn the marker
+    // into an empty final result while waiting for message_end.
+    const waiting = { ...running, status, isError: status === "failed" };
+    expect(waiting.result).toBeUndefined();
+    expect(text(renderer.render(nativeTranscript([], { streaming: { active: false, tools: [waiting] } }), 80, options))).toContain("visible partial");
+    expect(updates).toHaveBeenCalledTimes(2);
+    expect(updates.mock.calls[1]).toEqual([{ content: partial.content, isError: waiting.isError }, false]);
+    expect(updates.mock.instances[1]).toBe(component);
+    const canonical = { ...result("elided", "canonical final"), isError: waiting.isError };
+    const finished = { ...waiting, result: { content: canonical.content } };
+    const lines = renderer.render(nativeTranscript([canonical], { streaming: { active: false, tools: [finished] } }), 80, options);
+    expect(text(lines)).toContain("canonical final");
+    expect(text(lines)).not.toContain("visible partial");
+    expect(updates).toHaveBeenCalledTimes(3);
+    expect(updates.mock.calls[2]).toEqual([{ content: canonical.content, isError: canonical.isError }, false]);
+    expect(updates.mock.instances[2]).toBe(component);
+  });
+
   it("transitions pending partial calls through args completion and error-only changes", () => {
     const contexts: Array<{ executionStarted: boolean; argsComplete: boolean; isError: boolean }> = [];
     const { renderer } = setup({ getToolDefinition: () => ({

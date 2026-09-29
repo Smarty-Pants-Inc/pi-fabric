@@ -15,6 +15,7 @@ import {
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { runBridge } from "../src/mesh-bridge.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
+import { RootInbox } from "../src/topology/root-inbox.js";
 
 // Two scratch meshes: "dev1" (the hub, in-process) and "forge" (reached through the agent over
 // a stdio pair, as the ssh transport does).
@@ -497,7 +498,7 @@ describe("mesh bridge", () => {
   // Security review round 2, F4: presence both ways stays inside one frame, over a real pipe.
   it("keeps presence replies and mirror requests inside one frame over a real pipe", async () => {
     // Nine 1.9 MiB roots a side: about 17 MiB of presence, over the 16 MiB frame.
-    const { hub, far, bridge, remote, logs } = setup(undefined, { maxEventBytes: 2 * 1024 * 1024, realPipe: true });
+    const { hub, far, bridge, remote, logs } = setup(undefined, { maxEventBytes: 2 * 1024 * 1024, realPipe: true, callTimeoutMs: 240_000 });
     const cwd = "c".repeat(1_900 * 1024);
     for (let index = 0; index < 9; index++) {
       await addRoot(far, `far${index}`, 60_000, { cwd });
@@ -528,4 +529,72 @@ describe("mesh bridge", () => {
       expect(Date.now() - started).toBeLessThan(10_000);
     }
   }, 30_000);
+  // Security round 3, F1: a hub session name never answers to a bridged id.
+  it("keeps a hub Main whose session name looks like a remote id from taking that id's traffic", async () => {
+    const { hub, far, bridge } = setup();
+    const main = await addRoot(hub, "hubmain");
+    const evil = await addRoot(far, "evil");
+    await bridge.start();
+    await bridge.step();
+    // The hub Main's session name is the remote's canonical id.
+    const inbox = new RootInbox(hub, main.identity, () => [main.identity.id, evil.identity.id], { steerGraceMs: 0 });
+    const idle = { holdsBatch: () => false, holdsSteer: () => false };
+    await inbox.next(idle);
+    await hub.publish({ topic: "fleet.work.x.1", kind: "ask", from: main.identity, to: evil.identity.id, text: "to the remote id" });
+    await hub.publish({ topic: "fleet.work.x.2", kind: "ask", from: evil.identity, to: main.identity.id, text: "to the hub id" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect((await inbox.next(idle)).events.map((e) => e.text)).toEqual(["to the hub id"]);
+    await bridge.step();
+    expect(far.read({ after: 0, limit: 100 }).map((e) => e.text)).toEqual(["to the remote id"]);
+  });
+
+  // Security round 3, F2: ownership is checked for each event at commit, not once per page.
+  it("refuses an inbound event whose sender a native took over while the page was being published", async () => {
+    const hub = new MeshStore(scratch(), 64 * 1024, 100);
+    const lane = await addRoot(hub, "lane");
+    const { far, bridge, logs } = setup(undefined, { hub });
+    const y = await addRoot(far, "y");
+    const x = await addRoot(far, "x");
+    await bridge.start();
+    await bridge.step();
+    expect(hub.get(`topology/participants/${hash(x.identity.id)}`)!.value).toMatchObject({ remoteHost: "forge" });
+    await far.publish({ topic: "fleet.work.x.1", kind: "ask", from: y.identity, to: lane.identity.id, text: "from y" });
+    await far.publish({ topic: "fleet.work.x.2", kind: "ask", from: x.identity, to: lane.identity.id, text: "from x" });
+    // Hold the first hub publish; a native X registers meanwhile.
+    const publish = hub.publish.bind(hub);
+    let first = true;
+    hub.publish = async (input) => {
+      if (first) {
+        first = false;
+        await addRoot(hub, "x");
+      }
+      return publish(input);
+    };
+    await bridge.step();
+    expect(hub.read({ after: 0, limit: 100 }).map((e) => e.text)).toEqual(["from y"]);
+    expect(hub.get(`topology/participants/${hash(x.identity.id)}`)!.value).not.toHaveProperty("remoteHost");
+    expect(hub.get(`topology/hosts/${hash(x.hostId)}`)!.value).not.toHaveProperty("remoteHost");
+    expect(logs.join("\n")).toMatch(/no longer bound to bridge link forge/);
+  });
+
+  // Security round 3, F5: a setup failure never leaves a transport child behind.
+  it("checks its setup before it starts the transport", async () => {
+    const silent = [process.execPath, "-e", "setInterval(() => {}, 1e6)"];
+    const meshFile = path.join(scratch(), "a-file");
+    fs.writeFileSync(meshFile, "");
+    const base = { mesh: scratch(), name: "dev1", remote: "forge", cursor: path.join(scratch(), "c.json") };
+    const cases: Array<[Record<string, string>, RegExp]> = [
+      [{ ...base, cursor: "" }, /--cursor is required/],
+      [{ ...base, remote: "dev1" }, /names must differ/],
+      [{ ...base, mesh: path.join(meshFile, "mesh") }, /ENOTDIR|EEXIST|not a directory/i],
+    ];
+    for (const [flags, error] of cases) {
+      const spawned: Array<number | undefined> = [];
+      const started = Date.now();
+      await expect(runBridge(new Map(Object.entries(flags)), silent, new AbortController().signal, (pid) => spawned.push(pid)))
+        .rejects.toThrow(error);
+      expect(spawned).toEqual([]);
+      expect(Date.now() - started).toBeLessThan(5_000);
+    }
+  });
 });

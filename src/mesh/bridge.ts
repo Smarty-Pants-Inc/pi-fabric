@@ -5,6 +5,7 @@ import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { hostLeaseExpiry, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
+import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "./store.js";
 
 /**
@@ -102,7 +103,10 @@ export interface BridgeSide {
   latestSequence(): Promise<number>;
   read(after: number): Promise<BridgeRead>;
   presence(): Promise<BridgePresence>;
-  publish(event: BridgePublish): Promise<{ sequence: number }>;
+  /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
+  publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
+  /** Whether this link holds a live mirror answering to the id (the hub side only). */
+  holds?(id: string): boolean;
   /** Replace this side's mirror of the peer's presence. */
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void>;
   /** Original ids of events the peer bridged into this side after a sequence, one bounded page. */
@@ -213,6 +217,7 @@ export class StoreBridgeSide implements BridgeSide {
         continue;
       }
       reserved.add(participant.id).add(participant.ownerIdentityId).add(participant.rootId);
+      if (typeof participant.name === "string" && participant.name) reserved.add(participant.name);
       // Labels are minted per mesh and collide by design; they are never addresses across.
       if (typeof participant.sessionId === "string" && participant.sessionId) reserved.add(participant.sessionId);
       const owner = live.get(participant.ownerHostId);
@@ -224,13 +229,41 @@ export class StoreBridgeSide implements BridgeSide {
     return { hosts, participants, reserved: [...reserved] };
   }
 
-  async publish(event: BridgePublish): Promise<{ sequence: number }> {
+  async publish(event: BridgePublish, held: string[] = []): Promise<{ sequence: number }> {
     const checked = checkBridgePublish(event);
+    const data = { ...checked.data, bridge: { from: this.peer, id: checked.data.bridge.id } };
     const published = await this.store.publish({
       ...checked,
-      data: { ...checked.data, bridge: { from: this.peer, id: checked.data.bridge.id } },
+      // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
+      // ownership at commit: a native takeover before it refuses the event (security review
+      // round 3, F2). Every state writer takes the same lock.
+      data: () => {
+        for (const id of held) {
+          if (!this.holds(id)) throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
+        }
+        return data;
+      },
     });
     return { sequence: published.sequence };
+  }
+
+  holds(id: string): boolean {
+    const now = this.now();
+    const live = (host: FabricHostRecord | undefined): boolean =>
+      host !== undefined && hostLeaseExpiry(readHostLeases(this.store.root), host) > now;
+    const held = (prefix: string): unknown => {
+      const entry = this.store.get(keyFor(prefix, id), { fresh: true });
+      return entry && remoteHostOf(entry.value) === this.peer ? entry : undefined;
+    };
+    const hostEntry = held(HOST_PREFIX) as { key: string; value: unknown; updatedBy: MeshIdentity } | undefined;
+    const host = hostEntry ? hostOf(hostEntry.key, hostEntry.value) : undefined;
+    if (host && hostEntry!.updatedBy.id === host.identity.id && live(host)) return true;
+    const entry = held(PARTICIPANT_PREFIX) as { key: string; value: unknown; updatedBy: MeshIdentity } | undefined;
+    const participant = entry ? participantOf(entry.key, entry.value) : undefined;
+    if (!participant || entry!.updatedBy.id !== participant.ownerIdentityId) return false;
+    const ownerEntry = this.store.get(keyFor(HOST_PREFIX, participant.ownerHostId), { fresh: true });
+    const owner = ownerEntry && remoteHostOf(ownerEntry.value) === this.peer ? hostOf(ownerEntry.key, ownerEntry.value) : undefined;
+    return owner !== undefined && owner.identity.id === participant.ownerIdentityId && live(owner);
   }
 
   #fenced = false;
@@ -373,6 +406,9 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
 }
+
+/** An event refused at commit: its sender or target is no longer bound to this link. */
+export class BridgeOwnershipError extends Error {}
 
 const ignoreConflict = (error: unknown): void => {
   // A concurrent writer changed the key: the next presence round decides again.
@@ -637,11 +673,11 @@ const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Se
 
 /**
  * A root's canonical id (`session:<session id>`); its host id and identity id are the same. An
- * admitted remote id must have this form, so it never equals a hub session name.
- * ponytail: a hub user who names a session exactly like another host's `session:<uuid>` could
- * still collide; session names are not in any record the bridge can see.
+ * admitted remote id must have this form. A native root never accepts a name in this namespace
+ * other than its own id (RootInbox, ROOT_ID_PREFIX), and every native participant's id and name
+ * is reserved, so no hub recipient but the remote owner answers to an admitted id.
  */
-const CANONICAL_ID = /^session:[A-Za-z0-9-]{8,128}$/;
+const CANONICAL_ID = new RegExp(`^${ROOT_ID_PREFIX}[A-Za-z0-9-]{8,128}$`);
 
 /**
  * The remote's presence as this link admits it: hosts and roots none of whose ids or aliases
@@ -831,13 +867,25 @@ export class MeshBridge {
         } else if (this.#stopped) {
           return { forwarded, dropped };
         } else if (!seen.has(event.id)) {
+          // A long backlog must not outlast the mirrors' 15 s lease: renew presence when due.
+          if (Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS)) await this.syncPresence();
+          if (this.#stopped) return { forwarded, dropped };
           const data = isObject(event.data) ? event.data : {};
           try {
+            // Revalidated for each event after the awaits before it: an inbound event commits only
+            // while its sender (and an ack's target) is still this link's; an outbound one is sent
+            // only while its recipient is (security review round 3, F2).
+            const held = direction === "toLocal"
+              ? [event.from.id, ...(event.topic === "fabric.control.ack" && isObject(event.data) && typeof event.data.targetId === "string" ? [event.data.targetId] : [])]
+              : [];
+            if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
+              throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
+            }
             const published = await target.publish({
               topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
               ...(event.text !== undefined ? { text: event.text } : {}),
               data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
-            });
+            }, held);
             cursor.mark = Math.max(cursor.mark, published.sequence);
             cursor.after = event.sequence;
             forwarded += 1;
@@ -928,4 +976,4 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
-  error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message);
+  error instanceof BridgeOwnershipError || error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message);

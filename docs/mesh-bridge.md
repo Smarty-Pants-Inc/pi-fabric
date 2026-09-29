@@ -31,12 +31,17 @@ existing events and mirrors root presence. There is no new store or protocol.
 - A remote identity is bound to the one link that mirrored it first (the `remoteHost` on its record).
   Each link reserves every id it did not mirror: native records (live or not) and other links'
   mirrors. It reserves host ids, identity ids, root ids, participant ids and session ids, but not
-  labels, which each mesh mints and which collide by design. A remote root must have a canonical id
-  (`session:<session id>`), so it can never equal a hub session name.
+  labels, which each mesh mints and which collide by design. It also reserves every native
+  participant name. A remote root must have a canonical id (`session:<session id>`). A native
+  Main never accepts a `session:` name other than its own id (RootInbox), so native name delivery
+  and bridged ids are disjoint by construction.
 - Authority comes from ownership after the mirror step, not from the peer's claims: for each page it
   forwards, the bridge rereads the records this link holds now and checks them against the current
   reservations. A claim refused or lost in the same pass (to another link or to a new native) gets no
-  traffic, and its events are dropped. A remote event whose sender, or an ack whose `targetId`, is
+  traffic, and its events are dropped. Each event is checked again at commit. An inbound event is
+  published only if, under the mesh lock that commits it, its sender (and an ack's target) is
+  still a live mirror of this link. An outbound event is sent only while this link still holds its
+  recipient. While a backlog is forwarded, presence and leases are renewed when due. A remote event whose sender, or an ack whose `targetId`, is
   not bound to this link is dropped.
 - The hub routes to the remote only by canonical ids: host id, identity id, participant id and root
   id. Labels, session ids and names are never addresses across.
@@ -53,8 +58,9 @@ existing events and mirrors root presence. There is no new store or protocol.
   the count. A `bridgedIds` reply holds at most 50,000 ids per page.
 - Local mirror writes run one at a time behind a fence. On withdrawal, the bridge fences first,
   waits for a write in flight, then deletes, so no record or lease comes back after stop.
-- A transport that cannot start (a missing or non-executable ssh) fails the bridge with a named
-  error and exit status 1.
+- The bridge checks its arguments and opens the local mesh before it starts the transport. From the
+  spawn on, one `finally` withdraws the mirrors and reaps the child. A transport that cannot start
+  (a missing or non-executable ssh) fails the bridge with a named error and exit status 1.
 - The agent (the remote end) serves only the bridge operations. It applies the allow-list and
   stamps its pinned `--peer` name on everything it writes, whatever the hub sends.
 

@@ -74,50 +74,59 @@ export const runBridge = async (
   signal: AbortSignal,
   onChild?: (pid: number | undefined) => void,
 ): Promise<number> => {
+  // Everything that can fail without a transport is checked and built first; from the spawn on,
+  // one finally owns the child (security review round 3, F5).
   const localName = required(flags, "name");
   const remoteName = required(flags, "remote");
   if (!validBridgeName(localName) || !validBridgeName(remoteName)) throw new Error("Invalid bridge name");
+  if (localName === remoteName) throw new Error("Bridge side names must differ");
   const callTimeoutMs = Number(flags.get("call-timeout-ms") ?? DEFAULT_CALL_TIMEOUT_MS);
   if (!Number.isSafeInteger(callTimeoutMs) || callTimeoutMs <= 0) throw new Error("--call-timeout-ms must be a positive integer");
+  const cursorPath = required(flags, "cursor");
+  const local = new StoreBridgeSide(store(required(flags, "mesh")), remoteName);
   const argv = transportCommand(flags, command);
+  if (signal.aborted) return 0;
+
   const child = spawn(argv[0]!, argv.slice(1), { stdio: ["pipe", "pipe", "inherit"] });
-  onChild?.(child.pid);
-  const remote = new RemoteBridgeSide(child.stdout, child.stdin, callTimeoutMs);
-  // A transport that cannot start (no ssh, not executable) emits error and close, never exit
-  // (review round 2, F5): either settles the child, and the error fails the bridge by name.
   let spawnError: Error | undefined;
+  let remote: RemoteBridgeSide | undefined;
+  // A transport that cannot start (no ssh, not executable) emits error and close, never exit:
+  // either settles the child, and the error fails the bridge by name.
   const exited = new Promise<void>((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) resolve();
     child.once("exit", () => resolve());
     child.once("close", () => resolve());
     child.once("error", (error) => {
       spawnError ??= new Error(`Bridge transport ${argv[0]} failed: ${error.message}`);
-      remote.close(spawnError);
+      remote?.close(spawnError);
       resolve();
     });
   });
   child.stdin.on("error", () => undefined);
-  const bridge = new MeshBridge({
-    localName, remoteName,
-    local: new StoreBridgeSide(store(required(flags, "mesh")), remoteName),
-    remote,
-    cursorPath: required(flags, "cursor"),
-    stopMs: Math.min(callTimeoutMs, 5_000),
-    log,
-  });
-  const aborted = new Promise<void>((resolve) => {
-    if (signal.aborted) resolve();
-    else signal.addEventListener("abort", () => resolve(), { once: true });
-  });
+  let bridge: MeshBridge | undefined;
   let code = 0;
   try {
+    onChild?.(child.pid);
+    remote = new RemoteBridgeSide(child.stdout, child.stdin, callTimeoutMs);
+    if (spawnError) remote.close(spawnError);
+    const linked = remote;
+    bridge = new MeshBridge({
+      localName, remoteName, local, remote: linked, cursorPath,
+      stopMs: Math.min(callTimeoutMs, 5_000),
+      log,
+    });
+    const running = bridge;
+    const aborted = new Promise<void>((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
     await Promise.race([
       (async () => {
-        await remote.hello();
+        await linked.hello();
         log(`linked ${localName} <-> ${remoteName}`);
-        await bridge.run();
+        await running.run();
       })(),
-      remote.closed.then((error) => {
+      linked.closed.then((error) => {
         throw error;
       }),
       aborted,
@@ -127,14 +136,15 @@ export const runBridge = async (
       log(`stopped: ${(spawnError ?? (error instanceof Error ? error : new Error(String(error)))).message}`);
       code = 1;
     }
+  } finally {
+    // The mirrors of the remote on this side go at once; the remote's lapse with their lease.
+    await (bridge ? bridge.stop() : local.withdraw()).catch(() => undefined);
+    remote?.close();
+    if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    const timer = setTimeout(() => child.kill("SIGKILL"), CHILD_KILL_MS);
+    await exited;
+    clearTimeout(timer);
   }
-  // The mirrors of the remote on this side go at once; the remote's lapse with their lease.
-  await bridge.stop();
-  remote.close();
-  if (child.pid !== undefined) child.kill("SIGTERM");
-  const timer = setTimeout(() => child.kill("SIGKILL"), CHILD_KILL_MS);
-  await exited;
-  clearTimeout(timer);
   return spawnError ? 1 : code;
 };
 

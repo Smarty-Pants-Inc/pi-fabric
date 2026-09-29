@@ -80,6 +80,16 @@ input.on("line", (line) => {
     return;
   }
 
+  if (task.includes("REPORT_FLEET_ROLE")) {
+    finishAttempt(
+      successMessage(
+        JSON.stringify({ role: process.env.SMARTY_ROLE ?? null, lane: process.env.SMARTY_LANE ?? null }),
+      ),
+      false,
+    );
+    return;
+  }
+
   const value = {
     action: "message",
     message: `validated actor response:${process.env.PI_FABRIC_FULL_CODE_MODE ?? "missing"}`,

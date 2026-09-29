@@ -411,11 +411,17 @@ const main = async (): Promise<void> => {
     applyChildPriority(process.pid, options.nice, (message) =>
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
+  // smarty-dev#2088: a child inherits its parent's SMARTY_ROLE (or none), so the fleet write governor
+  // counted a task agent's GitHub writes as its parent's role. A task agent is "task-agent" in its
+  // parent's lane: the parent's SMARTY_LANE when set, else its role name. Actors keep their own identity.
+  const parentRole = process.env.SMARTY_ROLE?.split("@")[0]?.trim();
+  const lane = process.env.SMARTY_LANE?.trim() || parentRole;
   const child = spawnCli(childBinary, childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
     env: {
       ...process.env,
+      ...(options.actorName ? {} : { SMARTY_ROLE: "task-agent", ...(lane ? { SMARTY_LANE: lane } : {}) }),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),

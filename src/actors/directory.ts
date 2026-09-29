@@ -90,6 +90,7 @@ export class ActorDirectory extends ActorManager {
   override status(...args: Parameters<ActorManager["status"]>): ReturnType<ActorManager["status"]> { return this.#isPrimary(args[0]) ? super.status(...args) : this.#secondary.status(...args); }
   override owns(...args: Parameters<ActorManager["owns"]>): ReturnType<ActorManager["owns"]> { try { return this.#isPrimary(args[0]) ? super.owns(...args) : this.#secondary.owns(...args); } catch { return false; } }
   override resolveBinding(...args: Parameters<ActorManager["resolveBinding"]>): ReturnType<ActorManager["resolveBinding"]> { return this.#isPrimary(args[0]) ? super.resolveBinding(...args) : this.#secondary.resolveBinding(...args); }
+  override resolveActivationBinding(...args: Parameters<ActorManager["resolveActivationBinding"]>): ReturnType<ActorManager["resolveActivationBinding"]> { return this.#isPrimary(args[0]) ? super.resolveActivationBinding(...args) : this.#secondary.resolveActivationBinding(...args); }
   override setModel(...args: Parameters<ActorManager["setModel"]>): ReturnType<ActorManager["setModel"]> { return this.#isPrimary(args[0]) ? super.setModel(...args) : this.#secondary.setModel(...args); }
   override setThinking(...args: Parameters<ActorManager["setThinking"]>): ReturnType<ActorManager["setThinking"]> { return this.#isPrimary(args[0]) ? super.setThinking(...args) : this.#secondary.setThinking(...args); }
   override setTools(...args: Parameters<ActorManager["setTools"]>): ReturnType<ActorManager["setTools"]> { return this.#isPrimary(args[0]) ? super.setTools(...args) : this.#secondary.setTools(...args); }
@@ -124,6 +125,8 @@ export class ActorDirectory extends ActorManager {
   override dispatchObservedHostEvent(...args: Parameters<ActorManager["dispatchObservedHostEvent"]>): number { return super.dispatchObservedHostEvent(...args) + this.#secondary.dispatchObservedHostEvent(...args); }
   override stop(...args: Parameters<ActorManager["stop"]>): ReturnType<ActorManager["stop"]> { return this.#isPrimary(args[0]) ? super.stop(...args) : this.#secondary.stop(...args); }
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
+  /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
+  override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
   override haltAll(): { halted: number } { const first = super.haltAll(); const second = this.#secondary.haltAll(); return { halted: first.halted + second.halted }; }
   override remove(...args: Parameters<ActorManager["remove"]>): ReturnType<ActorManager["remove"]> { return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args); }
   override async close(): Promise<void> { await Promise.all([super.close(), this.#secondary.close()]); }

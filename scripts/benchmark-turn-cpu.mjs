@@ -12,7 +12,7 @@ try {
   await build({ stdin: { resolveDir: process.cwd(), loader: "ts", contents: `
 export { BackgroundEntropyCompiler, compileEntropySurfaceAsync } from './src/entropy/compiler.ts';
 export { SessionObservationCache, mergeObservationWindowAsync, poolToValueObservations } from './src/entropy/pool.ts';
-export { BackgroundSessionSelector, machineSessionFilesAsync } from './src/entropy/sessions.ts';
+export { sessionWindowEvidenceAsync } from './src/entropy/sessions.ts';
 export { LiteralCallScanner } from './src/speculation/scanner.ts';
 export { FabricSpeculationStreamTap } from './src/speculation/stream-tap.ts';
 ` }, outfile, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent" });
@@ -81,11 +81,23 @@ export { FabricSpeculationStreamTap } from './src/speculation/stream-tap.ts';
       assert.equal(launches, 400);
     } finally { Date.now = original; }
   });
-  const agentDir = path.join(root, "agent"); const sessionDir = path.join(agentDir, "sessions", "synthetic");
-  fs.mkdirSync(sessionDir, { recursive: true });
-  for (let i = 0; i < 5000; i++) fs.writeFileSync(path.join(sessionDir, `${i}.jsonl`), "");
-  const selector = new s.BackgroundSessionSelector();
-  await measure("discovery 5000 files: full scan", () => s.machineSessionFilesAsync(agentDir));
-  await measure("discovery 5000 files: cached selection", () => selector.select(agentDir, undefined));
+  // The background compile reads only the active session, from a complete-line cursor.
+  const sessionLine = JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "fabric_exec",
+    content: [{ type: "text", text: "ok" }], details: { success: true, trace: { kind: "pi-fabric.execution", version: 1,
+      outcome: "succeeded", phases: [], operations: [{ type: "call", sequence: 0, ref: "pi.read", args: { path: "a.ts" }, outcome: "succeeded" }],
+      counts: { droppedValues: 0, truncatedValues: 0, redactedValues: 0, droppedOperations: 0 } } } } }) + "\n";
+  const sessionBody = sessionLine.repeat(5000);
+  const copies = Array.from({ length: 7 }, (_, i) => {
+    const file = path.join(root, `session-${i}.jsonl`); fs.writeFileSync(file, sessionBody); return file;
+  });
+  let copy = 0;
+  await measure("own session 5000 lines: first read", () => s.sessionWindowEvidenceAsync([copies[copy++ % copies.length]], { windowsOnly: true }));
+  const live = copies[0];
+  await s.sessionWindowEvidenceAsync([live], { windowsOnly: true });
+  await measure("own session 5000 lines: append one line, cursor read", async () => {
+    fs.appendFileSync(live, sessionLine);
+    const evidence = await s.sessionWindowEvidenceAsync([live], { windowsOnly: true });
+    assert.ok(evidence.traceWindows[0].traces.length > 5000);
+  });
   console.log(JSON.stringify({ runtime: process.version, arch: process.arch, synthetic: true, repeats: 5, rows }, null, 2));
 } finally { fs.rmSync(root, { recursive: true, force: true }); }

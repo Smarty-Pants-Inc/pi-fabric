@@ -91,6 +91,27 @@ describe("Main followUp drain (unit)", () => {
     expect(sent).toHaveLength(0);
   });
 
+  // smarty-dev#2119: a followUp sent 29 s into a Main's 60 s capped wait lands at the tool
+  // boundary right after it, not 120 s later or at turn end.
+  it("flushes every held followUp at the boundary after a capped Main wait, once", () => {
+    const { main, sent, emit, ctx } = setup();
+    vi.advanceTimersByTime(29_000);
+    main.deliverAgent({ from: from("a"), message: "news", delivery: "followUp" });
+    vi.advanceTimersByTime(31_000);
+    emit("turn_end", toolTurn, ctx);                                          // counterexample: 31 s old, no capped wait
+    expect(sent).toHaveLength(0);
+    main.flushHeldAtNextBoundary();                                           // the capped wait returned
+    emit("turn_end", toolTurn, ctx);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.options.deliverAs).toBe("steer");
+    expect(sent[0]!.message.content).toMatch(/^1 follow-up message\(s\) sent while you were busy, delivered at the tool boundary after a capped agents\.wait\./);
+    expect(sent[0]!.message.content).toContain("news");
+    // One boundary only: #102's 120 s rule is back for the next followUp.
+    main.deliverAgent({ from: from("b"), message: "later", delivery: "followUp" });
+    emit("turn_end", toolTurn, ctx);
+    expect(sent).toHaveLength(1);
+  });
+
   // dev-lead review of pi-fabric#102: JSON.stringify is not attribute escaping.
   it("escapes every header attribute, so a sender cannot forge an envelope or another sender", () => {
     const { main, sent, emit, ctx } = setup();

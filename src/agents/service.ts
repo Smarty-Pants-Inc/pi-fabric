@@ -82,7 +82,7 @@ export class AgentService {
   }
 
   /**
-   * Waits for a direct child, bounded by timeoutMs (5 min by default, at most 60; smarty-dev#854).
+   * Waits for a direct child, bounded by timeoutMs (default and at most 5 min; smarty-dev#854).
    * At the bound only the wait ends: the child keeps running and its result stays available.
    */
   async wait(callerId: string, id: string, signal?: AbortSignal, timeoutMs?: number): Promise<AgentPublicRecord> {
@@ -95,7 +95,7 @@ export class AgentService {
       const entry = this.#child(callerId, id);
       throw new Error(
         `agents.wait: ${entry.record.name} is still running after ${describeWaitBound(bound)}. It continues: ` +
-          "check it later with agents.status or agents.wait, or pass a larger timeoutMs (up to 60 min).",
+          "end the turn now and check it later with agents.status or agents.wait.",
       );
     }
   }

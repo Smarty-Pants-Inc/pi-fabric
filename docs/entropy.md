@@ -67,10 +67,11 @@ changes still update the report. These caches are session-owned, retain at most
 16 windows, and are discarded on session start/shutdown. Cached snapshot inputs
 must not be mutated by callers.
 
-Background machine-wide discovery runs at most once per 30 seconds, with the
-active session file included on every compile. Selected files are still checked
-for changes each time. Explicit `/fabric entropy` inspection remains immediately
-fresh. Advisory enum/overload/sequence analysis runs only on the inspection path,
+The background compile reads only the active session's file, from a
+complete-line cursor: a partial tail is left for the next read, so a live
+session is never re-read from byte 0. Reads and scoring stop at once when the
+session ends; shutdown does not wait for them. Explicit `/fabric entropy`
+inspection remains machine-wide and immediately fresh. Advisory enum/overload/sequence analysis runs only on the inspection path,
 not in background compilation. No normalizations or historical outcomes change.
 `bun run benchmark:turn-cpu` compares cached/uncached source paths using synthetic
 evidence and reports process CPU separately from wall time.

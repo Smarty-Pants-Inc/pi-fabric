@@ -6,6 +6,8 @@ const primaryEntryPoints = [
   "src/index.ts",
   "src/memory.ts",
   "src/mesh.ts",
+  "src/mesh-bridge.ts",
+  "src/participants-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/jev.ts",
@@ -101,7 +103,7 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // ponytail: typebox (agent-result schema checks) is their only host import
 // today; scripts/smoke-package-install.mjs fails if one gains another.
 const standalone = await build({
-  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts"],
+  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

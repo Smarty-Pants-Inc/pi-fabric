@@ -137,6 +137,30 @@ describe("activation filter rules on real envelopes", () => {
     expect(skip(exists, envelope("issues.typed"))).toBe("snap");
     expect(skip(exists, envelope("issue_comment.created"))).toBeUndefined();
   });
+
+  // smarty-dev#2004: the factory projection carries label names, the author and the Owner line.
+  it("hold reads projected label names; owned set and bots off the allow list", () => {
+    const projected = (payload: Record<string, unknown>) => {
+      const item = envelope("issue_comment.created");
+      Object.assign(item.payload.data.payload, payload);
+      return item;
+    };
+    expect(skip(["hold"], projected({ labels: ["bug", "hold"] }))).toBe("hold");
+    expect(skip(["hold"], projected({ labels: ["bug"] }))).toBeUndefined();
+    expect(skip(["hold"], projected({ labels: [] }))).toBeUndefined();
+    const owned: FabricActorActivationFilter = [{ id: "not-owned", topic: ["github.*"], unless: [{ path: "data.payload.owners", in: ["fabric-v2"] }] }];
+    expect(skip(owned, projected({ owners: ["dev-lead"] }))).toBe("not-owned");
+    expect(skip(owned, projected({ owners: ["other", "fabric-v2"] }))).toBeUndefined();
+    expect(skip(owned, projected({}))).toBeUndefined();                               // no Owner line: unsure
+    const bots: FabricActorActivationFilter = [{
+      id: "bot-not-allowed", topic: ["github.*"], where: [{ path: "data.payload.author.type", equals: "Bot" }],
+      unless: [{ path: "data.payload.author.login", in: ["smarty-fleet-write[bot]"] }],
+    }];
+    expect(skip(bots, projected({ author: { login: "mergify[bot]", type: "Bot" } }))).toBe("bot-not-allowed");
+    expect(skip(bots, projected({ author: { login: "smarty-fleet-write[bot]", type: "Bot" } }))).toBeUndefined();
+    expect(skip(bots, projected({ author: { login: "paul", type: "User" } }))).toBeUndefined();
+    expect(skip(bots, projected({ author: { type: "Bot" } }))).toBeUndefined();        // login missing: unsure
+  });
 });
 
 describe("activation filter validation", () => {
@@ -252,20 +276,43 @@ describe("actor activation filter in ActorManager", () => {
     await event(2, "two-held", [hold]);
     await event(3, "three", []);
     await event(1, "one-b", [bug]);                    // replaces one-a in its place
-    await event(2, "two-released", []);                // replaces the held one: the newest state wins
+    await event(2, "two-released", []);                // the held one never queued: the release queues
     await event(4, "four-held", [hold]);
-    await waitFor(() => actors.status(actor.id).queued === 4);
+    await waitFor(() => actors.status(actor.id).queued === 3);
     await waitFor(() => actors.status(actor.id).status === "idle" && actors.status(actor.id).queued === 0, 20_000);
     const markers = runTasks(root, actor.id).map((task) => task.match(/"marker": "([^"]+)"/)?.[1]).filter(Boolean);
-    expect(markers).toEqual(["one-b", "two-released", "three"]);
-    expect(filtered(actors, actor.id).map((m) => m.reason)).toEqual(["filtered: hold"]);
-    expect(actors.status(actor.id).filteredCount).toBe(1);
+    expect(markers).toEqual(["one-b", "three", "two-released"]);
+    expect(filtered(actors, actor.id).map((m) => m.reason)).toEqual(["filtered: hold", "filtered: hold"]);
+    expect(actors.status(actor.id).filteredCount).toBe(2);
     // A direct message is never filtered, even by a rule its fields match.
     await actors.setActivationFilter(actor.id, [{ id: "any-message", where: [{ path: "message", exists: true }] }]);
     const runs = runDirs(root, actor.id).length;
     actors.tell(actor.id, "direct work");
     await waitFor(() => runDirs(root, actor.id).length === runs + 1);
-    expect(filtered(actors, actor.id)).toHaveLength(1);
+    expect(filtered(actors, actor.id)).toHaveLength(2);
+  }, 40_000);
+
+  // smarty-dev#2004: a skipped event must not replace a queued one by coalescing and take it along.
+  it("filters on arrival: an edit never replaces the queued comment it would skip", async () => {
+    const { root, mesh, actors } = setup();
+    const actor = await actors.create({
+      name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], coalesce: false,
+      coalesceKey: "payload.number", activationFilter: [{ id: "edited", topic: ["github.*"], where: [{ path: "data.payload.action", equals: "edited" }] }],
+    });
+    await mesh.publish({ topic: "github.demo", from, text: "LIVE_WITH_PROGRESS" });           // keeps the actor busy
+    await waitFor(() => actors.status(actor.id).status === "running");
+    const comment = (number: number, action: string, marker: string) =>
+      mesh.publish({ topic: "github.demo", kind: "github.webhook", from, data: { event: "issue_comment", payload: { action, number, marker } } });
+    await comment(7, "created", "seven-created");
+    await comment(7, "edited", "seven-edited");        // the reported sequence: skipped, the creation stays
+    await comment(8, "created", "eight-a");
+    await comment(8, "created", "eight-b");            // counterexample: a delivered event still coalesces
+    await waitFor(() => filtered(actors, actor.id).length === 1 && actors.status(actor.id).queued === 2);
+    await waitFor(() => actors.status(actor.id).status === "idle" && actors.status(actor.id).queued === 0, 20_000);
+    const markers = runTasks(root, actor.id).map((task) => task.match(/"marker": "([^"]+)"/)?.[1]).filter(Boolean);
+    expect(markers).toEqual(["seven-created", "eight-b"]);
+    expect(filtered(actors, actor.id).map((m) => [m.source, m.reason])).toEqual([["mesh:github.demo", "filtered: edited"]]);
+    expect(actors.status(actor.id).filteredCount).toBe(1);
   }, 40_000);
 
   it("rejects an invalid filter at create and set time, and sets, persists and clears a valid one", async () => {

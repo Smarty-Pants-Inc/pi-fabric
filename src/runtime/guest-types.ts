@@ -813,7 +813,7 @@ interface FabricAgentsApi {
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
   spawn(args: FabricAgentRequest): Promise<FabricAgentHandle>;
-  /** Bounded by timeoutMs (default 5 min, at most 60 min): a child still running keeps running and reports on completion. */
+  /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */
   join(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;

@@ -6,11 +6,8 @@ import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
-import {
-  resolveAvailablePiModel,
-  type FabricModelCandidate,
-} from "./core/model-resolution.js";
-import { loadModelUsage } from "./core/model-usage.js";
+import type { FabricModelCandidate } from "./core/model-resolution.js";
+import { resolvePiModel } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +21,7 @@ import { buildActorContext } from "./actors/context.js";
 import { actorDeliveryNotice } from "./actors/delivery-policy.js";
 import { prepareFabricActorHostPayload } from "./actors/host-event-payload.js";
 import type { JevObservationHost } from "./jev/observation.js";
+import type { JevProgramManager } from "./jev/manager.js";
 import { resolveJevModelRoute } from "./jev/routes.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
 import { CapturedToolCatalog, type CapturedToolEntry } from "./capture/catalog.js";
@@ -130,7 +128,7 @@ import {
 import { participantProject, participantRole } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
-import { restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
+import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
 import { ResidencyClient } from "./residency/client.js";
@@ -198,6 +196,7 @@ export class FabricRuntimeState {
   #shellInbox: ShellEventInbox | undefined;
   #actors: ActorDirectory | undefined;
   #jevObservationHost: JevObservationHost | undefined;
+  #jevPrograms: JevProgramManager | undefined;
   #globalActors: GlobalActorRegistry | undefined;
   #rootInbox: RootInbox | undefined;
   #records: Promise<RecordsService> | undefined;
@@ -649,23 +648,23 @@ export class FabricRuntimeState {
         ...(defaultModel ? { defaultModel } : {}),
       };
     };
-    const resolveParticipantPiModel = (selector?: string) => {
-      const models = visiblePiModels();
-      const state = piModelState(models);
-      const query = selector?.trim() || state.defaultModel || "";
-      const resolved = resolveAvailablePiModel(query, {
-        aliases: state.aliases,
-        available: state.available,
-        lastUsed: loadModelUsage(),
+    // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
+    const resolveParticipantPiModel = async (selector?: string) => {
+      const defaultModel = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
+      const resolved = await resolvePiModel({
+        selector,
+        registry: context.modelRegistry,
+        aliases: modelsConfig.aliases,
+        defaultModel,
       });
-      const model = models.find(
+      const model = visiblePiModels().find(
         (candidate) =>
           String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
           String(candidate.id).toLowerCase() === resolved.id.toLowerCase(),
       );
       if (!model) {
         throw new Error(
-          `Model ${JSON.stringify(query)} is not available to this Pi session. ` +
+          `Model ${JSON.stringify(selector?.trim() || defaultModel || "")} is not available to this Pi session. ` +
             'Use agents.models({ runner: "pi" }) to list the models visible to this session.',
         );
       }
@@ -705,7 +704,7 @@ export class FabricRuntimeState {
         }).appendText || undefined;
       },
       resolveHandoffCompactionBudget: async (modelKey, cwd) => {
-        const { model } = resolveParticipantPiModel(modelKey);
+        const { model } = await resolveParticipantPiModel(modelKey);
         // Load host settings only for an actual compacted handoff. Project
         // trust does not transfer implicitly to a different working directory.
         const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
@@ -720,7 +719,7 @@ export class FabricRuntimeState {
         };
       },
       preparePiModel: async (modelKey) => {
-        const resolved = resolveParticipantPiModel(modelKey);
+        const resolved = await resolveParticipantPiModel(modelKey);
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
@@ -734,8 +733,10 @@ export class FabricRuntimeState {
         completionInbox.acknowledge(id);
         markStoppedDelivered(id);
       },
-      onStoppedAtClose: (results) =>
-        this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results }),
+      onStoppedAtClose: (results) => {
+        rememberStoppedAtClose(sessionId, results);
+        this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results });
+      },
     });
     // Runs a previous runtime of this session stopped at reload/shutdown (smarty-dev#1602):
     // wait/status answer from the record, and with notices on each result reaches the spawner once.
@@ -809,7 +810,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
+            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
             acquireCapabilityView: acquireActorCapabilityView,
             // A /reload or restart of this session resumes its actors' mesh stream where the
             // last runtime stopped, so events published in between still reach them
@@ -828,7 +829,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
+            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);
@@ -986,12 +987,14 @@ export class FabricRuntimeState {
           });
           // A program may pin jev.evaluate itself. Cancel at owner retirement,
           // not only at provider.close(), which waits for those pins to drain.
+          this.#jevPrograms = provider.manager;
           const stop = () => { observationHost?.close(); provider.manager.stopAll(); };
           component.signal.addEventListener("abort", stop, { once: true });
           component.defer(async () => {
             component.signal.removeEventListener("abort", stop);
             observationHost?.close();
             if (this.#jevObservationHost === observationHost) this.#jevObservationHost = undefined;
+            if (this.#jevPrograms === provider.manager) this.#jevPrograms = undefined;
             await provider.manager.close();
           }, { label: "jev-program-owner", kind: "transactional", resources: ["jev:programs"], ordering: "ordered" });
           return provider;
@@ -1513,6 +1516,20 @@ export class FabricRuntimeState {
     this.#externalProviders.clear();
     this.prewalk.cancel();
     this.prewalkDrift.clear();
+  }
+
+  /**
+   * Session-owned work a reload would cancel besides task agents and actor runs: live shell jobs
+   * (background, monitors, auto-detached) and running Jev programs, observers included (smarty-dev#2160).
+   */
+  backgroundWorkCount(): number {
+    return this.#shellJobs.live().length + (this.#jevPrograms?.runningCount() ?? 0);
+  }
+
+  /** Best-effort ops event on the mesh, e.g. ops.fabric.reloaded (smarty-dev#2160). */
+  publishOpsEvent(topic: string, kind: string, data: Record<string, unknown>): Promise<void> {
+    if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return Promise.resolve();
+    return this.#mesh.publish({ topic, kind, from: this.#identity, data }).then(() => undefined, () => undefined);
   }
 
   // Publish a best-effort mesh event to the durable `fabric.compact` topic so

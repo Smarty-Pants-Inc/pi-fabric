@@ -10,6 +10,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { addAbortSignal } from "node:stream";
 import { sessionDirForCwd, sessionsDirRoot } from "../memory/discovery.js";
 import {
   entropySessionEvidenceFromJsonl,
@@ -55,11 +56,13 @@ const mapConcurrent = async <T, R>(
   items: readonly T[],
   limit: number,
   fn: (item: T) => Promise<R>,
+  signal?: AbortSignal,
 ): Promise<R[]> => {
   const results = new Array<R>(items.length);
   let cursor = 0;
   const worker = async (): Promise<void> => {
     for (;;) {
+      signal?.throwIfAborted();
       const index = cursor++;
       if (index >= items.length) return;
       results[index] = await fn(items[index]!);
@@ -345,30 +348,6 @@ export const measureSessionCorpus = (input: {
 // corpus, the verbatim audit calls, and the per-file observation windows
 // the machine-wide pool consumes with exact deltas, so the autonomous
 // compile and the command share a single window scan.
-/** Background-only discovery cadence; explicit inspection continues to scan immediately. */
-export class BackgroundSessionSelector {
-  #cached: { agentDir: string; cwd: string | undefined; files: string[]; until: number } | undefined;
-
-  constructor(readonly scan = machineSessionFilesAsync) {}
-
-  async select(agentDir: string, cwd: string | undefined, currentFile?: string): Promise<string[]> {
-    const cached = this.#cached;
-    let files: string[];
-    if (cached && cached.agentDir === agentDir && cached.cwd === cwd && Date.now() < cached.until) {
-      files = cached.files;
-    } else {
-      files = await this.scan(agentDir, cwd);
-      // Do not cache an absent session root: it may be created by this turn.
-      this.#cached = files.length > 0 ? { agentDir, cwd, files, until: Date.now() + 30_000 } : undefined;
-    }
-    // The active file is fresh on every compile, including forks and switches
-    // which occurred inside the machine-wide discovery window.
-    return currentFile
-      ? [currentFile, ...files.filter((file) => file !== currentFile)].slice(0, DEFAULT_SESSION_WINDOW)
-      : [...files];
-  }
-}
-
 export interface SessionObservationWindow {
   file: string;
   observations: EntropyValueObservation[];
@@ -403,19 +382,27 @@ const sessionMetadata = async (file: string): Promise<SessionFileMetadata | unde
   }
 };
 
-const endsAtLineBoundary = async (
-  file: string,
-  metadata: SessionFileMetadata,
-): Promise<boolean> => {
-  if (metadata.size === 0) return true;
+/**
+ * Offset just past the last newline in [start, size), or `start` when the range holds no complete
+ * line. A session being written ends mid-line; the cursor stops at the last complete line, so the
+ * next read resumes there instead of re-reading the whole file (smarty-dev#2010).
+ */
+const completeLinesEnd = async (file: string, start: number, size: number): Promise<number> => {
+  if (size <= start) return start;
   let handle: fs.promises.FileHandle | undefined;
   try {
     handle = await fs.promises.open(file, "r");
-    const byte = Buffer.allocUnsafe(1);
-    const { bytesRead } = await handle.read(byte, 0, 1, metadata.size - 1);
-    return bytesRead === 1 && byte[0] === 0x0a;
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    for (let end = size; end > start;) {
+      const from = Math.max(start, end - chunk.length);
+      const { bytesRead } = await handle.read(chunk, 0, end - from, from);
+      const index = chunk.subarray(0, bytesRead).lastIndexOf(0x0a);
+      if (index >= 0) return from + index + 1;
+      end = from;
+    }
+    return start;
   } catch {
-    return false;
+    return start;
   } finally {
     await handle?.close().catch(() => undefined);
   }
@@ -426,8 +413,11 @@ const scanSessionRange = async (
   start: number,
   end: number,
   initialModel?: string,
+  signal?: AbortSignal,
 ): ReturnType<typeof scanEntropySessionJsonlAsync> => {
   const input = fs.createReadStream(file, { encoding: "utf8", start, end });
+  // Shutdown aborts a multi-hundred-megabyte scan instead of waiting it out (smarty-dev#2010).
+  if (signal) addAbortSignal(signal, input);
   const lines = createInterface({ input, crlfDelay: Infinity });
   try {
     return await scanEntropySessionJsonlAsync(lines, initialModel);
@@ -463,6 +453,7 @@ const sameSessionFile = (
 
 const readSessionEvidenceAsync = async (
   file: string,
+  signal?: AbortSignal,
 ): Promise<SessionWindowEvidence | undefined> => {
   const metadata = await sessionMetadata(file);
   if (!metadata) return undefined;
@@ -482,9 +473,11 @@ const readSessionEvidenceAsync = async (
       ? cached
       : undefined;
   const start = append ? append.size : 0;
+  const end = await completeLinesEnd(file, start, metadata.size);
+  signal?.throwIfAborted();
   let scan: Awaited<ReturnType<typeof scanEntropySessionJsonlAsync>>;
   try {
-    scan = metadata.size === start
+    scan = end === start
       ? {
           evidence: { traces: [], valueObservations: [], auditCalls: [] },
           ...(append?.currentModel ? { currentModel: append.currentModel } : {}),
@@ -492,13 +485,17 @@ const readSessionEvidenceAsync = async (
       : await scanSessionRange(
           file,
           start,
-          metadata.size - 1,
+          end - 1,
           append?.currentModel,
+          signal,
         );
   } catch {
     return undefined;
   }
-  const evidence: EntropySessionEvidence = append
+  const unchanged = append && end === start;
+  const evidence: EntropySessionEvidence = unchanged
+    ? append.evidence
+    : append
     ? {
         traces: [...append.evidence.traces, ...scan.evidence.traces],
         valueObservations: [
@@ -508,23 +505,28 @@ const readSessionEvidenceAsync = async (
         auditCalls: [...append.evidence.auditCalls, ...scan.evidence.auditCalls],
       }
     : scan.evidence;
-  if (await endsAtLineBoundary(file, metadata)) {
-    cacheSessionEvidence(file, {
-      ...metadata,
-      ...(scan.currentModel ? { currentModel: scan.currentModel } : {}),
-      evidence,
-    });
-  } else {
-    asyncEvidenceCache.delete(file);
-  }
+  // The cached size is the complete-line cursor, not the file size: a partial tail is read next time.
+  cacheSessionEvidence(file, {
+    ...metadata,
+    size: end,
+    ...(scan.currentModel ? { currentModel: scan.currentModel } : {}),
+    evidence,
+  });
   return evidenceWindow(file, evidence);
 };
 
 export const sessionWindowEvidenceAsync = async (
   files: readonly string[],
-  options: { windowsOnly?: boolean } = {},
+  options: { windowsOnly?: boolean; signal?: AbortSignal } = {},
 ): Promise<SessionWindowEvidence> => {
-  const windows = await mapConcurrent(files, SESSION_READ_CONCURRENCY, readSessionEvidenceAsync);
+  const { signal } = options;
+  const windows = await mapConcurrent(
+    files,
+    SESSION_READ_CONCURRENCY,
+    (file) => readSessionEvidenceAsync(file, signal),
+    signal,
+  );
+  signal?.throwIfAborted();
   const traces: EntropyTraceInput[] = [];
   const valueObservations: EntropyValueObservation[] = [];
   const auditCalls: EntropyAuditCall[] = [];

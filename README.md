@@ -147,6 +147,7 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 - [Memory & recall](docs/memory-recall.md): compact ranked hits, uniform follow calls, lossless expansion, and guest-local `memory.walk` computation.
 - [Interface & commands](docs/interface.md): dashboard, settings, keybindings, slash commands, and headless runs.
 - [Agents, actors & mesh](docs/agents.md): model handoff, `/fabric prewalk`, runners, transports, actors, councils, recursive queries, and durable coordination.
+- [Participants CLI](docs/participants-cli.md): `fabric-participants --json`, the mesh's live participants as JSON for readers outside Pi.
 - [Durable residency through Pi](docs/residency-runtime.md): background host lifecycle and the Pi-runtime launcher boundary.
 - [Harness CLI composition](docs/harnesses.md): use browser/macOS tools through their existing CLIs, without Fabric-specific bridges or component configuration.
 - [Jev shell orchestration](docs/jev.md): bounded process supervision, event-driven task wait/watch, optional explicit typed judgments, and foreground/background budgets.

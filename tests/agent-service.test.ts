@@ -71,6 +71,20 @@ describe("hosted agents.wait bound", () => {
     child.result.resolve({status: "completed", text: "done"});
     await expect(waiting).resolves.toMatchObject({status: "completed"});
   });
+
+  // Acceptance audit on #854: a 60-min cap let a program's timeoutMs 3_500_000 hold its session 20 min.
+  it("clamps a larger timeoutMs to the 5-minute foreground limit", async () => {
+    const child = held();
+    const instance = service(child.port);
+    const bounds = vi.spyOn(AbortSignal, "timeout");
+    const handle = await instance.spawn("root", {task: "long"}) as {id: string};
+    await child.entered.promise;
+    const waiting = createAgentServiceClient(createAgentServiceHandler(instance, "root")).wait(handle.id, undefined, 3_500_000);
+    await vi.waitFor(() => expect(bounds).toHaveBeenCalledWith(5 * 60_000));
+    expect(bounds).not.toHaveBeenCalledWith(3_500_000);
+    child.result.resolve({status: "completed", text: "done"});
+    await expect(waiting).resolves.toMatchObject({status: "completed"});
+  });
 });
 
 describe("hosted Fabric agent service", () => {

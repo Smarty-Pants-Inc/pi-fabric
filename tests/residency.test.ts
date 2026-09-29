@@ -25,6 +25,7 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
+import type { FabricActorMessage } from "../src/actors/types.js";
 
 const repo = process.cwd();
 const hostPath = path.resolve("dist/residency/launcher.js");
@@ -186,12 +187,24 @@ const stopResident = async (config: ResidentHostConfig): Promise<void> => {
     }
   })();
   if (owner?.pid) {
+    const alive = (): boolean => {
+      try {
+        process.kill(owner.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
     try {
       process.kill(owner.pid, "SIGTERM");
     } catch {
       // Process already exited.
     }
-    await waitFor(() => !fs.existsSync(ownerPath)).catch(() => undefined);
+    // The host still writes under mesh/ after it removes owner.json: wait for the process
+    // itself to exit, not only its marker, before the root is removed.
+    await waitFor(() => !alive(), 20_000).catch(() => {
+      try { process.kill(owner.pid, "SIGKILL"); } catch { /* exited */ }
+    });
   }
 };
 
@@ -209,7 +222,9 @@ afterEach(async () => {
     } catch {
       // No resident host was created.
     }
-    fs.rmSync(root, { recursive: true, force: true });
+    // A host that already removed owner.json (idle exit) may still be finishing its last mesh
+    // writes: retry ENOTEMPTY briefly instead of failing the suite on a loaded runner.
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
 
@@ -235,6 +250,30 @@ describe("durable cwd validation", () => {
       ).rejects.toThrow(/Invalid Fabric agent cwd.*ENOENT.*call spawn in the next message/);
       expect(fs.existsSync(path.join(state.config.residencyRoot, "owner.json"))).toBe(false);
       expect(fs.existsSync(path.join(state.config.residencyRoot, "requests"))).toBe(false);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+});
+
+// smarty-dev#883: a timed-out start left its launcher (and Pi child) running
+// with no owner. The client must end the launcher it spawned.
+describe.skipIf(process.platform === "win32")("resident host start timeout", () => {
+  it("ends the launcher and its child when the start budget runs out", async () => {
+    const state = await rootHarness("resident-start-timeout");
+    const client = new ResidencyClient({
+      config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent,
+      hostPath: path.resolve("tests/fixtures/stalled-launcher.mjs"), startupTimeoutMs: 300,
+    });
+    try {
+      await expect(client.ensureHost()).rejects.toThrow(/Timed out after \d+ms starting Fabric resident host/);
+      const log = fs.readFileSync(path.join(state.config.residencyRoot, "launcher.log"), "utf8");
+      const launcher = (JSON.parse(log.trim().split("\n")[0]!) as { pid: number }).pid;
+      const child = Number(fs.readFileSync(path.join(state.config.residencyRoot, "stalled-child.pid"), "utf8"));
+      const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      // SIGTERM went to the whole group before the rejection; wait for both exits.
+      await waitFor(() => !alive(launcher) && !alive(child), 30_000);
     } finally {
       await client.close();
       await state.participants.close();
@@ -875,6 +914,97 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     }
   });
 
+  it("resolves a model added to models.json after the resident host started, with no restart", { timeout: 60_000 }, async () => {
+    // pi-fabric#138: the resident host runs in its own Pi process; its registry, not the
+    // session's snapshot from host start, must discover the new exact id on ask and tell.
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-resident-models-"));
+    roots.push(agentDir);
+    const modelsPath = path.join(agentDir, "models.json");
+    const writeModels = (ids: string[]) => fs.writeFileSync(modelsPath, JSON.stringify({
+      providers: {
+        "probe-late": {
+          baseUrl: "http://127.0.0.1:9/v1",
+          api: "openai-completions",
+          apiKey: "probe",
+          models: ids.map((id) => ({ id })),
+        },
+      },
+    }));
+    writeModels(["claude-late-5-5"]);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    const state = await rootHarness("resident-late-model");
+    state.config.piModels = {
+      available: [{ provider: "probe-late", id: "claude-late-5-5" }],
+      aliases: {},
+      defaultModel: "probe-late/claude-late-5-5",
+    };
+    const client = new ResidencyClient({
+      config: state.config,
+      mesh: state.mesh,
+      participants: state.participants,
+      mainAgent: state.mainAgent,
+      hostPath,
+    });
+    const control = new FabricControlPlane(state.mesh, state.identity, {
+      enabled: true,
+      hostId: state.identity.id,
+      pollMs: 20,
+      acknowledgementTimeoutMs: 5_000,
+    });
+    control.start(() => ({ accepted: false }));
+    const ownerPid = () =>
+      (JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner).pid;
+    try {
+      const actor = await client.createActor({
+        name: "late model witness",
+        instructions: "Reply with the model of each run.",
+        residency: "durable",
+        runner: "pi",
+        model: "probe-late/claude-late-5-5",
+      });
+      const pid = ownerPid();
+      writeModels(["claude-late-5-5", "claude-late-5-6"]);
+
+      const asked = await control.requestResult<FabricActorMessage>(
+        client.hostId,
+        actor.id,
+        "ask",
+        { message: "ECHO_MODEL ping", binding: { model: "probe-late/claude-late-5-6" } },
+        client.hostId,
+        { timeoutMs: 20_000 },
+      );
+      expect(asked).toMatchObject({ text: "model probe-late/claude-late-5-6" });
+
+      writeModels(["claude-late-5-5", "claude-late-5-6", "claude-late-5-7"]);
+      await new Promise((resolve) => setTimeout(resolve, 10_500)); // past the shared refresh throttle
+      await control.request(
+        client.hostId,
+        actor.id,
+        "followUp",
+        { message: "ECHO_MODEL pong", binding: { model: "probe-late/claude-late-5-7" } },
+        client.hostId,
+      );
+      await waitFor(() => state.mesh.read({ topic: "fabric.actor.output", limit: 50 })
+        .some((event) => event.text?.includes("model probe-late/claude-late-5-7")), 15_000);
+
+      // A model that is still not configured fails after the refresh, not with a fuzzy stand-in.
+      await expect(control.request(
+        client.hostId,
+        actor.id,
+        "followUp",
+        { message: "nope", binding: { model: "probe-missing/claude-late-5-9" } },
+        client.hostId,
+      )).rejects.toThrow(/not available to this Pi session/);
+      expect(ownerPid()).toBe(pid);
+      await client.removeActor(actor.id);
+    } finally {
+      await control.close();
+      await client.close();
+      await state.participants.close();
+      await stopResident(state.config);
+    }
+  });
+
   it("applies live model guidance snapshots to durable participants", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-guidance");
     const client = new ResidencyClient({
@@ -973,6 +1103,32 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     await reconnect.close();
   });
 
+  // smarty-dev#883: on SIGTERM, Pi exited before the host's close stopped its
+  // durable workers, which ran on as orphans and kept writing.
+  it("stops its durable workers before a SIGTERM'd resident host exits", { timeout: 60_000 }, async () => {
+    const state = await rootHarness("resident-sigterm");
+    const client = new ResidencyClient({
+      config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath,
+    });
+    try {
+      const handle = await client.spawnAgent({ task: "HANG", transport: "process", residency: "durable" });
+      const workerPid = (): number | undefined => execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" })
+        .split("\n").filter((line) => line.includes(handle.id) && line.includes(fakeWorker))
+        .map((line) => Number(line.trim().split(/\s+/)[0]))[0];
+      await waitFor(() => workerPid() !== undefined, 30_000);
+      const worker = workerPid()!;
+      const host = (JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner).pid;
+      const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      process.kill(host, "SIGTERM");
+      await waitFor(() => !alive(host), 30_000);
+      // The worker's exit is part of the host's close, so it is already gone.
+      expect(alive(worker)).toBe(false);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
   // smarty-dev#1882: the host's exit removes runs/; a later session still reads the result.
   it("returns a completed durable agent's result after its resident host exits", { timeout: 90_000 }, async () => {
     const state = await rootHarness("resident-exit-status");
@@ -990,6 +1146,30 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     // The real path: the host exits after 30 s idle and its close removes runs/.
     const runsDir = path.join(state.config.residencyRoot, "runs");
     await waitFor(() => !fs.existsSync(path.join(state.config.residencyRoot, "owner.json")), 60_000);
+    // owner.json goes last: nothing may write under mesh/ once it is gone, or a new host
+    // started in that window, and every cleanup that trusts the marker, races the old one.
+    const snapshot = (): Map<string, string> => {
+      const files = new Map<string, string>();
+      const walk = (directory: string): void => {
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+          const file = path.join(directory, entry.name);
+          if (entry.isDirectory()) walk(file);
+          else {
+            try {
+              const stat = fs.statSync(file);
+              files.set(file, `${stat.size}:${stat.mtimeMs}`);
+            } catch { /* removed meanwhile */ }
+          }
+        }
+      };
+      walk(path.join(state.root, "mesh"));
+      return files;
+    };
+    const released = snapshot();
+    await delay(2_000);
+    const late = [...snapshot()].filter(([file, stamp]) => released.get(file) !== stamp)
+      .map(([file]) => path.relative(state.root, file));
+    expect(late).toEqual([]);
     expect(fs.existsSync(path.join(runsDir, handle.id))).toBe(false);
 
     const reconnect = new ResidencyClient({ ...client.options, hostPath });

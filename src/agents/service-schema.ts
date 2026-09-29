@@ -34,7 +34,7 @@ export function agentServiceDescriptors(capabilities: AgentServiceCapabilities =
   const descriptors: FabricActionDescriptor[] = [
     {...run, description: "Run one host-authorized Pi child and wait for its result or pause", inputSchema: runSchema},
     {...native("spawn"), description: "Admit one host-authorized Pi child, or residency durable for an independent host worker", inputSchema: spawnSchema},
-    ...["wait", "join"].map((name) => ({...native(name), inputSchema: object({id, timeoutMs: {type: "number", minimum: 1_000, maximum: AGENT_WAIT_MAX_MS}}, ["id"])})),
+    ...["wait", "join"].map((name) => ({...native(name), inputSchema: object({id, timeoutMs: {type: "number", minimum: 1_000, description: `Clamped to ${AGENT_WAIT_MAX_MS / 60_000} min`}}, ["id"])})),
     ...["status", "stop"].map((name) => ({...native(name), inputSchema: object({id}, ["id"])})),
     {...native("list"), description: "List only the authenticated caller's direct children", inputSchema: object({})},
   ];

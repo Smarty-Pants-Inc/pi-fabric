@@ -136,7 +136,9 @@ try {
   });
   child.on("exit", (code, signal) => {
     clearInterval(ownerPoll);
-    trace("child-exit", { code, signal, seenOwner });
+    // A clean exit after ownership writes nothing: the host already released owner.json, and a
+    // new host may own this directory now (smarty-dev#2010). Abnormal exits keep their trace.
+    if (!seenOwner || code !== 0 || signal) trace("child-exit", { code, signal, seenOwner });
     if (!seenOwner) writeFailure(configPath, stderr.trim() || `Pi resident host exited (${signal ?? code ?? "unknown"})`);
     process.exitCode = code ?? 1;
   });

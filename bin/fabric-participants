@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Fabric participant directory as JSON, read-only (smarty-dev#395); see docs/participants-cli.md.
+// Fabric participant directory as JSON, read-only (smarty-knowledge-3#395); see docs/participants-cli.md.
 import { main } from "../dist/participants-cli.js";
 
 main(process.argv.slice(2)).then(

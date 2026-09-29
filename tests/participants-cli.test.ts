@@ -88,6 +88,11 @@ describe("fabric-participants", () => {
     expect(missing.err).toContain("FABRIC_MESH_MISSING");
     expect(fs.existsSync(path.join(root, "absent"))).toBe(false);
     expect((await run(["--kind", "peer"])).code).toBe(2);
+    // A damaged state is a failure, not an empty fleet.
+    fs.writeFileSync(path.join(root, "state.json"), "{\"entries\": {");
+    const damaged = await run(["--mesh", root]);
+    expect(damaged).toMatchObject({ code: 2, out: "" });
+    expect(damaged.err).toContain("FABRIC_MESH_UNREADABLE");
   });
 
   it("resolves the mesh root as Fabric does: env, project config over agent config, default", () => {

@@ -1,4 +1,4 @@
-// fabric-participants (smarty-dev#395): the mesh's participant directory as JSON, read-only.
+// fabric-participants (smarty-knowledge-3#395, for smarty-knowledge-3#400): the mesh's participant directory as JSON, read-only.
 //
 //   fabric-participants [--json] [--mesh DIR] [--include-stale] [--kind root|agent|actor]...
 //
@@ -20,7 +20,7 @@ const USAGE = `usage: fabric-participants [--json] [--mesh DIR] [--include-stale
 
 /** An error the CLI reports by name on stderr, with exit code 2. */
 class ParticipantsCliError extends Error {
-  constructor(readonly code: "FABRIC_USAGE" | "FABRIC_MESH_MISSING", message: string) {
+  constructor(readonly code: "FABRIC_USAGE" | "FABRIC_MESH_MISSING" | "FABRIC_MESH_UNREADABLE", message: string) {
     super(message);
   }
 }
@@ -57,14 +57,16 @@ const configuredRoot = (config: Record<string, unknown>): string | undefined => 
 /**
  * The mesh root a Pi started in cwd would use (src/fabric-runtime-state.ts): PI_FABRIC_MESH_ROOT,
  * else mesh.root from the project's .pi/fabric.json over the agent dir's fabric.json, relative to
- * the project root, else <project>/.pi/fabric/mesh. It reads the files as they are.
+ * the project root, else <project>/.pi/fabric/mesh. It reads the files as they are, and reads the
+ * project file without Pi's trust check: a reader that must not trust the cwd passes --mesh.
  * ponytail: loadFabricConfig would also migrate (rewrite) an old config file, so it is not used.
  */
 export const resolveMeshRoot = (env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string => {
   if (env.PI_FABRIC_MESH_ROOT) return env.PI_FABRIC_MESH_ROOT;
   const projectRoot = env.PI_FABRIC_PROJECT_ROOT ?? cwd;
+  // ponytail: resolveAgentDir() reads process.env only; this is its rule for an explicit env.
   const agentDir = env.PI_CODING_AGENT_DIR
-    ? env.PI_CODING_AGENT_DIR.replace(/^~(?=$|\/)/, os.homedir())
+    ? env.PI_CODING_AGENT_DIR.replace(/^~(?=$|[\\/])/, os.homedir())
     : path.join(os.homedir(), ".pi", "agent");
   const configured = configuredRoot(readJson(path.join(projectRoot, ".pi", "fabric.json"))) ??
     configuredRoot(readJson(path.join(agentDir, "fabric.json")));
@@ -79,7 +81,7 @@ interface ParticipantsOptions {
 
 const parseArgs = (argv: string[]): ParticipantsOptions => {
   const options: ParticipantsOptions = {};
-  // "participants" is accepted as a leading subcommand: `pi-fabric participants --json`.
+  // "participants" is accepted as a leading subcommand: `fabric-participants participants --json`.
   const args = argv[0] === "participants" ? argv.slice(1) : argv;
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index]!;
@@ -117,7 +119,8 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
   }
   const id = `participants-cli:${process.pid}:${Date.now()}`;
   // An identity no participant has: this reader is not a host, so every entry lists local: false.
-  const directory = new ParticipantDirectory(new ReadOnlyMeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS), {
+  const store = new ReadOnlyMeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS);
+  const directory = new ParticipantDirectory(store, {
     enabled: true,
     hostId: id,
     rootId: id,
@@ -125,12 +128,24 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
     reapDeadHosts: false,
   });
   // Scope project: the whole mesh without the reader's own synthetic self entry.
-  return directory.list({
+  const participants = directory.list({
     scope: "project",
     fresh: true,
     ...(options.includeStale ? { includeStale: true } : {}),
     ...(options.kinds ? { kinds: options.kinds } : {}),
   });
+  // The store reads a damaged state.json as an empty state. For a reader that keeps its last
+  // snapshot on failure, a damaged file must fail, not print a fleet of [].
+  if (participants.length === 0 && store.listAll().length === 0) {
+    const file = path.join(root, "state.json");
+    const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim() : "";
+    try {
+      if (text) JSON.parse(text);
+    } catch {
+      throw new ParticipantsCliError("FABRIC_MESH_UNREADABLE", `Fabric mesh state does not parse: ${file}`);
+    }
+  }
+  return participants;
 };
 
 export const main = async (

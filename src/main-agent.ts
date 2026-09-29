@@ -68,6 +68,9 @@ export interface FabricMainAgentTarget {
     target: { provider: string; id: string },
     context: ExtensionContext,
   ): Promise<FabricMainModelSwitchResult>;
+  // smarty-dev#2119: a capped Main wait returned; flush every held followUp at the next tool
+  // boundary, whatever its age. Local Mains with a followUp drain only.
+  flushHeldAtNextBoundary?(): void;
 }
 
 export interface FabricIdentityResolution {
@@ -231,6 +234,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext | undefined;
   #flushMs = 0;
+  #flushAll = false;
   #stallS = 600;
   #suspended = false;
   #closed = false;
@@ -550,10 +554,12 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#reconcile(event);
       if (ctx.signal?.aborted || ["aborted", "error"].includes(event.message?.stopReason ?? "")) {
         this.#suspended = true;
+        this.#flushAll = false;
         return;
       }
       this.#confirm();
       this.#flushDue();
+      this.#flushAll = false;
     });
     // Main is about to go idle. Hand the held followUps to Pi's followUp queue here, the last
     // boundary where Pi still continues the run for a queued message and where Pi itself drops
@@ -628,12 +634,21 @@ export class MainAgentController implements FabricMainAgentTarget {
       (this.#held.length > 0 || this.#context.isIdle() === false);
   }
 
+  /**
+   * smarty-dev#2119: an agents.wait in this Main hit its 60 s cap. The wait ended so Main can see
+   * news, so the next turn_end flushes every held followUp, not only those past flushMs.
+   */
+  flushHeldAtNextBoundary(): void {
+    if (this.#flushMs > 0 && !this.#closed) this.#flushAll = true;
+  }
+
   #flushDue(): void {
     if (!this.#held.length || this.#suspended) return;
     const now = Date.now();
+    const age = this.#flushAll ? 0 : this.#flushMs;
     let due = 0;
     let bytes = 0;
-    while (due < this.#held.length && now - this.#held[due]!.sentAt >= this.#flushMs) {
+    while (due < this.#held.length && now - this.#held[due]!.sentAt >= age) {
       bytes += itemBytes(this.#held[due]!);
       // A byte-bounded FIFO prefix per boundary; the rest waits for the next one.
       if (due > 0 && bytes > FOLLOW_UP_LIMITS.batchBytes) break;
@@ -741,7 +756,9 @@ export class MainAgentController implements FabricMainAgentTarget {
         customType: "pi-fabric-agent-message",
         content: [
           ...(flushed
-            ? [`${items.length} follow-up message(s) sent while you were busy, delivered at a tool boundary after waiting ${Math.round(this.#flushMs / 1000)} s or more. Oldest first; each is a followUp, not a steer.`]
+            ? [this.#flushAll
+              ? `${items.length} follow-up message(s) sent while you were busy, delivered at the tool boundary after a capped agents.wait. Oldest first; each is a followUp, not a steer.`
+              : `${items.length} follow-up message(s) sent while you were busy, delivered at a tool boundary after waiting ${Math.round(this.#flushMs / 1000)} s or more. Oldest first; each is a followUp, not a steer.`]
             : []),
           ...blocks,
         ].join("\n\n"),

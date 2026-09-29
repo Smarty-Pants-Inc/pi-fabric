@@ -28,8 +28,21 @@ existing events and mirrors root presence. There is no new store or protocol.
   - its sender is a live native participant or host identity of the remote;
   - no hub record, live or not, uses that id;
   - its recipient is native to the hub.
+- A remote identity is bound to the one link that mirrored it first (the `remoteHost` on its record).
+  Each link reserves every id it did not mirror: native records (live or not) and other links'
+  mirrors. The remote's presence is admitted against that set before it is used. A remote host or
+  root with a reserved id, label or session id is neither mirrored nor routed to. A remote event
+  whose sender, or an ack whose `targetId`, is not bound to this link is dropped.
+- Routing uses only ids and unique aliases: host id, identity id, participant id, root id, session id
+  and label. A free-form `name` is never an address.
 - A mirror never replaces a native record or another bridge's mirror. It writes by
   compare-and-swap only.
+- Each remote call has a deadline (`--call-timeout-ms`, default 30 s). A remote that misses it
+  closes the transport. On stop, the bridge fences the loop, gives the remote withdrawal a bounded
+  wait, withdraws the local mirrors regardless, and then reaps the transport child
+  (SIGTERM, then SIGKILL after 2 s).
+- A read page stays under 8 MiB of events, so it always fits one 16 MiB frame. An event that alone
+  is over the budget is skipped and logged with its id and sequence, and the cursor moves on.
 - The agent (the remote end) serves only the bridge operations. It applies the allow-list and
   stamps its pinned `--peer` name on everything it writes, whatever the hub sends.
 

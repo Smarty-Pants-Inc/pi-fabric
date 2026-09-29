@@ -25,7 +25,13 @@ const PARTICIPANT_PREFIX = "topology/participants/";
 export const BRIDGE_LEASE_MS = 15_000;
 const DEFAULT_POLL_MS = 250;
 const DEFAULT_PRESENCE_MS = 5_000;
+/** A bridge call the remote has not answered by then closes the transport. */
+export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
+/** stop() waits at most this long for the loop and for each remote step of the withdrawal. */
+const DEFAULT_STOP_MS = 5_000;
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
+/** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
+export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
 const NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$/;
 
 const keyFor = (prefix: string, id: string): string => prefix + createHash("sha256").update(id).digest("hex");
@@ -71,9 +77,13 @@ export interface BridgePresence {
   reserved: string[];
 }
 
+export interface BridgeSkip { id: string; sequence: number; topic: string; bytes: number }
+
 export interface BridgeRead {
   /** Allow-listed events after the cursor, in sequence order. */
   events: MeshEvent[];
+  /** Allow-listed events too large for one frame, passed over (the bridge logs each). */
+  skipped?: BridgeSkip[];
   /** The last sequence read (the cursor to resume from). */
   through: number;
 }
@@ -97,6 +107,8 @@ export interface BridgeSide {
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void>;
   /** Original ids of events the peer bridged into this side after a sequence. */
   bridgedIds(after: number): Promise<string[]>;
+  /** End the transport and fail pending calls (a remote side only). */
+  close?(error?: Error): void;
 }
 
 const remoteHostOf = (value: unknown): string | undefined =>
@@ -137,12 +149,29 @@ export class StoreBridgeSide implements BridgeSide {
     return this.store.latestSequence();
   }
 
-  async read(after: number): Promise<BridgeRead> {
+  // A page fits one transport frame (security review F4): it ends before the event that would
+  // pass the byte budget, and `through` stays at the last event it covers. One event that alone
+  // passes the budget is skipped with evidence, never a stall of the cursor.
+  async read(after: number, pageBytes = BRIDGE_PAGE_BYTES): Promise<BridgeRead> {
     const page = this.store.read({ after, limit: this.store.maxReadEvents });
-    return {
-      events: page.filter((event) => isBridgedTopic(event) && !hasBridgeField(event)),
-      through: page.at(-1)?.sequence ?? after,
-    };
+    const events: MeshEvent[] = [];
+    const skipped: BridgeSkip[] = [];
+    let bytes = 0;
+    let through = after;
+    for (const event of page) {
+      if (isBridgedTopic(event) && !hasBridgeField(event)) {
+        const size = Buffer.byteLength(JSON.stringify(event), "utf8");
+        if (size > pageBytes) {
+          skipped.push({ id: event.id, sequence: event.sequence, topic: event.topic, bytes: size });
+        } else {
+          if (bytes + size > pageBytes) break;
+          bytes += size;
+          events.push(event);
+        }
+      }
+      through = event.sequence;
+    }
+    return { events, through, ...(skipped.length ? { skipped } : {}) };
   }
 
   async presence(): Promise<BridgePresence> {
@@ -150,25 +179,36 @@ export class StoreBridgeSide implements BridgeSide {
     const leases = readHostLeases(this.store.root);
     const reserved = new Set<string>();
     const hosts: BridgeHost[] = [];
+    // Every id not mirrored by this link is reserved: natives, live or not, and other links'
+    // mirrors (security review F1/F2). Only natives are this side's presence.
     for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
-      if (remoteHostOf(entry.value) !== undefined) continue;
+      const mark = remoteHostOf(entry.value);
+      if (mark === this.peer) continue;
       const host = hostOf(entry.key, entry.value);
-      if (!host) continue;
+      if (!host) {
+        if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
+        continue;
+      }
       reserved.add(host.id).add(host.identity.id).add(host.rootId);
-      if (entry.updatedBy.id !== host.identity.id) continue;
+      if (mark !== undefined || entry.updatedBy.id !== host.identity.id) continue;
       const expiresAt = hostLeaseExpiry(leases, host);
       if (expiresAt > now) hosts.push({ record: host, expiresAt });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants: FabricParticipantRecord[] = [];
     for (const entry of this.store.listAll(PARTICIPANT_PREFIX, { fresh: true })) {
-      if (remoteHostOf(entry.value) !== undefined) continue;
+      const mark = remoteHostOf(entry.value);
+      if (mark === this.peer) continue;
       const participant = participantOf(entry.key, entry.value);
-      if (!participant) continue;
-      reserved.add(participant.id).add(participant.ownerIdentityId);
+      if (!participant) {
+        if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
+        continue;
+      }
+      reserved.add(participant.id).add(participant.ownerIdentityId).add(participant.rootId);
+      for (const alias of [participant.label, participant.sessionId]) if (typeof alias === "string" && alias) reserved.add(alias);
       const owner = live.get(participant.ownerHostId);
       if (
-        participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
+        mark === undefined && participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
         owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId
       ) participants.push(participant);
     }
@@ -312,6 +352,12 @@ const lines = (input: Readable, onLine: (line: string) => void, onEnd: (error?: 
     while ((newline = buffered.indexOf("\n")) >= 0) {
       const line = buffered.slice(0, newline);
       buffered = buffered.slice(newline + 1);
+      if (line.length > MAX_RPC_LINE_BYTES) {
+        // A complete line over the limit fails the transport too.
+        input.destroy();
+        onEnd(new Error("Bridge transport line is too long"));
+        return;
+      }
       if (line.trim()) onLine(line);
     }
     if (buffered.length > MAX_RPC_LINE_BYTES) {
@@ -384,7 +430,7 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unk
     case "hello": return { version: BRIDGE_PROTOCOL_VERSION };
     case "latestSequence": return side.latestSequence();
     case "read": return side.read(numberArg(request.args, "after"));
-    case "presence": return side.presence();
+    case "presence": return { ...(await side.presence()), reserved: [] };
     case "publish": return side.publish(checkBridgePublish(request.args));
     case "mirror": return side.mirror(presenceArg(request.args));
     case "bridgedIds": return side.bridgedIds(numberArg(request.args, "after"));
@@ -397,11 +443,17 @@ export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
   #closed: Error | undefined;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  readonly #onClosed: (error: Error) => void;
   readonly closed: Promise<Error>;
 
-  constructor(readonly input: Readable, readonly output: Writable) {
+  /**
+   * Every call has a deadline: a remote that stops answering closes the transport, so an
+   * untrusted peer never decides whether the bridge can stop (security review F3).
+   */
+  constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
     let onClosed!: (error: Error) => void;
     this.closed = new Promise((resolve) => (onClosed = resolve));
+    this.#onClosed = onClosed;
     lines(
       input,
       (line) => {
@@ -417,21 +469,34 @@ export class RemoteBridgeSide implements BridgeSide {
         if (response.ok === true) pending.resolve(response.result);
         else pending.reject(new Error(`Bridge agent: ${String(response.error)}`));
       },
-      (error) => {
-        if (this.#closed) return;
-        this.#closed = error ?? new Error("Bridge transport closed");
-        for (const pending of this.#pending.values()) pending.reject(this.#closed);
-        this.#pending.clear();
-        onClosed(this.#closed);
-      },
+      (error) => this.close(error ?? new Error("Bridge transport closed")),
     );
+  }
+
+  /** Fail every pending and later call, and end the transport's streams. */
+  close(error: Error = new Error("Bridge transport closed")): void {
+    if (this.#closed) return;
+    this.#closed = error;
+    for (const pending of this.#pending.values()) pending.reject(error);
+    this.#pending.clear();
+    this.#onClosed(error);
+    this.output.end();
+    this.input.destroy();
   }
 
   #call<T>(op: RpcOp, args?: unknown): Promise<T> {
     if (this.#closed) return Promise.reject(this.#closed);
     const id = this.#next++;
     return new Promise<T>((resolve, reject) => {
-      this.#pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
+      const timer = setTimeout(
+        () => this.close(new Error(`Bridge agent did not answer ${op} within ${this.callTimeoutMs} ms`)),
+        this.callTimeoutMs,
+      );
+      const settle = <V>(done: (value: V) => void) => (value: V): void => {
+        clearTimeout(timer);
+        done(value);
+      };
+      this.#pending.set(id, { resolve: settle(resolve as (value: unknown) => void), reject: settle(reject) });
       this.output.write(`${JSON.stringify({ id, op, ...(args === undefined ? {} : { args }) })}\n`);
     });
   }
@@ -477,6 +542,8 @@ export interface MeshBridgeOptions {
   cursorPath: string;
   pollMs?: number;
   presenceMs?: number;
+  /** Bound on each wait in stop(); the remote cannot hold a stop longer. */
+  stopMs?: number;
   log?: (message: string) => void;
 }
 
@@ -486,17 +553,38 @@ export interface BridgeStepResult {
   dropped: number;
 }
 
-const addresses = (presence: BridgePresence): Set<string> => {
+// Ids and unique aliases only: a free-form name is never an address (security review F1).
+const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   const names = new Set<string>();
   for (const { record } of presence.hosts) names.add(record.id).add(record.identity.id);
   for (const participant of presence.participants) {
     names.add(participant.id).add(participant.rootId);
-    for (const name of [participant.label, participant.name, participant.sessionId]) if (name) names.add(name);
+    for (const alias of [participant.label, participant.sessionId]) if (alias) names.add(alias);
   }
   return names;
 };
 
-const senders = (presence: BridgePresence): Set<string> => {
+/**
+ * The remote's presence as this link admits it: hosts and roots none of whose ids or aliases
+ * are reserved on the hub (natives, live or not, and other links' mirrors), and roots under an
+ * admitted host. Mirroring, routing and sender checks all use this snapshot, never the peer's
+ * raw claims (security review F1/F2).
+ */
+export const admitPresence = (claimed: BridgePresence, reserved: ReadonlySet<string>): Pick<BridgePresence, "hosts" | "participants"> => {
+  const hosts = claimed.hosts.filter(({ record }) =>
+    ![record.id, record.identity.id, record.rootId].some((id) => reserved.has(id)));
+  const admitted = new Map(hosts.map(({ record }) => [record.id, record]));
+  const participants = claimed.participants.filter((participant) => {
+    const owner = admitted.get(participant.ownerHostId);
+    return participant.kind === "root" && owner !== undefined &&
+      owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId &&
+      ![participant.id, participant.rootId, participant.ownerIdentityId, participant.label, participant.sessionId]
+        .some((id) => typeof id === "string" && reserved.has(id));
+  });
+  return { hosts, participants };
+};
+
+const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   const ids = new Set<string>();
   for (const { record } of presence.hosts) ids.add(record.identity.id);
   for (const participant of presence.participants) ids.add(participant.id).add(participant.ownerIdentityId);
@@ -506,10 +594,12 @@ const senders = (presence: BridgePresence): Set<string> => {
 export class MeshBridge {
   #cursor: CursorFile | undefined;
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
-  #presence: { local: BridgePresence; remote: BridgePresence } | undefined;
+  #presence: { local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> } | undefined;
   #presenceAt = Number.NEGATIVE_INFINITY;
   #stopped = false;
   #wake: (() => void) | undefined;
+  /** The loop's current pass, so stop() can fence it before the final withdrawal. */
+  #running: Promise<void> = Promise.resolve();
 
   constructor(readonly options: MeshBridgeOptions) {
     for (const name of [options.localName, options.remoteName]) {
@@ -558,7 +648,9 @@ export class MeshBridge {
 
   /** Mirror each side's live roots into the other, and keep both views for routing. */
   async syncPresence(): Promise<void> {
-    const [local, remote] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
+    const [local, claimed] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
+    const remote = admitPresence(claimed, new Set(local.reserved));
+    if (this.#stopped) return;
     await Promise.all([this.options.remote.mirror(local), this.options.local.mirror(remote)]);
     this.#presence = { local, remote };
     this.#presenceAt = Date.now();
@@ -570,13 +662,14 @@ export class MeshBridge {
     if (!this.#presence || Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS)) {
       await this.syncPresence();
     }
-    const { local, remote } = this.#presence!;
+    if (this.#stopped || !this.#presence) return { toRemote: 0, toLocal: 0, dropped: 0 };
+    const { local, remote } = this.#presence;
     const toRemote = await this.#forward("toRemote", this.options.local, this.options.remote, {
       recipients: addresses(remote),
     });
     const toLocal = await this.#forward("toLocal", this.options.remote, this.options.local, {
       recipients: addresses(local),
-      // The remote is untrusted: its sender must be a live remote native no hub record claims.
+      // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
       senders: senders(remote),
       reserved: new Set(local.reserved),
     });
@@ -596,6 +689,10 @@ export class MeshBridge {
     while (true) {
       const start = cursor.after;
       const page = await source.read(start);
+      for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
+        dropped += 1;
+        this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
+      }
       for (const event of page.events) {
         if (event.sequence <= cursor.after) continue;
         const reason = this.#refusal(event, rules);
@@ -604,6 +701,8 @@ export class MeshBridge {
             dropped += 1;
             this.#log(`${direction}: dropped ${event.topic} ${event.id} from ${event.from.id}: ${reason}`);
           }
+        } else if (this.#stopped) {
+          return { forwarded, dropped };
         } else if (!seen.has(event.id)) {
           const data = isObject(event.data) ? event.data : {};
           try {
@@ -640,14 +739,21 @@ export class MeshBridge {
     if (!isIdentity(event.from)) return "no sender identity";
     if (rules.reserved?.has(event.from.id)) return "sender claims a hub identity";
     if (rules.senders && !rules.senders.has(event.from.id)) return "sender is not a live participant of the remote";
+    if (rules.senders && event.topic === "fabric.control.ack") {
+      const target = isObject(event.data) ? event.data.targetId : undefined;
+      if (typeof target !== "string" || !rules.senders.has(target)) return "ack target is not bound to this link";
+    }
     return undefined;
   }
 
   /** Step until stop() or a transport failure (thrown). */
   async run(): Promise<void> {
-    await this.start();
+    this.#running = this.start();
+    await this.#running;
     while (!this.#stopped) {
-      await this.step();
+      const pass = this.step();
+      this.#running = pass.then(() => undefined);
+      await pass;
       if (this.#stopped) break;
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, this.options.pollMs ?? DEFAULT_POLL_MS);
@@ -659,14 +765,25 @@ export class MeshBridge {
     }
   }
 
-  /** Stop the loop and withdraw both mirrors, so peers see the lapse at once. */
+  /**
+   * Stop the loop and withdraw both mirrors, so peers see the lapse at once. Each wait on the
+   * remote is bounded, and the local withdrawal never depends on it (security review F3): the
+   * loop is fenced first (a silent remote's transport is closed, which fails its pending calls),
+   * so no pass in flight can write a mirror after the withdrawal.
+   */
   async stop(): Promise<void> {
+    const bound = this.options.stopMs ?? DEFAULT_STOP_MS;
+    const within = (work: Promise<unknown>): Promise<unknown> =>
+      Promise.race([work.catch(() => undefined), new Promise((resolve) => setTimeout(resolve, bound).unref?.())]);
     this.#stopped = true;
     this.#wake?.();
-    await Promise.allSettled([
-      this.options.local.mirror({ hosts: [], participants: [] }),
-      this.options.remote.mirror({ hosts: [], participants: [] }),
-    ]);
+    await within(this.#running);
+    await within(this.options.remote.mirror({ hosts: [], participants: [] }));
+    this.options.remote.close?.(new Error("Bridge stopped"));
+    await within(this.#running);
+    await this.options.local.mirror({ hosts: [], participants: [] }).catch((error: unknown) => {
+      this.#log(`local withdrawal failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
   }
 }
 

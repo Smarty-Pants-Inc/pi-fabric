@@ -7,7 +7,7 @@
 // The remote pins the agent in authorized_keys, so the key can run nothing else:
 //   command="node /opt/pi-fabric/bin/mesh-bridge agent --mesh /home/u/proj/.pi/fabric/mesh --peer dev1",restrict ssh-ed25519 ...
 import { spawn } from "node:child_process";
-import { MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, validBridgeName } from "./mesh/bridge.js";
+import { DEFAULT_CALL_TIMEOUT_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, validBridgeName } from "./mesh/bridge.js";
 import { MeshStore } from "./mesh/store.js";
 
 // Fabric's defaults for mesh.maxEventBytes and mesh.maxReadEvents (src/config.ts).
@@ -15,7 +15,7 @@ const MAX_EVENT_BYTES = 256 * 1024;
 const MAX_READ_EVENTS = 500;
 
 const USAGE = `usage:
-  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE (--ssh HOST [--ssh-key KEY] | -- COMMAND...)
+  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--call-timeout-ms MS] (--ssh HOST [--ssh-key KEY] | -- COMMAND...)
   mesh-bridge agent --mesh ROOT --peer NAME`;
 
 const parseArgs = (argv: string[]): { mode: string; flags: Map<string, string>; command: string[] } => {
@@ -60,46 +60,74 @@ const runAgent = async (flags: Map<string, string>): Promise<void> => {
   await serveBridgeAgent(side, process.stdin, process.stdout);
 };
 
-const runBridge = async (flags: Map<string, string>, command: string[]): Promise<number> => {
+/** A transport child that ignores SIGTERM is killed this long after it. */
+const CHILD_KILL_MS = 2_000;
+
+/**
+ * Run one bridge until the signal aborts it or the transport fails. Every wait on the remote is
+ * bounded (security review F3): a silent agent cannot keep the bridge, its local mirrors or its
+ * transport child alive past the call deadline plus the stop bound.
+ */
+export const runBridge = async (
+  flags: Map<string, string>,
+  command: string[],
+  signal: AbortSignal,
+  onChild?: (pid: number | undefined) => void,
+): Promise<number> => {
   const localName = required(flags, "name");
   const remoteName = required(flags, "remote");
   if (!validBridgeName(localName) || !validBridgeName(remoteName)) throw new Error("Invalid bridge name");
+  const callTimeoutMs = Number(flags.get("call-timeout-ms") ?? DEFAULT_CALL_TIMEOUT_MS);
+  if (!Number.isSafeInteger(callTimeoutMs) || callTimeoutMs <= 0) throw new Error("--call-timeout-ms must be a positive integer");
   const argv = transportCommand(flags, command);
   const child = spawn(argv[0]!, argv.slice(1), { stdio: ["pipe", "pipe", "inherit"] });
-  const remote = new RemoteBridgeSide(child.stdout, child.stdin);
+  onChild?.(child.pid);
+  const exited = new Promise<void>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve();
+    else child.once("exit", () => resolve());
+  });
+  child.on("error", (error) => remote.close(error));
+  child.stdin.on("error", () => undefined);
+  const remote = new RemoteBridgeSide(child.stdout, child.stdin, callTimeoutMs);
   const bridge = new MeshBridge({
     localName, remoteName,
     local: new StoreBridgeSide(store(required(flags, "mesh")), remoteName),
     remote,
     cursorPath: required(flags, "cursor"),
+    stopMs: Math.min(callTimeoutMs, 5_000),
     log,
   });
-  let stopping = false;
-  const stop = (): void => {
-    if (stopping) return;
-    stopping = true;
-    void bridge.stop().finally(() => child.kill("SIGTERM"));
-  };
-  process.once("SIGTERM", stop);
-  process.once("SIGINT", stop);
+  const aborted = new Promise<void>((resolve) => {
+    if (signal.aborted) resolve();
+    else signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+  let code = 0;
   try {
-    await remote.hello();
-    log(`linked ${localName} <-> ${remoteName}`);
     await Promise.race([
-      bridge.run(),
+      (async () => {
+        await remote.hello();
+        log(`linked ${localName} <-> ${remoteName}`);
+        await bridge.run();
+      })(),
       remote.closed.then((error) => {
         throw error;
       }),
+      aborted,
     ]);
-    return 0;
   } catch (error) {
-    if (stopping) return 0;
-    log(`stopped: ${error instanceof Error ? error.message : String(error)}`);
-    // The mirrors of the remote on this side go at once; the remote's lapse with their lease.
-    await bridge.stop();
-    child.kill("SIGTERM");
-    return 1;
+    if (!signal.aborted) {
+      log(`stopped: ${error instanceof Error ? error.message : String(error)}`);
+      code = 1;
+    }
   }
+  // The mirrors of the remote on this side go at once; the remote's lapse with their lease.
+  await bridge.stop();
+  remote.close();
+  child.kill("SIGTERM");
+  const timer = setTimeout(() => child.kill("SIGKILL"), CHILD_KILL_MS);
+  await exited;
+  clearTimeout(timer);
+  return code;
 };
 
 export const main = async (argv: string[]): Promise<number> => {
@@ -108,7 +136,13 @@ export const main = async (argv: string[]): Promise<number> => {
     await runAgent(flags);
     return 0;
   }
-  if (mode === "run") return runBridge(flags, command);
+  if (mode === "run") {
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    process.once("SIGTERM", abort);
+    process.once("SIGINT", abort);
+    return runBridge(flags, command, controller.signal);
+  }
   process.stderr.write(`${USAGE}\n`);
   return 2;
 };

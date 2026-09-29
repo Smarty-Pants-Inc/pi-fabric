@@ -96,7 +96,7 @@ describe("fabric-participants", () => {
     const env = { PI_CODING_AGENT_DIR: agentDir };
     expect(resolveMeshRoot(env, project)).toBe(path.join(project, ".pi", "fabric", "mesh"));
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: { root: "/fleet/global" } }));
-    expect(resolveMeshRoot(env, project)).toBe("/fleet/global");
+    expect(resolveMeshRoot(env, project)).toBe(path.resolve("/fleet/global"));
     fs.mkdirSync(path.join(project, ".pi"));
     fs.writeFileSync(path.join(project, ".pi", "fabric.json"), JSON.stringify({ mesh: { root: "mesh-here" } }));
     expect(resolveMeshRoot(env, project)).toBe(path.join(project, "mesh-here"));

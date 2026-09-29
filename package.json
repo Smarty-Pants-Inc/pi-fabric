@@ -35,7 +35,11 @@
       "import": "./dist/mesh.js"
     }
   },
+  "bin": {
+    "mesh-bridge": "./bin/mesh-bridge"
+  },
   "files": [
+    "bin/",
     "dist/",
     "skillsets/",
     "docs/",

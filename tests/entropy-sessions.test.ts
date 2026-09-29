@@ -168,6 +168,21 @@ describe("async session pipeline", () => {
     expect(await measureSessionCorpusAsync({ files })).toEqual(measureSessionCorpus({ files }));
   });
 
+  it("stops a large session read when its signal aborts (smarty-dev#2010)", async () => {
+    const agentDir = makeTempDir();
+    const file = writeSession(agentDir, "/repo", "large.jsonl", new Date(2021, 0, 1));
+    // About 40 MB: far more than one stream chunk, so the abort lands mid-read.
+    fs.appendFileSync(file, `${sessionLine()}\n`.repeat(40_000));
+    const controller = new AbortController();
+    const stream = vi.spyOn(fs, "createReadStream");
+    const read = sessionWindowEvidenceAsync([file], { windowsOnly: true, signal: controller.signal });
+    await vi.waitFor(() => expect(stream).toHaveBeenCalled());
+    controller.abort();
+    await expect(read).rejects.toThrow(/abort/i);
+    expect((stream.mock.results[0]!.value as fs.ReadStream).destroyed).toBe(true);
+    stream.mockRestore();
+  });
+
   it("reads only the appended range when a cached session grows", async () => {
     const agentDir = makeTempDir();
     const file = writeSession(agentDir, "/repo", "live.jsonl", new Date(2021, 0, 1));
@@ -193,16 +208,27 @@ describe("async session pipeline", () => {
     expect(options).toMatchObject({ start: initialSize, end: grownSize - 1 });
   });
 
-  it("falls back to a full scan after observing a partial appended line", async () => {
+  it("resumes at the last complete line after a partial append, never from byte 0 (smarty-dev#2010)", async () => {
     const agentDir = makeTempDir();
     const file = writeSession(agentDir, "/repo", "partial.jsonl", new Date(2021, 0, 1));
-    expect((await sessionWindowEvidenceAsync([file])).traces).toHaveLength(1);
+    const first = await sessionWindowEvidenceAsync([file]);
+    expect(first.traces).toHaveLength(1);
+    const completeSize = fs.statSync(file).size;
     const line = sessionLine();
     const split = Math.floor(line.length / 2);
     fs.appendFileSync(file, line.slice(0, split));
-    expect((await sessionWindowEvidenceAsync([file])).traces).toHaveLength(1);
+    const stream = vi.spyOn(fs, "createReadStream");
+    const partial = await sessionWindowEvidenceAsync([file]);
+    expect(partial.traces).toHaveLength(1);
+    // Only a partial tail was new: no stream opens, and the cached snapshot is reused as is.
+    expect(stream).not.toHaveBeenCalled();
+    expect(partial.traceWindows[0]!.traces).toBe(first.traceWindows[0]!.traces);
     fs.appendFileSync(file, `${line.slice(split)}\n`);
     expect((await sessionWindowEvidenceAsync([file])).traces).toHaveLength(2);
+    const options = stream.mock.calls.at(-1)?.[1] as { start?: number } | undefined;
+    expect(stream).toHaveBeenCalledTimes(1);
+    stream.mockRestore();
+    expect(options?.start).toBe(completeSize);
   });
 });
 

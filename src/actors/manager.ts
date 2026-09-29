@@ -288,7 +288,7 @@ export class ActorManager {
   readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
   // Set while one mesh event is delivered synchronously after a single ownership refresh.
   #ownershipSnapshot = false;
-  readonly #resolvePiModel: ((model: string) => string) | undefined;
+  readonly #resolvePiModel: ((model: string) => string | Promise<string>) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
@@ -353,7 +353,8 @@ export class ActorManager {
       persistent?: boolean;
       mainAgent?: FabricMainAgentTarget;
       canManageActor?: (id: string) => boolean | undefined;
-      resolvePiModel?: (model: string) => string;
+      /** May refresh the model registry on a miss, so it is awaited (smarty-dev#1830). */
+      resolvePiModel?: (model: string) => string | Promise<string>;
       lineageAlive?: (rootId: string) => boolean;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
@@ -517,7 +518,7 @@ export class ActorManager {
     });
     const pythonRuntime = kernel ? this.agents.resolvePythonRuntime(request.pythonRuntime) : undefined;
     const requestedModel = typeof request.model === "string" ? request.model.trim() : "";
-    const model = requestedModel ? this.#resolvedModel(runner, requestedModel) : undefined;
+    const model = requestedModel ? await this.#resolvedModel(runner, requestedModel) : undefined;
     const requirements = normalizeCapabilityRequirements(request.requires);
     if (requirements.length > 0 && !this.#acquireCapabilityView) {
       throw new Error("This Fabric host cannot commit actor capability requirements");
@@ -634,6 +635,25 @@ export class ActorManager {
   }
 
   /**
+   * Resolve the binding a direct activation will pin, awaiting a model registry refresh when the
+   * model is missing. A resident owner awaits this before the synchronous `tell`, so an override
+   * naming a model added after it started runs, and an unavailable one fails at once (pi-fabric#138).
+   */
+  async resolveActivationBinding(
+    id: string,
+    options: ActorMessageBindingOptions = {},
+  ): Promise<FabricActorRunBinding> {
+    this.#syncActorsFromRegistry();
+    const actor = this.#requireActor(id);
+    if (options.binding !== undefined && options.overrides !== undefined) {
+      throw new Error("Actor activation cannot carry both overrides and a resolved binding");
+    }
+    return this.#resolvedRunBinding(actor, options.binding !== undefined
+      ? this.#validatedRunBinding(options.binding)
+      : this.#runBinding(actor, options.overrides));
+  }
+
+  /**
    * Change an actor model binding. Session scope is the default and is writable
    * by passive project sessions because it never mutates the shared definition.
    * Project scope changes the shared default and therefore remains owner-gated.
@@ -651,7 +671,7 @@ export class ActorManager {
     const actor = scope === "session" ? this.#requireActor(id) : this.#requireOwnedActor(id);
     const resolved = next
       ? scope === "project" || this.#canManage(actor.id)
-        ? this.#resolvedModel(actor.runner, next)
+        ? await this.#resolvedModel(actor.runner, next)
         : next
       : undefined;
     if (scope === "session") {
@@ -1495,12 +1515,14 @@ export class ActorManager {
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
-    const binding = this.#resolvedRunBinding(
-      actor,
-      options.binding !== undefined
-        ? this.#validatedRunBinding(options.binding)
-        : this.#runBinding(actor, options.overrides),
-    );
+    const unresolved = options.binding !== undefined
+      ? this.#validatedRunBinding(options.binding)
+      : this.#runBinding(actor, options.overrides);
+    // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
+    // learns at once. A resolver that may refresh the registry is async: #drain resolves the
+    // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
+    const resolving = this.#resolvedRunBinding(actor, unresolved);
+    const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
     if (options.coalesceKey) {
@@ -1685,6 +1707,8 @@ export class ActorManager {
           } else {
             delete actor.capabilityDigest;
           }
+          // A miss fails this activation with the resolver's error (ask rejects, lastError set).
+          item.binding = await this.#resolvedRunBinding(actor, item.binding);
           const result = await this.agents.run(
             this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
@@ -2838,7 +2862,7 @@ export class ActorManager {
     this.#persistQueue(actor.id);
   }
 
-  #resolvedModel(runner: FabricAgentRunner, model: string): string {
+  #resolvedModel(runner: FabricAgentRunner, model: string): string | Promise<string> {
     return runner === "pi" && this.#resolvePiModel
       ? this.#resolvePiModel(model)
       : model;
@@ -2847,10 +2871,12 @@ export class ActorManager {
   #resolvedRunBinding(
     actor: ManagedActor,
     binding: FabricActorRunBinding,
-  ): FabricActorRunBinding {
-    return binding.model
-      ? { ...binding, model: this.#resolvedModel(actor.runner, binding.model) }
-      : binding;
+  ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
+    if (!binding.model) return binding;
+    const model = this.#resolvedModel(actor.runner, binding.model);
+    return model instanceof Promise
+      ? model.then((resolved) => ({ ...binding, model: resolved }))
+      : { ...binding, model };
   }
 
   #validatedRunBinding(binding: FabricActorRunBinding): FabricActorRunBinding {

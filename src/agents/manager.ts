@@ -104,6 +104,8 @@ const MAX_RETAINED_RUN_HANDLES = 1_000;
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
+// Synchronous walk: bound it on exit and on a live Main's event loop (smarty-dev#2010).
+const RETENTION_SWEEP_BUDGET_MS = 1_000;
 
 export const effectiveAgentTimeoutMs = (
   configuredTimeoutMs: number,
@@ -1504,6 +1506,8 @@ export class AgentManager {
           currentRoot: this.#runRoot,
           orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
           oneShotRunRetentionMs: this.#retention.oneShotRunMs,
+          minIntervalMs: RETENTION_SWEEP_INTERVAL_MS,
+          budgetMs: RETENTION_SWEEP_BUDGET_MS,
         });
       } catch {}
     }
@@ -1526,6 +1530,8 @@ export class AgentManager {
         orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
         oneShotRunRetentionMs: this.#retention.oneShotRunMs,
         now,
+        minIntervalMs: RETENTION_SWEEP_INTERVAL_MS,
+        budgetMs: RETENTION_SWEEP_BUDGET_MS,
       });
     }
     const expired = [...this.#runs.values()].filter((managed) => {

@@ -36,7 +36,7 @@ const setup = (
   ) => Promise<FabricCapabilityViewLease>,
   modelValidation?: {
     preparePiModel?: (model: string | undefined) => Promise<string | void>;
-    resolvePiModel?: (model: string) => string;
+    resolvePiModel?: (model: string) => string | Promise<string>;
   },
   meshOverrides: Partial<typeof DEFAULT_FABRIC_CONFIG.mesh> = {},
 ) => {
@@ -1328,6 +1328,7 @@ describe("ActorManager", () => {
     await expect(actors.setModel(actor.id, "provider/hidden")).rejects.toThrow(
       /not available to this Pi session/,
     );
+    // A synchronous resolver rejects at enqueue; an async (refreshing) one fails the activation.
     expect(() =>
       actors.tell(actor.id, "Do not queue", undefined, {
         overrides: { model: "provider/hidden" },

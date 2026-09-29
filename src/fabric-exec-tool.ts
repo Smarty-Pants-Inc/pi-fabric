@@ -161,8 +161,10 @@ export const createFabricExecTool = (
   const python = toolKernel(state) === "python";
   const monty = python && state.config.executor.pythonRuntime === "monty";
   // As the executor decides: `pi` and `extensions` exist in full code mode and Schema enforce.
-  // Before bootstrap this is the default (full code); applyFabricMode re-creates the tool.
-  const piTools = !state.bootstrapped || state.config.fullCodeMode || state.config.schema?.mode === "enforce";
+  // Before bootstrap the mode comes from the config readable at load (smarty-dev#459);
+  // applyFabricMode re-creates the tool after bootstrap.
+  const modeConfig = state.bootstrapped ? state.config : state.provisionalConfig?.();
+  const piTools = !modeConfig || modeConfig.fullCodeMode || modeConfig.schema?.mode === "enforce";
   const repeatGuard = new FabricRepeatGuard(FABRIC_REPEAT_WARN, FABRIC_REPEAT_BLOCK);
   return decorateShell(
   defineTool({

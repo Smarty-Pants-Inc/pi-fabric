@@ -2,7 +2,18 @@ import type { FabricKernel } from "../runtime/kernel.js";
 import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 
-export const fabricExecutionKernelGuidance = (fullCodeMode: boolean, kernel: FabricKernel = "typescript", pythonRuntime: "cpython" | "monty" = "monty"): string =>
+// Host globals that the QuickJS guest (and its type check) does not have; the fleet's
+// residual "Cannot find name" failures were these (smarty-dev#459).
+export const MISSING_HOST_GLOBALS = [
+  "process", "fetch", "btoa", "atob", "TextEncoder", "TextDecoder", "crypto", "Buffer",
+  "URL", "URLSearchParams", "structuredClone", "require", "Bun", "Deno",
+] as const;
+
+export const hostGlobalsGuidance = (fullCodeMode: boolean): string =>
+  "The QuickJS fabric_exec kernel has no host globals: `process`, `fetch`, `btoa`/`atob`, `TextEncoder`/`TextDecoder`, `crypto`, `Buffer`, `URL`, `structuredClone`, `require` and `Bun` do not exist. " +
+  `For environment, network, encoding or hashing, run a shell command (\`env\`, \`curl\`, \`base64\`, \`sha256sum\`) with ${fullCodeMode ? "`pi.bash`" : "the native `bash` tool, outside `fabric_exec`"}; for data, use the \`JSON\`, \`String\` and \`Array\` builtins.`;
+
+export const fabricExecutionKernelGuidance = (fullCodeMode: boolean, kernel: FabricKernel = "typescript", pythonRuntime: "cpython" | "monty" = "monty", runtime: "quickjs" | "node-process" | "bun-process" = "quickjs"): string =>
   [
     kernel === "python"
       ? `Configured fabric_exec kernel: Python (${pythonRuntime === "monty" ? "Monty sandboxed subset" : "CPython"}). Write Python only in \`code\`: top-level await/return, dicts, True/False/None, and asyncio.gather. There is no per-call language switch.`
@@ -15,6 +26,7 @@ export const fabricExecutionKernelGuidance = (fullCodeMode: boolean, kernel: Fab
     // use; this line rides the turn-stable kernel guidance so provider prefix
     // caches stay warm.
     `Read every file the user provides (images, screenshots, code, text) with the ${fullCodeMode ? "`pi.read`" : "`read`"} tool before responding — never assume its contents.`,
+    ...(kernel === "typescript" && runtime === "quickjs" ? [hostGlobalsGuidance(fullCodeMode)] : []),
   ].join(" ");
 
 export const defaultFabricExecutionGuidance = (fullCodeMode: boolean, kernel: FabricKernel = "typescript", pythonRuntime: "cpython" | "monty" = "monty"): string =>

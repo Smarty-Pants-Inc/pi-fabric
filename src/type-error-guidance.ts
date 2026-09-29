@@ -1,4 +1,5 @@
 import type { FabricTypeError } from "./runtime/type-checker.js";
+import { MISSING_HOST_GLOBALS, hostGlobalsGuidance } from "./core/system-guidance.js";
 import {
   CORE_TOOL_NAMES,
   coreToolProperties,
@@ -136,6 +137,10 @@ export const typeErrorRecoveryHint = (
       const hint = unknownPropertyHint(property, tool);
       if (hint) return hint;
     }
+  }
+  // The same line the QuickJS kernel guidance carries (smarty-dev#459).
+  if (errors.some((error) => (MISSING_HOST_GLOBALS as readonly string[]).includes(MISSING_NAME_PATTERN.exec(error.message)?.[1] ?? ""))) {
+    return `Recovery hint: ${hostGlobalsGuidance(piTools)}`;
   }
   if (
     PROMISE_ALL_PATTERN.test(code)

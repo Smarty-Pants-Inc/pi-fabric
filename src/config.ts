@@ -1529,6 +1529,12 @@ export const loadFabricConfig = (options: {
   return config;
 };
 
+// The global configuration plus environment overrides, readable at extension load before a
+// session context exists (smarty-dev#459). Project configuration needs the trust decision
+// that only bootstrap has, so it is left out here.
+export const loadGlobalFabricConfig = (agentDir: string): FabricConfig =>
+  resolveFabricConfig({ cwd: agentDir, agentDir }, false, true);
+
 export const saveFabricConfig = (
   options: {
     cwd: string;

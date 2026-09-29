@@ -21,7 +21,9 @@
 
 // `names[i]` is the placeholder `${name}` that stands for `subs[i]` in `text`: a script run by
 // bash -c, eval, ssh, env -S or a heredoc sees which operand came from which substitution.
-type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean };
+// `pattern` is `text` with each quoted or escaped glob character (* ? [ ]) replaced by \u0001, so an
+// unquoted glob stays visible to the /tmp rule (smarty-dev#1998).
+type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string };
 type Expansion = { subs: string[]; names: string[]; text?: string; dynamic?: boolean };
 
 let placeholders = 0;
@@ -107,7 +109,7 @@ function tokenize(source: string): Token[] {
     word = undefined;
     target = false;
   };
-  const current = (): Word => (word ??= { text: "", subs: [], names: [], dynamic: false });
+  const current = (): Word => (word ??= { text: "", subs: [], names: [], dynamic: false, pattern: "" });
   while (index < text.length) {
     const c = text[index]!;
     if (c === " " || c === "\t" || c === "\r") { endWord(); index += 1; continue; }
@@ -146,7 +148,9 @@ function tokenize(source: string): Token[] {
     if ((c === "<" || c === ">") && text[index + 1] === "(") {
       const end = readBalanced(text, index + 2, "(", ")");
       const w = current();
-      w.text += substitute(w, text.slice(index + 2, end - 1));
+      const placeholder = substitute(w, text.slice(index + 2, end - 1));
+      w.text += placeholder;
+      w.pattern += placeholder;
       index = end;
       continue;
     }
@@ -170,6 +174,8 @@ function tokenize(source: string): Token[] {
       continue;
     }
     const w = current();
+    const before = w.text.length;
+    let bare = false;
     if (c === "'") {
       const end = text.indexOf("'", index + 1);
       w.text += text.slice(index + 1, end < 0 ? text.length : end);
@@ -192,7 +198,10 @@ function tokenize(source: string): Token[] {
       if (c === "$") w.dynamic = true;
       w.text += c;
       index += 1;
+      bare = true;
     }
+    const added = w.text.slice(before);
+    w.pattern += bare ? added : added.replace(/[*?[\]]/g, "\u0001");
   }
   endWord();
   return tokens;
@@ -220,8 +229,28 @@ const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 const SSH_VALUE_OPTIONS = new Set(["-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w", "-B"]);
 const VARIABLE = /\$\{?([A-Za-z_][A-Za-z0-9_]*|[0-9@*])/g;
 
+// smarty-dev#1998: deletes whose operand may be another agent's /tmp entry.
+const DELETERS = new Set(["rm", "unlink", "shred"]);
+const TMP_ROOTS = [["tmp"], ["var", "tmp"], ["private", "tmp"], ["private", "var", "tmp"]];
+
+/**
+ * True when `pattern` (a word's pattern after variable expansion) names /tmp or /var/tmp itself, or has an
+ * unquoted glob (or ..) in the component directly below it: `/tmp/tmp.*`, `/tmp/*`, `/tmp`. A glob below a
+ * concrete component (`/tmp/tmp.AbC123/*.md`) stays inside one dir. A relative word counts only after a known `cd`.
+ */
+function tmpGlob(pattern: string, cwd: string | undefined): boolean {
+  const path = pattern.startsWith("/") ? pattern : cwd && pattern && !/^[~$]/.test(pattern) ? `${cwd}/${pattern}` : undefined;
+  if (!path) return false;
+  const parts = path.split("/").filter((part) => part !== "" && part !== ".");
+  const root = TMP_ROOTS.find((r) => r.every((part, i) => parts[i] === part));
+  if (!root) return false;
+  const rest = parts.slice(root.length);
+  return rest.length === 0 || /[*?[]/.test(rest[0]!) || rest.includes("..");
+}
+
 // `blocked`: a kill by pattern. `lookup`: runs a name lookup (LOOKUPS) anywhere.
-type Verdict = { blocked: boolean; lookup: boolean };
+// `wipe`: a delete over a /tmp glob (smarty-dev#1998). `tmpList`: a word names a /tmp glob, so its output may list other agents' dirs.
+type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean };
 type Command = { words: Word[]; redirects: Word[]; heredocs: Array<{ body: string; quoted: boolean }> };
 
 /** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
@@ -273,8 +302,8 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
  * Scans a shell script. `names` holds the variables and placeholders whose value comes from a name
  * lookup in the calling script (review/astra F8 on #105: per operand, never the whole script).
  */
-function scan(script: string, depth: number, names: ReadonlySet<string> = new Set()): Verdict {
-  const verdict: Verdict = { blocked: false, lookup: false };
+function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), tmpIn: ReadonlySet<string> = new Set()): Verdict {
+  const verdict: Verdict = { blocked: false, lookup: false, wipe: false, tmpList: false };
   if (depth > 6) return verdict;
   // Variables whose value comes from a name lookup (`P=$(pgrep …)`, `for p in $(pgrep …)`,
   // `pgrep … | while read p`), and the placeholders of lookup substitutions. A `kill` of one is a
@@ -283,16 +312,28 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
   let stages: Command[] = [];
   let command: Command = { words: [], redirects: [], heredocs: [] };
 
-  const nested = (text: string, extra: Iterable<string> = []): Verdict => {
-    const inner = scan(text, depth + 1, new Set([...tainted, ...extra]));
+  // smarty-dev#1998: variables and placeholders that hold a /tmp glob's matches, the literal values of
+  // earlier assignments, and the directory of the last `cd` (undefined when unknown).
+  const tmpNames = new Set(tmpIn);
+  const values = new Map<string, string>();
+  let cwd: string | undefined;
+
+  const nested = (text: string, extra: Iterable<string> = [], tmpExtra: Iterable<string> = []): Verdict => {
+    const inner = scan(text, depth + 1, new Set([...tainted, ...extra]), new Set([...tmpNames, ...tmpExtra]));
     verdict.blocked ||= inner.blocked;
     verdict.lookup ||= inner.lookup;
+    verdict.wipe ||= inner.wipe;
     return inner;
   };
   const fromLookup = (text: string): boolean => [...text.matchAll(VARIABLE)].some((match) => tainted.has(match[1]!));
+  const expand = (pattern: string): string =>
+    pattern.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name: string) => values.get(name) ?? whole);
+  const tmpOperand = (pattern: string): boolean =>
+    [...pattern.matchAll(VARIABLE)].some((match) => tmpNames.has(match[1]!)) || tmpGlob(expand(pattern), cwd);
 
   const runPipeline = (): void => {
     let pipeFeed = false;
+    let pipeTmp = false;
     stages.forEach((stage, position) => {
       const piped = position < stages.length - 1;
       // Substitutions in words and redirection targets run; so do those of an unquoted heredoc
@@ -302,11 +343,13 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       const expansions: Expansion[] = [...stage.words, ...stage.redirects, ...heredocs];
       let captured = false;
       for (const expansion of expansions) expansion.subs.forEach((sub, k) => {
-        if (!nested(sub).lookup) return;
+        const inner = nested(sub);
+        if (inner.tmpList) tmpNames.add(expansion.names[k]!);
+        if (!inner.lookup) return;
         captured = true;
         tainted.add(expansion.names[k]!);
       });
-      const scripts: Array<{ text: string; extra?: string[] }> = [];
+      const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[] }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
       const { words, fedByXargs } = unwrap(stage.words, envScripts);
       // review/astra F6 on #105: an `env -S` script, with the placeholders of its word.
@@ -319,9 +362,39 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
       for (const word of stage.words) {
         const assigned = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word.text);
         if (assigned && fromLookup(assigned[2]!)) tainted.add(assigned[1]!);
+        const value = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word.pattern);
+        if (value) {
+          if (tmpOperand(value[2]!)) tmpNames.add(value[1]!);
+          values.set(value[1]!, expand(value[2]!));
+        }
       }
       if (name === "for" && args[0] && args.slice(2).some((arg) => fromLookup(arg.text))) tainted.add(args[0].text);
+      if (name === "for" && args[0] && args.slice(2).some((arg) => tmpOperand(arg.pattern))) tmpNames.add(args[0].text);
       if (name === "read" && pipeFeed) for (const arg of args) if (!arg.text.startsWith("-")) tainted.add(arg.text);
+      if (name === "read" && pipeTmp) for (const arg of args) if (!arg.text.startsWith("-")) tmpNames.add(arg.text);
+      let listsTmp = stage.words.some((word) => tmpOperand(word.pattern));
+      if (name === "cd") {
+        const target = args.find((arg) => !arg.text.startsWith("-"));
+        const dir = target && expand(target.pattern);
+        cwd = dir?.startsWith("/") ? dir : dir && cwd && !/^[~$]/.test(dir) ? `${cwd}/${dir}` : undefined;
+      }
+      // smarty-dev#1998: rm (and xargs rm) of a /tmp glob, or find over one with -delete or -exec rm.
+      if (DELETERS.has(name)) {
+        const end = args.findIndex((arg) => arg.text === "--");
+        const operands = args.filter((arg, i) => (end >= 0 && i > end) || (!(arg.text.startsWith("-") && arg.text.length > 1) && (end < 0 || i < end)));
+        if (operands.some((arg) => tmpOperand(arg.pattern)) || (fedByXargs && pipeTmp)) verdict.wipe = true;
+      }
+      if (name === "find") {
+        const roots: Word[] = [];
+        for (const arg of args) {
+          if (["-H", "-L", "-P"].includes(arg.text)) continue;
+          if (arg.text.startsWith("-") || ["(", "!", ")"].includes(arg.text)) break;
+          roots.push(arg);
+        }
+        const deletes = args.some((arg, i) => arg.text === "-delete" || (["-exec", "-execdir", "-ok", "-okdir"].includes(arg.text) &&
+          /(^|[\s/])(rm|unlink|shred)(\s|$)/.test(args.slice(i + 1).map((a) => a.text).join(" ").split(/\s[;+](\s|$)/)[0]!)));
+        if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern)) : tmpGlob(".", cwd))) verdict.wipe = true;
+      }
       // xargs appends its input: from a lookup, `{}` and every positional parameter hold it.
       const xargsFeed = fedByXargs && pipeFeed;
       if (name === "kill") {
@@ -339,10 +412,13 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
           // review/astra F9 on #105: `sh -c SCRIPT NAME ARGS…` binds $0, $1, … (and $@, $*) to the
           // words after the script; xargs appends its input after them.
           const extra: string[] = [];
+          const tmpExtra: string[] = [];
           const positional = args.slice(flag + 2);
           positional.forEach((arg, k) => { if (fromLookup(arg.text)) extra.push(String(k), "@", "*"); });
+          positional.forEach((arg, k) => { if (tmpOperand(arg.pattern)) tmpExtra.push(String(k), "@", "*"); });
           if (xargsFeed) extra.push(..."123456789@*".split(""), "{}");
-          scripts.push({ text: payload.text, extra });
+          if (fedByXargs && pipeTmp) tmpExtra.push(..."123456789@*".split(""), "{}");
+          scripts.push({ text: payload.text, extra, tmpExtra });
         }
       }
       if (name === "eval") scripts.push({ text: args.map((arg) => arg.text).join(" ") });
@@ -351,9 +427,15 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
         while (args[i]?.text.startsWith("-")) i += SSH_VALUE_OPTIONS.has(args[i]!.text) ? 2 : 1;
         scripts.push({ text: args.slice(i + 1).map((arg) => arg.text).join(" ") });
       }
-      for (const inner of scripts) lookup = nested(inner.text, inner.extra).lookup || lookup;
+      for (const inner of scripts) {
+        const result = nested(inner.text, inner.extra, inner.tmpExtra);
+        lookup = result.lookup || lookup;
+        listsTmp = result.tmpList || listsTmp;
+      }
       if (lookup) verdict.lookup = true;
       if (piped && lookup) pipeFeed = true;
+      if (listsTmp) verdict.tmpList = true;
+      if (piped && listsTmp) pipeTmp = true;
     });
     stages = [];
   };
@@ -375,6 +457,17 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
 export function killsByPattern(command: string): boolean {
   return scan(command, 0).blocked;
 }
+
+/** True when the shell command deletes by a glob over /tmp or /var/tmp, or deletes /tmp itself (smarty-dev#1998). */
+export function wipesTmp(command: string): boolean {
+  return scan(command, 0).wipe;
+}
+
+export const TMP_WIPE_REASON =
+  "Blocked (smarty-dev#1998): this deletes by a glob in /tmp or /var/tmp (or /tmp itself), which also " +
+  "deletes other agents' live dirs on a shared host. Record the path when you create it " +
+  "(`D=$(mktemp -d)`), then delete only your own mktemp -d path by its exact name (\"$D\"), #1508/#1998. " +
+  "A glob inside that dir is fine: `rm -f \"$D\"/*.json`.";
 
 export const PATTERN_KILL_REASON =
   "Blocked (smarty-dev#774): a kill by name pattern (pkill, killall, or kill of pgrep output) also kills " +

@@ -1,7 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
-import { killsByPattern, PATTERN_KILL_REASON } from "./core/pattern-kill.js";
+import { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp } from "./core/pattern-kill.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
@@ -787,6 +787,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
     if (killsByPattern(command)) return { block: true, reason: PATTERN_KILL_REASON };
+    if (wipesTmp(command)) return { block: true, reason: TMP_WIPE_REASON };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
     return reason ? { block: true, reason } : undefined;
   });

@@ -7,6 +7,7 @@ import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  MessageUpdateEvent,
 } from "@earendil-works/pi-coding-agent";
 import { defaultCodePreviewSettings } from "./ui/code-preview.js";
 import {
@@ -627,6 +628,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   };
 
   pi.on("session_start", async (_event, context) => {
+    fabricPrewarm = undefined;
     stopInboxWake();
     inboxWake.context = context;
     inboxWake.armed = true;
@@ -764,6 +766,22 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   };
 
 
+  // The first fabric_exec of a session paid Fabric's initialization and the TypeScript checker
+  // (5-10 s on a loaded host) after the model finished streaming it. Start both when the model
+  // starts streaming that call, the first sign of actual use (smarty-dev#2010).
+  let fabricPrewarm: Promise<void> | undefined;
+  const prewarmOnFabricExecStream = (event: MessageUpdateEvent, context: ExtensionContext): void => {
+    if (fabricPrewarm) return;
+    const update = event.assistantMessageEvent;
+    if (update.type !== "toolcall_start" && update.type !== "toolcall_delta") return;
+    const block = update.partial?.content?.[update.contentIndex];
+    if (block?.type !== "toolCall" || block.name !== "fabric_exec") return;
+    fabricPrewarm = (async () => {
+      await state.ensure(context);
+      await state.execution.prewarm(context);
+    })().catch(() => undefined);
+  };
+
   // Speculative PTC: follow fabric_exec argument streaming and pre-launch
   // literal-argument read calls so their latency hides behind generation.
   pi.on("message_start", () => {
@@ -771,6 +789,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("message_update", (event, context) => {
+    prewarmOnFabricExecStream(event, context);
     if (!state.initialized) return;
     state.speculationTap?.handleMessageUpdate(event, context);
   });

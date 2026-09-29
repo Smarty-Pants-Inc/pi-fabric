@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js";
 import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
@@ -625,13 +626,14 @@ export class AgentsProvider implements FabricProvider {
         const request = runRequest(this.#resolvePiModelArgs(args, context), context, this.manager);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
+        const durableCwd = request.residency === "durable" && request.cwd !== undefined
+          ? await this.manager.resolveCwd(request.cwd, context.signal)
+          : undefined;
         const durableRequest = withInheritedSessionPins({
           ...baseRequest,
           ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime() } : {}),
           extensions: request.extensions ?? this.manager.config.extensions,
-          ...(request.residency === "durable" && request.cwd !== undefined
-            ? { cwd: this.manager.resolveCwd(request.cwd) }
-            : {}),
+          ...(durableCwd !== undefined ? { cwd: durableCwd } : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
         const handle = durableRequest.residency === "durable"
           ? await this.#resident().spawnAgent(durableRequest, context.signal)
@@ -664,8 +666,7 @@ export class AgentsProvider implements FabricProvider {
             if (!bound.aborted || context.signal?.aborted) throw error;
             throw new Error(
               `agents.wait: durable agent ${status.name} is still running after ${describeWaitBound(timeoutMs)}. ` +
-                "It continues, and its result arrives as a completion message: end the turn now, or pass a larger " +
-                "timeoutMs (up to 60 min) to wait longer.",
+                "It continues, and its result arrives as a completion message: end the turn now.",
             );
           }
         }
@@ -1049,6 +1050,17 @@ export class AgentsProvider implements FabricProvider {
       }
       case "actorStatus":
         return this.actorManager.status(String(args.id));
+      case "instructions": {
+        const actor = this.actorManager.status(String(args.id));
+        const { instructions } = this.actorManager.definition(actor.id);
+        return {
+          id: actor.id,
+          name: actor.name,
+          instructions,
+          instructionsDigest: createHash("sha256").update(instructions).digest("hex"),
+          instructionsLength: instructions.length,
+        };
+      }
       case "actors":
         return args.scope === "global" ? this.globalActors.list() : this.actorManager.list();
       case "messages": {
@@ -1196,6 +1208,12 @@ export class AgentsProvider implements FabricProvider {
         return actor;
       }
       case "export": {
+        // Agents called export to read an actor and left stray global templates (smarty-dev#918).
+        if (args.write !== true) {
+          throw new Error(
+            "agents.export writes a global template; pass write: true to confirm. To read an actor's instructions, use agents.instructions({ id }).",
+          );
+        }
         const actor = this.actorManager.status(String(args.id));
         const overwrite = args.overwrite === true;
         const def = this.actorManager.definition(actor.id);
@@ -1393,6 +1411,13 @@ export class AgentsProvider implements FabricProvider {
       }
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
+    }
+    // A finished durable run has no participant after its host exits: return its result (smarty-dev#1882).
+    // Only a settled run: a live host may still resume or retry a stopped attempt.
+    const settled = this.residency?.settledAgent(id);
+    if (settled) {
+      this.residency!.acknowledgeCompletion(id);
+      return settled;
     }
     const participant = this.participants.get(id);
     if (!participant) throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, id);

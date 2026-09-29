@@ -142,6 +142,8 @@ interface FabricPeerInfo {
   updatedAt: number;
   pendingMessages: boolean;
   local: false;
+  /** The remote host of a peer mirrored by the mesh bridge. */
+  host?: string;
 }
 type FabricParticipantKind = "root" | "agent" | "actor";
 type FabricParticipantResidency = "session" | "durable";
@@ -179,6 +181,8 @@ interface FabricParticipantInfo {
   actorQueued?: number;
   actorMessages?: number;
   controlProtocol: "v1" | "legacy";
+  /** The remote host of a root mirrored by the mesh bridge; never a local owner. */
+  remoteHost?: string;
   residency: FabricParticipantResidency;
   local: boolean;
   stale: boolean;
@@ -809,7 +813,7 @@ interface FabricAgentsApi {
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
   spawn(args: FabricAgentRequest): Promise<FabricAgentHandle>;
-  /** Bounded by timeoutMs (default 5 min, at most 60 min): a child still running keeps running and reports on completion. */
+  /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */
   join(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
@@ -869,6 +873,14 @@ interface FabricAgentsApi {
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
   actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorInfo>;
+  /** Read a live actor's instruction text and its sha256 digest. Writes nothing. */
+  instructions(args: FabricAgentTargetArgs): Promise<{
+    id: string;
+    name: string;
+    instructions: string;
+    instructionsDigest: string;
+    instructionsLength: number;
+  }>;
   actors(args?: { scope?: "project" }): Promise<FabricActorInfo[]>;
   /** Project-independent templates in the global registry. */
   actors(args: { scope: "global" }): Promise<FabricActorTemplate[]>;
@@ -880,8 +892,8 @@ interface FabricAgentsApi {
   resetSession(args: { id: string }): Promise<FabricActorInfo>;
   /** Stamp a global template into the current project as a fresh live actor with no inherited history. */
   "import"(args: { id?: string; name?: string; as?: string }): Promise<FabricActorInfo>;
-  /** Export a live project actor's definition to the global registry as a project-independent template. */
-  "export"(args: { id: string; overwrite?: boolean }): Promise<FabricActorTemplate>;
+  /** Write a live project actor's definition to the global registry as a template. Requires write: true; it is not a read. */
+  "export"(args: { id: string; write: true; overwrite?: boolean }): Promise<FabricActorTemplate>;
   log(args: {
     id: string;
     type?: "session" | "run" | "all";

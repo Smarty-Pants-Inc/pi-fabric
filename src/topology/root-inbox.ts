@@ -16,6 +16,12 @@ import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
  */
 export const ROOT_INBOX_PREFIX = "topology/inbox/";
 export const WORK_TOPIC_PREFIX = "fleet.";
+/**
+ * The canonical id namespace of root sessions. A root accepts a name in it only when the name is
+ * its own id, never a session name that looks like one: the mesh bridge routes ids in this
+ * namespace to other hosts, so native name delivery must stay disjoint from it (smarty-dev#2004).
+ */
+export const ROOT_ID_PREFIX = "session:";
 export const ROOT_INBOX_CUSTOM_TYPE = "pi-fabric-inbox";
 /** The custom type Main gives a delivered steer or follow-up (src/main-agent.ts deliverAgent). */
 const AGENT_MESSAGE_CUSTOM_TYPE = "pi-fabric-agent-message";
@@ -150,7 +156,8 @@ export class RootInbox {
 
   #scan(after: number, session: RootInboxSession, bounded = true): RootInboxBatch {
     const now = this.#now();
-    const names = new Set(this.names().filter((name) => name.trim()));
+    const names = new Set(this.names().filter((name) =>
+      name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
     const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
     const pageSize = this.options.pageSize ?? 500;
     const events: MeshEvent[] = [];

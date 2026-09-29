@@ -161,7 +161,7 @@ const waitSchema = {
   type: "object",
   properties: {
     id: { type: "string" },
-    timeoutMs: { type: "number", minimum: 1_000, maximum: AGENT_WAIT_MAX_MS },
+    timeoutMs: { type: "number", minimum: 1_000, description: `Clamped to ${AGENT_WAIT_MAX_MS / 60_000} min: a foreground wait over the bash guard's limit blocks steers (smarty-dev#854)` },
   },
   required: ["id"],
   additionalProperties: false,
@@ -206,7 +206,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "wait",
-    description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification. Bounded by timeoutMs (default 5 min, at most 60 min): a child still running then keeps running, the wait throws, and its result arrives as a completion message after the turn",
+    description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification. Bounded by timeoutMs (default and at most 5 min): a child still running then keeps running, the wait throws, and its result arrives as a completion message after the turn",
     effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
     inputSchema: waitSchema,
     risk: "read",
@@ -563,6 +563,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "read",
   },
   {
+    name: "instructions",
+    description:
+      "Read a live actor's current instruction text with its sha256 instructionsDigest and instructionsLength. Use it to check the text before and after agents.setInstructions. Writes nothing.",
+    inputSchema: idSchema,
+    risk: "read",
+  },
+  {
     name: "actors",
     description:
       'List persistent actors. Default scope "project" lists live actors in this Fabric session; scope "global" lists project-independent templates in the global registry.',
@@ -794,11 +801,15 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "export",
     description:
-      "Write a live project actor's definition to the global registry as a project-independent template, without any history (no messages, session, or run logs). This is a write, not a read: remove the template with agents.remove({ id, scope: \"global\" }). Read a live actor's instructions digest with agents.actorStatus. Throws on a name collision unless overwrite is true.",
+      "Write a live project actor's definition to the global registry as a project-independent template, without any history (no messages, session, or run logs). This is a write, not a read: it requires write: true, and throws without it. Read a live actor's instructions with agents.instructions. Remove a template with agents.remove({ id, scope: \"global\" }). Throws on a name collision unless overwrite is true.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
+        write: {
+          type: "boolean",
+          description: "Must be true: confirms the write of a global template",
+        },
         overwrite: { type: "boolean" },
       },
       required: ["id"],

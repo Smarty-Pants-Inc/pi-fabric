@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { projectOf } from "../src/topology/project-identity.js";
+import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -676,6 +677,32 @@ describe("AgentsProvider runner support", () => {
     const { provider } = setup([], [other, lead]);
     await expect(provider.invoke("projectAgent", {}, context)).resolves.toMatchObject({ id: "session:lead" });
     expect((await provider.describe("projectAgent", context))?.risk).toBe("read");
+  });
+
+  // smarty-dev#2045 (security review F1 on pi-fabric#132): a mirrored root's role and project are
+  // the remote's own claims and never make it this project's leader.
+  it("never returns a mirrored root as the project agent, even newer than the native one", async () => {
+    const project = projectOf(process.cwd());
+    const base = {
+      format: 1 as const, kind: "root" as const, name: "main", status: "idle", runner: "pi", transport: "host",
+      capabilities: ["steer", "followUp", "fabric"] as FabricParticipantInfo["capabilities"],
+      updatedAt: 2, controlProtocol: "v1" as const, local: false, stale: false, role: "project-agent", project, cwd: project,
+    };
+    const lead = {
+      ...base, id: "session:lead", rootId: "session:lead", ownerHostId: "session:lead", ownerIdentityId: "session:lead",
+      sessionId: "lead", startedAt: 1,
+    } as FabricParticipantInfo;
+    const mirrored = {
+      ...base, id: "session:remote", rootId: "session:remote", ownerHostId: "session:remote", ownerIdentityId: "session:remote",
+      sessionId: "remote", startedAt: 99, remoteHost: "forge",
+    } as FabricParticipantInfo;
+    await expect(setup([], [lead, mirrored]).provider.invoke("projectAgent", {}, context))
+      .resolves.toMatchObject({ id: "session:lead" });
+    await expect(setup([], [mirrored]).provider.invoke("projectAgent", {}, context))
+      .rejects.toThrow(`No live project agent for ${project}`);
+    // The resident-actor fallback uses the same resolver: with the actor's root gone, no mirror.
+    expect(deliveryRoot("session:gone", [lead, mirrored], project)).toBe("session:lead");
+    expect(deliveryRoot("session:gone", [mirrored], project)).toBe("session:gone");
   });
 
   it("lists current and peer roots as symmetric session agents", async () => {
@@ -1535,7 +1562,22 @@ describe("AgentsProvider shared actor definitions", () => {
     await expect(provider.invoke("log", { id: actor.id }, context)).resolves.toMatchObject({
       actorId: actor.id,
     });
-    await expect(provider.invoke("export", { id: actor.id }, context)).resolves.toMatchObject({
+    const read = (await provider.invoke("instructions", { id: actor.id }, context)) as {
+      instructions: string;
+      instructionsDigest: string;
+      instructionsLength: number;
+    };
+    expect(read).toMatchObject({ id: actor.id, name: actor.name, instructions: createRequest.instructions });
+    expect(read.instructionsDigest).toBe(
+      createHash("sha256").update(createRequest.instructions).digest("hex"),
+    );
+    expect(read.instructionsLength).toBe(createRequest.instructions.length);
+    // A read of the actor must not write a global template (smarty-dev#918).
+    await expect(provider.invoke("export", { id: actor.id }, context)).rejects.toThrow(
+      /write: true.*agents\.instructions/,
+    );
+    await expect(provider.invoke("actors", { scope: "global" }, context)).resolves.toEqual([]);
+    await expect(provider.invoke("export", { id: actor.id, write: true }, context)).resolves.toMatchObject({
       name: actor.name,
     });
   });
@@ -1982,7 +2024,7 @@ describe("AgentsProvider global actors", () => {
     await waitFor(() => actors.status(actor.id).status === "idle");
     expect(actors.status(actor.id).messages).toBeGreaterThan(0);
 
-    const template = (await provider.invoke("export", { id: actor.id }, context)) as {
+    const template = (await provider.invoke("export", { id: actor.id, write: true }, context)) as {
       name: string;
       instructions: string;
     };
@@ -2008,8 +2050,8 @@ describe("AgentsProvider global actors", () => {
     const { provider } = setup();
     await provider.invoke("create", { ...createRequest, scope: "global" }, context);
     const actor = (await provider.invoke("create", createRequest, context)) as { id: string };
-    await expect(provider.invoke("export", { id: actor.id }, context)).rejects.toThrow(/already exists/);
-    const replaced = (await provider.invoke("export", { id: actor.id, overwrite: true }, context)) as {
+    await expect(provider.invoke("export", { id: actor.id, write: true }, context)).rejects.toThrow(/already exists/);
+    const replaced = (await provider.invoke("export", { id: actor.id, write: true, overwrite: true }, context)) as {
       name: string;
     };
     expect(replaced.name).toBe("reviewer");
@@ -2050,7 +2092,7 @@ describe("AgentsProvider global actors", () => {
     expect(actors.status(actor.id)).toMatchObject({ inferenceContext: "activation", extensions: false, tools: [] });
     await provider.invoke("setInferenceContext", { id: actor.id, inferenceContext: "full-history" }, context);
     expect(await provider.invoke("actorStatus", { id: actor.id }, context)).toMatchObject({ id: actor.id, sessionFile: actor.sessionFile, inferenceContext: "full-history" });
-    const template = await provider.invoke("export", { id: actor.id }, context) as { id: string };
+    const template = await provider.invoke("export", { id: actor.id, write: true }, context) as { id: string };
     await provider.invoke("setInferenceContext", { id: template.id, inferenceContext: "activation", scope: "global" }, context);
     const imported = await provider.invoke("import", { id: template.id, as: "window-copy" }, context) as { id: string; sessionFile: string; messages: number; inferenceContext: string };
     expect(imported).toMatchObject({ inferenceContext: "activation", messages: 0 });
@@ -2307,6 +2349,32 @@ describe("AgentsProvider steering", () => {
       await expect(provider.invoke(action, { id: "session:never" }, context))
         .rejects.toThrow("Unknown Fabric participant: session:never (no record on this mesh root");
     }
+  });
+
+  // smarty-dev#1882: after its host exits, a finished durable agent has no participant; stop
+  // returns its terminal record. A durable agent that still runs keeps the participant route.
+  it("stops a finished durable agent with its terminal record, not Unknown participant", async () => {
+    const { agents, actors, globalActors, mainAgent, participants, control, lifecycle } = setup();
+    const id = "b".repeat(32);
+    let settled: unknown = { id, name: "durable", status: "completed", text: "done", residency: "durable" };
+    const acknowledged: string[] = [];
+    const residency = {
+      hasAgent: (candidate: string) => candidate === id,
+      settledAgent: (candidate: string) => candidate === id ? settled : undefined,
+      statusAgent: () => ({ id, name: "durable", status: "stopped", residency: "durable" }),
+      acknowledgeCompletion: (candidate: string) => acknowledged.push(candidate),
+    } as unknown as ResidencyClient;
+    const provider = new AgentsProvider(
+      agents, actors, globalActors, mainAgent, participants, control, lifecycle,
+      undefined, residency, false,
+    );
+    await expect(provider.invoke("stop", { id }, context)).resolves.toMatchObject({ status: "completed", text: "done" });
+    expect(acknowledged).toEqual([id]);
+    // review/astra on #136: a terminal-looking attempt that a live host may resume is not settled;
+    // stop takes the participant route and acknowledges nothing.
+    settled = undefined;
+    await expect(provider.invoke("stop", { id }, context)).rejects.toThrow("Unknown Fabric participant");
+    expect(acknowledged).toEqual([id]);
   });
 
   // review/astra on #57: the remote-Main branch of status said only "Unknown Fabric Main participant".

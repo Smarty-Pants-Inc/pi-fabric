@@ -24,13 +24,13 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 ## Agents
 
-`agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, at most 60. A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
+`agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
 ### Background completion inbox
 
 `agents.spawn` returns immediately; independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.
 
-`agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop. Fabric refuses a foreground `bash` call, native or through `pi.bash`, whose sleeps add up to more than 5 minutes: a long `sleep`, a sleep in a counted `for` loop, or a sleep in a `while` or `until` loop without a `timeout`. A session that waits in the foreground takes no steer or ask. Start the poll detached, or wait for a completion message or a mesh event, and end the turn.
+`agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop. Fabric refuses a foreground `bash` call, native or through `pi.bash`, whose sleeps add up to more than 5 minutes: a long `sleep`, a sleep in a counted `for` loop, a sleep in a `while` or `until` loop without a `timeout`, a sleep whose length is not a literal (`sleep $((t-now))`), or a `flock -w` wait. The tool call's own `timeout` or a literal `timeout N` bounds the estimate. A session that waits in the foreground takes no steer or ask. Start the poll detached, or wait for a completion message or a mesh event, and end the turn.
 
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results: Fabric does not start a turn to deliver them, and they join Main's next turn, whatever starts it (typed input, a peer message or another trigger). Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
 
@@ -509,18 +509,32 @@ Pass `coalesceKey` to `agents.create` for a new actor, or `null` to `agents.setC
 
 #### Activation filter
 
-An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Coalescing and queue order stay the same: the filter sees the item that would run, after coalescing.
+An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Fabric checks an event when it arrives, before it can join or replace a queued item, and again just before the run (for items queued before the filter was set). So a skipped event never replaces a queued one by `coalesceKey`: a comment edit that arrives while its comment's creation waits in the queue is skipped, and the creation still runs.
 
 Each skip adds a record to the actor's message log: direction `in`, the event's `source`, and reason `filtered: <rule id>`. The actor status counts skips in `filteredCount` and `lastFilteredAt`.
 
 Two presets come ready to use. Each had zero false skips in 24 hours of supervisor runs (smarty-dev#1579):
 
-- `hold` skips a GitHub event (`github.*` topic) when the item's labels (`data.payload.issue.labels` or `data.payload.pull_request.labels`, whichever the event carries) include `hold`. The event that removes `hold` (action `unlabeled` with `label.name` `hold`) is always delivered. An event with no labels field is delivered. The factory's projected webhook payload has no labels today, so this rule skips only when the ingress adds them.
+- `hold` skips a GitHub event (`github.*` topic) when the item's labels (`data.payload.issue.labels` or `data.payload.pull_request.labels`, whichever the event carries) include `hold`. The event that removes `hold` (action `unlabeled` with `label.name` `hold`) is always delivered. An event with no labels field is delivered. The rule also reads `data.payload.labels`, the label names in the factory's projected webhook payload.
 - `never-message-events` skips `issues.field_added`, `issues.typed` and `issue_comment.deleted` GitHub events, `host:tool_error`, and `ops.owner` events of kind `actions.minutes`.
 
 A custom rule is an object: `{ id, source?, topic?, kind?, where?, unless? }`. `source` (`mesh:<topic>` or `host:<event>`), `topic` and `kind` are lists of names; a trailing `*` matches a prefix. `where` is a list of predicates that must all match. `unless` is the rule's exception: the rule skips only when some `unless` predicate is known to be false (its field is present and does not match). For example, a held comment (action `created`) rules out the unlabel exception although a comment has no `label` field. A predicate is `{ path, equals }`, `{ path, in: [...] }` or `{ path, exists: true }`. `path` is a dotted path into the queued payload: for a mesh event that is the event itself (`topic`, `kind`, `data.payload.action`); for a host event, the event data. An array on the path fans out, so `data.payload.issue.labels.name` reads each label's name. A list of paths gives alternatives: the first path with a value is used.
 
 Unsure means deliver. A `where` predicate whose field is missing does not match. An `unless` exception that no present field rules out stays open, so an `unlabeled` event with no label name is delivered. `exists: false` is not allowed. `agents.create` and `agents.setActivationFilter` reject an invalid rule, an unknown preset or a duplicate rule id. A rule must name a source, topic, kind or `where` predicate, so no rule can skip everything.
+
+A supervisor that wakes on GitHub webhooks can drop comment edits, bots that are not on an allow list, and items another agent owns. The factory's projected payload carries `author` (`login`, `type`, `association`), `labels` (names) and `owners` (the names on the first `Owner:` line of the issue or pull request body). A field the factory cannot read is omitted, so the event is delivered (smarty-dev#2004):
+
+```ts
+[
+  "hold", "never-message-events",
+  { id: "edited", topic: ["github.*"], where: [{ path: "data.payload.action", equals: "edited" }] },
+  { id: "bot-not-allowed", topic: ["github.*"], where: [{ path: "data.payload.author.type", equals: "Bot" }],
+    unless: [{ path: "data.payload.author.login", in: ["smarty-fleet-write[bot]"] }] },
+  { id: "not-owned", topic: ["github.*"], unless: [{ path: "data.payload.owners", in: ["fabric-v2"] }] },
+]
+```
+
+A deny list is a `where` rule on `data.payload.author.login` with `in`. Keep `coalesceKey: "payload.number"` so a burst on one issue that queues while a run is in progress becomes one wake.
 
 ```ts
 const supervisor = (await agents.actors()).find((actor) => actor.name === "dev-supervisor");
@@ -677,7 +691,7 @@ const actor = await agents.import({ name: template.name });            // create
 await agents.import({ name: "security-reviewer", as: "security-reviewer-2" }); // rename it if the name exists
 
 // Copy a tuned project actor to the global library without its history.
-await agents.export({ id: actor.id, overwrite: true });
+await agents.export({ id: actor.id, write: true, overwrite: true }); // a global write: write: true is required
 
 // Change the default instruction and continuation policy of a template.
 await agents.setInstructions({ id: template.id, instructions: "Be brief.", scope: "global" });
@@ -689,7 +703,7 @@ return agents.setDeliveryPolicy({
 });
 ```
 
-`agents.setInstructions` can also change a live project actor. Its default scope is `"project"`. The new instruction applies to the next queued actor message. Only definitions cross the project⇄global boundary. Import and export never move history. Slash commands provide the same operations. `/fabric global` lists templates. `/fabric import <name> [as <new>]` creates one in the project. `/fabric export <id> [--overwrite]` promotes a project actor. The dashboard shows global templates with live actors. From there, you can import, export, delete, edit instructions, and change delivery policy without code. Existing persisted actors and templates continue to load as passive. New active delivery definitions must explicitly set `triggerTurn`.
+`agents.setInstructions` can also change a live project actor. Its default scope is `"project"`. The new instruction applies to the next queued actor message. `agents.instructions({ id })` reads the live text with its sha256 `instructionsDigest`; it writes nothing. `agents.export` requires `write: true`, so a caller cannot create a template by mistake. Only definitions cross the project⇄global boundary. Import and export never move history. Slash commands provide the same operations. `/fabric global` lists templates. `/fabric import <name> [as <new>]` creates one in the project. `/fabric export <id> [--overwrite]` promotes a project actor. The dashboard shows global templates with live actors. From there, you can import, export, delete, edit instructions, and change delivery policy without code. Existing persisted actors and templates continue to load as passive. New active delivery definitions must explicitly set `triggerTurn`.
 
 ## Councils
 

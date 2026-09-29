@@ -15,6 +15,8 @@ import { linuxCPythonNetworkFilter } from "./cpython-linux-sandbox.js";
 
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const HOST_SETTLE_MS = 250;
+// Bounds only the wait for a killed child's exit diagnosis after its IPC broke.
+const PIPE_DIAGNOSIS_MS = 2_000;
 // No blanket mach* allowance: Mach services can broker effects outside the
 // file/network policy. CPython's standard-library startup needs none here.
 const MACOS_PROFILE = "(version 1) (deny default) (allow process-exec) (allow process-fork) (allow file-read*) (allow sysctl-read)";
@@ -194,15 +196,21 @@ export class CPythonRuntime implements FabricKernelRuntime {
       // A child that dies at startup (bwrap without user namespaces) resets its
       // pipes before "close" reports its exit status and stderr. Let that
       // diagnosis settle the run instead of racing it with a bare EPIPE or
-      // ECONNRESET; a live child is killed so "close" always follows.
+      // ECONNRESET. The bridge itself ends at once: host calls are aborted and
+      // no further guest frame is admitted (finishing). Only the diagnosis
+      // waits, and for at most PIPE_DIAGNOSIS_MS, since a descendant that keeps
+      // stdout/stderr open can hold back "close".
       let pipeError: string | undefined;
       const failPipe = (message: string): void => {
-        if (settled || finishing || pipeError) return;
+        if (settled || finishing) return;
         pipeError = message;
+        finishing = true;
+        hostAbort.abort(new Error(message));
         if (child.pid && process.platform !== "win32") {
           try { process.kill(-child.pid, "SIGKILL"); } catch { /* The process group may already have exited. */ }
         }
         child.kill("SIGKILL");
+        setTimeout(() => fail(`${message}; CPython process did not report its exit`), PIPE_DIAGNOSIS_MS).unref?.();
       };
       const scheduleDeadline = (): void => {
         if (deadline) clearTimeout(deadline);
@@ -315,7 +323,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
       child.stderr?.on("data", (chunk: Buffer) => appendLog(1, decoders[1]!.write(chunk)));
       child.on("error", (error) => fail(`CPython process failed: ${error.message}${this.enforce ? "; OS sandbox is required (no native fallback)" : ""}`));
       child.on("close", (exitCode, signal) => {
-        if (settled || finishing) return;
+        if (settled || (finishing && !pipeError)) return;
         const diagnostics = [...logs, ...partialLogs].join("\n").slice(-4000);
         fail(`${pipeError ? `${pipeError}; ` : ""}CPython ${this.enforce ? "sandbox " : ""}process exited before returning a result (${signal ?? exitCode}).${this.enforce ? " Verify OS sandbox availability/user namespaces; no unsandboxed fallback is permitted." : ""}${diagnostics ? `\n${diagnostics}` : ""}`);
       });

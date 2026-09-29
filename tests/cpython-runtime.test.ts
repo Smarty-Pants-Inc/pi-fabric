@@ -260,6 +260,46 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
     expect(writes).toEqual(["execute"]);
   });
 
+  // Security review on #146: a broken pipe must end host authority at once,
+  // even when the child's "close" is held back (a descendant keeps stdout open).
+  it.skipIf(process.platform === "win32")("aborts issued host calls at a pipe error while the child's close is withheld", async () => {
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+        queueMicrotask(() => channel.push(`${JSON.stringify({ type: "call", id: 1, ref: "schema.status", args: {} })}\n`));
+      },
+    });
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(), stderr: new PassThrough(),
+      stdio: [null, null, null, channel], kill: vi.fn(),
+    });
+    vi.mocked(childProcess.spawn).mockReturnValue(child as unknown as ReturnType<typeof childProcess.spawn>);
+    const calls: string[] = [];
+    let abortedAtError: boolean | undefined;
+    const started = Date.now();
+    const result = await run("return 1", (ref, _args, signal) => {
+      calls.push(ref);
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        if (calls.length === 1) queueMicrotask(() => {
+          channel.emit("error", new Error("read ECONNRESET"));
+          abortedAtError = signal?.aborted;
+          // A late guest frame after the break is not admitted.
+          channel.emit("data", Buffer.from(`${JSON.stringify({ type: "call", id: 2, ref: "memory.sessions", args: {} })}\n`));
+        });
+      });
+    }, { timeoutMs: 60_000 });
+    expect(abortedAtError).toBe(true);
+    expect(calls).toEqual(["schema.status"]);
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(result).toMatchObject({ terminationReason: "runtime_error" });
+    expect(result.error).toContain("CPython IPC failed: read ECONNRESET");
+    expect(result.error).toContain("did not report its exit");
+    expect(Date.now() - started).toBeLessThan(30_000);
+  });
+
   it("bounds non-cooperative host calls after guest failure", async () => {
     const started = Date.now();
     const result = await run('await asyncio.gather(schema.status(), memory.sessions())', async (ref) => {

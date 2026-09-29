@@ -6,11 +6,8 @@ import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
-import {
-  resolveAvailablePiModel,
-  type FabricModelCandidate,
-} from "./core/model-resolution.js";
-import { loadModelUsage } from "./core/model-usage.js";
+import type { FabricModelCandidate } from "./core/model-resolution.js";
+import { resolvePiModel } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -649,23 +646,23 @@ export class FabricRuntimeState {
         ...(defaultModel ? { defaultModel } : {}),
       };
     };
-    const resolveParticipantPiModel = (selector?: string) => {
-      const models = visiblePiModels();
-      const state = piModelState(models);
-      const query = selector?.trim() || state.defaultModel || "";
-      const resolved = resolveAvailablePiModel(query, {
-        aliases: state.aliases,
-        available: state.available,
-        lastUsed: loadModelUsage(),
+    // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
+    const resolveParticipantPiModel = async (selector?: string) => {
+      const defaultModel = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
+      const resolved = await resolvePiModel({
+        selector,
+        registry: context.modelRegistry,
+        aliases: modelsConfig.aliases,
+        defaultModel,
       });
-      const model = models.find(
+      const model = visiblePiModels().find(
         (candidate) =>
           String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
           String(candidate.id).toLowerCase() === resolved.id.toLowerCase(),
       );
       if (!model) {
         throw new Error(
-          `Model ${JSON.stringify(query)} is not available to this Pi session. ` +
+          `Model ${JSON.stringify(selector?.trim() || defaultModel || "")} is not available to this Pi session. ` +
             'Use agents.models({ runner: "pi" }) to list the models visible to this session.',
         );
       }
@@ -705,7 +702,7 @@ export class FabricRuntimeState {
         }).appendText || undefined;
       },
       resolveHandoffCompactionBudget: async (modelKey, cwd) => {
-        const { model } = resolveParticipantPiModel(modelKey);
+        const { model } = await resolveParticipantPiModel(modelKey);
         // Load host settings only for an actual compacted handoff. Project
         // trust does not transfer implicitly to a different working directory.
         const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
@@ -720,7 +717,7 @@ export class FabricRuntimeState {
         };
       },
       preparePiModel: async (modelKey) => {
-        const resolved = resolveParticipantPiModel(modelKey);
+        const resolved = await resolveParticipantPiModel(modelKey);
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
@@ -811,7 +808,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
+            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
             acquireCapabilityView: acquireActorCapabilityView,
             // A /reload or restart of this session resumes its actors' mesh stream where the
             // last runtime stopped, so events published in between still reach them
@@ -830,7 +827,7 @@ export class FabricRuntimeState {
             role: participantRole(),
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
-            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
+            resolvePiModel: async (model) => (await resolveParticipantPiModel(model)).key,
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);

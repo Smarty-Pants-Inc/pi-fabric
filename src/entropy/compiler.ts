@@ -78,7 +78,10 @@ export class BackgroundEntropyCompiler {
 
   async compile(input: Omit<CompileEntropyInput, "traces" | "valueObservations" | "auditCalls"> & {
     windows: readonly EntropyTraceWindow[];
+    signal?: AbortSignal;
   }): Promise<CompileEntropyOutcome> {
+    const { signal, ...compileInput } = input;
+    input = compileInput;
     const digest = entropySurfaceHash(input.surface);
     if (this.#plans?.digest !== digest) {
       const plans: NormalFormPlan[] = [];
@@ -86,7 +89,10 @@ export class BackgroundEntropyCompiler {
       for (const action of sortedActions(input.surface)) {
         const plan = deriveNormalFormPlan(action.ref, action.inputSchema);
         if (plan && plans.length < MAX_NORMAL_FORM_PLANS) plans.push(plan);
-        if (++processed % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+        if (++processed % 32 === 0) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          signal?.throwIfAborted();
+        }
       }
       this.#plans = { digest, plans };
     }
@@ -94,7 +100,7 @@ export class BackgroundEntropyCompiler {
     const report = await this.#meter.measure(input.windows, {
       surface: input.surface, ...(input.repairs ? { repairs: input.repairs } : {}),
       catalogDigest: input.catalogDigest ?? digest,
-    });
+    }, signal);
     // Background callers never consume advisory proposals. Keep those scans
     // on the explicit inspection path, not in an unyielding turn-end tail.
     return finishCompile({ ...input, traces: [] }, report, structuredClone(plans), false);

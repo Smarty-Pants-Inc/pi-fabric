@@ -314,6 +314,7 @@ export class SessionEntropyMeter {
   async measure(
     windows: readonly EntropyTraceWindow[],
     input: Omit<EntropyMeterInput, "traces">,
+    signal?: AbortSignal,
   ): Promise<EntropyReport> {
     const reportInput = { ...input, traces: [] };
     const combined = createMeasureState(reportInput);
@@ -338,7 +339,10 @@ export class SessionEntropyMeter {
             accumulateTrace(model, trace);
             model.totals.traces++;
           }
-          if ((index + 1) % COOPERATIVE_TRACE_CHUNK === 0) await yieldToLoop();
+          if ((index + 1) % COOPERATIVE_TRACE_CHUNK === 0) {
+            await yieldToLoop();
+            signal?.throwIfAborted();
+          }
         }
         entry.traces = window.traces;
       }
@@ -353,6 +357,7 @@ export class SessionEntropyMeter {
         mergeMeasureState(model, source);
       }
       await yieldToLoop();
+      signal?.throwIfAborted();
     }
     const report = finalizeMeasure(reportInput, combined);
     const byModel = [...models.entries()].sort(([a], [b]) => compareCodeUnits(a, b)).map(([model, state]) => {

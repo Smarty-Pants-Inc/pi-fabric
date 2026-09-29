@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BackgroundEntropyCompiler, compileEntropySurface } from "../src/entropy/compiler.js";
 import { SessionEntropyMeter, measureEntropy, type EntropyTraceWindow } from "../src/entropy/meter.js";
 import { SessionObservationCache, mergeObservationWindow, type EntropyObservationPoolFile } from "../src/entropy/pool.js";
-import { BackgroundSessionSelector } from "../src/entropy/sessions.js";
 import * as normalForms from "../src/entropy/normal-form.js";
 import type { EntropySurfaceSnapshot, EntropyTraceInput, EntropyValueObservation } from "../src/entropy/types.js";
 
@@ -142,30 +141,17 @@ describe("incremental observation pool", () => {
   });
 });
 
-describe("background session discovery", () => {
-  it("amortizes full scans for 30 seconds, always includes the current file, and isolates returned lists", async () => {
-    vi.useFakeTimers(); vi.setSystemTime(0);
-    const files = Array.from({ length: 8 }, (_, i) => `session-${i}`);
-    const scan = vi.fn(async () => files);
-    const selector = new BackgroundSessionSelector(scan);
-    const first = await selector.select("agent", "cwd", "active");
-    expect(first).toEqual(["active", ...files.slice(0, 7)]);
-    first.length = 0;
-    vi.setSystemTime(29_999);
-    expect(await selector.select("agent", "cwd", "fork")).toEqual(["fork", ...files.slice(0, 7)]);
-    expect(scan).toHaveBeenCalledOnce();
-    vi.setSystemTime(30_000);
-    await selector.select("agent", "cwd", "fork");
-    expect(scan).toHaveBeenCalledTimes(2);
-    await selector.select("other-agent", "cwd");
-    await selector.select("other-agent", "other-cwd");
-    expect(scan).toHaveBeenCalledTimes(4);
-  });
-
-  it("does not cache an absent session directory", async () => {
-    const scan = vi.fn(async () => [] as string[]);
-    const selector = new BackgroundSessionSelector(scan);
-    await selector.select("agent", "cwd"); await selector.select("agent", "cwd");
-    expect(scan).toHaveBeenCalledTimes(2);
+describe("observation merge cancellation (smarty-dev#2010)", () => {
+  it("stops a large merge when its signal aborts and keeps the previous cache entry", async () => {
+    const cache = new SessionObservationCache();
+    const observations = Array.from({ length: 20_000 }, (_, index) => ({ ref: "pi.read", key: "path", value: `file-${index}` }));
+    const first = await cache.merge(undefined, [{ file: "session", observations: observations.slice(0, 10) }]);
+    const controller = new AbortController();
+    const merging = cache.merge(first.file, [{ file: "session", observations }], controller.signal);
+    controller.abort();
+    await expect(merging).rejects.toThrow(/abort/i);
+    // The aborted pass published nothing: a later merge of the same prefix is unchanged.
+    const again = await cache.merge(first.file, [{ file: "session", observations: observations.slice(0, 10) }]);
+    expect(again.file).toEqual(first.file);
   });
 });

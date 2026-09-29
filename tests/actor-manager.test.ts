@@ -1328,13 +1328,12 @@ describe("ActorManager", () => {
     await expect(actors.setModel(actor.id, "provider/hidden")).rejects.toThrow(
       /not available to this Pi session/,
     );
-    // An activation resolves its model when it runs, since resolving may refresh the registry
-    // (smarty-dev#1830): a hidden override fails that activation with the same error.
-    actors.tell(actor.id, "Do not run", undefined, {
-      overrides: { model: "provider/hidden" },
-    });
-    await waitFor(() => /not available to this Pi session/.test(actors.status(actor.id).lastError ?? ""));
-    await waitFor(() => actors.status(actor.id).status === "idle");
+    // A synchronous resolver rejects at enqueue; an async (refreshing) one fails the activation.
+    expect(() =>
+      actors.tell(actor.id, "Do not queue", undefined, {
+        overrides: { model: "provider/hidden" },
+      })
+    ).toThrow(/not available to this Pi session/);
     await expect(
       actors.ask(actor.id, "Do not run", undefined, undefined, {
         overrides: { model: "provider/hidden" },

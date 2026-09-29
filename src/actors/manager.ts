@@ -1491,11 +1491,14 @@ export class ActorManager {
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
-    // The model is resolved when the activation runs (#drain): resolving may refresh the model
-    // registry, and enqueue must stay synchronous (smarty-dev#1830).
-    const binding = options.binding !== undefined
+    const unresolved = options.binding !== undefined
       ? this.#validatedRunBinding(options.binding)
       : this.#runBinding(actor, options.overrides);
+    // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
+    // learns at once. A resolver that may refresh the registry is async: #drain resolves the
+    // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
+    const resolving = this.#resolvedRunBinding(actor, unresolved);
+    const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
     if (options.coalesceKey) {
@@ -2818,19 +2821,21 @@ export class ActorManager {
     this.#persistQueue(actor.id);
   }
 
-  async #resolvedModel(runner: FabricAgentRunner, model: string): Promise<string> {
+  #resolvedModel(runner: FabricAgentRunner, model: string): string | Promise<string> {
     return runner === "pi" && this.#resolvePiModel
-      ? await this.#resolvePiModel(model)
+      ? this.#resolvePiModel(model)
       : model;
   }
 
-  async #resolvedRunBinding(
+  #resolvedRunBinding(
     actor: ManagedActor,
     binding: FabricActorRunBinding,
-  ): Promise<FabricActorRunBinding> {
-    return binding.model
-      ? { ...binding, model: await this.#resolvedModel(actor.runner, binding.model) }
-      : binding;
+  ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
+    if (!binding.model) return binding;
+    const model = this.#resolvedModel(actor.runner, binding.model);
+    return model instanceof Promise
+      ? model.then((resolved) => ({ ...binding, model: resolved }))
+      : { ...binding, model };
   }
 
   #validatedRunBinding(binding: FabricActorRunBinding): FabricActorRunBinding {

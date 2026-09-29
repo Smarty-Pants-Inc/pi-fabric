@@ -431,13 +431,14 @@ export class AgentsProvider implements FabricProvider {
     // A model added to models.json after startup resolves after one shared refresh (smarty-dev#1830).
     return resolveWithModelRefresh(
       context.extensionContext.modelRegistry,
-      () => this.#resolveVisiblePiModel(model, context),
+      (exact) => this.#resolveVisiblePiModel(model, context, exact),
     );
   }
 
   #resolveVisiblePiModel(
     model: string,
     context: FabricInvocationContext,
+    exact: boolean,
   ): string {
     let available: FabricModelCandidate[] = [];
     try {
@@ -453,6 +454,7 @@ export class AgentsProvider implements FabricProvider {
       aliases: this.modelsConfig().aliases,
       available,
       lastUsed: loadModelUsage(),
+      exact,
     });
     return `${resolved.provider}/${resolved.id}`;
   }

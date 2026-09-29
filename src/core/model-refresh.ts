@@ -26,20 +26,25 @@ const refreshOnce = (registry: RefreshableModelRegistry): Promise<unknown> | und
   return refresh;
 };
 
-/** Resolve against the registry; on a "not available" miss, refresh it once and retry. */
+/**
+ * Resolve against the registry. The first pass is exact (`resolve(true)` must throw a "not
+ * available" miss rather than fuzzy-match an absent exact model), so a model just added to
+ * models.json is not replaced by a similar stale one. On that miss, refresh once and resolve the
+ * original selector again with fuzzy matching allowed (`resolve(false)`).
+ */
 export const resolveWithModelRefresh = async <T>(
   registry: RefreshableModelRegistry | undefined,
-  resolve: () => T,
+  resolve: (exact: boolean) => T,
 ): Promise<T> => {
+  if (!registry) return resolve(false);
   try {
-    return resolve();
+    return resolve(true);
   } catch (error) {
-    if (!registry || !(error instanceof Error) || !error.message.includes("is not available to this Pi session")) {
+    if (!(error instanceof Error) || !error.message.includes("is not available to this Pi session")) {
       throw error;
     }
     const refresh = refreshOnce(registry);
-    if (!refresh) throw error;
-    await refresh;
-    return resolve();
+    if (refresh) await refresh;
+    return resolve(false);
   }
 };

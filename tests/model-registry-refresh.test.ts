@@ -12,11 +12,14 @@ import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 const withRuntime = async (
   added: string[],
   run: (runtime: FabricRuntimeState, refresh: ReturnType<typeof vi.fn>, context: ExtensionContext) => Promise<void>,
+  initial: string[] = [],
+  aliases: Record<string, string> = {},
 ) => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-model-refresh-"));
   vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
   vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
-  const models = [{ provider: "dest", id: "old", name: "Old", contextWindow: 48_000 }];
+  const models = [{ provider: "dest", id: "old", name: "Old", contextWindow: 48_000 },
+    ...initial.map((id) => ({ provider: "dest", id, name: id, contextWindow: 48_000 }))];
   const refresh = vi.fn(async () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     for (const id of added) models.push({ provider: "dest", id, name: id, contextWindow: 48_000 });
@@ -39,7 +42,7 @@ const withRuntime = async (
     extension: path.resolve("dist/index.js"), worker: path.resolve("tests/fixtures/fake-worker.mjs"), residentHost: path.join(cwd, "unused.mjs"), skills: cwd,
   } });
   try {
-    await runtime.initialize(context, normalizeFabricConfig({ fullCodeMode: false, agents: { enabled: true, budgetUsd: 0 }, mcp: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, mesh: { enabled: true }, prewalk: { enabled: false, alwaysRearm: false } }));
+    await runtime.initialize(context, normalizeFabricConfig({ fullCodeMode: false, agents: { enabled: true, budgetUsd: 0 }, mcp: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, models: { aliases }, mesh: { enabled: true }, prewalk: { enabled: false, alwaysRearm: false } }));
     await run(runtime, refresh, context);
   } finally {
     await runtime.shutdown();
@@ -148,4 +151,54 @@ it("fails an activation whose model is still missing with the same error", async
       .rejects.toThrow('Model "dest/typo-model-zzzz" is not available to this Pi session');
     expect(refresh).toHaveBeenCalledTimes(1);
   });
+});
+
+// review/astra round 2 on #138: a similar stale model on the same provider must not win the fuzzy
+// fallback before the refresh runs (claude-opus-5-6 requested, only claude-opus-5-5 listed).
+const similar = ["claude-opus-5-5"];
+
+it("resolves an exact model added next to a similar one after one refresh, on every path", async () => {
+  await withRuntime(["claude-opus-5-6"], async (runtime, refresh) => {
+    const handle = await runtime.agents.spawn({ task: "HANG", model: "dest/claude-opus-5-6" });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(runtime.agents.status(handle.id)).toMatchObject({ model: "dest/claude-opus-5-6" });
+    await runtime.agents.stop(handle.id);
+  }, similar);
+  await withRuntime(["claude-opus-5-6"], async (runtime, refresh, context) => {
+    const handle = await invoke(runtime, context, "agents.spawn", { task: "HANG", model: "dest/claude-opus-5-6" }) as { id: string };
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(runtime.agents.status(handle.id)).toMatchObject({ model: "dest/claude-opus-5-6" });
+    await runtime.agents.stop(handle.id);
+  }, similar);
+  await withRuntime(["claude-opus-5-6"], async (runtime, refresh, context) => {
+    const actor = await invoke(runtime, context, "agents.create", {
+      name: "similar-actor", instructions: "Reply.", runner: "pi", model: "dest/claude-opus-5-6",
+    }) as { model?: string };
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(actor.model).toBe("dest/claude-opus-5-6");
+  }, similar);
+  await withRuntime(["claude-opus-5-6"], async (runtime, refresh) => {
+    const actor = await runtime.actors.create({ name: "bare-actor", instructions: "Reply.", runner: "pi", model: "claude-opus-5-6" });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(actor.model).toBe("dest/claude-opus-5-6");
+  }, similar);
+});
+
+it("keeps the same error for a truly unknown exact id next to similar models after one refresh", async () => {
+  await withRuntime([], async (runtime, refresh) => {
+    await expect(runtime.agents.spawn({ task: "HANG", model: "dest/typo-model-zzzz" }))
+      .rejects.toThrow('Model "dest/typo-model-zzzz" is not available to this Pi session');
+    expect(refresh).toHaveBeenCalledTimes(1);
+  }, similar);
+});
+
+it("resolves an alias or a fuzzy query that matches today without a refresh", async () => {
+  await withRuntime(["claude-opus-5-6"], async (runtime, refresh, context) => {
+    const aliased = await invoke(runtime, context, "agents.spawn", { task: "HANG", model: "big" }) as { id: string };
+    const fuzzy = await runtime.agents.spawn({ task: "HANG", model: "opus" });
+    expect(refresh).not.toHaveBeenCalled();
+    expect(runtime.agents.status(aliased.id)).toMatchObject({ model: "dest/claude-opus-5-5" });
+    expect(runtime.agents.status(fuzzy.id)).toMatchObject({ model: "dest/claude-opus-5-5" });
+    for (const handle of [aliased, fuzzy]) await runtime.agents.stop(handle.id);
+  }, similar, { big: "dest/claude-opus-5-5" });
 });

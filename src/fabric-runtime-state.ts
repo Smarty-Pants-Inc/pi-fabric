@@ -650,7 +650,7 @@ export class FabricRuntimeState {
         ...(defaultModel ? { defaultModel } : {}),
       };
     };
-    const resolveVisiblePiModel = (selector?: string) => {
+    const resolveVisiblePiModel = (selector: string | undefined, exact: boolean) => {
       const models = visiblePiModels();
       const state = piModelState(models);
       const query = selector?.trim() || state.defaultModel || "";
@@ -658,6 +658,7 @@ export class FabricRuntimeState {
         aliases: state.aliases,
         available: state.available,
         lastUsed: loadModelUsage(),
+        exact,
       });
       const model = models.find(
         (candidate) =>
@@ -674,7 +675,7 @@ export class FabricRuntimeState {
     };
     // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
     const resolveParticipantPiModel = (selector?: string) =>
-      resolveWithModelRefresh(context.modelRegistry, () => resolveVisiblePiModel(selector));
+      resolveWithModelRefresh(context.modelRegistry, (exact) => resolveVisiblePiModel(selector, exact));
     const completionInbox = new AgentCompletionInbox(this.pi, context);
     this.#completionInbox = completionInbox;
     let markStoppedDelivered = (_id: string): void => {};

@@ -1192,6 +1192,10 @@ export class ActorManager {
         continue;
       }
       try {
+        if (this.#skipOnArrival(actor, `host:${event}`, payload)) {
+          delivered++;
+          continue;
+        }
         this.#enqueue(
           actor,
           `host:${event}`,
@@ -1282,6 +1286,7 @@ export class ActorManager {
             typeof (image as { mimeType?: unknown }).mimeType === "string",
         )
       : [];
+    if (this.#skipOnArrival(actor, `host:${hostEvent}`, data.payload)) return;
     this.#enqueue(actor, `host:${hostEvent}`, data.payload, {
       ...(actor.coalesce ? { coalesceKey: `host:${hostEvent}` } : {}),
       ...(images.length > 0 ? { images } : {}),
@@ -2075,7 +2080,24 @@ export class ActorManager {
     return activationFilterSkip(actor.activationFilter, item.source, item.payload);
   }
 
-  #recordFiltered(actor: ManagedActor, item: ActorQueueItem, ruleId: string): void {
+  /**
+   * Filter a callerless event before it enters the queue (smarty-dev#2004). Coalescing replaces a
+   * queued item's payload, so a skippable event (a comment edit) must never reach the queue: it
+   * would replace a queued event that should run (the comment's creation) and then be skipped.
+   * The drain checks again, for items queued before the filter was set.
+   */
+  #skipOnArrival(actor: ManagedActor, source: string, payload: unknown): boolean {
+    if (!actor.activationFilter || actor.status === "stopped") return false;
+    const ruleId = activationFilterSkip(actor.activationFilter, source, payload);
+    if (!ruleId) return false;
+    this.#recordFiltered(actor, { id: randomUUID(), source }, ruleId);
+    // ponytail: save the count and log locally; no presence write, the skip changes no mesh state.
+    this.#emitChange();
+    void this.#saveActors().catch(() => undefined);
+    return true;
+  }
+
+  #recordFiltered(actor: ManagedActor, item: Pick<ActorQueueItem, "id" | "source">, ruleId: string): void {
     const now = Date.now();
     actor.filteredCount = (actor.filteredCount ?? 0) + 1;
     actor.lastFilteredAt = now;
@@ -2191,7 +2213,7 @@ export class ActorManager {
       try {
         if (event.topic === RESIDENT_HOST_EVENT_TOPIC && addressed) {
           this.#acceptRelayedHostEvent(actor, event);
-        } else {
+        } else if (!this.#skipOnArrival(actor, `mesh:${event.topic}`, event)) {
           const key = actor.coalesceKey ? meshCoalesceValue(event.data, actor.coalesceKey) : undefined;
           // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
           // so a joined key could merge two topics' subjects. Keeps the value's type.

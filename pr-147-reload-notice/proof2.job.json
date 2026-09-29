@@ -1,0 +1,19 @@
+{"app": "com.mitchellh.ghostty", "owner": "reload-notice-1882 pi-fabric#147 proof2", "lease": "6E5FB226-93D7-4BA6-AAEA-C55472102025", "caller": 25792, "record": true, "steps": [
+ {"wait": 1, "note": "start: a Ghostty window on m4max at a shell prompt"},
+ {"text": "herdr --remote dev1 --session smarty-dev", "note": "1. attach a Herdr client to Paul's Dev1 session smarty-dev"},
+ {"key": "return", "wait": 45, "note": "1. attach: Return; the client draws Paul's session"},
+ {"chord": ["ctrl", "b"], "hold": 0.1, "note": "2. open Herdr's navigator: prefix"},
+ {"key": "g", "wait": 2, "note": "2. open Herdr's navigator: g"},
+ {"key": "/", "wait": 1, "note": "2. focus the navigator search"},
+ {"text": "zq147cand", "wait": 2, "note": "2. search for the candidate Pi workspace (zq147cand)"},
+ {"key": "return", "wait": 4, "note": "2. open the candidate Pi pane (Pi with pi-fabric#147 build 50de923)"},
+ {"text": "Use fabric_exec once: call agents.spawn({name:\"reload-victim\", transport:\"process\", model:\"cliproxyapi-anthropic/claude-haiku-4-5-20251001\", task:\"Run the shell command: sleep 240; then reply DONE.\"}) without residency, and do not wait. Reply with its id and status.", "note": "3. ask Pi to spawn a non-durable task agent"},
+ {"key": "return", "wait": 50, "note": "3. submit; the agent runs (1 running)"},
+ {"text": "/reload", "note": "4. type /reload while the task agent runs"},
+ {"key": "return", "wait": 45, "note": "4. reload; after the redraw the notice names reload-victim and suggests residency: durable"},
+ {"text": "/reload", "note": "5. reload again, with no task agent running"},
+ {"key": "return", "wait": 40, "note": "5. after this redraw no new 'The last /reload stopped' notice appears"},
+ {"chord": ["ctrl", "b"], "hold": 0.1, "note": "6. detach: prefix"},
+ {"key": "q", "wait": 3, "note": "6. detach: q; the local shell prompt returns"}
+]
+}

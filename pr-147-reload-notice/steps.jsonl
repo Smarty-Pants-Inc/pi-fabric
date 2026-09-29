@@ -1,0 +1,24 @@
+{"app":"com.mitchellh.ghostty","do":"job","owner":"reload-notice-1882 pi-fabric#147 proof2","record":true,"steps":16,"t":-0}
+{"assertion":32917,"do":"wake","t":0.0050000000000000001}
+{"do":"target","pid":26269,"t":2.1549999999999998,"window":1216}
+{"black":false,"do":"first-frame","t":2.2770000000000001}
+{"do":"record-start","t":2.3460000000000001,"window":"(56.0, 29.0, 1440.0, 938.0)"}
+{"do":"excluded-window","frame":"(62.0, 35.0, 66.0, 20.0)","id":2774,"t":2.3500000000000001}
+{"do":"step","note":"start: a Ghostty window on m4max at a shell prompt","step":0,"t":3.3570000000000002,"wait":1}
+{"do":"step","note":"1. attach a Herdr client to Paul's Dev1 session smarty-dev","step":1,"t":8.9600000000000009,"text":"herdr --remote dev1 --session smarty-dev"}
+{"do":"step","hold":0.080000000000000002,"key":"return","note":"1. attach: Return; the client draws Paul's session","step":2,"t":54.133000000000003,"wait":45}
+{"chord":["ctrl","b"],"do":"step","held":{"b":0.14599999999999999,"ctrl":0.34000000000000002},"hold":0.10000000000000001,"note":"2. open Herdr's navigator: prefix","step":3,"t":54.491}
+{"do":"step","hold":0.080000000000000002,"key":"g","note":"2. open Herdr's navigator: g","step":4,"t":56.673999999999999,"wait":2}
+{"do":"step","hold":0.080000000000000002,"key":"\/","note":"2. focus the navigator search","step":5,"t":57.774000000000001,"wait":1}
+{"do":"step","note":"2. search for the candidate Pi workspace (zq147cand)","step":6,"t":61.020000000000003,"text":"zq147cand","wait":2}
+{"do":"step","hold":0.080000000000000002,"key":"return","note":"2. open the candidate Pi pane (Pi with pi-fabric#147 build 50de923)","step":7,"t":65.192999999999998,"wait":4}
+{"do":"step","note":"3. ask Pi to spawn a non-durable task agent","step":8,"t":105.982,"text":"Use fabric_exec once: call agents.spawn({name:\"reload-victim\", transport:\"process\", model:\"cliproxyapi-anthropic\/claude-haiku-4-5-20251001\", task:\"Run the shell command: sleep 240; then reply DONE.\"}) without residency, and do not wait. Reply with its id and status."}
+{"do":"step","hold":0.080000000000000002,"key":"return","note":"3. submit; the agent runs (1 running)","step":9,"t":156.185,"wait":50}
+{"do":"step","note":"4. type \/reload while the task agent runs","step":10,"t":157.173,"text":"\/reload"}
+{"do":"step","hold":0.080000000000000002,"key":"return","note":"4. reload; after the redraw the notice names reload-victim and suggests residency: durable","step":11,"t":202.37899999999999,"wait":45}
+{"do":"step","note":"5. reload again, with no task agent running","step":12,"t":203.28399999999999,"text":"\/reload"}
+{"do":"step","hold":0.080000000000000002,"key":"return","note":"5. after this redraw no new 'The last \/reload stopped' notice appears","step":13,"t":243.41800000000001,"wait":40}
+{"chord":["ctrl","b"],"do":"step","held":{"b":0.105,"ctrl":0.29399999999999998},"hold":0.10000000000000001,"note":"6. detach: prefix","step":14,"t":243.721}
+{"do":"step","hold":0.080000000000000002,"key":"q","note":"6. detach: q; the local shell prompt returns","step":15,"t":246.84100000000001,"wait":3}
+{"do":"record-stop","finished":true,"t":246.96600000000001}
+{"do":"done","t":246.96600000000001}

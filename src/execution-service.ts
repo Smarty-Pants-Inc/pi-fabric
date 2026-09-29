@@ -854,7 +854,7 @@ export class FabricExecutionService {
           memoryLimitBytes: this.config.executor.memoryLimitBytes,
           maxLogChars: this.config.executor.maxOutputChars,
           minimumTimeoutMsForHostCall,
-          ...(!python ? { piToolCanonicalFields } : {}),
+          ...(!python ? { piToolCanonicalFields, piTools: effectiveFullCodeMode } : {}),
           ...(checked.javascript ? { transpiledCode: checked.javascript } : {}),
           ...(checked.sourceMap ? { transpiledSourceMap: checked.sourceMap } : {}),
           ...(options.strings ? { strings: options.strings } : {}),

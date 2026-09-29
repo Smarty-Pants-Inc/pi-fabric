@@ -69,8 +69,10 @@ const quickJsModule = (): Promise<QuickJsModule> => {
   return quickJsModulePromise;
 };
 
-export const guestSetupSource = (fields?: Record<string, string[]>): string =>
-  `const __piCanonicalFields = ${JSON.stringify(fields ?? {})};\n${GUEST_SETUP}`;
+// piTools is false in orchestration-only mode: `pi` fails the type check there, so hints
+// name the native tool instead (smarty-dev#459).
+export const guestSetupSource = (fields?: Record<string, string[]>, piTools = true): string =>
+  `const __piCanonicalFields = ${JSON.stringify(fields ?? {})};\nconst __piToolsAvailable = ${piTools};\n${GUEST_SETUP}`;
 
 export const GUEST_SETUP = `
 (() => {
@@ -98,6 +100,9 @@ const __call = async (ref, args) => {
   return value;
 };
 const __piToolNames = ["read","bash","powershell","edit","write","grep","find","ls"];
+const __coreToolHint = (name) => __piToolsAvailable
+  ? "For the Pi core tool, call pi." + name + "(args), e.g. pi." + name + "({ ... })."
+  : "Orchestration-only mode: pi does not exist inside fabric_exec; call the native " + name + " tool directly, outside fabric_exec.";
 const __toolsBase = {
   providers: () => __call("fabric.$providers", {}),
   catalog: (args = {}) => __call("fabric.$catalog", args),
@@ -122,7 +127,7 @@ globalThis.tools = new Proxy(__toolsBase, {
     if (__piToolNames.indexOf(name) >= 0) {
       return () => {
         throw new Error(
-          "tools." + name + " is not available on the discovery API. tools is discovery + generic calls only (providers/catalog/list/search/describe/call/models). For the Pi core tool, call pi." + name + "(args), e.g. pi." + name + "({ ... })."
+          "tools." + name + " is not available on the discovery API. tools is discovery + generic calls only (providers/catalog/list/search/describe/call/models). " + __coreToolHint(name)
         );
       };
     }
@@ -266,7 +271,7 @@ globalThis["π"] = new Proxy(__piStrings, {
     if (Object.prototype.hasOwnProperty.call(target, name)) return target[name];
     if (__piToolNames.indexOf(name) >= 0) {
       throw new Error(
-        "π." + name + " is the strings accessor, not a tool. For the Pi core tool, call pi." + name + "(args)."
+        "π." + name + " is the strings accessor, not a tool. " + __coreToolHint(name)
       );
     }
     const provided = Object.keys(target);
@@ -1063,7 +1068,7 @@ export class QuickJsRuntime {
       tokenBudget.dispose();
 
       cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
-      const setupResult = context.evalCode(guestSetupSource(options.piToolCanonicalFields), "pi-fabric-setup.js");
+      const setupResult = context.evalCode(guestSetupSource(options.piToolCanonicalFields, options.piTools !== false), "pi-fabric-setup.js");
       if (setupResult.error) {
         const deadlineExceeded = interruptedByDeadline || interruptedByCpu || Date.now() > executionDeadlineAt;
         if (deadlineExceeded) timedOut = true;

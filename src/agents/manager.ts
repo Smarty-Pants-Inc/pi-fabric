@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { describeWaitBound } from "./wait-bound.js";
+import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -1155,7 +1155,7 @@ export class AgentManager {
     const bound = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
         this.#detach(managed, "agents.wait reached its bound; the run continues");
-        reject(new Error(
+        reject(new AgentWaitBoundError(
           `agents.wait: ${managed.name} is still running after ${describeWaitBound(timeoutMs)}. It continues, and its result ` +
             "arrives as a completion message after this turn: end the turn now.",
         ));

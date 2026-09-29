@@ -1195,6 +1195,37 @@ describe("AgentsProvider runner support", () => {
     await provider.invoke("cleanup", { id: handle.id }, invocationContext);
   });
 
+  // smarty-dev#2119: an interactive Main's wait is capped at 60 s and the bound is a normal result.
+  it("returns the live status at the bound in an interactive Main; a task agent's wait still throws", async () => {
+    const { provider } = setup();
+    const mainContext = (mode: string) => ({
+      ...context,
+      extensionContext: { ...context.extensionContext, mode, sessionManager: { getSessionId: () => "test" } } as unknown as ExtensionContext,
+    });
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    try {
+      for (const mode of ["tui", "rpc"]) {
+        const handle = await provider.invoke("spawn", { task: "LIVE_WITH_PROGRESS", transport: "process" }, mainContext(mode)) as { id: string };
+        const started = Date.now();
+        const result = await provider.invoke("wait", { id: handle.id, timeoutMs: 1_000 }, mainContext(mode)) as Record<string, unknown>;
+        expect(Date.now() - started).toBeLessThan(1_400);
+        expect(result).toMatchObject({ id: handle.id, status: "running", waitTimedOut: true });
+        expect(result.note).toMatch(/Still running after 1 s; Main waits are capped at 60 s/);
+        await expect(provider.invoke("wait", { id: handle.id }, mainContext(mode))).resolves.toMatchObject({ status: "completed" });
+      }
+      // Print mode is a script, not an interactive Main: the #854 error is unchanged.
+      const scripted = await provider.invoke("spawn", { task: "LIVE_WITH_PROGRESS", transport: "process" }, mainContext("print")) as { id: string };
+      await expect(provider.invoke("wait", { id: scripted.id, timeoutMs: 1_000 }, mainContext("print"))).rejects.toThrow(/is still running after 1 s\. It continues/);
+      // A task agent (PI_FABRIC_PARENT_RUN set) in RPC mode keeps the #854 error too.
+      vi.stubEnv("PI_FABRIC_PARENT_RUN", "parent-run");
+      const child = await provider.invoke("spawn", { task: "LIVE_WITH_PROGRESS", transport: "process" }, mainContext("rpc")) as { id: string };
+      await expect(provider.invoke("wait", { id: child.id, timeoutMs: 1_000 }, mainContext("rpc"))).rejects.toThrow(/is still running after 1 s\. It continues/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 30_000);
+
   it("exposes the compact option on handoff only and validates it before deferring", async () => {
     const { provider, root } = setup();
     const source = SessionManager.inMemory(root);

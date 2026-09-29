@@ -98,13 +98,19 @@ const REMOTE_HOST = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 const remoteHostValid = (value: unknown): boolean =>
   value === undefined || (typeof value === "string" && REMOTE_HOST.test(value));
 
+const optionalStrings = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
+  keys.every((key) => value[key] === undefined || typeof value[key] === "string");
+
 const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
-  const value = entry.value as Partial<FabricParticipantRecord>;
+  const value = entry.value as Partial<FabricParticipantRecord> & Record<string, unknown>;
   const kind = participantKind(value.kind);
   if (
     !kind ||
     !remoteHostValid(value.remoteHost) ||
+    // Optional fields that consumers read as strings (peer cards, labels, leader selection):
+    // a malformed one drops this record alone, never the listing (smarty-dev#2045).
+    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -470,7 +476,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const refused: string[] = [];
     for (const entry of this.mesh.listAll(PARTICIPANT_PREFIX, read)) {
       const participant = participantFromEntry(entry);
-      if (!participant) continue;
+      if (!participant) {
+        this.#reportMalformedMirror(entry);
+        continue;
+      }
       const owner = hosts.get(participant.ownerHostId);
       if (!ownerMatches(participant, owner, this.options.hostId)) continue;
       if (this.#collides(participant, hosts)) {
@@ -565,15 +574,30 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #reportCollision(participant: FabricParticipantRecord): void {
-    const key = `${participant.id}\0${participant.remoteHost}`;
+    this.#reportRefusal(participant.id, participant.remoteHost, "it collides with a local participant", {
+      rootId: participant.rootId, ownerHostId: participant.ownerHostId,
+    });
+  }
+
+  // A record the bridge marked remoteHost that fails validation: dropped alone, logged once.
+  #reportMalformedMirror(entry: MeshStateEntry): void {
+    const value = isObject(entry.value) ? entry.value : undefined;
+    if (!value || value.remoteHost === undefined) return;
+    const id = typeof value.id === "string" ? value.id.slice(0, 200) : entry.key;
+    const remoteHost = typeof value.remoteHost === "string" ? value.remoteHost.slice(0, 64) : "(invalid)";
+    this.#reportRefusal(id, remoteHost, "it is malformed", {});
+  }
+
+  #reportRefusal(id: string, remoteHost: string | undefined, reason: string, data: Record<string, unknown>): void {
+    const key = `${id}\0${remoteHost}\0${reason}`;
     if (this.#reportedCollisions.has(key) || this.#reportedCollisions.size >= 1_000) return;
     this.#reportedCollisions.add(key);
     void this.mesh.publish({
       topic: MIRROR_COLLISION_TOPIC,
       kind: "refused",
       from: this.options.identity,
-      text: `Refused mirrored record ${participant.id} from remote host ${participant.remoteHost}: it collides with a local participant`,
-      data: { id: participant.id, rootId: participant.rootId, remoteHost: participant.remoteHost, ownerHostId: participant.ownerHostId },
+      text: `Refused mirrored record ${id} from remote host ${remoteHost}: ${reason}`,
+      data: { id, remoteHost, reason, ...data },
     }).catch(() => undefined);
   }
 

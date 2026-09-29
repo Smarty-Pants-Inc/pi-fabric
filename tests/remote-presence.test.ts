@@ -192,7 +192,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     const { mesh, directory, mirror, local, remote } = await setup();
     await mirror();
     const { received } = await remoteOwner(mesh, local, remote);
-    const router = routerFor(directory, senderOn(mesh, local), local);
+    const router = routerFor(directory, senderOn(mesh, local, 5_000), local);
     await expect(router.routeMessage(remote.id, "steer me", undefined, "steer"))
       .resolves.toMatchObject({ routed: "mesh", acknowledged: true, messageId: "m-1" });
     await expect(router.routeMessage(remote.id, "later", undefined, "followUp"))
@@ -320,6 +320,24 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     const { directory, mirror, remote } = await setup();
     await mirror({ record: { label: "PF-2" } });
     expect(directory.peers()).toEqual([expect.objectContaining({ id: remote.id, label: "PF-2@forge", name: "PF-2@forge", host: "forge" })]);
+  });
+
+  // Security review F2 on #132: one malformed mirror must not break discovery for the mesh.
+  it("drops a mirror with malformed optional fields alone, logs it once, and peers still lists the healthy ones", async () => {
+    const { mesh, directory, mirror, remote } = await setup();
+    await mirror();
+    for (const [field, bad] of [["sessionId", 42], ["cwd", {}], ["label", 7], ["role", []], ["project", 1]] as const) {
+      await mirror({ record: { id: `session:bad-${field}`, rootId: remote.id, [field]: bad, ...(field === "label" ? {} : { label: undefined }) } as never });
+    }
+    expect(() => directory.peers()).not.toThrow();
+    expect(directory.peers().map((peer) => peer.id)).toEqual([remote.id]);
+    expect(directory.sessions().map((session) => session.id).sort()).toEqual(["session:dev1", remote.id].sort());
+    const refused = await vi.waitFor(() => {
+      const texts = mesh.tail(0, 1_000).events.filter((event) => event.topic === MIRROR_COLLISION_TOPIC).map((event) => event.text);
+      if (texts.length < 5) throw new Error("not yet");
+      return texts;
+    });
+    expect(refused.every((text) => text?.endsWith("it is malformed"))).toBe(true);
   });
 
   it("rejects mixed ownership: a remote record under a local host, a local record under a mirrored host", async () => {

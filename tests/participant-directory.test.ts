@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
@@ -5,7 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, STATE_LEASE_RENEW_MS } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, readHostLeases, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -1145,5 +1146,126 @@ describe("ParticipantDirectory", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(directory.writeStalled()).toBeUndefined();
     expect(() => directory.sessions()).not.toThrow();
+  });
+});
+
+// smarty-dev#557: every dashboard rebuild, peer listing and ownership check cloned the whole
+// fleet directory. The directory now parses the shared state once per parse of the file.
+describe("ParticipantDirectory reads", () => {
+  const identity: MeshIdentity = { id: "session:reader", name: "main", kind: "main", sessionId: "reader" };
+  const writer: MeshIdentity = { id: "session:writer", name: "main", kind: "main", sessionId: "writer" };
+
+  it("reuse one parse while the state is unchanged, and see a write at once", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const reader = createDirectory(meshRoot, identity, identity.id, () => [rootRecord(identity.id, identity.id, "reader")],
+      { heartbeatMs: 60_000, leaseMs: 120_000 });
+    const peer = createDirectory(meshRoot, writer, writer.id, () => [rootRecord(writer.id, writer.id, "writer")],
+      { heartbeatMs: 60_000, leaseMs: 120_000 });
+    await reader.start();
+    await peer.start();
+    const shared = vi.spyOn(reader.mesh, "listAllShared");
+    const first = reader.list({ scope: "project" });
+    const calls = shared.mock.calls.length;
+    expect(first.map((participant) => participant.id)).toContain(writer.id);
+    for (let i = 0; i < 5; i++) reader.list({ scope: "project" });
+    reader.peers();
+    expect(shared.mock.calls.length).toBe(calls);                  // no read of the directory per call
+    // Callers get their own top-level objects; the shared parse is frozen.
+    first[0]!.status = "changed";
+    expect(reader.list({ scope: "project" })[0]!.status).not.toBe("changed");
+    const capabilities = reader.list({ scope: "project" }).find((participant) => participant.id === writer.id)!.capabilities;
+    expect(Object.isFrozen(capabilities)).toBe(true);
+
+    await store.put({ key: "topology/participants/" + createHash("sha256").update("session:writer:agent").digest("hex"),
+      value: agentRecord("session:writer:agent", writer.id, writer.id, writer.id), identity: writer });
+    const after = reader.list({ scope: "project", fresh: true });
+    expect(after.map((participant) => participant.id)).toContain("session:writer:agent");
+    // The write copied only the new entry: an unchanged record is the same parse.
+    expect(after.find((participant) => participant.id === writer.id)!.capabilities).toBe(capabilities);
+    // A changed record is read again.
+    const key = "topology/participants/" + createHash("sha256").update(writer.id).digest("hex");
+    const current = store.get(key)!;
+    await store.put({ key, value: { ...(current.value as FabricParticipantRecord), status: "busy" }, identity: writer, ifVersion: current.version });
+    expect(reader.list({ scope: "project", fresh: true }).find((participant) => participant.id === writer.id)!.status).toBe("busy");
+    shared.mockRestore();
+  });
+});
+
+// review/astra F1 on pi-fabric#140: a listing reuses the lease files it read for heartbeat/5.
+// Under file-only renewals those files are the only liveness evidence, so a reused read must
+// never turn a renewed peer into an absent one.
+describe("ParticipantDirectory lease reads", () => {
+  const reader: MeshIdentity = { id: "session:reader", name: "main", kind: "main", sessionId: "reader" };
+  const peer: MeshIdentity = { id: "session:peer", name: "main", kind: "main", sessionId: "peer" };
+  const timing = { heartbeatMs: 60_000, leaseMs: 120_000 };            // leases are reused for 12 s
+  const setup = async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    await store.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity: peer });
+    const readerDirectory = createDirectory(meshRoot, reader, reader.id, () => [rootRecord(reader.id, reader.id, "reader")], timing);
+    const peerDirectory = createDirectory(meshRoot, peer, peer.id, () => [rootRecord(peer.id, peer.id, "peer")], timing);
+    await readerDirectory.start();
+    await peerDirectory.start();
+    const fileLease = readHostLeases(meshRoot).get(peer.id)!;
+    const shared = store.listAll("topology/hosts/").find((entry) => (entry.value as { id?: string }).id === peer.id)!;
+    // The peer's effective expiry: the later of its file lease and its shared-state record.
+    const lease = { expiresAt: Math.max(fileLease.expiresAt, (shared.value as { expiresAt: number }).expiresAt) };
+    const renew = (at: number) => writeHostLease(meshRoot, { ...fileLease, updatedAt: at, expiresAt: at + timing.leaseMs });
+    const seesPeer = () => readerDirectory.peers().some((candidate) => candidate.id === peer.id);
+    return { readerDirectory, lease, renew, seesPeer };
+  };
+  afterEach(() => vi.restoreAllMocks());
+
+  it("keep a peer whose file lease was renewed after the read and before its old expiry", async () => {
+    const { lease, renew, seesPeer } = await setup();
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(lease.expiresAt - 5_000);
+    expect(seesPeer()).toBe(true);                                   // fills the lease read
+    renew(lease.expiresAt - 2_000);                                  // file-only renewal
+    clock.mockReturnValue(lease.expiresAt + 1);                      // old expiry passed, read reused
+    expect(seesPeer()).toBe(true);
+    clock.mockReturnValue(lease.expiresAt + 5_000);
+    expect(seesPeer()).toBe(true);
+  });
+
+  it("drop a peer whose lease lapsed and was not renewed", async () => {
+    const { lease, seesPeer } = await setup();
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(lease.expiresAt - 5_000);
+    expect(seesPeer()).toBe(true);
+    clock.mockReturnValue(lease.expiresAt + 1);
+    expect(seesPeer()).toBe(false);
+  });
+
+  it("read the lease files again after this host's heartbeat commits", async () => {
+    const { readerDirectory, lease, renew, seesPeer } = await setup();
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(lease.expiresAt + 1_000);
+    expect(seesPeer()).toBe(false);                                  // lapsed when read: the read is reused
+    renew(lease.expiresAt + 1_500);                                  // the peer comes back
+    clock.mockReturnValue(lease.expiresAt + 2_000);
+    const confirmed = readerDirectory.confirmedAt();
+    await readerDirectory.refresh();                                  // a confirming heartbeat
+    expect(readerDirectory.confirmedAt()).toBeGreaterThan(confirmed);
+    expect(seesPeer()).toBe(true);                                   // no view older than the commit
+  });
+});
+
+describe("MeshStore.list", () => {
+  it("returns the first page, sorted, as copies", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const store = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000);
+    const identity: MeshIdentity = { id: "session:a", name: "main", kind: "main" };
+    for (const key of ["c", "a", "b"]) await store.put({ key: "x/" + key, value: { key }, identity });
+    const page = store.list("x/", 2);
+    expect(page.map((entry) => entry.key)).toEqual(["x/a", "x/b"]);
+    (page[0]!.value as { key: string }).key = "mutated";
+    expect((store.get("x/a")!.value as { key: string }).key).toBe("a");
   });
 });

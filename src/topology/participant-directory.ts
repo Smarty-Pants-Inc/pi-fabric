@@ -92,12 +92,21 @@ const capabilities = new Set([
   "fabric",
 ]);
 
+// A host name the mesh bridge marks mirrored records with (smarty-dev#2004). Absent: a record
+// this mesh's own hosts wrote. Present but invalid: the record is rejected.
+const REMOTE_HOST = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+const remoteHostValid = (value: unknown): boolean =>
+  value === undefined || (typeof value === "string" && REMOTE_HOST.test(value));
+
 const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
   const value = entry.value as Partial<FabricParticipantRecord>;
   const kind = participantKind(value.kind);
   if (
     !kind ||
+    !remoteHostValid(value.remoteHost) ||
+    // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
+    (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
     entry.key !== keyFor(PARTICIPANT_PREFIX, value.id) ||
     typeof value.rootId !== "string" ||
@@ -129,6 +138,7 @@ const hostFromEntry = (entry: MeshStateEntry): FabricHostRecord | undefined => {
   if (
     typeof value.id !== "string" ||
     entry.key !== keyFor(HOST_PREFIX, value.id) ||
+    !remoteHostValid(value.remoteHost) ||
     typeof value.rootId !== "string" ||
     !isObject(value.identity) ||
     typeof value.identity.id !== "string" ||
@@ -174,8 +184,23 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
     updatedAt: participant.updatedAt,
     pendingMessages: participant.pendingMessages === true,
     local: false,
+    ...(participant.remoteHost ? { host: participant.remoteHost } : {}),
   };
 };
+
+// A mirrored participant counts only under a host record the bridge mirrored from the same
+// remote host, and a local participant only under a local host record: neither side can claim
+// the other's owner. A mirrored host never carries this host's id (smarty-dev#2004).
+const ownerMatches = (
+  participant: FabricParticipantRecord,
+  owner: FabricHostRecord | undefined,
+  localHostId: string,
+): boolean =>
+  !owner ||
+  (owner.remoteHost === participant.remoteHost && !(owner.remoteHost !== undefined && owner.id === localHostId));
+
+const isLocal = (participant: FabricParticipantRecord, localHostId: string): boolean =>
+  participant.remoteHost === undefined && participant.ownerHostId === localHostId;
 
 const legacyRootFromEntry = (
   entry: MeshStateEntry,
@@ -438,20 +463,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const participant = participantFromEntry(entry);
       if (!participant) continue;
       const owner = hosts.get(participant.ownerHostId);
+      if (!ownerMatches(participant, owner, this.options.hostId)) continue;
       const stale =
         !owner ||
         owner.expiresAt < now ||
         owner.identity.id !== participant.ownerIdentityId ||
         owner.rootId !== participant.rootId;
       if (stale && !options.includeStale) continue;
-      if (options.scope === "local" && participant.ownerHostId !== this.options.hostId) continue;
+      const local = isLocal(participant, this.options.hostId);
+      if (options.scope === "local" && !local) continue;
       if (options.scope === "lineage" && participant.rootId !== this.options.rootId) continue;
       if (options.kinds && !options.kinds.includes(participant.kind)) continue;
-      byId.set(participant.id, {
-        ...participant,
-        local: participant.ownerHostId === this.options.hostId,
-        stale,
-      });
+      byId.set(participant.id, { ...participant, local, stale });
     }
     const legacyRoots = new Map(
       this.mesh
@@ -534,11 +557,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
         const lease = owner ? readHostLease(this.mesh.root, owner.id) : undefined;
         if (
           owner &&
+          ownerMatches(participant, owner, this.options.hostId) &&
           hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner) >= now &&
           owner.identity.id === participant.ownerIdentityId &&
           owner.rootId === participant.rootId
         ) {
-          return { ...participant, local: participant.ownerHostId === this.options.hostId, stale: false };
+          return { ...participant, local: isLocal(participant, this.options.hostId), stale: false };
         }
       }
     }
@@ -588,7 +612,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #lapsedSince(since: number, now: number): number {
     let lapsed = 0;
     for (const host of this.#liveHosts(this.mesh.listAll(HOST_PREFIX)).values()) {
-      if (host.id !== this.options.hostId && host.expiresAt > since && host.expiresAt <= now) lapsed += 1;
+      // A mirrored lease lapses when its bridge stops, which says nothing about this mesh's lock.
+      if (host.id !== this.options.hostId && host.remoteHost === undefined && host.expiresAt > since && host.expiresAt <= now) lapsed += 1;
     }
     for (const entry of this.mesh.listAll(LEGACY_SESSION_PREFIX)) {
       const expiresAt = entry.updatedAt + PARTICIPANT_LEASE_MS;
@@ -604,7 +629,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.mesh
         .listAll(PARTICIPANT_PREFIX)
         .map(participantFromEntry)
-        .find((participant) => participant?.id === this.options.identity.id);
+        .find((participant) => participant?.id === this.options.identity.id && participant.remoteHost === undefined);
     if (existing) {
       return {
         ...existing,
@@ -707,7 +732,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!this.options.enabled) return;
     const owned = this.mesh
       .listAll(PARTICIPANT_PREFIX)
-      .filter((entry) => participantFromEntry(entry)?.ownerHostId === this.options.hostId);
+      .filter((entry) => {
+        const participant = participantFromEntry(entry);
+        return participant !== undefined && isLocal(participant, this.options.hostId);
+      });
     await Promise.allSettled(owned.map((entry) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
     const legacySessionKey = this.#legacySessionKey();
     if (legacySessionKey) {
@@ -718,7 +746,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     removeHostLease(this.mesh.root, this.options.hostId);
     const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
-    if (hostEntry) await this.mesh.delete({ key: hostEntry.key, ifVersion: hostEntry.version }).catch(() => undefined);
+    if (hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined) {
+      await this.mesh.delete({ key: hostEntry.key, ifVersion: hostEntry.version }).catch(() => undefined);
+    }
   }
 
   // Returns whether it wrote. A change-only refresh (full false) writes nothing when no
@@ -790,7 +820,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       .listAll(PARTICIPANT_PREFIX)
       .flatMap((entry) => {
         const participant = participantFromEntry(entry);
-        return participant?.ownerHostId === this.options.hostId ? [{ entry, participant }] : [];
+        return participant && isLocal(participant, this.options.hostId) ? [{ entry, participant }] : [];
       });
     const existingById = new Map(existing.map((item) => [item.participant.id, item]));
     const legacyRoots = new Map(
@@ -825,7 +855,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!occupiedParticipant && legacyOwner && legacyOwner !== this.options.identity.id) {
         continue;
       }
-      if (occupiedParticipant && occupiedParticipant.ownerHostId !== this.options.hostId) {
+      // A live owner elsewhere keeps its key; a mirrored record never outranks a local one.
+      if (
+        occupiedParticipant &&
+        occupiedParticipant.remoteHost === undefined &&
+        occupiedParticipant.ownerHostId !== this.options.hostId
+      ) {
         const ownerEntry = this.mesh.get(keyFor(HOST_PREFIX, occupiedParticipant.ownerHostId));
         const owner = ownerEntry && this.#liveHosts([ownerEntry]).get(occupiedParticipant.ownerHostId);
         if (
@@ -848,7 +883,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         // whole heartbeat (nothing written) so the next one retries.
         onConflict: (latest) => {
           const latestParticipant = latest && participantFromEntry(latest);
-          return latestParticipant && latestParticipant.ownerHostId !== this.options.hostId ? "skip" : "abort";
+          return latestParticipant && !isLocal(latestParticipant, this.options.hostId) ? "skip" : "abort";
         },
       });
     }

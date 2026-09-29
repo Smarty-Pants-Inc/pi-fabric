@@ -21,14 +21,12 @@ import { resolveAgentDir } from "./core/agent-dir.js";
 import {
   comparableCompiledSurfaceScore,
   BackgroundEntropyCompiler,
-  BackgroundSessionSelector,
   SessionObservationCache,
   entropyRepairRows,
   formatEntropyCompileNotice,
   liveSurfaceSnapshot,
   loadCompiledSurfaceAsync,
   loadObservationPoolAsync,
-  machineSessionFilesAsync,
   saveCompiledSurfaceAsync,
   saveObservationPoolAsync,
   sessionWindowEvidenceAsync,
@@ -445,10 +443,19 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   let entropyCompileInFlight: Promise<void> | undefined;
   let entropyCompilePending: EntropyCompileRequest | undefined;
   let entropyLifecycleEpoch = 0;
+  // Aborted when the lifecycle epoch ends: reads, stats and scoring stop at once (smarty-dev#2010).
+  let entropyAbort = new AbortController();
+  const endEntropyLifecycle = (): void => {
+    entropyLifecycleEpoch += 1;
+    entropyAbort.abort();
+    entropyAbort = new AbortController();
+    entropyCaches = createEntropyCaches();
+    entropyEvidenceThisTurn = false;
+    entropyCompilePending = undefined;
+  };
   const createEntropyCaches = () => ({
     compiler: new BackgroundEntropyCompiler(),
     observations: new SessionObservationCache(),
-    sessions: new BackgroundSessionSelector(machineSessionFilesAsync),
   });
   let entropyCaches = createEntropyCaches();
 
@@ -456,32 +463,43 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     context: ExtensionContext;
     delayMs: number;
     epoch: number;
+    signal: AbortSignal;
   }
 
   const compileEntropyNow = async (
     context: ExtensionContext,
     epoch: number,
+    signal: AbortSignal,
   ): Promise<void> => {
     const current = (): boolean =>
-      epoch === entropyLifecycleEpoch && state.initialized && state.config.entropy.compile;
+      !signal.aborted && epoch === entropyLifecycleEpoch && state.initialized &&
+      state.config.entropy.compile;
     if (!current()) return;
     const agentDir = resolveAgentDir();
     const cwd = state.cwd ?? context.cwd;
     const repairs = entropyRepairRows(state.repairs.repairs);
     const caches = entropyCaches;
-    const [files, loaded, poolLoaded, snapshot] = await Promise.all([
-      caches.sessions.select(agentDir, cwd, context.sessionManager.getSessionFile?.()),
+    // Only this session's file, read by an appended-bytes cursor. The machine-wide window made every
+    // Pi re-read the host's newest (often 100-300 MB) foreign sessions (smarty-dev#2010). The compiled
+    // normal forms derive from the declared schemas alone; traces feed only the advisory score, and
+    // the machine-wide observation pool still receives each session's own window.
+    const sessionFile = context.sessionManager.getSessionFile?.();
+    const files = sessionFile ? [sessionFile] : [];
+    const [loaded, poolLoaded, snapshot] = await Promise.all([
       loadCompiledSurfaceAsync(agentDir),
       loadObservationPoolAsync(agentDir),
       liveSurfaceSnapshot({ registry: state.registry, extensionContext: context, cwd }),
     ]);
     if (!current() || loaded.error) return;
-    const evidence = await sessionWindowEvidenceAsync(files, { windowsOnly: true });
+    const evidence = await sessionWindowEvidenceAsync(files, { windowsOnly: true, signal });
     if (!current()) return;
     const mergedPool = await caches.observations.merge(
       poolLoaded.file,
       evidence.observationWindows,
+      signal,
     );
+    // Shutdown may land during the merge: never start the pool write after it.
+    if (!current()) return;
     if (!poolLoaded.error && (mergedPool.mergedSessions > 0 || !poolLoaded.file)) {
       await saveObservationPoolAsync(agentDir, mergedPool.file);
     }
@@ -491,6 +509,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       surface: snapshot,
       repairs,
       ...(loaded.file ? { artifact: loaded.file } : {}),
+      signal,
     });
     if (!current()) return;
     if (outcome.status === "compiled" && outcome.artifact) {
@@ -520,8 +539,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         if (request.delayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, request.delayMs));
         }
-        await compileEntropyNow(request.context, request.epoch);
+        await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
+        if (request.signal.aborted) return;
         console.warn(
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)
@@ -543,16 +563,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     context: ExtensionContext,
     delayMs = 250,
   ): void => {
-    const request = { context, delayMs, epoch: entropyLifecycleEpoch };
+    const request = { context, delayMs, epoch: entropyLifecycleEpoch, signal: entropyAbort.signal };
     if (entropyCompileInFlight) {
       entropyCompilePending = request;
       return;
     }
     launchEntropyCompile(request);
-  };
-
-  const settleEntropyCompiles = async (): Promise<void> => {
-    while (entropyCompileInFlight) await entropyCompileInFlight;
   };
 
   // smarty-dev#1595: an idle Main takes the work events addressed to it without waiting for a
@@ -614,10 +630,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     stopInboxWake();
     inboxWake.context = context;
     inboxWake.armed = true;
-    entropyLifecycleEpoch += 1;
-    entropyCaches = createEntropyCaches();
-    entropyEvidenceThisTurn = false;
-    entropyCompilePending = undefined;
+    endEntropyLifecycle();
     pendingHandoffs.clear();
     directToolApproval.clear();
     toolDisplay.clear();
@@ -1088,16 +1101,11 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         "warning",
       );
     }
-    // Queue the richest final window and let async I/O/cooperative scoring
-    // finish before teardown; the TUI event loop remains responsive.
-    if (entropyEvidenceThisTurn) {
-      entropyEvidenceThisTurn = false;
-      scheduleEntropyCompile(context, 0);
-    }
-    await settleEntropyCompiles();
-    entropyLifecycleEpoch += 1;
-    entropyCaches = createEntropyCaches();
-    entropyCompilePending = undefined;
+    // ponytail: the entropy compile is advisory and machine-wide; session JSONL stays the source
+    // of truth, so the next compile on this machine reads this session's final window. Waiting
+    // for it here kept `pi -p` alive 14-98 s re-reading other agents' multi-hundred-MB sessions
+    // (smarty-dev#2010). Abort it instead; every write is gated on current().
+    endEntropyLifecycle();
     unsubscribeComponentRegistration();
     unsubscribeProviderRegistration();
     pendingHandoffs.clear();

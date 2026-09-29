@@ -1,6 +1,16 @@
 import type { FabricActorInfo } from "../actors/types.js";
+import { terminalAgentStatuses } from "../agents/lifecycle.js";
 import type { AgentHandleInfo, AgentRunRecord } from "../agents/types.js";
 import type { FabricParticipantRecord } from "./types.js";
+
+/**
+ * A finished agent stays in the shared directory this long after it finished, then only in its
+ * owner's local list. Every locked mesh write parses and rewrites the whole state file, and on
+ * Dev1 finished agents (up to 240 per host, for a day) were a third of it (smarty-dev#2004).
+ * ponytail: a peer that asks about another host's agent over an hour after it finished gets
+ * "unknown"; its owner still answers from its own list.
+ */
+export const SETTLED_AGENT_PUBLISH_MS = 60 * 60 * 1000;
 
 const isAgentRunRecord = (
   record: AgentRunRecord | AgentHandleInfo,
@@ -13,6 +23,7 @@ export const agentParticipantRecords = (
   ownerIdentityId: string,
   parentId: string,
   firstSeen: Map<string, number>,
+  now = Date.now(),
 ): FabricParticipantRecord[] => {
   const participants: FabricParticipantRecord[] = [];
   const append = (
@@ -24,6 +35,8 @@ export const agentParticipantRecords = (
     const run = isAgentRunRecord(record) ? record : undefined;
     const parent = record.actorId ?? semanticParentId;
     if (record.actorId) return;
+    const settledAt = run?.finishedAt ?? run?.updatedAt ?? observedAt;
+    if (terminalAgentStatuses.has(record.status) && now - settledAt > SETTLED_AGENT_PUBLISH_MS) return;
     const active = record.status === "queued" || record.status === "running";
     participants.push({
       format: 1,

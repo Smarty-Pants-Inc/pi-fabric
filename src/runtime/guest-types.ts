@@ -869,6 +869,14 @@ interface FabricAgentsApi {
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
   actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorInfo>;
+  /** Read a live actor's instruction text and its sha256 digest. Writes nothing. */
+  instructions(args: FabricAgentTargetArgs): Promise<{
+    id: string;
+    name: string;
+    instructions: string;
+    instructionsDigest: string;
+    instructionsLength: number;
+  }>;
   actors(args?: { scope?: "project" }): Promise<FabricActorInfo[]>;
   /** Project-independent templates in the global registry. */
   actors(args: { scope: "global" }): Promise<FabricActorTemplate[]>;
@@ -880,8 +888,8 @@ interface FabricAgentsApi {
   resetSession(args: { id: string }): Promise<FabricActorInfo>;
   /** Stamp a global template into the current project as a fresh live actor with no inherited history. */
   "import"(args: { id?: string; name?: string; as?: string }): Promise<FabricActorInfo>;
-  /** Export a live project actor's definition to the global registry as a project-independent template. */
-  "export"(args: { id: string; overwrite?: boolean }): Promise<FabricActorTemplate>;
+  /** Write a live project actor's definition to the global registry as a template. Requires write: true; it is not a read. */
+  "export"(args: { id: string; write: true; overwrite?: boolean }): Promise<FabricActorTemplate>;
   log(args: {
     id: string;
     type?: "session" | "run" | "all";

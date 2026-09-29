@@ -39,7 +39,7 @@ describe("guest agents surface", () => {
     const calls: Array<{ ref: string; args: unknown }> = [];
     const result = await new QuickJsRuntime().execute(
       `const imported = await agents.import({ name: "reviewer", as: "auditor" });
-       const exported = await agents.export({ id: "actor-1", overwrite: true });
+       const exported = await agents.export({ id: "actor-1", write: true, overwrite: true });
        const unbound = ["sessions", "compact", "setTools", "setDeliveryPolicy", "clearMessages", "import", "export"]
          .filter((name) => typeof agents[name] !== "function");
        return { imported, exported, unbound };`,
@@ -53,7 +53,7 @@ describe("guest agents surface", () => {
     expect(result.terminationReason).toBe("completed");
     expect(calls).toEqual([
       { ref: "agents.import", args: { name: "reviewer", as: "auditor" } },
-      { ref: "agents.export", args: { id: "actor-1", overwrite: true } },
+      { ref: "agents.export", args: { id: "actor-1", write: true, overwrite: true } },
     ]);
     expect(result.value).toMatchObject({ unbound: [] });
   });
@@ -84,7 +84,7 @@ describe("guest agents surface", () => {
   it("types a stored template's validWhile as serialized source, not a callable", () => {
     const read = typeCheckFabricCode(
       `const [template] = await agents.actors({ scope: "global" });
-       const exported = await agents.export({ id: "actor-1" });
+       const exported = await agents.export({ id: "actor-1", write: true });
        const sources: string[] = [template.validWhile?.source, exported.validWhile?.source];
        const actors = await agents.actors();
        return { sources, status: actors[0]?.status };`,
@@ -95,7 +95,7 @@ describe("guest agents surface", () => {
     for (const call of [
       `const [template] = await agents.actors({ scope: "global" });
        return template.validWhile?.({} as never);`,
-      `const exported = await agents.export({ id: "actor-1" });
+      `const exported = await agents.export({ id: "actor-1", write: true });
        return exported.validWhile?.({} as never);`,
     ]) {
       expect(typeCheckFabricCode(call, GUEST_TYPE_DECLARATIONS).errors.map((error) => error.message))

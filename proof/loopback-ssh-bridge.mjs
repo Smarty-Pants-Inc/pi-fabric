@@ -2,13 +2,13 @@
 // linked by pi-fabric#135's bin/mesh-bridge over REAL ssh (a private loopback sshd; see
 // loopback-ssh-bridge.sh). Every agent step is a model turn that calls fabric_exec.
 // Based on lane B's two-mesh-proof.mjs (pi-fabric#132 round-1 proof).
-// usage: node loopback-ssh-bridge.mjs SCRATCH PI_FABRIC_DIST BRIDGE_BIN SSH_HOST SSH_KEY SHIM_PATH
+// usage: bun loopback-ssh-bridge.mjs SCRATCH PI_FABRIC_DIST BRIDGE_BIN SSH_HOST SSH_KEY SSH_PORT KNOWN_HOSTS
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-const [scratch, fabricDist, bridgeBin, sshHost, sshKey, shimPath] = process.argv.slice(2);
+const [scratch, fabricDist, bridgeBin, sshHost, sshKey, sshPort, knownHosts] = process.argv.slice(2);
 const { MeshStore } = await import(path.join(path.dirname(fabricDist), "../src/mesh/store.ts"));
 const fleetAgent = process.env.PI_CODING_AGENT_DIR;
 const MODEL = process.env.PROOF_MODEL ?? "cliproxyapi-anthropic/claude-opus-5-5";
@@ -110,13 +110,12 @@ const [rootB] = await waitFor("forge root", () => roots(B, false)[0] && roots(B,
 results.roots = { dev1: rootA.id, forge: rootB.id };
 log("roots", rootA.id, rootB.id);
 
-// The bridge: the hub side on dev1's mesh; the transport is ssh to the loopback sshd, whose forced
-// command runs `mesh-bridge agent --mesh <forge mesh> --peer dev1`. The shim only adds `-F <private
-// ssh_config>` so nothing in ~/.ssh is touched; the bridge's own ssh argv is unchanged.
+// The bridge: the hub side on dev1's mesh; the transport is the bridge's own ssh argv to the loopback
+// sshd, whose forced command runs `mesh-bridge agent --mesh <forge mesh> --peer dev1`.
 const bridgeLog = path.join(scratch, "bridge.log");
 const bridge = spawn("node", [bridgeBin, "run", "--mesh", A.mesh, "--name", "dev1", "--remote", "forge",
-  "--cursor", path.join(scratch, "bridge-cursor.json"), "--ssh", sshHost, "--ssh-key", sshKey],
-  { env: { ...process.env, PATH: `${shimPath}:${process.env.PATH}` }, stdio: ["ignore", "inherit", fs.openSync(bridgeLog, "a")], detached: true });
+  "--cursor", path.join(scratch, "bridge-cursor.json"), "--ssh", sshHost, "--ssh-key", sshKey, "--ssh-port", sshPort, "--ssh-known-hosts", knownHosts],
+  { stdio: ["ignore", "inherit", fs.openSync(bridgeLog, "a")], detached: true });
 children.add(bridge);
 await waitFor("forge root mirrored into dev1", () => roots(A, true).find((r) => r.id === rootB.id && r.remoteHost === "forge"));
 await waitFor("dev1 root mirrored into forge", () => roots(B, true).find((r) => r.id === rootA.id && r.remoteHost === "dev1"));

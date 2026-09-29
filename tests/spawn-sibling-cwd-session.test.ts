@@ -20,6 +20,26 @@ const fabricEntry = path.resolve("dist/index.js");
 const built = fs.existsSync(fabricEntry);
 const ENV_KEYS = ["PI_FABRIC_MESH_ROOT", "PI_CODING_AGENT_DIR"] as const;
 
+const alive = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+};
+// Every resident host under root records its pid in its residency owner.json.
+const residentHostPids = (root: string): number[] =>
+  (fs.readdirSync(root, { recursive: true }) as string[])
+    .filter((entry) => path.basename(entry) === "owner.json")
+    .map((entry) => { try { return JSON.parse(fs.readFileSync(path.join(root, entry), "utf8")).pid; } catch { return undefined; } })
+    .filter((pid): pid is number => Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid);
+// SIGTERM lets the host close its agents and release its files. Wait for the
+// exit itself; SIGKILL only if the host hangs.
+const stopProcess = async (pid: number): Promise<void> => {
+  try { process.kill(pid, "SIGTERM"); } catch { return; }
+  const killAt = Date.now() + 30_000;
+  while (alive(pid)) {
+    if (Date.now() > killAt) { try { process.kill(pid, "SIGKILL"); } catch { /* It exited. */ } }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+};
+
 describe.skipIf(!built || process.platform === "win32")("durable spawn beside the tool call that creates its cwd", () => {
   const roots: string[] = [];
   const sessions: AgentSession[] = [];
@@ -30,9 +50,15 @@ describe.skipIf(!built || process.platform === "win32")("durable spawn beside th
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    // The durable agent's resident host may still be writing its run files as it exits.
-    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
-  });
+    // smarty-dev#883: the durable spawn started a detached resident host that
+    // writes under root until it exits (ENOTEMPTY on CI). Stop it and wait
+    // for its exit, then remove the files; the retry only covers the
+    // filesystem settling after that exit.
+    for (const root of roots.splice(0)) {
+      await Promise.all(residentHostPids(root).map(stopProcess));
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 60_000);
 
   it("spawns only after a parallel sibling git worktree add finishes its checkout", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-seq-")));
@@ -93,5 +119,7 @@ describe.skipIf(!built || process.platform === "win32")("durable spawn beside th
     expect(results[1]![1]).toMatch(/^spawned \d+$/);
     expect(Number(results[1]![1].split(" ")[1])).toBeGreaterThanOrEqual(addedAt);
     expect(fs.readFileSync(path.join(worktree, "slow.txt"), "utf8")).toBe("complete\n");
+    // The durable spawn must have started a resident host; afterEach stops it.
+    expect(residentHostPids(root).length).toBeGreaterThan(0);
   }, 120_000);
 });

@@ -110,7 +110,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
-import { readStoppedRuns } from "./agents/stopped-runs.js";
+import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -627,9 +627,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
   };
 
-  pi.on("session_start", async (_event, context) => {
+  pi.on("session_start", async (event, context) => {
     fabricPrewarm = undefined;
     stopInboxWake();
+    // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
+    const reloadNotice = takeReloadStoppedNotice(context.sessionManager?.getSessionId?.() ?? "", event?.reason ?? "");
+    if (reloadNotice && context.hasUI) context.ui.notify(reloadNotice, "warning");
     inboxWake.context = context;
     inboxWake.armed = true;
     endEntropyLifecycle();

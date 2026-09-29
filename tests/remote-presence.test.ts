@@ -8,6 +8,7 @@ import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { MIRROR_COLLISION_TOPIC, ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { readParticipantFiles, writeParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 // smarty-dev#2004: the mesh bridge mirrors another host's root records and host lease into this
@@ -314,6 +315,22 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
 
     const refusals = mesh.tail(0, 1_000).events.filter((event) => event.topic === MIRROR_COLLISION_TOPIC);
     expect(refusals.map((event) => (event.data as { id: string }).id).sort()).toEqual([CHILD, local.id].sort());
+  });
+
+  // pi-fabric#142: a local record also lives in its own file. A mirror at its key is refused and
+  // reported whichever copy is newer (CI saw a file and a mirror in the same millisecond).
+  it("refuses and reports a mirror at a local key even when the local file is newer than the mirror", async () => {
+    const CHILD = "0123456789abcdef0123456789abcdef";
+    const { mesh, directory, mirror, remote } = await setup({ heartbeatMs: 60_000, children: [CHILD] });
+    const hostOf = (id: string) => ({ id: `forge-host:${id}`, rootId: id, identity: remote });
+    await mirror({ record: { id: CHILD, rootId: CHILD, ownerHostId: hostOf(CHILD).id }, hostId: hostOf(CHILD).id, host: hostOf(CHILD) });
+    const key = "topology/participants/" + hash(CHILD);
+    const file = readParticipantFiles(mesh.root, { maxAgeMs: 0 }).find((entry) => entry.key === key)!;
+    writeParticipantFile(mesh.root, { ...file, updatedAt: Date.now() + 60_000 });
+    expect(directory.get(CHILD)).toMatchObject({ id: CHILD, kind: "agent", local: true });
+    expect(directory.list().filter((participant) => participant.remoteHost !== undefined)).toEqual([]);
+    const refusals = mesh.tail(0, 1_000).events.filter((event) => event.topic === MIRROR_COLLISION_TOPIC);
+    expect(refusals.map((event) => (event.data as { id: string }).id)).toEqual([CHILD]);
   });
 
   it("qualifies a mirrored peer's label with its host, so a selector never matches it for a local label", async () => {

@@ -9,6 +9,7 @@ import { FabricActivityStore } from "../src/activity/store.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricUiController } from "../src/ui/controller.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { readParticipantFiles } from "../src/topology/participant-files.js";
 import type { FabricDashboard } from "../src/ui/dashboard.js";
 import { FabricWidget } from "../src/ui/widget.js";
 import "../src/ui/dashboard.js";
@@ -563,6 +564,54 @@ describe("FabricUiController dashboard wiring", () => {
       }
     },
   );
+
+  // review/astra F3 on #142: participant records live in files too (smarty-dev#2004). A rebuild for
+  // a file-only change must show the listing it records as built, even when another reader warmed
+  // the participant file cache just before the change.
+  it("shows a file-only participant change after another reader warmed the participant cache", async () => {
+    vi.useFakeTimers();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-dashboard-"));
+    const key = "topology/participants/" + "a".repeat(64);
+    const writeExternally = (status: string) => {           // another process: no in-process cache hint
+      const file = path.join(root, "participants", `${"a".repeat(64)}.json`);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(`${file}.tmp`, JSON.stringify({
+        format: 1, key, version: 1, updatedAt: 1, updatedBy: { id: "session:peer" }, value: { id: "peer", status },
+      }));
+      fs.renameSync(`${file}.tmp`, file);
+    };
+    writeExternally("A0");
+    const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 2_000 });
+    await mesh.put({ key: "status", value: "unchanged", identity: { id: "session:w", name: "w", kind: "main", sessionId: "w" } });
+    const state = stubState();
+    state.config.ui.refreshMs = 500;
+    vi.mocked(state.actors.list).mockReturnValue([]);
+    const activity = new FabricActivityStore();
+    const participantInfos = () => readParticipantFiles(root, { maxAgeMs: 2_000 }).map((entry) => ({
+      ...(entry.value as object), kind: "agent", name: "peer", rootId: "peer", ownerHostId: "h", startedAt: 1, updatedAt: 1,
+      runner: "pi", transport: "process", capabilities: [], local: false, stale: false,
+    }));
+    Object.assign(state, { activity, participantInfos, config: { ...state.config, mesh: { enabled: true } }, mesh });
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    const shown = () => controller.snapshot().agents.find((agent) => agent.id === "peer")?.status;
+    try {
+      controller.start(context);
+      activity.start("live", { name: "local work" });            // polls at refreshMs
+      await vi.advanceTimersByTimeAsync(4_700);
+      expect(shown()).toBe("A0");
+      writeExternally("A");
+      expect(readParticipantFiles(root, { maxAgeMs: 0 })).toHaveLength(1);   // another reader: a warm cache holds A
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);      // B lands in a later timestamp tick
+      writeExternally("B");
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(shown()).toBe("B");
+    } finally {
+      controller.stop();
+      vi.useRealTimers();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   it("ticks the activity widget elapsed clock while nested calls are idle", async () => {
     vi.useFakeTimers();

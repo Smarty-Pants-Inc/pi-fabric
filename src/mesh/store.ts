@@ -877,16 +877,38 @@ export class MeshStore {
 
   list(prefix = "", limit = 100): MeshStateEntry[] {
     const boundedLimit = Math.max(1, Math.min(Math.floor(limit), this.maxReadEvents));
-    return this.listAll(prefix).slice(0, boundedLimit);
+    // Clone only the page: the dashboard lists the first 200 of the whole fleet state, and
+    // cloning every entry to keep 200 was a large share of an idle Pi's CPU (smarty-dev#557).
+    return this.#select(prefix, {}).slice(0, boundedLimit).map((entry) => jsonClone(entry));
   }
 
   /** Internal project-state scan for host-managed indexes that must reconcile every key. */
   listAll(prefix = "", options: MeshReadOptions = {}): MeshStateEntry[] {
+    return this.#select(prefix, options).map((entry) => jsonClone(entry));
+  }
+
+  /**
+   * The parsed state that reads now return, as an opaque token: the same object until this
+   * store parses the file again. A reader that derives an index from listAll can reuse it
+   * while the token is unchanged (smarty-dev#557).
+   */
+  stateToken(options: MeshReadOptions = {}): object {
+    return this.#readCachedState(options.fresh === true);
+  }
+
+  /**
+   * listAll without the copies: the parsed entries themselves, which the caller must not change.
+   * For an index that copies only the entries whose version moved (smarty-dev#557).
+   */
+  listAllShared(prefix = "", options: MeshReadOptions = {}): readonly Readonly<MeshStateEntry>[] {
+    return this.#select(prefix, options);
+  }
+
+  #select(prefix: string, options: MeshReadOptions): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
     return Object.values(this.#readCachedState(options.fresh === true).entries)
       .filter((entry) => !prefix || entry.key.startsWith(prefix))
-      .sort((left, right) => left.key.localeCompare(right.key))
-      .map((entry) => jsonClone(entry));
+      .sort((left, right) => left.key.localeCompare(right.key));
   }
 
   async put(input: {

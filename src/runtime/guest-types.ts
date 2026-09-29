@@ -142,6 +142,8 @@ interface FabricPeerInfo {
   updatedAt: number;
   pendingMessages: boolean;
   local: false;
+  /** The remote host of a peer mirrored by the mesh bridge. */
+  host?: string;
 }
 type FabricParticipantKind = "root" | "agent" | "actor";
 type FabricParticipantResidency = "session" | "durable";
@@ -179,6 +181,8 @@ interface FabricParticipantInfo {
   actorQueued?: number;
   actorMessages?: number;
   controlProtocol: "v1" | "legacy";
+  /** The remote host of a root mirrored by the mesh bridge; never a local owner. */
+  remoteHost?: string;
   residency: FabricParticipantResidency;
   local: boolean;
   stale: boolean;
@@ -809,7 +813,7 @@ interface FabricAgentsApi {
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
   spawn(args: FabricAgentRequest): Promise<FabricAgentHandle>;
-  /** Bounded by timeoutMs (default 5 min, at most 60 min): a child still running keeps running and reports on completion. */
+  /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */
   join(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;

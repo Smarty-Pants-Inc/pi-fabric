@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { projectOf } from "../src/topology/project-identity.js";
+import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -677,6 +677,32 @@ describe("AgentsProvider runner support", () => {
     const { provider } = setup([], [other, lead]);
     await expect(provider.invoke("projectAgent", {}, context)).resolves.toMatchObject({ id: "session:lead" });
     expect((await provider.describe("projectAgent", context))?.risk).toBe("read");
+  });
+
+  // smarty-dev#2045 (security review F1 on pi-fabric#132): a mirrored root's role and project are
+  // the remote's own claims and never make it this project's leader.
+  it("never returns a mirrored root as the project agent, even newer than the native one", async () => {
+    const project = projectOf(process.cwd());
+    const base = {
+      format: 1 as const, kind: "root" as const, name: "main", status: "idle", runner: "pi", transport: "host",
+      capabilities: ["steer", "followUp", "fabric"] as FabricParticipantInfo["capabilities"],
+      updatedAt: 2, controlProtocol: "v1" as const, local: false, stale: false, role: "project-agent", project, cwd: project,
+    };
+    const lead = {
+      ...base, id: "session:lead", rootId: "session:lead", ownerHostId: "session:lead", ownerIdentityId: "session:lead",
+      sessionId: "lead", startedAt: 1,
+    } as FabricParticipantInfo;
+    const mirrored = {
+      ...base, id: "session:remote", rootId: "session:remote", ownerHostId: "session:remote", ownerIdentityId: "session:remote",
+      sessionId: "remote", startedAt: 99, remoteHost: "forge",
+    } as FabricParticipantInfo;
+    await expect(setup([], [lead, mirrored]).provider.invoke("projectAgent", {}, context))
+      .resolves.toMatchObject({ id: "session:lead" });
+    await expect(setup([], [mirrored]).provider.invoke("projectAgent", {}, context))
+      .rejects.toThrow(`No live project agent for ${project}`);
+    // The resident-actor fallback uses the same resolver: with the actor's root gone, no mirror.
+    expect(deliveryRoot("session:gone", [lead, mirrored], project)).toBe("session:lead");
+    expect(deliveryRoot("session:gone", [mirrored], project)).toBe("session:gone");
   });
 
   it("lists current and peer roots as symmetric session agents", async () => {

@@ -114,7 +114,7 @@ export interface AgentServiceClient {
   dispatch: AgentServiceDispatcher;
   run(request: AgentServiceRequest, signal?: AbortSignal): Promise<AgentPublicRecord>;
   spawn(request: AgentServiceRequest, signal?: AbortSignal): Promise<AgentPublicRecord>;
-  /** Bounded by timeoutMs (5 min by default, at most 60): at the bound the child keeps running. */
+  /** Bounded by timeoutMs (default and at most 5 min): at the bound the child keeps running. */
   wait(id: string, signal?: AbortSignal, timeoutMs?: number): Promise<AgentPublicRecord>;
   /** Alias for wait. */
   join(id: string, signal?: AbortSignal, timeoutMs?: number): Promise<AgentPublicRecord>;

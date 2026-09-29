@@ -187,12 +187,24 @@ const stopResident = async (config: ResidentHostConfig): Promise<void> => {
     }
   })();
   if (owner?.pid) {
+    const alive = (): boolean => {
+      try {
+        process.kill(owner.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
     try {
       process.kill(owner.pid, "SIGTERM");
     } catch {
       // Process already exited.
     }
-    await waitFor(() => !fs.existsSync(ownerPath)).catch(() => undefined);
+    // The host still writes under mesh/ after it removes owner.json: wait for the process
+    // itself to exit, not only its marker, before the root is removed.
+    await waitFor(() => !alive(), 20_000).catch(() => {
+      try { process.kill(owner.pid, "SIGKILL"); } catch { /* exited */ }
+    });
   }
 };
 
@@ -210,7 +222,9 @@ afterEach(async () => {
     } catch {
       // No resident host was created.
     }
-    fs.rmSync(root, { recursive: true, force: true });
+    // A host that already removed owner.json (idle exit) may still be finishing its last mesh
+    // writes: retry ENOTEMPTY briefly instead of failing the suite on a loaded runner.
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
 

@@ -677,7 +677,7 @@ const actor = await agents.import({ name: template.name });            // create
 await agents.import({ name: "security-reviewer", as: "security-reviewer-2" }); // rename it if the name exists
 
 // Copy a tuned project actor to the global library without its history.
-await agents.export({ id: actor.id, overwrite: true });
+await agents.export({ id: actor.id, write: true, overwrite: true }); // a global write: write: true is required
 
 // Change the default instruction and continuation policy of a template.
 await agents.setInstructions({ id: template.id, instructions: "Be brief.", scope: "global" });
@@ -689,7 +689,7 @@ return agents.setDeliveryPolicy({
 });
 ```
 
-`agents.setInstructions` can also change a live project actor. Its default scope is `"project"`. The new instruction applies to the next queued actor message. Only definitions cross the project⇄global boundary. Import and export never move history. Slash commands provide the same operations. `/fabric global` lists templates. `/fabric import <name> [as <new>]` creates one in the project. `/fabric export <id> [--overwrite]` promotes a project actor. The dashboard shows global templates with live actors. From there, you can import, export, delete, edit instructions, and change delivery policy without code. Existing persisted actors and templates continue to load as passive. New active delivery definitions must explicitly set `triggerTurn`.
+`agents.setInstructions` can also change a live project actor. Its default scope is `"project"`. The new instruction applies to the next queued actor message. `agents.instructions({ id })` reads the live text with its sha256 `instructionsDigest`; it writes nothing. `agents.export` requires `write: true`, so a caller cannot create a template by mistake. Only definitions cross the project⇄global boundary. Import and export never move history. Slash commands provide the same operations. `/fabric global` lists templates. `/fabric import <name> [as <new>]` creates one in the project. `/fabric export <id> [--overwrite]` promotes a project actor. The dashboard shows global templates with live actors. From there, you can import, export, delete, edit instructions, and change delivery policy without code. Existing persisted actors and templates continue to load as passive. New active delivery definitions must explicitly set `triggerTurn`.
 
 ## Councils
 

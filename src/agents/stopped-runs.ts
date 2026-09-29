@@ -56,3 +56,22 @@ export const restoreStoppedRuns = (options: {
   }
   return markDelivered;
 };
+
+// ponytail: a process-global handoff. A reload replaces this module and clears the chat, but the
+// process and the session id stay; the next session_start shows what the close stopped (smarty-dev#1882).
+const STOPPED_AT_CLOSE = Symbol.for("pi-fabric.stopped-at-close");
+const stoppedAtClose = (): Map<string, string[]> =>
+  ((globalThis as Record<symbol, unknown>)[STOPPED_AT_CLOSE] ??= new Map<string, string[]>()) as Map<string, string[]>;
+
+export const rememberStoppedAtClose = (sessionId: string, runs: readonly AgentRunResult[]): void => {
+  stoppedAtClose().set(sessionId, runs.map((run) => run.name || run.id));
+};
+
+/** The notice for the reloaded session, once; any other start only drops the record. */
+export const takeReloadStoppedNotice = (sessionId: string, reason: string): string | undefined => {
+  const names = stoppedAtClose().get(sessionId);
+  stoppedAtClose().delete(sessionId);
+  if (reason !== "reload" || !names?.length) return undefined;
+  return `The last /reload stopped ${names.length} task agent${names.length === 1 ? "" : "s"}: ${names.join(", ")}; ` +
+    'spawn with residency: "durable" to keep agents across reloads.';
+};

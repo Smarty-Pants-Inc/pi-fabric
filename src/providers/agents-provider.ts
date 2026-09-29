@@ -626,13 +626,14 @@ export class AgentsProvider implements FabricProvider {
         const request = runRequest(this.#resolvePiModelArgs(args, context), context, this.manager);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
+        const durableCwd = request.residency === "durable" && request.cwd !== undefined
+          ? await this.manager.resolveCwd(request.cwd, context.signal)
+          : undefined;
         const durableRequest = withInheritedSessionPins({
           ...baseRequest,
           ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime() } : {}),
           extensions: request.extensions ?? this.manager.config.extensions,
-          ...(request.residency === "durable" && request.cwd !== undefined
-            ? { cwd: this.manager.resolveCwd(request.cwd) }
-            : {}),
+          ...(durableCwd !== undefined ? { cwd: durableCwd } : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
         const handle = durableRequest.residency === "durable"
           ? await this.#resident().spawnAgent(durableRequest, context.signal)

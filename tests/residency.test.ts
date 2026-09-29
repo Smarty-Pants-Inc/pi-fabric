@@ -232,7 +232,7 @@ describe("durable cwd validation", () => {
           recursive: true,
           residency: "durable",
         }),
-      ).rejects.toThrow(/Invalid Fabric agent cwd/);
+      ).rejects.toThrow(/Invalid Fabric agent cwd.*ENOENT.*call spawn in the next message/);
       expect(fs.existsSync(path.join(state.config.residencyRoot, "owner.json"))).toBe(false);
       expect(fs.existsSync(path.join(state.config.residencyRoot, "requests"))).toBe(false);
     } finally {

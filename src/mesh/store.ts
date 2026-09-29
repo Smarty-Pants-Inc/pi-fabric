@@ -245,7 +245,9 @@ const readState = (filePath: string, maxBytes: number, recoverDamage = true): Me
 };
 
 const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY): void => {
-  const serialized = JSON.stringify(value, null, 2);
+  // Compact: the file is rewritten under the mesh lock on every write, and indenting made it 22%
+  // larger and slower to serialize (smarty-dev#2004).
+  const serialized = JSON.stringify(value);
   if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
     throw new Error(`Fabric mesh state exceeds ${maxBytes} bytes`);
   }

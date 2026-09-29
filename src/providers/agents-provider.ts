@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js";
 import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
@@ -1050,6 +1051,17 @@ export class AgentsProvider implements FabricProvider {
       }
       case "actorStatus":
         return this.actorManager.status(String(args.id));
+      case "instructions": {
+        const actor = this.actorManager.status(String(args.id));
+        const { instructions } = this.actorManager.definition(actor.id);
+        return {
+          id: actor.id,
+          name: actor.name,
+          instructions,
+          instructionsDigest: createHash("sha256").update(instructions).digest("hex"),
+          instructionsLength: instructions.length,
+        };
+      }
       case "actors":
         return args.scope === "global" ? this.globalActors.list() : this.actorManager.list();
       case "messages": {
@@ -1197,6 +1209,12 @@ export class AgentsProvider implements FabricProvider {
         return actor;
       }
       case "export": {
+        // Agents called export to read an actor and left stray global templates (smarty-dev#918).
+        if (args.write !== true) {
+          throw new Error(
+            "agents.export writes a global template; pass write: true to confirm. To read an actor's instructions, use agents.instructions({ id }).",
+          );
+        }
         const actor = this.actorManager.status(String(args.id));
         const overwrite = args.overwrite === true;
         const def = this.actorManager.definition(actor.id);

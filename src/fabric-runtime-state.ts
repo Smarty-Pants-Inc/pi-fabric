@@ -130,7 +130,7 @@ import {
 import { participantProject, participantRole } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
-import { restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
+import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
 import { ResidencyClient } from "./residency/client.js";
@@ -734,8 +734,10 @@ export class FabricRuntimeState {
         completionInbox.acknowledge(id);
         markStoppedDelivered(id);
       },
-      onStoppedAtClose: (results) =>
-        this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results }),
+      onStoppedAtClose: (results) => {
+        rememberStoppedAtClose(sessionId, results);
+        this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results });
+      },
     });
     // Runs a previous runtime of this session stopped at reload/shutdown (smarty-dev#1602):
     // wait/status answer from the record, and with notices on each result reaches the spawner once.

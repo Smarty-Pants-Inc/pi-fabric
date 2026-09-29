@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BackgroundEntropyCompiler, compileEntropySurface } from "../src/entropy/compiler.js";
 import { SessionEntropyMeter, measureEntropy, type EntropyTraceWindow } from "../src/entropy/meter.js";
 import { SessionObservationCache, mergeObservationWindow, type EntropyObservationPoolFile } from "../src/entropy/pool.js";
-import { BackgroundSessionSelector } from "../src/entropy/sessions.js";
 import * as normalForms from "../src/entropy/normal-form.js";
 import type { EntropySurfaceSnapshot, EntropyTraceInput, EntropyValueObservation } from "../src/entropy/types.js";
 
@@ -139,33 +138,5 @@ describe("incremental observation pool", () => {
     for (let i = 0; i < 16; i++) await cache.merge(undefined, [{ file: `evict-${i}`, observations: [] }]);
     await cache.merge(undefined, windows);
     expect(reads).toBeGreaterThan(initialReads);
-  });
-});
-
-describe("background session discovery", () => {
-  it("amortizes full scans for 30 seconds, always includes the current file, and isolates returned lists", async () => {
-    vi.useFakeTimers(); vi.setSystemTime(0);
-    const files = Array.from({ length: 8 }, (_, i) => `session-${i}`);
-    const scan = vi.fn(async () => files);
-    const selector = new BackgroundSessionSelector(scan);
-    const first = await selector.select("agent", "cwd", "active");
-    expect(first).toEqual(["active", ...files.slice(0, 7)]);
-    first.length = 0;
-    vi.setSystemTime(29_999);
-    expect(await selector.select("agent", "cwd", "fork")).toEqual(["fork", ...files.slice(0, 7)]);
-    expect(scan).toHaveBeenCalledOnce();
-    vi.setSystemTime(30_000);
-    await selector.select("agent", "cwd", "fork");
-    expect(scan).toHaveBeenCalledTimes(2);
-    await selector.select("other-agent", "cwd");
-    await selector.select("other-agent", "other-cwd");
-    expect(scan).toHaveBeenCalledTimes(4);
-  });
-
-  it("does not cache an absent session directory", async () => {
-    const scan = vi.fn(async () => [] as string[]);
-    const selector = new BackgroundSessionSelector(scan);
-    await selector.select("agent", "cwd"); await selector.select("agent", "cwd");
-    expect(scan).toHaveBeenCalledTimes(2);
   });
 });

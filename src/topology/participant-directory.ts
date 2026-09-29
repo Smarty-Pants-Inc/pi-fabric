@@ -346,7 +346,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
   #parsedCache: { token: object; value: ParsedDirectory } | undefined;
   #parsedEntries = new Map<string, { version: number; updatedAt: number; entry: MeshStateEntry }>();
-  #leaseRead: { at: number; leases: ReturnType<typeof readHostLeases> } | undefined;
   readonly #reportedCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
@@ -457,9 +456,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       const committed = await operation;
       if (!committed) return;
-      // A committed heartbeat certifies a view after it (confirmedAt, peer-settle): no listing
-      // after it may use lease files read before it (review/astra F1 on pi-fabric#140).
-      this.#leaseRead = undefined;
       this.#refreshedAt = Date.now();
       this.#refreshError = undefined;
       if (full) this.#sweepDeadHosts();
@@ -493,7 +489,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     const read = { fresh: options.fresh === true };
     const parsed = this.#parsed(read);
-    const hosts = this.#liveHosts(parsed.hosts, !read.fresh, now);
+    const hosts = this.#liveHosts(parsed.hosts);
     const byId = new Map<string, FabricParticipantInfo>();
     const refused: string[] = [];
     for (const participant of parsed.participants) {
@@ -607,29 +603,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   // Valid host records by id, each with its effective expiry: the later of its shared-state
   // lease and its file lease (smarty-dev#816).
-  // A listing reuses the lease files it read within a fifth of a heartbeat (1 s by default):
-  // the dashboard lists the directory three times per rebuild, and each read stats every host's
-  // lease file (smarty-dev#557). A lease that was valid at that read but has lapsed by `now` is
-  // not trusted: the host may have renewed its file since, so its own file is read again before
-  // the lapse counts (review/astra F1 on pi-fabric#140). A committed heartbeat drops
-  // the recent read. Fresh reads, and single lookups, read the files.
-  #liveHosts(entries: Iterable<MeshStateEntry>, reuse = false, now = Date.now()): Map<string, FabricHostRecord> {
-    const readAt = Date.now();
-    const recent = this.#leaseRead;
-    const cached = reuse && recent !== undefined && readAt - recent.at >= 0 && readAt - recent.at < this.#heartbeatMs / 5;
-    const leases = cached ? recent.leases : readHostLeases(this.mesh.root);
-    if (reuse && !cached) this.#leaseRead = { at: readAt, leases };
+  #liveHosts(entries: Iterable<MeshStateEntry>): Map<string, FabricHostRecord> {
+    const leases = readHostLeases(this.mesh.root);
     const hosts = new Map<string, FabricHostRecord>();
     for (const entry of entries) {
       const host = hostFromEntry(entry);
-      if (!host) continue;
-      let expiresAt = hostLeaseExpiry(leases, host);
-      // A lease already lapsed when the files were read stays lapsed until the next read.
-      if (cached && expiresAt < now && expiresAt >= recent.at) {
-        const lease = readHostLease(this.mesh.root, host.id);
-        expiresAt = hostLeaseExpiry(lease ? new Map([[host.id, lease]]) : new Map(), host);
-      }
-      hosts.set(host.id, { ...host, expiresAt });
+      if (host) hosts.set(host.id, { ...host, expiresAt: hostLeaseExpiry(leases, host) });
     }
     return hosts;
   }
@@ -684,7 +663,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {
     if (!this.options.enabled) return undefined;
     const target = id === "main" ? this.options.rootId : id;
-    const participant = this.list({ scope: "project", includeStale: true }, now)
+    // Fresh: this answers whether a lease lapsed, so a lease file read within the listing's reuse
+    // window (smarty-dev#557) must not hide a lapse or removal since. It runs only for an unknown id.
+    const participant = this.list({ scope: "project", includeStale: true, fresh: true }, now)
       .find((candidate) => candidate.id === target);
     if (!participant?.stale) return undefined;
     const entry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId));

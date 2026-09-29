@@ -15,6 +15,8 @@ import { linuxCPythonNetworkFilter } from "./cpython-linux-sandbox.js";
 
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const HOST_SETTLE_MS = 250;
+// Bounds only the wait for a killed child's exit diagnosis after its IPC broke.
+const PIPE_DIAGNOSIS_MS = 2_000;
 // No blanket mach* allowance: Mach services can broker effects outside the
 // file/network policy. CPython's standard-library startup needs none here.
 const MACOS_PROFILE = "(version 1) (deny default) (allow process-exec) (allow process-fork) (allow file-read*) (allow sysctl-read)";
@@ -191,11 +193,33 @@ export class CPythonRuntime implements FabricKernelRuntime {
       };
       const abort = (): void => void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
       const fail = (message: string): void => void finish({ value: undefined, terminationReason: "runtime_error", error: message });
+      // A child that dies at startup (bwrap without user namespaces) resets its
+      // pipes before "close" reports its exit status and stderr. Let that
+      // diagnosis settle the run instead of racing it with a bare EPIPE or
+      // ECONNRESET. The bridge itself ends at once: host calls are aborted and
+      // no further guest frame is admitted (finishing). Only the diagnosis
+      // waits, and for at most PIPE_DIAGNOSIS_MS, since a descendant that keeps
+      // stdout/stderr open can hold back "close".
+      let pipeError: string | undefined;
+      const failPipe = (message: string): void => {
+        if (settled || finishing) return;
+        pipeError = message;
+        finishing = true;
+        hostAbort.abort(new Error(message));
+        if (child.pid && process.platform !== "win32") {
+          try { process.kill(-child.pid, "SIGKILL"); } catch { /* The process group may already have exited. */ }
+        }
+        child.kill("SIGKILL");
+        setTimeout(() => fail(`${message}; CPython process did not report its exit`), PIPE_DIAGNOSIS_MS).unref?.();
+      };
       const scheduleDeadline = (): void => {
         if (deadline) clearTimeout(deadline);
-        deadline = setTimeout(() => void finish({
-          value: undefined, terminationReason: "timed_out", error: `Execution timed out after ${deadlineAt - startedAt}ms`,
-        }), Math.max(0, deadlineAt - Date.now()));
+        // A recorded pipe failure is the real cause; the deadline only ends its diagnosis wait.
+        deadline = setTimeout(() => pipeError
+          ? fail(`${pipeError}; CPython process did not report its exit`)
+          : void finish({
+            value: undefined, terminationReason: "timed_out", error: `Execution timed out after ${deadlineAt - startedAt}ms`,
+          }), Math.max(0, deadlineAt - Date.now()));
         deadline.unref?.();
       };
       const send = (message: unknown): void => {
@@ -209,7 +233,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
             fail("CPython IPC frame or write buffer exceeds its 16 MiB frame limit");
             return;
           }
-          channel.write(frame, (error) => { if (error && !settled && !finishing) fail(`CPython IPC failed: ${error.message}`); });
+          channel.write(frame, (error) => { if (error) failPipe(`CPython IPC failed: ${error.message}`); });
         } catch (error) { fail(`CPython IPC serialization failed: ${errorText(error)}`); }
       };
       const handleMessage = (message: unknown): void => {
@@ -296,21 +320,21 @@ export class CPythonRuntime implements FabricKernelRuntime {
         channel = socket;
         if (socket instanceof net.Socket) socket.setNoDelay(true);
         socket.on("data", onData);
-        socket.on("error", (error) => { if (!settled && !finishing) fail(`CPython IPC failed: ${error.message}`); });
+        socket.on("error", (error) => failPipe(`CPython IPC failed: ${error.message}`));
       };
       child.stdout?.on("data", (chunk: Buffer) => appendLog(0, decoders[0]!.write(chunk)));
       child.stderr?.on("data", (chunk: Buffer) => appendLog(1, decoders[1]!.write(chunk)));
       child.on("error", (error) => fail(`CPython process failed: ${error.message}${this.enforce ? "; OS sandbox is required (no native fallback)" : ""}`));
       child.on("close", (exitCode, signal) => {
-        if (settled || finishing) return;
+        if (settled || (finishing && !pipeError)) return;
         const diagnostics = [...logs, ...partialLogs].join("\n").slice(-4000);
-        fail(`CPython ${this.enforce ? "sandbox " : ""}process exited before returning a result (${signal ?? exitCode}).${this.enforce ? " Verify OS sandbox availability/user namespaces; no unsandboxed fallback is permitted." : ""}${diagnostics ? `\n${diagnostics}` : ""}`);
+        fail(`${pipeError ? `${pipeError}; ` : ""}CPython ${this.enforce ? "sandbox " : ""}process exited before returning a result (${signal ?? exitCode}).${this.enforce ? " Verify OS sandbox availability/user namespaces; no unsandboxed fallback is permitted." : ""}${diagnostics ? `\n${diagnostics}` : ""}`);
       });
       options.signal?.addEventListener("abort", abort, { once: true });
       if (options.signal?.aborted) { abort(); return; }
       if (command.seccomp) {
         const filterPipe = child.stdio[4] as Duplex;
-        filterPipe.on("error", (error) => { if (!settled) fail(`CPython sandbox filter failed: ${error.message}`); });
+        filterPipe.on("error", (error) => failPipe(`CPython sandbox filter failed: ${error.message}`));
         filterPipe.end(command.seccomp);
       }
       scheduleDeadline();

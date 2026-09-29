@@ -161,7 +161,7 @@ const waitSchema = {
   type: "object",
   properties: {
     id: { type: "string" },
-    timeoutMs: { type: "number", minimum: 1_000, description: `Clamped to ${AGENT_WAIT_MAX_MS / 60_000} min: a foreground wait over the bash guard's limit blocks steers (smarty-dev#854)` },
+    timeoutMs: { type: "number", minimum: 1_000, description: `Clamped to ${AGENT_WAIT_MAX_MS / 60_000} min: a foreground wait over the bash guard's limit blocks steers (smarty-dev#854). In an interactive Main, clamped to 60 s, and the bound returns the live status with waitTimedOut: true (smarty-dev#2119)` },
   },
   required: ["id"],
   additionalProperties: false,

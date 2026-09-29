@@ -182,6 +182,25 @@ describe("installSelfReload", () => {
     expect(context.reload).toHaveBeenCalledTimes(1);
   });
 
+  it("a deferred command that finds the Main busy keeps checking (review/astra round 2 note)", async () => {
+    vi.useFakeTimers();
+    let busy = 0;
+    const { next, emit, commands, sent, selfReload } = setup({ busy: () => busy });
+    const context = fakeContext("s-late-busy", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    emit("agent_settled", context);
+    expect(sent).toHaveLength(1);
+    busy = 1; // an actor run started between the settle and the deferred command
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).not.toHaveBeenCalled();
+    busy = 0; // it ended with no Main turn
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(sent).toHaveLength(2);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(1);
+  });
+
   it("the command defers when a turn or a queued message arrived meanwhile", async () => {
     const { next, commands, selfReload } = setup();
     const state = { idle: true, pending: true };

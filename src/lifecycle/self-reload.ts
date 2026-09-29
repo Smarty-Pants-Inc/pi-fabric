@@ -190,9 +190,15 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
   pi.on("agent_settled", (_event, context) => {
     stopRetry();
     // Pi defers a prompt sent while agent_settled handlers run until they finish.
-    if (request(context)) return;
-    // Busy: the last task agent or actor run can end with no new turn (an actor bound to
-    // agent_settled starts right now), so re-check while the Main stays idle.
+    if (!request(context)) armRetry(context);
+  });
+
+  /**
+   * Busy: the last task agent or actor run can end with no new turn (an actor bound to
+   * agent_settled starts right now), so re-check while the Main stays idle.
+   */
+  const armRetry = (context: ExtensionContext): void => {
+    stopRetry();
     retry = setInterval(() => {
       try {
         if (!context.isIdle()) return stopRetry(); // a new run settles and re-checks
@@ -203,10 +209,13 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       }
     }, RETRY_MS);
     retry.unref?.();
-  });
+  };
 
   pi.on("session_shutdown", () => stopRetry());
+  let statusShown = false;
   pi.on("input", (_event, context) => {
+    if (!statusShown) return;
+    statusShown = false;
     if (context.hasUI) context.ui.setStatus(SELF_RELOAD_STATUS, undefined);
   });
 
@@ -217,7 +226,11 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       const target = watch?.check();
       const say = (message: string) => { if (!auto && context.hasUI) context.ui.notify(message, "info"); };
       if (!watch || !target) return say("No newer Fabric release is active.");
-      if (!safe(context)) return say("Fabric reloads after its task agents and actor runs finish.");
+      if (!safe(context)) {
+        // A run that started after the settle can end with no Main turn: keep checking (round 2 note).
+        if (auto) armRetry(context);
+        return say("Fabric reloads after its task agents and actor runs finish.");
+      }
       const sessionId = context.sessionManager.getSessionId();
       if (auto && attemptedSelfReload(sessionId, target)) return;
       rememberSelfReload(sessionId, watch.loaded, target);
@@ -239,6 +252,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       // A session switch in this runtime keeps the watch (and its profile check) taken at load.
       if (watch?.loaded !== loaded) watch = new ActiveReleaseWatch(loaded, deps.settingsPath);
       const done = takeSelfReload(context.sessionManager.getSessionId(), reason);
+      statusShown = done !== undefined; // index.ts shows the footer notice for a finished self-reload
       return done ? { old: releaseLabel(done.old), new: releaseLabel(loaded) } : undefined;
     },
   };

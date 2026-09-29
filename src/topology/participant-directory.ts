@@ -92,6 +92,21 @@ const capabilities = new Set([
   "fabric",
 ]);
 
+interface ParsedDirectory {
+  hosts: MeshStateEntry[];
+  participants: FabricParticipantRecord[];
+  legacySessions: MeshStateEntry[];
+  legacyActors: MeshStateEntry[];
+}
+
+const deepFreeze = <T>(value: T): T => {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+};
+
 const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
   const value = entry.value as Partial<FabricParticipantRecord>;
@@ -291,6 +306,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #heartbeatMs: number;
   readonly #leaseMs: number;
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
+  #parsedCache: { token: object; value: ParsedDirectory } | undefined;
+  #leaseRead: { at: number; leases: ReturnType<typeof readHostLeases> } | undefined;
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
   #refreshing: Promise<void> | undefined;
@@ -432,11 +449,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       return [...byId.values()];
     }
     const read = { fresh: options.fresh === true };
-    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read));
+    const parsed = this.#parsed(read);
+    const hosts = this.#liveHosts(parsed.hosts, !read.fresh);
     const byId = new Map<string, FabricParticipantInfo>();
-    for (const entry of this.mesh.listAll(PARTICIPANT_PREFIX, read)) {
-      const participant = participantFromEntry(entry);
-      if (!participant) continue;
+    for (const participant of parsed.participants) {
       const owner = hosts.get(participant.ownerHostId);
       const stale =
         !owner ||
@@ -454,8 +470,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
     }
     const legacyRoots = new Map(
-      this.mesh
-        .listAll(LEGACY_SESSION_PREFIX, read)
+      parsed.legacySessions
         .flatMap((entry) => {
           const root = legacyRootFromEntry(entry, this.options.rootId, now);
           return root ? [[root.id, root] as const] : [];
@@ -468,7 +483,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }
       if (!options.kinds || options.kinds.includes("actor")) {
-        for (const entry of this.mesh.listAll(LEGACY_ACTOR_PREFIX, read)) {
+        for (const entry of parsed.legacyActors) {
           const actor = legacyActorFromEntry(entry, legacyRoots);
           if (actor && !byId.has(actor.id)) byId.set(actor.id, actor);
         }
@@ -488,10 +503,41 @@ export class ParticipantDirectory implements FabricParticipantSource {
     );
   }
 
+  // The directory's records, parsed once per parse of the shared state. list() ran for every
+  // dashboard rebuild, peer listing and ownership check, and each call cloned every participant
+  // and host record of the fleet state: most of an idle Pi's CPU (smarty-dev#557). The cached
+  // records are frozen, since every caller now shares them.
+  #parsed(read: { fresh: boolean }): ParsedDirectory {
+    const token = typeof this.mesh.stateToken === "function" ? this.mesh.stateToken(read) : undefined;
+    const cached = this.#parsedCache;
+    if (token !== undefined && cached?.token === token) return cached.value;
+    const value: ParsedDirectory = {
+      hosts: this.mesh.listAll(HOST_PREFIX, read).map(deepFreeze),
+      participants: this.mesh.listAll(PARTICIPANT_PREFIX, read)
+        .flatMap((entry) => {
+          const participant = participantFromEntry(entry);
+          return participant ? [deepFreeze(participant)] : [];
+        }),
+      legacySessions: this.mesh.listAll(LEGACY_SESSION_PREFIX, read).map(deepFreeze),
+      legacyActors: this.mesh.listAll(LEGACY_ACTOR_PREFIX, read).map(deepFreeze),
+    };
+    this.#parsedCache = token === undefined ? undefined : { token, value };
+    return value;
+  }
+
   // Valid host records by id, each with its effective expiry: the later of its shared-state
   // lease and its file lease (smarty-dev#816).
-  #liveHosts(entries: Iterable<MeshStateEntry>): Map<string, FabricHostRecord> {
-    const leases = readHostLeases(this.mesh.root);
+  // A listing reuses the lease files it read within a fifth of a heartbeat (1 s by default):
+  // the dashboard lists the directory three times per rebuild, and each read stats every host's
+  // lease file (smarty-dev#557). A lease is renewed every heartbeat and lasts three, so a read
+  // this recent never shows a live host as lapsed. Fresh reads, and single lookups, read the files.
+  #liveHosts(entries: Iterable<MeshStateEntry>, reuse = false): Map<string, FabricHostRecord> {
+    const now = Date.now();
+    const recent = this.#leaseRead;
+    const leases = reuse && recent && now - recent.at >= 0 && now - recent.at < this.#heartbeatMs / 5
+      ? recent.leases
+      : readHostLeases(this.mesh.root);
+    if (reuse && leases !== recent?.leases) this.#leaseRead = { at: now, leases };
     const hosts = new Map<string, FabricHostRecord>();
     for (const entry of entries) {
       const host = hostFromEntry(entry);
@@ -601,10 +647,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   self(now = Date.now()): FabricParticipantInfo {
     const existing =
       this.#localRecords.get(this.options.identity.id) ??
-      this.mesh
-        .listAll(PARTICIPANT_PREFIX)
-        .map(participantFromEntry)
-        .find((participant) => participant?.id === this.options.identity.id);
+      this.#parsed({ fresh: false }).participants
+        .find((participant) => participant.id === this.options.identity.id);
     if (existing) {
       return {
         ...existing,

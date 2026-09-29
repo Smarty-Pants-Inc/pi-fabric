@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
@@ -1145,5 +1146,56 @@ describe("ParticipantDirectory", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(directory.writeStalled()).toBeUndefined();
     expect(() => directory.sessions()).not.toThrow();
+  });
+});
+
+// smarty-dev#557: every dashboard rebuild, peer listing and ownership check cloned the whole
+// fleet directory. The directory now parses the shared state once per parse of the file.
+describe("ParticipantDirectory reads", () => {
+  const identity: MeshIdentity = { id: "session:reader", name: "main", kind: "main", sessionId: "reader" };
+  const writer: MeshIdentity = { id: "session:writer", name: "main", kind: "main", sessionId: "writer" };
+
+  it("reuse one parse while the state is unchanged, and see a write at once", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const reader = createDirectory(meshRoot, identity, identity.id, () => [rootRecord(identity.id, identity.id, "reader")],
+      { heartbeatMs: 60_000, leaseMs: 120_000 });
+    const peer = createDirectory(meshRoot, writer, writer.id, () => [rootRecord(writer.id, writer.id, "writer")],
+      { heartbeatMs: 60_000, leaseMs: 120_000 });
+    await reader.start();
+    await peer.start();
+    const listAll = vi.spyOn(reader.mesh, "listAll");
+    const first = reader.list({ scope: "project" });
+    const calls = listAll.mock.calls.length;
+    expect(first.map((participant) => participant.id)).toContain(writer.id);
+    for (let i = 0; i < 5; i++) reader.list({ scope: "project" });
+    reader.peers();
+    expect(listAll.mock.calls.length).toBe(calls);                 // no clone of the directory per call
+    // Callers get their own top-level objects; the shared parse is frozen.
+    first[0]!.status = "changed";
+    expect(reader.list({ scope: "project" })[0]!.status).not.toBe("changed");
+    expect(Object.isFrozen(reader.list({ scope: "project" })[0]!.capabilities)).toBe(true);
+
+    await store.put({ key: "topology/participants/" + createHash("sha256").update("session:writer:agent").digest("hex"),
+      value: agentRecord("session:writer:agent", writer.id, writer.id, writer.id), identity: writer });
+    expect(reader.list({ scope: "project", fresh: true }).map((participant) => participant.id))
+      .toContain("session:writer:agent");
+    listAll.mockRestore();
+  });
+});
+
+describe("MeshStore.list", () => {
+  it("returns the first page, sorted, as copies", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
+    roots.push(root);
+    const store = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000);
+    const identity: MeshIdentity = { id: "session:a", name: "main", kind: "main" };
+    for (const key of ["c", "a", "b"]) await store.put({ key: "x/" + key, value: { key }, identity });
+    const page = store.list("x/", 2);
+    expect(page.map((entry) => entry.key)).toEqual(["x/a", "x/b"]);
+    (page[0]!.value as { key: string }).key = "mutated";
+    expect((store.get("x/a")!.value as { key: string }).key).toBe("a");
   });
 });

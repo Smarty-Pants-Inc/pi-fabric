@@ -165,10 +165,14 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
   ) {
     return undefined;
   }
+  // A mirrored root's label comes from its own mesh's sequence, so it can repeat a local label:
+  // the host suffix keeps every label a selector can match unique (smarty-dev#2004).
+  const at = participant.remoteHost ? `@${participant.remoteHost}` : "";
+  const label = participant.label ? participant.label + at : undefined;
   return {
     id: participant.id,
-    name: participant.label ?? "Peer " + participant.sessionId.slice(0, 8),
-    ...(participant.label ? { label: participant.label } : {}),
+    name: label ?? "Peer " + participant.sessionId.slice(0, 8) + at,
+    ...(label ? { label } : {}),
     ...(typeof participant.role === "string" ? { role: participant.role } : {}),
     ...(typeof participant.project === "string" ? { project: participant.project } : {}),
     kind: "peer",
@@ -201,6 +205,9 @@ const ownerMatches = (
 
 const isLocal = (participant: FabricParticipantRecord, localHostId: string): boolean =>
   participant.remoteHost === undefined && participant.ownerHostId === localHostId;
+
+/** Mesh topic of a refused mirrored record (smarty-dev#2004); one event per collision and process. */
+export const MIRROR_COLLISION_TOPIC = "fabric.topology.mirror-refused";
 
 const legacyRootFromEntry = (
   entry: MeshStateEntry,
@@ -316,6 +323,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #heartbeatMs: number;
   readonly #leaseMs: number;
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
+  readonly #reportedCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
   #refreshing: Promise<void> | undefined;
@@ -459,11 +467,16 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const read = { fresh: options.fresh === true };
     const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read));
     const byId = new Map<string, FabricParticipantInfo>();
+    const refused: string[] = [];
     for (const entry of this.mesh.listAll(PARTICIPANT_PREFIX, read)) {
       const participant = participantFromEntry(entry);
       if (!participant) continue;
       const owner = hosts.get(participant.ownerHostId);
       if (!ownerMatches(participant, owner, this.options.hostId)) continue;
+      if (this.#collides(participant, hosts)) {
+        refused.push(participant.id);
+        continue;
+      }
       const stale =
         !owner ||
         owner.expiresAt < now ||
@@ -475,6 +488,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (options.scope === "lineage" && participant.rootId !== this.options.rootId) continue;
       if (options.kinds && !options.kinds.includes(participant.kind)) continue;
       byId.set(participant.id, { ...participant, local, stale });
+    }
+    // A local record a mirror overwrote in the shared state still answers from memory until
+    // this host's next heartbeat puts it back: local always wins (smarty-dev#2004).
+    for (const id of refused) {
+      const record = this.#localRecords.get(id);
+      if (!record || byId.has(id)) continue;
+      if (options.scope === "lineage" && record.rootId !== this.options.rootId) continue;
+      if (options.kinds && !options.kinds.includes(record.kind)) continue;
+      byId.set(id, { ...record, local: true, stale: false });
     }
     const legacyRoots = new Map(
       this.mesh
@@ -523,6 +545,38 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return hosts;
   }
 
+  // A mirrored record never shadows a local target (smarty-dev#2004): it is refused when its id
+  // or root is a participant this host publishes, this host's own root or identity, or any
+  // unmirrored host's id, root or identity on this mesh.
+  // ponytail: a mirror that overwrote another local host's child agent is not detectable here;
+  // that host's next heartbeat takes its key back, and the bridge never overwrites unmirrored keys.
+  #collides(participant: FabricParticipantRecord, hosts: ReadonlyMap<string, FabricHostRecord>): boolean {
+    if (participant.remoteHost === undefined) return false;
+    const ids = new Set([participant.id, participant.rootId]);
+    let collides = [...ids].some((id) =>
+      this.#localRecords.has(id) || id === this.options.rootId || id === this.options.identity.id);
+    for (const host of hosts.values()) {
+      if (collides) break;
+      collides = host.remoteHost === undefined &&
+        (ids.has(host.id) || ids.has(host.rootId) || ids.has(host.identity.id));
+    }
+    if (collides) this.#reportCollision(participant);
+    return collides;
+  }
+
+  #reportCollision(participant: FabricParticipantRecord): void {
+    const key = `${participant.id}\0${participant.remoteHost}`;
+    if (this.#reportedCollisions.has(key) || this.#reportedCollisions.size >= 1_000) return;
+    this.#reportedCollisions.add(key);
+    void this.mesh.publish({
+      topic: MIRROR_COLLISION_TOPIC,
+      kind: "refused",
+      from: this.options.identity,
+      text: `Refused mirrored record ${participant.id} from remote host ${participant.remoteHost}: it collides with a local participant`,
+      data: { id: participant.id, rootId: participant.rootId, remoteHost: participant.remoteHost, ownerHostId: participant.ownerHostId },
+    }).catch(() => undefined);
+  }
+
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {
     if (!this.options.enabled) return undefined;
     const target = id === "main" ? this.options.rootId : id;
@@ -551,7 +605,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const read = { fresh: options.fresh === true };
       const entry = this.mesh.get(keyFor(PARTICIPANT_PREFIX, target), read);
       const participant = entry ? participantFromEntry(entry) : undefined;
-      if (participant?.id === target) {
+      if (participant?.id === target && (
+        participant.remoteHost === undefined ||
+        !this.#collides(participant, this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read)))
+      )) {
         const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId), read);
         const owner = hostEntry ? hostFromEntry(hostEntry) : undefined;
         const lease = owner ? readHostLease(this.mesh.root, owner.id) : undefined;
@@ -956,9 +1013,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!this.options.enabled) return;
     for (const record of desired.values()) {
       if (record.kind !== "root" || record.id !== this.options.rootId || record.label) continue;
+      const published = this.#localRecords.get(record.id)?.label;
+      if (published) {
+        record.label = published;
+        continue;
+      }
       const existingEntry = this.mesh.get(keyFor(PARTICIPANT_PREFIX, record.id));
       const existing = existingEntry ? participantFromEntry(existingEntry) : undefined;
-      if (existing?.label) {
+      // Only this mesh's own record keeps a label: a mirror at the key never names a local root.
+      if (existing?.label && existing.remoteHost === undefined) {
         record.label = existing.label;
         continue;
       }

@@ -69,6 +69,21 @@ const refused: Array<[string, string]> = [
   ["cd /tmp, then a loop fed by ls in a process substitution", `cd /tmp && while read d; do rm -rf "$d"; done < <(ls)`],
   ["an array of a /tmp listing", `dirs=($(ls -d /tmp/tmp.*)); rm -rf "\${dirs[@]}"`],
   ["xargs --arg-file with a process substitution", `xargs --arg-file=<(ls -d /tmp/tmp.*) rm -rf`],
+  // Round 3 on PR #148, security F4: redirect listings use the state at the redirect, not script entry.
+  ["F4: a loop variable feeds a redirected find listing", `for t in /tmp /var/tmp; do while read -r d; do rm -rf "$d"; done < <(find "$t" -maxdepth 1 -name 'tmp.*' -mmin +60); done`],
+  ["F4: an assigned root feeds redirected xargs", `T=/tmp; xargs -0 rm -rf < <(find "$T" -maxdepth 1 -name 'tmp.*' -print0)`],
+  ["F4: an assigned root feeds redirected mapfile", `T=/tmp; mapfile -t dirs < <(ls -d "$T"/tmp.*); rm -rf "\${dirs[@]}"`],
+  ["F4: an assigned root feeds redirected readarray", `T=/tmp; readarray -t dirs < <(ls -d "$T"/tmp.*); rm -rf "\${dirs[@]}"`],
+  ["F4: cd -P to a shared root before a redirected loop", `cd -P /tmp && while read -r d; do rm -rf "$d"; done < <(ls)`],
+  ["F4: cd -- to a shared root before a redirected loop", `cd -- /tmp && while read -r d; do rm -rf "$d"; done < <(ls)`],
+  ["F4: cd through an assigned root before a redirected loop", `T=/tmp; cd "$T" && while read -r d; do rm -rf "$d"; done < <(ls)`],
+  // Security F5: a compound producer's listing survives its closing word/operator before the pipe.
+  ["F5: a loop listing both shared roots feeds xargs", `for t in /tmp /var/tmp; do find "$t" -maxdepth 1 -name 'tmp.*' -mmin +60; done | xargs rm -rf`],
+  ["F5: a brace group listing both shared roots feeds xargs", `{ ls -d /tmp/tmp.*; ls -d /var/tmp/tmp.*; } | xargs rm -rf`],
+  ["F5: a subshell listing a shared root feeds xargs", `(ls -d /tmp/tmp.*) | xargs rm -rf`],
+  ["F5: a loop listing both shared roots feeds read", `for t in /tmp /var/tmp; do find "$t" -maxdepth 1 -name 'tmp.*' -mmin +60; done | while read -r d; do rm -rf "$d"; done`],
+  ["F5: a brace group listing both shared roots feeds read", `{ ls -d /tmp/tmp.*; ls -d /var/tmp/tmp.*; } | while read -r d; do rm -rf "$d"; done`],
+  ["F5: a subshell listing a shared root feeds read", `(ls -d /tmp/tmp.*) | while read -r d; do rm -rf "$d"; done`],
 ];
 
 const allowed: Array<[string, string]> = [
@@ -118,6 +133,22 @@ const allowed: Array<[string, string]> = [
   ["cd to the own dir, then ls | xargs rm", `cd "$D" && ls | xargs rm -f`],
   ["cd to an exact tmp dir, then ls | xargs rm", `cd /tmp/tmp.AbC123 && ls | xargs rm -f`],
   ["cd /tmp, then a recorded mktemp dir", `cd /tmp && D=$(mktemp -d) && rm -rf "$D"`],
+  // Round 3 F4/F5 counterparts: an own-directory listing must not become a shared-root feed.
+  ["F4: a while loop over an own process-substitution listing", `while read -r f; do rm -f "$D/$f"; done < <(ls "$D")`],
+  ["F4: a recorded mktemp dir feeds an own redirected loop", `D=$(mktemp -d); while read -r f; do rm -f "$D/$f"; done < <(ls "$D")`],
+  ["F4: a loop variable feeds redirected listings of exact own dirs", `for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do while read -r d; do rm -rf "$d"; done < <(find "$t" -maxdepth 1 -name '*.json'); done`],
+  ["F4: an assigned exact own dir feeds redirected xargs", `T=/tmp/tmp.AbC123; xargs -0 rm -f < <(find "$T" -maxdepth 1 -name '*.json' -print0)`],
+  ["F4: an assigned exact own dir feeds redirected mapfile", `T=/tmp/tmp.AbC123; mapfile -t files < <(ls -d "$T"/*.json); rm -f "\${files[@]}"`],
+  ["F4: an assigned exact own dir feeds redirected readarray", `T=/tmp/tmp.AbC123; readarray -t files < <(ls -d "$T"/*.json); rm -f "\${files[@]}"`],
+  ["F4: cd -P to an exact own dir before a redirected loop", `cd -P /tmp/tmp.AbC123 && while read -r f; do rm -f "$f"; done < <(ls)`],
+  ["F4: cd -- to an exact own dir before a redirected loop", `cd -- /tmp/tmp.AbC123 && while read -r f; do rm -f "$f"; done < <(ls)`],
+  ["F4: cd through an assigned exact own dir before a redirected loop", `T=/tmp/tmp.AbC123; cd "$T" && while read -r f; do rm -f "$f"; done < <(ls)`],
+  ["F5: a loop listing exact own dirs feeds xargs", `for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do find "$t" -maxdepth 1 -name '*.json'; done | xargs rm -f`],
+  ["F5: a brace group listing exact own dirs feeds xargs", `{ ls -d /tmp/tmp.AbC123/*.json; ls -d /var/tmp/tmp.Def456/*.json; } | xargs rm -f`],
+  ["F5: a subshell listing an exact own dir feeds xargs", `(ls -d /tmp/tmp.AbC123/*.json) | xargs rm -f`],
+  ["F5: a loop listing exact own dirs feeds read", `for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do find "$t" -maxdepth 1 -name '*.json'; done | while read -r f; do rm -f "$f"; done`],
+  ["F5: a brace group listing exact own dirs feeds read", `{ ls -d /tmp/tmp.AbC123/*.json; ls -d /var/tmp/tmp.Def456/*.json; } | while read -r f; do rm -f "$f"; done`],
+  ["F5: a subshell listing an exact own dir feeds read", `(ls -d /tmp/tmp.AbC123/*.json) | while read -r f; do rm -f "$f"; done`],
 ];
 
 describe("tmp-wipe guard (smarty-dev#1998)", () => {

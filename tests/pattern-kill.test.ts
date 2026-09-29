@@ -35,6 +35,13 @@ const refused: Array<[string, string]> = [
   // Security N5 on pi-fabric#148: the same lookup fed through a redirect.
   ["a while loop fed by a pgrep process substitution", `while read p; do kill "$p"; done < <(pgrep x)`],
   ["xargs kill fed by a pgrep here-string", `xargs kill <<< "$(pgrep x)"`],
+  // Round 3 security N8 on #148: a compound producer's lookup survives the closing group/loop.
+  ["N8: a brace group lookup feeds xargs kill", `{ pgrep x; } | xargs kill`],
+  ["N8: a subshell lookup feeds xargs kill", `(pgrep x) | xargs kill`],
+  ["N8: a loop lookup feeds xargs kill", `for name in worker server; do pgrep -f "$name"; done | xargs kill`],
+  ["N8: a brace group lookup feeds read then kill", `{ pgrep x; } | while read -r p; do kill "$p"; done`],
+  ["N8: a subshell lookup feeds read then kill", `(pgrep x) | while read -r p; do kill "$p"; done`],
+  ["N8: a loop lookup feeds read then kill", `for name in worker server; do pgrep -f "$name"; done | while read -r p; do kill "$p"; done`],
   ["bash -c 'pkill …'", `bash -c 'pkill -f server'`],
   ["bash -lc 'kill $(pgrep …)'", `bash -lc 'kill $(pgrep -f server)'`],
   ["sh -c with pgrep | xargs kill", `sh -c "pgrep -f x | xargs kill"`],
@@ -183,6 +190,13 @@ const allowed: Array<[string, string]> = [
   ["sudo --user=root kill of a literal PID", `sudo --user=root kill 4242`],
   ["a recorded PID in bash -c", `PID=$!; bash -c "kill $PID"`],
   ["a PID file piped into xargs kill", `cat run.pid | xargs kill`],
+  // N8 counterparts: grouping recorded PID files does not turn them into process-name lookups.
+  ["N8: a brace group of recorded PID files feeds xargs kill", `{ cat .local/server.pid; cat .local/worker.pid; } | xargs kill`],
+  ["N8: a subshell with a recorded PID file feeds xargs kill", `(cat .local/server.pid) | xargs kill`],
+  ["N8: a loop of recorded PID files feeds xargs kill", `for file in .local/server.pid .local/worker.pid; do cat "$file"; done | xargs kill`],
+  ["N8: a brace group of recorded PID files feeds read then kill", `{ cat .local/server.pid; cat .local/worker.pid; } | while read -r p; do kill "$p"; done`],
+  ["N8: a subshell with a recorded PID file feeds read then kill", `(cat .local/server.pid) | while read -r p; do kill "$p"; done`],
+  ["N8: a loop of recorded PID files feeds read then kill", `for file in .local/server.pid .local/worker.pid; do cat "$file"; done | while read -r p; do kill "$p"; done`],
   ["a pgrep count, then a recorded kill", `N=$(pgrep -c worker); kill "$PID"`],
   ["bash -c \"kill $PID\"", `bash -c "kill $PID"`],
   ["bash -c echo of a lookup", `bash -c 'echo "kill $(pgrep x) is refused"'`],

@@ -267,8 +267,9 @@ function tmpGlob(pattern: string, cwd: string | undefined): boolean {
 }
 
 // `blocked`: a kill by pattern. `lookup`: runs a name lookup (LOOKUPS) anywhere.
-// `wipe`: a delete over a /tmp glob (smarty-dev#1998). `tmpList`: a word names a /tmp glob, so its output may list other agents' dirs.
+// `wipe`: a delete over a /tmp glob (smarty-dev#1998). `tmpList`: a stage or substitution may list other agents' dirs.
 type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean };
+type Feed = { lookup: boolean; tmp: boolean };
 type Command = { words: Word[]; redirects: Word[]; heredocs: Array<{ body: string; quoted: boolean }> };
 
 /** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
@@ -322,6 +323,19 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
  */
 function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), tmpIn: ReadonlySet<string> = new Set(),
   context: Context = { root: script, owned: new Set(), values: new Map(), unknown: new Set() }): Verdict {
+  // Security F4/F5 on PR #148: collect provenance with the state at each command, then replay from
+  // the same entry state. Whole-script feed reaches bodies before `done < <(…)` and group pipelines.
+  const first = scanPass(script, depth, names, tmpIn, context, { lookup: false, tmp: false });
+  if (!first.lookup && !first.tmpList) return first;
+  const second = scanPass(script, depth, names, tmpIn, context, { lookup: first.lookup, tmp: first.tmpList });
+  return {
+    blocked: first.blocked || second.blocked, lookup: first.lookup || second.lookup,
+    wipe: first.wipe || second.wipe, tmpList: first.tmpList || second.tmpList,
+  };
+}
+
+function scanPass(script: string, depth: number, names: ReadonlySet<string>, tmpIn: ReadonlySet<string>,
+  context: Context, fed: Feed): Verdict {
   const verdict: Verdict = { blocked: false, lookup: false, wipe: false, tmpList: false };
   if (depth > 6) return verdict;
   // Variables whose value comes from a name lookup (`P=$(pgrep …)`, `for p in $(pgrep …)`,
@@ -360,22 +374,7 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
   const unknownOperand = (pattern: string): boolean =>
     [...pattern.matchAll(REFERENCE)].some((match) => match[1] === "$" && unknown.has(match[2]!)) && MENTIONS_TMP.test(context.root);
 
-  // Security F1/N5 on PR #148: a lookup or /tmp listing fed by a redirect (`done < <(…)`, `<<< "$(…)"`,
-  // a heredoc) may reach any read, mapfile or xargs of this script. ponytail: whole script, not per stage.
   const tokens = tokenize(script);
-  const fed = { lookup: false, tmp: false };
-  const cdTmp = tmpGlob(".", cwd) || tokens.some((token, i) => {
-    const next = tokens[i + 1];
-    return "word" in token && token.word.text === "cd" && !!next && "word" in next && tmpGlob(next.word.pattern, cwd);
-  });
-  for (const token of tokens) {
-    const subs = "redirect" in token ? token.redirect.subs : "heredoc" in token && !token.heredoc.quoted ? expandHeredoc(token.heredoc.body).subs : [];
-    for (const sub of subs) {
-      const inner = scan(sub, depth + 1, tainted, tmpNames, { ...context, cwd, values, unknown });
-      fed.lookup ||= inner.lookup;
-      fed.tmp ||= inner.tmpList || cdTmp;
-    }
-  }
 
   const runPipeline = (): void => {
     let pipeFeed = fed.lookup;
@@ -392,7 +391,11 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
         const inner = nested(sub);
         if (/^\s*mktemp(\s|$)/.test(sub)) context.owned.add(expansion.names[k]!);
         // Security F3: after `cd /tmp`, any captured output (`$(ls)`) may list /tmp.
-        if (inner.tmpList || (tmpGlob(".", cwd) && !/^\s*mktemp(\s|$)/.test(sub))) tmpNames.add(expansion.names[k]!);
+        if (inner.tmpList || (tmpGlob(".", cwd) && !/^\s*mktemp(\s|$)/.test(sub))) {
+          tmpNames.add(expansion.names[k]!);
+          // A redirect on `done` has no consumer in this pass; retain its feed for the replay.
+          verdict.tmpList = true;
+        }
         if (!inner.lookup) return;
         captured = true;
         tainted.add(expansion.names[k]!);
@@ -501,6 +504,10 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
         listsTmp = result.tmpList || listsTmp;
       }
       if (lookup) verdict.lookup = true;
+      // A recorded PID file is an explicit pipeline source, not the whole-script lookup fallback.
+      // Preserve `pgrep …; cat run.pid | xargs kill` without clearing a real lookup in this pipeline.
+      if (position === 0 && piped && name === "cat" && !captured &&
+        args.some((arg) => !arg.text.startsWith("-")) && !args.some((arg) => arg.text === "-" || fromLookup(arg.text))) pipeFeed = false;
       if (piped && lookup) pipeFeed = true;
       if (listsTmp) verdict.tmpList = true;
       if (piped && listsTmp) pipeTmp = true;

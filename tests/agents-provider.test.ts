@@ -2314,11 +2314,12 @@ describe("AgentsProvider steering", () => {
   it("stops a finished durable agent with its terminal record, not Unknown participant", async () => {
     const { agents, actors, globalActors, mainAgent, participants, control, lifecycle } = setup();
     const id = "b".repeat(32);
-    let status = "completed";
+    let settled: unknown = { id, name: "durable", status: "completed", text: "done", residency: "durable" };
     const acknowledged: string[] = [];
     const residency = {
       hasAgent: (candidate: string) => candidate === id,
-      statusAgent: () => ({ id, name: "durable", status, text: "done", residency: "durable" }),
+      settledAgent: (candidate: string) => candidate === id ? settled : undefined,
+      statusAgent: () => ({ id, name: "durable", status: "stopped", residency: "durable" }),
       acknowledgeCompletion: (candidate: string) => acknowledged.push(candidate),
     } as unknown as ResidencyClient;
     const provider = new AgentsProvider(
@@ -2327,8 +2328,11 @@ describe("AgentsProvider steering", () => {
     );
     await expect(provider.invoke("stop", { id }, context)).resolves.toMatchObject({ status: "completed", text: "done" });
     expect(acknowledged).toEqual([id]);
-    status = "running";
+    // review/astra on #136: a terminal-looking attempt that a live host may resume is not settled;
+    // stop takes the participant route and acknowledges nothing.
+    settled = undefined;
     await expect(provider.invoke("stop", { id }, context)).rejects.toThrow("Unknown Fabric participant");
+    expect(acknowledged).toEqual([id]);
   });
 
   // review/astra on #57: the remote-Main branch of status said only "Unknown Fabric Main participant".

@@ -443,6 +443,30 @@ describe("durable completion receipts", () => {
     }
   });
 
+  // review/astra on pi-fabric#136: while a host lives, a stopped attempt may still resume or retry.
+  it("treats a terminal status.json as settled only once no host owns the run or the host saved it", async () => {
+    const state = await rootHarness("settled-terminal-record");
+    const seeded = await seedCompletion(state, "stopped");
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    fs.writeFileSync(ownerPath, JSON.stringify({
+      format: RESIDENT_HOST_FORMAT, hostId: residentHostId(state.identity.id), pid: process.pid, token: "t", startedAt: 1, readyAt: 1,
+    }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      expect(client.settledAgent(seeded.id)).toBeUndefined();
+      const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
+      fs.mkdirSync(path.dirname(resultPath), { recursive: true });
+      fs.writeFileSync(resultPath, JSON.stringify({ ...seeded.result, status: "completed" }));
+      expect(client.settledAgent(seeded.id)).toMatchObject({ status: "completed" });
+      fs.rmSync(resultPath);
+      fs.rmSync(ownerPath);
+      expect(client.settledAgent(seeded.id)).toMatchObject({ status: "stopped" });
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
   it("does not consume a result when a durable wait is aborted", async () => {
     const state = await rootHarness("aborted-completion-wait");
     const seeded = await seedCompletion(state, "running");
@@ -600,6 +624,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       hostPath,
     });
     await expect(reconnect.removeActor(actor.id)).resolves.toEqual({ removed: true });
+    // review/astra on pi-fabric#136: actor activations leave no saved durable task result.
+    const resultsDir = path.join(state.config.residencyRoot, "results");
+    expect(fs.existsSync(resultsDir) ? fs.readdirSync(resultsDir) : []).toEqual([]);
     const registry = JSON.parse(
       fs.readFileSync(path.join(state.config.actorRoot, "actors.json"), "utf8"),
     ) as { actors: Array<{ id: string }> };

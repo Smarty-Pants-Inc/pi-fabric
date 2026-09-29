@@ -238,6 +238,8 @@ class ResidentHost {
       },
       onLifecycle: (event) => void this.lifecycle?.publish(event).catch(() => undefined),
       onSettled: (result) => {
+        // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
+        if (result.actorId) return;
         const file = residentResultPath(config.residencyRoot, result.id);
         fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
         atomicWrite(file, result);

@@ -1395,12 +1395,11 @@ export class AgentsProvider implements FabricProvider {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
     }
     // A finished durable run has no participant after its host exits: return its result (smarty-dev#1882).
-    if (this.residency?.hasAgent(id)) {
-      const status = this.residency.statusAgent(id);
-      if (terminalAgentStatuses.has(status.status)) {
-        this.residency.acknowledgeCompletion(id);
-        return status;
-      }
+    // Only a settled run: a live host may still resume or retry a stopped attempt.
+    const settled = this.residency?.settledAgent(id);
+    if (settled) {
+      this.residency!.acknowledgeCompletion(id);
+      return settled;
     }
     const participant = this.participants.get(id);
     if (!participant) throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, id);

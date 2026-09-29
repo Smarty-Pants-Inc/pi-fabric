@@ -276,6 +276,21 @@ export class ResidencyClient {
     };
   }
 
+  /**
+   * The result of a durable run known to be settled: the host's saved terminal record, or any
+   * terminal status once no host owns the run. A worker's terminal status.json alone is not
+   * settlement while a host lives: a stopped or failed attempt can still resume or retry, so a
+   * stop must go to the host (review/astra on pi-fabric#136).
+   */
+  settledAgent(id: string): AgentRunResult | undefined {
+    const metadata = this.#metadata(id);
+    if (!metadata) return undefined;
+    const saved = readJson<AgentRunRecord>(residentResultPath(this.options.config.residencyRoot, id));
+    if (!(saved?.id === id && terminal(saved.status)) && this.#liveOwner()) return undefined;
+    const status = this.statusAgent(id);
+    return terminal(status.status) && "startedAt" in status ? status as AgentRunResult : undefined;
+  }
+
   listAgents(): Array<AgentRunRecord | AgentHandleInfo> {
     let entries: string[];
     try {
@@ -457,10 +472,10 @@ export class ResidencyClient {
    * running: report it failed rather than the stale spawn handle (smarty-dev#1882).
    */
   #record(metadata: ResidentAgentMetadata): AgentRunRecord | undefined {
-    const live = readJson<AgentRunRecord>(path.join(metadata.runDirectory, "status.json"));
-    if (live?.id === metadata.id) return live;
     const saved = readJson<AgentRunRecord>(residentResultPath(this.options.config.residencyRoot, metadata.id));
     if (saved?.id === metadata.id && terminal(saved.status)) return saved;
+    const live = readJson<AgentRunRecord>(path.join(metadata.runDirectory, "status.json"));
+    if (live?.id === metadata.id) return live;
     if (fs.existsSync(metadata.runDirectory) || this.#liveOwner()) return undefined;
     const { handle } = metadata;
     return {

@@ -71,6 +71,7 @@ import {
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
+import { resolveWithModelRefresh } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
 import { agentWaitBound, describeWaitBound } from "../agents/wait-bound.js";
@@ -426,6 +427,17 @@ export class AgentsProvider implements FabricProvider {
   #resolvePiModel(
     model: string,
     context: FabricInvocationContext,
+  ): Promise<string> {
+    // A model added to models.json after startup resolves after one shared refresh (smarty-dev#1830).
+    return resolveWithModelRefresh(
+      context.extensionContext.modelRegistry,
+      () => this.#resolveVisiblePiModel(model, context),
+    );
+  }
+
+  #resolveVisiblePiModel(
+    model: string,
+    context: FabricInvocationContext,
   ): string {
     let available: FabricModelCandidate[] = [];
     try {
@@ -445,11 +457,11 @@ export class AgentsProvider implements FabricProvider {
     return `${resolved.provider}/${resolved.id}`;
   }
 
-  #resolvePiModelArgs(
+  async #resolvePiModelArgs(
     args: Record<string, unknown>,
     context: FabricInvocationContext,
     runnerOverride?: FabricAgentRunner,
-  ): Record<string, unknown> {
+  ): Promise<Record<string, unknown>> {
     const runner = runnerOverride ??
       (args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
         ? args.runner
@@ -457,17 +469,17 @@ export class AgentsProvider implements FabricProvider {
     if (runner !== "pi") return args;
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) return args;
-    const resolved = this.#resolvePiModel(model, context);
+    const resolved = await this.#resolvePiModel(model, context);
     return resolved === model ? args : { ...args, model: resolved };
   }
 
-  #resolvePiRunBinding(
+  async #resolvePiRunBinding(
     binding: FabricActorRunBinding,
     runner: FabricAgentRunner,
     context: FabricInvocationContext,
-  ): FabricActorRunBinding {
+  ): Promise<FabricActorRunBinding> {
     if (runner !== "pi" || !binding.model) return binding;
-    return { ...binding, model: this.#resolvePiModel(binding.model, context) };
+    return { ...binding, model: await this.#resolvePiModel(binding.model, context) };
   }
 
   async list(
@@ -514,7 +526,7 @@ export class AgentsProvider implements FabricProvider {
         "agents.handoff must be scheduled from inside fabric_exec and completed at its outer result boundary",
       );
     }
-    const handoffArgs = this.#resolvePiModelArgs(
+    const handoffArgs = await this.#resolvePiModelArgs(
       { ...args, model },
       context,
       "pi",
@@ -537,7 +549,7 @@ export class AgentsProvider implements FabricProvider {
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
     const request = runRequest(
-      this.#resolvePiModelArgs(
+      await this.#resolvePiModelArgs(
         {
           ...args,
           task: handoffTask(args),
@@ -601,7 +613,7 @@ export class AgentsProvider implements FabricProvider {
     switch (actionName) {
       case "run": {
         const handle = await this.manager.spawn(
-          runRequest(this.#resolvePiModelArgs(args, context), context, this.manager),
+          runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager),
           context.signal,
         );
         this.participants.scheduleRefresh();
@@ -623,7 +635,7 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = runRequest(this.#resolvePiModelArgs(args, context), context, this.manager);
+        const request = runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
         const durableRequest = withInheritedSessionPins({
@@ -928,7 +940,7 @@ export class AgentsProvider implements FabricProvider {
           : this.manager.cleanup(id, args.deleteBranch === true);
       }
       case "create": {
-        const createArgs = this.#resolvePiModelArgs(args, context);
+        const createArgs = await this.#resolvePiModelArgs(args, context);
         if (createArgs.scope === "global") {
           return this.globalActors.create(actorRequest(createArgs, context, this.manager, false));
         }
@@ -946,7 +958,7 @@ export class AgentsProvider implements FabricProvider {
         const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
         const requestedOverrides = actorRunBinding(args);
         const overrides = ownsActor
-          ? this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context)
+          ? await this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context)
           : requestedOverrides;
         context.activity?.({
           type: "entity",
@@ -1077,7 +1089,7 @@ export class AgentsProvider implements FabricProvider {
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
         const runner = target.actor?.runner ?? target.participant!.runner;
         const resolvedModel = model && ownsActor
-          ? this.#resolvePiModelArgs({ model }, context, runner).model as string
+          ? (await this.#resolvePiModelArgs({ model }, context, runner)).model as string
           : model || undefined;
         return this.actorManager.setModel(
           id,
@@ -1195,11 +1207,11 @@ export class AgentsProvider implements FabricProvider {
         const resolvedRequest = request.model
           ? {
               ...request,
-              model: this.#resolvePiModelArgs(
+              model: (await this.#resolvePiModelArgs(
                 { model: request.model },
                 context,
                 request.runner ?? this.manager.config.runner,
-              ).model as string,
+              )).model as string,
             }
           : request;
         const actor = await this.#createActor(resolvedRequest);

@@ -50,7 +50,7 @@ export class AgentMessageRouter {
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown">,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
-    readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding,
+    readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
   ) {}
   #recentlyLapsedRoot(id: string): FabricParticipantInfo | undefined {
     // A write-stalled mesh explains the lapse, and delivery needs the mesh: report the stall.
@@ -199,7 +199,7 @@ export class AgentMessageRouter {
     const { actor, participant } = target;
     const localActor = Boolean(actor && (!participant || participant.local));
     const binding = options.binding && context && localActor
-      ? this.resolvePiRunBinding(options.binding, actor!.runner, context)
+      ? await this.resolvePiRunBinding(options.binding, actor!.runner, context)
       : options.binding;
     if (actor && localActor) {
       context?.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });

@@ -12,10 +12,16 @@ export interface FabricSandboxResult {
   logs: string[];
   terminationReason: FabricSandboxTerminationReason;
   error?: string;
+  /** Host-only deadline cause. Guest error text is never a ceiling identity. */
+  deadlineReason?: Error;
 }
 
 export interface FabricSandboxOptions {
   timeoutMs: number;
+  /** Host-owned absolute ceiling; host-call floors cannot extend it. */
+  maximumDeadlineAt?: number;
+  /** Opaque host-issued cause, used only when this runtime is clamped to that ceiling. */
+  maximumDeadlineReason?: Error;
   memoryLimitBytes: number;
   /** Optional uninterrupted guest CPU limit. Await host work/timers to yield. */
   maxCpuSliceMs?: number;

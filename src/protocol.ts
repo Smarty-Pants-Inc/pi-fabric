@@ -345,6 +345,8 @@ export interface FabricInvocationContext {
   activity?(update: FabricInvocationActivityUpdate): void;
   /** Host-owned absolute Main ceiling, shared by observations; never supplied by guest arguments. */
   readonly mainDeadlineAt?: number;
+  /** Host budget guard at effect admission and publication; never populated from guest arguments. */
+  readonly checkExecutionBudget?: () => void;
   /** Host-supplied inside fabric_exec so agents.handoff schedules the outer-call boundary. */
   deferHandoff?(args: Record<string, unknown>): Record<string, unknown>;
   // Out-of-band image content blocks a provider (currently only pi.read of an

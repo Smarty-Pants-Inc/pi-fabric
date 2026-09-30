@@ -1,3 +1,4 @@
+import { ExecutionDeadline } from "./execution-deadline.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mainExecutionCeilingAbortReason, runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
@@ -103,10 +104,7 @@ export class NodeProcessRuntime {
       };
     }
     const hostAbortController = new AbortController();
-    const startedAt = Date.now();
-    let effectiveTimeoutMs = options.timeoutMs;
-    let deadlineAt = startedAt + effectiveTimeoutMs;
-    let deadline: NodeJS.Timeout | undefined;
+    const executionDeadline = new ExecutionDeadline(options);
     let abortHandler: (() => void) | undefined;
     let settled = false;
     let finishing = false;
@@ -121,8 +119,12 @@ export class NodeProcessRuntime {
     return new Promise<FabricSandboxResult>((resolve) => {
       const finish = (result: FabricSandboxResult): void => {
         if (settled) return;
+        if (result.terminationReason === "completed" && executionDeadline.reached) {
+          hostAbortController.abort(executionDeadline.reason);
+          result = executionDeadline.timeoutResult([]);
+        }
         settled = true;
-        if (deadline) clearTimeout(deadline);
+        executionDeadline.clear();
         if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
         if (!hostAbortController.signal.aborted && hostTasks.size > 0) {
           hostAbortController.abort(new Error(result.error ?? "Process execution stopped"));
@@ -132,22 +134,15 @@ export class NodeProcessRuntime {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
         resolve(result);
       };
-      const scheduleDeadline = (): void => {
-        clearTimeout(deadline);
-        deadline = setTimeout(() => {
-          const error = `Execution timed out after ${effectiveTimeoutMs}ms`;
-          finish({ value: undefined, logs: [], terminationReason: "timed_out", error });
-        }, Math.min(2_147_483_647, Math.max(0, deadlineAt - Date.now())));
-        deadline.unref?.();
+      const expireDeadline = (): void => {
+        if (settled) return;
+        hostAbortController.abort(executionDeadline.reason);
+        finish(executionDeadline.timeoutResult([]));
       };
+      const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
       const extendDeadline = (ref: string, args: Record<string, unknown>): void => {
         const requested = options.minimumTimeoutMsForHostCall?.(ref, args);
-        if (typeof requested !== "number" || !Number.isFinite(requested)) return;
-        const nextDeadlineAt = Date.now() + Math.max(1, Math.floor(requested));
-        if (nextDeadlineAt <= deadlineAt) return;
-        deadlineAt = nextDeadlineAt;
-        effectiveTimeoutMs = deadlineAt - startedAt;
-        scheduleDeadline();
+        if (executionDeadline.extend(requested)) scheduleDeadline();
       };
 
       abortHandler = () => {
@@ -166,9 +161,10 @@ export class NodeProcessRuntime {
       child.on("message", (raw: unknown) => {
         if (settled || finishing || typeof raw !== "object" || raw === null) return;
         const message = raw as ChildMessage;
+        if (executionDeadline.reached) { expireDeadline(); return; }
         if (message.type === "result") {
           finishing = true;
-          if (deadline) clearTimeout(deadline);
+          executionDeadline.clear();
           if (message.result.terminationReason !== "completed" && !hostAbortController.signal.aborted) {
             hostAbortController.abort(new Error(message.result.error ?? "Process execution stopped"));
           }
@@ -193,11 +189,13 @@ export class NodeProcessRuntime {
         }
         if (message.type !== "call") return;
         extendDeadline(message.ref, message.args);
+        if (executionDeadline.reached) { expireDeadline(); return; }
         if (message.ref === "fabric.$timer") {
           const ms = Math.max(0, Number(message.args?.ms ?? 0));
           let timer: NodeJS.Timeout | undefined;
           const timerTask = new Promise<void>((resolveTask) => {
             timer = setTimeout(() => {
+              if (!settled && !finishing && executionDeadline.reached) expireDeadline();
               if (!settled && !finishing) {
                 send(child, { type: "response", id: message.id, ok: true, value: undefined });
               }
@@ -215,7 +213,10 @@ export class NodeProcessRuntime {
         const task = runAbortable(hostAbortController.signal, () =>
           hostCall(message.ref, message.args, hostAbortController.signal),
         ).then(
-          (value) => send(child, { type: "response", id: message.id, ok: true, value }),
+          (value) => {
+            if (executionDeadline.reached) { expireDeadline(); return; }
+            send(child, { type: "response", id: message.id, ok: true, value });
+          },
           (error) =>
             send(child, {
               type: "response",

@@ -1,6 +1,7 @@
 import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import ts from "typescript";
+import { ExecutionDeadline } from "./execution-deadline.js";
 import { runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
@@ -823,10 +824,7 @@ const disposeQuickJsContext = (context: any): void => {
   }
 };
 
-export interface QuickJsSandboxOptions extends FabricSandboxOptions {
-  /** Host-owned absolute ceiling. Unlike host-call floors, it cannot slide. */
-  maximumDeadlineAt?: number;
-}
+export type QuickJsSandboxOptions = FabricSandboxOptions;
 
 export class QuickJsRuntime {
   async execute(
@@ -891,16 +889,11 @@ export class QuickJsRuntime {
     const runtime = context.runtime;
     const jsonObject = context.getProp(context.global, "JSON");
     const jsonParse = context.getProp(jsonObject, "parse");
-    const executionStartedAt = Date.now();
-    let effectiveTimeoutMs = options.timeoutMs;
-    let executionDeadlineAt = Math.min(
-      executionStartedAt + effectiveTimeoutMs,
-      options.maximumDeadlineAt ?? Infinity,
-    );
+    const executionDeadline = new ExecutionDeadline(options);
     let interruptedByDeadline = false;
     // Timers cannot police an uninterrupted chain of already-resolved host
     // promises. Every boundary and the CPU interrupt use this same deadline.
-    const deadlineReached = (): boolean => interruptedByDeadline || Date.now() >= executionDeadlineAt;
+    const deadlineReached = (): boolean => interruptedByDeadline || executionDeadline.reached;
     let interruptedByCpu = false;
     let cpuDeadlineAt = Infinity;
     const pumpJobs = () => {
@@ -929,16 +922,15 @@ export class QuickJsRuntime {
     let closing = false;
     let cancelled = false;
     let timedOut = false;
-    let timeout: NodeJS.Timeout | undefined;
     let rejectDeadline: ((error: Error) => void) | undefined;
     let abortHandler: (() => void) | undefined;
     let activePromiseHandle: any;
     let executionGate: any;
     let pendingResolution: Promise<any> | undefined;
     const hostAbortController = new AbortController();
-    const abortHostCalls = (reason: string): void => {
+    const abortHostCalls = (reason: string | Error): void => {
       if (!hostAbortController.signal.aborted) {
-        hostAbortController.abort(new Error(reason));
+        hostAbortController.abort(reason instanceof Error ? reason : new Error(reason));
       }
     };
 
@@ -953,19 +945,20 @@ export class QuickJsRuntime {
     const timeoutMessage = (): string =>
       interruptedByCpu
         ? `Guest exceeded ${options.maxCpuSliceMs}ms uninterrupted CPU; await host work or program.sleep() in loops`
-        : `Execution timed out after ${effectiveTimeoutMs}ms`;
+        : executionDeadline.reason.message;
     const expireDeadline = (): void => {
       if (closing || cancelled || timedOut) return;
+      // Also guard direct callbacks: an early timer is not an ordinary timeout.
+      if (!deadlineReached()) { scheduleDeadline(); return; }
       timedOut = true;
       const message = timeoutMessage();
-      abortHostCalls(message);
+      abortHostCalls(interruptedByCpu ? message : executionDeadline.reason);
       rejectExecutionGate(message);
       rejectDeadline?.(new Error(message));
     };
     const scheduleDeadline = (): void => {
       if (!rejectDeadline || closing || cancelled || timedOut) return;
-      clearTimeout(timeout);
-      timeout = setTimeout(expireDeadline, Math.min(2_147_483_647, Math.max(0, executionDeadlineAt - Date.now())));
+      executionDeadline.scheduleDeadline(expireDeadline);
     };
     const extendExecutionTimeout = (
       ref: string,
@@ -978,13 +971,7 @@ export class QuickJsRuntime {
       ) {
         return;
       }
-      const requestedDurationMs = Math.max(1, Math.floor(requestedTimeoutMs));
-      const nextDeadlineAt = Math.min(Date.now() + requestedDurationMs, options.maximumDeadlineAt ?? Infinity);
-      const nextTimeoutMs = nextDeadlineAt - executionStartedAt;
-      if (nextDeadlineAt <= executionDeadlineAt) return;
-      effectiveTimeoutMs = nextTimeoutMs;
-      executionDeadlineAt = nextDeadlineAt;
-      scheduleDeadline();
+      if (executionDeadline.extend(requestedTimeoutMs)) scheduleDeadline();
     };
 
     try {
@@ -1029,7 +1016,7 @@ export class QuickJsRuntime {
           const task = runAbortable(hostAbortController.signal, () => {
             // Argument decoding and deadline policy also consume wall time.
             // Recheck immediately before admitting actual host work.
-            if (deadlineReached()) throw new Error(timeoutMessage());
+            if (deadlineReached()) { expireDeadline(); throw executionDeadline.reason; }
             return hostCall(reference, args, hostAbortController.signal);
           })
             .then((value) => {
@@ -1037,6 +1024,7 @@ export class QuickJsRuntime {
               if (deadlineReached()) { expireDeadline(); return; }
               cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
               const handle = jsonHandle(context, jsonObject, jsonParse, value);
+              if (deadlineReached()) { handle.dispose(); expireDeadline(); return; }
               promise.resolve(handle);
               handle.dispose();
             })
@@ -1102,7 +1090,7 @@ export class QuickJsRuntime {
             ? timeoutMessage()
             : formatValue(context.dump(setupResult.error));
         setupResult.error.dispose();
-        abortHostCalls(error);
+        abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error);
         return {
           value: undefined,
           logs,
@@ -1112,6 +1100,8 @@ export class QuickJsRuntime {
               ? "timed_out"
               : "runtime_error",
           error,
+          ...(deadlineExceeded && !interruptedByCpu && !options.signal?.aborted && executionDeadline.timeoutResult(logs).deadlineReason
+            ? { deadlineReason: executionDeadline.reason } : {}),
         };
       }
       setupResult.value.dispose();
@@ -1136,7 +1126,7 @@ export class QuickJsRuntime {
             ? timeoutMessage()
             : remapGuestErrorText(formatValue(context.dump(evaluation.error)), guestStackMap, guestLineCount);
         evaluation.error.dispose();
-        abortHostCalls(error);
+        abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error);
         return {
           value: undefined,
           logs,
@@ -1146,6 +1136,8 @@ export class QuickJsRuntime {
               ? "timed_out"
               : "runtime_error",
           error,
+          ...(deadlineExceeded && !interruptedByCpu && !options.signal?.aborted && executionDeadline.timeoutResult(logs).deadlineReason
+            ? { deadlineReason: executionDeadline.reason } : {}),
         };
       }
 
@@ -1180,7 +1172,7 @@ export class QuickJsRuntime {
             ? timeoutMessage()
             : remapGuestErrorText(formatValue(context.dump(resolution.error)), guestStackMap, guestLineCount);
         resolution.error.dispose();
-        abortHostCalls(error);
+        abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error);
         return {
           value: undefined,
           logs,
@@ -1190,22 +1182,30 @@ export class QuickJsRuntime {
               ? "timed_out"
               : "runtime_error",
           error,
+          ...(deadlineExceeded && !interruptedByCpu && !options.signal?.aborted && executionDeadline.timeoutResult(logs).deadlineReason
+            ? { deadlineReason: executionDeadline.reason } : {}),
         };
       }
       if (deadlineReached()) {
         resolution.value.dispose();
         timedOut = true;
-        abortHostCalls(timeoutMessage());
-        return { value: undefined, logs, terminationReason: "timed_out", error: timeoutMessage() };
+        abortHostCalls(executionDeadline.reason);
+        return executionDeadline.timeoutResult(logs);
       }
       const value = context.dump(resolution.value);
       resolution.value.dispose();
+      if (deadlineReached()) {
+        timedOut = true;
+        abortHostCalls(executionDeadline.reason);
+        return executionDeadline.timeoutResult(logs);
+      }
       return { value, logs, terminationReason: "completed" };
     } catch (error) {
       const deadlineExceeded = timedOut || interruptedByCpu || deadlineReached();
       if (deadlineExceeded) timedOut = true;
-      abortHostCalls(error instanceof Error ? error.message : String(error));
+      abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error instanceof Error ? error : String(error));
       return {
+        ...(deadlineExceeded && !interruptedByCpu && !cancelled ? executionDeadline.timeoutResult(logs) : {}),
         value: undefined,
         logs,
         terminationReason: cancelled ? "aborted" : deadlineExceeded ? "timed_out" : "runtime_error",
@@ -1218,7 +1218,7 @@ export class QuickJsRuntime {
               : String(error),
       };
     } finally {
-      if (timeout) clearTimeout(timeout);
+      executionDeadline.clear();
       for (const timer of pendingTimers) clearTimeout(timer);
       if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
       if (hostTasks.size > 0) {
@@ -1236,7 +1236,9 @@ export class QuickJsRuntime {
           : timedOut
             ? timeoutMessage()
             : "Fabric guest execution ended before its host calls settled";
-        if (!hostAbortController.signal.aborted) hostAbortController.abort(new Error(cleanupMessage));
+        if (!hostAbortController.signal.aborted) {
+          abortHostCalls(timedOut && !interruptedByCpu ? executionDeadline.reason : cleanupMessage);
+        }
         rejectExecutionGate(cleanupMessage);
         const errorHandle = context.newError(cleanupMessage);
         for (const promise of pendingHostPromises) promise.reject(errorHandle);

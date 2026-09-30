@@ -1,3 +1,5 @@
+import { createMainExecutionCeilingError, isMainExecutionCeilingError, mainExecutionCeilingAbortReason } from "./async-settlement.js";
+import { ExecutionDeadline } from "./runtime/execution-deadline.js";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -505,6 +507,7 @@ export class FabricExecutionService {
         const value = await run((nextStage) => {
           stage = nextStage;
         });
+        checkMainDeadline();
         operation.succeed(undefined);
         return value;
       } catch (error) {
@@ -574,13 +577,11 @@ export class FabricExecutionService {
     // This independent, fixed Main watchdog cannot be extended by a loop, a computed
     // orchestration ref, a shell timeout, or a configured host-call floor.
     const mainCeiling = mainMaxTimeoutMs === undefined ? undefined : new AbortController();
-    const mainDeadlineAt = mainMaxTimeoutMs === undefined ? undefined : Date.now() + mainMaxTimeoutMs;
-    const mainCeilingError = `MainExecutionCeilingError: Main ceiling hit after ${mainMaxTimeoutMs}ms ` +
-      "(executor.mainMaxTimeoutMs). Spawned agents keep running detached and report results as completion messages; check agents.status/list.";
-    const mainTimer = mainCeiling
-      ? setTimeout(() => mainCeiling.abort(new Error(mainCeilingError)), mainMaxTimeoutMs)
-      : undefined;
-    mainTimer?.unref?.();
+    const mainBudget = mainMaxTimeoutMs === undefined ? undefined : new ExecutionDeadline({ timeoutMs: mainMaxTimeoutMs });
+    const mainDeadlineAt = mainBudget?.at;
+    const mainCeilingReason = mainMaxTimeoutMs === undefined ? undefined : createMainExecutionCeilingError(mainMaxTimeoutMs);
+    const mainCeilingError = mainCeilingReason?.message ?? "";
+    mainBudget?.scheduleDeadline(() => mainCeiling!.abort(mainCeilingReason), true);
     const programSignal = mainCeiling
       ? options.signal ? AbortSignal.any([options.signal, mainCeiling.signal]) : mainCeiling.signal
       : options.signal;
@@ -592,27 +593,17 @@ export class FabricExecutionService {
       if (!programSignal) return runtimeSignal;
       let combined = providerSignals.get(runtimeSignal);
       if (!combined) {
-        // A runtime's own watchdog can win the timer-order race at Main's
-        // absolute deadline. Publish Main's reason before forwarding that
-        // runtime cancellation; never relabel a shorter deadline or Escape.
-        const runtimeBoundary = new AbortController();
-        const forwardRuntimeAbort = (): void => {
-          if (!options.signal?.aborted && mainDeadlineAt !== undefined && Date.now() >= mainDeadlineAt) {
-            mainCeiling!.abort(new Error(mainCeilingError));
-          }
-          runtimeBoundary.abort(runtimeSignal.reason);
-        };
-        combined = AbortSignal.any([programSignal, runtimeBoundary.signal]);
+        // Runtimes carry the clamped ceiling's opaque cause explicitly. Never
+        // promote another abort by clock, error name or guest exception text.
+        combined = AbortSignal.any([programSignal, runtimeSignal]);
         providerSignals.set(runtimeSignal, combined);
-        if (runtimeSignal.aborted) forwardRuntimeAbort();
-        else runtimeSignal.addEventListener("abort", forwardRuntimeAbort, { once: true });
       }
       return combined;
     };
     const checkMainDeadline = (): void => {
       if (options.signal?.aborted) options.signal.throwIfAborted();
-      if (mainDeadlineAt !== undefined && Date.now() >= mainDeadlineAt) {
-        mainCeiling!.abort(new Error(mainCeilingError));
+      if (mainCeiling?.signal.aborted || mainBudget?.reached) {
+        mainCeiling!.abort(mainCeilingReason);
         throw mainCeiling!.signal.reason;
       }
     };
@@ -620,7 +611,7 @@ export class FabricExecutionService {
       // Throw synchronously before allocating a dispatch promise: aborting here
       // must not leave a rejected operation behind runAbortable's aborted race.
       checkMainDeadline();
-      return dispatch(ref, args, signal).finally(checkMainDeadline);
+      return dispatch(ref, args, signal).then(value => { checkMainDeadline(); return value; });
     };
     try {
       sandboxResult = await runtime.execute(
@@ -628,7 +619,7 @@ export class FabricExecutionService {
         guardHostCall(async (ref, args, runtimeSignal) => {
           const callContext = {
             ...baseContext, signal: providerSignal(runtimeSignal),
-            ...(mainDeadlineAt !== undefined ? { mainDeadlineAt } : {}),
+            ...(mainDeadlineAt !== undefined ? { mainDeadlineAt, checkExecutionBudget: checkMainDeadline } : {}),
           };
           switch (ref) {
             case "fabric.$providers":
@@ -956,7 +947,7 @@ export class FabricExecutionService {
         }),
         {
           timeoutMs: effectiveTimeoutMs,
-          ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt } : {}),
+          ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
           cwd: options.context.cwd,
           memoryLimitBytes: this.config.executor.memoryLimitBytes,
           maxLogChars: this.config.executor.maxOutputChars,
@@ -969,10 +960,12 @@ export class FabricExecutionService {
           ...(programSignal ? { signal: programSignal } : {}),
         } satisfies QuickJsSandboxOptions,
       );
-      // A synchronous guest can hit its runtime interrupt before the host timer gets
-      // an event-loop turn. Name that same ceiling, but not a shorter default timeout.
-      if (!options.signal?.aborted && (mainCeiling?.signal.aborted ||
-        (sandboxResult.terminationReason === "timed_out" && mainDeadlineAt !== undefined && Date.now() >= mainDeadlineAt))) {
+      // A runtime-first ceiling carries its opaque cause. A shorter timeout
+      // stays ordinary even if its cleanup runs past Main's deadline. Only a
+      // completed late value constitutes a new publication-budget violation.
+      if (!options.signal?.aborted && ((sandboxResult.terminationReason === "aborted" && mainExecutionCeilingAbortReason(programSignal)) ||
+        isMainExecutionCeilingError(sandboxResult.deadlineReason) ||
+        (sandboxResult.terminationReason === "completed" && mainBudget?.reached))) {
         sandboxResult = { ...sandboxResult, value: undefined, terminationReason: "timed_out", error: mainCeilingError };
       }
       if (executionOutcomeFromTermination(sandboxResult.terminationReason) === "succeeded") invocationOutcome = "succeeded";
@@ -981,7 +974,7 @@ export class FabricExecutionService {
       this.activity?.finish(options.parentToolCallId, false, message);
       throw error;
     } finally {
-      clearTimeout(mainTimer);
+      mainBudget?.clear();
       await this.registry.endInvocation(options.parentToolCallId, invocationOutcome);
       flushEmit();
     }
@@ -990,18 +983,25 @@ export class FabricExecutionService {
       const hint = pythonErrorRecoveryHint(code, sandboxResult.error, monty ? "monty" : "cpython");
       if (hint && !sandboxResult.error.includes(hint)) sandboxResult.error += `\n\nRecovery hint: ${hint}`;
     }
-    const runOutcome = executionOutcomeFromTermination(sandboxResult.terminationReason);
-    const succeeded = runOutcome === "succeeded";
-    this.activity?.finish(options.parentToolCallId, succeeded, sandboxResult.error);
     // Logs, results, and error text reach the model, the event stream, and
     // persisted traces. Raw media must not: images are hoisted out of band and
     // base64 payloads collapse to a descriptor (see core/media-sanitize.ts).
-    const sanitizedValue = sanitizeFabricMediaValue(sandboxResult.value);
+    let sanitizedValue = sanitizeFabricMediaValue(sandboxResult.value);
+    const sanitizedLogs = sandboxResult.logs.map(sanitizeFabricMediaText);
+    // Cleanup and final media/log serialization also consume the absolute budget.
+    // Reject before announcing success or attaching model-visible media.
+    if (sandboxResult.terminationReason === "completed" && !options.signal?.aborted && mainBudget?.reached) {
+      sandboxResult = { ...sandboxResult, value: undefined, terminationReason: "timed_out", error: mainCeilingError };
+      sanitizedValue = sanitizeFabricMediaValue(undefined);
+    }
+    const runOutcome = executionOutcomeFromTermination(sandboxResult.terminationReason);
+    const succeeded = runOutcome === "succeeded";
+    this.activity?.finish(options.parentToolCallId, succeeded, sandboxResult.error);
     return {
       success: succeeded,
       kernel: python ? "python" : "typescript",
       value: sanitizedValue.value,
-      logs: sandboxResult.logs.map(sanitizeFabricMediaText),
+      logs: sanitizedLogs,
       ...(sanitizedValue.images.length > 0 ? { media: sanitizedValue.images } : {}),
       audits,
       phases,

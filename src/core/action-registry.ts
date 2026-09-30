@@ -17,7 +17,7 @@ import {
   previewArgs,
   previewResult,
 } from "./action-result.js";
-import { runAbortable, settleWithin, throwIfAborted } from "../async-settlement.js";
+import { runAbortable, settleWithin, throwIfAborted, throwIfExecutionExpired } from "../async-settlement.js";
 import type {
   FabricCapabilityRequirement,
   FabricComponentProviderLease,
@@ -821,6 +821,7 @@ export class ActionRegistry {
       if (context.approve) {
         await runAbortable(context.signal, () => context.approve!(structuredClone(action), snapshotArguments(catalog.args)));
       }
+      throwIfExecutionExpired(context);
       const acquired = await runAbortable(context.signal, () =>
         this.#runPlanned(binding, providerActionName, authority, "acquire", catalog.args, context, undefined, adopt),
       ) as FabricScopedProviderResult;
@@ -981,6 +982,7 @@ export class ActionRegistry {
       await runAbortable(context.signal, () => context.approve(structuredClone(action), snapshotArguments(catalog.args)));
 
       failureStage = "invoke";
+      throwIfExecutionExpired(context);
       const nestedToolCallId = `${NESTED_TOOL_CALL_ID_PREFIX}${randomUUID()}`;
       const effect = action.effect!;
       const effectConflicts = [...this.#activeEffects.values()].flatMap((active) => {
@@ -1035,6 +1037,7 @@ export class ActionRegistry {
           this.#speculation!.tryServe(context.parentToolCallId, ref, snapshotArguments(catalog.args), JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null])));
         if (served.hit) {
           providerValue = await runAbortable(context.signal, () => this.#runPlanned(binding, providerActionName, authority, "replay", catalog.args, context, served.value));
+          throwIfExecutionExpired(context);
           servedFromSpeculation = true;
           activeAudit.speculated = true;
           if (served.replay.updatedArgs !== undefined) {
@@ -1065,7 +1068,9 @@ export class ActionRegistry {
           nestedToolCallId,
           update(message) {
             if (!invocationActive) return;
+            throwIfExecutionExpired(context);
             context.update(message);
+            throwIfExecutionExpired(context);
             context.observeInvocation?.({
               type: "call_update",
               callId: nestedToolCallId,
@@ -1074,7 +1079,9 @@ export class ActionRegistry {
           },
           activity(update) {
             if (!invocationActive) return;
+            throwIfExecutionExpired(context);
             context.activity?.(update);
+            throwIfExecutionExpired(context);
             context.observeInvocation?.({
               type: "call_update",
               callId: nestedToolCallId,
@@ -1083,17 +1090,20 @@ export class ActionRegistry {
           },
           attachMedia(blocks, note) {
             if (!invocationActive) return;
+            throwIfExecutionExpired(context);
+            const media = [...blocks];
+            throwIfExecutionExpired(context);
             if (!activeAudit.media) activeAudit.media = [];
-            for (const block of blocks) activeAudit.media.push(block);
+            for (const block of media) activeAudit.media.push(block);
             if (note) activeAudit.mediaNote = note;
           },
           updateArguments(updatedArgs) {
             if (!invocationActive) return;
+            throwIfExecutionExpired(context);
             const updatedPreview = previewArgs(ref, updatedArgs);
-            activeAudit.args = boundedPreviewValue(
-              updatedPreview,
-              MAX_AUDIT_VALUE_CHARS,
-            ) as Record<string, unknown>;
+            const updatedSnapshot = boundedPreviewValue(updatedPreview, MAX_AUDIT_VALUE_CHARS);
+            throwIfExecutionExpired(context);
+            activeAudit.args = updatedSnapshot as Record<string, unknown>;
             traceOperation?.prepared(snapshotArguments(updatedArgs));
             context.observeInvocation?.({
               type: "call_args",
@@ -1103,6 +1113,7 @@ export class ActionRegistry {
           },
           attachPreview(preview) {
             if (!invocationActive) return;
+            throwIfExecutionExpired(context);
             activeAudit.preview = preview;
           },
           }).finally(() => {
@@ -1114,6 +1125,7 @@ export class ActionRegistry {
       } finally {
         if (!providerInvoked) this.#activeEffects.delete(nestedToolCallId);
       }
+      throwIfExecutionExpired(context);
       const value = this.toolResultProxy
         ? await runAbortable(context.signal, () => this.toolResultProxy!.proxy({
             action,
@@ -1123,15 +1135,21 @@ export class ActionRegistry {
             ...(context.signal ? { signal: context.signal } : {}),
           }))
         : providerValue;
+      throwIfExecutionExpired(context);
       const bounded = boundedResult(value, context.maxResultChars);
       const resultError = failedResultError(value);
+      const resultPreview = previewResult(bounded.value);
+      const auditResult = boundedPreviewValue(resultPreview, MAX_AUDIT_VALUE_CHARS);
+      // Bounding/preview serialization also consumes wall time. No late result
+      // or success may reach audits, activity, media or the durable trace.
+      throwIfExecutionExpired(context);
       activeAudit.success = resultError === undefined;
       if (resultError) activeAudit.error = resultError;
       activeAudit.resultChars = bounded.chars;
       activeAudit.resultTruncated = bounded.truncated;
-      const resultPreview = previewResult(bounded.value);
-      activeAudit.result = boundedPreviewValue(resultPreview, MAX_AUDIT_VALUE_CHARS);
+      activeAudit.result = auditResult;
       activeAudit.endedAt = Date.now();
+      throwIfExecutionExpired(context);
       context.observeInvocation?.({
         type: "call_end",
         callId: nestedToolCallId,
@@ -1140,6 +1158,7 @@ export class ActionRegistry {
         ...(activeAudit.preview !== undefined ? { preview: activeAudit.preview } : {}),
         ...(resultError ? { error: resultError } : {}),
       });
+      throwIfExecutionExpired(context);
       if (resultError) {
         traceOperation?.fail("invoke", resultError, failedResultOutcome(value), bounded.value, {
           resultTruncated: bounded.truncated,
@@ -1147,9 +1166,12 @@ export class ActionRegistry {
       } else {
         traceOperation?.succeed(bounded.value, { resultTruncated: bounded.truncated });
       }
-      throwIfAborted(context.signal);
+      throwIfExecutionExpired(context);
       return bounded.value;
     } catch (error) {
+      // A late rejection is also publication: do not expose its provider text
+      // before the absolute budget is checked. Existing aborts keep their cause.
+      try { throwIfExecutionExpired(context); } catch (expired) { error = expired; }
       const message = error instanceof Error ? error.message : String(error);
       traceOperation?.fail(failureStage, error, executionOutcomeFromError(error, context.signal));
       if (audit) {

@@ -75,6 +75,7 @@ import {
 import { resolvePiModel } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
+import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import {
   AGENT_WAIT_MAX_MS,
   AgentWaitBoundError,
@@ -632,20 +633,20 @@ export class AgentsProvider implements FabricProvider {
         const main = isInteractiveMain(context.extensionContext);
         const handle = await this.manager.spawn(
           runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager),
-          // Main's program owns only its wait, including while launch is in flight.
-          // Do not attach the child to the deadline's abort (even before first progress).
-          main ? undefined : context.signal,
+          // Only the branded Main ceiling is observation-only, including during launch.
+          // Escape and ordinary deadlines retain zero-progress child cancellation.
+          main ? withoutMainExecutionCeiling(context.signal) : context.signal,
         );
-        this.participants.scheduleRefresh();
-        context.activity?.({
-          type: "entity",
-          id: handle.id,
-          kind: "agent",
-          name: handle.name,
-        });
-        context.update(agentStartedMessage(handle));
         const timeoutMs = mainAgentWaitBound(args.timeoutMs, context.mainDeadlineAt);
         try {
+          this.participants.scheduleRefresh();
+          context.activity?.({
+            type: "entity",
+            id: handle.id,
+            kind: "agent",
+            name: handle.name,
+          });
+          context.update(agentStartedMessage(handle));
           return await waitWithProgress(
             this.manager,
             this.#transcripts,
@@ -655,6 +656,9 @@ export class AgentsProvider implements FabricProvider {
             main ? { timeoutMs, ...(context.signal ? { signal: context.signal } : {}) } : {},
           );
         } catch (error) {
+          // A launch can spend the remaining budget before its first update/wait.
+          // Accepted work still needs a detached completion owner in that case.
+          if (main && mainExecutionCeilingAbortReason(context.signal)) this.manager.detachSignal(handle.id);
           if (!main || !(error instanceof AgentWaitBoundError)) throw error;
           return this.#mainWaitAtBound(this.manager.status(handle.id), timeoutMs);
         }
@@ -676,7 +680,7 @@ export class AgentsProvider implements FabricProvider {
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
         const handle = durableRequest.residency === "durable"
           ? await this.#resident().spawnAgent(durableRequest, context.signal)
-          : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? undefined : context.signal);
+          : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
         if (request.residency !== "durable") this.manager.detachSignal(handle.id);
         this.participants.scheduleRefresh();
         context.activity?.({

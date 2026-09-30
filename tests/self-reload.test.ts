@@ -145,6 +145,25 @@ describe("installSelfReload", () => {
     expect(context.reload).not.toHaveBeenCalled();
   });
 
+  it("superseded queued Fabric keeps its idle retry without another Main turn", async () => {
+    vi.useFakeTimers();
+    const { next, emit, commands, sent, selfReload } = setup();
+    const third = release("ccc");
+    const context = fakeContext("s-fabric-superseded", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next); emit("agent_settled", context); expect(sent).toHaveLength(1);
+    activate(third);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).not.toHaveBeenCalled(); // never retarget the queued command
+    await vi.advanceTimersByTimeAsync(6_000); // no input, agent turn or second settle
+    expect(sent).toHaveLength(2);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sent).toHaveLength(2); // the exact third target is consumed once
+    emit("session_shutdown", context);
+  });
+
   it("attempts each exact Fabric target once even across intervening failed targets", async () => {
     const { next, emit, commands, sent, selfReload } = setup();
     const third = release("ccc");

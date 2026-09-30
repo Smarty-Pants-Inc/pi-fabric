@@ -129,7 +129,6 @@ export class ActiveReleaseWatch {
   }
 }
 
-interface PendingResource extends ReloadTargetRequest { target: string }
 interface ReloadCandidate {
   kind: "fabric" | "resource";
   loaded: string;
@@ -226,7 +225,10 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
   const settingsPath = deps.settingsPath ?? path.join(resolveAgentDir(), "settings.json");
   const explicit = explicitExtensions();
   const bindings = new Map<string, ResourceBinding>();
-  const pending = new Map<string, PendingResource>();
+  // Fabric and public resources share one pending set; a queued command owns no retry.
+  const pending = new Map<string, ReloadCandidate>();
+  const pendingKey = (candidate: ReloadCandidate): string =>
+    candidate.kind === "fabric" ? "fabric" : `resource:${candidate.resource!}`;
   // Keep exact-target attempts through native reloads, even if a different target was tried later.
   const attempts = ((globalThis as Record<symbol, unknown>)[ATTEMPTS] ??= new Map<string, Set<string>>()) as Map<string, Set<string>>;
   const attempted = (id: string, candidate: ReloadCandidate): boolean => attemptedSelfReload(id, candidate.target);
@@ -261,15 +263,19 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     } catch { return "unsupported-host:ui-hold-query-failed"; }
   };
   const invalidate = (candidate: ReloadCandidate, reason: string, target?: string): void => {
+    const key = pendingKey(candidate);
+    if (pending.get(key)?.target === candidate.target) pending.delete(key);
     if (candidate.kind !== "resource") return;
-    const request = pending.get(candidate.resource!);
-    if (request?.target === candidate.target) pending.delete(request.resource);
     // A newer advertisement for this resource may have arrived after the command was queued.
     // Refuse the queued request by its original ID, not the newer request's correlation fields.
     reply({ requestId: candidate.requestId!, owner: candidate.owner!, resource: candidate.resource! }, false, reason, target);
   };
   const recheck = (candidate: ReloadCandidate): boolean => {
-    if (candidate.kind === "fabric") return activeFabricRoot(settingsPath) === candidate.target;
+    if (candidate.kind === "fabric") {
+      if (activeFabricRoot(settingsPath) === candidate.target) return true;
+      invalidate(candidate, "target-changed");
+      return false;
+    }
     const binding = bindings.get(candidate.resource!);
     const active = binding ? targetFor(binding) : { reason: "unbound-resource" };
     const reason = active.reason ?? (active.target === candidate.loaded ? "target-reverted"
@@ -278,13 +284,15 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     return true;
   };
   const candidateNow = (): ReloadCandidate | undefined => {
-    for (const request of pending.values()) {
-      const candidate: ReloadCandidate = { kind: "resource", loaded: request.loaded, target: request.target,
-        owner: request.owner, resource: request.resource, requestId: request.requestId };
+    const target = watch?.check();
+    if (target && watch) pending.set("fabric", { kind: "fabric", loaded: watch.loaded, target });
+    else pending.delete("fabric");
+    for (const [key, candidate] of pending) {
+      // Consumed targets must not starve another resource after a failed native reload.
+      if (sessionId && attempted(sessionId, candidate)) { pending.delete(key); continue; }
       if (recheck(candidate)) return candidate;
     }
-    const target = watch?.check();
-    return target && watch ? { kind: "fabric", loaded: watch.loaded, target } : undefined;
+    return undefined;
   };
   const receive = async (value: unknown): Promise<void> => {
     const data = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -326,14 +334,14 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     if (active.reason || !active.target) return reply(request, false, active.reason ?? "missing-profile-target");
     if (request.configured !== active.target) return reply(request, false, "configured-mismatch", active.target);
     if (active.target === binding.loaded) {
-      const wasPending = pending.delete(request.resource);
+      const wasPending = pending.delete(`resource:${request.resource}`);
       return reply(request, !wasPending, wasPending ? "target-reverted" : "bound-unchanged", active.target);
     }
     if (autoReloadOptedOut(deps.autoReloadConfigured())) return reply(request, false, "auto-reload-disabled", active.target);
     const limit = hostLimit(context);
     if (limit) return reply(request, false, limit, active.target);
     if (attempts.get(sessionId)?.has(active.target)) return reply(request, false, "already-attempted", active.target);
-    pending.set(request.resource, { ...request, target: active.target });
+    pending.set(`resource:${request.resource}`, { ...request, kind: "resource", target: active.target });
     reply(request, true, "pending", active.target);
     // Reuse the idle retry for a changed pointer with no subsequent Main turn. Advertising
     // never clears the halt or injects a command synchronously.
@@ -368,13 +376,13 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     if (userHalted()) return true;
     if (candidate.kind === "resource") {
       const hold = resourceHold(context);
-      if (hold?.startsWith("unsupported-host:")) { invalidate(candidate, hold, candidate.target); return true; }
+      if (hold?.startsWith("unsupported-host:")) { invalidate(candidate, hold, candidate.target); return false; }
       if (hold || promptPending(context) || !context.isIdle()) return false;
     }
     const busy = deps.busy();
     if (busy > 0) noteHeld(context, candidate.target, busy);
     if (busy > 0 || context.hasPendingMessages()) return false;
-    if (scheduled) return true;
+    if (scheduled) return false; // keep the shared idle retry until the queued command executes
     const globals = globalThis as Record<symbol, unknown>;
     const sequence = Number(globals[commandSequenceKey] ?? 0) + 1;
     globals[commandSequenceKey] = sequence;
@@ -431,6 +439,10 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       if (token && scheduled?.token !== token) return;
       const candidate = scheduled?.candidate ?? candidateNow();
       scheduled = undefined;
+      // Consuming a command never consumes other pending targets. In particular, a stale
+      // pinned target or a failed reload must leave an idle path to the current target.
+      // Native session_start/shutdown clears this timer after a successful reload.
+      if (auto && contextNow && context.sessionManager.getSessionId() === sessionId) armRetry(context);
       const say = (message: string) => { if (!auto && context.hasUI) context.ui.notify(message, "info"); };
       if (!candidate || !recheck(candidate)) return say("No newer Fabric release or bound extension target is active.");
       if (auto && (userHalted() || autoReloadOptedOut(deps.autoReloadConfigured()))) return;
@@ -450,7 +462,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       if (!recheck(candidate)) return;
       const tried = attempts.get(id) ?? new Set<string>(); tried.add(candidate.target); attempts.set(id, tried);
       if (candidate.kind === "resource") {
-        pending.delete(candidate.resource!);
+        pending.delete(pendingKey(candidate));
         handoffs().set(id, { old: candidate.loaded, target: candidate.target, owner: candidate.owner!, resource: candidate.resource! });
       } else rememberSelfReload(id, candidate.loaded, candidate.target);
       await context.reload();

@@ -200,6 +200,74 @@ describe("reload-target v1 adversarial admission", () => {
     expect(s.replies.filter(reply => reply.requestId === newer.requestId)).toEqual([newer]);
     s.emit("agent_settled"); await s.execute(); expect(s.context.reload).toHaveBeenCalledTimes(1);
   });
+  it.each(["fabric", "resource"])("a request for a different resource never drops a superseded queued %s idle retry", async first => {
+    vi.useFakeTimers(); const s = setup(); await s.bind();
+    const fabricNext = path.dirname(entry("fabric-next", "pi-fabric"));
+    const fabricThird = path.dirname(entry("fabric-third", "pi-fabric"));
+    const codeThird = entry("code-third");
+    const profile = (fabric: string, code: string) => {
+      const previous = fs.statSync(s.settingsPath).mtimeMs;
+      fs.writeFileSync(s.settingsPath, JSON.stringify({ packages: [fabric], extensions: [code] }));
+      fs.utimesSync(s.settingsPath, new Date(previous + 1000), new Date(previous + 1000));
+    };
+    if (first === "fabric") {
+      profile(fabricNext, s.loaded); s.emit("agent_settled");
+      profile(fabricNext, s.next); await s.request(s.next);
+    } else {
+      profile(path.dirname(s.fabric), s.next); await s.request(s.next); s.emit("agent_settled");
+      profile(fabricNext, s.next); await s.request(s.next);
+    }
+    const stale = s.sent[0]!;
+    await vi.advanceTimersByTimeAsync(6_000); expect(s.sent).toHaveLength(1);
+    profile(first === "fabric" ? fabricThird : fabricNext, first === "fabric" ? s.next : codeThird);
+    // No new advertisement, input, turn or settle after the pinned target is superseded.
+    await s.execute(stale); expect(s.context.reload).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(6_000); expect(s.sent).toHaveLength(2);
+    await s.execute(); expect(s.context.reload).toHaveBeenCalledTimes(1);
+    if (first === "fabric") {
+      await vi.advanceTimersByTimeAsync(6_000); expect(s.sent).toHaveLength(3);
+      await s.execute(); expect(s.context.reload).toHaveBeenCalledTimes(2);
+    }
+    // Unadvertised Code-third is not adopted; the pending Fabric target still survives.
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(s.context.reload).toHaveBeenCalledTimes(first === "fabric" ? 2 : 1);
+  });
+
+  it.each(["fabric", "resource"])("a superseded queued %s preserves both resources' idle retries", async first => {
+    vi.useFakeTimers(); const s = setup(); await s.bind();
+    const fabricNext = path.dirname(entry("fabric-next", "pi-fabric"));
+    const fabricThird = path.dirname(entry("fabric-third", "pi-fabric"));
+    const codeThird = entry("code-third");
+    const profile = (fabric: string, code: string) => {
+      const previous = fs.statSync(s.settingsPath).mtimeMs;
+      fs.writeFileSync(s.settingsPath, JSON.stringify({ packages: [fabric], extensions: [code] }));
+      fs.utimesSync(s.settingsPath, new Date(previous + 1000), new Date(previous + 1000));
+    };
+    if (first === "fabric") {
+      profile(fabricNext, s.loaded); s.emit("agent_settled");
+      profile(fabricNext, s.next); await s.request(s.next);
+    } else {
+      profile(path.dirname(s.fabric), s.next); await s.request(s.next); s.emit("agent_settled");
+      profile(fabricNext, s.next); await s.request(s.next);
+    }
+    expect(s.sent).toHaveLength(1); const stale = s.sent[0]!;
+    // A retry tick while the command is queued must not abandon either pending target.
+    await vi.advanceTimersByTimeAsync(6_000); expect(s.sent).toHaveLength(1);
+    profile(first === "fabric" ? fabricThird : fabricNext, codeThird);
+    await s.request(codeThird);
+    await s.execute(stale); expect(s.context.reload).not.toHaveBeenCalled();
+    // The modeled reload does not replace the runtime: this also checks that an already
+    // attempted candidate cannot starve the other resource, including after a native failure.
+    s.context.reload.mockRejectedValueOnce(new Error("native failure"));
+    await vi.advanceTimersByTimeAsync(6_000); expect(s.sent).toHaveLength(2);
+    await expect(s.execute()).rejects.toThrow("native failure");
+    await vi.advanceTimersByTimeAsync(6_000); expect(s.sent).toHaveLength(3);
+    await s.execute(); expect(s.context.reload).toHaveBeenCalledTimes(2);
+    expect(await s.request(codeThird)).toMatchObject({ accepted: false, reason: "already-attempted" });
+    await vi.advanceTimersByTimeAsync(20_000); s.emit("agent_settled"); await s.execute();
+    expect(s.sent).toHaveLength(3); expect(s.context.reload).toHaveBeenCalledTimes(2);
+  });
+
   it("a native session change before lifecycle cleanup cannot reuse the previous binding", async () => {
     const s = setup(); await s.bind(); s.activate(s.next); await s.request(s.next); s.emit("agent_settled");
     s.replaceSessionWithoutStart(); await s.execute();

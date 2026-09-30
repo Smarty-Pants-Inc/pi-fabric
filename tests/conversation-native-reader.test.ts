@@ -832,18 +832,18 @@ describe("native conversation reader — identical-prefix continuation", () => {
     let verifiedReads = 0;
     let injected = 0;
     let failedFd = -1;
-    const reads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
       const stack = new Error().stack ?? "";
-      if (fs.fstatSync(args[0]).ino === newStat.ino) {
+      if (fs.fstatSync(fd).ino === newStat.ino) {
         if (stack.includes("matchesLoadedPages")) verifiedReads++;
-        else if (stack.includes("readForwardPage") && args[4] === Buffer.byteLength(bytes)) {
+        else if (stack.includes("readForwardPage") && position === Buffer.byteLength(bytes)) {
           expect(verifiedReads).toBeGreaterThan(0);
           injected++;
-          failedFd = args[0];
+          failedFd = fd;
           throw Object.assign(new Error("private prefix EIO"), { code: "EIO" });
         }
       }
-      return realRead(...args);
+      return realRead(fd, buffer, offset, length, position);
     }) as typeof fs.readSync);
     let failed: ReturnType<NativeConversationReader["read"]> | undefined;
     expect(() => { failed = api === "loadNewer" ? reader.loadNewer() : reader.read(input, true); }).not.toThrow();
@@ -897,17 +897,17 @@ describe("native conversation reader — identical-prefix continuation", () => {
     const realRead = fs.readSync.bind(fs);
     let verified = false;
     let injected = 0;
-    const reads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
       const stack = new Error().stack ?? "";
-      if (fs.fstatSync(args[0]).ino === inode) {
+      if (fs.fstatSync(fd).ino === inode) {
         if (stack.includes("matchesLoadedPages")) verified = true;
-        else if (stack.includes("readForwardPage") && args[4] === Buffer.byteLength(bytes)) {
+        else if (stack.includes("readForwardPage") && position === Buffer.byteLength(bytes)) {
           expect(verified).toBe(true);
           injected++;
           throw Object.assign(new Error("private partial EIO"), { code: "EIO" });
         }
       }
-      return realRead(...args);
+      return realRead(fd, buffer, offset, length, position);
     }) as typeof fs.readSync);
     let failed: ReturnType<NativeConversationReader["read"]> | undefined;
     expect(() => { failed = api === "loadNewer" ? reader.loadNewer() : reader.read(input, true); }).not.toThrow();

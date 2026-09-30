@@ -5,7 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorDirectory } from "../src/actors/directory.js";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { LifecycleBroker } from "../src/lifecycle/broker.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
+import { runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { createMainExecutionCeilingError } from "../src/async-settlement.js";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -22,6 +33,7 @@ import {
   type ResidentHostOwner,
 } from "../src/residency/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { launchLog, same, startedAtMs } from "./helpers/owned-processes.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
@@ -285,6 +297,166 @@ describe.skipIf(process.platform === "win32")("resident host start timeout", () 
 // node_modules shims hangs before the child starts, so the launcher never
 // reaches its spawn trace. Durable residency E2E stays POSIX-only until that
 // spawn path is resolved; the launcher logic tests below run everywhere.
+describe("saturated durable spawn receipt consistency (#181 F2)", () => {
+  it("revokes accepted queued work before reporting failure through the provider", { timeout: 15_000 }, async () => {
+    const state = await rootHarness("resident-saturated");
+    state.config.agents = { ...state.config.agents, maxConcurrent: 1 };
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify(state.config));
+    const controller = new AbortController();
+    const running = runResidentHostFromConfigPath(configPath, controller.signal);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const agents = new AgentManager(repo, state.config.agents, { workerPath: fakeWorker, runRoot: path.join(state.root, "passive-runs") });
+    const passive = new ActorDirectory([state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {},
+      { persistent: true, rootId: state.identity.id, canManageActor: () => false }],
+      { project: state.config.actorRoot, session: state.config.sessionActorRoot! }, "project");
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants,
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(agents, passive, new GlobalActorRegistry(state.root, 64 * 1024),
+      state.mainAgent, state.participants, undefined, lifecycle, undefined, client);
+    const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "test", nestedToolCallId: "spawn",
+      extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
+    const spawned = vi.spyOn(AgentManager.prototype, "spawn");
+    try {
+      await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
+      const blocker = await client.spawnAgent({ task: "HANG", residency: "durable", transport: "process" });
+      await expect(provider.invoke("spawn", { task: "rejected durable activation", residency: "durable", transport: "process" }, context))
+        .rejects.toThrow(/no run directory|cannot queue durable spawns/);
+      const queued = await spawned.mock.results[1]!.value;
+      const hostManager = spawned.mock.contexts[1] as AgentManager;
+      expect(queued.status).toBe("queued");
+      expect(JSON.parse(fs.readFileSync(residentResultPath(state.config.residencyRoot, queued.id), "utf8")))
+        .toMatchObject({ status: "stopped" });
+      expect(() => hostManager.status(queued.id)).toThrow(/Unknown Fabric agent/);
+      expect(client.hasAgent(queued.id)).toBe(false);
+      expect(client.listAgents().map((run) => run.id)).toEqual([blocker.id]);
+      await hostManager.stop(blocker.id);
+      const successor = await client.spawnAgent({ task: "accepted after pool release", residency: "durable", transport: "process" });
+      await expect(client.waitAgent(successor.id)).resolves.toMatchObject({ status: "completed" });
+      expect(hostManager.runDirectory(queued.id)).toBeUndefined();
+      expect(fs.existsSync(path.join(state.config.residencyRoot, "runs", queued.id))).toBe(false);
+      expect(hostManager.list().some((run) => run.id === queued.id)).toBe(false);
+    } finally {
+      spawned.mockRestore();
+      controller.abort(); await running;
+      await Promise.all([client.close(), passive.close(), lifecycle.close(), state.participants.close()]);
+      await agents.close();
+    }
+  });
+});
+
+describe("#169 round 2 public cleanup outcome", () => {
+  it.each(["main", "nested"] as const)("carries failed cleanup and exact-id retry through the real %s client and provider", { timeout: 15_000 }, async (caller) => {
+    const state = await rootHarness(`public-cleanup-${caller}`);
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify(state.config));
+    const controller = new AbortController();
+    const running = runResidentHostFromConfigPath(configPath, controller.signal);
+    const mainClient = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const nestedClient = new ResidentActorClient(state.config.meshRoot, state.identity.id);
+    const agents = new AgentManager(repo, state.config.agents, { workerPath: fakeWorker, runRoot: path.join(state.root, "passive-runs") });
+    const passive = new ActorDirectory([state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {},
+      { persistent: true, rootId: state.identity.id, canManageActor: () => false }],
+      { project: state.config.actorRoot, session: state.config.sessionActorRoot! }, "project");
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants,
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", state.identity.id);
+    vi.stubEnv("PI_FABRIC_MESH_ROOT", state.config.meshRoot);
+    const provider = new AgentsProvider(agents, passive, new GlobalActorRegistry(state.root, 64 * 1024),
+      state.mainAgent, state.participants, undefined, lifecycle, undefined, caller === "main" ? mainClient : undefined);
+    const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "test", nestedToolCallId: "remove",
+      extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
+    let failing: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
+      const client = caller === "main" ? mainClient : nestedClient;
+      const actor = await client.createActor({ name: "public cleanup", instructions: "Work.", residency: "durable" });
+      const dir = path.join(state.config.actorRoot, actor.id);
+      const marker = path.join(state.config.actorRoot, `removal-${actor.id}.json`);
+      const rm = fs.rmSync.bind(fs);
+      failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+        if (target === dir) throw new Error("public cleanup unavailable");
+        return rm(target, options);
+      });
+      await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
+        removed: true, cleaned: false, pending: expect.stringContaining("cleanup failed"),
+      });
+      // Exercise the concrete proxy directly too, not only provider routing.
+      await expect(client.removeActor(actor.id)).resolves.toMatchObject({
+        removed: true, cleaned: false, pending: expect.stringContaining("cleanup failed"),
+      });
+      expect(fs.existsSync(marker)).toBe(true);
+      failing.mockRestore();
+      await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toEqual({ removed: true });
+      expect(fs.existsSync(dir)).toBe(false);
+      expect(fs.existsSync(marker)).toBe(false);
+    } finally {
+      failing?.mockRestore();
+      controller.abort(); await running;
+      await Promise.all([mainClient.close(), passive.close(), lifecycle.close(), state.participants.close()]);
+      await agents.close();
+    }
+  });
+});
+
+describe("#169 round 1 resident cleanup routing", () => {
+  it.each(["project", "session"] as const)("retries and reports an exact cleanup-only %s id through the resident removeActor request", { timeout: 15_000 }, async (scope) => {
+    const state = await rootHarness(`cleanup-host-${scope}`);
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify(state.config));
+    const controller = new AbortController();
+    const running = runResidentHostFromConfigPath(configPath, controller.signal);
+    const request = async (command: Record<string, unknown>) => {
+      const requestId = randomId();
+      fs.writeFileSync(path.join(state.config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({
+        format: RESIDENT_HOST_FORMAT, rootId: state.identity.id, requestId, createdAt: Date.now(), ...command,
+      }));
+      const responsePath = path.join(state.config.residencyRoot, "responses", `${requestId}.json`);
+      await waitFor(() => fs.existsSync(responsePath));
+      return JSON.parse(fs.readFileSync(responsePath, "utf8"));
+    };
+    let failing: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "requests")));
+      const created = await request({ operation: "createActor", request: { scope, name: "resident retry", instructions: "Work.", residency: "durable" } });
+      expect(created.ok).toBe(true);
+      const actor = created.actor;
+      const dir = path.join(scope === "project" ? state.config.actorRoot : state.config.sessionActorRoot!, actor.id);
+      const marker = path.join(path.dirname(dir), `removal-${actor.id}.json`);
+      const rm = fs.rmSync.bind(fs);
+      failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+        if (target === dir) throw new Error("resident cleanup failure");
+        return rm(target, options);
+      });
+      const first = await request({ operation: "removeActor", id: actor.id });
+      expect(first).toMatchObject({ ok: true, pending: expect.stringContaining("cleanup failed") });
+      expect(fs.existsSync(marker)).toBe(true);
+      const removalsPath = path.join(state.config.residencyRoot, "removals.json");
+      expect(JSON.parse(fs.readFileSync(removalsPath, "utf8")).removals).toContainEqual(expect.objectContaining({ id: actor.id }));
+      const successor = (await request({ operation: "createActor", request: { scope, name: "resident retry", instructions: "Successor.", residency: "durable" } })).actor;
+      fs.writeFileSync(successor.sessionFile, "successor history\n");
+      // Refresh the participant view: the revoked actor must not need a live presence row.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      failing.mockRestore();
+      const retried = await request({ operation: "removeActor", id: actor.id });
+      expect(retried).toMatchObject({ ok: true });
+      expect(first.cleaned).toBe(false);
+      expect(retried.pending).toBeUndefined();
+      expect(fs.existsSync(dir)).toBe(false);
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(fs.existsSync(removalsPath)).toBe(false);
+      expect(fs.readFileSync(successor.sessionFile, "utf8")).toBe("successor history\n");
+    } finally {
+      failing?.mockRestore();
+      controller.abort();
+      await running;
+      await state.participants.close();
+    }
+  });
+});
 describe("durable completion receipts", () => {
   const seedCompletion = async (state: RootHarness, status = "completed") => {
     const id = "a".repeat(32);
@@ -315,6 +487,45 @@ describe("durable completion receipts", () => {
     return { id, result, runDirectory, metadataPath, key };
   };
 
+  it.each(["wait", "join", "status"])("keeps a durable completion unread when terminal %s publication is rejected", async action => {
+    const state = await rootHarness(`rejected-durable-${action}`);
+    const seeded = await seedCompletion(state);
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const sendMessage = vi.fn();
+    const context = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, context);
+    const consumed = vi.fn((id: string) => inbox.acknowledge(id));
+    const completed = vi.fn((result, delivered) => inbox.enqueue(result, delivered));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete: completed, onResultConsumed: consumed });
+    const agents = new AgentManager(repo, state.config.agents, { workerPath: fakeWorker, runRoot: path.join(state.root, "session-runs") });
+    const actors = new ActorManager(state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {}, { actorRoot: path.join(state.root, "session-actors"), persistent: true });
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(agents, actors, new GlobalActorRegistry(state.root, 64 * 1024), state.mainAgent, state.participants, undefined, lifecycle, () => false, client);
+    const registry = new ActionRegistry(); registry.register(provider);
+    let expired = false;
+    const ceiling = createMainExecutionCeilingError(700);
+    try {
+      client.start();
+      await waitFor(() => completed.mock.calls.length === 1);
+      await expect(registry.invoke(`agents.${action}`, { id: seeded.id }, {
+        cwd: repo, signal: undefined, parentToolCallId: "receipt", nestedToolCallId: "receipt", extensionContext: context,
+        update() {}, audits: [], maxResultChars: 100_000, async approve() {},
+        checkExecutionBudget() { if (expired) throw ceiling; },
+        observeInvocation(event) { if (event.type === "call_end" && event.success) expired = true; },
+      })).rejects.toBe(ceiling);
+      expect(consumed).not.toHaveBeenCalled();
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeUndefined();
+      expect(state.mesh.get(seeded.key)).toBeDefined();
+      const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, context);
+      boundary(); boundary();
+      expect(sendMessage).toHaveBeenCalledOnce();
+      expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([seeded.id]);
+      expect(sendMessage.mock.calls[0]![0].content).toContain("authoritative full result");
+      await waitFor(() => state.mesh.get(seeded.key) === undefined);
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeGreaterThan(0);
+    } finally { inbox.close(); await registry.close(); await client.close(); await lifecycle.close(); await actors.close(); await agents.close(); await state.participants.close(); }
+  });
+
   // smarty-dev#878: a resident host whose root is gone sends its actors' messages to the project's
   // project agent. That Main accepts an actor message from another root's resident host, and
   // still nothing from a writer that is not a resident host.
@@ -341,6 +552,370 @@ describe("durable completion receipts", () => {
       await client.close();
       await state.participants.close();
     }
+  });
+
+  // smarty-dev#2236: one text reply from a resident actor (lucky-asc-router on gpt-6-sol, run
+  // 5b660655: one run, one outgoing message, one fabric.actor.output) reached Main twice, 1.5 s
+  // apart, because the client delivered a record before deleting it: any drain that saw the record
+  // again delivered it again. A record is delivered only by the drainer that claims it.
+  describe("a resident actor's delivery record", () => {
+    const actorReply = async (state: RootHarness, policy: { delivery: "steer" | "followUp"; triggerTurn: boolean } = { delivery: "followUp", triggerTurn: true }) => {
+      const id = "sol-text-reply";
+      const key = `${residentDeliveryPrefix(state.identity.id)}${id}`;
+      await state.mesh.put({
+        key, identity: { id: residentHostId(state.identity.id), name: "resident", kind: "main" }, ifVersion: 0,
+        value: {
+          format: RESIDENT_HOST_FORMAT, id, rootId: state.identity.id,
+          from: { id: "a50e8177eef74cf3a5adb16c068961f7", name: "lucky-asc-router", kind: "actor" },
+          ...policy, message: "asc-router: <redacted one-line relay>", createdAt: 1,
+        },
+      });
+      return key;
+    };
+
+    // A real Main whose Pi only queues what it is sent (prompt preflight, a settle): nothing is in
+    // the session until the test appends it. Review round 2 on pi-fabric#160 (finding 1, S1).
+    type Sent = { message: { details: Record<string, any> }; options?: { deliverAs?: string; triggerTurn?: boolean } | undefined };
+    const realMain = async (state: RootHarness, entries: unknown[], modules?: { MainAgentController: typeof import("../src/main-agent.js").MainAgentController }, idle = true) => {
+      const { MainAgentController } = modules ?? await import("../src/main-agent.js");
+      const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => void>>();
+      const sent: Sent[] = [];
+      const pi = {
+        on: (name: string, fn: (event: unknown, ctx: unknown) => void) => { handlers.set(name, [...(handlers.get(name) ?? []), fn]); },
+        sendMessage: (message: Sent["message"], options: Sent["options"]) => { sent.push({ message, options }); },
+        getThinkingLevel: () => "off",
+      };
+      const ctx = { isIdle: () => idle, hasPendingMessages: () => false, signal: { aborted: false }, sessionManager: { getEntries: () => entries } };
+      const main = new MainAgentController(pi as never, state.identity.id, true, repo, state.identity.sessionId);
+      main.attachFollowUpDrain(ctx as never, 60_000, path.join(state.config.meshRoot, "main-followups", "root.json"));
+      const emit = (name: string, event: unknown) => { for (const fn of handlers.get(name) ?? []) fn(event, ctx); };
+      const append = (item: Sent) => entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: item.message.details });
+      return { main, sent, emit, append };
+    };
+    const settle = { outcome: "completed", context: { pendingMessages: [] } };
+
+    it.each(process.platform === "win32" ? ["file"] : ["file", "directory"])("#169 round 3 keeps the resident source when Main's %s journal barrier fails", { timeout: 15_000 }, async (barrier) => {
+      const state = await rootHarness(`delivery-barrier-${barrier}`);
+      const key = await actorReply(state);
+      const main = await realMain(state, []);
+      const sync = fs.fsyncSync.bind(fs);
+      let fail = true;
+      const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+        if (fail && fs.fstatSync(fd).isDirectory() === (barrier === "directory")) throw new Error("journal barrier unavailable");
+        sync(fd);
+      });
+      const deliver = vi.spyOn(main.main, "deliverAgent");
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      try {
+        client.start();
+        await waitFor(() => deliver.mock.results.length > 0);
+        expect(deliver.mock.results[0]).toMatchObject({ type: "throw", value: expect.objectContaining({ message: expect.stringContaining("journal barrier unavailable") }) });
+        expect(state.mesh.get(key)).toBeDefined();
+        expect(main.sent).toHaveLength(0);
+        fail = false;
+        await waitFor(() => state.mesh.get(key) === undefined);
+        expect(main.sent).toHaveLength(1);
+      } finally { fail = false; synced.mockRestore(); await client.close(); main.main.closeFollowUpDrain(); await state.participants.close(); }
+    });
+
+    it("#169 round 2 isolates a refused first source while delivering a steer and another sender, then retries after a boundary", { timeout: 15_000 }, async () => {
+      // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
+      const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+      try {
+        const state = await rootHarness("fair-ancestry-drain");
+        const main = await realMain(state, [], undefined, false);
+        const from = { id: "bounded-actor", name: "actor", kind: "actor" as const };
+        for (let index = 0; index <= 1024; index++) {
+          main.main.deliverAgent({ from, message: "tiny", delivery: "followUp", triggerTurn: true, data: { coalesceKey: "state" }, deliveryId: `prior-${index}` });
+        }
+        const prefix = residentDeliveryPrefix(state.identity.id);
+        const seed = async (id: string, sender: typeof from, delivery: "steer" | "followUp", data?: unknown) => {
+          await state.mesh.put({ key: `${prefix}${id}`, identity: { id: residentHostId(state.identity.id), name: "resident", kind: "main" }, value: {
+            format: RESIDENT_HOST_FORMAT, id, rootId: state.identity.id, from: sender,
+            message: id, delivery, triggerTurn: true, ...(data ? { data } : {}), createdAt: Date.now(),
+          } });
+        };
+        await seed("a-refused", from, "followUp", { coalesceKey: "state" });
+        await seed("b-steer", { ...from, id: "steerer" }, "steer");
+        await seed("c-other", { ...from, id: "another-sender" }, "followUp");
+        const deliver = vi.spyOn(main.main, "deliverAgent");
+        const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+        try {
+          client.start();
+          await waitFor(() => deliver.mock.calls.length >= 1);
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          expect(deliver.mock.calls.map(([request]) => request.message)).toContain("b-steer");
+          expect(deliver.mock.calls.map(([request]) => request.message)).toContain("c-other");
+          expect(state.mesh.get(`${prefix}a-refused`)).toBeDefined();
+          expect(state.mesh.get(`${prefix}b-steer`)).toBeUndefined();
+          expect(state.mesh.get(`${prefix}c-other`)).toBeUndefined();
+          expect(main.sent.some((item) => item.options?.deliverAs === "steer")).toBe(true);
+          // Release and durably acknowledge the old carrier at a real Main boundary.
+          main.main.flushHeldAtNextBoundary();
+          main.emit("turn_end", { context: { pendingMessages: [] } });
+          for (const item of main.sent) main.append(item);
+          main.emit("turn_end", { context: { pendingMessages: [] } });
+          await waitFor(() => state.mesh.get(`${prefix}a-refused`) === undefined);
+          expect(deliver.mock.results.some((result) => result.type === "throw")).toBe(true);
+          expect(deliver.mock.calls.filter(([request]) => request.message === "a-refused").length).toBeGreaterThan(1);
+        } finally { await client.close(); await state.participants.close(); }
+      } finally { synced.mockRestore(); }
+    });
+
+    it("#169 round 1 leaves an over-bound replacement source in the resident mesh", { timeout: 15_000 }, async () => {
+      // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
+      const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+      try {
+        const state = await rootHarness("ancestry-backpressure");
+        const main = await realMain(state, [], undefined, false);
+        const from = { id: "bounded-actor", name: "actor", kind: "actor" as const };
+        const maxAncestry = 1024;
+        for (let index = 0; index <= maxAncestry; index++) {
+          main.main.deliverAgent({ from, message: "tiny", delivery: "followUp", triggerTurn: true, data: { coalesceKey: "state" }, deliveryId: `prior-${index}` });
+        }
+        const key = `${residentDeliveryPrefix(state.identity.id)}refused-source`;
+        await state.mesh.put({ key, identity: { id: residentHostId(state.identity.id), name: "resident", kind: "agent" }, value: {
+          format: RESIDENT_HOST_FORMAT, id: "refused-source", rootId: state.identity.id, from,
+          message: "tiny", delivery: "followUp", triggerTurn: true, data: { coalesceKey: "state" }, createdAt: Date.now(),
+        } });
+        const deliver = vi.spyOn(main.main, "deliverAgent");
+        const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+        try {
+          client.start();
+          await waitFor(() => deliver.mock.calls.length >= 1);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          expect(state.mesh.get(key)).toBeDefined();
+          expect(deliver.mock.results.every((result) => result.type === "throw" && /queue is full/.test(String(result.value)))).toBe(true);
+          expect(main.main.queueDepth().pendingFollowUps).toBe(1);
+          const saved = JSON.parse(fs.readFileSync(path.join(state.config.meshRoot, "main-followups", "root.json"), "utf8"));
+          expect(saved.items[0].supersedes).toHaveLength(maxAncestry);
+          expect(saved.items[0].deliveryId).toBe(`prior-${maxAncestry}`);
+        } finally { await client.close(); await state.participants.close(); }
+      } finally { synced.mockRestore(); }
+    });
+    it("is delivered once when its delete fails after it was read", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-delete-fails");
+      const key = await actorReply(state);
+      const main = await realMain(state, []);
+      const original = state.mesh.delete.bind(state.mesh);
+      let failures = 1;
+      vi.spyOn(state.mesh, "delete").mockImplementation(async (input) => {
+        if (failures-- > 0) throw new Error("Timed out waiting for the Fabric mesh lock");
+        return original(input);
+      });
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      try {
+        client.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(main.sent).toHaveLength(1);
+        expect(main.sent[0]!.message.details.deliveryId).toBe(`resident:${state.identity.id}:sol-text-reply`);
+      } finally {
+        await client.close();
+        await state.participants.close();
+      }
+    });
+
+    it("is delivered once when a second drainer read it before the first deleted it", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-stale-drainer");
+      const key = await actorReply(state);
+      const main = await realMain(state, []);
+      const stale = state.mesh.listAll(residentDeliveryPrefix(state.identity.id));
+      const first = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      // A second store on the same mesh whose recent-parse cache still holds the record.
+      const staleMesh = new MeshStore(state.config.meshRoot, state.meshConfig.maxEventBytes, state.meshConfig.maxReadEvents);
+      vi.spyOn(staleMesh, "listAll").mockImplementation(() => structuredClone(stale));
+      const second = new ResidencyClient({ config: state.config, mesh: staleMesh, participants: state.participants, mainAgent: main.main });
+      try {
+        first.start();
+        await waitFor(() => state.mesh.get(key) === undefined && main.sent.length > 0);
+        await first.close();
+        second.start();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(main.sent).toHaveLength(1);
+      } finally {
+        await first.close();
+        await second.close();
+        await state.participants.close();
+      }
+    });
+
+    // Review round 1 on pi-fabric#160: a Main that dies before it took the reply must find it after
+    // its restart (a delete-first claim lost it).
+    it("survives a Main that dies before taking it, and reaches the restarted Main once", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-main-dies");
+      const key = await actorReply(state);
+      const dying = { ...state.mainAgent, deliverAgent: () => { throw new Error("Main process exited"); } };
+      const before = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: dying });
+      try {
+        before.start();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      } finally {
+        await before.close();
+      }
+      expect(state.mesh.get(key)).toBeDefined();
+      const main = await realMain(state, []);
+      const after = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      try {
+        after.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(main.sent).toHaveLength(1);
+      } finally {
+        await after.close();
+        await state.participants.close();
+      }
+    });
+
+    // Review round 2 on pi-fabric#160: deliverAgent returned while the reply sat only in Pi's
+    // volatile queue behind a prompt preflight; the record was deleted, then Main died.
+    it("is journalled by Main before its record goes, and a restarted Main replays it exactly once", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-preflight-dies");
+      const key = await actorReply(state);
+      const entries: unknown[] = [];
+      const dying = await realMain(state, entries);
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: dying.main });
+      try {
+        client.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+      } finally {
+        await client.close();
+      }
+      expect(dying.sent).toHaveLength(1);                                           // queued in Pi, never in the session
+      // Main dies (no close); a new controller on the same journal and session.
+      const restarted = await realMain(state, entries);
+      restarted.emit("agent_before_settle", settle);
+      expect(restarted.sent.map((item) => item.message.details.id)).toEqual([dying.sent[0]!.message.details.id]);
+      restarted.append(restarted.sent[0]!);
+      restarted.emit("agent_settled", { outcome: "completed" });
+      restarted.emit("agent_before_settle", settle);
+      expect(restarted.sent).toHaveLength(1);
+      await state.participants.close();
+    });
+
+    // Review round 2 on pi-fabric#160: a module-local set of delivered ids does not survive a
+    // release reload, which loads a fresh copy of every module.
+    it("is not delivered twice after a failed delete and a release reload", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-release-reload");
+      const key = await actorReply(state);
+      const entries: unknown[] = [];
+      const old = await realMain(state, entries);
+      const original = state.mesh.delete.bind(state.mesh);
+      const failing = vi.spyOn(state.mesh, "delete").mockRejectedValue(new Error("Timed out waiting for the Fabric mesh lock"));
+      const before = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: old.main });
+      try {
+        before.start();
+        await waitFor(() => old.sent.length > 0 && failing.mock.calls.length > 0);
+      } finally {
+        await before.close();
+      }
+      old.append(old.sent[0]!);                                                     // the session holds it
+      old.emit("agent_settled", { outcome: "completed" });
+      failing.mockImplementation(original);
+      vi.resetModules();                                                            // a new release generation
+      const [{ ResidencyClient: FreshClient }, freshMain] = await Promise.all([
+        import("../src/residency/client.js"),
+        import("../src/main-agent.js"),
+      ]);
+      const fresh = await realMain(state, entries, freshMain);
+      const after = new FreshClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: fresh.main });
+      try {
+        after.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(fresh.sent).toHaveLength(0);
+      } finally {
+        await after.close();
+        await state.participants.close();
+      }
+    });
+
+    // Security round 3 on pi-fabric#160 (S2): a passive reply (a non-triggering followUp; a nextTurn
+    // delivery reaches Main as one, src/residency/host.ts) keeps its policy across a restart and a
+    // release reload: appended once, triggerTurn false, and no Main turn of its own.
+    it("keeps a passive reply passive when a restarted, reloaded Main replays it", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-passive-replay");
+      const key = await actorReply(state, { delivery: "followUp", triggerTurn: false });
+      const entries: unknown[] = [];
+      const dying = await realMain(state, entries, undefined, false);             // Main is streaming
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: dying.main });
+      try {
+        client.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+      } finally {
+        await client.close();
+      }
+      expect(dying.sent.map((item) => item.options)).toEqual([{ deliverAs: "followUp", triggerTurn: false }]);
+      // Main dies before Pi appends it; the restart loads a new release generation.
+      vi.resetModules();
+      const fresh = await realMain(state, entries, await import("../src/main-agent.js"), false);
+      fresh.emit("agent_before_settle", settle);
+      expect(fresh.sent.map((item) => item.message.details.id)).toEqual([dying.sent[0]!.message.details.id]);
+      expect(fresh.sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: false });
+      expect(fresh.sent[0]!.message.details.triggerTurn).toBe(false);
+      fresh.append(fresh.sent[0]!);
+      fresh.emit("agent_settled", { outcome: "completed" });
+      fresh.emit("agent_before_settle", settle);
+      expect(fresh.sent).toHaveLength(1);                                           // once, no triggering release
+      expect(fs.existsSync(path.join(state.config.meshRoot, "main-followups", "root.json"))).toBe(false);
+      await state.participants.close();
+    });
+
+    // Astra round 3 finding 2 on pi-fabric#160: shutdown closes Main's journal first; a drain in
+    // that window must keep the record, and the next Main gets it once.
+    it("is kept when Main's journal is already closed, and the next Main takes it once", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-journal-closed");
+      const key = await actorReply(state);
+      const closing = await realMain(state, []);
+      closing.main.closeFollowUpDrain();
+      const during = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: closing.main });
+      try {
+        during.start();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      } finally {
+        await during.close();
+      }
+      expect(closing.sent).toHaveLength(0);
+      expect(state.mesh.get(key)).toBeDefined();
+      const next = await realMain(state, []);
+      const after = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: next.main });
+      try {
+        after.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+        expect(next.sent).toHaveLength(1);
+      } finally {
+        await after.close();
+        await state.participants.close();
+      }
+    });
+
+    it("is kept for a later drain when Main refuses it", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-refused");
+      const key = await actorReply(state);
+      const main = await realMain(state, []);
+      const deliver = main.main.deliverAgent.bind(main.main);
+      let refusals = 1;
+      let keptAtRefusal = false;
+      vi.spyOn(main.main, "deliverAgent").mockImplementation((request) => {
+        // Review round 1 on pi-fabric#160: until Main took it, the record is the only copy.
+        if (refusals-- > 0) {
+          keptAtRefusal = state.mesh.get(key) !== undefined;
+          throw new Error("Main's followUp queue is full");
+        }
+        return deliver(request);
+      });
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      try {
+        client.start();
+        await waitFor(() => main.sent.length > 0 && state.mesh.get(key) === undefined);
+        expect(keptAtRefusal).toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(main.sent).toHaveLength(1);
+      } finally {
+        await client.close();
+        await state.participants.close();
+      }
+    });
   });
 
   // review/astra on 3257dba, D1: the durable fallback cleanup keeps a possibly live worker's files.
@@ -526,6 +1101,51 @@ describe("durable completion receipts", () => {
 });
 
 describe.skipIf(!hasResidentHost || process.platform === "win32")("durable participant residency", () => {
+  it.each([false, true])("preserves a resident-host ASK activation at the Main ceiling (queued=%s)", { timeout: 45_000 }, async queued => {
+    const state = await rootHarness(`resident-main-ceiling-${queued}`);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    const control = new FabricControlPlane(state.mesh, state.identity, { enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
+    control.start(() => ({ accepted: false }));
+    const controller = new AbortController();
+    let first: Promise<unknown> | undefined;
+    try {
+      client.start();
+      const actor = await client.createActor({ name: "durable survivor", instructions: "Reply.", residency: "durable", transport: "process", responseMode: "text", delivery: "followUp", triggerTurn: false });
+      const participant = () => state.participants.get(actor.id, undefined, { fresh: true });
+      const current = () => state.mesh.get(`actors/${state.config.sessionId}/${actor.id}`, { fresh: true })?.value as import("../src/actors/types.js").FabricActorInfo | undefined;
+      if (queued) {
+        first = control.requestResult(client.hostId, actor.id, "ask", { message: "LIVE_WITHOUT_PROGRESS" }, client.hostId, { timeoutMs: 10_000 }).catch(error => error);
+        await waitFor(() => participant()?.actorRun !== undefined);
+      }
+      const observation = control.requestResult(client.hostId, actor.id, "ask", { message: queued ? "accepted durable queue item" : "LIVE_WITHOUT_PROGRESS" }, client.hostId, { timeoutMs: 10_000, signal: controller.signal, detachOnMainCeiling: true }).catch(error => error);
+      await waitFor(() => queued ? current()?.queued === 1 : current()?.inFlightRun !== undefined);
+      const runId = current()!.inFlightRun!.id;
+      const ceiling = createMainExecutionCeilingError(700);
+      controller.abort(ceiling);
+      const rejection = await observation;
+      await delay(100);
+      expect(state.mesh.read({ topic: "fabric.control.command", limit: 50 }).filter(event => event.kind === "cancel")).toHaveLength(0);
+      expect(rejection).toBe(ceiling);
+      expect(current()!.inFlightRun!.id).toBe(runId);
+      if (queued) expect(current()!.queued).toBe(1);
+      const worker = JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "runs", runId, "status.json"), "utf8"));
+      expect(worker).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
+      await first;
+      await waitFor(() => state.deliveries.length === (queued ? 2 : 1) && participant()?.actorRun === undefined);
+      const persisted = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)!;
+      expect((persisted.messages as FabricActorMessage[]).filter(message => message.direction === "out")).toHaveLength(queued ? 2 : 1);
+      await delay(200);
+      expect(state.deliveries).toHaveLength(queued ? 2 : 1);
+      // An explicit remote stop still owns activation lifetime after observation expiry.
+      const again = control.requestResult(client.hostId, actor.id, "ask", { message: "HANG" }, client.hostId, { timeoutMs: 10_000 }).catch(error => error);
+      await waitFor(() => participant()?.actorRun !== undefined);
+      await control.request(client.hostId, actor.id, "stop", {}, client.hostId);
+      await again;
+      await waitFor(() => participant()?.actorRun === undefined);
+      expect(state.deliveries).toHaveLength(queued ? 2 : 1);
+      await client.removeActor(actor.id);
+    } finally { controller.abort(); await first; await control.close(); await client.close(); await state.participants.close(); await stopResident(state.config); }
+  });
   it("keeps a durable actor responsive after its originating Main closes", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-actor");
     const agents = new AgentManager(repo, state.config.agents, {
@@ -671,6 +1291,74 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     ) as { actors: Array<{ id: string }> };
     expect(registry.actors.some((candidate) => candidate.id === actor.id)).toBe(false);
     await reconnect.close();
+  });
+
+  // smarty-dev#2184 item 8: a removal waited for the actor's in-flight run and blocked every
+  // later request to the host (clients timed out; a create right after it was dropped).
+  it("returns a removal behind an in-flight run at once and keeps serving requests", { timeout: 60_000 }, async () => {
+    const testStarted = Date.now();
+    const state = await rootHarness("resident-remove-pending");
+    state.config.agents = { ...state.config.agents, timeoutMs: 120_000 };
+    // The resident host and its workers inherit this and record themselves at launch: the worker
+    // to kill is found there, never by a host-wide command-line match (pi-fabric#160 S4).
+    const launches = launchLog(state.root);
+    const savedEnv = Object.fromEntries(Object.keys(launches.env).map((key) => [key, process.env[key]]));
+    Object.assign(process.env, launches.env);
+    const client = new ResidencyClient({
+      config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath,
+    });
+    const control = new FabricControlPlane(state.mesh, state.identity, {
+      enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000,
+    });
+    control.start(() => ({ accepted: false }));
+    try {
+      const request = { name: "hung reviewer", instructions: "Review.", residency: "durable" as const, delivery: "mailbox" as const };
+      const actor = await client.createActor(request);
+      await control.request(client.hostId, actor.id, "followUp", { message: "HANG_WITH_PROGRESS" }, client.hostId);
+      await waitFor(() => state.participants.get(actor.id, undefined, { fresh: true })?.actorRun !== undefined, 30_000);
+      const runId = state.participants.get(actor.id, undefined, { fresh: true })!.actorRun!.id;
+
+      const started = Date.now();
+      const removed = await client.removeActor(actor.id);
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(removed.pending).toContain(`pending behind its in-flight run ${runId}`);
+      expect(client.hostStateNote()).toContain(`removal of hung reviewer (${actor.id}) is pending behind its in-flight run ${runId}`);
+
+      // The queue is free: a same-name create right after the removal succeeds.
+      const successor = await client.createActor(request);
+      expect(successor.id).not.toBe(actor.id);
+
+      // The old run ends (its worker is killed); the removal then finishes and cleans up.
+      // Of the processes this fixture launched, the one started as the worker of this run.
+      const workers = launches.owned().filter(({ argv }) =>
+        argv[0] === fakeWorker && argv[argv.indexOf("--id") + 1] === runId);
+      expect(workers).toHaveLength(1);
+      const worker = workers[0]!;
+      expect(startedAtMs(worker.started)).toBeGreaterThanOrEqual(testStarted - 1_000);
+      // Revalidated just before the signal: the pid still names the recorded process.
+      expect(same(worker)).toBe(true);
+      process.kill(worker.pid, "SIGKILL");
+      const registryIds = (): string[] => [state.config.actorRoot, state.config.sessionActorRoot!].flatMap((root) => {
+        try {
+          return (JSON.parse(fs.readFileSync(path.join(root, "actors.json"), "utf8")) as { actors: Array<{ id: string }> })
+            .actors.map((entry) => entry.id);
+        } catch { return []; }
+      });
+      expect(registryIds()).toContain(actor.id);
+      await waitFor(() => !registryIds().includes(actor.id), 30_000);
+      expect(registryIds()).toContain(successor.id);
+      await waitFor(() => client.hostStateNote() === "", 5_000);
+      await client.removeActor(successor.id);
+    } finally {
+      await control.close();
+      await client.close();
+      await stopResident(state.config);
+      await state.participants.close();
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   it("queues passive actor delivery until Main resumes", { timeout: 45_000 }, async () => {

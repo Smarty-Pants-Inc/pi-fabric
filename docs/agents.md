@@ -28,7 +28,11 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 ### Background completion inbox
 
-`agents.spawn` returns immediately; independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.
+`agents.spawn` validates the request and returns a handle. With a free concurrency slot, Fabric launches the worker and returns a `running` handle. When every slot is occupied, it returns a `queued` handle without waiting for admission. `agents.list` and `agents.status` show queued runs with a one-based `queuePosition`. Fabric admits them in FIFO order as running children finish. Queued spawns count against `maxPerExecution` and the calling program's `agentBudget`; cancelling one does not refund that count.
+
+`agents.wait`/`join` can wait on a queued handle through admission and completion. Their wait bound includes time spent queued. `agents.stop` removes a queued run without launching its worker and settles its result as `stopped`. A returned queued handle belongs to the session: returning from, timing out, or aborting the calling `fabric_exec` program leaves it queued. Session shutdown still stops session-owned queued and running children. These admission rules apply to every local worker transport. Queued receipts are currently session-only: a saturated durable spawn cancels its accepted queue entry and safely rejects instead of returning a queued handle. If a cancellation races worker creation and exit cannot be confirmed, Fabric retains its run/worktree files, reports cleanup pending, and refuses cleanup until the worker is checked manually.
+
+Independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.
 
 `agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop. Fabric refuses a foreground `bash` call, native or through `pi.bash`, whose sleeps add up to more than 5 minutes: a long `sleep`, a sleep in a counted `for` loop, a sleep in a `while` or `until` loop without a `timeout`, a sleep whose length is not a literal (`sleep $((t-now))`), or a `flock -w` wait. The tool call's own `timeout` or a literal `timeout N` bounds the estimate. A session that waits in the foreground takes no steer or ask. Start the poll detached, or wait for a completion message or a mesh event, and end the turn.
 
@@ -39,6 +43,33 @@ Durable spawns use the same inbox. Undelivered envelopes survive disconnects; re
 After a failed or aborted assistant response (including `Error: Terminated`), Fabric allows Pi's own retries to recover. If no recovery output arrives for 60 seconds, the worker fails the run with the original error and terminates the child, escalating from SIGTERM to SIGKILL after another 5 seconds. Repeated retry announcements, errors, or lifecycle events do not extend this deadline. Nonempty text/thinking/tool-call deltas refresh it; a successful assistant response clears it. Healthy inference and tool execution are not subject to this recovery timer, and the overall run deadline still applies.
 
 When Pi exhausts its retries, Fabric ends the run; it no longer waits forever on an earlier `willRetry` flag. Child shutdown after RPC stdin closes is also bounded: 5 seconds for graceful exit, then SIGTERM and a further 5 seconds before SIGKILL. These failures settle `agents.wait`/`join` and notify detached callers normally; they do not automatically replay potentially side-effecting work. Already-running workers must be stopped and respawned to use the fix.
+
+### Fleet write attribution for process children
+
+Ordinary process children receive `SMARTY_ROLE=task-agent`, whether the parent has a stamped
+fleet role or no role. The fleet write governor derives their lane from the child's cwd, not
+from a role or a lane environment variable. Explicit actor runs retain their inherited role
+and set `PI_FABRIC_ACTOR_NAME`; that actor identity takes precedence in the governor. An
+ordinary task spawned by an actor also inherits `PI_FABRIC_ACTOR_NAME`, so its governed
+writes still count as that actor. This is write attribution, not an authorization boundary.
+`PI_FABRIC_ROLE` is unchanged: when the parent sets it, `participantRole` still prefers that
+inherited value over `SMARTY_ROLE`.
+
+Task agents return status to their parent; they must not call `smarty-status` to update the
+parent's status comment. That helper keys ordinary comments by role/worktree, so a task
+agent's call would create a separate `task-agent/<worktree>` comment and leave the
+parent's unchanged. The parent owns and writes its status updates. No parent-role environment variable
+is exported for status impersonation.
+
+The installed admin audit's `actor()` likewise records `PI_FABRIC_ACTOR_NAME`, else
+`SMARTY_ROLE`. Non-actor session roles rendered by `smarty-role --format fabric` (including
+security passes and acceptance auditors) therefore execute and are recorded as `task-agent`;
+the role instructions describe the assignment, not a separate process identity. This coarse
+attribution is intentional for delegated work: it identifies the actual task-agent writer
+without claiming the parent's role. It does not identify the named review assignment; retain
+that provenance in the Fabric run/task and review receipt. Work requiring a distinct session
+role in the admin audit must use a separately role-launched root session, not an ordinary task
+agent. Fabric does not change those external helpers or their audit schema.
 
 ### Image-heavy lifecycle events
 

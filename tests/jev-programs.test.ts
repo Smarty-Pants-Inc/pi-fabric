@@ -47,6 +47,20 @@ describe("Jev reactive programs", () => {
     expect(result).toEqual(await provider.manager.join(run.id));
     expect(result).toMatchObject({state: "completed", result: 7});
   });
+  it("holds a self-reload for an unread background result, for a bounded time (smarty-dev#2216)", async () => {
+    const { provider } = setup(); const manager = provider.manager;
+    const run = await callProgram(provider, "spawn", launch("return 7;"));
+    while (manager.list()[0]?.state === "running") await delay(5);
+    await delay(5); // the run's finally releases its lease and sets endedAt
+    // A reload now would clear the run: a later jev.wait says "Unknown or expired Jev run ID".
+    expect(manager.runningCount()).toBe(1);
+    expect(manager.runningCount(Date.now() + 10 * 60_000)).toBe(0); // an unread result cannot hold it forever
+    expect(manager.status(run.id)).toMatchObject({ state: "completed", result: 7 });
+    expect(manager.runningCount()).toBe(0);
+    const waited = await callProgram(provider, "spawn", launch("return 8;"));
+    await manager.wait(waited.id);
+    expect(manager.runningCount()).toBe(0);
+  });
   it("stops a long-lived loop and is idempotent", async () => {
     const { provider } = setup();
     const run = await callProgram(provider, "spawn", launch("while(true) { await program.sleep(10); }"));

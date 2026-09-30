@@ -131,11 +131,11 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(svc).toContain("User=test-org-records\n");
 		expect(svc).toContain("Group=test-org-records\n");
 		expect(svc).not.toContain("SupplementaryGroups");
-		expect(svc).toContain("ExecStartPre=+/bin/chmod 2750 /run/test-org-records\n");
+		expect(svc).toContain("ExecStartPre=+/usr/bin/install -d -m 2750 -o test-org-records -g nobodyuser /run/test-org-records\n");
 		expect(svc).toContain("Requires=test-org-records-pg.service\n");
-		expect(svc).toContain("RuntimeDirectoryMode=0750\n");
+		expect(svc).not.toMatch(/^RuntimeDirectory(?:Mode|Preserve)?=/m);
+		expect(svc).not.toMatch(/^ExecStartPre=.*\/(?:chgrp|chmod) /m);
 		expect(svc).toContain("UMask=0007\n");
-		expect(svc).toContain("ExecStartPre=+/bin/chgrp nobodyuser /run/test-org-records\n");
 		expect(svc).toContain(
 			"ExecStart=/opt/test-org-records/node /opt/test-org-records/service-main.mjs serve --config /etc/test-org-records/service.json\n",
 		);
@@ -200,6 +200,9 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.out).toContain("? via a temp file in /var/lib/test-org-records-installer (root-only), then + install -m 0644 -o root -g root /var/lib/test-org-records-installer/write.XXXXXX /etc/systemd/system/test-org-records.service\n");
 		expect(r.out).toContain("+ install -d -m 0700 -o test-org-records -g test-org-records /run/test-org-records-pg\n");
 		expect(r.out).toContain("+ install -d -m 2750 -o test-org-records -g nobodyuser /run/test-org-records\n");
+		const svc = r.out.split("+ write /etc/systemd/system/test-org-records.service")[1]!.split("+ systemctl daemon-reload")[0];
+		expect(svc).not.toMatch(/\| RuntimeDirectory(?:Mode|Preserve)?=/);
+		expect(svc).toContain("    | ExecStartPre=+/usr/bin/install -d -m 2750 -o test-org-records -g nobodyuser /run/test-org-records\n");
 		expect(r.out).not.toContain("/etc/test-org-records/credentials");
 		for (const [path, mode] of [
 			["/var/lib/test-org-records/pg/pg_hba.conf", "0600"],
@@ -685,7 +688,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 	// Root-side install/chown/chmod log their args; install really runs only inside the temp system root.
 	// runuser drops "-u USER --" and runs the rest (the real binaries) as this user.
 	const relayRun = (layout: "plain" | "dest-link" | "config-link", pgFrom: "tree17" | "tree16" = "tree17", prep?: (root: string, t: string) => void, real?: { bundle: string; port: number }) => {
-		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-relay-"));
+		// This root also holds Unix sockets: keep the prefix short for deep checkout-local TMPDIRs.
+		const t = mkdtempSync(join(tmpdir(), "relay-"));
 		const L = join(t, "calls.log");
 		const bin = join(t, "bin");
 		// A detected /usr/lib/postgresql/17 or 16 under the test root.
@@ -1448,12 +1452,17 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		const r = run([...dryBase, "--dry-run"], fakeEnv);
 		expect(r.code, r.err).toBe(0);
 		expect(r.out).not.toMatch(/^C10_RECORDS_INSTALLED org=/m);
+		expect(r.out).toContain("then wait up to 30 s for a successful connection to /run/test-org-records/records.sock as nobodyuser");
+		const withOperator = run([...dryBase, "--dry-run", "--operator", "importer:github"], fakeEnv);
+		expect(withOperator.code, withOperator.err).toBe(0);
+		expect(withOperator.out).toContain("wait up to 30 s for a successful connection to /run/test-org-records/records.sock as nobodyuser (the service's SIGHUP handler is in place by then)");
 		for (const check of [
 			"? systemctl is-active --quiet test-org-records.service",
 			"? systemctl is-active --quiet test-org-records-pg.service",
 			`? runuser -u test-org-records -- ${q(`${hostPgBin}/pg_isready`)} -h /run/test-org-records-pg -p 5433`,
 			"? runuser -u test-org-records -- python3 -c 'import ctypes; ctypes.CDLL(None).getsockopt'",
 			"? test -S /run/test-org-records/records.sock",
+			"? runuser -u nobodyuser -- python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5); s.connect(sys.argv[1]); s.close()' /run/test-org-records/records.sock  (service socket connect as nobodyuser)",
 		])
 			expect(r.out).toContain(check);
 		const out = r.out.trimEnd().split("\n");
@@ -1482,6 +1491,146 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(down.out).not.toContain("## ROLLBACK");
 		} finally {
 			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	// Observe real connect attempts without changing the installer's Python code or deadline.
+	// The runuser shim records the requested identity; all test processes stay unprivileged.
+	const observeSocketWait = (bin: string, t: string, L: string) => {
+		const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" });
+		expect(python.status, python.stderr).toBe(0);
+		const attempts = join(t, "connect-attempts");
+		writeFileSync(attempts, "");
+		writeFileSync(join(bin, "python3"), `#!${python.stdout.trim()}
+import socket, sys
+class ObservedSocket(socket.socket):
+    def connect(self, path):
+        with open(${JSON.stringify(attempts)}, "a") as log:
+            log.write("connect\\n")
+        return super().connect(path)
+socket.socket = ObservedSocket
+code = sys.argv[2]
+sys.argv = ["-c", *sys.argv[3:]]
+exec(compile(code, "<installer-probe>", "exec"))
+`);
+		writeFileSync(join(bin, "runuser"), `#!/bin/bash
+echo "as-user $2 $4" >> "${L}"
+[ "$1" = -u ] && shift 2; [ "$1" = -- ] && shift
+FAKE_AS_USER=1 exec "$@"
+`);
+		return () => readFileSync(attempts, "utf8").trim().split("\n").filter(Boolean).length;
+	};
+
+	for (const context of ["restart", "reload"] as const)
+		it.skipIf(process.getuid?.() === 0)(`a dead socket wait polls then fails within the 30 s bound before ${context}`, () => {
+			const { t, r, bin, L, again } = relayRun("plain");
+			try {
+				expect(r.code, r.err + r.out).toBe(0);
+				// relayRun's child exits without closing its listener, leaving a genuine dead socket.
+				expect(lstatSync(join(t, "root/run/test-org-records/records.sock")).isSocket()).toBe(true);
+				const attempts = observeSocketWait(bin, t, L);
+				const marker = join(t, "root/var/lib/test-org-records-installer/restart-pending");
+				if (context === "restart") writeFileSync(marker, "test-org-records.service\n", { mode: 0o600 });
+				writeFileSync(L, "");
+				const start = performance.now();
+				const failed = again(context === "restart" ? [] : undefined);
+				const elapsed = performance.now() - start;
+				expect(failed.code, failed.err + failed.out).toBe(1);
+				expect(elapsed).toBeGreaterThanOrEqual(30_000);
+				expect(elapsed).toBeLessThan(40_000);
+				expect(attempts()).toBeGreaterThan(2);
+				expect(attempts()).toBeLessThanOrEqual(301);
+				expect(failed.err).toContain(context === "restart"
+					? "did not appear within 30 s after restarting test-org-records.service; see journalctl -u test-org-records.service"
+					: "did not appear within 30 s; not reloading test-org-records.service");
+				expect(failed.err).toContain(`FAILED at step ${context === "restart" ? "7 (Database, role, migrations)" : "8 (Operator principals)"}`);
+				expect(failed.err).toContain("Nothing after this step ran.");
+				expect(failed.out).not.toContain("C10_RECORDS_INSTALLED org=");
+				expect(failed.out).not.toContain("## 9. Verification");
+				const calls = readFileSync(L, "utf8");
+				expect(calls).toContain(`as-user ${me} python3\n`);
+				expect(calls).not.toContain("systemctl reload");
+				if (context === "restart") expect(readFileSync(marker, "utf8")).toBe("test-org-records.service\n");
+			} finally {
+				rmSync(t, { recursive: true, force: true });
+			}
+		});
+
+	it.skipIf(process.getuid?.() === 0)("a stale socket waits for a delayed live listener before restart completion and reload", async () => {
+		const { t, r, bin, L, again } = relayRun("plain");
+		const socket = join(t, "root/run/test-org-records/records.sock");
+		const attempts = observeSocketWait(bin, t, L);
+		writeFileSync(join(t, "root/var/lib/test-org-records-installer/restart-pending"), "test-org-records.service\n", { mode: 0o600 });
+		// A separate process can bind while again() blocks this test's event loop.
+		const listener = spawn(process.execPath, ["-e", `
+const fs = require("fs"), net = require("net"), socket = process.argv[1];
+setTimeout(() => {
+    fs.unlinkSync(socket);
+    net.createServer(c => c.destroy()).listen(socket);
+}, 2000);
+process.stdout.write("starting\\n");
+`, socket], { stdio: ["ignore", "pipe", "inherit"] });
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			await new Promise<void>((resolve) => listener.stdout!.once("data", () => resolve()));
+			writeFileSync(L, "");
+			const live = again();
+			expect(live.code, live.err + live.out).toBe(0);
+			expect(attempts()).toBeGreaterThan(3); // retries, then both waits and step 9 connect succeed
+			expect(live.out.trimEnd().split("\n").at(-1)).toBe(success);
+			const calls = readFileSync(L, "utf8");
+			expect(calls).toContain(`as-user ${me} python3\n`);
+			expect(calls).toContain("systemctl restart test-org-records.service\n");
+			expect(calls).toContain("systemctl reload test-org-records.service\n");
+		} finally {
+			const exited = new Promise<void>((resolve) => listener.once("exit", () => resolve()));
+			listener.kill();
+			await exited;
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("an EACCES connecting as the org user fails step 9 and never prints success", () => {
+		const { t, r, again, bin, L } = relayRun("plain");
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			expect(r.out).toContain(`OK: service socket connect as ${me}`);
+			writeFileSync(join(bin, "python3"), `#!/bin/bash\necho "python3 $*" >> "${L}"\ncase $2 in *s.connect*) echo 'PermissionError: [Errno 13] Permission denied (EACCES)' >&2; exit 1 ;; esac\n`);
+			writeFileSync(L, "");
+			const denied = again([]);
+			expect(denied.code).toBe(1);
+			expect(denied.err).toContain("Permission denied (EACCES)");
+			expect(denied.err).toContain(`FAILED at step 9 (Verification)`);
+			expect(denied.err).toContain(`check failed (service socket connect as ${me}): runuser -u ${me} -- python3 -c`);
+			expect(denied.out).not.toContain("C10_RECORDS_INSTALLED org=");
+			expect(denied.out).not.toContain("## ROLLBACK");
+			expect(readFileSync(L, "utf8")).toContain("runuser python3 -c import socket, sys;");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("the printed connect probe really connects and reports directory EACCES", async () => {
+		const preview = run([...dryBase, "--dry-run"], fakeEnv);
+		const code = preview.out.match(/\? runuser -u nobodyuser -- python3 -c '([^']*s\.connect[^']*)'/)?.[1];
+		expect(code).toBeDefined();
+		const { createServer } = await import("node:net");
+		const dir = mkdtempSync(join(tmpdir(), "connect-"));
+		const socket = join(dir, "records.sock");
+		const server = createServer((client) => client.destroy());
+		try {
+			await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
+			const probe = () => spawnSync("python3", ["-c", code!, socket], { encoding: "utf8", timeout: 10_000 });
+			const ok = probe();
+			expect(ok.status, ok.stderr).toBe(0);
+			chmodSync(dir, 0o000);
+			const denied = probe();
+			expect(denied.status).toBe(1);
+			expect(denied.stderr).toContain("PermissionError: [Errno 13] Permission denied");
+		} finally {
+			chmodSync(dir, 0o700);
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 

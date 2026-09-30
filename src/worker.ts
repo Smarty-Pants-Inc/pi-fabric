@@ -80,6 +80,13 @@ const loadWorkerRecovery = async (): Promise<WorkerRecoveryModule> => {
   return import(sourceModulePath) as Promise<WorkerRecoveryModule>;
 };
 
+type WorkerToolCallStreamGuardModule = typeof import("./worker/tool-call-stream-guard.js");
+const loadToolCallStreamGuard = async (): Promise<WorkerToolCallStreamGuardModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/tool-call-stream-guard.js");
+  const sourceModulePath = "./worker/tool-call-stream-guard.ts";
+  return import(sourceModulePath) as Promise<WorkerToolCallStreamGuardModule>;
+};
+
 type AgentResultModule = typeof import("./agents/result.js");
 
 const loadAgentResult = async (): Promise<AgentResultModule> => {
@@ -240,7 +247,7 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -249,6 +256,7 @@ const main = async (): Promise<void> => {
     loadWorkerEventProjection(),
     loadWorkerRecovery(),
     loadWorkerRunLog(),
+    loadToolCallStreamGuard(),
   ]);
   runRecordHelpers = loadedRunRecordHelpers;
   const {
@@ -355,6 +363,18 @@ const main = async (): Promise<void> => {
     fs.rmSync(replyFile!, { force: true });
     piArguments.push("-e", hookPath);
   }
+  // smarty-dev#2184: every Pi actor run gets the bash timeout, also a native-tool one that runs
+  // with --no-extensions (an explicit -e still loads). It comes after Fabric's -e so Fabric's
+  // foreground-wait guard judges the caller's own timeout; with Fabric loaded, the second hook finds
+  // the timeout set and does nothing.
+  if (options.actorId) {
+    const hookPath = fileURLToPath(new URL(
+      import.meta.url.endsWith(".ts") ? "./guards/actor-bash-hook.ts" : "./guards/actor-bash-hook.js",
+      import.meta.url,
+    ));
+    if (!fs.existsSync(hookPath)) throw new Error("Actor bash timeout hook is missing");
+    piArguments.push("-e", hookPath);
+  }
   const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
   if (piTools.length > 0) piArguments.push("--tools", piTools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
@@ -410,11 +430,21 @@ const main = async (): Promise<void> => {
     applyChildPriority(process.pid, options.nice, (message) =>
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
+  // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
+  const childEnvironment = { ...process.env };
+  delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
+  if (options.actorId && options.bashTimeoutSeconds !== undefined &&
+    Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
+    childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S = String(options.bashTimeoutSeconds);
+  }
+  // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
+  // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
   const child = spawnCli(childBinary, childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
     env: {
-      ...process.env,
+      ...childEnvironment,
+      ...(options.actorName ? {} : { SMARTY_ROLE: "task-agent" }),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
@@ -484,8 +514,22 @@ const main = async (): Promise<void> => {
   let killTimer: NodeJS.Timeout | undefined;
   let closeTimer: NodeJS.Timeout | undefined;
   const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error));
+  const toolCallStreamGuard = new ToolCallStreamGuard((error) => {
+    if (terminalStatus) return;
+    terminalStatus = "failed";
+    terminalError = error.message;
+    record.error = error.message;
+    record.errorCode = error.code;
+    update();
+    appendLog(`${JSON.stringify({ type: "fabric_runaway_error", errorCode: error.code,
+      error: error.message, model: error.model, effort: error.effort, bytes: error.bytes,
+      elapsedMs: error.elapsedMs, contentIndex: error.contentIndex })}\n`);
+    process.stderr.write(`${error.name}: ${error.message}\n`);
+    killChild();
+  }, () => ({ model: record.model ?? "unknown", effort: record.thinking ?? "unknown" }));
   const killChild = (): void => {
     recoveryWatchdog.dispose();
+    toolCallStreamGuard.dispose();
     if (closeTimer) clearTimeout(closeTimer);
     terminateChild(child, "SIGTERM");
     killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
@@ -956,6 +1000,10 @@ const main = async (): Promise<void> => {
         modelControl.observeAssistant(message as Record<string, unknown>);
       }
     }
+    if (!terminalStatus) {
+      toolCallStreamGuard.observe(event);
+      if (terminalStatus) return;
+    }
     if (event.type === "message_update" && !terminalStatus) {
       const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
       if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
@@ -1251,6 +1299,7 @@ const main = async (): Promise<void> => {
   let oversized: { chars: number; prefix: string } | undefined;
   let oversizedCount = 0;
   const startOversizedEvent = (text: string): void => {
+    toolCallStreamGuard.discardedEvent();
     oversized = { chars: text.length, prefix: text.slice(0, MAX_EVENT_LINE_CHARS) };
   };
   const finishOversizedEvent = (): void => {
@@ -1370,6 +1419,7 @@ const main = async (): Promise<void> => {
   if (killTimer) clearTimeout(killTimer);
   if (closeTimer) clearTimeout(closeTimer);
   recoveryWatchdog.dispose();
+  toolCallStreamGuard.dispose();
   if (options.runner === "pi" && !modelControl.ready && !terminalStatus) {
     terminalStatus = "failed";
     terminalError = `Child Pi exited before requested model admission completed; task was not sent${stderr.trim() ? `: ${stderr.trim()}` : ""}`;

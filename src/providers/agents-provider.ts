@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js";
+import { formatAge } from "../residency/protocol.js";
+import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
@@ -74,10 +75,11 @@ import {
 import { resolvePiModel } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
+import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import {
   AGENT_WAIT_MAX_MS,
   AgentWaitBoundError,
-  MAIN_AGENT_WAIT_MAX_MS,
+  mainAgentWaitBound,
   agentWaitBound,
   describeWaitBound,
   isInteractiveMain,
@@ -92,6 +94,7 @@ import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
 import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
+import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
 
@@ -322,6 +325,7 @@ const actorRequest = (
       : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(args.nice !== undefined ? { nice: parseAgentNice(args.nice as number) } : {}), // non-numbers throw at runtime
+    ...(args.bashTimeoutSeconds !== undefined ? { bashTimeoutSeconds: parseBashTimeoutSeconds(args.bashTimeoutSeconds) } : {}),
     ...(typeof args.extensions === "boolean" ? { extensions: args.extensions } : {}),
     ...(args.inferenceContext !== undefined ? { inferenceContext: args.inferenceContext } : {}),
     ...(requires ? { requires } : {}),
@@ -583,6 +587,7 @@ export class AgentsProvider implements FabricProvider {
       handle.id,
       context,
       this.agentToolPreviewEnabled,
+      { ...(context.deferResultConsumption ? { deferConsumption: context.deferResultConsumption } : {}) },
     );
     context.update(
       completed.status === "completed"
@@ -597,27 +602,68 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<unknown> {
+    try {
+      return await this.#invoke(actionName, args, context);
+    } catch (error) {
+      // smarty-dev#2184 item 8: name a pending removal (or a long host request) that these
+      // errors come from, so a caller does not read them as a lost or foreign host.
+      if (!(error instanceof Error) || !/owned by another host/.test(error.message)) throw error;
+      const note = this.residency?.hostStateNote?.();
+      if (note) error.message = `${error.message}; ${note}`;
+      throw error;
+    }
+  }
+
+  #mainWaitAtBound(record: object, timeoutMs: number): Record<string, unknown> {
+    // The wait ended so Main can see news: held followUps land at this tool boundary.
+    this.mainAgent.flushHeldAtNextBoundary?.();
+    return {
+      ...record,
+      waitTimedOut: true,
+      note: `Still running after ${describeWaitBound(timeoutMs)}; Main waits are capped at 60 s. It continues, and its ` +
+        "result arrives as a completion message: end the turn or do other work, then check agents.status.",
+    };
+  }
+
+  async #invoke(
+    actionName: string,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+  ): Promise<unknown> {
     switch (actionName) {
       case "run": {
+        const main = isInteractiveMain(context.extensionContext);
         const handle = await this.manager.spawn(
           runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager),
-          context.signal,
+          // Only the branded Main ceiling is observation-only, including during launch.
+          // Escape and ordinary deadlines retain zero-progress child cancellation.
+          main ? withoutMainExecutionCeiling(context.signal) : context.signal,
         );
-        this.participants.scheduleRefresh();
-        context.activity?.({
-          type: "entity",
-          id: handle.id,
-          kind: "agent",
-          name: handle.name,
-        });
-        context.update(agentStartedMessage(handle));
-        return waitWithProgress(
-          this.manager,
-          this.#transcripts,
-          handle.id,
-          context,
-          this.agentToolPreviewEnabled,
-        );
+        const timeoutMs = mainAgentWaitBound(args.timeoutMs, context.mainDeadlineAt);
+        try {
+          this.participants.scheduleRefresh();
+          context.activity?.({
+            type: "entity",
+            id: handle.id,
+            kind: "agent",
+            name: handle.name,
+          });
+          context.update(agentStartedMessage(handle));
+          return await waitWithProgress(
+            this.manager,
+            this.#transcripts,
+            handle.id,
+            context,
+            this.agentToolPreviewEnabled,
+            { ...(main ? { timeoutMs, ...(context.signal ? { signal: context.signal } : {}) } : {}), ...(context.deferResultConsumption ? { deferConsumption: context.deferResultConsumption } : {}) },
+          );
+        } catch (error) {
+          // A launch can spend the remaining budget before its first update/wait.
+          // Accepted work still needs a detached completion owner in that case.
+          if (main && mainExecutionCeilingAbortReason(context.signal)) this.manager.detachSignal(handle.id);
+          if (!main || !(error instanceof AgentWaitBoundError)) throw error;
+          return this.#mainWaitAtBound(this.manager.status(handle.id), timeoutMs);
+        }
       }
       case "handoff":
         return this.handoff(args, context);
@@ -636,7 +682,7 @@ export class AgentsProvider implements FabricProvider {
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
         const handle = durableRequest.residency === "durable"
           ? await this.#resident().spawnAgent(durableRequest, context.signal)
-          : await this.manager.spawn(durableRequest, context.signal);
+          : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
         if (request.residency !== "durable") this.manager.detachSignal(handle.id);
         this.participants.scheduleRefresh();
         context.activity?.({
@@ -653,17 +699,10 @@ export class AgentsProvider implements FabricProvider {
         const id = String(args.id);
         // smarty-dev#2119: an interactive Main waits at most 60 s, and the bound is a normal result.
         const main = isInteractiveMain(context.extensionContext);
-        const timeoutMs = agentWaitBound(args.timeoutMs, main ? MAIN_AGENT_WAIT_MAX_MS : AGENT_WAIT_MAX_MS);
-        const atBound = (record: object) => {
-          // The wait ended so Main can see news: held followUps land at this tool boundary.
-          this.mainAgent.flushHeldAtNextBoundary?.();
-          return {
-            ...record,
-            waitTimedOut: true,
-            note: `Still running after ${describeWaitBound(timeoutMs)}; Main waits are capped at 60 s. It continues, and its ` +
-              "result arrives as a completion message: end the turn or do other work, then check agents.status.",
-          };
-        };
+        const timeoutMs = main
+          ? mainAgentWaitBound(args.timeoutMs, context.mainDeadlineAt)
+          : agentWaitBound(args.timeoutMs, AGENT_WAIT_MAX_MS);
+        const atBound = (record: object) => this.#mainWaitAtBound(record, timeoutMs);
         if (this.residency?.hasAgent(id)) {
           const status = this.residency.statusAgent(id);
           context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
@@ -672,7 +711,7 @@ export class AgentsProvider implements FabricProvider {
           const bound = AbortSignal.timeout(timeoutMs);
           const signal = context.signal ? AbortSignal.any([context.signal, bound]) : bound;
           try {
-            return await this.residency.waitAgent(id, signal);
+            return await this.residency.waitAgent(id, signal, context.deferResultConsumption);
           } catch (error) {
             if (!bound.aborted || context.signal?.aborted) throw error;
             if (main) return atBound(this.residency.statusAgent(id));
@@ -691,7 +730,7 @@ export class AgentsProvider implements FabricProvider {
             id,
             context,
             this.agentToolPreviewEnabled,
-            { timeoutMs },
+            { timeoutMs, ...(main && context.signal ? { signal: context.signal } : {}), ...(context.deferResultConsumption ? { deferConsumption: context.deferResultConsumption } : {}) },
           );
         } catch (error) {
           if (!main || !(error instanceof AgentWaitBoundError)) throw error;
@@ -709,14 +748,20 @@ export class AgentsProvider implements FabricProvider {
         try {
           const result = this.manager.status(id);
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
-          if (terminalAgentStatuses.has(result.status)) this.manager.markForeground(id);
+          if (terminalAgentStatuses.has(result.status)) {
+            if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
+            else this.manager.markForeground(id);
+          }
           return result;
         } catch (error) {
           if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
         }
         if (this.residency?.hasAgent(id)) {
           const result = this.residency.statusAgent(id);
-          if (terminalAgentStatuses.has(result.status)) this.residency.acknowledgeCompletion(id);
+          if (terminalAgentStatuses.has(result.status)) {
+            if (context.deferResultConsumption) context.deferResultConsumption(() => this.residency!.acknowledgeCompletion(id));
+            else this.residency.acknowledgeCompletion(id);
+          }
           return result;
         }
         const known = this.participants.get(id);
@@ -977,7 +1022,10 @@ export class AgentsProvider implements FabricProvider {
             this.#transcripts,
             actor.id,
             actor.name,
-            this.actorManager.ask(actor.id, message, args.data, context.signal, { overrides }),
+            this.actorManager.ask(actor.id, message, args.data, context.signal, {
+              overrides,
+              detachOnMainCeiling: isInteractiveMain(context.extensionContext),
+            }),
             context,
             this.agentToolPreviewEnabled,
           );
@@ -1008,6 +1056,8 @@ export class AgentsProvider implements FabricProvider {
             timeoutMs: (actor?.timeoutMs ?? this.manager.config.timeoutMs) +
               REMOTE_ASK_ACK_GRACE_MS,
             ...(context.signal ? { signal: context.signal } : {}),
+            routedRemoteHost: participant.remoteHost ?? null,
+            detachOnMainCeiling: isInteractiveMain(context.extensionContext),
           },
         );
       }
@@ -1079,7 +1129,7 @@ export class AgentsProvider implements FabricProvider {
         };
       }
       case "actors":
-        return args.scope === "global" ? this.globalActors.list() : this.actorManager.list();
+        return args.scope === "global" ? this.globalActors.list() : this.#actorsWithLiveState();
       case "messages": {
         const actor = this.actorManager.status(String(args.id));
         return this.actorManager.messages(
@@ -1169,6 +1219,14 @@ export class AgentsProvider implements FabricProvider {
         return this.actorManager.resetSession(String(args.id));
       case "remove": {
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
+        const cleanup = this.actorManager.cleanupObligation(String(args.id));
+        if (cleanup) {
+          if (this.actorManager.owns(cleanup.id)) return this.actorManager.remove(cleanup.id);
+          if (cleanup.residency !== "durable") throw new Error("Only the owning host can remove this actor");
+          return this.residency
+            ? this.residency.removeActor(cleanup.id)
+            : this.#residentActorClient().removeActor(cleanup.id);
+        }
         let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
         try {
           target = this.#resolveActorTarget(String(args.id));
@@ -1191,9 +1249,15 @@ export class AgentsProvider implements FabricProvider {
       case "setInstructions": {
         const id = String(args.id);
         const instructions = String(args.instructions);
-        if (args.scope === "global") {
-          return this.globalActors.update(id, { instructions });
+        const global = args.scope === "global";
+        // smarty-dev#2340: refuse a >80% shrink unless the caller opts into replace: true.
+        const current = global ? this.globalActors.resolve(id)?.instructions : this.actorManager.instructions(id);
+        if (args.replace !== true && current !== undefined && instructions.length * 5 < current.length) {
+          throw new Error(
+            `Refusing setInstructions: new instructions (${instructions.length} chars) are more than 80% shorter than the current ${current.length} chars; pass replace: true to replace them`,
+          );
         }
+        if (global) return this.globalActors.update(id, { instructions });
         return this.actorManager.setInstructions(id, instructions);
       }
       case "import": {
@@ -1286,7 +1350,13 @@ export class AgentsProvider implements FabricProvider {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
-    return this.#router.routeMessage(id, message, data, kind, context, options);
+    // Host-authored lifecycle routing has no sender invocation/history. Check
+    // only model sends, before *all* local/actor/remote routing branches.
+    if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
+    const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
+    const result = await deliverWithMessageNotice(message, checked,
+      text => this.#router.routeMessage(id, text, data, kind, context, options), `agents.${kind}`);
+    return checked.notice ? { ...result, notice: checked.notice } : result;
   }
 
   /** Flush pending coalesced lifecycle deliveries; used by tests and shutdown. */
@@ -1345,6 +1415,38 @@ export class AgentsProvider implements FabricProvider {
     return actor;
   }
 
+  /**
+   * Actors, with the owner's live state for those another host runs: the registry says only
+   * idle or stopped, so a stopped actor still ending a run looked finished (smarty-dev#2184 item 8).
+   */
+  #actorsWithLiveState(): FabricActorInfo[] {
+    return this.actorManager.list().map((actor) => {
+      if (this.actorManager.owns(actor.id)) return actor;
+      const live = this.participants.get(actor.id);
+      if (!live || live.stale || live.kind !== "actor") return actor;
+      const now = Date.now();
+      const removal = live.actorRemoval ?? actor.removal;
+      const run = live.actorRun;
+      const runId = removal?.runId ?? run?.id;
+      const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
+      return {
+        ...actor,
+        status: live.status as FabricActorInfo["status"],
+        ...(run ? { inFlightRun: { ...run, ageS: Math.max(0, Math.round((now - run.startedAt) / 1_000)) } } : {}),
+        ...(removal
+          ? {
+              removal: {
+                ...removal,
+                state: runId
+                  ? `removal of ${actor.name} (${actor.id}) is pending behind its in-flight run ${runId} (${runAge})`
+                  : `removal of ${actor.name} (${actor.id}) is pending (${runAge})`,
+              },
+            }
+          : {}),
+      };
+    });
+  }
+
   #residentActorClient(): ResidentActorClient {
     const client = ResidentActorClient.fromEnv();
     if (client) return client;
@@ -1381,7 +1483,10 @@ export class AgentsProvider implements FabricProvider {
 
   #listAgents(scopeValue: unknown): Array<AgentRunRecord | AgentHandleInfo | ReturnType<FabricParticipantSource["self"]>> {
     const scope = this.#participantScope(scopeValue, "local");
-    if (scope === "local") return this.manager.list();
+    // An actor's activation run is the actor at work, not an agent: listed, it read as a new
+    // root-less agent named after the actor with its run id (smarty-dev#2184). agents.actors lists
+    // the actor; the shared directory already omits these runs (agentParticipantRecords).
+    if (scope === "local") return this.manager.list().filter((record) => !record.actorId);
     // Like agents.members: a mesh-dependent listing (project or lineage) during a write
     // stall is unknown, not short.
     const stalled = this.participants.writeStalled?.();
@@ -1455,6 +1560,7 @@ export class AgentsProvider implements FabricProvider {
       "stop",
       {},
       participant.ownerIdentityId,
+      { routedRemoteHost: participant.remoteHost ?? null },
     );
     if (this.residency?.hasAgent(id)) this.residency.acknowledgeCompletion(id);
     return result;

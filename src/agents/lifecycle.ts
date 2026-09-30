@@ -17,10 +17,16 @@ export class AgentAdmission {
     if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error("Agent concurrency must be positive");
     this.starts = starts;
   }
-  acquire(parentId: string, signal?: AbortSignal): Promise<() => void> {
+  #parent(parentId: string): Semaphore {
     let semaphore = this.#parents.get(parentId);
     if (!semaphore) this.#parents.set(parentId, semaphore = new Semaphore(this.concurrency));
-    return semaphore.acquire(signal);
+    return semaphore;
+  }
+  tryAcquire(parentId: string, signal?: AbortSignal): (() => void) | undefined {
+    return this.#parent(parentId).tryAcquire(signal);
+  }
+  acquire(parentId: string, signal?: AbortSignal): Promise<() => void> {
+    return this.#parent(parentId).acquire(signal);
   }
   admit(depth: number): void {
     if (depth > this.maxDepth) throw new Error(`Fabric agent depth limit reached (${this.maxDepth})`);

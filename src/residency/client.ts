@@ -22,6 +22,7 @@ import {
   isResidentHostId,
   residentDeliveryPrefix,
   residentHostId,
+  residentHostStateNote,
   residentResultPath,
   sleepUnlessAborted,
   type ResidentAgentMetadata,
@@ -348,12 +349,13 @@ export class ResidencyClient {
     this.options.onResultConsumed?.(id);
   }
 
-  async waitAgent(id: string, signal?: AbortSignal): Promise<AgentRunResult> {
+  async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult> {
     while (true) {
       if (signal?.aborted) throw new Error(`Waiting for durable Fabric agent ${id} was aborted`);
       const status = this.statusAgent(id);
       if (terminal(status.status) && "startedAt" in status) {
-        this.acknowledgeCompletion(id);
+        if (deferConsumption) deferConsumption(() => this.acknowledgeCompletion(id));
+        else this.acknowledgeCompletion(id);
         return status as AgentRunResult;
       }
       await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
@@ -378,9 +380,9 @@ export class ResidencyClient {
     };
   }
 
-  async removeActor(id: string): Promise<{ removed: boolean }> {
+  async removeActor(id: string): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }> {
     await this.ensureHost();
-    await this.#command({
+    const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "removeActor",
       requestId: randomUUID(),
@@ -388,7 +390,13 @@ export class ResidencyClient {
       id,
       createdAt: Date.now(),
     });
-    return { removed: true };
+    return { removed: true, ...(response.pending === undefined ? {} : { pending: response.pending }),
+      ...(response.cleaned === undefined ? {} : { cleaned: response.cleaned }) };
+  }
+
+  /** Pending removals and a long request on the host, for error messages (smarty-dev#2184). */
+  hostStateNote(): string {
+    return residentHostStateNote(this.options.config.residencyRoot);
   }
 
   async cleanupAgent(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
@@ -473,7 +481,9 @@ export class ResidencyClient {
         if (!owner) throw new Error("Fabric resident host exited while processing a request");
         await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
       }
-      throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}`);
+      const note = this.hostStateNote();
+      throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}` +
+        ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
       abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
       throw error;
@@ -588,7 +598,9 @@ export class ResidencyClient {
     this.#drainingDeliveries = true;
     try {
       const entries = this.options.mesh.listAll(this.#deliveryPrefix);
-      for (const entry of entries) await this.#deliver(entry);
+      for (const entry of entries) {
+        try { await this.#deliver(entry); } catch { /* Retain this source for retry; other senders and steers still drain. */ }
+      }
     } finally {
       this.#drainingDeliveries = false;
     }
@@ -633,12 +645,18 @@ export class ResidencyClient {
         return;
       }
     }
+    // smarty-dev#2236: one record reached Main twice (a failed delete, or a second drainer that
+    // listed it through the 2 s read cache before the delete). The record stays the durable copy
+    // until Main durably admitted it: deliverAgent journals it under the record's stable id before
+    // it returns, keeps it until the session holds it, and admits one id once across restarts and
+    // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
     this.options.mainAgent.deliverAgent({
       from: value.from,
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,
       ...(value.data === undefined ? {} : { data: value.data }),
+      deliveryId: `resident:${this.options.config.rootId}:${value.id}`,
     });
     await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
   }

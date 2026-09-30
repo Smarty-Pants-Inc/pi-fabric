@@ -50,6 +50,53 @@ export const abandonResidentRequest = (
   }
 };
 
+/** A short age such as "42s", "3m12s" or "1h05m". */
+export const formatAge = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1_000));
+  if (s < 60) return `${s}s`;
+  if (s < 3_600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(s / 3_600)}h${String(Math.floor((s % 3_600) / 60)).padStart(2, "0")}m`;
+};
+
+/** The resident host's pending actor removals (smarty-dev#2184 item 8). */
+export const residentRemovalsPath = (residencyRoot: string): string =>
+  path.join(residencyRoot, "removals.json");
+
+/**
+ * Why a residency request may wait or fail, for its error: the removals pending behind in-flight
+ * runs, and a request the host has been processing for a while (smarty-dev#2184 item 8).
+ * Best effort: never throws.
+ */
+export const residentHostStateNote = (residencyRoot: string, now = Date.now()): string => {
+  const notes: string[] = [];
+  try {
+    const value = JSON.parse(fs.readFileSync(residentRemovalsPath(residencyRoot), "utf8")) as {
+      removals?: Array<{ name?: unknown; id?: unknown; runId?: unknown; runStartedAt?: unknown; requestedAt?: unknown }>;
+    };
+    for (const removal of value.removals ?? []) {
+      if (typeof removal.id !== "string") continue;
+      const label = typeof removal.name === "string" ? `${removal.name} (${removal.id})` : removal.id;
+      const since = typeof removal.runStartedAt === "number" ? removal.runStartedAt
+        : typeof removal.requestedAt === "number" ? removal.requestedAt : now;
+      notes.push(typeof removal.runId === "string"
+        ? `removal of ${label} is pending behind its in-flight run ${removal.runId} (${formatAge(now - since)})`
+        : `removal of ${label} is pending (${formatAge(now - since)})`);
+    }
+  } catch { /* no pending removals */ }
+  try {
+    const processing = path.join(residencyRoot, "processing");
+    for (const entry of fs.readdirSync(processing).filter((name) => name.endsWith(".json"))) {
+      const file = path.join(processing, entry);
+      const command = JSON.parse(fs.readFileSync(file, "utf8")) as { operation?: unknown; id?: unknown };
+      const age = now - fs.statSync(file).mtimeMs;
+      if (age < 2_000) continue;
+      notes.push(`the host has been processing ${String(command.operation)}` +
+        `${typeof command.id === "string" ? ` of ${command.id}` : ""} for ${formatAge(age)}; this request waits behind it`);
+    }
+  } catch { /* nothing in process */ }
+  return notes.join("; ");
+};
+
 export const RESIDENT_HOST_FORMAT = 1 as const;
 const RESIDENT_DELIVERY_PREFIX = "residency/deliveries/";
 
@@ -179,6 +226,9 @@ export interface ResidentCommandResponse {
   ok: boolean;
   handle?: AgentHandleInfo;
   actor?: FabricActorInfo;
+  /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
+  pending?: string;
+  cleaned?: boolean;
   error?: string;
   completedAt: number;
 }

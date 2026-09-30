@@ -48,12 +48,18 @@ commands_restrictions:
       - or:
           - sender-permission >= write
           - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
   # smarty-land's emergency dequeue posts as the actor that queued, the write App bot on the fleet host.
   dequeue:
     conditions:
       - or:
           - sender-permission >= write
           - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
   # The stuck-work check's R4 posts one `@mergifyio refresh` per head as the write App (smarty-dev#868);
   # without this Mergify answers "Command disallowed" (#251 F278).
   refresh:
@@ -61,3 +67,6 @@ commands_restrictions:
       - or:
           - sender-permission >= write
           - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]

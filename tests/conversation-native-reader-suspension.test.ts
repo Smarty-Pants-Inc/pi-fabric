@@ -58,19 +58,19 @@ describe("native reader identical-prefix paging", () => {
     expect(inode).not.toBe(oldInode);
     const realRead = fs.readSync.bind(fs);
     const suffixReads: Array<{ position: number; length: number; replacement: boolean }> = [];
-    const reads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
       const stack = new Error().stack ?? "";
-      if (fs.fstatSync(args[0]).ino === inode && stack.includes("readForwardPage") && !stack.includes("matchesLoadedPages")) {
-        suffixReads.push({ position: args[4] as number, length: args[3], replacement: stack.includes("replaceWindowIfNeeded") });
+      if (fs.fstatSync(fd).ino === inode && stack.includes("readForwardPage") && !stack.includes("matchesLoadedPages")) {
+        suffixReads.push({ position, length, replacement: stack.includes("replaceWindowIfNeeded") });
       }
-      return realRead(...args);
+      return realRead(fd, buffer, offset, length, position);
     }) as typeof fs.readSync);
     const older = olderReader.loadOlder(1)!;
     expect(older.messages.length).toBeGreaterThan(olderBefore.messages.length);
     expect(older.messages.slice(-olderBefore.messages.length)).toEqual(olderBefore.messages);
     expect(older.messages.at(-1)?.timestamp).toBe(149);
     expect(older.leafId).toBe(olderBefore.leafId);
-    expect(older.hasNewer).toBe(true);
+    expect(older.hasNewer).toBe(api !== "readFollow");
     expect(suffixReads).toEqual([]); // Even prior following must not consume unseen records.
     const grown = api === "readFollow" ? reader.read(input, true) : reader.loadNewer()!;
     expect(suffixReads).toEqual([{ position: Buffer.byteLength(bytes), length: 1024 * 1024, replacement: true }]);
@@ -78,7 +78,7 @@ describe("native reader identical-prefix paging", () => {
     expect(added.length).toBeGreaterThan(0);
     expect(added.length).toBeLessThan(500);
     expect(grown.messages).toEqual([...before.messages, ...records.slice(150, 150 + added.length).map((record) => record.message)]);
-    expect(grown.hasNewer).toBe(true);
+    expect(grown.hasNewer).toBe(false); // hasNewer is only reported while pinned.
     suffixReads.length = 0;
     const next = reader.read(input, true);
     expect(suffixReads).toHaveLength(1);
@@ -86,7 +86,14 @@ describe("native reader identical-prefix paging", () => {
     expect(suffixReads[0]!.replacement).toBe(false);
     expect(next.messages.slice(0, grown.messages.length)).toEqual(grown.messages);
     expect(next.messages.length).toBeGreaterThan(grown.messages.length);
-    expect(next.hasNewer).toBe(true);
+    expect(next.hasNewer).toBe(false);
+    const sourceCalls = reads.mock.calls.length;
+    const pinned = reader.read(input, false);
+    expect(pinned.hasNewer).toBe(true); // Following did not consume all pending records.
+    expect(pinned.messages).toEqual(next.messages);
+    expect(pinned.leafId).toBe(next.leafId);
+    expect(reads).toHaveBeenCalledTimes(sourceCalls); // Pinning reads no suffix.
+    expect(suffixReads).toHaveLength(1);
     reads.mockRestore();
     reader.clear();
     olderReader.clear();
@@ -103,11 +110,16 @@ describe("native reader identical-prefix paging", () => {
     fs.writeFileSync(`${file}.new`, bytes);
     fs.renameSync(`${file}.new`, file);
     expect(fs.statSync(file).ino).not.toBe(inode);
-    const reads = vi.spyOn(fs, "readSync");
+    const realRead = fs.readSync.bind(fs);
+    const positions: number[] = [];
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
+      positions.push(position);
+      return realRead(fd, buffer, offset, length, position);
+    }) as typeof fs.readSync);
     const after = reader.read(input, true);
     expect(content(after)).toEqual(content(before));
     expect(reads).toHaveBeenCalledTimes(1); // Loaded-page verification only.
-    expect(reads.mock.calls[0]![4]).toBe(0);
+    expect(positions).toEqual([0]);
     reader.clear();
   });
 });

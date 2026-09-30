@@ -565,6 +565,7 @@ describe("AgentsProvider runner support", () => {
       () => DEFAULT_FABRIC_CONFIG.models,
     );
 
+    const invocationContext = { ...context, signal: new AbortController().signal };
     const created = (await provider.invoke(
       "create",
       {
@@ -572,7 +573,7 @@ describe("AgentsProvider runner support", () => {
         instructions: "Created via the resident host.",
         residency: "durable",
       },
-      context,
+      invocationContext,
     )) as FabricActorInfo;
     state.globalActors.create({
       name: "durable-template",
@@ -582,7 +583,7 @@ describe("AgentsProvider runner support", () => {
     const imported = (await provider.invoke(
       "import",
       { name: "durable-template" },
-      context,
+      invocationContext,
     )) as FabricActorInfo;
 
     expect(created).toMatchObject({ id: "resident-actor-1", name: "second-durable" });
@@ -590,10 +591,12 @@ describe("AgentsProvider runner support", () => {
     expect(createActor).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({ name: "second-durable", residency: "durable" }),
+      invocationContext.signal,
     );
     expect(createActor).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({ name: "durable-template", residency: "durable" }),
+      invocationContext.signal,
     );
   });
 

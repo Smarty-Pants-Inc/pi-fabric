@@ -24,6 +24,8 @@ import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
   RESIDENT_HOST_FORMAT,
+  commitResidentRequest,
+  readResidentRequestDecision,
   residentDeliveryPrefix,
   residentHostId,
   residentRemovalsPath,
@@ -376,6 +378,7 @@ class ResidentHost {
       token: this.#token,
       startedAt: now,
       readyAt: now,
+      requestFence: 1,
     };
     atomicWrite(this.#ownerPath, owner);
     fs.rmSync(this.#errorPath, { force: true });
@@ -609,7 +612,7 @@ class ResidentHost {
 
   async #processRequest(filePath: string): Promise<void> {
     const command = readJson<ResidentCommand>(filePath);
-    const requestId = command?.requestId ?? path.basename(filePath, ".json");
+    const requestId = path.basename(filePath, ".json");
     let response: ResidentCommandResponse;
     try {
       if (
@@ -619,6 +622,10 @@ class ResidentHost {
       ) {
         throw new Error("Invalid Fabric residency request");
       }
+      if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+        throw new Error(`Fabric residency request ${requestId} was abandoned before commit`);
+      }
+      const commit = (id: string): void => commitResidentRequest(this.config.residencyRoot, command, id, this.hostId);
       if (command.operation === "spawn") {
         if (
           command.request.sessionSeed ||
@@ -632,7 +639,7 @@ class ResidentHost {
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" });
+        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, commit);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) throw new Error(`Resident agent ${handle.id} has no run directory`);
         const worktreeGitRoot = this.agents.worktreeGitRoot(handle.id);
@@ -657,6 +664,7 @@ class ResidentHost {
           completedAt: Date.now(),
         };
       } else if (command.operation === "foreground") {
+        commit(command.id);
         this.agents.markForeground(command.id);
         response = {
           format: RESIDENT_HOST_FORMAT,
@@ -666,6 +674,7 @@ class ResidentHost {
         };
       } else if (command.operation === "cleanup") {
         await this.agents.wait(command.id);
+        commit(command.id);
         await this.agents.cleanup(command.id, command.deleteBranch);
         fs.rmSync(path.join(this.#agentsPath, `${command.id}.json`), { force: true });
         fs.rmSync(residentResultPath(this.config.residencyRoot, command.id), { force: true });
@@ -682,7 +691,7 @@ class ResidentHost {
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.
-        const actor = await this.actors.create(command.request, { asRegistryOwner: true });
+        const actor = await this.actors.create(command.request, { asRegistryOwner: true, beforeCommit: commit });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,
@@ -695,6 +704,7 @@ class ResidentHost {
           throw new Error(`Resident host does not own ${command.id}`);
         }
         // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
+        commit(command.id);
         const removed = await this.actors.remove(command.id, { wait: false });
         if (removed.pending) {
           this.#writeRemovals();
@@ -720,7 +730,12 @@ class ResidentHost {
         completedAt: Date.now(),
       };
     }
-    atomicWrite(path.join(this.#responsesPath, `${requestId}.json`), response);
+    const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
+    atomicWrite(responsePath, response);
+    // An abandoned caller already left; clean late responses as well as processing files.
+    if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+      fs.rmSync(responsePath, { force: true });
+    }
     fs.rmSync(filePath, { force: true });
     this.participants.scheduleRefresh();
   }
@@ -741,6 +756,11 @@ class ResidentHost {
     }
     for (const entry of entries) {
       const requestId = path.basename(entry, ".json");
+      if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+        fs.rmSync(path.join(this.#processingPath, entry), { force: true });
+        fs.rmSync(path.join(this.#responsesPath, entry), { force: true });
+        continue;
+      }
       const response: ResidentCommandResponse = {
         format: RESIDENT_HOST_FORMAT,
         requestId,

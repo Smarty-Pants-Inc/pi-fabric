@@ -771,9 +771,9 @@ export class AgentManager {
     return runtime;
   }
 
-  spawn(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, beforeCommit?: (id: string) => void): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal);
+    const pending = this.#spawn(request, signal, beforeCommit);
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -793,7 +793,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, beforeCommit?: (id: string) => void): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -864,15 +864,17 @@ export class AgentManager {
     }
     const admissionSignal = signal ? AbortSignal.any([signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
     const release = await this.#semaphore.acquire("native", admissionSignal);
+    const id = randomUUID().replaceAll("-", "");
     try {
       if (runner === "pi") model = await this.#prepareModel(model);
       if (this.#closing) throw new Error("Fabric agent manager is closing");
+      // Internal resident-host fence: preparation may outlive the caller's deadline.
+      beforeCommit?.(id);
       this.#semaphore.admit(this.#currentDepth + 1);
     } catch (error) {
       release();
       throw error;
     }
-    const id = randomUUID().replaceAll("-", "");
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const runDirectory = path.join(this.#runRoot, id);
     fs.mkdirSync(runDirectory, { recursive: true });

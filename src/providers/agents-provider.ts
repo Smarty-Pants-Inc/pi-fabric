@@ -969,7 +969,7 @@ export class AgentsProvider implements FabricProvider {
           return this.globalActors.create(actorRequest(createArgs, context, this.manager, false));
         }
         const request = actorRequest(createArgs, context, this.manager);
-        const actor = await this.#createActor(request);
+        const actor = await this.#createActor(request, context.signal);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;
@@ -1204,8 +1204,8 @@ export class AgentsProvider implements FabricProvider {
         if (residency !== "durable") throw new Error("Only the owning host can remove this actor");
         const id = actor?.id ?? participant!.id;
         return this.residency
-          ? this.residency.removeActor(id)
-          : this.#residentActorClient().removeActor(id);
+          ? this.residency.removeActor(id, context.signal)
+          : this.#residentActorClient().removeActor(id, context.signal);
       }
       case "setInstructions": {
         const id = String(args.id);
@@ -1238,7 +1238,7 @@ export class AgentsProvider implements FabricProvider {
               )).model as string,
             }
           : request;
-        const actor = await this.#createActor(resolvedRequest);
+        const actor = await this.#createActor(resolvedRequest, context.signal);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;
@@ -1331,7 +1331,7 @@ export class AgentsProvider implements FabricProvider {
     return this.#router.resolveActorTarget(id);
   }
 
-  async #createActor(request: FabricActorRequest): Promise<FabricActorInfo> {
+  async #createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     // Also freeze imported templates before any resident host sees the request.
     const extensions = request.extensions ?? true;
     const kernel = this.manager.resolveKernel({ ...request, extensions });
@@ -1343,7 +1343,7 @@ export class AgentsProvider implements FabricProvider {
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
     };
     if (request.residency !== "durable") return this.actorManager.create(request);
-    if (!this.residency) return this.#residentActorClient().createActor(request);
+    if (!this.residency) return this.#residentActorClient().createActor(request, signal);
 
     await this.residency.ensureHost();
     let actor: FabricActorInfo;
@@ -1351,7 +1351,7 @@ export class AgentsProvider implements FabricProvider {
       actor = await this.actorManager.create(request);
     } catch (error) {
       if (!(error instanceof ActorRegistryOwnershipError)) throw error;
-      return this.residency.createActor(request);
+      return this.residency.createActor(request, signal);
     }
     await this.#activateDurableActor(actor);
     return actor;

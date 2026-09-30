@@ -1,5 +1,37 @@
 import { describe, expect, it } from "vitest";
-import { scanCommand } from "../src/core/pattern-kill.js";
+import { scanCommand, killsByPattern, wipesTmp } from "../src/core/pattern-kill.js";
+
+// R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
+// IDs/commands and the historical 102 false positives are unchanged.
+const round5IntentionalState = new Set<string>([
+  "P='/own /tmp'; IFS=:; read -r unused <<< ok; rm -rf $P",
+  "IFS=,; P='/own:/tmp'; IFS=: read -r unused <<< ok; rm -rf $P",
+  "IFS=:; P='/own /tmp'; IFS=' ' rm -rf $P",
+  "D=/own; D=/tmp printf -v OUT '%s' \"$D\"; rm -rf \"$OUT\"",
+  "D=/tmp; TAG=diagnostic printf -v D '%s' /own; rm -rf \"$D\"",
+  "P=4242; P=7777 printf -v OUT '%s' \"$P\"; kill \"$OUT\"",
+  "eval 'eval '\\''eval '\\''\\'\\'''\\''kill 4242; rm -f .local/own-file'\\''\\'\\'''\\'''\\'''"
+]);
+function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  const intentional = round5IntentionalState.has(command);
+  const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
+  if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);
+  if (intentional || (originallyRefused && result.shellState === true)) {
+    expect(Object.prototype.hasOwnProperty.call(result, "shellState"), command).toBe(true);
+    expect(result, command).toEqual({ blocked: false, wipe: false, exhausted: false, shellState: true });
+  } else if (original.overall !== undefined) {
+    expect(Object.keys(result).sort(), command).toEqual(["blocked", "exhausted", "wipe"]);
+    expect(result.exhausted, command).toBe(original.exhausted ?? false);
+    expect(typeof result.blocked, command).toBe("boolean");
+    expect(typeof result.wipe, command).toBe("boolean");
+    expect(result.blocked || result.wipe, command).toBe(original.overall);
+  } else {
+    expect(result, command).toEqual(original);
+  }
+  expect(killsByPattern(command), command).toBe(result.blocked || result.shellState === true);
+  expect(wipesTmp(command), command).toBe(result.wipe || result.shellState === true);
+}
+
 
 // PR #166 R1 acceptance ledger. Every command below is scanner DATA ONLY.
 // Never pass this corpus to a shell, subprocess, eval, or a real tool-call hook.
@@ -202,10 +234,10 @@ describe("PR166 R1 paired DATA regressions", () => {
     it(`${pair.name} — refuse`, () => {
       const verdict = scanCommand(pair.refuse);
       expect(verdict.exhausted).toBe(false);
-      expect(pair.policy === "kill" ? verdict.blocked : verdict.wipe).toBe(true);
+      expectRound5Guard(pair.refuse, verdict, { blocked: pair.policy === "kill", wipe: pair.policy === "tmp", exhausted: false });
     });
     it(`${pair.name} — allow`, () => {
-      expect(scanCommand(pair.allow)).toEqual({
+      expectRound5Guard(pair.allow, scanCommand(pair.allow), {
         blocked: conservativeFalsePositives.has(pair.name) && pair.policy === "kill",
         wipe: conservativeFalsePositives.has(pair.name) && pair.policy === "tmp",
         exhausted: false,
@@ -231,23 +263,22 @@ describe("PR166 R1 reader precision without relaxing amplification refusals", ()
     const command = `echo ${args.join(" ")}`;
     expect(args).toHaveLength(500);
     expect(command.length).toBe(9504); // ASCII: character count equals byte count.
-    expect(scanCommand(command)).toEqual({ blocked: false, wipe: false, exhausted: false });
+    expectRound5Guard(command, scanCommand(command), { blocked: false, wipe: false, exhausted: false });
   });
   it("N1 unchanged aggregate-reference amplification still exhausts both policies", () => {
     const command = `A=${"x".repeat(4096)}; B=${"$A".repeat(1024)}; :`;
-    expect(scanCommand(command)).toEqual({ blocked: true, wipe: true, exhausted: true });
+    expectRound5Guard(command, scanCommand(command), { blocked: true, wipe: true, exhausted: true });
   });
   it("N1 unchanged nested collection/replay amplification still exhausts both policies", () => {
-    expect(scanCommand(replayTree(3000))).toEqual({ blocked: true, wipe: true, exhausted: true });
+    expectRound5Guard(replayTree(3000), scanCommand(replayTree(3000)), { blocked: true, wipe: true, exhausted: true });
   });
   it("N1 same collection/replay structure with ordinary work stays allowed", () => {
-    expect(scanCommand(replayTree(8))).toEqual({ blocked: false, wipe: false, exhausted: false });
+    expectRound5Guard(replayTree(8), scanCommand(replayTree(8)), { blocked: false, wipe: false, exhausted: false });
   });
   it("N1 unchanged script-depth amplification still exhausts both policies", () => {
-    expect(scanCommand(nestedEval("echo safe", 8))).toEqual({ blocked: true, wipe: true, exhausted: true });
+    expectRound5Guard(nestedEval("echo safe", 8), scanCommand(nestedEval("echo safe", 8)), { blocked: true, wipe: true, exhausted: true });
   });
   it("N1 small nested recorded PID / own path stays allowed", () => {
-    expect(scanCommand(nestedEval("kill 4242; rm -f .local/own-file", 3)))
-      .toEqual({ blocked: false, wipe: false, exhausted: false });
+    expectRound5Guard(nestedEval("kill 4242; rm -f .local/own-file", 3), scanCommand(nestedEval("kill 4242; rm -f .local/own-file", 3)), { blocked: false, wipe: false, exhausted: false });
   });
 });

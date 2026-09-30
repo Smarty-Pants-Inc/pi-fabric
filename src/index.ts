@@ -833,11 +833,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
     // Load only on actual first bash use, never during registration or idle hooks.
-    const { scanCommand, GUARD_BUDGET_REASON, PATTERN_KILL_REASON, TMP_WIPE_REASON } =
+    const { scanCommand, GUARD_BUDGET_REASON, SHELL_STATE_REASON, PATTERN_KILL_REASON, TMP_WIPE_REASON } =
       await (bashGuard ??= import("./core/pattern-kill.js"));
     // One budget covers both policies, nested readers, and collection/replay for this call.
     const guard = scanCommand(command);
     if (guard.exhausted) return { block: true, reason: GUARD_BUDGET_REASON };
+    if (guard.shellState) return { block: true, reason: SHELL_STATE_REASON };
     if (guard.blocked) return { block: true, reason: PATTERN_KILL_REASON };
     if (guard.wipe) return { block: true, reason: TMP_WIPE_REASON };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);

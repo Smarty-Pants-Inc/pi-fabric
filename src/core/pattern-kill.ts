@@ -593,6 +593,85 @@ function readDestinations(name: string, args: Word[], budget: GuardBudget): stri
   return resolved.length === selected.length ? resolved : undefined;
 }
 
+// Owner scope cut: unsupported shell state refuses the WHOLE tool command. This
+// sentinel propagates out of receivers/captures, rather than becoming a safe feed.
+class ShellStateRefused extends Error {}
+const SHELL_STATE_BUILTINS = new Set(["declare", "typeset", "export", "read", "mapfile", "readarray", "eval", "source", ".", "local", "let", "getopts", "trap"]);
+
+/** Admit syntax, never a remembered whole-command fixture or inferred execution. */
+function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Context, budget: GuardBudget,
+  piped: boolean, after?: string, receiver?: { words: Word[]; assignments: Word[] }): void {
+  const simpleWord = (word: Word): boolean => {
+    budget.spend(4 * word.pattern.length + 1);
+    if (word.unprovedLiteral || word.process) return false;
+    // Only the reader's existing plain scalar/positional references and $! are
+    // supported. Parameter operators, indirect names and arithmetic are not state
+    // proofs. Literal dollars retain LITERAL and are data, not expansions.
+    return !/[$\u0002]/.test(word.pattern.replace(REFERENCE, "").replace(/[$\u0002]!/g, ""));
+  };
+  const scalar = (word: Word): boolean => {
+    budget.spend(word.pattern.length + 1);
+    const match = /^([A-Za-z_][A-Za-z0-9_]*)=(?!\()(.*)$/s.exec(word.pattern);
+    return !!match && match[1] !== "IFS" && simpleWord(word);
+  };
+    if (!stage.words.length) return;
+    const { words, assignments } = receiver ?? unwrap(stage.words, [], budget, (words) => words);
+    for (const assignment of assignments) if (!scalar(assignment)) throw new ShellStateRefused();
+    // A live executable/option boundary cannot be treated as an unrelated literal
+    // command. No command-name interpreter: decline its entire command instead.
+    if (words[0]?.dynamic || (words[0] && !simpleWord(words[0]))) throw new ShellStateRefused();
+    const name = words[0]?.text.split("/").pop() ?? "";
+    if (SHELL_STATE_BUILTINS.has(name)) throw new ShellStateRefused();
+    // A for/select destination writes shell state too; quote removal already
+    // resolved its name. Refuse IFS without interpreting iterations or values.
+    if (["for", "select"].includes(words[0]?.text ?? "") && !words[0]?.quoted && words[0]?.assignment !== false && words[1]?.text === "IFS") throw new ShellStateRefused();
+    if (!["readonly", "set", "printf"].includes(name)) return;
+    const args = words.slice(1);
+    if (name === "printf") {
+      const format = args[0];
+      // Lexical literal stdout formats need no exact-byte proof here. Masked
+      // dollars are data; unprovedLiteral still makes the renderer decline.
+      if (format) budget.spend(4 * format.pattern.length + 1);
+      if (!format || format.dynamic || format.subs.length || format.process || /\$/.test(format.pattern) || format.text.startsWith("-")) throw new ShellStateRefused();
+      return;
+    }
+    let unproved = context.unprovedRedirect === true || stage.conditional === true || stage.redirects.length > 0 || stage.heredocs.length > 0 || piped || ["|", "|&", "&"].includes(after ?? "");
+    for (const word of stage.words) {
+      for (let scope = scopes.members.get(word); scope !== undefined; scope = scopes.parents.get(scope)) {
+        budget.spend();
+        unproved ||= scopes.children.has(scope) || (scopes.outputs.get(scope)?.length ?? 0) > 0;
+      }
+    }
+    const direct = stage.words[0] === words[0] && words[0]?.text === name && !words[0]?.quoted && words[0]?.assignment !== false && !assignments.length;
+    if (!direct || unproved) throw new ShellStateRefused();
+    if (name === "readonly") {
+      // Existing bare scalar readonly is the sole attribute exception. No flags,
+      // expanded destinations, prefix, redirect or child-job attribute attestation.
+      if (!args.length || args.some((arg) => !(/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg.pattern) || (arg.assignment && scalar(arg))))) throw new ShellStateRefused();
+    } else {
+      // Existing diagnostic `set`, `set --` and plain positional replacement only.
+      const operands = args[0]?.text === "--" ? args.slice(1) : args;
+      if ((args[0] && args[0].text !== "--" && /^[-+]/.test(args[0].text)) || operands.some((arg) => arg.dynamic || arg.subs.length || !simpleWord(arg))) throw new ShellStateRefused();
+    }
+}
+
+function checkShellState(tokens: Token[], scopes: SourceScopes, context: Context, budget: GuardBudget): void {
+  let stage: Command = { words: [], redirects: [], heredocs: [] };
+  let piped = false;
+  for (const token of tokens) {
+    budget.spend();
+    if ("word" in token) stage.words.push(token.word);
+    else if ("redirect" in token) stage.redirects.push(token);
+    else if ("heredoc" in token) stage.heredocs.push(token.heredoc);
+    else if (!token.arrayClose) {
+      checkShellReceiver(stage, scopes, context, budget, piped, token.op);
+      stage = { words: [], redirects: [], heredocs: [] };
+      piped = token.op === "|" || token.op === "|&";
+    }
+  }
+  checkShellReceiver(stage, scopes, context, budget, piped);
+}
+
 /**
  * Scans a shell script. `names` holds the variables and placeholders whose value comes from a name
  * lookup in the calling script (review/astra F8 on #105: per operand, never the whole script).
@@ -605,6 +684,8 @@ function scan(script: string, depth: number, budget: GuardBudget, names: Readonl
   // F6: retain fallback for unresolved feeds, but late redirects belong only to their own scope.
   const tokens = tokenize(script, budget);
   const scopes = sourceScopes(tokens, budget);
+  // Before either collection/replay pass can grant a binding or consumer proof.
+  checkShellState(tokens, scopes, context, budget);
   const sources = new Map<Word, Feed | undefined>();
   const first = scanPass(tokens, scopes, sources, depth, budget, names, tmpIn, context, { lookup: false, tmp: false }, stdin);
   if (!first.lookup && !first.tmpList) return first;
@@ -1343,6 +1424,10 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         budget.spend(argv.reduce((size, word) => size + 2 * word.text.length + 1, 1));
         return argv.map((word) => ({ ...word, text: word.text.replaceAll(LITERAL, "$"), quoted: true }));
       });
+      // Use the SAME classifier on the actual existing caller-split receiver.
+      // Empty wrapper argv can select a state builtin that lexical unwrap missed.
+      // Preserve original stage identity/execution boundaries for simple exceptions.
+      checkShellReceiver(stage, scopes, context, budget, childBinding, background || piped ? "&" : undefined, { words, assignments });
       budget.spend(chdirs.length ? directoryStack.length + 1 : 1);
       const wrapperStack = chdirs.length ? [...directoryStack] : undefined;
       const wrapperUncertainStack = uncertainStack, wrapperSharedStack = sharedStack;
@@ -1944,7 +2029,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   return verdict;
 }
 
-export type CommandGuardResult = { blocked: boolean; wipe: boolean; exhausted: boolean };
+export type CommandGuardResult = { blocked: boolean; wipe: boolean; exhausted: boolean; shellState?: true };
 
 /** One cumulative budget for both verdicts, collection/replay, and all nested readers. */
 export function scanCommand(command: string): CommandGuardResult {
@@ -1953,16 +2038,31 @@ export function scanCommand(command: string): CommandGuardResult {
     const verdict = scan(command, 0, budget);
     return { blocked: verdict.blocked, wipe: verdict.wipe, exhausted: false };
   } catch (error) {
+    if (error instanceof ShellStateRefused) return { blocked: false, wipe: false, exhausted: false, shellState: true };
     if (!(error instanceof GuardBudgetExceeded)) throw error;
     return { blocked: true, wipe: true, exhausted: true };
   }
 }
 
-/** True when the shell command kills processes by name pattern (smarty-dev#774). */
-export function killsByPattern(command: string): boolean { return scanCommand(command).blocked; }
+/** Refuse process-name kills and whole-command unsupported shell state (smarty-dev#774). */
+export function killsByPattern(command: string): boolean {
+  const result = scanCommand(command);
+  return result.blocked || result.shellState === true;
+}
 
-/** True when the shell command deletes by a glob over /tmp or /var/tmp, or deletes /tmp itself (smarty-dev#1998). */
-export function wipesTmp(command: string): boolean { return scanCommand(command).wipe; }
+/** Refuse shared-tmp deletion and whole-command unsupported shell state (smarty-dev#1998). */
+export function wipesTmp(command: string): boolean {
+  const result = scanCommand(command);
+  return result.wipe || result.shellState === true;
+}
+
+export const SHELL_STATE_REASON =
+  "Blocked: unsupported shell-state syntax makes this whole command UNKNOWN; no safe PID or path is inferred. " +
+  "Use a plain scalar assignment (P=4242 or P=$!), a literal recorded PID, or your exact own path. " +
+  "For cleanup, use `D=$(mktemp -d)` in its own command, then `rm -rf \"$D\"`. " +
+  "Only direct bare scalar readonly, simple positional set, and literal stdout printf formats are supported; " +
+  "declaration flags/export/declare/typeset/local, IFS, read/mapfile/readarray, printf -v or expanded formats, " +
+  "eval/source/dot and other set options are not trusted.";
 
 export const TMP_WIPE_REASON =
   "Blocked (smarty-dev#1998): this deletes by a glob in /tmp or /var/tmp (or /tmp itself), which also " +

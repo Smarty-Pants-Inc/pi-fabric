@@ -1,5 +1,46 @@
 import { describe, expect, it } from "vitest";
-import { killsByPattern, TMP_WIPE_REASON, wipesTmp } from "../src/core/pattern-kill.js";
+import { killsByPattern, TMP_WIPE_REASON, wipesTmp, scanCommand } from "../src/core/pattern-kill.js";
+
+// R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
+// IDs/commands and the historical 102 false positives are unchanged.
+const round5IntentionalState = new Set<string>([
+  "files=(\"$D\"/*.json); rm -f \"${files[@]}\"",
+  "REPLY=/tmp/tmp.AbC123; ls -d /tmp/tmp.* | while read -r -p REPLY -n 1 -u 0 -- p; do rm -rf \"$REPLY\"; done",
+  "IFS=:; P='/home/paul/w/own:/tmp'; rm -rf \"$P\"",
+  "IFS=,; P='/home/paul/w/own,/var/tmp'; rm -rf \"$P\"",
+  "IFS=:; P='/tmp:/var/tmp'; rm -rf \"$P\"",
+  "IFS=:,; P='/home/paul/w/own,/tmp:/home/paul/w/other'; rm -rf \"$P\"",
+  "IFS=:; P='/tmp/tmp.AbC123:/tmp'; rm -rf \"$P\"",
+  "IFS=:; P='/home/paul/w/own:/tmp'; set -- \"$P\"; rm -rf \"$1\"",
+  "set -- $(find /tmp/tmp.AbC123 -name '*.json'); rm -rf \"$1\"",
+  "printf -v D '%s' /tmp/tmp.AbC123; rm -rf \"$D\"",
+  "printf -v P '%s/%s' /tmp 'tmp.*'; rm -rf \"$P\"",
+  "printf -v P '%s\\n' /home/paul/w/own /tmp/tmp.AbC123; rm -rf $P",
+  "dirs=(/tmp/tmp.AbC123/*.json); dirs+=(/tmp/tmp.AbC123); rm -rf \"${dirs[@]}\"",
+  "dirs=($(find /tmp/tmp.AbC123 -name '*.json')); dirs+=(/tmp/tmp.AbC123); rm -rf \"${dirs[@]}\"",
+  "dirs=(/tmp/tmp.AbC123); dirs+=(/tmp/tmp.AbC123/*.json); rm -rf \"${dirs[@]}\"",
+  "D=$(mktemp -d); dirs=(/tmp/tmp.AbC123/*.json); dirs+=(\"$D\"); rm -rf \"${dirs[@]}\""
+]);
+function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  const intentional = round5IntentionalState.has(command);
+  const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
+  if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);
+  if (intentional || (originallyRefused && result.shellState === true)) {
+    expect(Object.prototype.hasOwnProperty.call(result, "shellState"), command).toBe(true);
+    expect(result, command).toEqual({ blocked: false, wipe: false, exhausted: false, shellState: true });
+  } else if (original.overall !== undefined) {
+    expect(Object.keys(result).sort(), command).toEqual(["blocked", "exhausted", "wipe"]);
+    expect(result.exhausted, command).toBe(original.exhausted ?? false);
+    expect(typeof result.blocked, command).toBe("boolean");
+    expect(typeof result.wipe, command).toBe("boolean");
+    expect(result.blocked || result.wipe, command).toBe(original.overall);
+  } else {
+    expect(result, command).toEqual(original);
+  }
+  expect(killsByPattern(command), command).toBe(result.blocked || result.shellState === true);
+  expect(wipesTmp(command), command).toBe(result.wipe || result.shellState === true);
+}
+
 
 // smarty-dev#1998: two fleet-wide /tmp wipes on 2026-09-29, then the forms the rule refuses and
 // the deletes of an agent's own exact paths it must still allow.
@@ -202,11 +243,11 @@ const allowed: Array<[string, string]> = [
 
 describe("tmp-wipe guard (smarty-dev#1998)", () => {
   it.each(refused)("refuses %s", (_label, command) => {
-    expect(wipesTmp(command)).toBe(true);
+    expectRound5Guard(command, scanCommand(command), { wipe: true, blocked: false, exhausted: false });
   });
 
   it.each(allowed)("allows %s", (_label, command) => {
-    expect(wipesTmp(command)).toBe(_label.endsWith(" — conservative refusal"));
+    expectRound5Guard(command, scanCommand(command), { wipe: _label.endsWith(" — conservative refusal"), blocked: false, exhausted: false });
   });
 
   // Security S3: assignment expansion is bounded (the text is only read, never run).
@@ -214,7 +255,7 @@ describe("tmp-wipe guard (smarty-dev#1998)", () => {
     let script = "A=xxxxxxxxxxxxxxxx";
     for (let i = 0; i < 40; i++) script += `; A=$A$A$A$A`;
     const start = Date.now();
-    expect(wipesTmp(`${script}; rm -rf "$A"`)).toBe(false);
+    expectRound5Guard(`${script}; rm -rf "$A"`, scanCommand(`${script}; rm -rf "$A"`), { wipe: false, blocked: false, exhausted: false });
     expect(Date.now() - start).toBeLessThan(2000);
   });
 
@@ -356,10 +397,10 @@ describe("tmp-wipe follow-up regressions (#2275)", () => {
   ];
 
   it.each(refused)("refuses %s", (_label, command) => {
-    expect(wipesTmp(command)).toBe(true);
+    expectRound5Guard(command, scanCommand(command), { wipe: true, blocked: false, exhausted: false });
   });
   it.each(allowed)("allows %s", (_label, command) => {
-    expect(wipesTmp(command)).toBe(_label.endsWith(" — conservative refusal"));
+    expectRound5Guard(command, scanCommand(command), { wipe: _label.endsWith(" — conservative refusal"), blocked: false, exhausted: false });
   });
 });
 
@@ -374,6 +415,6 @@ describe("PR166 conservative refusal simple allowed counterparts", () => {
     ["transformation: plain scalar instead of percent-q", `D=/tmp/tmp.X1; rm -rf "$D"`],
     ["reusedfd: fresh standalone exact literal", `rm -rf /tmp/tmp.AbC123`],
   ])("allows %s", (_label, command) => {
-    expect(wipesTmp(command)).toBe(false);
+    expectRound5Guard(command, scanCommand(command), { wipe: false, blocked: false, exhausted: false });
   });
 });

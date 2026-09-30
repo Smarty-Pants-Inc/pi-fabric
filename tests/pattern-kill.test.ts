@@ -1,5 +1,40 @@
 import { describe, expect, it } from "vitest";
-import { killsByPattern, PATTERN_KILL_REASON } from "../src/core/pattern-kill.js";
+import { killsByPattern, PATTERN_KILL_REASON, scanCommand, wipesTmp } from "../src/core/pattern-kill.js";
+
+// R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
+// IDs/commands and the historical 102 false positives are unchanged.
+const round5IntentionalState = new Set<string>([
+  "P=~/.local/state/dev-lead-posts; printf -- '- %s NOTE: I ran pkill -f \"retry418.sh\" (name pattern, against #774)\\n' \"$(date -u +%H:%MZ)\" >> \"$P/notes.md\"",
+  "REPLY=4242; pgrep -f worker | while read -r -p REPLY -n 1 -u 0 -- p; do kill \"$REPLY\"; done",
+  "eval \"kill $PID\"",
+  "printf -v P '%s' 4242; kill \"$P\"",
+  "PID=$!; printf -v Q '%s' \"$PID\"; kill \"$Q\"",
+  "PID=$!; set -- \"$PID\"; kill \"$1\"",
+  "pids=(4242); pids+=(4243); kill \"${pids[@]}\"",
+  "pids=($(cat .local/server.pid)); pids+=($(cat .local/worker.pid)); kill \"${pids[@]}\"",
+  "pids=(4242); pids+=($(cat .local/server.pid)); kill \"${pids[@]}\"",
+  "PID=$!; pids=(4242); pids+=(\"$PID\"); kill \"${pids[@]}\""
+]);
+function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  const intentional = round5IntentionalState.has(command);
+  const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
+  if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);
+  if (intentional || (originallyRefused && result.shellState === true)) {
+    expect(Object.prototype.hasOwnProperty.call(result, "shellState"), command).toBe(true);
+    expect(result, command).toEqual({ blocked: false, wipe: false, exhausted: false, shellState: true });
+  } else if (original.overall !== undefined) {
+    expect(Object.keys(result).sort(), command).toEqual(["blocked", "exhausted", "wipe"]);
+    expect(result.exhausted, command).toBe(original.exhausted ?? false);
+    expect(typeof result.blocked, command).toBe("boolean");
+    expect(typeof result.wipe, command).toBe("boolean");
+    expect(result.blocked || result.wipe, command).toBe(original.overall);
+  } else {
+    expect(result, command).toEqual(original);
+  }
+  expect(killsByPattern(command), command).toBe(result.blocked || result.shellState === true);
+  expect(wipesTmp(command), command).toBe(result.wipe || result.shellState === true);
+}
+
 
 // smarty-dev#774: the three real incidents verbatim, then the forms the rule refuses and the
 // reads and recorded-PID kills it must still allow.
@@ -260,11 +295,11 @@ const allowed: Array<[string, string]> = [
 
 describe("pattern-kill guard (smarty-dev#774)", () => {
   it.each(refused)("refuses %s", (_label, command) => {
-    expect(killsByPattern(command)).toBe(true);
+    expectRound5Guard(command, scanCommand(command), { blocked: true, wipe: false, exhausted: false });
   });
 
   it.each(allowed)("allows %s", (_label, command) => {
-    expect(killsByPattern(command)).toBe(_label.endsWith(" — conservative refusal"));
+    expectRound5Guard(command, scanCommand(command), { blocked: _label.endsWith(" — conservative refusal"), wipe: false, exhausted: false });
   });
 
   it("names the fix in its reason", () => {
@@ -359,9 +394,9 @@ describe("pattern-kill follow-up regressions (#2275)", () => {
   ];
 
   it.each(refused)("refuses %s", (_label, command) => {
-    expect(killsByPattern(command)).toBe(true);
+    expectRound5Guard(command, scanCommand(command), { blocked: true, wipe: false, exhausted: false });
   });
   it.each(allowed)("allows %s", (_label, command) => {
-    expect(killsByPattern(command)).toBe(_label.endsWith(" — conservative refusal"));
+    expectRound5Guard(command, scanCommand(command), { blocked: _label.endsWith(" — conservative refusal"), wipe: false, exhausted: false });
   });
 });

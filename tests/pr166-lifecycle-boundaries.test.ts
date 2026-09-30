@@ -1,5 +1,31 @@
 import { describe, expect, it } from "vitest";
-import { scanCommand } from "../src/core/pattern-kill.js";
+import { scanCommand, killsByPattern, wipesTmp } from "../src/core/pattern-kill.js";
+
+// R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
+// IDs/commands and the historical 102 false positives are unchanged.
+const round5IntentionalState = new Set<string>([
+  "D=/own; D=/tmp eval \"rm -rf \\\"$D\\\"\""
+]);
+function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  const intentional = round5IntentionalState.has(command);
+  const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
+  if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);
+  if (intentional || (originallyRefused && result.shellState === true)) {
+    expect(Object.prototype.hasOwnProperty.call(result, "shellState"), command).toBe(true);
+    expect(result, command).toEqual({ blocked: false, wipe: false, exhausted: false, shellState: true });
+  } else if (original.overall !== undefined) {
+    expect(Object.keys(result).sort(), command).toEqual(["blocked", "exhausted", "wipe"]);
+    expect(result.exhausted, command).toBe(original.exhausted ?? false);
+    expect(typeof result.blocked, command).toBe("boolean");
+    expect(typeof result.wipe, command).toBe("boolean");
+    expect(result.blocked || result.wipe, command).toBe(original.overall);
+  } else {
+    expect(result, command).toEqual(original);
+  }
+  expect(killsByPattern(command), command).toBe(result.blocked || result.shellState === true);
+  expect(wipesTmp(command), command).toBe(result.wipe || result.shellState === true);
+}
+
 
 // DATA ONLY: never execute these shell strings, including their harmless counterparts.
 // Each half is an independent assertion. A regular-file fd fixes identity, not bytes;
@@ -81,12 +107,12 @@ const conservativeFalsePositives = new Set([
 describe("PR166 lifecycle boundaries — paired DATA only", () => {
   for (const pair of pairs) {
     it(`${pair.name} — refuse`, () => {
-      expect(scanCommand(pair.refuse)).toEqual({
+      expectRound5Guard(pair.refuse, scanCommand(pair.refuse), {
         blocked: pair.policy === "kill", wipe: pair.policy === "tmp", exhausted: false,
       });
     });
     it(`${pair.name} — allow`, () => {
-      expect(scanCommand(pair.allow)).toEqual({
+      expectRound5Guard(pair.allow, scanCommand(pair.allow), {
         blocked: conservativeFalsePositives.has(pair.name) && pair.policy === "kill",
         wipe: conservativeFalsePositives.has(pair.name) && pair.policy === "tmp",
         exhausted: false,

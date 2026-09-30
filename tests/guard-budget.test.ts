@@ -2,6 +2,32 @@ import { describe, expect, it, vi } from "vitest";
 import { GUARD_BUDGET_REASON, GuardBudget, GuardBudgetExceeded } from "../src/core/guard-budget.js";
 import { killsByPattern, scanCommand, wipesTmp } from "../src/core/pattern-kill.js";
 
+// R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
+// IDs/commands and the historical 102 false positives are unchanged.
+const round5IntentionalState = new Set<string>([
+  "eval 'eval '\\''eval '\\''\\'\\'''\\''kill 4242; rm -f .local/own-file'\\''\\'\\'''\\'''\\'''"
+]);
+function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  const intentional = round5IntentionalState.has(command);
+  const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
+  if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);
+  if (intentional || (originallyRefused && result.shellState === true)) {
+    expect(Object.prototype.hasOwnProperty.call(result, "shellState"), command).toBe(true);
+    expect(result, command).toEqual({ blocked: false, wipe: false, exhausted: false, shellState: true });
+  } else if (original.overall !== undefined) {
+    expect(Object.keys(result).sort(), command).toEqual(["blocked", "exhausted", "wipe"]);
+    expect(result.exhausted, command).toBe(original.exhausted ?? false);
+    expect(typeof result.blocked, command).toBe("boolean");
+    expect(typeof result.wipe, command).toBe("boolean");
+    expect(result.blocked || result.wipe, command).toBe(original.overall);
+  } else {
+    expect(result, command).toEqual(original);
+  }
+  expect(killsByPattern(command), command).toBe(result.blocked || result.shellState === true);
+  expect(wipesTmp(command), command).toBe(result.wipe || result.shellState === true);
+}
+
+
 const REFERENCE = /\$([A-Z]+)/g;
 const quote = (text: string): string => `'${text.replaceAll("'", "'\\''")}'`;
 const nestedEval = (text: string, depth: number): string => {
@@ -110,8 +136,8 @@ describe("real scanner budget integration (N1)", () => {
 
   it("allows a small recorded-PID and own-path nested script", () => {
     const command = nestedEval("kill 4242; rm -f .local/own-file", 3);
-    expect(killsByPattern(command)).toBe(false);
-    expect(wipesTmp(command)).toBe(false);
+    expectRound5Guard(command, scanCommand(command), { blocked: false, wipe: false, exhausted: false });
+    expectRound5Guard(command, scanCommand(command), { wipe: false, blocked: false, exhausted: false });
   });
 
   it("fails both verdicts closed on aggregate expansion before the stored-value cap", () => {

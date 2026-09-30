@@ -180,6 +180,96 @@ describe("native reader disk suspension", () => {
     expect(reads.mock.calls.length).toBe(0);
     reader.clear();
   });
+  it.each(["grow", "shrink", "timestamp"] as const)("bounds changing logical-history evidence and relocates current fences (%s)", (variant) => {
+    const file = path.join(workspace(), "session.jsonl");
+    const input = { id: "reader", status: "running", sessionFile: file };
+    const record = (i: number) => ({
+      ...entry(0, 16),
+      timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, variant === "timestamp" ? i : 0)).toISOString(),
+      message: { role: "user", content: String(i).padStart(variant === "grow" ? 16 + i : variant === "shrink" ? 272 - i : 16, "x"), timestamp: variant === "timestamp" ? 1000 + i : 0 },
+    });
+    fs.writeFileSync(file, jsonl([header, record(0)]));
+    const inode = fs.statSync(file).ino;
+    const initialSize = fs.statSync(file).size;
+    const reader = new NativeConversationReader();
+    const stringify = vi.spyOn(JSON, "stringify");
+    const reads = vi.spyOn(fs, "readSync");
+    const evidenceSizes: number[] = [];
+    const originalSet = Map.prototype.set;
+    // Observe ordinary map allocations, without accessing reader private state.
+    const evidenceSet = vi.spyOn(Map.prototype, "set").mockImplementation(function (this: Map<unknown, unknown>, key: unknown, value: unknown) {
+      const result = originalSet.call(this, key, value);
+      if (value && typeof value === "object" && "digest" in value && "start" in value && "first" in value) evidenceSizes.push(this.size);
+      return result;
+    });
+    reader.read(input, false);
+    for (let i = 1; i <= 256; i++) {
+      fs.writeFileSync(file, jsonl([header, record(i)]));
+      const latest = reader.loadLatest()!;
+      expect(latest.messages).toEqual([record(i).message]);
+      expect(latest.entries).toHaveLength(1);
+      expect(latest.entries[0]!.timestamp).toBe(record(i).timestamp);
+      expect(latest.leafId).toBe("m0");
+    }
+    const hashes = stringify.mock.calls.filter(([value]) => Array.isArray(value) && value.length === 2 && typeof value[0] === "string" && value[0].startsWith('{"type":"session"')).length;
+    stringify.mockRestore();
+    const rereadCount = reads.mock.calls.length;
+    reads.mockRestore();
+    evidenceSet.mockRestore();
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(Math.sign(fs.statSync(file).size - initialSize)).toBe(variant === "grow" ? 1 : variant === "shrink" ? -1 : 0);
+    // The same two logical records must not generate 256 obsolete fingerprints.
+    expect(evidenceSizes.length).toBeLessThanOrEqual(257);
+    expect(Math.max(...evidenceSizes)).toBe(1);
+    expect(hashes).toBeLessThanOrEqual(2);
+    expect(rereadCount).toBe(257);
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const resumed = reader.last!;
+    expect(resumed.messages).toEqual([record(256).message]);
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[1]!.value as string, "checkpoint");
+    const checkpointBytes = fs.readFileSync(checkpoint);
+    for (const failure of ["missing", "corrupt"]) {
+      if (failure === "missing") fs.unlinkSync(checkpoint);
+      else fs.writeFileSync(checkpoint, "corrupt");
+      const failedReads = vi.spyOn(fs, "readSync");
+      const failed = reader.read(input, false);
+      expect(failed.messages).toEqual([]);
+      expect(failed.error).toContain("Unable to restore reader history");
+      expect(failed.unavailable?.sessionFile).toBe(true);
+      expect(reader.suspended).toBe(true);
+      expect(failedReads.mock.calls).toHaveLength(0);
+      failedReads.mockRestore();
+    }
+    fs.writeFileSync(checkpoint, checkpointBytes);
+    expect(reader.last!.messages).toEqual([record(256).message]);
+    fs.copyFileSync(file, `${file}.new`);
+    fs.renameSync(`${file}.new`, file);
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const fresh = new NativeConversationReader();
+    const expected = fresh.read(input, false);
+    const relocated = reader.read(input, false);
+    expect(content(relocated)).toEqual(content(expected));
+    expect(relocated.entries[0]!.timestamp).toBe(record(256).timestamp);
+    expect(relocated.error).toBeUndefined();
+    expect(relocated.unavailable).toBeUndefined();
+    // Re-parsing a new inode refreshes fences but cannot erase prior conflict.
+    expect(reader.suspend()).toBe(true);
+    const relocatedCheckpoint = path.join(temporary.mock.results[2]!.value as string, "checkpoint");
+    for (const failure of ["missing", "corrupt"]) {
+      if (failure === "missing") fs.unlinkSync(relocatedCheckpoint);
+      else fs.writeFileSync(relocatedCheckpoint, "corrupt");
+      const failedReads = vi.spyOn(fs, "readSync");
+      expect(reader.read(input, false).error).toContain("Unable to restore reader history");
+      expect(reader.last!.messages).toEqual([]);
+      expect(failedReads.mock.calls).toHaveLength(0);
+      failedReads.mockRestore();
+    }
+    fresh.clear();
+    reader.clear();
+  });
+
   it("checkpoints only final-sized live tool state and replays older pages exactly after resume", () => {
     const file = path.join(workspace(), "events.jsonl");
     const oldMessage = { role: "user", content: "old" + "o".repeat(300000), timestamp: 1 };

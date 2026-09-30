@@ -628,20 +628,56 @@ export class NativeConversationReader {
     this.#eventReplay = new NativeReaderEventReplay(state.eventRecords);
   }
 
-  #rememberRange(kind: FileKind, page: RecordPage): void {
+  #rememberRange(kind: FileKind, page: RecordPage, rereadTail = false): void {
     if (page.end <= page.start) return;
     const pages = this.#loadedPages.get(kind) ?? new Map();
     const key = `${page.start}:${page.end}`;
-    const previous = pages.get(key);
-    if (previous) {
-      if (previous.digest !== null && previous.digest !== this.#pageDigest(page.records)) previous.digest = null;
-      return;
+    let digest: string | undefined;
+    let invalid = pages.has("invalid");
+    if (!invalid) {
+      for (const previous of pages.values()) {
+        // Validate overlapping immutable bytes using the records already read.
+        // A former endpoint inside a record is evidence of a size-changing
+        // rewrite, not an appended record with a new identity.
+        if ((rereadTail && previous.end > page.end) ||
+          page.offsets.some(([start, end]) =>
+            (start < previous.start && previous.start < end) ||
+            (start < previous.end && previous.end < end))) {
+          invalid = true;
+          break;
+        }
+        if (previous.start < page.start || previous.end > page.end) continue;
+        const first = page.offsets.findIndex(([start]) => start === previous.start);
+        const last = page.offsets.findIndex(([, end]) => end === previous.end);
+        if (first < 0 || last < first) { invalid = true; break; }
+        const current = previous.start === page.start && previous.end === page.end
+          ? (digest ??= this.#pageDigest(page.records))
+          : this.#pageDigest(page.records.slice(first, last + 1));
+        if (current !== previous.digest) { invalid = true; break; }
+      }
     }
-    pages.set(key, {
-      start: page.start, end: page.end, digest: this.#pageDigest(page.records),
-      first: this.#recordBoundary(page.records[0] ?? ""),
-      last: this.#recordBoundary(page.records.at(-1) ?? ""),
-    });
+    if (invalid) {
+      // Once contradictory, fingerprints of obsolete versions add no proof.
+      // Retain only logical coverage fences and an irreversible invalid latch.
+      const evidence = [...pages.values()];
+      const first = evidence.reduce((oldest, item) => item.start < oldest.start ? item : oldest);
+      const last = evidence.reduce((newest, item) => item.end > newest.end ? item : newest);
+      pages.clear();
+      pages.set("invalid", {
+        start: Math.min(first.start, page.start),
+        end: rereadTail ? page.end : Math.max(last.end, page.end),
+        digest: null,
+        first: page.start <= first.start ? this.#recordBoundary(page.records[0] ?? "") : first.first,
+        last: rereadTail || page.end >= last.end ? this.#recordBoundary(page.records.at(-1) ?? "") : last.last,
+      });
+    } else {
+      if (pages.has(key)) return;
+      pages.set(key, {
+        start: page.start, end: page.end, digest: digest ?? this.#pageDigest(page.records),
+        first: this.#recordBoundary(page.records[0] ?? ""),
+        last: this.#recordBoundary(page.records.at(-1) ?? ""),
+      });
+    }
     this.#loadedPages.set(kind, pages);
     const ranges = [...(this.#loadedRanges.get(kind) ?? []), [page.start, page.end] as [number, number]];
     ranges.sort((a, b) => a[0] - b[0]);
@@ -823,7 +859,7 @@ export class NativeConversationReader {
     try {
       const page = readBackwardPage(opened.descriptor, opened.size, INITIAL_PAGE_BYTES, kind === "events");
       this.#applyRecords(kind, page.records, true);
-      this.#rememberRange(kind, page);
+      this.#rememberRange(kind, page, true);
       this.#windows.set(kind, {
         head: page.start,
         tail: page.end,
@@ -963,12 +999,21 @@ export class NativeConversationReader {
       if (page.start >= end) break;
       end = page.start;
     } while (end > bounds.head);
+    const invalid = this.#loadedPages.get(kind)?.has("invalid");
     this.#clearFileState(kind);
     this.#loadedPages.delete(kind);
     this.#loadedRanges.delete(kind);
     for (let index = 0; index < pages.length; index++) {
       const page = pages[index]!;
       this.#applyRecords(kind, page.records, index === 0);
+      if (index === 0 && invalid) {
+        // Relocation refreshes coverage, not the failed checkpoint proof.
+        this.#loadedPages.set(kind, new Map([["invalid", {
+          start: page.start, end: page.end, digest: null,
+          first: this.#recordBoundary(page.records[0] ?? ""),
+          last: this.#recordBoundary(page.records.at(-1) ?? ""),
+        }]]));
+      }
       this.#rememberRange(kind, page);
     }
     this.#windows.set(kind, {

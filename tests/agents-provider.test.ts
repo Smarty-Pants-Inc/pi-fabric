@@ -368,13 +368,18 @@ describe("terminal result observation receipts", () => {
 describe("runtime observation receipts", () => {
   it.each(["quickjs", "node-process", "monty", "cpython"] as const)("keeps an unread completion after %s rejects result encoding, but not after delivered guest continuation", async backend => {
     vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const started = performance.now();
+    const steps: { atMs: number; step: string; details?: unknown }[] = [];
+    const record = (step: string, details?: unknown) => {
+      if (steps.length < 64) steps.push({ atMs: Math.round(performance.now() - started), step, details });
+    };
     const { AgentCompletionInbox } = await import("../src/agents/completion-inbox.js");
     const handlers = new Map<string, (...args: any[]) => unknown>();
     const sendMessage = vi.fn();
     const inboxContext = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
     const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, inboxContext);
-    const consumed = vi.fn((id: string) => inbox.acknowledge(id));
-    const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => inbox.enqueue(result));
+    const consumed = vi.fn((id: string) => { record("consumption receipt", { id }); inbox.acknowledge(id); });
+    const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => { record("background completion", { id: result.id, status: result.status }); inbox.enqueue(result); });
     const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
     const registry = new ActionRegistry(); registry.register(h.provider);
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
@@ -385,29 +390,53 @@ describe("runtime observation receipts", () => {
     config.executor.mainMaxTimeoutMs = 5_000;
     const service = new FabricExecutionService(registry, config);
     const mainContext = { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "receipt-main" } } as unknown as ExtensionContext;
-    await service.execute({ code: python ? "return 1" : "return 1;", context: mainContext, signal: undefined, parentToolCallId: "receipt-warmup", onPartial() {} });
+    const execute = async (parentToolCallId: string, code: string) => {
+      record(`${parentToolCallId}: start`);
+      const controller = new AbortController();
+      // Keep a real hang guard separate from the controlled Main budget, so a
+      // broken Windows IPC handshake still settles and emits diagnostics.
+      const guard = setTimeout(() => {
+        record(`${parentToolCallId}: hang guard`);
+        controller.abort(new Error("Receipt regression execution exceeded its 12-second hang guard"));
+      }, 12_000);
+      try {
+        const result = await service.execute({ code, context: mainContext, signal: controller.signal, parentToolCallId, onPartial() {} });
+        record(`${parentToolCallId}: end`, { success: result.success, error: result.error, logs: result.logs, phases: result.phases, audits: result.audits });
+        return result;
+      } finally { clearTimeout(guard); }
+    };
     const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
     try {
+      // Startup is not the behavior under test. Both watchdogs rearm on early
+      // firings; advance the wall clock only at the tested boundary. The old
+      // real 5-second ceiling could expire before encode on a cold CI runner.
+      const warmupClock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+      try {
+        const warmup = await execute("receipt-warmup", python ? "return 1" : "return 1;");
+        expect(warmup.success, warmup.error).toBe(true);
+        expect(warmup.value).toBe(1);
+      } finally { warmupClock.mockRestore(); }
       const handle = await h.agents.spawn({ task: "encoding receipt", transport: "process" });
       h.agents.detachSignal(handle.id);
       await waitFor(() => completed.mock.calls.length === 1, 5_000);
       const invoke = registry.invoke.bind(registry);
-      const clock = vi.spyOn(Date, "now");
+      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
       const encode = vi.fn((deadlineAt: number) => {
-        // Cross the ceiling only at the actual encoding seam, not while a
-        // fresh CPython child is still starting (including its Windows IPC).
+        record("encoding seam", { deadlineAt });
         clock.mockReturnValue(deadlineAt + 1);
         return "rejected encoding";
       });
       const encoding = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, callContext) => {
+        record("encoding host call", { ref });
         const value = await invoke(ref, args, callContext);
+        record("encoding host result", { ref });
         // Registry admission precedes guest promise/frame publication.
         Object.defineProperty(value, "text", { enumerable: true, get: () => encode(callContext.mainDeadlineAt!) });
         return value;
       });
       let rejected: Awaited<ReturnType<typeof service.execute>>;
       try {
-        rejected = await service.execute({ code: python ? `return await agents.wait(id=${JSON.stringify(handle.id)})` : `return await agents.wait({ id: ${JSON.stringify(handle.id)} });`, context: mainContext, signal: undefined, parentToolCallId: "receipt-encoding", onPartial() {} });
+        rejected = await execute("receipt-encoding", python ? `return await agents.wait(id=${JSON.stringify(handle.id)})` : `return await agents.wait({ id: ${JSON.stringify(handle.id)} });`);
       } finally { encoding.mockRestore(); clock.mockRestore(); }
       expect(encode).toHaveBeenCalled();
       expect(rejected.error).toMatch(/MainExecutionCeilingError/);
@@ -423,31 +452,44 @@ describe("runtime observation receipts", () => {
       let continued!: (deadlineAt: number) => void;
       const continuation = new Promise<number>(resolve => { continued = resolve; });
       const guestContinuation = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, callContext) => {
+        record("delivery host call", { ref });
         if (ref !== "agents.list") return invoke(ref, args, callContext);
         // This second guest call proves wait's response actually reached the
         // guest. Keep its continuation pending until the real watchdog aborts.
         const pending = new Promise<never>((_resolve, reject) => {
           callContext.signal!.addEventListener("abort", () => reject(callContext.signal!.reason), { once: true });
         });
+        record("guest continuation", { deadlineAt: callContext.mainDeadlineAt });
         continued(callContext.mainDeadlineAt!);
         return pending;
       });
       const timer = captureRuntimeDeadline(backend);
-      const execution = service.execute({ code: python ? `result = await agents.wait(id=${JSON.stringify(delivered.id)})\nreturn await agents.list()` : `const result = await agents.wait({ id: ${JSON.stringify(delivered.id)} }); return await agents.list();`, context: mainContext, signal: undefined, parentToolCallId: "receipt-delivered", onPartial() {} });
+      const deliveryClock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+      const execution = execute("receipt-delivered", python ? `result = await agents.wait(id=${JSON.stringify(delivered.id)})\nreturn await agents.list()` : `const result = await agents.wait({ id: ${JSON.stringify(delivered.id)} }); return await agents.list();`);
       try {
         const deadlineAt = await Promise.race([continuation, execution.then(result => {
           throw new Error(`Guest ended before delivered continuation: ${result.error}`);
         })]);
         expect(consumed).toHaveBeenCalledExactlyOnceWith(delivered.id);
+        deliveryClock.mockRestore();
+        record("fire runtime deadline", { deadlineAt });
         timer.fireAt(deadlineAt);
         const observed = await execution;
         expect(observed.error).toMatch(/MainExecutionCeilingError/);
         expect(consumed).toHaveBeenCalledExactlyOnceWith(delivered.id);
         boundary(); boundary();
         expect(sendMessage).toHaveBeenCalledOnce();
-      } finally { timer.restore(); guestContinuation.mockRestore(); await execution; }
+      } finally { deliveryClock.mockRestore(); timer.restore(); guestContinuation.mockRestore(); await execution; }
+    } catch (error) {
+      // Monotonic failure-only telemetry survives the mocked wall clock. The
+      // old assertion hid warmup errors and never identified the failing phase.
+      console.error("runtime observation receipts diagnostics", JSON.stringify({
+        backend, platform: process.platform, node: process.version, cpythonBinary: config.executor.cpython.binary,
+        steps, consumptionCalls: consumed.mock.calls, completionIds: completed.mock.calls.map(([result]) => result.id),
+      }, null, 2));
+      throw error;
     } finally { inbox.close(); await registry.close(); vi.unstubAllEnvs(); }
-  });
+  }, 45_000);
 });
 
 describe("AgentsProvider actor session reset", () => {

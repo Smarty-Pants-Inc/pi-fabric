@@ -311,7 +311,9 @@ export interface FabricAgentLog {
   status?: AgentRunRecord;
   events: FabricLogLine[];
   hasMore: boolean;
+  /** Exclusive byte offset; pair with generation as beforeGeneration on the next request. */
   before?: number;
+  generation?: string;
 }
 
 export type FabricSteeringMode = "all" | "one-at-a-time";

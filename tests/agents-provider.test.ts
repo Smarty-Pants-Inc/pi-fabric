@@ -1563,6 +1563,15 @@ describe("AgentsProvider runner support", () => {
 });
 
 describe("AgentsProvider shared actor definitions", () => {
+  it("refuses an unbound public log cursor instead of silently reusing bytes", async () => {
+    const { provider, actors } = setup();
+    const actor = await actors.create(createRequest as FabricActorRequest);
+    await expect(provider.invoke("log", { id: actor.id, before: 10 }, context)).rejects.toMatchObject({
+      name: "cursor-stale", message: expect.stringContaining("re-read from start"),
+    });
+    await expect(provider.invoke("log", { id: actor.id }, context)).resolves.toMatchObject({ actorId: actor.id });
+  });
+
   it("exposes the shared definition, mailbox, and logs while keeping mutation owner-gated", async () => {
     const members: FabricParticipantInfo[] = [];
     const { provider, actors } = setup([], members);

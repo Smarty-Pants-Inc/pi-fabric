@@ -1127,17 +1127,20 @@ export class ActorManager {
 
   readLog(
     id: string,
-    opts: { type?: "session" | "run" | "all"; lines?: number; runId?: string; before?: number } = {},
+    opts: { type?: "session" | "run" | "all"; lines?: number; runId?: string; before?: number; beforeGeneration?: string } = {},
   ): FabricActorLog {
     this.#syncActorsFromRegistry();
     const actor = this.#requireActor(id);
     const type = opts.type ?? "session";
+    if (type === "all" && opts.beforeGeneration !== undefined) {
+      throw new Error("Generation-bound actor paging requires type session or run; re-read all without a cursor");
+    }
     const lines = Math.max(1, Math.min(opts.lines ?? 200, 5000));
     const sessionFile = actor.sessionFile;
     const logDir = path.join(path.dirname(sessionFile), "runs");
     const sessionPage = type === "run"
       ? { lines: [], hasMore: false }
-      : readJsonlPage(sessionFile, lines, opts.before);
+      : readJsonlPage(sessionFile, lines, opts.before, undefined, opts.beforeGeneration);
     const session = sessionPage.lines;
     let run: FabricActorLog["run"];
     if (type !== "session") {
@@ -1147,7 +1150,7 @@ export class ActorManager {
         if (fs.existsSync(runPath)) {
           const statusRecord = readRunRecord(path.join(runPath, "status.json"));
           const eventsFile = path.join(runPath, "events.jsonl");
-          const page = readJsonlPage(eventsFile, lines, opts.before);
+          const page = readJsonlPage(eventsFile, lines, opts.before, undefined, opts.beforeGeneration);
           run = {
             runId: targetRunId,
             eventsFile,
@@ -1155,6 +1158,7 @@ export class ActorManager {
             events: page.lines,
             hasMore: page.hasMore,
             ...(page.before !== undefined ? { before: page.before } : {}),
+            ...(page.generation !== undefined ? { generation: page.generation } : {}),
           };
         }
       }
@@ -1167,6 +1171,7 @@ export class ActorManager {
       session,
       sessionHasMore: sessionPage.hasMore,
       ...(sessionPage.before !== undefined ? { sessionBefore: sessionPage.before } : {}),
+      ...(sessionPage.generation !== undefined ? { sessionGeneration: sessionPage.generation } : {}),
       ...(run ? { run } : {}),
       retainedRuns: this.#logs.retainedRunIds(actor),
     };

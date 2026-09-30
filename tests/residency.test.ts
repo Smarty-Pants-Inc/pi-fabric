@@ -10,6 +10,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { projectOf } from "../src/topology/project-identity.js";
@@ -713,6 +714,39 @@ describe("durable completion receipts", () => {
     }
   });
 
+  it("F1 preserves original completion through recovery sweep and a second host restart without a saved result", async () => {
+    const state = await rootHarness("f1-recovery-completion");
+    const seeded = await seedCompletion(state);
+    const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8"));
+    // The host died while the spawn handle still said running; only the worker's record advanced.
+    fs.writeFileSync(seeded.metadataPath, JSON.stringify({ ...metadata, handle: { ...metadata.handle, status: "running", text: "", residency: "durable" } }));
+    await state.mesh.delete({ key: seeded.key });
+    const expiredAt = Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000;
+    fs.utimesSync(seeded.runDirectory, expiredAt / 1_000, expiredAt / 1_000);
+    const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
+    const expected = { id: seeded.id, status: "completed", text: seeded.result.text, residency: "durable" };
+    let host: ResidentHost | undefined;
+    let client: ResidencyClient | undefined;
+    try {
+      expect(fs.existsSync(resultPath)).toBe(false);
+      for (let restart = 1; restart <= 2; restart++) {
+        host = new ResidentHost(state.config);
+        await host.start(); // The real fenced startup sweep runs before manager construction.
+        client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+        expect(client.statusAgent(seeded.id), `restart ${restart}`).toMatchObject(expected);
+        expect(await client.waitAgent(seeded.id, AbortSignal.timeout(2_000))).toMatchObject(expected);
+        expect(fs.existsSync(seeded.runDirectory)).toBe(true);
+        expect(fs.existsSync(resultPath)).toBe(false);
+        await client.close();
+        await host.close();
+      }
+    } finally {
+      await client?.close();
+      await host?.close();
+      await state.participants.close();
+    }
+  });
+
   // smarty-dev#1882: an idle resident host removes runs/; status must not fall back to the spawn handle.
   it("reads the saved terminal record after the host removed the run directory", async () => {
     const state = await rootHarness("saved-terminal-record");
@@ -794,6 +828,67 @@ describe("durable completion receipts", () => {
 });
 
 describe.skipIf(!hasResidentHost || process.platform === "win32")("durable participant residency", () => {
+  it.skipIf(process.platform !== "linux")("F1 retains a detached worker completion after SIGKILL, expiry, recovery and a second restart", { timeout: 60_000 }, async () => {
+    const state = await rootHarness("f1-detached-completion");
+    const launches = launchLog(state.root);
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath };
+    const client = new ResidencyClient(options);
+    let reconnect: ResidencyClient | undefined;
+    const killOwner = async () => {
+      const owner = JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner;
+      const owned = launches.owned().find((entry) => entry.pid === owner.pid)!;
+      expect(owned).toBeDefined();
+      expect(same(owned)).toBe(true);
+      process.kill(owner.pid, "SIGKILL"); // Kill only the host, not its detached process worker.
+      await waitFor(() => !same(owned), 20_000);
+    };
+    try {
+      const handle = await client.spawnAgent({ task: "STREAM_PREVIEW", transport: "process", residency: "durable" });
+      const run = path.join(state.config.residencyRoot, "runs", handle.id);
+      const statusPath = path.join(run, "status.json");
+      const resultPath = residentResultPath(state.config.residencyRoot, handle.id);
+      const record = () => JSON.parse(fs.readFileSync(statusPath, "utf8"));
+      await waitFor(() => fs.existsSync(statusPath));
+      expect(record().status).toBe("running");
+      const worker = launches.owned().find(({ argv }) => argv[0] === fakeWorker && argv[argv.indexOf("--id") + 1] === handle.id)!;
+      expect(worker).toBeDefined();
+      await killOwner();
+      expect(same(worker)).toBe(true);
+      await waitFor(() => record().status === "completed" && !same(worker), 10_000);
+      const original = record();
+      expect(original.text).toBe("stream preview complete");
+      expect(fs.existsSync(resultPath)).toBe(false);
+      const metadataPath = path.join(state.config.residencyRoot, "agents", `${handle.id}.json`);
+      expect(JSON.parse(fs.readFileSync(metadataPath, "utf8")).handle.status).toBe("running");
+      // Only advance retention age, never rewrite the worker's terminal record.
+      const expiredAt = Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000;
+      fs.utimesSync(run, expiredAt / 1_000, expiredAt / 1_000);
+      await client.close();
+      for (let restart = 1; restart <= 2; restart++) {
+        reconnect = new ResidencyClient(options);
+        await reconnect.ensureHost();
+        const expected = { id: handle.id, status: original.status, text: original.text, residency: "durable" };
+        expect(reconnect.statusAgent(handle.id), `restart ${restart}`).toMatchObject(expected);
+        expect(await reconnect.waitAgent(handle.id, AbortSignal.timeout(2_000))).toMatchObject(expected);
+        expect(record()).toEqual(original);
+        expect(fs.existsSync(resultPath)).toBe(false);
+        await reconnect.close();
+        await killOwner();
+      }
+    } finally {
+      await reconnect?.close();
+      await client.close();
+      await stopResident(state.config);
+      // Reap only processes recorded by this fixture if a pre-completion assertion failed.
+      for (const owned of launches.owned()) if (same(owned)) {
+        try { process.kill(owned.pid, "SIGKILL"); } catch { /* already exited */ }
+      }
+      await waitFor(() => launches.owned().every((owned) => !same(owned)), 10_000);
+      await state.participants.close();
+    }
+  });
+
   it.skipIf(process.platform !== "linux")("replaces owner and host lock whose live PID has a different start time", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-reused-pid");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh,

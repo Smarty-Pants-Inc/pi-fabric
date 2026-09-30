@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
-import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -32,6 +32,68 @@ const fixture = () => {
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 describe("resident orphan retention", () => {
+  it("F1 retains a public task's only completion until a valid saved terminal result authorizes collection", async () => {
+    const { root, config, host } = fixture();
+    const id = "a".repeat(32);
+    const runs = path.join(config.residencyRoot, "runs");
+    const run = path.join(runs, id);
+    const result = {
+      id, name: "orphaned public task", task: "work", status: "completed", text: "original completion",
+      runner: "pi", transport: "process", cwd: config.cwd, startedAt: 1, updatedAt: 2, finishedAt: 2,
+      turns: 1, toolCalls: 0, usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    };
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(result));
+    const metadataPath = path.join(config.residencyRoot, "agents", `${id}.json`);
+    fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+    fs.writeFileSync(metadataPath, JSON.stringify({
+      format: RESIDENT_HOST_FORMAT, rootId: config.rootId, id, runDirectory: run,
+      handle: { ...result, status: "running", text: "", residency: "durable" }, createdAt: 1, updatedAt: 1,
+    }));
+    const expiredAt = Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000;
+    fs.utimesSync(run, expiredAt / 1_000, expiredAt / 1_000);
+    const resultPath = residentResultPath(config.residencyRoot, id);
+    try {
+      // Lost host: the detached worker wrote status.json, but onSettled never saved results/id.
+      await host.start();
+      expect(fs.existsSync(run)).toBe(true);
+      expect(fs.existsSync(resultPath)).toBe(false);
+      fs.mkdirSync(path.dirname(resultPath), { recursive: true });
+      for (const malformed of [
+        "{", "null", "[]", JSON.stringify({ ...result, id: "b".repeat(32) }),
+        JSON.stringify({ ...result, status: "running" }),
+        JSON.stringify({ id, status: "completed" }),
+        JSON.stringify({ ...result, text: null }),
+        JSON.stringify({ ...result, usage: { ...result.usage, output: "invalid" } }),
+      ]) {
+        fs.writeFileSync(resultPath, malformed);
+        expect(sweepResidentRuns(runs), malformed).toEqual([]);
+        expect(fs.existsSync(run), malformed).toBe(true);
+        expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toEqual(result);
+      }
+      // A saved result cannot turn uncertain public metadata into permission to delete.
+      fs.writeFileSync(resultPath, JSON.stringify(result));
+      const metadata = fs.readFileSync(metadataPath, "utf8");
+      const parsedMetadata = JSON.parse(metadata);
+      for (const malformed of [
+        "{", "null", "[]", JSON.stringify({ id }),
+        JSON.stringify({ ...parsedMetadata, handle: null }),
+        JSON.stringify({ ...parsedMetadata, runDirectory: path.join(runs, "unrelated") }),
+      ]) {
+        fs.writeFileSync(metadataPath, malformed);
+        expect(sweepResidentRuns(runs), malformed).toEqual([]);
+        expect(fs.existsSync(run), malformed).toBe(true);
+        expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toEqual(result);
+      }
+      fs.writeFileSync(metadataPath, metadata);
+      // Counterexample: this SAME public task becomes collectable once its authoritative copy exists.
+      expect(sweepResidentRuns(runs)).toEqual([run]);
+      expect(fs.existsSync(run)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(resultPath, "utf8"))).toEqual(result);
+      expect(fs.existsSync(metadataPath)).toBe(true);
+    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("F6 sweeps old terminal untracked runs at fenced host start, preserving recent/live/unknown/unresolved runs", async () => {
     const { root, config, host } = fixture();
     const runs = path.join(config.residencyRoot, "runs");
@@ -44,6 +106,7 @@ describe("resident orphan retention", () => {
       return run;
     };
     const old = make("terminal-old", { status: "completed" });
+    const actor = make("actor-old", { status: "completed", actorId: "actor-without-public-metadata" });
     const recent = make("terminal-recent", { status: "completed" }, 1_000);
     const live = make("live", { status: "completed", transport: "process", sessionId: String(process.pid) });
     const unknown = make("unknown", { status: "running" });
@@ -55,6 +118,7 @@ describe("resident orphan retention", () => {
     try {
       await host.start();
       expect(fs.existsSync(old)).toBe(false);
+      expect(fs.existsSync(actor)).toBe(false);
       for (const run of [recent, live, unknown, malformed, deadWithoutBirth, unresolved]) expect(fs.existsSync(run), run).toBe(true);
       // Inject the clock: a preserved terminal survivor becomes eligible on a later host start.
       expect(sweepResidentRuns(runs, now + RESIDENT_RUN_RETENTION_MS + 60_000)).toEqual([recent]);

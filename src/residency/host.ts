@@ -43,6 +43,50 @@ import { canRemoveTerminalRun } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
 
 export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+
+/** A worker can finish after its host dies, leaving status.json as the only completion copy. */
+const hasPreservedResidentResult = (runsRoot: string, id: string): boolean => {
+  const residencyRoot = path.dirname(runsRoot);
+  const metadataPath = path.join(residencyRoot, "agents", `${id}.json`);
+  // Only proven absence permits ordinary actor/untracked collection. Unreadable or unsafe
+  // metadata may still describe a public task, so uncertainty keeps its run directory.
+  try { fs.lstatSync(metadataPath); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+  const readOwnedJson = <T>(file: string): T | undefined => {
+    const stat = ownedStat(file);
+    if (!stat?.isFile() || stat.size > 1024 * 1024) return undefined;
+    return readJson<T>(file);
+  };
+  const time = (value: unknown): value is number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0;
+  const metadata = readOwnedJson<ResidentAgentMetadata>(metadataPath);
+  if (metadata?.format !== RESIDENT_HOST_FORMAT || metadata.id !== id ||
+      typeof metadata.rootId !== "string" || metadata.handle?.id !== id ||
+      metadata.handle.residency !== "durable" || metadata.handle.actorId !== undefined ||
+      typeof metadata.handle.name !== "string" || typeof metadata.handle.cwd !== "string" ||
+      !["pi", "claude", "veda"].includes(metadata.handle.runner) ||
+      !["process", "tmux", "screen", "localterm", "herdr"].includes(metadata.handle.transport) ||
+      !["queued", "running", "completed", "failed", "stopped", "timed_out"].includes(metadata.handle.status) ||
+      !time(metadata.createdAt) || !time(metadata.updatedAt) ||
+      typeof metadata.runDirectory !== "string" ||
+      path.resolve(metadata.runDirectory) !== path.resolve(runsRoot, id)) return false;
+  const saved = readOwnedJson<AgentRunRecord>(residentResultPath(residencyRoot, id));
+  // Validate the terminal record, not just a matching id/status stub: deleting the run must
+  // leave a usable result (including its text) for client status/wait across restarts.
+  return !!saved && saved.id === id && saved.actorId === undefined &&
+    ["completed", "failed", "stopped", "timed_out"].includes(saved.status) &&
+    typeof saved.name === "string" && typeof saved.task === "string" &&
+    typeof saved.cwd === "string" && typeof saved.text === "string" &&
+    ["pi", "claude", "veda"].includes(saved.runner) &&
+    ["process", "tmux", "screen", "localterm", "herdr"].includes(saved.transport) &&
+    time(saved.startedAt) && time(saved.updatedAt) &&
+    (saved.finishedAt === undefined || time(saved.finishedAt)) &&
+    time(saved.turns) && time(saved.toolCalls) &&
+    (saved.error === undefined || typeof saved.error === "string") &&
+    !!saved.usage && [saved.usage.input, saved.usage.output, saved.usage.cacheRead,
+      saved.usage.cacheWrite, saved.usage.cost].every(time);
+};
+
 /** Called under the host fence, before constructing the manager: every existing run is untracked. */
 export const sweepResidentRuns = (runsRoot: string, now = Date.now(), budgetMs = 100): string[] => {
   const removed: string[] = [];
@@ -58,7 +102,8 @@ export const sweepResidentRuns = (runsRoot: string, now = Date.now(), budgetMs =
       const run = path.join(runsRoot, entry.name);
       const stat = ownedStat(run);
       if (!stat?.isDirectory() || now - stat.mtimeMs <= RESIDENT_RUN_RETENTION_MS) continue;
-      if (!canRemoveTerminalRun(run, expired) || expired()) continue;
+      if (!canRemoveTerminalRun(run, expired) ||
+          !hasPreservedResidentResult(runsRoot, entry.name) || expired()) continue;
       try { fs.rmSync(run, { recursive: true, force: true }); removed.push(run); } catch {}
     }
   } finally { directory.closeSync(); }

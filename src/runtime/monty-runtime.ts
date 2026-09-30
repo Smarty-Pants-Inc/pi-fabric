@@ -148,6 +148,7 @@ export class MontyRuntime implements FabricKernelRuntime {
           checkDeadline();
           const normalized = montyInput(normalizeMontyValue(value, true));
           checkDeadline();
+          options.onHostResultDelivered?.(args);
           return normalized;
         }
         catch (error) {

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import type { FabricActorRunBinding } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 
@@ -199,6 +200,8 @@ export interface FabricControlRequestOptions {
   routedRemoteHost?: string | null;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Host-selected ASK observation policy; only the private branded ceiling qualifies. */
+  detachOnMainCeiling?: boolean;
 }
 
 interface PendingControlRequest {
@@ -416,8 +419,12 @@ export class FabricControlPlane {
       if (options.signal) {
         const onAbort = (): void => {
           const cancelled = this.#clearPending(commandId);
-          if (cancelled) void this.#publishCancellation(commandId, cancelled);
-          reject(new Error(`Remote Fabric request cancelled: ${targetId}`));
+          const ceiling = operation === "ask" && options.detachOnMainCeiling
+            ? mainExecutionCeilingAbortReason(options.signal) : undefined;
+          // The remote owner already owns accepted work. Do not translate Main's
+          // observation ceiling into an unbranded activation-cancel wire command.
+          if (cancelled && !ceiling) void this.#publishCancellation(commandId, cancelled);
+          reject(ceiling ?? new Error(`Remote Fabric request cancelled: ${targetId}`));
         };
         pending.signal = options.signal;
         pending.onAbort = onAbort;

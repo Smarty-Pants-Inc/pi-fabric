@@ -1,4 +1,5 @@
 import { createMainExecutionCeilingError, isMainExecutionCeilingError, mainExecutionCeilingAbortReason } from "./async-settlement.js";
+import { ResultConsumption } from "./result-consumption.js";
 import { ExecutionDeadline } from "./runtime/execution-deadline.js";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -635,6 +636,8 @@ export class FabricExecutionService {
         throw mainCeiling!.signal.reason;
       }
     };
+    const pendingConsumption = new Map<Record<string, unknown>, ResultConsumption>();
+    let consumptionClosed = false;
     const guardHostCall = (dispatch: FabricHostCall): FabricHostCall => (ref, args, signal) => {
       // Throw synchronously before allocating a dispatch promise: aborting here
       // must not leave a rejected operation behind runAbortable's aborted race.
@@ -647,6 +650,20 @@ export class FabricExecutionService {
         guardHostCall(async (ref, args, runtimeSignal) => {
           const callContext = {
             ...baseContext, signal: providerSignal(runtimeSignal),
+            deferResultConsumption(consume: () => void, abandon?: () => void) {
+              if (consumptionClosed) {
+                const dropped = new ResultConsumption();
+                dropped.defer(consume, abandon);
+                dropped.abandon();
+                return;
+              }
+              let consumption = pendingConsumption.get(args);
+              if (!consumption) {
+                consumption = new ResultConsumption();
+                pendingConsumption.set(args, consumption);
+              }
+              consumption.defer(consume, abandon);
+            },
             ...(mainDeadlineAt !== undefined ? { mainDeadlineAt, checkExecutionBudget: checkMainDeadline } : {}),
           };
           switch (ref) {
@@ -981,6 +998,11 @@ export class FabricExecutionService {
           memoryLimitBytes: this.config.executor.memoryLimitBytes,
           maxLogChars: this.config.executor.maxOutputChars,
           minimumTimeoutMsForHostCall,
+          onHostResultDelivered(args) {
+            const consumption = pendingConsumption.get(args);
+            pendingConsumption.delete(args);
+            consumption?.commit();
+          },
           ...(!python ? { piToolCanonicalFields, piTools: effectiveFullCodeMode } : {}),
           ...(checked.javascript ? { transpiledCode: checked.javascript } : {}),
           ...(checked.sourceMap ? { transpiledSourceMap: checked.sourceMap } : {}),
@@ -1003,6 +1025,9 @@ export class FabricExecutionService {
       this.activity?.finish(options.parentToolCallId, false, message);
       throw error;
     } finally {
+      consumptionClosed = true;
+      for (const consumption of pendingConsumption.values()) consumption.abandon();
+      pendingConsumption.clear();
       for (const cleanup of providerSignalCleanups) cleanup();
       runtimeDeadline?.clear();
       mainBudget?.clear();

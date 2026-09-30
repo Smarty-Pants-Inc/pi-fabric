@@ -1148,24 +1148,32 @@ export class AgentManager {
    * as a completion message. An optional signal cancels only this observation (Main's
    * program deadline / Escape), detaches the run, and leaves its result unconsumed.
    */
-  async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<AgentRunResult> {
+  async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void } = {}): Promise<AgentRunResult> {
     const previous = this.#previousRun(id);
-    if (previous) return previous;
+    if (previous) {
+      if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id));
+      else this.#onResultConsumed?.(id);
+      return previous;
+    }
     const managed = this.#requireRun(id);
-    managed.background = false;
+    if (!options.deferConsumption) managed.background = false;
+    const consumed = (): void => {
+      if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id), () => this.detachSignal(id));
+      else this.#onResultConsumed?.(id);
+    };
     if (!managed.settled) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
       const result = options.timeoutMs === undefined && options.signal === undefined
         ? await managed.result
         : await this.#boundedResult(managed, options);
-      this.#onResultConsumed?.(id);
+      consumed();
       return result;
     }
     const record = readRecord(managed.statusFile) ?? managed.latestRecord;
     if (!record || !terminalStatuses.has(record.status)) {
       throw new Error(`Agent ${id} settled without a result`);
     }
-    this.#onResultConsumed?.(id);
+    consumed();
     return this.#withTransportMetadata(record, managed) as AgentRunResult;
   }
 
@@ -1361,7 +1369,6 @@ export class AgentManager {
   #previousRun(id: string): AgentRunResult | undefined {
     const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id);
     if (!previous) return undefined;
-    this.#onResultConsumed?.(id);
     return structuredClone(previous);
   }
 

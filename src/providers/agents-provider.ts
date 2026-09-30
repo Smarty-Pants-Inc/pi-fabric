@@ -586,6 +586,7 @@ export class AgentsProvider implements FabricProvider {
       handle.id,
       context,
       this.agentToolPreviewEnabled,
+      { ...(context.deferResultConsumption ? { deferConsumption: context.deferResultConsumption } : {}) },
     );
     context.update(
       completed.status === "completed"
@@ -653,7 +654,7 @@ export class AgentsProvider implements FabricProvider {
             handle.id,
             context,
             this.agentToolPreviewEnabled,
-            main ? { timeoutMs, ...(context.signal ? { signal: context.signal } : {}) } : {},
+            { ...(main ? { timeoutMs, ...(context.signal ? { signal: context.signal } : {}) } : {}), ...(context.deferResultConsumption ? { deferConsumption: context.deferResultConsumption } : {}) },
           );
         } catch (error) {
           // A launch can spend the remaining budget before its first update/wait.
@@ -709,7 +710,7 @@ export class AgentsProvider implements FabricProvider {
           const bound = AbortSignal.timeout(timeoutMs);
           const signal = context.signal ? AbortSignal.any([context.signal, bound]) : bound;
           try {
-            return await this.residency.waitAgent(id, signal);
+            return await this.residency.waitAgent(id, signal, context.deferResultConsumption);
           } catch (error) {
             if (!bound.aborted || context.signal?.aborted) throw error;
             if (main) return atBound(this.residency.statusAgent(id));
@@ -728,7 +729,7 @@ export class AgentsProvider implements FabricProvider {
             id,
             context,
             this.agentToolPreviewEnabled,
-            { timeoutMs, ...(main && context.signal ? { signal: context.signal } : {}) },
+            { timeoutMs, ...(main && context.signal ? { signal: context.signal } : {}), ...(context.deferResultConsumption ? { deferConsumption: context.deferResultConsumption } : {}) },
           );
         } catch (error) {
           if (!main || !(error instanceof AgentWaitBoundError)) throw error;
@@ -746,14 +747,20 @@ export class AgentsProvider implements FabricProvider {
         try {
           const result = this.manager.status(id);
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
-          if (terminalAgentStatuses.has(result.status)) this.manager.markForeground(id);
+          if (terminalAgentStatuses.has(result.status)) {
+            if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
+            else this.manager.markForeground(id);
+          }
           return result;
         } catch (error) {
           if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
         }
         if (this.residency?.hasAgent(id)) {
           const result = this.residency.statusAgent(id);
-          if (terminalAgentStatuses.has(result.status)) this.residency.acknowledgeCompletion(id);
+          if (terminalAgentStatuses.has(result.status)) {
+            if (context.deferResultConsumption) context.deferResultConsumption(() => this.residency!.acknowledgeCompletion(id));
+            else this.residency.acknowledgeCompletion(id);
+          }
           return result;
         }
         const known = this.participants.get(id);
@@ -1048,6 +1055,8 @@ export class AgentsProvider implements FabricProvider {
             timeoutMs: (actor?.timeoutMs ?? this.manager.config.timeoutMs) +
               REMOTE_ASK_ACK_GRACE_MS,
             ...(context.signal ? { signal: context.signal } : {}),
+            routedRemoteHost: participant.remoteHost ?? null,
+            detachOnMainCeiling: isInteractiveMain(context.extensionContext),
           },
         );
       }

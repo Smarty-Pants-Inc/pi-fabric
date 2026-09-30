@@ -18,6 +18,7 @@ import {
   previewResult,
 } from "./action-result.js";
 import { runAbortable, settleWithin, throwIfAborted, throwIfExecutionExpired } from "../async-settlement.js";
+import { ResultConsumption } from "../result-consumption.js";
 import type {
   FabricCapabilityRequirement,
   FabricComponentProviderLease,
@@ -849,6 +850,8 @@ export class ActionRegistry {
     let failureStage: "resolve" | "guard" | "prepare" | "validate" | "approve" | "invoke" = "resolve";
     let audit: FabricCallAudit | undefined;
     let invocationActive = false;
+    const consumption = new ResultConsumption();
+    const deferConsumption = context.deferResultConsumption;
     let endBindingInvocation: (() => Promise<void>) | undefined;
     try {
       const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(
@@ -1066,6 +1069,7 @@ export class ActionRegistry {
           this.#runPlanned(binding, providerActionName, authority, "invoke", catalog.args, {
           ...context,
           nestedToolCallId,
+          deferResultConsumption: consumption.defer,
           update(message) {
             if (!invocationActive) return;
             throwIfExecutionExpired(context);
@@ -1167,6 +1171,7 @@ export class ActionRegistry {
         traceOperation?.succeed(bounded.value, { resultTruncated: bounded.truncated });
       }
       throwIfExecutionExpired(context);
+      consumption.commit(deferConsumption);
       return bounded.value;
     } catch (error) {
       // A late rejection is also publication: do not expose its provider text
@@ -1188,6 +1193,7 @@ export class ActionRegistry {
       throw error;
     } finally {
       invocationActive = false;
+      consumption.abandon();
       if (audit) audit.endedAt ??= Date.now();
       void endBindingInvocation?.().catch(() => undefined);
     }

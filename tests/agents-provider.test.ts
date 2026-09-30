@@ -23,6 +23,7 @@ import type {
   FabricMainAgentTarget,
 } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantSource,
@@ -86,10 +87,13 @@ const setup = (
   members: FabricParticipantInfo[] = [],
   control?: FabricControlPlane,
   options?: {
+    identity?: MeshIdentity;
     switchModel?: FabricMainAgentTarget["switchModel"];
     modelsConfig?: FabricModelsConfig;
     agentsConfig?: Partial<FabricAgentConfig>;
     writeStalled?: () => Error | undefined;
+    onBackgroundComplete?: (result: import("../src/agents/types.js").AgentRunResult) => void;
+    onResultConsumed?: (id: string) => void;
   },
 ) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agents-provider-"));
@@ -103,10 +107,12 @@ const setup = (
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
+      ...(options?.onBackgroundComplete ? { onBackgroundComplete: options.onBackgroundComplete } : {}),
+      ...(options?.onResultConsumed ? { onResultConsumed: options.onResultConsumed } : {}),
     },
   );
   agentManagers.push(agents);
-  const identity: MeshIdentity = {
+  const identity: MeshIdentity = options?.identity ?? {
     id: "session:test",
     name: "main",
     kind: "main",
@@ -225,6 +231,199 @@ const setup = (
 };
 
 // smarty-dev#1439: agents.compact on an actor id pointed nowhere ("Unknown Fabric agent").
+describe("Main remote ASK observation ownership", () => {
+  it.each([
+    ["native", false], ["native", true], ["mesh", false], ["mesh", true],
+  ] as const)("preserves accepted %s owner work at the Main ceiling (queued=%s)", async (route, queued) => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const owner = setup([], [], undefined, { identity: { id: "session:remoteowner", name: "remote owner", kind: "main", sessionId: "remoteowner" } });
+    const actor = await owner.actors.create({ name: "remote survivor", instructions: "Reply.", transport: "process", responseMode: "text", delivery: "followUp", triggerTurn: false });
+    const ownerId = owner.identity.id;
+    const senderIdentity: MeshIdentity = { id: "session:observer", name: "observer", kind: "main" };
+    const senderMesh = route === "mesh" ? new MeshStore(path.join(owner.root, "observer-mesh"), 64 * 1024, 100) : owner.mesh;
+    const ownerControl = new FabricControlPlane(owner.mesh, owner.identity, { enabled: true, hostId: ownerId, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
+    const senderControl = new FabricControlPlane(senderMesh, senderIdentity, {
+      enabled: true, hostId: senderIdentity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000,
+      ...(route === "mesh" ? { readMirroredOwner: () => ({ remoteHost: "remote-machine", expiresAt: Date.now() + 60_000 }) } : {}),
+    });
+    controlPlanes.push(ownerControl, senderControl);
+    ownerControl.start((command, from, signal) => owner.provider.acceptControl(command, from, signal));
+    senderControl.start(() => ({ accepted: false }));
+    let bridge: MeshBridge | undefined;
+    let pumping = true;
+    let pump: Promise<void> | undefined;
+    if (route === "mesh") {
+      for (const [mesh, identity] of [[owner.mesh, owner.identity], [senderMesh, senderIdentity]] as const) {
+        const now = Date.now();
+        await mesh.put({ key: "topology/hosts/" + createHash("sha256").update(identity.id).digest("hex"), identity, value: { format: 1, id: identity.id, rootId: identity.id, identity, startedAt: now, updatedAt: now, expiresAt: now + 60_000 } });
+        await mesh.put({ key: "topology/participants/" + createHash("sha256").update(identity.id).digest("hex"), identity, value: { format: 1, id: identity.id, rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id, kind: "root", name: identity.name, sessionId: identity.id, startedAt: now, updatedAt: now } });
+      }
+      await owner.mesh.put({ key: "topology/participants/" + createHash("sha256").update(actor.id).digest("hex"), identity: owner.identity, value: { format: 1, id: actor.id, rootId: ownerId, ownerHostId: ownerId, ownerIdentityId: ownerId, kind: "actor", name: actor.name, startedAt: Date.now(), updatedAt: Date.now() } });
+      bridge = new MeshBridge({ localName: "observer-machine", remoteName: "remote-machine", local: new StoreBridgeSide(senderMesh, "remote-machine"), remote: new StoreBridgeSide(owner.mesh, "observer-machine"), cursorPath: path.join(owner.root, "bridge.cursor.json"), presenceMs: 60_000 });
+      await bridge.start(); await bridge.syncPresence();
+      expect((bridge.options.local as StoreBridgeSide).holds(ownerId)).toBe(true);
+      const connected = bridge;
+      pump = (async () => { while (pumping) { await connected.step(); await new Promise(resolve => setTimeout(resolve, 20)); } })();
+    }
+    const member: FabricParticipantInfo = { format: 1, id: actor.id, name: actor.name, kind: "actor", rootId: owner.identity.id, ownerHostId: ownerId, ownerIdentityId: owner.identity.id, status: "idle", runner: "pi", transport: "host", capabilities: ["ask", "stop", "actor-bindings"], startedAt: 1, updatedAt: 1, controlProtocol: "v1", local: false, stale: false, ...(route === "mesh" ? { remoteHost: "remote-machine" } : {}) };
+    const sender = setup([], [member], senderControl);
+    const stop = vi.spyOn(owner.agents, "stop");
+    const run = vi.spyOn(owner.agents, "run");
+    try {
+      const first = queued ? owner.actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS").catch(error => error) : undefined;
+      if (queued) await waitFor(() => Boolean(owner.actors.status(actor.id).inFlightRun));
+      const controller = new AbortController();
+      const observation = sender.provider.invoke("ask", { id: actor.id, message: queued ? "accepted queued request" : "LIVE_WITHOUT_PROGRESS" }, {
+        ...context, signal: controller.signal, extensionContext: { ...context.extensionContext, mode: "rpc", sessionManager: { getSessionId: () => "observer" } } as unknown as ExtensionContext,
+      }).catch(error => error);
+      await waitFor(() => queued ? owner.actors.status(actor.id).queued === 1 : Boolean(owner.actors.status(actor.id).inFlightRun));
+      const ceiling = createMainExecutionCeilingError(700);
+      controller.abort(ceiling);
+      const rejection = await observation;
+      await new Promise(resolve => setTimeout(resolve, 80)); // let any destructive cancel reach the real receiver
+      expect(senderMesh.read({ topic: "fabric.control.command", limit: 50 }).filter(event => event.kind === "cancel")).toHaveLength(0);
+      expect(rejection).toBe(ceiling);
+      expect(stop).not.toHaveBeenCalled();
+      if (queued) expect(owner.actors.status(actor.id).queued).toBe(1);
+      else expect(owner.agents.list()[0]).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
+      await first;
+      await waitFor(() => owner.actorDeliveries.length === (queued ? 2 : 1) && owner.actors.status(actor.id).status === "idle", 5_000);
+      expect(owner.actors.messages(actor.id).filter(message => message.direction === "out")).toHaveLength(queued ? 2 : 1);
+      expect(run).toHaveBeenCalledTimes(queued ? 2 : 1);
+      expect(stop).not.toHaveBeenCalled();
+      // Expiry did not revoke owner authority: explicit stop still cancels new accepted work.
+      const stopObservation = new AbortController();
+      const again = sender.provider.invoke("ask", { id: actor.id, message: "HANG" }, { ...context, signal: stopObservation.signal }).catch(error => error);
+      await waitFor(() => Boolean(owner.actors.status(actor.id).inFlightRun));
+      const activationId = owner.actors.status(actor.id).inFlightRun!.id;
+      if (route === "mesh") {
+        // v1 bridges bind ACK targets to Main roots, not actor ids. The command
+        // still reaches the real owner; prove stop via authoritative activation
+        // state, then bound the unsupported actor ACK observation separately.
+        await senderControl.request(ownerId, actor.id, "stop", {}, ownerId, { timeoutMs: 500, routedRemoteHost: "remote-machine" }).catch(error => {
+          expect(error.message).toContain("the outcome is unknown");
+        });
+      } else await sender.provider.stopParticipant(actor.id);
+      stopObservation.abort(new Error("stop observation finished"));
+      await again;
+      expect(stop.mock.calls.filter(([id]) => id === activationId)).toHaveLength(1);
+      expect(owner.actorDeliveries).toHaveLength(queued ? 2 : 1);
+    } finally { pumping = false; await pump; await bridge?.stop(); vi.unstubAllEnvs(); }
+  });
+});
+
+describe("terminal result observation receipts", () => {
+  it.each([["wait", "publication"], ["join", "publication"], ["status", "publication"], ["wait", "progress"], ["join", "progress"], ["wait", "serialization"], ["join", "serialization"], ["status", "serialization"]] as const)("keeps exactly one completion when terminal %s %s crosses the ceiling", async (action, stage) => {
+    const { AgentCompletionInbox } = await import("../src/agents/completion-inbox.js");
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const sendMessage = vi.fn();
+    const inboxContext = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, inboxContext);
+    const consumed = vi.fn((id: string) => inbox.acknowledge(id));
+    const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => inbox.enqueue(result));
+    const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
+    const registry = new ActionRegistry();
+    registry.register(h.provider);
+    const handle = await h.agents.spawn({ task: "receipt test", transport: "process" });
+    h.agents.detachSignal(handle.id);
+    await waitFor(() => completed.mock.calls.length === 1, 5_000);
+    let expired = false;
+    const ceiling = createMainExecutionCeilingError(700);
+    if (stage === "serialization") {
+      const original = h.agents.status.bind(h.agents);
+      vi.spyOn(h.agents, "status").mockImplementation(id => {
+        const result = original(id);
+        const plain = { ...result };
+        Object.defineProperty(result, "toJSON", { value() { expired = true; return plain; } });
+        return result;
+      });
+      if (action !== "status") {
+        const originalWait = h.agents.wait.bind(h.agents);
+        vi.spyOn(h.agents, "wait").mockImplementation(async (...args) => {
+          const result = await originalWait(...args);
+          const plain = { ...result };
+          Object.defineProperty(result, "toJSON", { value() { expired = true; return plain; } });
+          return result;
+        });
+      }
+    }
+    try {
+      await expect(registry.invoke(`agents.${action}`, { id: handle.id }, {
+        ...context, audits: [], maxResultChars: 100_000, async approve() {},
+        checkExecutionBudget() { if (expired) throw ceiling; },
+        activity(event) { if (stage === "progress" && event.type === "metrics") expired = true; },
+        observeInvocation(event) { if (stage === "publication" && event.type === "call_end" && event.success) expired = true; },
+      })).rejects.toBe(ceiling);
+      expect(consumed).not.toHaveBeenCalled();
+      const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
+      boundary(); boundary();
+      expect(sendMessage).toHaveBeenCalledOnce();
+      expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([handle.id]);
+      expect(sendMessage.mock.calls[0]![0].content).toContain("fake worker complete");
+    } finally { inbox.close(); await registry.close(); }
+  });
+});
+
+describe("runtime observation receipts", () => {
+  it.each(["quickjs", "node-process", "monty", "cpython"] as const)("keeps an unread completion after %s rejects result encoding, but not after delivered guest continuation", async backend => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const { AgentCompletionInbox } = await import("../src/agents/completion-inbox.js");
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const sendMessage = vi.fn();
+    const inboxContext = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, inboxContext);
+    const consumed = vi.fn((id: string) => inbox.acknowledge(id));
+    const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => inbox.enqueue(result));
+    const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
+    const registry = new ActionRegistry(); registry.register(h.provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.memoryLimitBytes = 128 * 1024 * 1024;
+    const python = backend === "monty" || backend === "cpython";
+    if (python) { config.executor.kernel = "python"; config.executor.pythonRuntime = backend; }
+    else config.executor.runtime = backend;
+    config.executor.mainMaxTimeoutMs = 5_000;
+    const service = new FabricExecutionService(registry, config);
+    const mainContext = { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "receipt-main" } } as unknown as ExtensionContext;
+    await service.execute({ code: python ? "return 1" : "return 1;", context: mainContext, signal: undefined, parentToolCallId: "receipt-warmup", onPartial() {} });
+    const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
+    try {
+      const handle = await h.agents.spawn({ task: "encoding receipt", transport: "process" });
+      h.agents.detachSignal(handle.id);
+      await waitFor(() => completed.mock.calls.length === 1, 5_000);
+      const invoke = registry.invoke.bind(registry);
+      const encoding = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, callContext) => {
+        const value = await invoke(ref, args, callContext);
+        // Cross the remaining budget at the runtime's actual encoding seam,
+        // after registry admission but before guest promise/frame publication.
+        Object.defineProperty(value, "text", { enumerable: true, get() {
+          while (Date.now() <= callContext.mainDeadlineAt! + 25) { /* serialization overrun */ }
+          return "rejected encoding";
+        } });
+        return value;
+      });
+      config.executor.mainMaxTimeoutMs = 1_000;
+      const rejected = await service.execute({ code: python ? `return await agents.wait(id=${JSON.stringify(handle.id)})` : `return await agents.wait({ id: ${JSON.stringify(handle.id)} });`, context: mainContext, signal: undefined, parentToolCallId: "receipt-encoding", onPartial() {} });
+      encoding.mockRestore();
+      expect(rejected.error).toMatch(/MainExecutionCeilingError/);
+      expect(consumed).not.toHaveBeenCalled();
+      boundary(); boundary();
+      expect(sendMessage).toHaveBeenCalledOnce();
+      expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([handle.id]);
+      // A result admitted to the guest is consumed even if later guest code
+      // spends the ceiling. Deferring all receipts until program success is wrong.
+      const delivered = await h.agents.spawn({ task: "delivered receipt", transport: "process" });
+      h.agents.detachSignal(delivered.id);
+      await waitFor(() => completed.mock.calls.length === 2, 5_000);
+      const observed = await service.execute({ code: python ? `result = await agents.wait(id=${JSON.stringify(delivered.id)})\nwhile True:\n    pass` : `const result = await agents.wait({ id: ${JSON.stringify(delivered.id)} }); while (true) {}`, context: mainContext, signal: undefined, parentToolCallId: "receipt-delivered", onPartial() {} });
+      expect(observed.error).toMatch(/MainExecutionCeilingError/);
+      expect(consumed).toHaveBeenCalledExactlyOnceWith(delivered.id);
+      boundary(); boundary();
+      expect(sendMessage).toHaveBeenCalledOnce();
+    } finally { inbox.close(); await registry.close(); vi.unstubAllEnvs(); }
+  });
+});
+
 describe("AgentsProvider actor session reset", () => {
   it("answers agents.compact on an actor id with a pointer to resetSession, and routes resetSession", async () => {
     const { provider, actors } = setup();
@@ -2293,7 +2492,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/one-off", thinking: "xhigh" },
       }),
       "identity:owner",
-      { timeoutMs: 2 * 60 * 60 * 1_000 + 30_000 },
+      { timeoutMs: 2 * 60 * 60 * 1_000 + 30_000, routedRemoteHost: null, detachOnMainCeiling: false },
     );
 
     await expect(
@@ -2390,7 +2589,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "ask",
       { message: "PING" },
       "identity:resident",
-      { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000 },
+      { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000, routedRemoteHost: null, detachOnMainCeiling: false },
     );
 
     await provider.invoke("tell", {

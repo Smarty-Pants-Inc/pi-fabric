@@ -26,10 +26,17 @@ describe("execution deadline under microtask starvation", () => {
     const registry = new ActionRegistry();
     let calls = 0;
     let lastCallAt = 0;
+    let coldDispatch = true;
     const descriptor = { name: main ? "wait" : "done", description: "immediate result", inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const };
     registry.register({
       name: main ? "agents" : "demo", description: "immediate provider",
-      async list() { return [descriptor]; }, async describe() { return descriptor; },
+      async list() { return [descriptor]; },
+      async describe() {
+        // Deterministically model the first-dispatch initialization cost seen in
+        // both CI jobs. prewarm alone does not visit actual provider dispatch.
+        if (coldDispatch) { coldDispatch = false; busyUntil(Date.now() + boundMs + 50); }
+        return descriptor;
+      },
       async invoke() {
         calls++; lastCallAt = performance.now();
         // Each already-resolved call does modest synchronous work: too few guest
@@ -44,6 +51,20 @@ describe("execution deadline under microtask starvation", () => {
     const context = { cwd: process.cwd(), mode: main ? "rpc" : "print", sessionManager: { getSessionId: () => "deadline-test" } } as unknown as ExtensionContext;
     const service = new FabricExecutionService(registry, config);
     await service.prewarm(context);
+    // Initialize the actual descriptor/provider/bridge path under a separate
+    // setup budget. Do not charge cold dispatch to the starvation measurement.
+    config.executor.timeoutMs = 5_000;
+    config.executor.mainMaxTimeoutMs = 5_000;
+    const initialized = await service.execute({
+      code: `${call} return "initialized";`, context, signal: undefined,
+      parentToolCallId: "starvation-setup", onPartial() {},
+    });
+    expect(initialized.success).toBe(true);
+    expect(initialized.value).toBe("initialized");
+    if (!call.includes("tools.providers")) expect(calls).toBe(1);
+    calls = 0; lastCallAt = 0;
+    config.executor.timeoutMs = main ? 500 : boundMs;
+    config.executor.mainMaxTimeoutMs = boundMs;
     const began = performance.now();
     try {
       const result = await service.execute({

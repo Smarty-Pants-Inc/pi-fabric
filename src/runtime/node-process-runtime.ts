@@ -214,18 +214,25 @@ export class NodeProcessRuntime {
           hostCall(message.ref, message.args, hostAbortController.signal),
         ).then(
           (value) => {
+            if (settled || finishing || !child.connected) return;
             if (executionDeadline.reached) { expireDeadline(); return; }
-            send(child, { type: "response", id: message.id, ok: true, value });
+            // Serialize before admission: getters/toJSON can spend the remaining
+            // budget, and must not acknowledge an undelivered observation.
+            const response = JSON.parse(JSON.stringify({ type: "response", id: message.id, ok: true, value }));
+            if (executionDeadline.reached) { expireDeadline(); return; }
+            send(child, response);
+            options.onHostResultDelivered?.(message.args);
           },
-          (error) =>
-            send(child, {
+        ).catch((error) => {
+          if (executionDeadline.reached) { expireDeadline(); return; }
+          send(child, {
               type: "response",
               id: message.id,
               ok: false,
               error: error instanceof Error ? error.message : String(error),
               bashExit: isPiShellRef(message.ref) ? piBashExitMetadata(error) : undefined,
-            }),
-        );
+            });
+        });
         hostTasks.add(task);
         void task.finally(() => hostTasks.delete(task));
       });

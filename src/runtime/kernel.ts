@@ -35,6 +35,8 @@ export interface FabricSandboxOptions {
   tokenBudget?: number;
   signal?: AbortSignal;
   cwd?: string;
+  /** Host-only receipt callback after serialization and final deadline admission. */
+  onHostResultDelivered?(args: Record<string, unknown>): void;
   minimumTimeoutMsForHostCall?(
     ref: string,
     args: Record<string, unknown>,

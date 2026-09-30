@@ -1027,6 +1027,7 @@ export class QuickJsRuntime {
               if (deadlineReached()) { handle.dispose(); expireDeadline(); return; }
               promise.resolve(handle);
               handle.dispose();
+              options.onHostResultDelivered?.(args);
             })
             .catch((error) => {
               if (closing || promise.alive === false) return;

@@ -235,7 +235,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         void finish(executionDeadline.timeoutResult([]));
       };
       const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
-      const send = (message: unknown): void => {
+      const send = (message: unknown, delivered?: () => void): void => {
         // A terminal guest result closes its reply channel while issued host
         // work may still be settling. Its late replies are no longer consumed.
         if (settled || finishing || !channel || channel.destroyed) return;
@@ -249,6 +249,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
           }
           if (executionDeadline.reached) { expireDeadline(); return; }
           channel.write(frame, (error) => { if (error) failPipe(`CPython IPC failed: ${error.message}`); });
+          delivered?.();
         } catch (error) { fail(`CPython IPC serialization failed: ${errorText(error)}`); }
       };
       const handleMessage = (message: unknown): void => {
@@ -294,7 +295,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         } catch (error) { fail(`CPython deadline policy failed: ${errorText(error)}`); return; }
         if (executionDeadline.reached) { expireDeadline(); return; }
         const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal)).then(
-          (value) => send({ type: "response", id, ok: true, value }),
+          (value) => send({ type: "response", id, ok: true, value }, () => options.onHostResultDelivered?.(args)),
           (error) => send({ type: "response", id, ok: false, error: errorText(error), ...(isPiShellRef(ref) ? { bashExit: piBashExitMetadata(error) } : {}) }),
         ).finally(() => { hostTasks.delete(task); callIds.delete(id); });
         hostTasks.add(task);

@@ -25,6 +25,7 @@ export const createRunningRecord = (
 ): AgentRunRecord => ({
   id: options.id,
   name: options.name,
+  ...(options.spawner ? { spawner: options.spawner } : {}),
   task,
   status: "running",
   runner: options.runner,

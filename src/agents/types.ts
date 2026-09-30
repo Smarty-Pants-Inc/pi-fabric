@@ -40,6 +40,13 @@ export interface AgentSessionSeed {
   outerToolResult: AgentToolResultMessage;
 }
 
+export interface AgentSpawner {
+  id: string;
+  kind: "main" | "agent" | "actor";
+  /** The activation that spawned the child; actor identity survives that run ending. */
+  runId?: string;
+}
+
 export interface AgentRunRequest {
   task: string;
   images?: ImageContent[];
@@ -117,6 +124,8 @@ export interface AgentCompactionStatus {
 }
 
 export interface AgentRunRecord {
+  /** Immediate caller, distinct from the lineage Main. */
+  spawner?: AgentSpawner;
   /** Requested launch model; model below follows verified state/assistant attribution. */
   requestedModel?: string;
   id: string;
@@ -169,6 +178,7 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  spawner?: AgentSpawner;
   id: string;
   name: string;
   status: AgentRunStatus;
@@ -216,6 +226,7 @@ export interface AgentWorkerOptions {
   depth: number;
   fullCodeMode: boolean;
   mainAgentId?: string;
+  spawner?: AgentSpawner;
   fabricSessionId?: string;
   extensions: boolean;
   tools: string[];

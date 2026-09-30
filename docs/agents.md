@@ -34,6 +34,24 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results: Fabric does not start a turn to deliver them, and they join Main's next turn, whatever starts it (typed input, a peer message or another trigger). Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
 
+### Actor children and reply targets
+
+A child's immediate spawner is distinct from its lineage root. `agents.spawner()` returns `{ id, kind, runId? }`; `agents.followUp({ id: "spawner", message })` and `agents.steer` accept that bound target. Inside an actor-spawned task, it names the actor and its spawning activation run, not the implementing lead's Main. `agents.main()` / `id: "main"` still deliberately address the root Main. An absent spawner binding fails rather than falling back to the root; old workers must be respawned to get the new binding.
+
+Automatic completion goes to the spawning actor's live run inbox. If that activation ends before consumption, a write-ahead result is transferred once to that actor's persisted mailbox for its next activation. Wait/status or live-inbox delivery records a receipt and suppresses a later mailbox copy. The mailbox envelope includes `data.resultFile`, an actor-local JSON file containing the full result (including structured value), so a later activation can read more than the bounded notification. Stopped actors retain unread results with their session; Fabric never silently delivers them to Main as Main-owned children. A session-owned child still stops when its spawning worker shuts down; that stopped outcome is preserved, not a promise that the child survives shutdown.
+
+**Review-role mitigation for older installations:** for bounded subtasks, keep the result in the same `fabric_exec` program and wait before deciding the verdict:
+
+```ts
+const result = await agents.run({
+  task: "Review this bounded part of the diff; return your findings. Do not message Main.",
+  transport: "process",
+});
+return result;
+```
+
+`agents.run` includes the wait; alternatively `spawn` followed by `await agents.wait({ id: child.id })` in the same program acknowledges the result. Inspect its terminal status/error and do not declare review complete if the wait or program deadline expired. On updated workers, addressed progress can use `id: "spawner"`; no `fabric_reply` action is required for ordinary task-agent final results. Do not substitute `id: "main"` for an actor reply target.
+
 ### Stalled Pi error recovery
 
 After a failed or aborted assistant response (including `Error: Terminated`), Fabric allows Pi's own retries to recover. If no recovery output arrives for 60 seconds, the worker fails the run with the original error and terminates the child, escalating from SIGTERM to SIGKILL after another 5 seconds. Repeated retry announcements, errors, or lifecycle events do not extend this deadline. Nonempty text/thinking/tool-call deltas refresh it; a successful assistant response clears it. Healthy inference and tool execution are not subject to this recovery timer, and the overall run deadline still applies.

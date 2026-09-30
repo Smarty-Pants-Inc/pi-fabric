@@ -1,3 +1,4 @@
+import { boundAgentSpawner } from "../agents/spawner.js";
 import type { AgentManager } from "../agents/manager.js";
 import type { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js";
@@ -59,6 +60,7 @@ export class AgentMessageRouter {
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown">,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
+    readonly spawner = boundAgentSpawner(),
   ) {}
   #recentlyLapsedRoot(id: string): FabricParticipantInfo | undefined {
     // A write-stalled mesh explains the lapse, and delivery needs the mesh: report the stall.
@@ -119,6 +121,10 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    if (id === "spawner") {
+      if (!this.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
+      id = this.spawner.id;
+    }
     id = this.#sessionTarget(id);
     const isMain = this.mainAgent.matches(id);
     const remoteRoot = isMain ? undefined : this.participants.get(id) ?? this.#recentlyLapsedRoot(id);

@@ -498,6 +498,7 @@ globalThis.agents = Object.freeze({
   members: (args = {}) => __call("agents.members", args),
   self: () => __call("agents.self", {}),
   main: () => __call("agents.main", {}),
+  spawner: () => __call("agents.spawner", {}),
   sessions: () => __call("agents.sessions", {}),
   peers: () => __call("agents.peers", {}),
   projectAgent: () => __call("agents.projectAgent", {}),

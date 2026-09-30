@@ -41,7 +41,9 @@ import { ProcessTransport } from "./transports/process-transport.js";
 import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
+import { resolveAgentSpawner } from "./spawner.js";
 import type {
+  AgentSpawner,
   FabricBudgetSummary,
   FabricSteeringMode,
   FabricAgentLog,
@@ -285,6 +287,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   thinking?: AgentRunRequest["thinking"];
   actorId?: string;
   actorName?: string;
+  spawner?: AgentSpawner;
   capabilityRequirements?: string[];
   capabilityDigest?: string;
   runnerSessionId?: string;
@@ -511,6 +514,7 @@ const failedRecord = (
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
     ...(managed.actorId ? { actorId: managed.actorId } : {}),
     ...(managed.actorName ? { actorName: managed.actorName } : {}),
+    ...(managed.spawner ? { spawner: managed.spawner } : {}),
     ...(managed.runnerSessionId ? { runnerSessionId: managed.runnerSessionId } : {}),
     ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
     ...(managed.transport.attachCommand ? { attachCommand: managed.transport.attachCommand } : {}),
@@ -564,6 +568,7 @@ export class AgentManager {
   readonly #kernel: () => FabricKernel;
   readonly #pythonRuntime: () => FabricPythonRuntime;
   readonly #mainAgentId: string | undefined;
+  readonly #spawner: AgentSpawner | undefined;
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   readonly #projectRoot: string;
@@ -675,6 +680,7 @@ export class AgentManager {
       options.projectRoot ?? process.env.PI_FABRIC_PROJECT_ROOT ?? cwd;
     this.#hostId = options.hostId ?? process.env.PI_FABRIC_HOST_ID;
     this.#identityId = options.identityId ?? process.env.PI_FABRIC_IDENTITY_ID;
+    this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
     const inheritedBudget = activeBudgetState();
     this.#budget =
       inheritedBudget ??
@@ -952,7 +958,12 @@ export class AgentManager {
       const componentGuidance = recursive
         ? undefined
         : this.#resolveParticipantGuidance?.({ ...(model ? { model } : {}), runner })?.trim();
-      const systemPrompt = [request.systemPrompt?.trim(), componentGuidance]
+      const spawnerGuidance = runner === "pi" && extensions && this.#spawner && this.#spawner.kind !== "main"
+        ? `Your immediate Fabric spawner is ${this.#spawner.kind} ${this.#spawner.id}${this.#spawner.runId ? ` (run ${this.#spawner.runId})` : ""}. ` +
+          "Your final result is returned to that spawner automatically. For addressed updates use agents.followUp({id:'spawner',message:'...'}); " +
+          "agents.spawner() discovers this binding. The 'main' target is the lineage root, NOT an actor spawner."
+        : undefined;
+      const systemPrompt = [request.systemPrompt?.trim(), componentGuidance, spawnerGuidance]
         .filter((section): section is string => Boolean(section))
         .join("\n\n") || undefined;
       const sessionExportDir = resolveSessionExportDir(this.config);
@@ -996,6 +1007,8 @@ export class AgentManager {
         "--full-code-mode",
         String(inheritedFullCodeMode),
         ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
+        ...(this.#spawner ? ["--spawner-id", this.#spawner.id, "--spawner-kind", this.#spawner.kind,
+          ...(this.#spawner.runId ? ["--spawner-run", this.#spawner.runId] : [])] : []),
         ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
         "--extensions",
         String(extensions),
@@ -1089,6 +1102,7 @@ export class AgentManager {
         ...(thinking ? { thinking } : {}),
         ...(request.actorId ? { actorId: request.actorId } : {}),
         ...(request.actorName ? { actorName: request.actorName } : {}),
+        ...(this.#spawner ? { spawner: this.#spawner } : {}),
         ...(request.capabilityRequirements
           ? { capabilityRequirements: [...request.capabilityRequirements] }
           : {}),
@@ -2236,6 +2250,7 @@ export class AgentManager {
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),
+      ...(managed.spawner ? { spawner: managed.spawner } : {}),
       ...(managed.capabilityRequirements
         ? { capabilityRequirements: [...managed.capabilityRequirements] }
         : {}),
@@ -2298,6 +2313,7 @@ export class AgentManager {
       ...(thinking ? { thinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),
+      ...(managed.spawner ? { spawner: managed.spawner } : {}),
       ...(managed.capabilityRequirements
         ? { capabilityRequirements: [...managed.capabilityRequirements] }
         : {}),

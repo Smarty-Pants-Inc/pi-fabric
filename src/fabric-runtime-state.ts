@@ -128,6 +128,8 @@ import {
 import { participantProject, participantRole } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
+import { ActorChildCompletionStore } from "./actors/child-completions.js";
+import { resolveAgentSpawner } from "./agents/spawner.js";
 import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
@@ -674,6 +676,9 @@ export class FabricRuntimeState {
     };
     const completionInbox = new AgentCompletionInbox(this.pi, context);
     this.#completionInbox = completionInbox;
+    const actorSpawner = identity.kind === "actor" ? resolveAgentSpawner(identity.id, mainAgentId) : undefined;
+    const actorSessionFile = process.env.PI_FABRIC_ACTOR_SESSION_FILE?.trim() || context.sessionManager.getSessionFile?.();
+    const actorChildStore = actorSpawner && actorSessionFile ? new ActorChildCompletionStore(actorSessionFile) : undefined;
     let markStoppedDelivered = (_id: string): void => {};
     this.#agents = new AgentManager(context.cwd, agentConfig, {
       fullCodeMode: this.#config.fullCodeMode,
@@ -730,12 +735,20 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publish(event).catch(() => undefined);
       },
-      onBackgroundComplete: (result) => completionInbox.enqueue(result),
+      onBackgroundComplete: (result) => {
+        if (actorChildStore && actorSpawner) actorChildStore.enqueue(result, actorSpawner);
+        completionInbox.enqueue(result, actorChildStore ? () => actorChildStore.acknowledge(result.id) : undefined);
+      },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);
+        actorChildStore?.acknowledge(id);
         markStoppedDelivered(id);
       },
       onStoppedAtClose: (results) => {
+        if (actorChildStore && actorSpawner) {
+          for (const result of results) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
+          return;
+        }
         rememberStoppedAtClose(sessionId, results);
         this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results });
       },

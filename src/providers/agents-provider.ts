@@ -801,6 +801,9 @@ export class AgentsProvider implements FabricProvider {
         return this.participants.self();
       case "main":
         return this.mainAgent.info(context.extensionContext);
+      case "spawner":
+        if (!this.#router.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
+        return structuredClone(this.#router.spawner);
       case "sessions": {
         const stalled = this.participants.writeStalled?.();
         if (stalled) throw stalled;

@@ -21,6 +21,7 @@ import type { FabricParticipantResidency } from "../topology/types.js";
 import { AgentManager } from "../agents/manager.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readJsonlPage } from "../log-tail.js";
+import { ActorChildCompletionStore } from "./child-completions.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
@@ -470,6 +471,7 @@ export class ActorManager {
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
         // Preserve deferred events while halted; fencing remains manager-owned.
+        if (!this.#halted) this.#reconcileChildCompletions();
         return !this.#halted;
       },
       onEvent: (event) => {
@@ -1885,6 +1887,37 @@ export class ActorManager {
     fs.rmSync(this.#actorRoot, { recursive: true, force: true });
   }
 
+  // Once its spawning activation ends, an unread child result belongs to the
+  // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
+  #reconcileChildCompletions(): void {
+    if (!this.#persistent || this.#closing) return;
+    for (const actor of this.#actors.values()) {
+      if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
+      const store = new ActorChildCompletionStore(actor.sessionFile);
+      for (const { spawner, result } of store.pending()) {
+        if (spawner.id !== actor.id || (spawner.runId && actor.inFlightRun?.id === spawner.runId)) continue;
+        try {
+          const id = result.id;
+          const existing = [this.#inFlight.get(actor.id), ...actor.queue,
+            ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
+            .some((item) => item?.id === id);
+          if (!existing) {
+            this.#enqueue(actor, "child-completion", {
+              message: `Unread child agent ${result.name} (${id}) ${result.status}:\n${[result.error, result.text].filter(Boolean).join("\n") || "no result"}`,
+              data: { spawner, result, resultFile: store.resultFile(id) },
+            }, { id, deferDrain: true, holdWhenFull: true, ownershipChecked: true });
+          }
+          // Queue write first, receipt second, drain last. A retry between the first
+          // two finds the same deterministic item, including after an owner restart.
+          if (this.#persistQueue(actor.id, true)) {
+            store.acknowledge(id);
+            this.#ensureDrain(actor);
+          }
+        } catch { /* The actor-addressed file stays pending for the next owner poll. */ }
+      }
+    }
+  }
+
   #enqueue(
     actor: ManagedActor,
     source: string,
@@ -1897,6 +1930,9 @@ export class ActorManager {
       ownershipChecked?: boolean;
       /** A full queue and overflow reject the item instead of recording it dropped. */
       holdWhenFull?: boolean;
+      /** Host-owned deterministic child completion id and write-ahead handoff. */
+      id?: string;
+      deferDrain?: boolean;
     } = {},
   ): ActorQueueItem {
     const canManage = options.ownershipChecked
@@ -1947,7 +1983,7 @@ export class ActorManager {
         `Fabric actor queue limit reached for ${actor.name} (${this.meshConfig.actorQueueLimit})`,
       );
     }
-    const itemId = randomUUID();
+    const itemId = options.id ?? randomUUID();
     const item: ActorQueueItem = {
       id: itemId,
       source,
@@ -1991,7 +2027,7 @@ export class ActorManager {
       data: structuredClone(payload),
     });
     void this.#publishPresence(actor).catch(() => undefined);
-    this.#ensureDrain(actor);
+    if (!options.deferDrain) this.#ensureDrain(actor);
     return item;
   }
 
@@ -2036,6 +2072,12 @@ export class ActorManager {
         const reset = this.#resetAtBoundary(actor);
         if (reset) await reset;
         if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing) break;
+        // A persisted completion cannot run before its handoff receipt commits.
+        // If receipt I/O failed, even an unrelated new message must not drain it;
+        // the next poll retries the same queued id before opening this gate.
+        const head = actor.queue[0];
+        if (head?.source === "child-completion" &&
+          !new ActorChildCompletionStore(actor.sessionFile).received(head.id)) break;
         const item = actor.queue.shift();
         this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
@@ -2684,6 +2726,8 @@ export class ActorManager {
   }
 
   #recordMessage(actor: ManagedActor, message: FabricActorMessage): void {
+    if (message.source === "child-completion" && message.direction === "in" &&
+      actor.messages.some((known) => known.id === message.id && known.direction === "in")) return;
     this.#logs.recordMessage(actor.messages, message);
   }
 
@@ -3140,7 +3184,7 @@ export class ActorManager {
 
   // Returns whether this lineage's file now holds the actor's work. Only then are the predecessor
   // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
-  #persistQueue(actorId: string): boolean {
+  #persistQueue(actorId: string, durable = false): boolean {
     if (!this.#persistent || this.#closing) return false;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
@@ -3171,7 +3215,7 @@ export class ActorManager {
         writeJsonAtomic(file, {
           format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
           mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
-        });
+        }, { durable });
       }
     } catch {
       return false;                                         // best-effort; memory still runs the work

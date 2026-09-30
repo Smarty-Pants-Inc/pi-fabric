@@ -426,6 +426,12 @@ const main = async (): Promise<void> => {
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
   const childEnvironment = { ...process.env };
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
+  // A task child has its own identity and reply contract, not its actor parent's.
+  for (const key of ["PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ACTOR_SESSION_FILE",
+    "PI_FABRIC_REPLY_SCHEMA_FILE", "PI_FABRIC_REPLY_FILE", "PI_FABRIC_REPLY_HOOK",
+    "PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN"]) {
+    delete childEnvironment[key];
+  }
   if (options.actorId && options.bashTimeoutSeconds !== undefined &&
     Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
     childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S = String(options.bashTimeoutSeconds);
@@ -452,6 +458,11 @@ const main = async (): Promise<void> => {
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
       PI_FABRIC_AGENT_NAME: options.name,
+      ...(options.spawner ? {
+        PI_FABRIC_SPAWNER_ID: options.spawner.id,
+        PI_FABRIC_SPAWNER_KIND: options.spawner.kind,
+        PI_FABRIC_SPAWNER_RUN: options.spawner.runId ?? "",
+      } : {}),
       ...(options.mainAgentId ? { PI_FABRIC_MAIN_AGENT_ID: options.mainAgentId } : {}),
       ...(options.fabricSessionId ? { PI_FABRIC_SESSION_ID: options.fabricSessionId } : {}),
       PI_FABRIC_GRANTED_RISKS: options.grantedRisks.join(","),
@@ -469,6 +480,7 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.actorId ? { PI_FABRIC_ACTOR_ID: options.actorId } : {}),
       ...(options.actorName ? { PI_FABRIC_ACTOR_NAME: options.actorName } : {}),
+      ...(options.actorId && options.sessionFile ? { PI_FABRIC_ACTOR_SESSION_FILE: options.sessionFile } : {}),
       PI_FABRIC_CAPABILITY_REQUIREMENTS: JSON.stringify(
         options.capabilityRequirements ?? [],
       ),

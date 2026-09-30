@@ -243,6 +243,8 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  /** Immediate spawning participant, distinct from rootId. */
+  spawner?: { id: string; kind: "main" | "agent" | "actor"; runId?: string };
   /** Resolved Fabric kernel, absent for non-Fabric runners. */
   kernel?: FabricKernel;
   id: string;
@@ -824,6 +826,8 @@ interface FabricAgentsApi {
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
   self(): Promise<FabricParticipantInfo>;
   main(): Promise<FabricMainAgentInfo>;
+  /** Immediate spawning participant; main is the root, not an actor spawner. Address it with id: "spawner". */
+  spawner(): Promise<{ id: string; kind: "main" | "agent" | "actor"; runId?: string }>;
   sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
   /** The live project agent for this session's project (role project-agent, same git common checkout). */

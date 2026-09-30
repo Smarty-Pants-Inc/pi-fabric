@@ -1367,7 +1367,7 @@ describe("AgentManager", () => {
     });
   });
 
-  it("marks ordinary process children as task agents without replacing actor identity (smarty-dev#2088)", async () => {
+  it("marks ordinary children as task agents while preserving explicitly launched actor identity (#2088, #2643)", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
@@ -1400,12 +1400,12 @@ describe("AgentManager", () => {
       expect(await report("security-review")).toEqual({
         role: null, actorName: "security-review", fabricRole: null,
       });
-      // These inherited identities are deliberately unchanged: the governor prioritizes actors,
-      // and participantRole prioritizes PI_FABRIC_ROLE over SMARTY_ROLE.
+      // A task must not impersonate its spawning actor (#2643). Explicit actor launches
+      // above keep their own identity; the separate project-role metadata stays inherited.
       vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
       vi.stubEnv("PI_FABRIC_ROLE", "project-agent");
       expect(await report()).toEqual({
-        role: "task-agent", actorName: "parent-actor", fabricRole: "project-agent",
+        role: "task-agent", actorName: null, fabricRole: "project-agent",
       });
     } finally {
       vi.unstubAllEnvs();

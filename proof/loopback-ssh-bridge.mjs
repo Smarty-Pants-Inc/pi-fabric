@@ -107,15 +107,34 @@ const assertNative = (message, needle, customType, id, sender, delivery) => {
   }
   return { customType, id, sender, content, details: message.details };
 };
-const assertLapse = (turn, target, host, boundS = 180) => {
-  const attempts = turn?.value;
-  assert(Array.isArray(attempts) && attempts.length > 0, "missing post-kill attempts");
-  const last = attempts.at(-1);
-  assert(typeof last.error === "string" && last.error.includes(`Unknown Fabric participant: ${target}`) &&
-    last.error.includes(`lease mirrored from remote host ${host} lapsed`) && last.error.includes("mesh bridge") &&
-    Number.isFinite(last.sAfterKill) && Number.isFinite(last.ms) && last.ms >= 0 && last.sAfterKill >= 0 && last.sAfterKill + last.ms / 1000 <= boundS,
-  `missing/beyond-bound named ${host} lease-lapsed error for ${target}`);
+// BEGIN FIRST SEND VALIDATOR — inert probes extract this production predicate.
+const assertFirstSend = (attempts, target, host, killedAt, boundMs = 10_000) => {
+  const fail = (message) => { throw new Error(`FIRST postkill send to ${target} on ${host}: ${message}`); };
+  if (!Array.isArray(attempts) || !attempts.length) fail("missing first attempt");
+  const first = attempts[0]; // A later named lapse can never rescue this attempt.
+  if (!first || Object.hasOwn(first, "delivered") || Object.hasOwn(first, "accepted") || typeof first.error !== "string") fail("accepted/delivered or missing native failure");
+  const { requestAt, nativeStartedAt, nativeCompletedAt, completedAt, nativeMs } = first;
+  if (![killedAt, requestAt, nativeStartedAt, nativeCompletedAt, completedAt, nativeMs, boundMs].every(Number.isFinite) ||
+      boundMs !== 10_000 || requestAt < killedAt || completedAt < requestAt || nativeCompletedAt < nativeStartedAt ||
+      nativeMs !== nativeCompletedAt - nativeStartedAt || nativeMs > boundMs)
+    fail("missing/invalid timing or native operation over 10000ms");
+  const error = first.error;
+  // Trust only the full native router clause, never a target prefix or appended diagnostic.
+  const preSendPrefix = `Unknown Fabric participant: ${target} (its lease mirrored from remote host ${host} lapsed`;
+  const remainder = error.slice(preSendPrefix.length);
+  const clause = /^(?: (\d+) s ago)?: the mesh bridge to that host is down, or the session has ended\)$/.exec(remainder);
+  const preSend = error.startsWith(preSendPrefix) && clause !== null && clause[0] === remainder &&
+    (clause[1] === undefined || Number.isFinite(Number(clause[1])));
+  const pending = error.startsWith(`Fabric lease mirrored from remote host ${host} lapsed for ${target};`) && error.includes("mesh bridge");
+  const deadline = error.startsWith(`Fabric mesh bridge to remote host ${host} is not responding for ${target};`);
+  if (!preSend && !pending && !deadline) fail("unnamed or wrong host/target bridge condition");
+  if ((pending || deadline) && !error.includes("the outcome is unknown")) fail("pending/deadline failure lacks unknown-outcome warning");
+  return { condition: preSend ? "pre-send-lapsed" : pending ? "pending-lapsed" : "ack-deadline",
+    nativeTimestampDomain: "native-execution-host-local", nativeStartedAt, nativeCompletedAt, nativeMs,
+    driverTimestampDomain: "local-driver", requestAfterKillMs: requestAt - killedAt,
+    completionAfterKillMs: completedAt - killedAt, rpcModelDurationMs: completedAt - requestAt };
 };
+// END FIRST SEND VALIDATOR
 const assertNoSurvivors = (processes) => { assert(Object.keys(processes).length === 2 && Object.values(processes).every((v) => v === "none"), "bridge/SSH transport survivors"); };
 // END LOOPBACK VALIDATORS
 
@@ -488,7 +507,7 @@ log("forge read pr.wake", JSON.stringify(readWake));
 save();
 
 // 4. Kill the bridge (SIGKILL: no clean withdrawal). Both Mains then try to reach the other side,
-// once a second, and record every attempt with its duration until the named lapse error.
+// exactly once per direction. A later named lapse must never rescue the first send.
 control.gate();
 ownedMembers(sshdOwner);
 ownedMembers(bridgeOwner);
@@ -496,11 +515,31 @@ assert(processIdentity(bridge.pid)?.tick === bridgeOwner.identity.tick, "bridge 
 assert(bridge.kill("SIGKILL"), "bridge SIGKILL failed");
 const killedAt = Date.now();
 results.bridgeKilledAt = new Date(killedAt).toISOString();
-const probe = (target) => run(
-  `const killedAt = ${killedAt};\nconst attempts = [];\nfor (let i = 0; i < 60 && Date.now() - killedAt < 150_000; i++) {\n  const t = Date.now();\n  try { const r = await agents.steer(${JSON.stringify(target)}, "after the bridge died"); attempts.push({ sAfterKill: (t - killedAt) / 1000, ms: Date.now() - t, delivered: r }); }\n  catch (error) { const message = String(error?.message ?? error); attempts.push({ sAfterKill: (t - killedAt) / 1000, ms: Date.now() - t, error: message }); if (/lapsed/.test(message)) break; }\n  await new Promise((r) => setTimeout(r, 1000));\n}\nreturn attempts;`);
-const after = await Promise.allSettled([piA.prompt(probe(rootB.id), 180_000), piB.prompt(probe(rootA.id), 180_000)]);
+const firstSendProbe = async (pi, target) => {
+  const requestAt = Date.now();
+  // No retry or pre-send discovery. Native timing excludes idle/model/settlement overhead.
+  const turn = await pi.prompt(run(
+    `const nativeStartedAt = Date.now(); let outcome; try { outcome = { delivered: await agents.steer(${JSON.stringify(target)}, "after bridge SIGKILL; remote owner may be unavailable") }; } catch (error) { outcome = { error: String(error?.message ?? error) }; } const nativeCompletedAt = Date.now(); return { nativeStartedAt, nativeCompletedAt, nativeMs: nativeCompletedAt - nativeStartedAt, ...outcome };`), 180_000);
+  const completedAt = Date.now();
+  return { ...turn, value: [{ ...turn.value, nativeTimestampDomain: "native-execution-host-local",
+    driverTimestampDomain: "local-driver", requestAt, completedAt, requestAfterKillMs: requestAt - killedAt,
+    completionAfterKillMs: completedAt - killedAt, rpcModelDurationMs: completedAt - requestAt }] };
+};
+const after = await Promise.allSettled([firstSendProbe(piA, rootB.id), firstSendProbe(piB, rootA.id)]);
 results.afterKill = Object.fromEntries(after.map((entry, i) => [["dev1ToForge", "forgeToDev1"][i], entry.status === "fulfilled" ? entry.value : { error: String(entry.reason?.stack ?? entry.reason) }]));
 save(); saveAfterKill();
+assert(after.every((entry) => entry.status === "fulfilled"), "required first post-kill prompt failed");
+results.firstPostkillSends = {
+  dev1ToForge: assertFirstSend(results.afterKill.dev1ToForge.value, rootB.id, "forge", killedAt),
+  forgeToDev1: assertFirstSend(results.afterKill.forgeToDev1.value, rootA.id, "dev1", killedAt),
+};
+save(); saveAfterKill();
+// The original roots must still work; do not replace them after transport loss.
+results.nativeMainPeersAfterDeath = await Promise.all([[piA, rootA.id, rootB.id], [piB, rootB.id, rootA.id]].map(async ([pi, ownId, target]) => {
+  const turn = await pi.prompt(run(`const main = await agents.main(); const peers = await agents.peers(); return { main: { id: main.id, local: main.local }, ownTarget: peers.filter(p => p.id === ${JSON.stringify(target)}).map(p => ({ id: p.id, host: p.host })) };`));
+  assert(turn.value?.main?.id === ownId && turn.value.main.local === true && turn.value.ownTarget.length === 0, "original native main/peers unusable after bridge loss or lapsed target still visible");
+  return turn;
+}));
 await sleep(3_000);
 // pgrep exits 1 when nothing matches; any other failure is an error, not "none".
 const regexEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -510,9 +549,6 @@ results.processesAfterKill = Object.fromEntries([["bridge or agent", `mesh-bridg
 }));
 results.bridgeLog = fs.readFileSync(bridgeLog, "utf8");
 save(); saveAfterKill();
-assert(after.every((entry) => entry.status === "fulfilled"), "required post-kill prompt failed");
-assertLapse(results.afterKill.dev1ToForge, rootB.id, "forge");
-assertLapse(results.afterKill.forgeToDev1, rootA.id, "dev1");
 assertNoSurvivors(results.processesAfterKill);
 log("RESULTS", JSON.stringify(results.afterKill, null, 2), results.processesAfterKill);
 results.proofPassed = true;

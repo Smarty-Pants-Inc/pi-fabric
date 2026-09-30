@@ -61,6 +61,35 @@ const workInboxIngress = (messages, expected) => {
 };
 // END WORK INGRESS HELPER
 
+// BEGIN FIRST SEND VALIDATOR — inert probes extract this production predicate.
+const assertFirstSend = (attempts, target, host, killedAt, boundMs = 10_000) => {
+  const fail = (message) => { throw new Error(`FIRST postkill send to ${target} on ${host}: ${message}`); };
+  if (!Array.isArray(attempts) || !attempts.length) fail("missing first attempt");
+  const first = attempts[0]; // A later named lapse can never rescue this attempt.
+  if (!first || Object.hasOwn(first, "delivered") || Object.hasOwn(first, "accepted") || typeof first.error !== "string") fail("accepted/delivered or missing native failure");
+  const { requestAt, nativeStartedAt, nativeCompletedAt, completedAt, nativeMs } = first;
+  if (![killedAt, requestAt, nativeStartedAt, nativeCompletedAt, completedAt, nativeMs, boundMs].every(Number.isFinite) ||
+      boundMs !== 10_000 || requestAt < killedAt || completedAt < requestAt || nativeCompletedAt < nativeStartedAt ||
+      nativeMs !== nativeCompletedAt - nativeStartedAt || nativeMs > boundMs)
+    fail("missing/invalid timing or native operation over 10000ms");
+  const error = first.error;
+  // Trust only the full native router clause, never a target prefix or appended diagnostic.
+  const preSendPrefix = `Unknown Fabric participant: ${target} (its lease mirrored from remote host ${host} lapsed`;
+  const remainder = error.slice(preSendPrefix.length);
+  const clause = /^(?: (\d+) s ago)?: the mesh bridge to that host is down, or the session has ended\)$/.exec(remainder);
+  const preSend = error.startsWith(preSendPrefix) && clause !== null && clause[0] === remainder &&
+    (clause[1] === undefined || Number.isFinite(Number(clause[1])));
+  const pending = error.startsWith(`Fabric lease mirrored from remote host ${host} lapsed for ${target};`) && error.includes("mesh bridge");
+  const deadline = error.startsWith(`Fabric mesh bridge to remote host ${host} is not responding for ${target};`);
+  if (!preSend && !pending && !deadline) fail("unnamed or wrong host/target bridge condition");
+  if ((pending || deadline) && !error.includes("the outcome is unknown")) fail("pending/deadline failure lacks unknown-outcome warning");
+  return { condition: preSend ? "pre-send-lapsed" : pending ? "pending-lapsed" : "ack-deadline",
+    nativeTimestampDomain: "native-execution-host-local", nativeStartedAt, nativeCompletedAt, nativeMs,
+    driverTimestampDomain: "local-driver", requestAfterKillMs: requestAt - killedAt,
+    completionAfterKillMs: completedAt - killedAt, rpcModelDurationMs: completedAt - requestAt };
+};
+// END FIRST SEND VALIDATOR
+
 const exec = promisify(execFile);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const quote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
@@ -447,27 +476,25 @@ try {
   });
   check("factoryPrWakeRead", prRead);
   await Promise.all([piA, piB].map((pi) => waitFor("idle before bridge kill", pi.idle)));
-  bridge.kill("SIGKILL");
+  assert(bridge.kill("SIGKILL"), "bridge SIGKILL failed");
   const killedAt = Date.now(); results.bridgeKilledAt = new Date(killedAt).toISOString(); save();
-  const lapseProbe = async (pi, target, host) => {
-    const attempts = [], deadline = killedAt + 60_000;
-    while (Date.now() < deadline) {
-      const start = Date.now();
-      const v = await pi.execute(`const nativeStartedAt = Date.now(); try { const delivered = await agents.steer(${JSON.stringify(target)}, ${JSON.stringify(`${runId}-after-kill: reply only OK`)}); return { nativeStartedAt, nativeMs: Date.now() - nativeStartedAt, delivered }; } catch(error) { return { nativeStartedAt, nativeMs: Date.now() - nativeStartedAt, error: String(error?.message ?? error) }; }`, Math.max(1, deadline - Date.now()));
-      const completedAt = Date.now();
-      attempts.push({ afterKillMs: start - killedAt, completionAfterKillMs: completedAt - killedAt, durationMs: completedAt - start, ...v });
-      results.afterKill ??= {}; results.afterKill[host] = attempts; save();
-      if (v.error?.includes(target) && v.error.includes(`remote host ${host}`) && /lapsed/.test(v.error) && /mesh bridge/.test(v.error)) {
-        assert(completedAt <= deadline, `${host}: named lapse completed after the 60s deadline`);
-        return attempts;
-      }
-      await sleep(1000); // One bounded attempt per second; ack timeout may occur first.
-    }
-    throw new Error(`${host}: named mirrored-lease lapsed error absent within 60s`);
+  const firstSendProbe = async (pi, target, host) => {
+    const requestAt = Date.now();
+    // The outer RPC/model budget is not the native send budget. No retry, no delay,
+    // and no preceding peer read that could refresh away the pending-lapse path.
+    const v = await pi.execute(`const nativeStartedAt = Date.now(); let outcome; try { outcome = { delivered: await agents.steer(${JSON.stringify(target)}, ${JSON.stringify(`${runId}-after-kill: reply only OK`)} ) }; } catch(error) { outcome = { error: String(error?.message ?? error) }; } const nativeCompletedAt = Date.now(); return { nativeStartedAt, nativeCompletedAt, nativeMs: nativeCompletedAt - nativeStartedAt, ...outcome };`, 120_000);
+    const completedAt = Date.now();
+    const attempts = [{ ...v, nativeTimestampDomain: "native-execution-host-local",
+      driverTimestampDomain: "local-driver", requestAt, completedAt, requestAfterKillMs: requestAt - killedAt,
+      completionAfterKillMs: completedAt - killedAt, rpcModelDurationMs: completedAt - requestAt }];
+    results.afterKill ??= {}; results.afterKill[host] = attempts; save();
+    const validation = assertFirstSend(attempts, target, host, killedAt);
+    check(`firstPostkillSend-${host}`, validation);
+    return validation;
   };
-  const probes = await Promise.allSettled([lapseProbe(piA, b.id, cfg.remoteName), lapseProbe(piB, a.id, cfg.localName)]);
+  const probes = await Promise.allSettled([firstSendProbe(piA, b.id, cfg.remoteName), firstSendProbe(piB, a.id, cfg.localName)]);
   assert(probes.every((p) => p.status === "fulfilled"), probes.filter((p) => p.status === "rejected").map((p) => p.reason.message).join("; "));
-  check("bothNamedLapsedErrors", true);
+  check("bothFirstPostkillSendsNamedBounded", true);
   const afterDeath = await Promise.all([[piA, a.id, b.id], [piB, b.id, a.id]].map(async ([pi, ownId, target]) => {
     const v = await pi.execute(`const main=await agents.main(); const peers=await agents.peers(); return {main:{id:main.id,local:main.local},ownTarget:peers.filter(p=>p.id===${JSON.stringify(target)}).map(p=>({id:p.id,host:p.host})),unrelatedCount:peers.filter(p=>p.id!==${JSON.stringify(a.id)}&&p.id!==${JSON.stringify(b.id)}).length};`);
     assert(v.main.id === ownId && v.main.local === true && v.ownTarget.length === 0, "native main/peers must remain usable after bridge death without the lapsed own target");

@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeConversationReader } from "../src/ui/conversation-native-reader.js";
 import { AgentTranscriptReader } from "../src/ui/transcript-reader.js";
-import { createRunLogWriter, MAX_EVENT_LINE_CHARS } from "../src/worker/run-log.js";
+import { compactTerminalRunLog, createRunLogWriter, MAX_EVENT_LINE_CHARS } from "../src/worker/run-log.js";
 import { PiEventProjection } from "../src/worker/event-projection.js";
 import { TranscriptAccumulator } from "../src/ui/transcript-parser.js";
 
@@ -59,11 +59,12 @@ const run: Array<Record<string, unknown>> = [
   { type: "agent_end" },
 ];
 
-const write = (events: Array<Record<string, unknown>>, flushAfter = false): { lines: Array<Record<string, unknown>>; text: string } => {
+const write = (events: Array<Record<string, unknown>>, flushAfter = false, terminal = true): { lines: Array<Record<string, unknown>>; text: string } => {
   let text = "";
   const writer = createRunLogWriter((chunk) => { text += chunk; });
   for (const event of events) writer.event(JSON.stringify(event), event);
   if (flushAfter) writer.flush();
+  if (terminal) text = compactText(text);
   return { text, lines: text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>) };
 };
 
@@ -73,6 +74,12 @@ const logFile = (text: string): string => {
   const file = path.join(directory, "events.jsonl");
   fs.writeFileSync(file, text, "utf8");
   return file;
+};
+const compactText = (text: string): string => {
+  const file = logFile(text);
+  const outcome = compactTerminalRunLog(file, "completed");
+  expect(outcome.error).toBeUndefined();
+  return fs.readFileSync(file, "utf8");
 };
 const readTranscript = (text: string) => new NativeConversationReader().read({ id: "run", status: "running", logFile: logFile(text) });
 // Entry ids are derived from line positions, which compaction changes.
@@ -93,6 +100,7 @@ const projectedWrite = (events: Array<Record<string, unknown>>) => {
     writer.event(line, JSON.parse(line) as Record<string, unknown>);
   }
   writer.flush();
+  text = compactText(text);
   return { text, dropped, lines: text.trimEnd().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>) };
 };
 
@@ -110,6 +118,134 @@ const capEvents = (text: string, isError = false, extras = {}) => {
 };
 
 describe("worker run log", () => {
+  it("keeps the full live end through crash/abort before canonical and refuses nonterminal compaction", () => {
+    const { events, end } = capEvents("durable crash result", false, { terminate: true });
+    const live = write(events.slice(0, 2), true, false);
+    expect(live.lines[1]).toEqual(end);
+    const file = logFile(live.text);
+    const inode = fs.statSync(file).ino;
+    expect(compactTerminalRunLog(file, "running").compacted).toBe(0);
+    expect(compactTerminalRunLog(file, "completed").compacted).toBe(0);
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fs.readFileSync(file, "utf8")).toBe(live.text);
+    expect(readEntries(live.text)[0]).toMatchObject({ status: "completed", result: end.result });
+    expect(readTranscript(live.text).streaming.tools[0]?.result).toEqual({ content: end.result.content, details: end.result.details });
+    const paired = write(events, true, false);
+    expect(paired.lines[1]).toEqual(end); // Even after canonical, active log stays full.
+    expect(compactTerminalRunLog(logFile(paired.text), "running").compacted).toBe(0);
+  });
+
+  it.each(["content", "details", "isError", "toolName", "partial", "duplicate", "reused"])("preserves full ends with unavailable/different/ambiguous canonical (%s)", (difference) => {
+    const { events, end } = capEvents("main-kept result", false, { opaque: { elided: true }, terminate: true });
+    const message = { ...(events[3]!.message as Record<string, unknown>) };
+    if (difference === "content") message.content = [{ type: "text", text: "different" }];
+    if (difference === "details") message.details = { changed: true };
+    if (difference === "isError") message.isError = true;
+    if (difference === "toolName") message.toolName = "different";
+    const records = [events[0]!, end, { type: "message_end", message }];
+    if (difference === "duplicate") records.push({ type: "message_end", message });
+    if (difference === "reused") records.push(events[0]!);
+    let text = write(records, true, false).text;
+    if (difference === "partial") text = text.trimEnd();
+    const file = logFile(text);
+    expect(compactTerminalRunLog(file, "failed").compacted).toBe(0);
+    expect(fs.readFileSync(file, "utf8")).toBe(text);
+  });
+
+  it("preserves opaque legacy marker fields during paired compaction", () => {
+    const content = [{ type: "text", text: "legacy full result" }];
+    const result = { content, details: { a: 1, b: 2 }, elided: true, bytes: 17, terminate: true };
+    const events = [
+      { type: "tool_execution_start", toolCallId: "legacy", toolName: "tool", args: {} },
+      { type: "tool_execution_end", toolCallId: "legacy", toolName: "tool", result, isError: false },
+      { type: "message_end", message: { role: "toolResult", toolCallId: "legacy", toolName: "tool", content, details: { a: 1, b: 2 }, isError: false, timestamp: 1 } },
+    ];
+    const full = write(events, true, false).text;
+    const compacted = compactText(full);
+    expect(JSON.parse(compacted.split("\n")[1]!).resultMetadata).toEqual({ elided: true, bytes: 17, terminate: true });
+    expect(readEntries(compacted)).toEqual(readEntries(full));
+    expect(readTranscript(compacted).streaming).toEqual(readTranscript(full).streaming);
+  });
+
+  it("keeps differently ordered equal details that would change bounded dashboard output", () => {
+    const details = Object.fromEntries(Array.from({ length: 450 }, (_, index) => [`k${index}`, index]));
+    const content = [{ type: "text", text: "budgeted details" }];
+    const events = [
+      { type: "tool_execution_start", toolCallId: "order", toolName: "tool", args: {} },
+      { type: "tool_execution_end", toolCallId: "order", toolName: "tool", result: { content, details }, isError: false },
+      { type: "message_end", message: { role: "toolResult", toolCallId: "order", toolName: "tool", content, details: Object.fromEntries(Object.entries(details).reverse()), isError: false, timestamp: 1 } },
+    ];
+    const full = write(events, true, false).text;
+    expect(compactText(full)).toBe(full);
+    expect(readEntries(compactText(full))).toEqual(readEntries(full));
+  });
+
+  it.each(["source-fsync", "temp-fsync", "rename"])("preserves original and cleans only owned temp when %s fails", (failure) => {
+    const text = write(capEvents("durability payload").events, true, false).text;
+    const file = logFile(text);
+    const directory = path.dirname(file);
+    const foreign = path.join(directory, "foreign.compact.tmp");
+    fs.writeFileSync(foreign, "not ours");
+    const inode = fs.statSync(file).ino;
+    let syncs = 0;
+    const fsync = fs.fsyncSync;
+    const spy = failure === "rename"
+      ? vi.spyOn(fs, "renameSync").mockImplementation(() => { throw new Error("injected rename failure"); })
+      : vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+        if (++syncs === (failure === "source-fsync" ? 1 : 2)) throw new Error("injected fsync failure");
+        fsync(fd);
+      });
+    try {
+      expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 0, error: expect.stringContaining("injected") });
+    } finally { spy.mockRestore(); }
+    expect(fs.readFileSync(file, "utf8")).toBe(text);
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fs.readdirSync(directory).sort()).toEqual(["events.jsonl", "foreign.compact.tmp"]);
+  });
+
+  it.each(["x".repeat(2000), ""])("invalidates held reader offsets on atomic replacement (body length=%s)", (body) => {
+    const { events: fullEvents } = capEvents(body);
+    const events: Array<Record<string, unknown>> = body ? fullEvents : [
+      fullEvents[0]!,
+      { type: "tool_execution_end", toolCallId: "capcall", toolName: "cap", result: { content: [] }, isError: false },
+      { type: "message_end", message: { role: "toolResult", toolCallId: "capcall", toolName: "cap", content: [], isError: false, timestamp: 1 } },
+    ];
+    const raw = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+    const live = write(events, true, false).text;
+    const file = logFile(live);
+    const source = { id: "held", status: "completed", logFile: file };
+    const dashboard = new AgentTranscriptReader();
+    const native = new NativeConversationReader();
+    const beforeDashboard = dashboard.read(source, false);
+    const beforeNative = native.read(source, false);
+    const fd = fs.openSync(file, "r");
+    const inode = fs.statSync(file).ino;
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome.compacted).toBe(1);
+      expect(fs.statSync(file).ino).not.toBe(inode);
+      expect(fs.readFileSync(fd, "utf8")).toBe(live);
+      const compacted = fs.readFileSync(file, "utf8");
+      expect(compacted.trimEnd().split("\n")).toHaveLength(live.trimEnd().split("\n").length);
+      expect(readEntries(compacted)).toEqual(readEntries(raw));
+      const fresh = readTranscript(compacted);
+      expect(fresh.messages).toEqual(readTranscript(raw).messages);
+      expect(fresh.streaming).toEqual(readTranscript(raw).streaming);
+      const afterNative = native.read(source, false);
+      expect(afterNative.revision).toBeGreaterThan(beforeNative.revision);
+      expect(afterNative.hasNewer).toBe(false);
+      expect(afterNative.messages).toEqual(beforeNative.messages);
+      expect(afterNative.streaming).toEqual(beforeNative.streaming);
+      expect(dashboard.read(source, false).entries).toEqual(beforeDashboard.entries);
+      if (body) expect(outcome.afterBytes).toBeLessThan(outcome.beforeBytes);
+      else expect(outcome.afterBytes).toBeGreaterThan(outcome.beforeBytes);
+      fs.appendFileSync(file, `${JSON.stringify({ type: "message_end", message: { role: "user", content: "new-path-offset", timestamp: 99 } })}\n`);
+      expect(native.read(source).messages.at(-1)).toMatchObject({ role: "user", content: "new-path-offset" });
+      expect(dashboard.read(source).entries.at(-1)).toMatchObject({ kind: "user", text: "new-path-offset" });
+      expect(beforeNative.messages).not.toEqual(native.last!.messages);
+    } finally { fs.closeSync(fd); }
+  });
+
   it.each([false, true])("retains the only accepted result when canonical envelopes exceed the unchanged cap (isError=%s)", (isError) => {
     // Success is the exact review sequence: end4194304 / canonical4194344.
     const { events, end } = capEvents("x".repeat(4194157 + Number(isError)), isError);

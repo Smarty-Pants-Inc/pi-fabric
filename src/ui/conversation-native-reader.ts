@@ -328,6 +328,8 @@ interface NativeReaderState {
 type NativeReaderMetadata = Omit<NativeConversationTranscript, "messages" | "entries" | "streaming" | "pendingMessages">;
 
 interface FileWindow {
+  device?: number;
+  inode?: number;
   /** Oldest byte loaded so far (record-aligned); 0 once history start is reached. */
   head: number;
   /** Newest byte consumed so far. */
@@ -365,7 +367,7 @@ const classifyFile = (filePath: string): FileKind | "unreadable" => {
 
 const openDescriptor = (
   filePath: string,
-): { descriptor: number; size: number } | { error: string } | undefined => {
+): { descriptor: number; size: number; device: number; inode: number } | { error: string } | undefined => {
   try {
     const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
     const descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
@@ -374,7 +376,7 @@ const openDescriptor = (
       closeQuietly(descriptor);
       return { error: "not a regular file" };
     }
-    return { descriptor, size: stat.size };
+    return { descriptor, size: stat.size, device: stat.dev, inode: stat.ino };
   } catch (error) {
     return { error: clipError(error) };
   }
@@ -628,7 +630,10 @@ export class NativeConversationReader {
       if (!opened || "error" in opened) throw new Error(`${filePath}: ${opened?.error ?? "unavailable"}`);
       try {
         for (const [head, tail] of ranges) {
-          if (opened.size < tail) throw new Error(`${filePath}: loaded range no longer available`);
+          const window = this.#windows.get(kind);
+          if (window?.device !== opened.device || window?.inode !== opened.inode || opened.size < tail) {
+            throw new Error(`${filePath}: loaded range no longer available`);
+          }
           let offset = head;
           while (offset < tail) {
             const page = readForwardPage(opened.descriptor, offset, tail, GROWTH_PAGE_BYTES);
@@ -785,6 +790,8 @@ export class NativeConversationReader {
         head: page.start,
         tail: page.end,
         size: opened.size,
+        device: opened.device,
+        inode: opened.inode,
         hasOlder: page.start > 0,
         unavailable: false,
       });
@@ -804,7 +811,7 @@ export class NativeConversationReader {
 
   #loadOlderFile(kind: FileKind, filePath: string): boolean {
     const window = this.#windows.get(kind);
-    if (!window || !window.hasOlder || window.head <= 0) return false;
+    if (!window) return false;
     const opened = openDescriptor(filePath);
     if (!opened) return false;
     if ("error" in opened) {
@@ -813,6 +820,8 @@ export class NativeConversationReader {
       return false;
     }
     try {
+      if (this.#replaceWindowIfNeeded(kind, opened.device, opened.inode)) return true;
+      if (!window.hasOlder || window.head <= 0) return false;
       const page = readBackwardPage(opened.descriptor, window.head, OLDER_PAGE_BYTES, false);
       if (page.start >= window.head) return false;
       // Older records join the index without moving the authoritative leaf.
@@ -838,6 +847,9 @@ export class NativeConversationReader {
       return false;
     }
     try {
+      // Check identity even when pinned or size grew: terminal compaction can
+      // shorten the file OR grow a near-empty end into the compact marker.
+      if (this.#replaceWindowIfNeeded(kind, opened.device, opened.inode)) return true;
       window.size = opened.size;
       window.unavailable = false;
       if (!followLatest || opened.size <= window.tail) return false;
@@ -850,6 +862,15 @@ export class NativeConversationReader {
     } finally {
       closeQuietly(opened.descriptor);
     }
+  }
+
+  #replaceWindowIfNeeded(kind: FileKind, device: number, inode: number): boolean {
+    const window = this.#windows.get(kind);
+    if (!window || window.device === undefined ||
+      (window.device === device && window.inode === inode)) return false;
+    if (kind === "events") this.#resetEventsState();
+    else this.#resetPaths(this.#sourceId, this.#status, this.#sessionFile, this.#eventsFile);
+    return true;
   }
 
   #ingest(followLatest: boolean): void {

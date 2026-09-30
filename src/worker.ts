@@ -240,7 +240,7 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter, MAX_EVENT_LINE_CHARS }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -1518,12 +1518,18 @@ const main = async (): Promise<void> => {
     }
   }
   delete record.currentTool;
-  writeRunRecord(options.statusFile, record);
-  terminalWritten = true;
-  process.stdout.write(`\n[pi-fabric] ${record.status}\n`);
   await new Promise<void>((resolve) =>
     sessionStream ? sessionStream.end(resolve) : resolve(),
   );
+  // Child close drained stdout/stderr, decoder tails and held log events above.
+  // The result is now terminal, including reply/schema validation. Compact only
+  // this quiescent source, before publishing terminal status: manager settlement
+  // and actor/residency retention can copy/remove the run as soon as it appears.
+  // Failure is best-effort and must never change or mask the original run result.
+  compactTerminalRunLog(options.logFile, record.status);
+  writeRunRecord(options.statusFile, record);
+  terminalWritten = true;
+  process.stdout.write(`\n[pi-fabric] ${record.status}\n`);
   process.exitCode = record.status === "completed" ? 0 : 1;
 };
 

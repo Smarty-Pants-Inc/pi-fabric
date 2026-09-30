@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { StaleMainGuard, type StaleMainNotice } from "../lifecycle/stale-main.js";
+import { loadedFabricRoot } from "../core/agent-dir.js";
+import { pathToFileURL } from "node:url";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
@@ -245,6 +248,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   id: string;
   name: string;
   task: string;
+  notice?: string;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
   recursive: boolean;
@@ -563,6 +567,7 @@ export class AgentManager {
   readonly #fullCodeMode: boolean;
   readonly #kernel: () => FabricKernel;
   readonly #pythonRuntime: () => FabricPythonRuntime;
+  readonly #releaseGuard: StaleMainGuard;
   readonly #mainAgentId: string | undefined;
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
@@ -612,6 +617,10 @@ export class AgentManager {
       /** The detached temp-root sweep entry (dist/storage/sweep-main.js). */
       sweepPath?: string;
       fabricExtensionPath?: string;
+      /** Profile selector override for tests/embedding; defaults to resolveAgentDir()/settings.json. */
+      releaseSettingsPath?: string;
+      /** Best-effort ops.fabric.stale-main publication; once per Main and active release. */
+      publishStaleMain?: (data: StaleMainNotice) => void | Promise<void>;
       piBinary?: string;
       claudeBinary?: string;
       vedaBinary?: string;
@@ -649,6 +658,12 @@ export class AgentManager {
       options.sweepPath ?? fileURLToPath(new URL("../storage/sweep-main.js", import.meta.url));
     this.#fabricExtensionPath =
       options.fabricExtensionPath ?? fileURLToPath(new URL("../index.js", import.meta.url));
+    this.#releaseGuard = new StaleMainGuard(
+      loadedFabricRoot(pathToFileURL(this.#fabricExtensionPath).href),
+      options.mainAgentId ?? process.env.PI_FABRIC_MAIN_AGENT_ID ?? options.fabricSessionId ?? `pid:${process.pid}`,
+      options.releaseSettingsPath,
+      options.publishStaleMain,
+    );
     this.#piBinary = resolvePiBinary(options.piBinary);
     this.#claudeBinary =
       options.claudeBinary ?? process.env.PI_FABRIC_CLAUDE_BINARY ?? config.claude.binary;
@@ -771,6 +786,11 @@ export class AgentManager {
     return runtime;
   }
 
+  /** Admission before forwarding to a durable host; local/native launches recheck at use. */
+  checkReleaseAdmission(): string | undefined {
+    return this.#releaseGuard.check();
+  }
+
   spawn(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
     const pending = this.#spawn(request, signal);
@@ -781,6 +801,7 @@ export class AgentManager {
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     if (this.#closing) throw new Error("Fabric agent manager is closing");
+    this.#releaseGuard.check(); // Includes worker resume/startup retries, not just public spawns.
     const pending = adapter.launch({ ...request, signal: this.#closeAbort.signal });
     this.#launches.add(pending);
     try {
@@ -799,6 +820,7 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    let notice = this.#releaseGuard.check();
     const kernel = this.resolveKernel({
       ...request,
       ...(request.recursive === true ? { extensions: true } : {}),
@@ -865,6 +887,7 @@ export class AgentManager {
     const admissionSignal = signal ? AbortSignal.any([signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
     const release = await this.#semaphore.acquire("native", admissionSignal);
     try {
+      notice = this.#releaseGuard.check();
       if (runner === "pi") model = await this.#prepareModel(model);
       if (this.#closing) throw new Error("Fabric agent manager is closing");
       this.#semaphore.admit(this.#currentDepth + 1);
@@ -1057,6 +1080,7 @@ export class AgentManager {
         workerArguments,
       };
       if (this.#closing) throw new Error("Fabric agent manager is closing");
+      notice = this.#releaseGuard.check();
       const transport = await this.#launchTransport(adapter, launch);
       const lifecycle = createAgentLifecycle<AgentRunResult>(release);
       if (signal?.aborted || this.#closing) {
@@ -1068,6 +1092,7 @@ export class AgentManager {
         id,
         name,
         task: request.task,
+        ...(notice ? { notice } : {}),
         runner,
         ...(kernel ? { kernel } : {}),
         recursive,
@@ -2228,6 +2253,7 @@ export class AgentManager {
       name: managed.name,
       status,
       runner: managed.runner,
+      ...(managed.notice ? { notice: managed.notice } : {}),
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       transport: managed.transport.kind,
       cwd: managed.cwd,
@@ -2289,6 +2315,7 @@ export class AgentManager {
       ...safeRecord,
       cwd: managed.cwd,
       runner: managed.runner,
+      ...(managed.notice ? { notice: managed.notice } : {}),
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       logFile: path.join(managed.runDirectory, "events.jsonl"),

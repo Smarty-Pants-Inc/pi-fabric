@@ -6,6 +6,8 @@ import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
+import { recordMainRelease } from "./lifecycle/release-process.js";
+import { loadedFabricRoot } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
 import { resolvePiModel } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -675,6 +677,7 @@ export class FabricRuntimeState {
     const completionInbox = new AgentCompletionInbox(this.pi, context);
     this.#completionInbox = completionInbox;
     let markStoppedDelivered = (_id: string): void => {};
+    recordMainRelease(sessionId, loadedFabricRoot(import.meta.url));
     this.#agents = new AgentManager(context.cwd, agentConfig, {
       fullCodeMode: this.#config.fullCodeMode,
       kernel: () => this.#config?.executor.kernel ?? "typescript",
@@ -686,6 +689,10 @@ export class FabricRuntimeState {
       hostId,
       identityId: identity.id,
       retention: this.#config.retention,
+      ...(identity.kind === "main" ? {
+        publishStaleMain: (data: import("./lifecycle/stale-main.js").StaleMainNotice) =>
+          this.publishOpsEvent("ops.fabric.stale-main", "fabric.stale_main", { ...data }),
+      } : {}),
       ...(this.#paths
         ? {
             workerPath: this.#paths.worker,

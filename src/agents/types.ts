@@ -147,6 +147,8 @@ export interface AgentRunRecord {
   replyVia?: "tool";
   value?: unknown;
   error?: string;
+  /** The spawning Main is behind the fleet release (smarty-dev#2665). */
+  notice?: string;
   /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
   warnings?: string[];
   stderr?: string;
@@ -171,6 +173,8 @@ export interface AgentRunResult extends AgentRunRecord {
 export interface AgentHandleInfo {
   id: string;
   name: string;
+  /** The spawning Main is behind the fleet release (smarty-dev#2665). */
+  notice?: string;
   status: AgentRunStatus;
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */

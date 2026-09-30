@@ -233,6 +233,9 @@ class ResidentHost {
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: config.retention,
+      publishStaleMain: data => this.mesh.publish({
+        topic: "ops.fabric.stale-main", kind: "fabric.stale_main", from: this.identity, data: { ...data },
+      }).then(() => undefined, () => undefined),
       preparePiModel: async (model) => resolveResidentPiModel(model),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;

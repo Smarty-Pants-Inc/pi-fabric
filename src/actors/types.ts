@@ -339,6 +339,8 @@ export interface FabricActorMessage {
   data?: unknown;
   action?: "silent" | "message" | "stop";
   runId?: string;
+  /** The spawning Main's release notice. */
+  notice?: string;
   usage?: AgentUsage;
   error?: string;
   stale?: boolean;

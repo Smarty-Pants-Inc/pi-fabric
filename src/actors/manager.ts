@@ -2430,6 +2430,7 @@ export class ActorManager {
         ...(directive.data !== undefined ? { data: directive.data } : {}),
         runId: result.id,
         usage: result.usage,
+        ...(result.notice ? { notice: result.notice } : {}),
       };
     }
     return {
@@ -2444,6 +2445,7 @@ export class ActorManager {
       ...(result.value !== undefined ? { data: result.value } : {}),
       runId: result.id,
       usage: result.usage,
+      ...(result.notice ? { notice: result.notice } : {}),
     };
   }
 

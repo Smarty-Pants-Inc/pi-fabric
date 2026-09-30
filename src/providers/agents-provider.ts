@@ -632,6 +632,7 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     switch (actionName) {
       case "run": {
+        this.manager.checkReleaseAdmission();
         const main = isInteractiveMain(context.extensionContext);
         const handle = await this.manager.spawn(
           runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager),
@@ -668,6 +669,7 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
+        this.manager.checkReleaseAdmission();
         const request = runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
@@ -680,6 +682,7 @@ export class AgentsProvider implements FabricProvider {
           extensions: request.extensions ?? this.manager.config.extensions,
           ...(durableCwd !== undefined ? { cwd: durableCwd } : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
+        const notice = this.manager.checkReleaseAdmission(); // Activation may have changed during model/cwd resolution.
         const handle = durableRequest.residency === "durable"
           ? await this.#resident().spawnAgent(durableRequest, context.signal)
           : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
@@ -692,7 +695,7 @@ export class AgentsProvider implements FabricProvider {
           name: handle.name,
         });
         context.update(agentStartedMessage(handle));
-        return handle;
+        return notice ? { ...handle, notice } : handle;
       }
       case "join":
       case "wait": {

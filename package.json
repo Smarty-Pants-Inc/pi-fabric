@@ -37,7 +37,8 @@
   },
   "bin": {
     "fabric-participants": "./bin/fabric-participants",
-    "mesh-bridge": "./bin/mesh-bridge"
+    "mesh-bridge": "./bin/mesh-bridge",
+    "fabric-releases": "./bin/fabric-releases"
   },
   "files": [
     "bin/",
@@ -51,7 +52,8 @@
     "PROOF.bend",
     "proofs/",
     "scripts/verified-kernels.mjs",
-    "scripts/test-verified-kernels.mjs"
+    "scripts/test-verified-kernels.mjs",
+    "releases-safety.json"
   ],
   "scripts": {
     "proof:generate": "node scripts/verified-kernels.mjs --write",

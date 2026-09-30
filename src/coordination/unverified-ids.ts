@@ -11,7 +11,8 @@ export const MESSAGE_ID_LIMITS = {
   metadataItems: 2_000,
 } as const;
 
-type Identifier = { kind: "session" | "actor" | "sha" | "comment" | "pid"; value: string; display: string; at: number };
+type Identifier = { kind: "session" | "actor" | "sha" | "comment" | "pid" | "issue"; value: string; repository?: string; display: string; at: number };
+const identifierKey = (id: Identifier): string => `${id.kind}:${id.repository ?? ""}:${id.value}`;
 const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const bareSession = "01a0[0-9a-f]{4}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 const literal = new RegExp(`(?:#issuecomment-\\d{9,10}|(?<![\\w-])(?:session:${uuid}|${bareSession}|(?:actor:|run:)?[0-9a-f]{32}|comment[ \\t:=#-]*\\d{9,10}|pid[ \\t:=#-]*\\d{1,10}))(?![\\w-])`, "gi");
@@ -19,12 +20,21 @@ const literal = new RegExp(`(?:#issuecomment-\\d{9,10}|(?<![\\w-])(?:session:${u
 // of these words followed by whitespace, ':' or '=' (JSON key quoting allowed).
 const shaWord = /\b(?:sha|commit|head|base|revision|rev)(?:["']?[ \t]*[:=][ \t]*["']?|[ \t]+)([0-9a-f]{7,40})(?![\w-])/gi;
 const shaTick = /(?<!`)`([0-9a-f]{7,40})`(?!`)/gi;
+const issueRepository = "[a-z0-9][a-z0-9-]*/[a-z0-9_.-]+";
+const issueReference = new RegExp(`(?<![\\w./-])(?:https://github\\.com/(${issueRepository})/(?:issues|pull)/(\\d+)|(${issueRepository})#(\\d+)|#(\\d{3,}))(?![\\w-])`, "gi");
 // Read text can contain raw git / PID / JSON API output. Search only the
 // outgoing candidates, not every token in a potentially multi-megabyte read.
 const readMatcher = (id: Identifier): RegExp => {
   const start = "(?<![\\w-])";
   const end = "(?![\\w-])";
   let token: string;
+  if (id.kind === "issue") {
+    // A bare reference has no repository identity. A bare read can establish
+    // either qualified form; a qualified read must preserve its repository.
+    const repository = id.repository?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") ?? issueRepository;
+    const bare = id.value.length >= 3 ? "|#" : "";
+    return new RegExp(`(?<![\\w./-])(?:https://github\\.com/${repository}/(?:issues|pull)/|${repository}#${bare})${id.value}(?![\\w-])`, "i");
+  }
   if (id.kind === "session") token = `(?:session:)?${id.value}`;
   else if (id.kind === "comment") return new RegExp(`(?:#issuecomment-|${start}(?:comment[ \\t:=#-]*)?)${id.value}${end}`, "i");
   else if (id.kind === "pid") token = `(?:pid[ \\t:=#-]*)?${id.value}`;
@@ -59,7 +69,7 @@ const identifier = (raw: string, at: number, sha = false): Identifier => {
 const candidates = (text: string): Identifier[] => {
   const unique = new Map<string, Identifier>();
   const add = (id: Identifier): void => {
-    const key = `${id.kind}:${id.value}`;
+    const key = identifierKey(id);
     const previous = unique.get(key);
     if (!previous || id.at < previous.at) unique.set(key, id);
     if (unique.size > MESSAGE_ID_LIMITS.identifiers) throw new Error("Identifier budget exceeded");
@@ -76,6 +86,14 @@ const candidates = (text: string): Identifier[] => {
   // an actor/run. Bare 32-hex tokens retain the actor/run interpretation.
   for (const match of text.matchAll(literal)) {
     if (!shaPositions.has(match.index)) add(identifier(match[0], match.index));
+  }
+  // Ordinary legacy identifiers need no extra repository-pattern scan.
+  if (text.includes("/") || /#\d{3}/.test(text)) {
+    for (const match of text.matchAll(issueReference)) {
+      const repository = match[1] ?? match[3];
+      const value = match[2] ?? match[4] ?? match[5]!;
+      add({ kind: "issue", value, ...(repository ? { repository: repository.toLowerCase() } : {}), display: `${repository ?? ""}#${value}`, at: match.index });
+    }
   }
   return [...unique.values()].sort((a, b) => a.at - b.at);
 };
@@ -163,7 +181,7 @@ export function unverifiedMessageIds(text: string, session?: ReadonlySessionMana
   const ids = candidates(text);
   if (!ids.length) return [];
   if (!session?.getLeafId || !session.getEntry) throw new Error("Sender history unavailable");
-  const pending = new Map(ids.map(id => [`${id.kind}:${id.value}`, id]));
+  const pending = new Map(ids.map(id => [identifierKey(id), id]));
   const matchers = new Map(ids.map(id => [id, readMatcher(id)]));
   // Values contain only hex, digits and UUID dashes (no regex metacharacters).
   // A single literal-alternative scan avoids 128 full scans of unrelated reads.
@@ -229,5 +247,5 @@ export function unverifiedMessageIds(text: string, session?: ReadonlySessionMana
     }
     leaf = entry.parentId ?? null;
   }
-  return ids.filter(id => pending.has(`${id.kind}:${id.value}`)).map(id => id.display);
+  return ids.filter(id => pending.has(identifierKey(id))).map(id => id.display);
 }

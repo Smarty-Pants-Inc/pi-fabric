@@ -43,8 +43,22 @@ describe("conservative identifier classes", () => {
     ["comment 123456789", ["comment 123456789"]],
     ["comment1234567890", ["comment 1234567890"]],
     ["#issuecomment-1234567890", ["comment 1234567890"]],
-    ["https://github.com/o/r/issues/1#issuecomment-1234567890", ["comment 1234567890"]],
-    ["1234567890; #2175; comment 123; #issuecomment-12345678901", []],
+    ["https://github.com/o/r/issues/1#issuecomment-1234567890", ["o/r#1", "comment 1234567890"]],
+    ["1234567890; comment 123; #issuecomment-12345678901", []],
+    ["#2175", ["#2175"]],
+    ["#123", ["#123"]],
+    ["#1; #12; 2175; # Title; ## Heading; # 2175", []],
+    ["o/r#1", ["o/r#1"]],
+    ["o/r#12", ["o/r#12"]],
+    ["Smarty-Pants-Inc/pi-fabric#2175", ["Smarty-Pants-Inc/pi-fabric#2175"]],
+    ["https://github.com/o/r/issues/2175", ["o/r#2175"]],
+    ["https://github.com/o/r/pull/2175", ["o/r#2175"]],
+    ["HTTPS://GITHUB.COM/O/R/PULL/2175?tab=files", ["O/R#2175"]],
+    ["(o/repo.name#2175), #2176.", ["o/repo.name#2175", "#2176"]],
+    ["x#2175; #2175suffix; #2175-thing; o/r#2175suffix", []],
+    ["https://github.com/o/r/issues/2175suffix; https://example.com/o/r/issues/2175", []],
+    ["o/r#2175; https://github.com/O/R/pull/2175; https://github.com/o/r/issues/2175", ["o/r#2175"]],
+    ["o/r#2175; o/other#2175", ["o/r#2175", "o/other#2175"]],
     ["pid987654", ["pid 987654"]],
     ["pid=987654", ["pid 987654"]],
     ["pid 987654", ["pid 987654"]],
@@ -58,6 +72,46 @@ describe("conservative identifier classes", () => {
 });
 
 describe("actual sender-session read evidence", () => {
+  const issueForms = ["#2175", "o/r#2175", "https://github.com/o/r/issues/2175", "https://github.com/o/r/pull/2175"];
+  it.each(issueForms.flatMap(text => issueForms.map(evidence => [text, evidence])))("normalizes issue forms %s after reading %s", (text, evidence) => {
+    const manager = session();
+    read(manager, evidence);
+    expect(unverifiedMessageIds(text, manager)).toEqual([]);
+  });
+
+  it("accepts bare issue reads across repositories while preserving qualified identity", () => {
+    const manager = session();
+    read(manager, "other/repository#2175");
+    expect(unverifiedMessageIds("#2175", manager)).toEqual([]);
+    expect(unverifiedMessageIds("o/r#2175", manager)).toEqual(["o/r#2175"]);
+    expect(unverifiedMessageIds("#2175; o/r#2175", manager)).toEqual(["o/r#2175"]);
+    read(manager, "#2175");
+    expect(unverifiedMessageIds("o/r#2175; another/repo#2175", manager)).toEqual([]);
+  });
+
+  it("requires a reference token as issue evidence and escapes repository punctuation", () => {
+    const manager = session();
+    read(manager, "2175 #21750 #2175suffix #2175-thing o/repoXname#2175");
+    expect(unverifiedMessageIds("o/repo.name#2175", manager)).toEqual(["o/repo.name#2175"]);
+    read(manager, "https://github.com/O/REPO.NAME/issues/2175");
+    expect(unverifiedMessageIds("o/repo.name#2175", manager)).toEqual([]);
+    const small = session();
+    read(small, "#1 #12 1 12");
+    expect(unverifiedMessageIds("o/r#1; o/r#12", small)).toEqual(["o/r#1", "o/r#12"]);
+  });
+
+  it("checks issue and comment provenance separately on an anchored URL", () => {
+    const manager = session();
+    const text = "https://github.com/o/r/issues/2175#issuecomment-1234567890";
+    read(manager, "o/r#2175");
+    expect(unverifiedMessageIds(text, manager)).toEqual(["comment 1234567890"]);
+    read(manager, "#issuecomment-1234567890");
+    expect(unverifiedMessageIds(text, manager)).toEqual([]);
+    const commentOnly = session();
+    read(commentOnly, "#issuecomment-1234567890");
+    expect(unverifiedMessageIds(text, commentOnly)).toEqual(["o/r#2175"]);
+  });
+
   it.each(["pi-fabric-agent-message", "pi-fabric-inbox", "pi-fabric-records", "other-received-message"])("counts received %s content", customType => {
     const manager = session();
     manager.appendCustomMessageEntry(customType, `received ${uuid}; actor ${actor}; commit ${full}; #issuecomment-1234567890; pid 987654`, true);
@@ -219,12 +273,14 @@ describe("fail-open notices and fast path", () => {
     expect(await outgoingMessageNotice(oversized, context(session()))).toHaveProperty("notice", "unverified ids: check failed");
     const ids = Array.from({ length: MESSAGE_ID_LIMITS.identifiers + 1 }, (_, i) => `pid ${i + 1}`).join("; ");
     expect(await outgoingMessageNotice(ids, context(session()))).toHaveProperty("notice", "unverified ids: check failed");
+    const issues = Array.from({ length: MESSAGE_ID_LIMITS.identifiers + 1 }, (_, i) => `o/r#${i + 1}`).join("; ");
+    expect(await outgoingMessageNotice(issues, context(session()))).toHaveProperty("notice", "unverified ids: check failed");
   });
 
   it("no ids means no history API access, including ordinary short prose hex", async () => {
     const manager = session();
     vi.spyOn(manager, "getLeafId").mockImplementation(() => { throw new Error("never read"); });
-    for (const text of ["Ready to review", "decafed abc1234 is prose", "color abcdef12", "comment 12", "pid nope"]) {
+    for (const text of ["Ready to review", "decafed abc1234 is prose", "color abcdef12", "comment 12", "pid nope", "2175", "#1", "#12", "# Title", "## Heading", "# 2175"]) {
       expect(await outgoingMessageNotice(text, context(manager))).toEqual({ text });
     }
   });

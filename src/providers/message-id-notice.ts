@@ -4,6 +4,7 @@ export interface OutgoingMessageNotice { text: string; notice?: string }
 
 // Only the cheap prefilter is reachable from providers. The parser/history walk
 // is first-use code, never loaded by registration or idle lifecycle hooks.
+const possibleIssueReference = /(?<![\w./-])(?:https:\/\/github\.com\/[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+\/(?:issues|pull)\/\d+|[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+#\d+|#\d{3,})(?![\w-])/i;
 const possibleIdentifier = /(?:#issuecomment-\d{9,10}|(?<![\w-])(?:session:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|01a0[0-9a-f]{4}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|(?:actor:|run:)?[0-9a-f]{32}|comment[ \t:=#-]*\d{9,10}|pid[ \t:=#-]*\d{1,10}))(?![\w-])|(?<!`)`[0-9a-f]{7,40}`(?!`)|\b(?:sha|commit|head|base|revision|rev)(?:["']?[ \t]*[:=][ \t]*["']?|[ \t]+)[0-9a-f]{7,40}(?![\w-])/i;
 const failed = "unverified ids: check failed";
 
@@ -16,7 +17,7 @@ export async function outgoingMessageNotice(
   let notice: string | undefined;
   try {
     if (text.length > 256 * 1024) notice = failed;
-    else if (!possibleIdentifier.test(text)) return { text };
+    else if (!possibleIdentifier.test(text) && !((text.includes("#") || text.includes("/")) && possibleIssueReference.test(text))) return { text };
     else {
       const { unverifiedMessageIds } = await import("../coordination/unverified-ids.js");
       const ids = unverifiedMessageIds(text, context.extensionContext?.sessionManager, senderId);

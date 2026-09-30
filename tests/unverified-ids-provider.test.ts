@@ -25,6 +25,22 @@ const replay = [
   ["comment", "#issuecomment-1234567890"],
   ["pid", "pid 987654"],
 ] as const;
+const issueReferences = [
+  ["qualified issue", "Smarty-Pants-Inc/pi-fabric#2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["bare issue", "#2175", "#2175"],
+  ["issue URL", "https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["pull URL", "https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["anchored issue URL", "https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175#issuecomment-1234567890", "Smarty-Pants-Inc/pi-fabric#2175, comment 1234567890"],
+] as const;
+const mixedIssueReads = [
+  ["#2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["#2175", "another/repository#2175"],
+  ["Smarty-Pants-Inc/pi-fabric#2175", "#2175"],
+  ["Smarty-Pants-Inc/pi-fabric#2175", "https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175"],
+  ["Smarty-Pants-Inc/pi-fabric#2175", "https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2175"],
+  ["https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2175", "#2175"],
+] as const;
 const surfaces = ["legacy.steer", "legacy.followUp", "hosted.steer", "hosted.followUp", "mesh.publish"] as const;
 const session = () => SessionManager.inMemory(process.cwd());
 const invocation = (manager: SessionManager): FabricInvocationContext => ({
@@ -182,6 +198,31 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
     expect(result.notice?.split("\n")).toHaveLength(1);
   });
 
+  it.each(issueReferences)("flags an unread GitHub %s and clears it after a read", async (_kind, text, display) => {
+    const h = harness(surface);
+    const notice = `unverified ids: ${display}`;
+    expect(await h.send(text)).toHaveProperty("notice", notice);
+    expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+    read(h.manager, text);
+    expect(await h.send(text)).not.toHaveProperty("notice");
+    expect(h.sent.at(-1)).toBe(text);
+  });
+
+  it.each(mixedIssueReads)("normalizes mixed GitHub forms: outgoing %s, read %s", async (text, evidence) => {
+    const h = harness(surface);
+    read(h.manager, evidence);
+    expect(await h.send(text)).not.toHaveProperty("notice");
+    expect(h.sent).toEqual([text]);
+  });
+
+  it("does not let an issue send receipt launder an unread GitHub reference", async () => {
+    const h = harness(surface);
+    const text = "Smarty-Pants-Inc/pi-fabric#2175";
+    const first = await h.send(text);
+    read(h.manager, JSON.stringify({ text: h.sent[0], ...first as object }), "fabric_exec");
+    expect(await h.send(text)).toHaveProperty("notice", `unverified ids: ${text}`);
+  });
+
   it("does not annotate real reads from agents list/peers/create, git or the GitHub API", async () => {
     const manager = session();
     read(manager, 'agents.list: [{"id":"aaaa1111bbbb2222cccc3333dddd4444"}]', "fabric_exec");
@@ -199,9 +240,9 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
   it("leaves no-identifier text untouched without accessing history", async () => {
     const h = harness(surface);
     vi.spyOn(h.manager, "getLeafId").mockImplementation(() => { throw new Error("must not read"); });
-    const text = "Ready for the review; no identifiers here.";
-    expect(await h.send(text)).not.toHaveProperty("notice");
-    expect(h.sent).toEqual([text]);
+    const texts = ["Ready for the review; no identifiers here.", "2175", "#1", "#12", "# Title", "## Heading", "# 2175"];
+    for (const text of texts) expect(await h.send(text)).not.toHaveProperty("notice");
+    expect(h.sent).toEqual(texts);
   });
 
   it("fails open when the session history check throws", async () => {

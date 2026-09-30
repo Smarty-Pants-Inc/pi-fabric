@@ -3,7 +3,8 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { FOLLOW_UP_LIMITS, MainAgentController, type FabricMainAgentDeliveryRequest, type FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, residentHostId, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -254,19 +255,127 @@ describe("resident delivery wake scheduling", () => {
     expect(scans).not.toHaveBeenCalled();
   });
 
-  it("preserves processwide root+id admission across separate receivers after a failed delete", async () => {
+  it("retries failed deletion through Main's durable journal across a controller restart", async () => {
     const h = harness();
     fakeWatch();
-    await h.put("processwide-once");
-    vi.spyOn(h.mesh, "delete").mockImplementationOnce(async () => { throw new Error("delete failed"); });
-    const first = h.client();
-    first.start();
-    await until(() => h.delivered.length === 1);
-    await first.close();
-    const secondDelivery = vi.fn(() => ({ queued: true, messageId: "second", routed: "main" as const }));
-    h.client(h.mesh, { ...h.main, deliverAgent: secondDelivery }).start();
-    await until(() => h.pending() === 0);
-    expect(secondDelivery).not.toHaveBeenCalled();
+    const journal = path.join(h.root, "main-followups", "root.json");
+    // Each controller owns fresh fake Pi ports and session entries. Only the journal survives.
+    const receiver = () => {
+      type Handler = (event: unknown, context: ExtensionContext) => unknown;
+      const handlers = new Map<string, Handler[]>();
+      const entries: unknown[] = [];
+      const context = {
+        isIdle: () => false, hasPendingMessages: () => false,
+        signal: { aborted: false }, sessionManager: { getEntries: () => entries },
+      } as unknown as ExtensionContext;
+      const sendMessage = vi.fn();
+      const pi = {
+        on: (name: string, handler: Handler) => {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+          return () => handlers.set(name, (handlers.get(name) ?? []).filter((fn) => fn !== handler));
+        },
+        sendMessage,
+      } as unknown as ExtensionAPI;
+      const main = new MainAgentController(pi, h.rootId, true, h.root, path.basename(h.root));
+      main.attachFollowUpDrain(context, 60_000, journal);
+      const emit = (name: string, event: unknown) => {
+        for (const handler of handlers.get(name) ?? []) handler(event, context);
+      };
+      return { main, context, entries, sendMessage, emit };
+    };
+    const firstReceiver = receiver();
+    let secondReceiver: ReturnType<typeof receiver> | undefined;
+    const clients: ResidencyClient[] = [];
+    const start = (main: MainAgentController) => {
+      const client = h.client(h.mesh, main);
+      clients.push(client);
+      client.start();
+      return client;
+    };
+    const items = () => (JSON.parse(fs.readFileSync(journal, "utf8")) as {
+      items: Array<{ id: string; deliveryId: string; message: string }>;
+    }).items;
+    try {
+      await h.put("journal-once");
+      const deliveryId = `resident:${h.rootId}:journal-once`;
+      const firstAdmission = vi.spyOn(firstReceiver.main, "deliverAgent");
+      const deletion = vi.spyOn(h.mesh, "delete").mockImplementationOnce(async () => {
+        // The deletion fails only AFTER a successful, durable Main admission.
+        expect(firstAdmission.mock.results[0]!.type).toBe("return");
+        expect(items()).toHaveLength(1);
+        expect(items()[0]!.deliveryId).toBe(deliveryId);
+        throw new Error("delete failed");
+      });
+      const firstClient = start(firstReceiver.main);
+      await until(() => deletion.mock.calls.length === 1);
+      await firstClient.close();
+      const admitted = items()[0]!;
+      expect(h.pending()).toBe(1);
+      expect(firstReceiver.main.queueDepth().pendingFollowUps).toBe(1);
+      expect(firstReceiver.sendMessage).not.toHaveBeenCalled();
+      firstReceiver.main.closeFollowUpDrain();
+
+      secondReceiver = receiver(); // same root/journal, no shared receiver state
+      const secondAdmission = vi.spyOn(secondReceiver.main, "deliverAgent");
+      expect(secondReceiver.main.queueDepth().pendingFollowUps).toBe(1);
+      const resumed = start(secondReceiver.main);
+      await until(() => h.pending() === 0);
+      await resumed.close();
+      expect(secondAdmission).toHaveBeenCalledTimes(1); // retry reaches the REAL receiver
+      expect(secondAdmission.mock.calls[0]![0].deliveryId).toBe(deliveryId);
+      expect(secondAdmission.mock.results[0]!.value).toMatchObject({ duplicate: true, messageId: admitted.id });
+      expect(secondReceiver.main.queueDepth().pendingFollowUps).toBe(1); // no second admission
+      expect(items()).toEqual([admitted]); // message identity stable; no duplicate journal item
+      expect(secondReceiver.sendMessage).not.toHaveBeenCalled();
+      const boundary = { outcome: "completed", context: { pendingMessages: [] } };
+      secondReceiver.emit("agent_before_settle", boundary); // next safe boundary releases it
+      expect(secondReceiver.sendMessage).toHaveBeenCalledTimes(1);
+      const [message, options] = secondReceiver.sendMessage.mock.calls[0]!;
+      expect(message.details).toMatchObject({ id: admitted.id, deliveryId });
+      expect(message.details.items).toBeUndefined();
+      expect(options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+      secondReceiver.entries.push({ type: "custom_message", customType: message.customType, details: message.details });
+      secondReceiver.emit("agent_settled", { outcome: "completed" });
+      secondReceiver.emit("agent_before_settle", boundary);
+      expect(secondReceiver.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(journal)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).ids).toContain(deliveryId);
+
+      // A closed journal and a REAL quota refusal must keep future work for a later drain.
+      secondReceiver.main.closeFollowUpDrain();
+      await h.put("future");
+      const closedClient = start(secondReceiver.main);
+      await until(() => secondAdmission.mock.calls.length === 2);
+      await closedClient.close();
+      expect(secondAdmission.mock.results[1]!.type).toBe("throw");
+      expect(secondAdmission.mock.results[1]!.value.message).toMatch(/journal/);
+      expect(h.pending()).toBe(1);
+      const replaceFuture = async (message: string) => {
+        const record = h.mesh.listAll(residentDeliveryPrefix(h.rootId), { fresh: true })[0]!;
+        await h.mesh.put({ key: record.key, ifVersion: record.version, identity: record.updatedBy,
+          value: { ...(record.value as Record<string, unknown>), message } });
+      };
+      await replaceFuture("x".repeat(FOLLOW_UP_LIMITS.senderBytes + 1));
+      secondReceiver.main.attachFollowUpDrain(secondReceiver.context, 60_000, journal);
+      const fullClient = start(secondReceiver.main);
+      await until(() => secondAdmission.mock.calls.length === 3);
+      await fullClient.close();
+      expect(secondAdmission.mock.results[2]!.type).toBe("throw");
+      expect(secondAdmission.mock.results[2]!.value.message).toMatch(/followUp queue is full/);
+      expect(h.pending()).toBe(1);
+      expect(secondReceiver.main.queueDepth().pendingFollowUps).toBe(0);
+      expect(secondReceiver.sendMessage).toHaveBeenCalledTimes(1);
+      await replaceFuture("future");
+      start(secondReceiver.main);
+      await until(() => h.pending() === 0);
+      expect(secondAdmission.mock.results[3]!.type).toBe("return");
+      expect(items()).toHaveLength(1);
+      expect(items()[0]!.deliveryId).toBe(`resident:${h.rootId}:future`);
+    } finally {
+      await Promise.all(clients.map((client) => client.close()));
+      firstReceiver.main.closeFollowUpDrain();
+      secondReceiver?.main.closeFollowUpDrain();
+    }
   });
 
 });

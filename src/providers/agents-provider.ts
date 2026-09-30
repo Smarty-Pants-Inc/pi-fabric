@@ -1432,7 +1432,7 @@ export class AgentsProvider implements FabricProvider {
     return client?.isLive() ? client : undefined;
   }
 
-  #residentActorOwner(id: string): { id: string; client: Pick<ResidentActorClient, "setActor" | "actorStatus" | "removeActor"> } | undefined {
+  #residentActorOwner(id: string): { id: string; client: ResidencyClient | ResidentActorClient } | undefined {
     const { actor, participant } = this.#resolveActorTarget(id);
     const rootId = actor?.rootId ?? participant?.rootId;
     if (rootId !== this.mainAgent.id) return undefined; // foreign session overlays remain caller-local

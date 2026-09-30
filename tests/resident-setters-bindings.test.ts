@@ -26,7 +26,7 @@ const terminal = (request: AgentRunRequest, id: number): AgentRunResult => ({
   runner: "pi", transport: "process", cwd: process.cwd(), startedAt: Date.now(), updatedAt: Date.now(),
   turns: 1, toolCalls: 0, text: "done", usage: {
     input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    cost: 0,
   },
 });
 const setup = (queueLimit = 2) => {

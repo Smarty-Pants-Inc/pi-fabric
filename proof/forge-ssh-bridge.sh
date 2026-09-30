@@ -7,4 +7,5 @@ here=$(cd "$(dirname "$0")" && pwd)
 [[ $# == 1 && -f $1 ]] || { echo "usage: $0 CONFIG.json" >&2; exit 2; }
 # GNU timeout bounds the driver too; its finally handles normal timeout signals.
 # Evidence and all scratch state belong under the configured .local directory.
-exec timeout --signal=TERM --kill-after=30s 900s bun "$here/forge-ssh-bridge.mjs" "$1"
+# The driver is plain JavaScript; use the same Node runtime as Pi and mesh-bridge.
+exec timeout --signal=TERM --kill-after=30s 900s node "$here/forge-ssh-bridge.mjs" "$1"

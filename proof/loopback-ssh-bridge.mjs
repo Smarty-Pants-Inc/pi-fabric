@@ -253,6 +253,27 @@ const assertPostkillLedger = (events, source, target, marker, host, condition) =
     destination: send ? { to: send.to, destinationRemoteHost: send.data.destinationRemoteHost } : null };
 };
 // END POSTKILL LEDGER
+
+// BEGIN EXCLUSIVE LEDGER — serialize only proof snapshots, never mutate mesh state.
+const exclusiveLedger = async (store, operation, gate, wait) => {
+  gate();
+  const deadline = Date.now() + 5000;
+  const check = () => {
+    gate();
+    if (Date.now() >= deadline) throw new Error("postkill ledger snapshot exceeded 5000ms");
+  };
+  // exclusive takes a synchronous callback. IO cannot be preempted: reject an
+  // over-budget result after IO, and gate a delayed acquisition before any read.
+  const value = await wait(store.exclusive(() => {
+    check();
+    const value = operation();
+    check();
+    return value;
+  }));
+  check();
+  return value;
+};
+// END EXCLUSIVE LEDGER
 const assertNoSurvivors = (processes) => { assert(Object.keys(processes).length === 2 && Object.values(processes).every((v) => v === "none"), "bridge/SSH transport survivors"); };
 // END LOOPBACK VALIDATORS
 
@@ -467,7 +488,7 @@ const side = (name) => {
   for (const file of ["auth.json", "models.json"]) fs.symlinkSync(path.join(fleetAgent, file), path.join(agentDir, file));
   fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [], extensions: [] }));
   fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: { root: mesh } }));
-  return { name, root, agentDir, cwd, mesh, store: new MeshStore(mesh, 256 * 1024, 500) };
+  return { name, root, agentDir, cwd, mesh, store: new MeshStore(mesh, 256 * 1024, 500, { lockTimeoutMs: 2000 }) };
 };
 
 const startPi = (s) => {
@@ -672,7 +693,9 @@ control.gate();
 ownedMembers(sshdOwner);
 ownedMembers(bridgeOwner);
 assert(processIdentity(bridge.pid)?.tick === bridgeOwner.identity.tick, "bridge identity changed before kill");
-const ledgerStarts = { dev1ToForge: captureLedger(A.store), forgeToDev1: captureLedger(B.store) };
+const ledgerStarts = { dev1ToForge: await exclusiveLedger(A.store, () => captureLedger(A.store), control.gate, control.wait),
+  forgeToDev1: await exclusiveLedger(B.store, () => captureLedger(B.store), control.gate, control.wait) };
+control.gate();
 const postkillMarkers = { dev1ToForge: `LOOP-POSTKILL-D2F-${randomUUID()}`, forgeToDev1: `LOOP-POSTKILL-F2D-${randomUUID()}` };
 assert(bridge.kill("SIGKILL"), "bridge SIGKILL failed");
 const killedAt = Date.now();
@@ -718,10 +741,14 @@ assertNoSurvivors(results.processesAfterKill);
 // after two bounded 10s mesh-lock windows; native clocks and first-only sends are unchanged.
 results.postkillLedgerReadNotBefore = Math.max(...Object.values(results.afterKill).map((v) => v.value[0].completedAt)) + 20_000;
 await sleep(Math.max(0, results.postkillLedgerReadNotBefore - Date.now()));
-results.postkillLedgers = Object.fromEntries([["dev1ToForge", A.store, rootA.id, rootB.id, "forge"],
-  ["forgeToDev1", B.store, rootB.id, rootA.id, "dev1"]].map(([direction, store, source, target, host]) =>
-  [direction, { window: ledgerStarts[direction], ...assertPostkillLedger(readLedger(store, ledgerStarts[direction]),
-    source, target, postkillMarkers[direction], host, results.firstPostkillSends[direction].condition) }]));
+results.postkillLedgers = {};
+for (const [direction, store, source, target, host] of [["dev1ToForge", A.store, rootA.id, rootB.id, "forge"],
+  ["forgeToDev1", B.store, rootB.id, rootA.id, "dev1"]]) {
+  const value = await exclusiveLedger(store, () => assertPostkillLedger(readLedger(store, ledgerStarts[direction]),
+    source, target, postkillMarkers[direction], host, results.firstPostkillSends[direction].condition), control.gate, control.wait);
+  control.gate();
+  results.postkillLedgers[direction] = { window: ledgerStarts[direction], ...value };
+}
 save(); saveAfterKill();
 log("RESULTS", JSON.stringify(results.afterKill, null, 2), results.processesAfterKill);
 results.proofPassed = true;

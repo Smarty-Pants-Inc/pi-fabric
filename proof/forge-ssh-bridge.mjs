@@ -24,8 +24,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { spawn, execFile, execFileSync } from "node:child_process";
-import { promisify, isDeepStrictEqual } from "node:util";
+import { spawn, execFileSync } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 import { randomUUID } from "node:crypto";
 
 // BEGIN WORK INGRESS HELPER — extracted by .local/work-wake-probe.mjs without running this driver.
@@ -207,7 +207,27 @@ const assertPostkillLedger = (events, source, target, marker, host, condition) =
 };
 // END POSTKILL LEDGER
 
-const exec = promisify(execFile);
+// BEGIN EXCLUSIVE LEDGER — serialize only proof snapshots, never mutate mesh state.
+const exclusiveLedger = async (store, operation, gate, wait) => {
+  gate();
+  const deadline = Date.now() + 5000;
+  const check = () => {
+    gate();
+    if (Date.now() >= deadline) throw new Error("postkill ledger snapshot exceeded 5000ms");
+  };
+  // exclusive takes a synchronous callback. IO cannot be preempted: reject an
+  // over-budget result after IO, and gate a delayed acquisition before any read.
+  const value = await wait(store.exclusive(() => {
+    check();
+    const value = operation();
+    check();
+    return value;
+  }));
+  check();
+  return value;
+};
+// END EXCLUSIVE LEDGER
+
 const cleanupSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const quote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
 const shell = (args) => args.map(quote).join(" ");
@@ -269,17 +289,115 @@ const waitFor = async (what, predicate, ms = 60_000) => {
 };
 const sshArgs = () => ["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
   "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", cfg.sshHost];
+// BEGIN REMOTE HELPER — inert native probe extracts this block, not the driver.
+const remoteBuffered = (command, cleanupOnly) => {
+  // execFile silently drops detached; spawn is also the regular child() mechanism.
+  const transport = spawn("ssh", [...sshArgs(), command], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  children.add(transport); // Every real child remains in the existing cleanup ledger.
+  let resolveReady, rejectReady, resolveClosed;
+  const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  transport.proofClosed = new Promise((resolve) => { resolveClosed = resolve; });
+  const operation = new Promise((resolve, reject) => {
+    const chunks = { stdout: [], stderr: [] }, bytes = { stdout: 0, stderr: 0 };
+    let settled = false, finalized = false, timer;
+    const done = (error, value) => {
+      if (settled) return;
+      settled = true; pending.delete(cancel);
+      transport.stdout?.removeListener("data", onStdout);
+      transport.stderr?.removeListener("data", onStderr);
+      // Wait settlement is NOT lifetime finalization or a group-death receipt.
+      // Drain without collecting; retain errors, close and the direct-child bound.
+      transport.stdout?.resume(); transport.stderr?.resume();
+      chunks.stdout.length = 0; chunks.stderr.length = 0;
+      if (error) { rejectReady(error); reject(error); } else resolve(value);
+    };
+    const finalize = () => {
+      if (finalized) return;
+      finalized = true; clearTimeout(timer); pending.delete(cancel);
+      transport.removeListener("spawn", onSpawn);
+      transport.removeListener("error", onError);
+      transport.removeListener("close", onClose);
+      transport.stdout?.removeListener("data", onStdout);
+      transport.stderr?.removeListener("data", onStderr);
+      transport.stdout?.removeListener("error", onStreamError);
+      transport.stderr?.removeListener("error", onStreamError);
+      chunks.stdout.length = 0; chunks.stderr.length = 0;
+      resolveClosed(); // Actual child closure (or no-PID failed spawn), not group death.
+    };
+    const latch = (error) => {
+      transport.proofError ??= error;
+      results.status = "FAIL"; results.failed ??= String(error?.stack ?? error);
+      done(error);
+      stop(); // Also works during cleanupOnly: never resume ordinary proof waits.
+      try { save(); } catch (saveError) { results.failed += `; failure save: ${saveError}`; }
+    };
+    const cancel = (error) => done(error);
+    const collect = (stream, data) => {
+      bytes[stream] += data.length;
+      if (bytes[stream] > 1024 * 1024) {
+        const error = new Error(`remote helper ${stream} maxBuffer exceeded`);
+        error.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+        done(error); // No numeric signal; tracked group is cleaned by cleanupOwned.
+      } else chunks[stream].push(data);
+    };
+    const onStreamError = (error) => latch(error);
+    const onStdout = (data) => collect("stdout", data);
+    const onStderr = (data) => collect("stderr", data);
+    const onError = (error) => {
+      latch(error);
+      // Failed spawn has no process/group to own or clean.
+      if (transport.pid === undefined) { children.delete(transport); finalize(); }
+    };
+    const onSpawn = () => {
+      try { transport.owned = ownLocal(transport.pid); }
+      catch (error) { latch(error); return; }
+      resolveReady();
+      if (!cleanupOnly && !settled) {
+        pending.add(cancel); // Ownership precedes all cancelable waits.
+        if (stopping) cancel(new Error("proof interrupted"));
+      }
+    };
+    const onClose = (code, signal) => {
+      if (!settled) {
+        const stdout = Buffer.concat(chunks.stdout).toString("utf8");
+        const stderr = Buffer.concat(chunks.stderr).toString("utf8");
+        if (code !== 0 || signal) {
+          const error = new Error(`remote helper exited (${signal ?? code})${stderr ? `: ${stderr.trim()}` : ""}`);
+          error.code = code; error.signal = signal; error.stdout = stdout; error.stderr = stderr;
+          done(error);
+        } else done(null, { stdout, stderr });
+      }
+      finalize();
+    };
+    transport.once("spawn", onSpawn);
+    transport.on("error", onError);
+    transport.once("close", onClose);
+    transport.stdout?.on("data", onStdout); transport.stderr?.on("data", onStderr);
+    transport.stdout?.on("error", onStreamError); transport.stderr?.on("error", onStreamError);
+    timer = setTimeout(() => {
+      const error = new Error("remote helper deadline exceeded (20000ms)");
+      error.code = "ETIMEDOUT";
+      // Only this directly owned ChildProcess, for its own deadline. Group death
+      // is still verified later by the unchanged incarnation/pidfd cleanup.
+      try { transport.kill("SIGKILL"); } catch (killError) { error.cause = killError; }
+      latch(error);
+    }, 20_000);
+  });
+  // Ownership readiness can fail before remote() attaches its operation await.
+  operation.catch(() => {});
+  return { ready, operation };
+};
 const remote = async (command, cleanupOnly = false) => {
   if (!cleanupOnly) gate();
-  const operation = exec("ssh", [...sshArgs(), command], { detached: true, timeout: 20_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
-  const transport = operation.child;
-  children.add(transport);
-  try { transport.owned = ownLocal(transport.pid); } catch (error) { transport.proofError = error; }
-  transport.once("error", (error) => { transport.proofError = error; });
-  const { stdout } = await (cleanupOnly ? operation : cancelWait(operation));
+  const { ready, operation } = remoteBuffered(command, cleanupOnly);
+  await ready;
+  // remoteBuffered already registers its own cancellation after ownership. A
+  // second cancelWait would replace its specific error when latch() stops peers.
+  const { stdout } = await operation;
   if (!cleanupOnly) gate();
   return stdout.trim();
 };
+// END REMOTE HELPER
 // Process identity is PID + Linux start ticks, not a global name pattern. Forge
 // is Linux. Return only mesh-bridge agents for this configured mesh, not raw ps.
 const processScript = `const fs=require('fs'); const mesh=process.argv[1]; const rows=[];
@@ -580,6 +698,7 @@ const cleanup = () => cleanupPromise ??= (async () => {
   const errors = [], receipts = [];
   // Capture authenticated descendants BEFORE EOF can remove their leader.
   for (const p of children) {
+    if (p.proofError) errors.push(String(p.proofError));
     try { if (p.owned) ownedMembers(p.owned); else throw p.proofError ?? new Error(`missing local ownership: ${p.pid}`); }
     catch (error) { errors.push(String(error)); }
   }
@@ -605,9 +724,18 @@ const cleanup = () => cleanupPromise ??= (async () => {
   }
   // Includes ordinary SSH operation groups, bridge SSH, and both local Pi wrappers.
   for (const p of children) {
-    if (!p.owned) { errors.push(`missing ownership: ${p.pid}`); continue; }
+    if (!p.owned) {
+      errors.push(`missing ownership: ${p.pid}`);
+      if (p.proofClosed) await p.proofClosed;
+      if (p.proofError) errors.push(String(p.proofError));
+      continue;
+    }
     const receipt = await cleanupOwned(p.owned);
     receipts.push({ remote: false, ...receipt }); errors.push(...receipt.errors);
+    // Buffered helper settlement is not closure; retain its direct-child bound
+    // even when authenticated group cleanup fails, then read any late latch.
+    if (p.proofClosed) await p.proofClosed;
+    if (p.proofError) errors.push(String(p.proofError));
   }
   results.cleanup = { remoteOwned, receipts, errors }; save();
   assert(errors.length === 0, errors.join("; "));
@@ -651,7 +779,7 @@ try {
   assert(beforeRemote.length === 0, "existing bridge agent on selected remote mesh: cannot prove isolated bridge death");
   const { MeshStore } = await cancelWait(import(pathToFileURL(path.join(path.dirname(cfg.localFabric), "mesh.js")).href));
   gate();
-  const store = new MeshStore(cfg.localMesh, 256 * 1024, 500);
+  const store = new MeshStore(cfg.localMesh, 256 * 1024, 500, { lockTimeoutMs: 2000 });
   piA = rpc(child("timeout", ["--signal=TERM", "--kill-after=10s", "900s", "nice", "-n", "19", cfg.localPi, ...piArgs(cfg.localFabric, path.join(evidence, "sessions"))],
     { cwd: cfg.localCwd, env: { ...cleanEnv(), PI_CODING_AGENT_DIR: cfg.localAgentDir }, stdio: ["pipe", "pipe", "pipe"] }, `${cfg.localName} Pi`), cfg.localName);
   // ponytail: SSH's command may already lead a process group; setsid then forks.
@@ -759,13 +887,21 @@ import { MeshStore } from ${JSON.stringify(pathToFileURL(path.join(path.dirname(
 const validateLedgerEvent = ${validateLedgerEvent.toString()};
 const captureLedger = ${captureLedger.toString()}; const readLedger = ${readLedger.toString()};
 const assertPostkillLedger = ${assertPostkillLedger.toString()};
-const store = new MeshStore(${JSON.stringify(cfg.remoteMesh)}, 256 * 1024, 500);
+const assert = ${assert.toString()};
+let stopping = false; const pending = new Set();
+const gate = ${gate.toString()}; const stop = ${stop.toString()}; const cancelWait = ${cancelWait.toString()};
+const exclusiveLedger = ${exclusiveLedger.toString()};
+process.on("SIGTERM", stop); process.on("SIGINT", stop);
+const store = new MeshStore(${JSON.stringify(cfg.remoteMesh)}, 256 * 1024, 500, { lockTimeoutMs: 2000 });
 const start = ${JSON.stringify(start ?? null)};
-console.log(JSON.stringify(start ? assertPostkillLedger(readLedger(store, start), ${JSON.stringify(b.id)},
-  ${JSON.stringify(a.id)}, ${JSON.stringify(marker ?? null)}, ${JSON.stringify(cfg.localName)}, ${JSON.stringify(condition ?? null)}) : captureLedger(store)));`;
-    return JSON.parse(await remote(shell([cfg.remoteNode, "--input-type=module", "-e", program])));
+const value = await exclusiveLedger(store, () => start ? assertPostkillLedger(readLedger(store, start), ${JSON.stringify(b.id)},
+  ${JSON.stringify(a.id)}, ${JSON.stringify(marker ?? null)}, ${JSON.stringify(cfg.localName)}, ${JSON.stringify(condition ?? null)}) : captureLedger(store), gate, cancelWait);
+console.log(JSON.stringify(value));`;
+    const output = await remote(shell([cfg.remoteNode, "--input-type=module", "-e", program]));
+    gate();
+    return JSON.parse(output);
   };
-  const ledgerStarts = { local: captureLedger(store), remote: await remoteLedger() };
+  const ledgerStarts = { local: await exclusiveLedger(store, () => captureLedger(store), gate, cancelWait), remote: await remoteLedger() };
   gate(); // In particular, a canceled prekill SSH ledger must not reach SIGKILL.
   const postkillMarkers = { local: `${runId}-${cfg.localName}-to-${cfg.remoteName}-postkill-${randomUUID()}`,
     remote: `${runId}-${cfg.remoteName}-to-${cfg.localName}-postkill-${randomUUID()}` };
@@ -818,8 +954,8 @@ console.log(JSON.stringify(start ? assertPostkillLedger(readLedger(store, start)
   const localCondition = results.checks[`firstPostkillSend-${cfg.remoteName}`].condition;
   const remoteCondition = results.checks[`firstPostkillSend-${cfg.localName}`].condition;
   check("postkillSourceLedgers", {
-    local: { window: ledgerStarts.local, ...assertPostkillLedger(readLedger(store, ledgerStarts.local),
-      a.id, b.id, postkillMarkers.local, cfg.remoteName, localCondition) },
+    local: { window: ledgerStarts.local, ...await exclusiveLedger(store, () => assertPostkillLedger(readLedger(store, ledgerStarts.local),
+      a.id, b.id, postkillMarkers.local, cfg.remoteName, localCondition), gate, cancelWait) },
     remote: { window: ledgerStarts.remote, ...await remoteLedger(ledgerStarts.remote, postkillMarkers.remote, remoteCondition) },
   });
   assert(!stopping, "proof interrupted during ledger read");

@@ -4,7 +4,10 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
-import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
+import { ActorManager } from "../src/actors/manager.js";
+import { AgentManager } from "../src/agents/manager.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { MeshStore, type MeshEvent, type MeshTailResult } from "../src/mesh/store.js";
 
 const roots: string[] = [];
 const monitors: ActorMeshMonitor[] = [];
@@ -24,7 +27,7 @@ function setup(cursor?: string) {
   const watcher = Object.assign(new EventEmitter(), { close: vi.fn() });
   vi.spyOn(fs, "watch").mockReturnValue(watcher as unknown as FSWatcher);
   const event = { topic: "test" } as MeshEvent;
-  const mesh = { root, latestOffset: vi.fn(() => 10), tail: vi.fn(() => ({ events: [event], nextOffset: 20 })) };
+  const mesh = { root, latestOffset: vi.fn(() => 10), tail: vi.fn((_offset: number, _limit: number): MeshTailResult => ({ events: [event], nextOffset: 20 })) };
   const beforePoll = vi.fn(() => true);
   const onEvent = vi.fn();
   const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 7 }, { cursorPath, beforePoll, onEvent });
@@ -35,6 +38,17 @@ function setup(cursor?: string) {
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
+  it("does not persist a cursor when disabled or never started", () => {
+    const disabled = setup();
+    disabled.monitor.config.enabled = false;
+    disabled.monitor.start();
+    disabled.monitor.close();
+    expect(fs.existsSync(disabled.cursorPath)).toBe(false);
+    const unstarted = setup();
+    unstarted.monitor.close();
+    expect(fs.existsSync(unstarted.cursorPath)).toBe(false);
+  });
+
   it("coalesces notifications, preserves a halted cursor, and resumes in order", async () => {
     const s = setup('{"format":1,"cursor":3}');
     s.beforePoll.mockReturnValue(false);
@@ -195,6 +209,186 @@ describe("ActorMeshMonitor", () => {
     expect(vi.getTimerCount()).toBe(1);
   });
 
+  it("idle checkpoints seed once and never rewrite an unchanged cursor", async () => {
+    const s = setup();
+    s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
+    const writes = vi.spyOn(fs, "renameSync");
+    s.monitor.schedule();
+    await flush();
+    for (let index = 0; index < 100; index++) {
+      s.monitor.schedule();
+      await flush();
+    }
+    await vi.advanceTimersByTimeAsync(30_000);
+    s.monitor.schedule();
+    await flush();
+    s.monitor.close();
+    expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(10);
+  });
+
+  it("idle checkpoints bound unrelated append writes to ten seconds and flush on close", async () => {
+    const s = setup('{"format":1,"cursor":3}');
+    const start = Date.now();
+    s.onEvent.mockReturnValue("ignored");
+    s.mesh.tail.mockImplementation((offset: number) => ({ events: [{ topic: "other" } as MeshEvent], nextOffset: offset + 1 }));
+    const writes = vi.spyOn(fs, "renameSync");
+    s.monitor.start();
+    for (let index = 0; index < 100; index++) {
+      s.monitor.schedule();
+      await flush();
+    }
+    expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(0);
+    vi.setSystemTime(start + 9_999);
+    s.monitor.schedule();
+    await flush();
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(3);
+    vi.setSystemTime(start + 10_000);
+    s.monitor.schedule();
+    await flush();
+    expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(105);
+    s.monitor.schedule();
+    await flush();
+    expect(s.mesh.tail).toHaveBeenCalledTimes(103);
+    s.monitor.close();
+    s.monitor.close();
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(106);
+    expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(2);
+  });
+
+  it("idle checkpoints persist relevant delivery immediately and leave rejected work for restart", async () => {
+    const s = setup('{"format":1,"cursor":3}');
+    const events = [
+      { id: "noise", sequence: 1, topic: "other", createdAt: Date.now() },
+      { id: "work", sequence: 2, topic: "fleet.work.a", to: "actor:a", createdAt: Date.now() },
+      { id: "held", sequence: 3, topic: "fleet.work.a", to: "actor:a", createdAt: Date.now() },
+    ] as MeshEvent[];
+    s.mesh.tail.mockReturnValue({ events, nextOffset: 30, cursors: [10, 20, 30] });
+    s.onEvent.mockImplementation((event: MeshEvent) => event.id === "noise" ? "ignored" : event.id !== "held");
+    s.monitor.schedule();
+    await flush();
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({ format: 1, cursor: 20, last: { sequence: 2, id: "work" } });
+    s.monitor.close();
+    const seen: MeshEvent[] = [];
+    const tail = vi.fn(() => ({ events: [events[2]!], nextOffset: 30, cursors: [30] }));
+    const resumed = new ActorMeshMonitor({ root: s.root, latestOffset: () => 30, tail },
+      { enabled: true, actorPollMs: 50, maxReadEvents: 7 }, {
+        cursorPath: s.cursorPath, maxReplayAgeMs: -60_000, beforePoll: () => true, onEvent: (event) => { seen.push(event); return true; },
+      });
+    monitors.push(resumed);
+    resumed.schedule();
+    await flush();
+    expect(tail).toHaveBeenCalledWith(20, 7);
+    expect(seen).toEqual([events[2]]);
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).last).toEqual({ sequence: 3, id: "held" });
+  });
+
+  it("idle checkpoints reconcile archived work across rewrite and full-receiver retry", async () => {
+    const s = setup('{"format":1,"cursor":0,"last":{"sequence":1,"id":"seen"}}');
+    s.monitor.close();
+    const events = [2, 3, 4, 5].map((sequence) => ({
+      id: `e${sequence}`, sequence, topic: sequence % 2 ? "fleet.work.a" : "team.noise", createdAt: 0,
+    })) as MeshEvent[];
+    const generationStart = 2 ** 32;
+    const tail = vi.fn((cursor: number) => cursor === generationStart + 20
+      ? { events: [], nextOffset: cursor }
+      : { events: events.slice(2), nextOffset: generationStart + 20, cursors: [generationStart + 10, generationStart + 20] });
+    const read = vi.fn((input: { after?: number }) => events.filter((event) => event.sequence > (input.after ?? 0)));
+    let full = true;
+    const seen: string[] = [];
+    const onEvent = vi.fn((event: MeshEvent) => {
+      if (full) return false;
+      seen.push(event.id);
+      return true;
+    });
+    const monitor = new ActorMeshMonitor({ root: s.root, latestOffset: () => generationStart + 20,
+      oldestSequence: () => 4, read, tail }, { enabled: true, actorPollMs: 50, maxReadEvents: 7 }, {
+      cursorPath: s.cursorPath, maxReplayAgeMs: 60_000, beforePoll: () => true, onEvent,
+    });
+    monitors.push(monitor);
+    const writes = vi.spyOn(fs, "renameSync");
+    monitor.schedule();
+    await flush();
+    expect(onEvent.mock.calls.map(([event]) => event.id)).toEqual(["e3"]);
+    expect(tail).not.toHaveBeenCalled();
+    expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(0);
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).last.sequence).toBe(1);
+    full = false;
+    monitor.schedule();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual(["e3", "e5"]); // old noise skipped, old work retained across both sources
+    expect(onEvent.mock.calls.map(([event]) => event.id)).toEqual(["e3", "e3", "e5"]);
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({
+      format: 1, cursor: generationStart + 20, last: { sequence: 5, id: "e5" },
+    });
+    expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(2);
+    monitor.close();
+    expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(2);
+  });
+
+  it("idle checkpoints flush only safe progress when a later live dispatch throws", async () => {
+    const s = setup('{"format":1,"cursor":3}');
+    s.onEvent.mockReturnValue("ignored");
+    s.monitor.start();
+    await flush();
+    const failed = { id: "failed", sequence: 1, topic: "fleet.work.a", createdAt: Date.now() } as MeshEvent;
+    s.mesh.tail.mockReturnValue({ events: [failed], nextOffset: 30, cursors: [30] });
+    s.onEvent.mockImplementationOnce(() => { throw new Error("dispatch"); });
+    s.monitor.schedule();
+    await flush();
+    expect(s.mesh.tail).toHaveBeenCalledTimes(2);
+    expect(s.onEvent).toHaveBeenCalledTimes(2);
+    // Model a fallback poll that would be empty at the wrongly advanced offset.
+    s.mesh.tail.mockImplementation((offset: number) => offset >= 30
+      ? { events: [], nextOffset: 30 }
+      : { events: [failed], nextOffset: 30, cursors: [30] });
+    s.onEvent.mockImplementation(() => { throw new Error("dispatch still fails"); });
+    s.monitor.schedule();
+    await flush();
+    s.monitor.close();
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(20);
+    const offered: string[] = [];
+    const resumed = new ActorMeshMonitor(s.mesh, s.monitor.config, {
+      cursorPath: s.cursorPath, beforePoll: () => true, onEvent: (event) => { offered.push(event.id); },
+    });
+    monitors.push(resumed);
+    resumed.schedule();
+    await flush();
+    expect(offered).toEqual(["failed"]);
+  });
+
+  it("retains only the same-page consumed prefix when a later dispatch throws", async () => {
+    const s = setup('{"format":1,"cursor":3,"last":{"sequence":0,"id":""}}');
+    const events = [1, 2, 3].map((sequence) => ({
+      id: `e${sequence}`, sequence, topic: "fleet.work.a", createdAt: Date.now(),
+    })) as MeshEvent[];
+    s.mesh.tail.mockImplementation((offset: number) => {
+      const index = offset === 3 ? 0 : offset / 10;
+      return { events: events.slice(index), nextOffset: 30, cursors: [10, 20, 30].slice(index) };
+    });
+    s.onEvent.mockImplementation((event: MeshEvent) => {
+      if (event.sequence === 2) throw new Error("dispatch");
+      return true;
+    });
+    s.monitor.start();
+    await flush();
+    s.monitor.schedule();
+    await flush();
+    expect(s.mesh.tail).toHaveBeenLastCalledWith(10, 7);
+    expect(s.onEvent.mock.calls.map(([event]) => event.id)).toEqual(["e1", "e2", "e2"]);
+    s.monitor.close();
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({ format: 1, cursor: 10, last: { sequence: 1, id: "e1" } });
+    const offered: string[] = [];
+    const resumed = new ActorMeshMonitor(s.mesh, s.monitor.config, {
+      cursorPath: s.cursorPath, beforePoll: () => true, onEvent: (event) => { offered.push(event.id); },
+    });
+    monitors.push(resumed);
+    resumed.schedule();
+    await flush();
+    expect(offered).toEqual(["e2", "e3"]);
+  });
+
   it("does not commit a cursor after dispatch failure and tolerates cursor write failure", async () => {
     const s = setup('{"format":1,"cursor":3}');
     s.onEvent.mockImplementationOnce(() => { throw new Error("dispatch"); });
@@ -205,8 +399,191 @@ describe("ActorMeshMonitor", () => {
     fs.mkdirSync(s.cursorPath);
     s.monitor.schedule();
     await flush();
-    expect(s.mesh.tail).toHaveBeenLastCalledWith(20, 7);
+    expect(s.mesh.tail).toHaveBeenLastCalledWith(3, 7);
     expect(s.onEvent).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("ActorMeshMonitor unanchored crash recovery", () => {
+  for (const mode of ["empty seed", "existing tail seed", "first ignored progress", "legacy lastless"] as const) {
+    it(`recovers archived targeted work after ${mode}, without a later-sequence seed`, async () => {
+      vi.useFakeTimers({ now: 1_000_000 });
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "actor-monitor-anchor-"));
+      roots.push(base);
+      const root = path.join(base, "mesh");
+      const dir = path.join(base, "archive");
+      fs.mkdirSync(root);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(root, "event-archive.json"), JSON.stringify({ version: 1, dir }));
+      vi.spyOn(fs, "watch").mockReturnValue(Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as FSWatcher);
+      const mesh = new MeshStore(root, 4_096, 50);
+      const from = { id: "peer", name: "peer", kind: "actor" as const };
+      const cursorPath = path.join(base, "cursor.json");
+      const historical = mode === "existing tail seed" || mode === "legacy lastless"
+        ? await mesh.publish({ topic: mode === "existing tail seed" ? "fleet.work.a" : "team.noise", from, text: "before first start" })
+        : undefined;
+      if (mode === "legacy lastless") fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, cursor: mesh.latestOffset() }));
+      const before = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 60_000, maxReadEvents: 50 }, {
+        cursorPath, beforePoll: () => true, onEvent: () => "ignored",
+      });
+      monitors.push(before);
+      // Leave a legacy lastless cursor untouched until the restart after compaction.
+      if (mode !== "legacy lastless") {
+        before.start();
+        await flush();
+      }
+      if (mode === "first ignored progress") {
+        const ignored = await mesh.publish({ topic: "team.noise", from });
+        before.schedule();
+        await flush();
+        // The first actual event anchor must not wait for the ten-second checkpoint.
+        expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).last).toEqual({ sequence: ignored.sequence, id: ignored.id });
+      }
+      const crashCursor = fs.readFileSync(cursorPath, "utf8");
+      before.close();
+      fs.writeFileSync(cursorPath, crashCursor); // Restore the bytes a crash (no close flush) leaves.
+      const noise = await mesh.publish({ topic: "team.noise", from, text: "old ordinary" });
+      const target = await mesh.publish({ topic: "fleet.work.a", to: "actor:a", from, text: "archived target" });
+      const retained = await mesh.publish({ topic: "team.noise", from, text: "retained old ordinary" });
+      const live = path.join(root, "events.jsonl");
+      const suffix = fs.readFileSync(live, "utf8").split("\n").filter((line) => line && JSON.parse(line).sequence >= retained.sequence);
+      fs.writeFileSync(`${live}.tmp`, suffix.join("\n") + "\n");
+      fs.renameSync(`${live}.tmp`, live);
+      fs.writeFileSync(path.join(root, "generation"), "1");
+      const seen: MeshEvent[] = [];
+      const resumed = new ActorMeshMonitor(mesh, before.config, {
+        cursorPath, maxReplayAgeMs: -60_000, beforePoll: () => true, onEvent: (event) => { seen.push(event); },
+      });
+      monitors.push(resumed);
+      resumed.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(seen.map((event) => event.id)).toEqual([target.id]);
+      expect(seen.some((event) => event.id === noise.id || event.id === historical?.id)).toBe(false);
+    });
+  }
+});
+
+describe("ActorManager idle checkpoints", () => {
+  const fixture = async (filtered: boolean) => {
+    vi.useFakeTimers();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-manager-cursor-"));
+    roots.push(root);
+    const watcher = Object.assign(new EventEmitter(), { close: vi.fn() });
+    // fs.watch attaches its callback as a change listener; returning an emitter alone
+    // silently drops every notification in this fixture.
+    vi.spyOn(fs, "watch").mockImplementation((_root: fs.PathLike, ...args: unknown[]) => {
+      const listener = args.at(-1);
+      if (typeof listener === "function") watcher.on("change", listener as fs.WatchListener<string>);
+      return watcher as unknown as FSWatcher;
+    });
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    let pollFinished: (() => void) | undefined;
+    const tail = mesh.tail.bind(mesh);
+    vi.spyOn(mesh, "tail").mockImplementation((...args) => {
+      const result = tail(...args);
+      // Dispatch and the safe-page checkpoint are synchronous after tail returns.
+      // Resolve on the next microtask, not at a guessed timer delay.
+      const finished = pollFinished;
+      pollFinished = undefined;
+      if (finished) queueMicrotask(finished);
+      return result;
+    });
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let firstRunStarted!: () => void;
+    let allRunsStarted!: () => void;
+    const firstRun = new Promise<void>((resolve) => { firstRunStarted = resolve; });
+    const allRuns = new Promise<void>((resolve) => { allRunsStarted = resolve; });
+    let runs = 0;
+    const run = vi.spyOn(agents, "run").mockImplementation(async () => {
+      if (++runs === 1) firstRunStarted();
+      if (runs === 11) allRunsStarted();
+      await gate;
+      throw new Error("test activation ended");
+    });
+    const identity = { id: "session:test", name: "main", kind: "main" as const, sessionId: "test" };
+    const cursorPath = path.join(root, "cursor.json");
+    const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 50, actorQueueLimit: 1 },
+      agents, () => {}, { actorRoot: path.join(root, "actors"), meshCursorPath: cursorPath });
+    const actor = await actors.create({ name: "receiver", instructions: "Watch", topics: ["fleet.work.wanted"],
+      responseMode: "text", coalesce: false,
+      ...(filtered ? { activationFilter: [{ id: "skip", topic: ["fleet.work.wanted"], kind: ["skip"] }] } : {}),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const poll = async () => {
+      const finished = new Promise<void>((resolve) => { pollFinished = resolve; });
+      watcher.emit("change", "change", "events.jsonl");
+      if (process.platform === "win32") await vi.advanceTimersByTimeAsync(50);
+      await finished;
+    };
+    const cursor = () => JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { cursor: number; last?: { sequence: number; id: string } };
+    const from = { id: "session:peer", name: "main", kind: "main" as const };
+    return { mesh, actors, agents, actor, run, firstRun, allRuns, release, cursorPath, cursor, from, poll };
+  };
+
+  it("real manager ignores unrelated appends but immediately checkpoints a relevant skip and direct event", async () => {
+    const s = await fixture(true);
+    const writes = vi.spyOn(fs, "renameSync");
+    const initial = s.cursor();
+    try {
+      for (let index = 0; index < 40; index++) {
+        await s.mesh.publish({ topic: index % 2 ? "fabric.control.noise" : "fleet.work.other", to: "actor:elsewhere", from: s.from });
+        await s.poll();
+      }
+      // An empty seed is safe at sequence zero; the first real ignored event anchors
+      // immediately, then the remaining unrelated burst stays batched.
+      expect(initial.last).toEqual({ sequence: 0, id: "" });
+      expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(1);
+      expect(s.cursor().last?.sequence).toBe(1);
+      const skipped = await s.mesh.publish({ topic: "fleet.work.wanted", kind: "skip", from: s.from });
+      await s.poll();
+      expect(s.actors.status(s.actor.id).filteredCount).toBe(1);
+      expect(s.cursor().last).toEqual({ sequence: skipped.sequence, id: skipped.id });
+      expect(s.run).not.toHaveBeenCalled();
+      const directed = await s.mesh.publish({ topic: "team.direct", to: s.actor.id, from: s.from });
+      await s.poll();
+      await s.firstRun;
+      expect(s.run).toHaveBeenCalledOnce();
+      expect(s.cursor().last).toEqual({ sequence: directed.sequence, id: directed.id });
+      expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(3);
+    } finally {
+      s.release();
+      await s.actors.close();
+      await s.agents.close();
+    }
+  });
+
+  it("real manager retries work rejected by a full receiver without rewriting an unchanged cursor", async () => {
+    const s = await fixture(false);
+    const writes = vi.spyOn(fs, "renameSync");
+    try {
+      // One running activation, one queued, eight overflow: the eleventh waits in the mesh.
+      const events: MeshEvent[] = [];
+      for (let index = 0; index < 11; index++) {
+        events.push(await s.mesh.publish({ topic: "fleet.work.wanted", from: s.from, text: `${index}` }));
+        await s.poll();
+        if (index === 0) await s.firstRun;
+      }
+      expect(s.cursor().last).toEqual({ sequence: events[9]!.sequence, id: events[9]!.id });
+      const count = writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath).length;
+      await s.poll();
+      await s.poll();
+      expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(count);
+      expect(s.run).toHaveBeenCalledOnce();
+      s.release();
+      await s.allRuns;
+      await s.poll();
+      expect(s.cursor().last).toEqual({ sequence: events[10]!.sequence, id: events[10]!.id });
+      expect(s.run).toHaveBeenCalledTimes(11);
+      expect(s.run.mock.calls.map(([request]) =>
+        JSON.parse(request.task.slice(request.task.indexOf("\n\n") + 2)).payload.id,
+      )).toEqual(events.map((event) => event.id));
+    } finally {
+      s.release();
+      await s.actors.close();
+      await s.agents.close();
+    }
   });
 });
 

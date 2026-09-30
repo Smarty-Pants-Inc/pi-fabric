@@ -26,6 +26,8 @@ const createStore = (options?: MeshStoreOptions): MeshStore => {
 };
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -53,6 +55,57 @@ describe("MeshStore", () => {
     const secondTail = store.tail(firstTail.nextOffset, 10);
     expect(secondTail.events).toMatchObject([{ sequence: 2, text: "two" }]);
     expect(secondTail.nextOffset).toBe(store.latestOffset());
+  });
+
+  it("captures a coherent tail cursor without using reserved or partial sequences", async () => {
+    const store = createStore();
+    expect(store.latestCursor()).toEqual({ cursor: 0, last: { sequence: 0, id: "" } });
+    const event = await store.publish({ topic: "team.auth", from: identity, text: "complete" });
+    const cursor = store.latestOffset();
+    fs.writeFileSync(path.join(store.root, "sequence"), "999");
+    fs.appendFileSync(path.join(store.root, "events.jsonl"), '{"sequence":999,"id":"partial"');
+    expect(store.latestCursor()).toEqual({ cursor, last: { sequence: event.sequence, id: event.id } });
+    expect(store.tail(cursor).events).toEqual([]);
+  });
+
+  it("does not anchor beyond the captured file offset when an append follows the size read", async () => {
+    const store = createStore();
+    const first = await store.publish({ topic: "team.auth", from: identity, text: "first" });
+    const cursor = store.latestOffset();
+    const second = await store.publish({ topic: "team.auth", from: identity, text: "unread" });
+    const live = path.join(store.root, "events.jsonl");
+    const bytes = fs.readFileSync(live);
+    const unread = bytes.subarray(cursor);
+    fs.writeFileSync(live, bytes.subarray(0, cursor));
+    // The sequence reservation (and, with an archive, its durable append) can already
+    // name second. Startup must use the first line's same-handle boundary instead.
+    const fstat = fs.fstatSync.bind(fs);
+    let appended = false;
+    const stat = vi.spyOn(fs, "fstatSync").mockImplementation(((...args: Parameters<typeof fs.fstatSync>) => {
+      const snapshot = fstat(...args);
+      if (!appended) { appended = true; fs.appendFileSync(live, unread); }
+      return snapshot;
+    }) as typeof fs.fstatSync);
+    let boundary: ReturnType<MeshStore["latestCursor"]>;
+    try { boundary = store.latestCursor(); } finally { stat.mockRestore(); }
+    expect(appended).toBe(true);
+    expect(boundary).toEqual({ cursor, last: { sequence: first.sequence, id: first.id } });
+    expect(store.tail(boundary.cursor).events.map((event) => event.id)).toEqual([second.id]);
+  });
+
+  it("reads only a bounded last line to anchor an existing live tail", () => {
+    const store = createStore();
+    const live = path.join(store.root, "events.jsonl");
+    const prefix = JSON.stringify({ sequence: 1, id: "old", text: "x".repeat(500) }) + "\n";
+    const last = JSON.stringify({ sequence: 2, id: "last" }) + "\n";
+    fs.writeFileSync(live, prefix.repeat(400) + last);
+    const reads = vi.spyOn(fs, "readSync");
+    const boundary = store.latestCursor();
+    const bytesRead = reads.mock.results.reduce((sum, result) => sum + Number(result.value), 0);
+    reads.mockRestore();
+    expect(boundary.last).toEqual({ sequence: 2, id: "last" });
+    expect(boundary.cursor).toBe(fs.statSync(live).size);
+    expect(bytesRead).toBeLessThanOrEqual(store.maxEventBytes + 3);
   });
 
   it("repairs an interrupted append without reusing sequence numbers", async () => {
@@ -529,6 +582,205 @@ describe("MeshStore lock recovery", () => {
     return lockPath;
   };
 
+  it("bounded lock backoff keeps the uncontended first attempt immediate", async () => {
+    vi.useFakeTimers();
+    const store = createStore();
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const operation = vi.fn(() => "done");
+    const result = store.exclusive(operation);
+    expect(operation).toHaveBeenCalledOnce();
+    expect(timers).not.toHaveBeenCalled();
+    await expect(result).resolves.toBe("done");
+  });
+
+  it("bounded lock backoff grows exponentially with jitter and caps contention waits", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 2_000 });
+    const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now()}\n`);
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const operation = vi.fn(() => "done");
+    const result = store.exclusive(operation);
+    expect(operation).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const waits = timers.mock.calls.map(([, wait]) => Number(wait));
+    expect(waits.slice(0, 6)).toEqual([15, 25, 45, 85, 130, 130]);
+    expect(waits.length).toBeLessThan(15); // fixed 10 ms retries took 100 probes here
+    expect(waits.every((wait) => wait >= 10 && wait <= 250)).toBe(true);
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`${process.pid}\n`);
+    fs.rmSync(lockPath, { recursive: true });
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(result).resolves.toBe("done");
+    expect(operation).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounded lock backoff applies the jitter floor and clamps the deadline, preserving diagnostics", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const lockPath = holdLock(store, `other\n${process.pid}\n${Date.now() - 60_000}\n`);
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const operation = vi.fn();
+    const result = store.exclusive(operation).catch((error: unknown) => error as Error & { code: string });
+    await vi.advanceTimersByTimeAsync(100);
+    const error = await result;
+    expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect((error as Error).message).toMatch(/after 4 attempts, largest gap between attempts 42 ms$/);
+    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual([19, 39, 42]);
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.existsSync(lockPath)).toBe(true); // a live holder is never swept, even beyond stale age
+    expect(vi.getTimerCount()).toBe(0);
+
+    // Minimum randomness still sleeps at least 10 ms rather than spinning on contention.
+    vi.mocked(Math.random).mockReturnValue(0);
+    timers.mockClear();
+    const second = store.exclusive(operation).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    await second;
+    expect(timers.mock.calls.map(([, wait]) => Number(wait))).toEqual(Array(10).fill(10));
+  });
+
+  it("reclaims a recent dead holder immediately without spending the stale window", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    holdLock(store, `recent-dead\n999999999\n${Date.now()}\n`);
+    const waits = vi.spyOn(globalThis, "setTimeout");
+    const operation = vi.fn(() => "recovered");
+    const result = store.exclusive(operation);
+    expect(operation).toHaveBeenCalledOnce();
+    expect(waits).not.toHaveBeenCalled();
+    await expect(result).resolves.toBe("recovered");
+    const fences = fs.readdirSync(store.root).filter((name) => name.startsWith(".lock.dead."));
+    expect(fences).toHaveLength(1);
+    expect(fs.readFileSync(path.join(store.root, fences[0]!, "owner"), "utf8")).toContain("recent-dead\n");
+  });
+
+  it("a paused stale cleaner cannot remove or rename over a successor held by another cleaner", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100 });
+    const lock = holdLock(store, `old-unique-token\n999999999\n${Date.now() - 60_000}\n`);
+    const ownerPath = path.join(lock, "owner");
+    const rename = fs.renameSync.bind(fs);
+    const remove = fs.rmSync.bind(fs);
+    let armed = true;
+    let competitor: Promise<void> | undefined;
+    let refused: unknown;
+    const pause = (resume: () => void) => {
+      armed = false;
+      competitor = other.exclusive(() => {
+        const successor = fs.readFileSync(ownerPath, "utf8");
+        const inode = fs.statSync(lock).ino;
+        try { resume(); } catch (error) { refused = error; }
+        expect(fs.readFileSync(ownerPath, "utf8")).toBe(successor);
+        expect(fs.statSync(lock).ino).toBe(inode);
+        expect(successor).not.toContain("old-unique-token");
+      });
+      void competitor.catch(() => undefined);
+      if (refused) throw refused;
+    };
+    // Intercept both the fixed atomic rename and HEAD's unsafe canonical recursive rm.
+    // The second cleaner runs synchronously and resumes the paused action while holding
+    // its successor, making this an actual filesystem fence test, not a guessed delay.
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (armed && String(from) === lock && String(to).startsWith(`${lock}.dead.`)) return pause(() => rename(from, to));
+      return rename(from, to);
+    });
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (armed && String(file) === lock) return pause(() => remove(file, options));
+      return remove(file, options);
+    });
+    const operation = vi.fn();
+    const result = store.exclusive(operation);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(armed).toBe(false);
+    expect(competitor).toBeDefined();
+    await competitor;
+    await result;
+    expect(operation).toHaveBeenCalledOnce();
+    expect(refused).toBeDefined();
+    expect(fs.readdirSync(store.root).filter((name) => name.startsWith(".lock.dead."))).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform !== "linux")("publishes Linux start time and distinguishes a reused PID from its live incarnation", async () => {
+    const store = createStore();
+    const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+    const startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]!;
+    await store.exclusive(() => {
+      const owner = fs.readFileSync(path.join(store.root, ".lock", "owner"), "utf8").trim().split("\n");
+      expect(owner).toHaveLength(4);
+      expect(owner[3]).toBe(startTime);
+    });
+    holdLock(store, `reused-pid\n${process.pid}\n${Date.now()}\n${BigInt(startTime) + 1n}\n`);
+    const operation = vi.fn();
+    await store.exclusive(operation);
+    expect(operation).toHaveBeenCalledOnce();
+  });
+
+  it.skipIf(process.platform !== "linux")("keeps a matching live incarnation and fails closed when start time is unavailable", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const procPath = `/proc/${process.pid}/stat`;
+    const stat = fs.readFileSync(procPath, "utf8");
+    const startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]!;
+    const lock = holdLock(store, `live\n${process.pid}\n${Date.now() - 60_000}\n${startTime}\n`);
+    const first = store.exclusive(() => { throw new Error("must not acquire"); }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await first).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    fs.writeFileSync(path.join(lock, "owner"), `unknown-incarnation\n${process.pid}\n${Date.now() - 60_000}\n${BigInt(startTime) + 1n}\n`);
+    const read = fs.readFileSync.bind(fs);
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === procPath) throw Object.assign(new Error("unreadable"), { code: "EACCES" });
+      return (read as (...args: unknown[]) => unknown)(file, ...args);
+    }) as typeof fs.readFileSync);
+    const second = store.exclusive(() => { throw new Error("must not acquire"); }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await second).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(fs.existsSync(lock)).toBe(true);
+  });
+
+  it.skipIf(process.platform !== "linux")("does not infer PID reuse from a torn fourth owner line", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+    const startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]!;
+    const partial = startTime.slice(0, -1) || "0";
+    const owner = `writing\n${process.pid}\n${Date.now() - 60_000}\n${partial}`;
+    const lock = holdLock(store, owner);
+    const result = store.exclusive(() => { throw new Error("must not acquire"); }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await result).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+  });
+
+  it("does not mistake a permission-denied live holder for a dead one", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const lock = holdLock(store, `protected\n${process.pid}\n${Date.now() - 60_000}\n`);
+    vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("denied"), { code: "EPERM" }); });
+    const result = store.exclusive(() => { throw new Error("must not acquire"); }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await result).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(fs.existsSync(lock)).toBe(true);
+  });
+
+  it("keeps fresh corrupt records and protects live PIDs even in stale malformed records", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const lock = holdLock(store, "not-a-valid-owner");
+    const first = store.exclusive(() => { throw new Error("must not acquire"); }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await first).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    fs.writeFileSync(path.join(lock, "owner"), `malformed\n${process.pid}\ninvalid-time\n`);
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(lock, old, old);
+    const second = store.exclusive(() => { throw new Error("must not acquire"); }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await second).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(fs.existsSync(lock)).toBe(true);
+  });
+
   it("sweeps a stale lock whose owner process is dead", async () => {
     const store = createStore();
     const lockPath = holdLock(store, `crashed\n999999999\n${Date.now() - 60_000}\n`);
@@ -549,11 +801,16 @@ describe("MeshStore lock recovery", () => {
 
     expect(event.sequence).toBe(1);
     expect(fs.existsSync(lockPath)).toBe(false);
+    const fence = fs.readdirSync(store.root).find((name) => name.startsWith(".lock.dead."));
+    expect(fence).toBeDefined();
+    expect(fs.readdirSync(path.join(store.root, fence!))).toContain(".recovery-fence");
   });
 
   it("sweeps a lock whose owner file is corrupt", async () => {
     const store = createStore();
     const lockPath = holdLock(store, "not-a-valid-owner");
+    const past = new Date(Date.now() - 60_000);
+    fs.utimesSync(lockPath, past, past);
 
     const event = await store.publish({ topic: "team.auth", from: identity, text: "recovered" });
 

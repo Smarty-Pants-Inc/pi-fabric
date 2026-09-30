@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { renameAtomic, syncDirectoryChain, writeFileAtomic, writeJsonAtomic, writeJsonAtomicAsync } from "../src/core/atomic-write.js";
+import { renameAtomic, syncDirectoryChain, syncPathNamespace, writeFileAtomic, writeJsonAtomic, writeJsonAtomicAsync } from "../src/core/atomic-write.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { MeshStore } from "../src/mesh/store.js";
 
@@ -16,18 +16,22 @@ const directoryChain = (directory: string): string[] => {
 };
 
 describe("#180 S4 physical directory ancestry", () => {
-  it.skipIf(process.platform === "win32").each(["target-leaf", "target-ancestor", "alias-parent"])("fails closed and retries %s across nested directory symlinks", (barrier) => {
+  it.skipIf(process.platform === "win32").each(["nested-component", "link-target"].flatMap((chain) =>
+    ["target-leaf", "target-ancestor", "alias-parent", "alias-ancestor"].map((barrier) => ({ chain, barrier })),
+  ))("fails closed and retries $barrier across $chain directory symlinks", ({ chain, barrier }) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-symlink-chain-"));
     const aliases = path.join(root, "aliases");
-    const intermediate = path.join(root, "intermediate");
+    const intermediate = path.join(root, "intermediate-tree", "leaf");
     const target = path.join(root, "physical", "leaf");
     fs.mkdirSync(aliases);
-    fs.mkdirSync(intermediate);
+    fs.mkdirSync(intermediate, { recursive: true });
     fs.mkdirSync(target, { recursive: true });
-    fs.symlinkSync(intermediate, path.join(aliases, "first"), "dir");
-    fs.symlinkSync(target, path.join(intermediate, "second"), "dir");
-    const directory = path.join(aliases, "first", "second");
-    const failingPath = { "target-leaf": target, "target-ancestor": path.dirname(target), "alias-parent": intermediate }[barrier]!;
+    const second = path.join(intermediate, "second");
+    fs.symlinkSync(path.relative(intermediate, target), second, "dir");
+    fs.symlinkSync(path.relative(aliases, chain === "link-target" ? second : intermediate), path.join(aliases, "first"), "dir");
+    const directory = chain === "link-target" ? path.join(aliases, "first") : path.join(aliases, "first", "second");
+    const failingPath = { "target-leaf": target, "target-ancestor": path.dirname(target),
+      "alias-parent": intermediate, "alias-ancestor": path.dirname(intermediate) }[barrier]!;
     const events: string[] = [];
     const descriptors = new Map<number, string>();
     const open = fs.openSync.bind(fs);
@@ -54,11 +58,68 @@ describe("#180 S4 physical directory ancestry", () => {
       syncDirectoryChain(directory);
       events.push("acknowledged");
       // Both physical targets and the directories containing both symlinks matter.
-      expect(events).toEqual([...directoryChain(target), intermediate, aliases, "acknowledged"]);
+      expect(events).toEqual([...new Set([...directoryChain(target), ...directoryChain(intermediate), ...directoryChain(aliases)]), "acknowledged"]);
     } finally {
       synced.mockRestore(); opened.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("#180 S4 hop-by-hop namespace confirmation", () => {
+  it.skipIf(process.platform === "win32").each([40, 41])("bounds a relative file-link chain at %s hops", (hops) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-hop-limit-"));
+    const target = path.join(root, "receipt");
+    fs.writeFileSync(target, "receipt");
+    for (let hop = hops - 1; hop >= 0; hop--) fs.symlinkSync(hop === hops - 1 ? "receipt" : `link-${hop + 1}`, path.join(root, `link-${hop}`));
+    try {
+      const confirm = () => syncPathNamespace(path.join(root, "link-0"), fs.statSync(target));
+      if (hops === 40) expect(confirm).not.toThrow();
+      else expect(confirm).toThrow("Namespace symlink loop or hop limit exceeded");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform === "win32")("detects a relative symlink loop before any barrier", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-hop-loop-"));
+    fs.symlinkSync("second", path.join(root, "first"));
+    fs.symlinkSync("first", path.join(root, "second"));
+    const synced = vi.spyOn(fs, "fsyncSync");
+    try {
+      expect(() => syncPathNamespace(path.join(root, "first"))).toThrow("Namespace symlink loop or hop limit exceeded");
+      expect(synced).not.toHaveBeenCalled();
+    } finally { synced.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform === "win32")("resolves dot-dot after following a target directory link", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-hop-dotdot-"));
+    fs.mkdirSync(path.join(root, "physical", "leaf"), { recursive: true });
+    const target = path.join(root, "physical", "receipt");
+    fs.writeFileSync(target, "receipt");
+    fs.symlinkSync("physical/leaf", path.join(root, "directory"), "dir");
+    fs.symlinkSync("directory/../receipt", path.join(root, "alias"));
+    try {
+      expect(() => syncPathNamespace(path.join(root, "alias"), fs.statSync(target))).not.toThrow();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a containing directory replaced before its barrier, then retries", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-hop-directory-race-"));
+    const directory = path.join(root, "namespace");
+    fs.mkdirSync(directory);
+    const open = fs.openSync.bind(fs);
+    let replaced = false;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      if (!replaced && String(file) === directory) {
+        replaced = true;
+        fs.renameSync(directory, path.join(root, "old"));
+        fs.mkdirSync(directory);
+      }
+      return open(file, flags, mode);
+    });
+    try {
+      expect(() => syncDirectoryChain(directory)).toThrow("Namespace directory changed before barrier");
+      expect(() => syncDirectoryChain(directory)).not.toThrow();
+    } finally { opened.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 });
 

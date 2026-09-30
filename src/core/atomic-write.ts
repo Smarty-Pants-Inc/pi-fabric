@@ -78,28 +78,98 @@ export const renameAtomic = (
   }
 };
 
-/** Establish every directory link through the filesystem root, even after a failed retry.
- * Existence is not a durability receipt; no cached/volatile ancestor is assumed durable.
- * Windows cannot open directories for fsync, so only directory barriers are skipped.
+type Inode = Pick<fs.Stats, "dev" | "ino">;
+const sameInode = (left: Inode, right: Inode): boolean => left.dev === right.dev && left.ino === right.ino;
+
+/** Confirm the complete reopenable namespace, not just realpath's collapsed endpoint.
+ * Every symlink's parent and the endpoint's directory owe barriers through the root.
+ * A second walk detects replacements, including links retargeted to the SAME inode.
+ * Windows skips unsupported directory fsync, but still binds the opened receipt.
  */
-export const syncDirectoryChain = (directory: string): void => {
-  if (process.platform === "win32") return;
-  const synced = new Set<string>();
-  for (let alias = path.resolve(directory); ; alias = path.dirname(alias)) {
-    // Lexical ancestry can omit the target tree of a directory symlink. Confirm
-    // its physical ancestry first, then the namespaces containing the aliases.
-    const physical = fs.realpathSync(alias);
-    for (let current = physical; ; current = path.dirname(current)) {
-      if (!synced.has(current)) {
-        const fd = fs.openSync(current, fs.constants.O_RDONLY);
-        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-        synced.add(current);
+export const syncPathNamespace = (target: string, receipt?: Inode): void => {
+  const walk = () => {
+    const absolute = path.isAbsolute(target) ? target : `${process.cwd()}${path.sep}${target}`;
+    const split = (value: string) => value.split(path.sep === "\\" ? /[\\/]+/ : /\/+/);
+    let current = path.parse(absolute).root;
+    let pending = split(absolute.slice(current.length)).filter(Boolean);
+    const entries: string[] = [];
+    const directories = new Map<string, fs.Stats>();
+    const parents: string[] = [];
+    const seen = new Set<string>();
+    let hops = 0;
+    const record = (file: string, stat: fs.Stats, link?: string) => {
+      entries.push(JSON.stringify([file, stat.dev, stat.ino, stat.mode & fs.constants.S_IFMT,
+        // A removed/recreated link can reuse its inode number; include its change time.
+        stat.isSymbolicLink() ? stat.ctimeMs : undefined, link]));
+      if (stat.isDirectory()) {
+        const previous = directories.get(file);
+        if (previous && !sameInode(previous, stat)) throw new Error("Namespace directory changed during resolution");
+        directories.set(file, stat);
       }
-      if (path.dirname(current) === current) break;
+    };
+    record(current, fs.lstatSync(current));
+    while (pending.length) {
+      const component = pending.shift()!;
+      if (component === ".") continue;
+      if (component === "..") { current = path.dirname(current); continue; }
+      const file = path.join(current, component);
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink()) {
+        const state = JSON.stringify([file, pending]);
+        if (++hops > 40 || seen.has(state)) throw new Error("Namespace symlink loop or hop limit exceeded");
+        seen.add(state);
+        const link = fs.readlinkSync(file);
+        const checked = fs.lstatSync(file);
+        if (!checked.isSymbolicLink() || !sameInode(stat, checked) || stat.ctimeMs !== checked.ctimeMs) {
+          throw new Error("Namespace link changed during resolution");
+        }
+        record(file, stat, link);
+        parents.push(current);
+        // Do not normalize '..' before following symlinks in the target itself.
+        if (path.isAbsolute(link)) {
+          current = path.parse(link).root;
+          record(current, fs.lstatSync(current));
+          pending = [...split(link.slice(current.length)).filter(Boolean), ...pending];
+        } else pending = [...split(link).filter(Boolean), ...pending];
+      } else {
+        record(file, stat);
+        if (pending.length && !stat.isDirectory()) throw new Error("Namespace component is not a directory");
+        current = file;
+      }
     }
-    // With no remaining symlink components, the full containing chain is done.
-    if (alias === physical) return;
+    const endpoint = fs.lstatSync(current);
+    record(current, endpoint);
+    if (receipt && !sameInode(receipt, endpoint)) throw new Error("Session receipt inode changed during namespace confirmation");
+    parents.push(endpoint.isDirectory() ? current : path.dirname(current));
+    return { entries, directories, parents };
+  };
+  const before = walk();
+  if (process.platform !== "win32") {
+    const synced = new Set<string>();
+    for (const parent of before.parents.reverse()) {
+      for (let current = parent; ; current = path.dirname(current)) {
+        if (!synced.has(current)) {
+          const fd = fs.openSync(current, fs.constants.O_RDONLY);
+          try {
+            const opened = fs.fstatSync(fd);
+            const expected = before.directories.get(current);
+            if (!opened.isDirectory() || !expected || !sameInode(opened, expected)) throw new Error("Namespace directory changed before barrier");
+            fs.fsyncSync(fd);
+          } finally { fs.closeSync(fd); }
+          synced.add(current);
+        }
+        if (path.dirname(current) === current) break;
+      }
+    }
   }
+  if (JSON.stringify(walk().entries) !== JSON.stringify(before.entries)) {
+    throw new Error("Namespace changed during durability barriers");
+  }
+};
+
+/** Existence is not a receipt; retry every required directory barrier without a cache. */
+export const syncDirectoryChain = (directory: string): void => {
+  if (process.platform !== "win32") syncPathNamespace(directory);
 };
 
 export const writeFileAtomic = (

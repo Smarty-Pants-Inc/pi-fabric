@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import path from "node:path";
-import { syncDirectoryChain, writeFileAtomic } from "./core/atomic-write.js";
+import { syncPathNamespace, writeFileAtomic } from "./core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 
@@ -610,25 +609,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       const stat = fs.fstatSync(fd);
       const size = stat.size;
       const identity = `${stat.dev}:${stat.ino}`;
-      // Opening the host's lexical session path follows file symlinks. Bind the
-      // receipt to that physical inode before syncing its actual namespace; the
-      // alias tree alone says nothing about a target created/replaced elsewhere.
-      const physical = fs.realpathSync(file);
-      const matchesReceipt = (target: string): boolean => {
-        const resolved = fs.statSync(target);
-        return resolved.dev === stat.dev && resolved.ino === stat.ino;
-      };
-      if (!matchesReceipt(physical)) throw new Error("Session receipt inode changed during resolution");
       fs.fsyncSync(fd);
-      syncDirectoryChain(path.dirname(physical));
-      // Also confirm any newly created/replaced alias and its containing links.
-      // We cannot assume a previously existing alias is already durable.
-      if (path.resolve(file) !== physical) syncDirectoryChain(path.dirname(file));
-      // A concurrent replacement/retarget during the barriers supplies no receipt.
-      // Recheck cached receipts too, before publishing an index or retiring data.
-      if (fs.realpathSync(file) !== physical || !matchesReceipt(physical)) {
-        throw new Error("Session receipt inode changed during namespace barriers");
-      }
+      // Bind every namespace hop (including hidden link targets) to the opened
+      // receipt inode, and recheck the walk after ALL required barriers. Any
+      // uncertain hop retains the journal/source and propagates duplicate retries.
+      syncPathNamespace(file, stat);
       if (this.#source !== file || this.#scanned === undefined || size < this.#scanned || this.#sessionFileIdentity !== identity) {
         this.#restartIndex(file);
       }

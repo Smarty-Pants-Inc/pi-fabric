@@ -161,7 +161,7 @@ class ResidentHost {
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
     this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
-      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS });
+      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     this.participants = new ParticipantDirectory(this.mesh, {
       enabled: true,
       hostId: this.hostId,

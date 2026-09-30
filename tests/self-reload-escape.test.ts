@@ -44,10 +44,14 @@ describe("self-reload after an idle Escape with the mesh off (pi-fabric#160)", (
     // This checkout is the loaded release; the profile then activates a newer one.
     const settings = path.join(agentDir, "settings.json");
     const activate = (source: string, bump: number): void => {
-      fs.writeFileSync(settings, JSON.stringify({ packages: [source] }));
+      fs.writeFileSync(settings, JSON.stringify({ packages: [source], extensions: [codeOld] }));
       const at = new Date(Date.now() + bump);
       fs.utimesSync(settings, at, at);
     };
+    const codeOld = path.join(root, "code-old.js");
+    const codeNext = path.join(root, "code-next.js");
+    fs.writeFileSync(codeOld, "export default () => {};\n");
+    fs.writeFileSync(codeNext, "export default () => {};\n");
     activate(process.cwd(), 0);
     const next = path.join(root, "releases", "next");
     fs.mkdirSync(next, { recursive: true });
@@ -79,8 +83,15 @@ describe("self-reload after an idle Escape with the mesh off (pi-fabric#160)", (
         onTerminalInput: (handler: (data: string) => unknown) => { terminalInputs.add(handler); return () => { terminalInputs.delete(handler); }; },
       }),
     }) as unknown as ExtensionContext;
+    const bus = new Map<string, Set<(data: unknown) => void>>();
     const pi = anyFn({
-      events: { emit: vi.fn(), on: vi.fn(() => () => undefined) },
+      events: {
+        emit: (topic: string, data: unknown) => { for (const handler of bus.get(topic) ?? []) handler(data); },
+        on: (topic: string, handler: (data: unknown) => void) => {
+          const listeners = bus.get(topic) ?? new Set(); listeners.add(handler); bus.set(topic, listeners);
+          return () => { listeners.delete(handler); };
+        },
+      },
       getActiveTools: () => [], getAllTools: () => [], getThinkingLevel: () => "off",
       on: (name: string, handler: Handler) => { handlers.set(name, [...handlers.get(name) ?? [], handler]); },
       registerCommand: (name: string, command: { handler: (args: string, context: ExtensionContext) => Promise<void> }) => {
@@ -99,6 +110,22 @@ describe("self-reload after an idle Escape with the mesh off (pi-fabric#160)", (
     await piFabric(pi);
     try {
       await emit("session_start", { type: "session_start", reason: "startup" });
+      // Exercise the production wiring through the public bus. Even with input checks present,
+      // the pinned public UI API cannot establish a global dialog/editor-clear proof.
+      const results: unknown[] = [];
+      pi.events.on("pi-fabric:reload-target:v1:result", data => { results.push(data); });
+      expect(bus.get("pi-fabric:reload-target:v1")?.size).toBeGreaterThan(0);
+      pi.events.emit("pi-fabric:reload-target:v1", { requestId: "code-bind", owner: "smarty-code", resource: codeOld,
+        loaded: codeOld, configured: codeOld, reason: "startup binding" });
+      await vi.waitFor(() => expect(results.at(-1)).toMatchObject({ requestId: "code-bind", accepted: true, reason: "bound-unchanged" }));
+      fs.writeFileSync(settings, JSON.stringify({ packages: [process.cwd()], extensions: [codeNext] }));
+      pi.events.emit("pi-fabric:reload-target:v1", { requestId: "code-update", owner: "smarty-code", resource: codeOld,
+        loaded: codeOld, configured: codeNext, reason: "Code-only install" });
+      await vi.waitFor(() => expect(results.at(-1)).toMatchObject({ requestId: "code-update", accepted: false,
+        reason: "unsupported-host:global-dialog/editor-hold-query", target: codeNext }));
+      expect(sent).toEqual([]); expect(reload).not.toHaveBeenCalled();
+      // Restore Code's pointer; the existing Fabric-only Escape test continues unchanged.
+      activate(process.cwd(), 1);
       await state!.ensure(context); // first fabric_exec: activation installs the Escape handler
       expect(state!.config.mesh.enabled).toBe(mesh);
       expect(terminalInputs.size).toBeGreaterThan(0);

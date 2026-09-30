@@ -27,15 +27,13 @@ export const resolveAgentDir = (): string => {
 
 // Shared with self-reload and spawn admission. Kept in this existing cheap core module so
 // code splitting does not create an additional eager startup chunk for release selectors.
-const FABRIC_PACKAGE_NAME = "pi-fabric";
 export const SELF_RELOAD_COMMAND = "fabric-release-reload";
 
-const packageName = (root: string): string | undefined => {
+const isFabricPackage = (root: string): boolean => {
   try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as { name?: unknown };
-    return typeof parsed.name === "string" ? parsed.name : undefined;
+    return (JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as { name?: unknown }).name === "pi-fabric";
   } catch {
-    return undefined;
+    return false;
   }
 };
 
@@ -48,7 +46,7 @@ export const loadedFabricRoot = (moduleUrl: string): string | undefined => {
   let directory: string;
   try { directory = path.dirname(fileURLToPath(moduleUrl)); } catch { return undefined; }
   for (;;) {
-    if (packageName(directory) === FABRIC_PACKAGE_NAME) return real(directory);
+    if (isFabricPackage(directory)) return real(directory);
     const parent = path.dirname(directory);
     if (parent === directory) return undefined;
     directory = parent;
@@ -70,7 +68,7 @@ export const activeFabricRoot = (settingsPath: string): string | undefined => {
     if (typeof source !== "string" || /^(npm|git|https?):/.test(source)) return [];
     const expanded = source.startsWith("~/") ? path.join(process.env.HOME ?? "", source.slice(2)) : source;
     const root = path.resolve(base, expanded);
-    return packageName(root) === FABRIC_PACKAGE_NAME ? [real(root)] : [];
+    return isFabricPackage(root) ? [real(root)] : [];
   });
   return roots.length === 1 ? roots[0] : undefined;
 };

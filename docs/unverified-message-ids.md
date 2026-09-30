@@ -14,7 +14,17 @@ A checker/import/history failure produces `unverified ids: check failed` in both
 places and still attempts the send. The delivered marker is optional at admission:
 if a marked send gets an explicit, pre-admission mesh/actor payload or Main
 follow-up quota refusal, Fabric makes one attempt with the original text and keeps
-the sender-side notice. These refusals occur before persistence/enqueueing, so no
+the sender-side notice. When the marker cannot fit under a route's limit, the
+send wins: the recipient gets the original text and only the sender gets the
+notice. Org accepted this exact near-limit exception on pi-fabric#179
+([comment 5911395961](https://github.com/Smarty-Pants-Inc/pi-fabric/pull/179#issuecomment-5911395961))
+with two conditions: the sender's notice explicitly adds
+`(recipient marker omitted: message at the route size limit)`, and each successful
+unmarked delivery writes one structured `recipient-marker-omitted` line with its
+public route (`agents.followUp`, `agents.steer`, or `mesh.publish`) and a running
+process-local `count` to Fabric's existing `[pi-fabric]` stderr diagnostic log.
+The counter spans all routes and resets on process restart; no new store is used.
+These refusals occur before persistence/enqueueing, so no
 message is duplicated. A remote owner's explicit admission rejection follows the
 same rule. Timeouts, unknown outcomes, stalled-but-accepted queues and all other
 delivery failures are **not** retried. Original payload/queue limits, capability
@@ -36,10 +46,27 @@ an outgoing SHA candidate.
 | Git SHA | 7–40 hex digits only after the whole word `sha`, `commit`, `head`, `base`, `revision`, or `rev`, separated by horizontal whitespace or `:` / `=` (optional JSON key/value quotes); or alone inside a single pair of inline backticks, not a triple-backtick fence |
 | GitHub comment | 9–10 decimal digits after `#issuecomment-`, or `comment` with zero or more horizontal-space / `:` / `=` / `#` / `-` separators |
 | PID | 1–10 decimal digits after `pid`, with those same separators |
+| GitHub issue/PR | `owner/repo#N`; repository-only `repo#N` or bare `#N` with at least 3 digits; or `https://github.com/<owner>/<repo>/(issues\|pull)/N` |
 
 An explicitly SHA-qualified 32-hex token is a SHA abbreviation, not also an
-actor/run at that position. Raw full SHAs and ordinary issue numbers are not
-outgoing candidates. A read may contain a raw identifier (e.g. git stdout or
+actor/run at that position. Raw full SHAs, naked decimal numbers, bare `#1` /
+`#12`, and heading markers such as `# Title` are not outgoing candidates.
+A hash-separated legacy comment or PID (for example `comment #1234567890`
+or `pid#987654`) belongs only to its own class, not also to the issue/PR class.
+Reading that legacy form does not establish an issue read with the same number.
+Issue and pull URLs normalize to `owner/repo#N` in notices and read matching.
+Qualified forms preserve repository identity, case-insensitively. Repository-only
+`repo#N` matches qualified references and URLs with that repository name and number,
+under any owner; different repository names remain distinct. `C#` / `F#` language
+tokens, `issue#` without digits, and repository-only references with fewer than
+three digits are not candidates. A bare `#N`
+read matches qualified references with that number; an outgoing bare `#N`
+matches a read from any repository with that number. Different qualified
+repositories remain distinct. An `#issuecomment-` URL anchor is also checked as
+its own comment identifier. Issue evidence needs a reference form, so raw
+numbers in API output do not establish an issue read.
+
+For the other classes, a read may contain a raw identifier (e.g. git stdout or
 JSON API output). SHA abbreviations must be exact tokens or prefixes of a
 7–40-hex read token; a raw 32-hex actor prefix alone is not SHA evidence, whereas
 a SHA-qualified 32-hex read is. Comment/PID labels are normalized in notices.
@@ -106,6 +133,8 @@ limits, no retry of unknown delivery outcomes, and native self/mixed inbox batch
 The provider replay covers actual session reads, untouched
 no-ID text, failure-open sends, self/receipt echoes, all standalone local/remote
 routing branches, hosted child/peer ports and actual local durable mesh writes.
+The same five surfaces cover unread/read issue and PR references, URL/qualified/
+bare mixed-form normalization, comment anchors and issue send-receipt exclusion.
 `tests/unverified-ids.test.ts` covers boundaries, budgets and mixed-format reads;
 `tests/unverified-ids-startup.test.ts` covers cold registration, idle hooks,
 no-ID sends and first use. Guest types expose the optional receipt notice.

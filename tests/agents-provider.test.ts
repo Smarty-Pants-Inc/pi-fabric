@@ -1801,7 +1801,10 @@ describe("AgentsProvider shared actor definitions", () => {
       "host:resident",
       participant.id,
       "ask",
-      { message: "PING" },
+      {
+        message: "PING",
+        bindingProvenance: { kind: "owner-defaults", rootId: "session:test" },
+      },
       "identity:resident",
       { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000 },
     );
@@ -1814,7 +1817,10 @@ describe("AgentsProvider shared actor definitions", () => {
       "host:resident",
       participant.id,
       "followUp",
-      expect.objectContaining({ message: "queue" }),
+      expect.objectContaining({
+        message: "queue",
+        bindingProvenance: { kind: "owner-defaults", rootId: "session:test" },
+      }),
       "identity:resident",
     );
   });

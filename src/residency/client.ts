@@ -28,6 +28,7 @@ import {
   type ResidentAgentMetadata,
   type ResidentCommand,
   type ResidentCommandResponse,
+  type ResidentActorMutation,
   type ResidentDeliveryRecord,
   type ResidentHostConfig,
   type ResidentHostOwner,
@@ -263,6 +264,37 @@ export class ResidencyClient {
     if (!response.actor) throw new Error("Fabric resident host returned no actor");
     await this.#waitForParticipant(response.actor.id, "actor");
     return response.actor;
+  }
+
+  /** Setters/status use only an existing owner, never create hidden residency. */
+  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal): Promise<FabricActorInfo> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      ...mutation, format: RESIDENT_HOST_FORMAT, requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor from setter");
+    return response.actor;
+  }
+
+  async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_HOST_FORMAT, operation: "actorStatus", id,
+      requestId: randomUUID(), rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor status");
+    return response.actor;
+  }
+
+  async actors(signal?: AbortSignal): Promise<FabricActorInfo[]> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_HOST_FORMAT, operation: "actors", requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actors) throw new Error("Resident host returned no actors");
+    return response.actors;
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {

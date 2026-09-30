@@ -4,7 +4,8 @@ import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
-import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
+import type { FabricThinking } from "../thinking.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
@@ -213,12 +214,37 @@ interface ResidentCreateActorCommand {
   createdAt: number;
 }
 
+/** Root-owned registry operations; these never start a resident host. */
+export type ResidentActorMutation =
+  | { operation: "setInstructions"; id: string; instructions: string }
+  | { operation: "setModel"; id: string; model?: string; scope: FabricActorBindingScope }
+  | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
+  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null };
+
+type ResidentActorMutationCommand = ResidentActorMutation & {
+  format: typeof RESIDENT_HOST_FORMAT;
+  requestId: string;
+  rootId: string;
+  createdAt: number;
+};
+
+interface ResidentActorStatusCommand {
+  format: typeof RESIDENT_HOST_FORMAT;
+  operation: "actorStatus" | "actors";
+  requestId: string;
+  rootId: string;
+  id?: string;
+  createdAt: number;
+}
+
 export type ResidentCommand =
   | ResidentSpawnCommand
   | ResidentCleanupCommand
   | ResidentForegroundCommand
   | ResidentRemoveActorCommand
-  | ResidentCreateActorCommand;
+  | ResidentCreateActorCommand
+  | ResidentActorMutationCommand
+  | ResidentActorStatusCommand;
 
 export interface ResidentCommandResponse {
   format: typeof RESIDENT_HOST_FORMAT;
@@ -226,6 +252,7 @@ export interface ResidentCommandResponse {
   ok: boolean;
   handle?: AgentHandleInfo;
   actor?: FabricActorInfo;
+  actors?: FabricActorInfo[];
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   error?: string;

@@ -19,7 +19,7 @@ import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mesh/store.js";
-import { FabricControlPlane, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
@@ -39,6 +39,8 @@ import { deliveryRoot, projectOf } from "../topology/project-identity.js";
 
 const REQUEST_POLL_MS = 50;
 const IDLE_EXIT_MS = 30_000;
+// Match root reply routing: a briefly late heartbeat is not proof that Main ended.
+const ROOT_LEASE_GRACE_MS = 5 * 60_000;
 const COMPLETION_MAX_CHARS = 8_000;
 
 const delay = (ms: number): Promise<void> =>
@@ -266,8 +268,9 @@ class ResidentHost {
       const participant = this.participants.get(id);
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
-    const lineageAlive = (rootId: string): boolean =>
-      this.participants.get(rootId) !== undefined;
+    const lineageAlive = (rootId: string): boolean => rootId === config.rootId
+      ? this.#rootSessionLive()
+      : this.participants.get(rootId) !== undefined;
     const actorRoots = config.sessionActorRoot
       ? { project: config.actorRoot, session: config.sessionActorRoot }
       : config.mesh.actorScope === "session"
@@ -303,6 +306,7 @@ class ResidentHost {
         canManageActor,
         lineageAlive,
         claimResidency: "durable",
+        hostSessionActors: true,
         rootId: config.rootId,
         // Recorded on every actor it creates, and the only project whose orphans it adopts, and
         // then only as a project agent's host.
@@ -403,7 +407,7 @@ class ResidentHost {
 
   async #acceptControl(
     command: FabricControlCommand,
-    _from: MeshIdentity,
+    from: MeshIdentity,
     signal?: AbortSignal,
   ): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
@@ -442,7 +446,8 @@ class ResidentHost {
           message,
           command.data,
           signal,
-          command.binding !== undefined ? { binding: command.binding } : {},
+          controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+            this.participants.get(from.id)?.rootId),
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -464,11 +469,11 @@ class ResidentHost {
       if (!this.actors.owns(command.targetId)) {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
-      const binding = await this.actors.resolveActivationBinding(
-        command.targetId,
-        command.binding !== undefined ? { binding: command.binding } : {},
-      );
-      const result = this.actors.tell(command.targetId, message, command.data, { binding });
+      const options = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+        this.participants.get(from.id)?.rootId);
+      // Validate now without turning the resolved owner defaults into per-call overrides.
+      await this.actors.resolveActivationBinding(command.targetId, options);
+      const result = this.actors.tell(command.targetId, message, command.data, options);
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       return { accepted: false, error: errorMessage(error) };
@@ -565,6 +570,15 @@ class ResidentHost {
     if (this.#pollingRequests || this.#closed) return;
     this.#pollingRequests = true;
     try {
+      // A resident registry does not extend Main's session. Durable actors are deliberately
+      // excluded, including when their root has died and their delivery moves to the project.
+      if (!this.#rootSessionLive()) {
+        for (const actor of this.actors.listOwned()) {
+          if (actor.rootId === this.config.rootId && actor.residency === "session" && !actor.removal) {
+            await this.actors.remove(actor.id, { wait: false });
+          }
+        }
+      }
       let entries: string[];
       try {
         entries = fs.readdirSync(this.#requestsPath).filter((entry) => entry.endsWith(".json"));
@@ -587,10 +601,18 @@ class ResidentHost {
     }
   }
 
+  #rootSessionLive(): boolean {
+    const root = this.participants.get(this.config.rootId);
+    if (root) return root.kind === "root" && root.status !== "stopping" && !root.stale;
+    const known = this.participants.lastKnown(this.config.rootId);
+    return known?.participant.kind === "root" && known.participant.status !== "stopping" &&
+      !known.participant.remoteHost && known.lapsedMs < ROOT_LEASE_GRACE_MS;
+  }
+
   #checkIdle(): void {
     const activeActor = this.actors
       .listOwned()
-      .some((actor) => actor.residency === "durable" && actor.status !== "stopped");
+      .some((actor) => actor.status !== "stopped");
     const activeAgent = this.agents
       .listForUi()
       .some((agent) => agent.status === "queued" || agent.status === "running");
@@ -676,8 +698,8 @@ class ResidentHost {
           completedAt: Date.now(),
         };
       } else if (command.operation === "createActor") {
-        if (command.request.residency !== "durable") {
-          throw new Error("Resident host createActor only supports durable residency");
+        if (command.request.residency !== "durable" && !this.#rootSessionLive()) {
+          throw new Error("Root session has ended; cannot create a session actor");
         }
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
@@ -690,9 +712,30 @@ class ResidentHost {
           actor: actor as FabricActorInfo,
           completedAt: Date.now(),
         };
+      } else if (command.operation === "actors") {
+        response = {
+          format: RESIDENT_HOST_FORMAT, requestId, ok: true,
+          actors: this.actors.listOwned().filter((actor) => actor.rootId === this.config.rootId),
+          completedAt: Date.now(),
+        };
+      } else if (command.operation !== "removeActor") {
+        const actor = this.actors.status(String(command.id));
+        if (actor.rootId !== this.config.rootId || !this.actors.owns(actor.id)) {
+          throw new Error(`Resident host does not own root actor ${actor.id}`);
+        }
+        let updated: FabricActorInfo;
+        switch (command.operation) {
+          case "actorStatus": updated = actor; break;
+          case "setInstructions": updated = await this.actors.setInstructions(actor.id, command.instructions); break;
+          case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope); break;
+          case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope); break;
+          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter); break;
+          default: throw new Error("Unknown resident actor operation");
+        }
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, completedAt: Date.now() };
       } else {
-        if (!this.actors.owns(command.id)) {
-          throw new Error(`Resident host does not own ${command.id}`);
+        if (!this.actors.owns(command.id) || this.actors.status(command.id).rootId !== this.config.rootId) {
+          throw new Error(`Resident host does not own root actor ${command.id}`);
         }
         // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
         const removed = await this.actors.remove(command.id, { wait: false });

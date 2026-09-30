@@ -1198,6 +1198,64 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     }
   });
 
+  it("applies resident root setters to actual launches and returns authoritative effective status", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-setters");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    const control = new FabricControlPlane(state.mesh, state.identity, { enabled: true, hostId: state.identity.id, pollMs: 20 });
+    control.start(() => ({ accepted: false }));
+    try {
+      const durable = await client.createActor({ name: "effective durable", instructions: "Before", residency: "durable", model: "provider/visible", thinking: "low" });
+      const session = await new ResidentActorClient(state.config.meshRoot, state.identity.id).createActor({ name: "effective session", instructions: "Before", residency: "session", model: "provider/visible", thinking: "low" });
+      for (const actor of [durable, session]) {
+        await client.setActor({ operation: "setInstructions", id: actor.id, instructions: "After" });
+        await client.setActor({ operation: "setModel", id: actor.id, model: "deepseek/deepseek-chat", scope: "session" });
+        await client.setActor({ operation: "setThinking", id: actor.id, thinking: "max", scope: "session" });
+        await client.setActor({ operation: "setActivationFilter", id: actor.id, activationFilter: [] });
+        await expect(client.actorStatus(actor.id)).resolves.toMatchObject({ model: "deepseek/deepseek-chat", thinking: "max", instructionsLength: 5, projectDefaults: { model: "provider/visible", thinking: "low" } });
+        const asked = await control.requestResult<FabricActorMessage>(client.hostId, actor.id, "ask", {
+          message: "ECHO_MODEL effective", bindingProvenance: { kind: "owner-defaults", rootId: state.identity.id },
+        }, client.hostId, { timeoutMs: 20_000 });
+        expect(asked.text).toBe("model deepseek/deepseek-chat");
+        const runFile = path.join(actor.logDir!, asked.runId!, "status.json");
+        await waitFor(() => fs.existsSync(runFile));
+        expect(JSON.parse(fs.readFileSync(runFile, "utf8"))).toMatchObject({ model: "deepseek/deepseek-chat", thinking: "max" });
+        const bindings = fs.readdirSync(path.join(state.config.actorRoot, "bindings")).filter((name) => name.endsWith(".json"))
+          .map((name) => JSON.parse(fs.readFileSync(path.join(state.config.actorRoot, "bindings", name), "utf8")));
+        expect(bindings.some((file) => file.bindings[actor.id]?.model === "deepseek/deepseek-chat" && file.bindings[actor.id]?.thinking === "max")).toBe(true);
+      }
+      await stopResident(state.config); await client.ensureHost();
+      for (const actor of [durable, session]) {
+        const asked = await control.requestResult<FabricActorMessage>(client.hostId, actor.id, "ask", {
+          message: "ECHO_MODEL persisted", bindingProvenance: { kind: "owner-defaults", rootId: state.identity.id },
+        }, client.hostId, { timeoutMs: 20_000 });
+        expect(asked.text).toBe("model deepseek/deepseek-chat");
+        const runFile = path.join(actor.logDir!, asked.runId!, "status.json");
+        await waitFor(() => fs.existsSync(runFile));
+        expect(JSON.parse(fs.readFileSync(runFile, "utf8"))).toMatchObject({ model: "deepseek/deepseek-chat", thinking: "max" });
+        await client.removeActor(actor.id);
+      }
+    } finally { await control.close(); await client.close(); await state.participants.close(); }
+  });
+
+  it("routes own-root session create/remove and ends those actors with Main while durable actors survive", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-session-lifetime");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    try {
+      const durable = await client.createActor({ name: "durable counterexample", instructions: "Survive", residency: "durable" });
+      const nested = new ResidentActorClient(state.config.meshRoot, state.identity.id);
+      const removed = await nested.createActor({ name: "session removed", instructions: "Watch", residency: "session", scope: "session" });
+      await nested.removeActor(removed.id);
+      await expect(nested.actorStatus(removed.id)).rejects.toThrow("Unknown Fabric actor");
+      const session = await nested.createActor({ name: "session ends", instructions: "Watch", residency: "session", scope: "session" });
+      await expect(nested.actorStatus(session.id)).resolves.toMatchObject({ residency: "session", rootId: state.identity.id });
+      await state.participants.close();
+      await waitFor(() => !fs.existsSync(path.dirname(session.sessionFile!)), 15_000);
+      await expect(client.actorStatus(durable.id)).resolves.toMatchObject({ id: durable.id, residency: "durable", status: "idle" });
+      await expect(nested.createActor({ name: "after root death", instructions: "Watch", residency: "session" })).rejects.toThrow("Root session has ended");
+      await client.removeActor(durable.id);
+    } finally { await client.close(); await state.participants.close(); }
+  });
+
   it("rejects a durable actor model that became hidden at the resident owner", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-hidden-model");
     const client = new ResidencyClient({

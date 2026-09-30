@@ -11,6 +11,7 @@ import {
   sleepUnlessAborted,
   type ResidentCommand,
   type ResidentCommandResponse,
+  type ResidentActorMutation,
 } from "./protocol.js";
 
 const COMMAND_TIMEOUT_MS = 30_000;
@@ -52,6 +53,40 @@ export class ResidentActorClient {
     return new ResidentActorClient(meshRoot, rootId);
   }
 
+  isLive(): boolean {
+    const owner = readJson<{ pid?: number }>(this.#ownerPath);
+    if (!owner?.pid || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) return false;
+    try { process.kill(owner.pid, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+  }
+
+  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal): Promise<FabricActorInfo> {
+    const response = await this.#send({
+      ...mutation, format: RESIDENT_HOST_FORMAT, requestId: randomUUID(),
+      rootId: this.#rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor from setter");
+    return response.actor;
+  }
+
+  async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
+    const response = await this.#send({
+      format: RESIDENT_HOST_FORMAT, operation: "actorStatus", id,
+      requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor status");
+    return response.actor;
+  }
+
+  async actors(signal?: AbortSignal): Promise<FabricActorInfo[]> {
+    const response = await this.#send({
+      format: RESIDENT_HOST_FORMAT, operation: "actors", requestId: randomUUID(),
+      rootId: this.#rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actors) throw new Error("Resident host returned no actors");
+    return response.actors;
+  }
+
   async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
@@ -78,6 +113,7 @@ export class ResidentActorClient {
   }
 
   async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    if (!this.isLive()) throw new Error("Root resident host is not live");
     fs.mkdirSync(this.#requestsPath, { recursive: true });
     writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);

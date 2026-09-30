@@ -63,7 +63,9 @@ interface ActorQueueItem {
   createdAt: number;
   coalesceKey?: string;
   activation: FabricActorActivation;
+  /** Only supplied fields are pinned; defaults are resolved at launch. */
   binding: FabricActorRunBinding;
+  bindingVersion?: 2;
   resolve?: (message: FabricActorMessage) => void;
   reject?: (error: Error) => void;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
@@ -100,6 +102,8 @@ interface ManagedActor {
   filteredCount?: number;
   lastFilteredAt?: number;
   residency: FabricParticipantResidency;
+  /** Session execution belongs to the root's existing resident registry, not Main/adopters. */
+  residentSession?: boolean;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
@@ -311,6 +315,7 @@ export class ActorManager {
   readonly #resolvePiModel: ((model: string) => string | Promise<string>) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
+  readonly #hostSessionActors: boolean;
   readonly #rootId: string;
   readonly #project: string | undefined;
   readonly #role: string | undefined;
@@ -379,6 +384,8 @@ export class ActorManager {
       lineageAlive?: (rootId: string) => boolean;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
+      /** Resident hosts may own their root's session actors, never adopt foreign session actors. */
+      hostSessionActors?: boolean;
       rootId?: string;
       /** This root's project and fleet role, which decide what it may adopt (smarty-dev#878). */
       project?: string | undefined;
@@ -419,6 +426,7 @@ export class ActorManager {
     this.#lineageAlive = options.lineageAlive;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
+    this.#hostSessionActors = options.hostSessionActors ?? false;
     this.#rootId = options.rootId ?? identity.id;
     this.#project = options.project;
     this.#role = options.role;
@@ -480,8 +488,8 @@ export class ActorManager {
   }
 
   /**
-   * Create an actor. The asRegistryOwner option is reserved for explicitly
-   * durable requests arriving through the resident host control channel. That
+   * Create an actor. The asRegistryOwner option is reserved for root-owned
+   * requests arriving through the resident host control channel. That
    * host already is the authoritative registry owner, so the foreign-live-actor
    * guard—which protects against concurrent local starters—must not veto the
    * request while a transferred actor still advertises its creating host.
@@ -491,7 +499,8 @@ export class ActorManager {
     { asRegistryOwner = false }: { asRegistryOwner?: boolean } = {},
   ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
-    const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
+    const registryOwnerCreate = asRegistryOwner &&
+      (request.residency === "durable" || this.#hostSessionActors);
     if (
       !registryOwnerCreate &&
       [...this.#actors.values()].some(
@@ -568,6 +577,7 @@ export class ActorManager {
       ...(request.coalesceKey ? { coalesceKey: request.coalesceKey } : {}),
       ...(activationFilter?.length ? { activationFilter } : {}),
       residency,
+      ...(registryOwnerCreate && this.#hostSessionActors && residency === "session" ? { residentSession: true } : {}),
       runner,
       ...(kernel ? { kernel } : {}),
       ...(pythonRuntime ? { pythonRuntime } : {}),
@@ -652,7 +662,7 @@ export class ActorManager {
     return this.#canManage(actor.id);
   }
 
-  /** Resolve the immutable model/thinking view that a direct activation will pin. */
+  /** Resolve a caller-local view for foreign routing; own-root defaults stay dynamic. */
   resolveBinding(
     id: string,
     overrides: FabricActorRunBinding = {},
@@ -1675,9 +1685,7 @@ export class ActorManager {
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
-    const unresolved = options.binding !== undefined
-      ? this.#validatedRunBinding(options.binding)
-      : this.#runBinding(actor, options.overrides);
+    const unresolved = this.#validatedRunBinding(options.binding ?? options.overrides ?? {});
     // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
     // learns at once. A resolver that may refresh the registry is async: #drain resolves the
     // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
@@ -1699,6 +1707,7 @@ export class ActorManager {
         existing.createdAt = createdAt;
         existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
         existing.binding = binding;
+        existing.bindingVersion = 2;
         this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
         return existing;
@@ -1721,6 +1730,7 @@ export class ActorManager {
       createdAt,
       activation: this.#activation(itemId, source, payload, sequence, createdAt),
       binding,
+      bindingVersion: 2,
       ...(options.resolve ? { resolve: options.resolve } : {}),
       ...(options.reject ? { reject: options.reject } : {}),
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
@@ -1774,6 +1784,7 @@ export class ActorManager {
       this.#draining.has(actor.id) ||
       actor.status === "stopped" ||
       this.#closing ||
+      (actor.residentSession && this.#hostSessionActors && this.#lineageAlive?.(actor.rootId) === false) ||
       !this.#canManage(actor.id)
     ) {
       return;
@@ -1794,6 +1805,7 @@ export class ActorManager {
         actor.queue.length > 0 &&
         actor.status !== "stopped" &&
         !this.#closing &&
+        !(actor.residentSession && this.#hostSessionActors && this.#lineageAlive?.(actor.rootId) === false) &&
         this.#canManage(actor.id)
       ) {
         const reset = this.#resetAtBoundary(actor);
@@ -1868,9 +1880,12 @@ export class ActorManager {
             delete actor.capabilityDigest;
           }
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
-          item.binding = await this.#resolvedRunBinding(actor, item.binding);
+          const launchBinding = await this.#resolvedRunBinding(actor, this.#runBinding(actor, item.binding));
+          if (actor.residentSession && this.#hostSessionActors && this.#lineageAlive?.(actor.rootId) === false) {
+            throw new Error("Root session ended before actor launch");
+          }
           const result = await this.agents.run(
-            this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
+            this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
             (handle) => {
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
@@ -2094,6 +2109,7 @@ export class ActorManager {
   #runRequest(
     actor: ManagedActor,
     item: ActorQueueItem,
+    binding: FabricActorRunBinding,
     inferenceContext: FabricActorInferenceContext | undefined,
     capabilityRequirements?: string[],
     capabilityDigest?: string,
@@ -2124,8 +2140,8 @@ export class ActorManager {
         ? { schema: directiveSchema, ...(actor.runner === "pi" ? { replyTool: true } : {}) }
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
-      ...(item.binding.model ? { model: item.binding.model } : {}),
-      ...(item.binding.thinking ? { thinking: item.binding.thinking } : {}),
+      ...(binding.model ? { model: binding.model } : {}),
+      ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
@@ -2574,6 +2590,7 @@ export class ActorManager {
       triggerTurn: actor.triggerTurn,
       coalesce: actor.coalesce,
       residency: actor.residency,
+      ...(actor.residentSession ? { residentSession: true } : {}),
       runner: actor.runner,
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
@@ -2762,6 +2779,7 @@ export class ActorManager {
         triggerTurn,
         coalesce: record.coalesce !== false,
         residency: record.residency === "durable" ? "durable" : "session",
+        ...(record.residentSession === true ? { residentSession: true } : {}),
         runner: record.runner === "claude" ? "claude" : "pi",
         // Legacy Pi sessions were TypeScript-only. Do not change their language
         // when the current host happens to select Python after a restart.
@@ -2891,7 +2909,8 @@ export class ActorManager {
   }
 
   #ownQueueFile(actor: ManagedActor): string {
-    return this.#queueFile(actor.id, this.#rootId, this.#claimResidency ?? actor.residency);
+    return this.#queueFile(actor.id, this.#rootId,
+      this.#hostSessionActors && actor.residentSession ? "resident-session" : this.#claimResidency ?? actor.residency);
   }
 
   // Returns whether this lineage's file now holds the actor's work. Only then are the predecessor
@@ -2913,7 +2932,7 @@ export class ActorManager {
         try {
           return [JSON.parse(JSON.stringify({
             id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
-            activation: item.activation, binding: item.binding,
+            activation: item.activation, binding: item.binding, bindingVersion: 2,
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
@@ -3016,7 +3035,11 @@ export class ActorManager {
         payload: value.payload,
         createdAt: value.createdAt,
         activation: shift(value.activation as FabricActorActivation),
-        binding: typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        // Old mesh/host bindings were enqueue-time defaults. Old direct bindings may be
+        // genuine per-call values: preserve them conservatively. New records carry raw fields.
+        binding: (value.bindingVersion === 2 || value.source === "direct") &&
+          typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        bindingVersion: 2,
         ...(Array.isArray(value.images) ? { images: value.images } : {}),
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
@@ -3191,14 +3214,17 @@ export class ActorManager {
       return false;
     }
 
+    if (actor?.residentSession && !this.#hostSessionActors) return false;
     if (this.#locallyCreated.has(id)) return true;
     if (actor && this.#claimResidency !== undefined) {
-      return actor.residency === this.#claimResidency;
+      return actor.residency === this.#claimResidency ||
+        (this.#hostSessionActors && actor.residentSession === true && actor.rootId === this.#rootId && actor.residency === "session");
     }
     return this.#canManageActor === undefined;
   }
 
   #maybeAdoptOrphan(actor: ManagedActor): void {
+    if (actor.residentSession) return; // session lifetime cannot move to a different root
     if (
       !this.#persistent ||
       this.#closing ||
@@ -3443,6 +3469,7 @@ export class ActorManager {
         first.createdAt = item.createdAt;
         first.activation = { ...item.activation, id: first.id };
         first.binding = item.binding;
+        first.bindingVersion = 2;
       }
       if (item.resumed) first.resumed = true;
       merged.add(item);

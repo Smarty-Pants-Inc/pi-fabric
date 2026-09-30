@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import type { FabricActorRunBinding } from "../actors/types.js";
+import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
@@ -41,6 +41,7 @@ export interface FabricControlCommand {
   data?: unknown;
   triggerTurn?: boolean;
   binding?: FabricActorRunBinding;
+  bindingProvenance?: FabricActorBindingProvenance;
   cancelCommandId?: string;
   requestedAt: number;
   deadlineAt?: number;
@@ -132,6 +133,9 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
     typeof data.requestedAt !== "number" ||
     (data.deadlineAt !== undefined && typeof data.deadlineAt !== "number") ||
     (data.operation === "cancel" && typeof data.cancelCommandId !== "string") ||
+    (data.bindingProvenance !== undefined &&
+      (!isObject(data.bindingProvenance) || data.bindingProvenance.kind !== "owner-defaults" ||
+        typeof data.bindingProvenance.rootId !== "string")) ||
     (data.binding !== undefined &&
       (!isObject(data.binding) ||
         (data.binding.model !== undefined && typeof data.binding.model !== "string") ||
@@ -180,7 +184,27 @@ export interface FabricControlInput {
   data?: unknown;
   triggerTurn?: boolean;
   binding?: FabricActorRunBinding;
+  bindingProvenance?: FabricActorBindingProvenance;
 }
+
+/** Trust owner-default provenance only from a validated member of that actor's root. */
+export const controlActorBindingOptions = (
+  command: Pick<FabricControlCommand, "binding" | "bindingProvenance">,
+  from: MeshIdentity,
+  actorRootId: string | undefined,
+  senderRootId: string | undefined,
+): { overrides?: FabricActorRunBinding; binding?: FabricActorRunBinding } => {
+  const provenance = command.bindingProvenance;
+  if (provenance) {
+    if (provenance.kind !== "owner-defaults" || !actorRootId || provenance.rootId !== actorRootId ||
+      (from.id !== actorRootId && senderRootId !== actorRootId)) {
+      throw new Error("Invalid actor owner-default binding provenance");
+    }
+    return { overrides: command.binding ?? {} };
+  }
+  // Legacy direct/foreign callers may intentionally supply a resolved session view.
+  return command.binding !== undefined ? { binding: command.binding } : {};
+};
 
 export interface FabricControlRequestOptions {
   timeoutMs?: number;
@@ -388,6 +412,7 @@ export class FabricControlPlane {
           ...(input.data !== undefined ? { data: input.data } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
           ...(input.binding !== undefined ? { binding: input.binding } : {}),
+          ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
           requestedAt: committedAt,
           deadlineAt: committedAt + timeoutMs,
         }),

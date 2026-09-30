@@ -1145,18 +1145,19 @@ export class AgentManager {
   /**
    * Waits for a run's result and consumes it. With timeoutMs, a run still going at the bound is
    * detached instead (smarty-dev#854): it continues, nothing is consumed, and its result arrives
-   * as a completion message.
+   * as a completion message. An optional signal cancels only this observation (Main's
+   * program deadline / Escape), detaches the run, and leaves its result unconsumed.
    */
-  async wait(id: string, options: { timeoutMs?: number } = {}): Promise<AgentRunResult> {
+  async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<AgentRunResult> {
     const previous = this.#previousRun(id);
     if (previous) return previous;
     const managed = this.#requireRun(id);
     managed.background = false;
     if (!managed.settled) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
-      const result = options.timeoutMs === undefined
+      const result = options.timeoutMs === undefined && options.signal === undefined
         ? await managed.result
-        : await this.#boundedResult(managed, options.timeoutMs);
+        : await this.#boundedResult(managed, options);
       this.#onResultConsumed?.(id);
       return result;
     }
@@ -1168,19 +1169,34 @@ export class AgentManager {
     return this.#withTransportMetadata(record, managed) as AgentRunResult;
   }
 
-  #boundedResult(managed: ManagedAgent, timeoutMs: number): Promise<AgentRunResult> {
+  #boundedResult(managed: ManagedAgent, options: { timeoutMs?: number; signal?: AbortSignal }): Promise<AgentRunResult> {
+    const { timeoutMs, signal } = options;
     let timer: NodeJS.Timeout | undefined;
+    let abort: (() => void) | undefined;
     const bound = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => {
-        this.#detach(managed, "agents.wait reached its bound; the run continues");
-        reject(new AgentWaitBoundError(
-          `agents.wait: ${managed.name} is still running after ${describeWaitBound(timeoutMs)}. It continues, and its result ` +
-            "arrives as a completion message after this turn: end the turn now.",
-        ));
-      }, timeoutMs);
-      timer.unref?.();
+      // Interactive Main owns the observation, not the child. Ending its program
+      // must also end the wait without consuming a later detached completion.
+      abort = () => {
+        this.#detach(managed, "caller stopped waiting; the run continues");
+        reject(signal?.reason ?? new Error("Agent wait aborted; the run continues"));
+      };
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          this.#detach(managed, "agents.wait reached its bound; the run continues");
+          reject(new AgentWaitBoundError(
+            `agents.wait: ${managed.name} is still running after ${describeWaitBound(timeoutMs)}. It continues, and its result ` +
+              "arrives as a completion message after this turn: end the turn now.",
+          ));
+        }, timeoutMs);
+        timer.unref?.();
+      }
     });
-    return Promise.race([managed.result!, bound]).finally(() => clearTimeout(timer));
+    return Promise.race([managed.result!, bound]).finally(() => {
+      clearTimeout(timer);
+      if (abort) signal?.removeEventListener("abort", abort);
+    });
   }
 
   markForeground(id: string): void {

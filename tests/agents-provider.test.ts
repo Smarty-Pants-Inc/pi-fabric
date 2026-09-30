@@ -35,6 +35,8 @@ import type { ResidencyClient } from "../src/residency/client.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { FabricExecutionService } from "../src/execution-service.js";
 
 const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
@@ -1252,6 +1254,111 @@ describe("AgentsProvider runner support", () => {
       vi.unstubAllEnvs();
     }
   }, 30_000);
+
+  it.each([undefined, 86_400_000])("bounds Main agents.run at 60 s without stopping its child (request %s)", async timeoutMs => {
+    const { provider, agents, mainAgent } = setup();
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const controller = new AbortController();
+    const mainContext = {
+      ...context, signal: controller.signal,
+      extensionContext: { ...context.extensionContext, mode: "tui", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+    };
+    const realWait = agents.wait.bind(agents);
+    let waitOptions: Parameters<AgentManager["wait"]>[1];
+    const waiting = new Promise<void>(resolve => {
+      vi.spyOn(agents, "wait").mockImplementation((id, options) => {
+        waitOptions = options;
+        vi.useFakeTimers();
+        resolve();
+        return realWait(id, options);
+      });
+    });
+    const run = provider.invoke("run", { task: "HANG", transport: "process", timeoutMs }, mainContext);
+    try {
+      await waiting;
+      let settled = false;
+      void run.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      const result = await run as Record<string, unknown>;
+      expect(waitOptions?.timeoutMs).toBe(60_000);
+      expect(result).toMatchObject({ status: "running", waitTimedOut: true });
+      expect(result.note).toMatch(/continues.*completion message/);
+      expect(mainAgent.flushHeldAtNextBoundary).toHaveBeenCalledOnce();
+      controller.abort();
+      expect(agents.status(String(result.id)).status).toBe("running");
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+      // On the unfixed base, bound the test's otherwise unbounded run before closing.
+      await Promise.all(agents.list().map(handle => agents.stop(handle.id)));
+      await run;
+    }
+  });
+
+  it.each([
+    'return agents.run({ task: "HANG", transport: "process" });',
+    'const child = await agents.spawn({ task: "HANG", transport: "process" }); while (true) await agents.wait({ id: child.id });',
+  ])("detaches a Main child with no progress when its program hits the ceiling: %s", async code => {
+    const { provider, agents } = setup();
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.mainMaxTimeoutMs = 200;
+    const safety = new AbortController();
+    const timer = setTimeout(() => safety.abort(), 800);
+    try {
+      const result = await new FabricExecutionService(registry, config).execute({
+        code,
+        signal: safety.signal, parentToolCallId: "main-run-ceiling",
+        context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+        onPartial() {},
+      });
+      expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
+      expect(result.trace.outcome).toBe("timed_out");
+      expect(agents.list()).toHaveLength(1);
+      expect(agents.list()[0]).toMatchObject({ status: "running" });
+    } finally { clearTimeout(timer); vi.unstubAllEnvs(); }
+  });
+
+  it("ends only the durable wait at the Main program ceiling, without stopping or acknowledging its run", async () => {
+    const state = setup();
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const durable = { id: "durable-child", name: "Durable child", status: "running" };
+    const stopAgent = vi.fn();
+    const acknowledgeCompletion = vi.fn();
+    const residency = {
+      hasAgent: () => true, statusAgent: () => durable, stopAgent, acknowledgeCompletion,
+      waitAgent: vi.fn((_id: string, signal: AbortSignal) => new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      })),
+    } as unknown as ResidencyClient;
+    const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent,
+      state.participants, state.control, state.lifecycle, undefined, residency, false);
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.mainMaxTimeoutMs = 50;
+    try {
+      const result = await new FabricExecutionService(registry, config).execute({
+        code: 'return agents.wait({ id: "durable-child" });',
+        signal: AbortSignal.timeout(1_000), parentToolCallId: "main-durable-ceiling",
+        context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+        onPartial() {},
+      });
+      expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
+      expect(residency.waitAgent).toHaveBeenCalledOnce();
+      expect(durable.status).toBe("running");
+      expect(stopAgent).not.toHaveBeenCalled();
+      expect(acknowledgeCompletion).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
 
   it("exposes the compact option on handoff only and validates it before deferring", async () => {
     const { provider, root } = setup();

@@ -57,6 +57,7 @@ import type {
 } from "./runtime/kernel.js";
 import type { TypeScriptKernelRuntime } from "./runtime/typescript-kernel.js";
 import type { FabricTypeError, FabricTypeCheckResult } from "./runtime/type-checker.js";
+import { isInteractiveMain } from "./agents/wait-bound.js";
 
 const executionOutcomeFromTermination = (
   reason: FabricSandboxTerminationReason,
@@ -126,7 +127,7 @@ export interface FabricExecutionOptions {
   strings?: Record<string, string>;
   /** Per-invocation whole-program deadline request from fabric_exec.timeoutMs.
    * Raises (never lowers) the configured executor.timeoutMs, subject to
-   * executor.maxTimeoutMs. */
+   * executor.maxTimeoutMs and, in interactive Main, executor.mainMaxTimeoutMs. */
   requestedTimeoutMs?: number;
   signal: AbortSignal | undefined;
   parentToolCallId: string;
@@ -425,13 +426,17 @@ export class FabricExecutionService {
       Number.isFinite(options.requestedTimeoutMs)
         ? Math.max(1, Math.floor(options.requestedTimeoutMs))
         : 0;
-    const effectiveTimeoutMs = Math.max(
+    const mainMaxTimeoutMs = isInteractiveMain(options.context)
+      ? this.config.executor.mainMaxTimeoutMs
+      : undefined;
+    const capForMain = (ms: number): number => Math.min(ms, mainMaxTimeoutMs ?? Infinity);
+    const effectiveTimeoutMs = capForMain(Math.max(
       codeUsesOrchestration(code)
         ? orchestrationTimeoutMs
         : this.config.executor.timeoutMs,
       Math.min(requestedTimeoutMs, this.config.executor.maxTimeoutMs),
-    );
-    const minimumTimeoutMsForHostCall = (
+    ));
+    const timeoutFloorForHostCall = (
       ref: string,
       args: Record<string, unknown>,
     ): number | undefined => {
@@ -481,6 +486,10 @@ export class FabricExecutionService {
             )
           : 0;
       return Math.max(orchestrationTimeoutMs, requestedTimeoutMs);
+    };
+    const minimumTimeoutMsForHostCall = (ref: string, args: Record<string, unknown>): number | undefined => {
+      const floor = timeoutFloorForHostCall(ref, args);
+      return floor === undefined ? undefined : capForMain(floor);
     };
     const traceAttempt = async <T>(
       ref: string,
@@ -559,6 +568,20 @@ export class FabricExecutionService {
     };
     let sandboxResult: FabricSandboxResult;
     let invocationOutcome: FabricInvocationOutcome = "failed";
+    // Host-call floors are measured from each call and can slide a runtime's deadline.
+    // This independent, fixed Main watchdog cannot be extended by a loop, a computed
+    // orchestration ref, a shell timeout, or a configured host-call floor.
+    const mainCeiling = mainMaxTimeoutMs === undefined ? undefined : new AbortController();
+    const mainDeadlineAt = mainMaxTimeoutMs === undefined ? undefined : Date.now() + mainMaxTimeoutMs;
+    const mainCeilingError = `MainExecutionCeilingError: Main ceiling hit after ${mainMaxTimeoutMs}ms ` +
+      "(executor.mainMaxTimeoutMs). Spawned agents keep running detached and report results as completion messages; check agents.status/list.";
+    const mainTimer = mainCeiling
+      ? setTimeout(() => mainCeiling.abort(new Error(mainCeilingError)), mainMaxTimeoutMs)
+      : undefined;
+    mainTimer?.unref?.();
+    const programSignal = mainCeiling
+      ? options.signal ? AbortSignal.any([options.signal, mainCeiling.signal]) : mainCeiling.signal
+      : options.signal;
     try {
       sandboxResult = await runtime.execute(
         code,
@@ -899,15 +922,22 @@ export class FabricExecutionService {
           ...(checked.sourceMap ? { transpiledSourceMap: checked.sourceMap } : {}),
           ...(options.strings ? { strings: options.strings } : {}),
           ...(options.tokenBudget !== undefined ? { tokenBudget: options.tokenBudget } : {}),
-          ...(options.signal ? { signal: options.signal } : {}),
+          ...(programSignal ? { signal: programSignal } : {}),
         },
       );
+      // A synchronous guest can hit its runtime interrupt before the host timer gets
+      // an event-loop turn. Name that same ceiling, but not a shorter default timeout.
+      if (!options.signal?.aborted && (mainCeiling?.signal.aborted ||
+        (sandboxResult.terminationReason === "timed_out" && mainDeadlineAt !== undefined && Date.now() >= mainDeadlineAt))) {
+        sandboxResult = { ...sandboxResult, value: undefined, terminationReason: "timed_out", error: mainCeilingError };
+      }
       if (executionOutcomeFromTermination(sandboxResult.terminationReason) === "succeeded") invocationOutcome = "succeeded";
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.activity?.finish(options.parentToolCallId, false, message);
       throw error;
     } finally {
+      clearTimeout(mainTimer);
       await this.registry.endInvocation(options.parentToolCallId, invocationOutcome);
       flushEmit();
     }

@@ -184,6 +184,7 @@ export const createFabricExecTool = (
     // Guidance follows the loaded mode (smarty-dev#459): orchestration-only programs have no
     // `pi` or `extensions`, so advertising them only produced failed type checks.
     promptGuidelines: [
+      "In a Main, a fabric_exec program ends after 10 min and agents.run/wait return after 60 s; spawned agents keep running and report back.",
       ...(piTools ? [
         python
           ? "Batch independent operations in one `fabric_exec` Python program with `asyncio.gather`; await dependent/conditional steps sequentially. Coalesce independent replacements into one `await pi.edit(path=..., edits=[...])`. Return only the compact final JSON-compatible value."
@@ -249,7 +250,7 @@ export const createFabricExecTool = (
         Type.Number({
           minimum: 1,
           description:
-            "Optional whole-program deadline in ms for this invocation; raises (never lowers) the configured executor.timeoutMs, capped by executor.maxTimeoutMs",
+            "Optional whole-program deadline in ms for this invocation; raises (never lowers) the configured executor.timeoutMs, capped by executor.maxTimeoutMs and, in a Main, executor.mainMaxTimeoutMs",
         }),
       ),
       display: Type.Optional(

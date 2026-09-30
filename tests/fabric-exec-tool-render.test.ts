@@ -94,6 +94,13 @@ const renderResult = (
 const nestedRows = (rendered: string): string[] => rendered.split("\n").slice(1);
 
 describe("registered fabric_exec compact transcript rendering", () => {
+  it.each([true, false])("advertises Main bounds in full-code mode %s", fullCodeMode => {
+    const state = stateFor("compact");
+    state.config.fullCodeMode = fullCodeMode;
+    expect(toolFor(state).promptGuidelines).toContain(
+      "In a Main, a fabric_exec program ends after 10 min and agents.run/wait return after 60 s; spawned agents keep running and report back.",
+    );
+  });
   it("infers Python compact titles while preserving explicit intent and neutral fallbacks", () => {
     const state = stateFor("compact");
     state.config.executor = { kernel: "python" } as FabricState["config"]["executor"];

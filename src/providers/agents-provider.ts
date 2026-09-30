@@ -1220,7 +1220,9 @@ export class AgentsProvider implements FabricProvider {
         return this.actorManager.resetSession(String(args.id));
       case "remove": {
         if (args.successor === true) {
-          if (args.scope === "global" || !this.ownsRuntime || !this.mainAgent.local || !this.residency || this.actorManager.identity.kind !== "main") {
+          // ownsRuntime controls lifecycle cleanup, not authority: native FabricRuntimeState
+          // owns and closes these managers itself. Main authority is fenced below and in preflight.
+          if (args.scope === "global" || !this.mainAgent.local || !this.residency || this.actorManager.identity.kind !== "main") {
             throw new Error("Successor removal requires the native Main root and a durable project actor");
           }
           let id = String(args.id);

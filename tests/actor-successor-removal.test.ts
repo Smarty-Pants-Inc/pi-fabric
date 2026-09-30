@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorDirectory } from "../src/actors/directory.js";
+import type { FabricActorMessage } from "../src/actors/types.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -47,7 +48,7 @@ const dead = async (process: Awaited<ReturnType<typeof child>>) => {
   await process.exited;
 };
 
-const fixture = async (options: { liveMain?: boolean; project?: string; agentName?: string; role?: string; mismatchHost?: boolean; noIdentity?: boolean; realHost?: boolean; sessionRegistry?: boolean } = {}) => {
+const fixture = async (options: { liveMain?: boolean; project?: string; agentName?: string; role?: string; mismatchHost?: boolean; noIdentity?: boolean; realHost?: boolean; sessionRegistry?: boolean; sharedRuntime?: boolean } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-successor-"));
   cleanups.push(async () => fs.rmSync(root, { recursive: true, force: true }));
   const main = await child();
@@ -118,7 +119,7 @@ const fixture = async (options: { liveMain?: boolean; project?: string; agentNam
   vi.spyOn(residency, "removeActor").mockRejectedValue(new Error(`Resident host does not own ${actor.id}`));
   const lifecycle = new LifecycleBroker(mesh, identity, participants, { enabled: false, pollMs: 20, maxReadEvents: 100 }, async () => {});
   cleanups.push(() => lifecycle.close());
-  const provider = new AgentsProvider(agents, actors, new GlobalActorRegistry(root, 64 * 1024), mainAgent, participants, undefined, lifecycle, () => false, residency);
+  const provider = new AgentsProvider(agents, actors, new GlobalActorRegistry(root, 64 * 1024), mainAgent, participants, undefined, lifecycle, () => false, residency, !options.sharedRuntime);
   const remove = () => provider.invoke("remove", { id: actor.id, successor: true }, context);
   return { root, actorRoot, actor, oldId, oldDir, main, host, actors, agents, meshConfig, provider, residency, mesh, remove, predecessor, identity, realOwner };
 };
@@ -151,7 +152,20 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
     expect(receipt?.updatedBy.id).toBe(f.identity.id);
     expect(receipt?.value).toMatchObject({ successor: { fromRootId: f.oldId, by: { id: f.identity.id } } });
   });
-  it("removes an actor loaded in a real compiled resident host and prevents its restart", { timeout: 60_000 }, async () => {
+  it("allows native Main successor removal when FabricRuntimeState owns lifecycle cleanup", async () => {
+    const f = await fixture({ sharedRuntime: true });
+    expect(f.provider.ownsRuntime).toBe(false);
+    await expect(f.remove()).resolves.toEqual({ removed: true });
+    expect(new ActorRegistryStore(f.actorRoot).records()).toEqual([]);
+  });
+  it("still refuses a remote caller when FabricRuntimeState owns lifecycle cleanup", async () => {
+    const f = await fixture({ sharedRuntime: true });
+    Object.assign(f.provider.mainAgent, { local: false });
+    await expect(f.remove()).rejects.toThrow("requires the native Main root");
+    expect(startTime(f.host.proc.pid!)).toBe(f.host.identity.startTime);
+    expect(fs.existsSync(path.join(f.oldDir, "retired.json"))).toBe(false);
+  });
+  it.each(["dead", "missing"])("refuses a stale launcher with %s Main identity after retiring a real compiled host", { timeout: 60_000 }, async (identity) => {
     const f = await fixture({ realHost: true });
     expect(f.realOwner?.processIdentity?.startTime).toBeTruthy();
     await expect(f.remove()).resolves.toEqual({ removed: true });
@@ -166,9 +180,59 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
     const oldConfig = JSON.parse(fs.readFileSync(path.join(f.oldDir, "config.json"), "utf8")) as ResidentHostConfig;
     const retry = new ResidencyClient({ config: oldConfig, mesh: f.mesh, participants: f.residency.options.participants,
       mainAgent: { id: f.oldId, local: true } as FabricMainAgentTarget, hostPath: path.resolve("dist/residency/launcher.js") });
-    try { await expect(retry.ensureHost()).rejects.toThrow("retired by a successor Main"); }
-    finally { await retry.close(); }
+    if (identity === "missing") delete oldConfig.rootOwner!.processIdentity;
+    try {
+      await expect(retry.ensureHost()).rejects.toThrow("retired by a successor Main");
+      expect(fs.existsSync(path.join(f.oldDir, "host.lock"))).toBe(false);
+    } finally { await retry.close(); }
     expect(new ActorRegistryStore(f.actorRoot).records()).toEqual([]);
+  });
+  it("allows ensureHost from a new live Main of the retired root and runs its durable actor", { timeout: 60_000 }, async () => {
+    const f = await fixture({ realHost: true });
+    await expect(f.remove()).resolves.toEqual({ removed: true });
+    const oldConfig = JSON.parse(fs.readFileSync(path.join(f.oldDir, "config.json"), "utf8")) as ResidentHostConfig;
+    const resumed = { ...f.predecessor, local: true, stale: false,
+      processIdentity: f.residency.options.participants.self()!.processIdentity! };
+    const identity: MeshIdentity = { id: f.oldId, name: "main", kind: "main", sessionId: "predecessor" };
+    const participants = new ParticipantDirectory(f.mesh, { enabled: true, identity, rootId: f.oldId, hostId: f.oldId, heartbeatMs: 50, leaseMs: 300 });
+    participants.registerSource(() => [resumed]);
+    cleanups.push(() => participants.close());
+    await participants.start();
+    oldConfig.piModels = { available: [{ provider: "provider", id: "visible" }], aliases: {}, defaultModel: "provider/visible" };
+    const client = new ResidencyClient({ config: oldConfig, mesh: f.mesh, participants,
+      mainAgent: { id: f.oldId, local: true } as FabricMainAgentTarget, hostPath: path.resolve("dist/residency/launcher.js") });
+    cleanups.push(() => client.close());
+    const owner = await client.ensureHost();
+    const owned: Owned = { pid: owner.pid, started: owner.processIdentity!.startTime, at: Date.now(), argv: [] };
+    cleanups.push(async () => { if (await stopOwned(owned, 20_000, 5_000)) throw new Error(`Resumed fixture ${owned.pid} did not stop`); });
+    expect(oldConfig.rootOwner?.processIdentity).toEqual(resumed.processIdentity);
+    expect(JSON.parse(fs.readFileSync(path.join(f.oldDir, "config.json"), "utf8")).rootOwner.processIdentity).toEqual(resumed.processIdentity);
+    expect(fs.existsSync(path.join(f.oldDir, "retired.json"))).toBe(true);
+    const actor = await client.createActor({ name: "resumed durable", instructions: "Reply.", residency: "durable",
+      responseMode: "text", topics: ["successor.resumed"] });
+    await f.mesh.publish({ topic: "successor.resumed", from: identity, text: "run after resume" });
+    const store = new ActorRegistryStore(f.actorRoot);
+    const deadline = Date.now() + 15_000;
+    const reply = () => (store.records().find((record) => record.id === actor.id)?.messages as FabricActorMessage[] | undefined)
+      ?.find((message) => message.direction === "out" && !message.error);
+    while (!reply() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(reply()?.text, JSON.stringify(store.records())).toBe("fake worker complete");
+    await expect(client.removeActor(actor.id)).resolves.toEqual({ removed: true });
+  });
+  it("refuses removal without retiring when Main resumes between the two pre-signal liveness checks", async () => {
+    const f = await fixture();
+    const list = vi.spyOn(f.residency.options.participants, "list").mockImplementationOnce(() => {
+      const file = path.join(f.oldDir, "config.json");
+      const config = JSON.parse(fs.readFileSync(file, "utf8"));
+      config.rootOwner.processIdentity = f.residency.options.participants.self()!.processIdentity;
+      fs.writeFileSync(file, JSON.stringify(config));
+      return [];
+    });
+    try { await expect(f.remove()).rejects.toThrow("owned by a live root"); }
+    finally { list.mockRestore(); }
+    expect(fs.existsSync(path.join(f.oldDir, "retired.json"))).toBe(false);
+    expect(startTime(f.host.proc.pid!)).toBe(f.host.identity.startTime);
+    expect(new ActorRegistryStore(f.actorRoot).records()[0]?.rootId).toBe(f.oldId);
   });
   it("removes a durable actor in the dead predecessor's session registry, not loaded by the new Main", { timeout: 60_000 }, async () => {
     const f = await fixture({ sessionRegistry: true, realHost: true });

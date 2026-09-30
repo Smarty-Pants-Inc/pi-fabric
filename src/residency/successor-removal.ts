@@ -199,17 +199,20 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
     if (host && !["alive", "dead"].includes(processIdentityState(host))) {
       throw new Error("Resident host process identity mismatch; no signal sent");
     }
-    // Retire the old residency root before stopping it. New hosts check this before and after
-    // acquiring host.lock, so an old launcher cannot resurrect a writer behind our registry fence.
-    writeJsonAtomic(path.join(dir, "retired.json"), { rootId: expectedRootId, by: manager.identity, mainIdentity }, { durable: true });
+    // Fence only the dead Main identity, after the final pre-signal liveness check.
+    // Hosts check before and after host.lock; a resumed Main rewrites rootOwner first.
+    const retire = (): void => {
+      writeJsonAtomic(path.join(dir, "retired.json"), { rootId: expectedRootId, by: manager.identity, mainIdentity }, { durable: true });
+    };
     if (host) {
       const signal = (value: NodeJS.Signals): void => {
         assertRootDead();
         const current = recordedHost();
         if (!current || !sameIdentity(current, host)) throw new Error("Resident host process identity mismatch; no signal sent");
         const state = processIdentityState(host);
+        if (state !== "alive" && state !== "dead") throw new Error("Resident host process identity mismatch; no signal sent");
+        retire();
         if (state === "dead") return;
-        if (state !== "alive") throw new Error("Resident host process identity mismatch; no signal sent");
         try { process.kill(host.pid, value); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       };
@@ -225,6 +228,9 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
       // that cannot finish close leaves removal unaccepted, for a later retry or explicit repair.
       await waitUntil(Date.now() + 30_000);
       if (processIdentityState(host) !== "dead") throw new Error("Resident host process identity mismatch or failed to stop");
+    } else {
+      assertRootDead();
+      retire();
     }
     assertRootDead();
     assertHostStopped();

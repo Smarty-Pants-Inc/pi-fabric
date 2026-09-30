@@ -81,14 +81,23 @@ live root`. Both roots must have the same nonempty recorded `agentName` and
 `role`; actor and root project identities and the actor registry must match.
 Malformed/unreadable ownership or lease evidence fails closed.
 
-Before accepting removal, Fabric retires the predecessor's residency root and
-stops its host by the exact PID recorded in `owner.json`/`host.lock`, only after
-checking its kernel start time, complete command line, and ownership token.
-It sends SIGTERM, waits up to 30 seconds for normal host/worker shutdown, and
-**does not force-kill** an uncooperative host. A mismatched/reused PID is never
-signalled. The retirement marker prevents an old launcher from restarting
-that root's host; other actors of that old resident host also stop. This is an
-intentional root-wide shutdown, not permission to execute its remaining work.
+Before accepting removal, Fabric retires the predecessor Main's process identity
+and stops its host by the exact PID recorded in `owner.json`/`host.lock`, only
+after checking its kernel start time, complete command line, and ownership token.
+The retirement marker is written only after the final pre-signal Main liveness
+check passes. It sends SIGTERM, waits up to 30 seconds for normal host/worker
+shutdown, and **does not force-kill** an uncooperative host. A mismatched/reused
+PID is never signalled. The marker refuses a host whose configured
+`rootOwner.processIdentity` matches the retired `mainIdentity`; a launcher with
+no identity is also refused. Other durable actors and durable agent runs of
+that old resident host also stop. This is an intentional host-wide shutdown,
+not permission to execute its remaining work.
+
+Retirement is **not permanent session retirement**. Resuming the predecessor's
+Pi session (`pi --session ...`) keeps the same root id but creates a new live
+Main process identity. `ResidencyClient.ensureHost` rewrites `rootOwner` with
+that live identity before launch, so its durable actor and agent operations
+work again; an old launcher carrying the dead Main's identity remains fenced.
 
 The registry lock rechecks the proof and accepts a stopped removal atomically.
 The normal `ActorManager.remove` transaction then handles pending removals,

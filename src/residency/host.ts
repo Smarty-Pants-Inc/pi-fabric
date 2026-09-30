@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { readProcessIdentity } from "../core/process-identity.js";
+import { readProcessIdentity, type ProcessStartIdentity } from "../core/process-identity.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -762,9 +762,19 @@ class ResidentHost {
     }
   }
 
+  #isRetiredMain(): boolean {
+    const file = path.join(this.config.residencyRoot, "retired.json");
+    if (!fs.existsSync(file)) return false;
+    const retired = readJson<{ mainIdentity?: ProcessStartIdentity }>(file);
+    const owner = this.config.rootOwner?.processIdentity;
+    // Missing ownership (or an unreadable marker) cannot authorize a stale launcher.
+    if (!owner || !retired?.mainIdentity) return true;
+    return owner.pid === retired.mainIdentity.pid && owner.startTime === retired.mainIdentity.startTime &&
+      owner.kernelId === retired.mainIdentity.kernelId;
+  }
+
   #acquireLock(): void {
-    const retired = path.join(this.config.residencyRoot, "retired.json");
-    if (fs.existsSync(retired)) throw new Error("Fabric resident root was retired by a successor Main");
+    if (this.#isRetiredMain()) throw new Error("Fabric resident root was retired by a successor Main");
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
     const existing = readJson<ResidentHostOwner>(this.#ownerPath);
     if (existing && processAlive(existing.pid)) {
@@ -788,7 +798,7 @@ class ResidentHost {
         throw error;
       }
     }
-    if (fs.existsSync(retired)) {
+    if (this.#isRetiredMain()) {
       this.#releaseLock();
       throw new Error("Fabric resident root was retired by a successor Main");
     }

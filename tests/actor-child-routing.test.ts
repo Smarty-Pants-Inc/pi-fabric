@@ -359,7 +359,8 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
       m.source === "child-completion" && m.direction === "out" && !m.error)).toHaveLength(2), { timeout: 5000 });
     for (const child of [a, b]) {
       expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
-      expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+      // Outgoing messages precede asynchronous run-log retention and cleanup.
+      await vi.waitFor(() => expect(fs.existsSync(store.resultFile(child.id))).toBe(false), { timeout: 5000 });
     }
     expect(store.pending()).toEqual([]);
     expect(h.rootDeliveries).not.toHaveBeenCalled();
@@ -438,7 +439,8 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     h.endActivation();
     await vi.waitFor(() => {
       expect(store.received(child.id)).toBe(true);
-      expect(h.owner.status(h.actor.id).status).toBe("queued");
+      expect(h.owner.status(h.actor.id).status).toBe("idle");
+      expect(h.owner.status(h.actor.id).queued).toBe(0);
       expect(h.owner.status(h.actor.id).inFlightRun).toBeUndefined();
     }, { timeout: 5000 });
     expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({
@@ -449,7 +451,7 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     failedRun.mockRestore();
     let consumed = 0;
     vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => {
-      if (args[0].task.includes(store.resultFile(child.id))) {
+      if (args[0].task.includes(JSON.stringify(store.resultFile(child.id)))) {
         ++consumed;
         expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8")).value).toEqual({ output: "x".repeat(100000) });
       }
@@ -463,6 +465,143 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
     expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
     expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("a stale latest-sequence handoff never blocks newer mailbox work and is consumed once (restart=%s)", async (restart) => {
+    const h = await setup(residency, true, {
+      version: 1, source: "({activation,current}) => activation.sequence === current.latestActivationSequence",
+    });
+    const child = await h.spawn("LARGE_RESULT");
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    await h.runtime.shutdown();
+    h.resolveModel.mockRejectedValue(new Error("transient pre-inference model failure"));
+    h.endActivation();
+    await vi.waitFor(() => {
+      expect(store.received(child.id)).toBe(true);
+      expect(h.owner.status(h.actor.id).status).toBe("idle");
+      expect(h.owner.status(h.actor.id).lastError).toContain("transient pre-inference");
+    }, { timeout: 5000 });
+    const queueFile = () => path.join(path.dirname(h.actor.sessionFile!),
+      fs.readdirSync(path.dirname(h.actor.sessionFile!)).find((file) => file.startsWith("queue-"))!);
+    const deferred = JSON.parse(fs.readFileSync(queueFile(), "utf8")).items;
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]).toMatchObject({ id: child.id, deferredHandoff: true });
+    const originalActivation = deferred[0].activation;
+    expect(h.owner.status(h.actor.id).queued).toBe(0);
+    expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8")).value).toEqual({ output: "x".repeat(100000) });
+    let owner = h.owner;
+    if (restart) {
+      await owner.close();
+      owner = h.makeOwner();
+      cleanups.push(() => owner.close());
+    }
+    h.resolveModel.mockImplementation(async (model) => model);
+    const tasks: string[] = [];
+    let release!: () => void;
+    const nextRun = new Promise<void>((resolve) => { release = resolve; });
+    cleanups.push(async () => { release(); });
+    const run = AgentManager.prototype.run.bind(h.ownerAgents);
+    vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => {
+      tasks.push(args[0].task);
+      if (tasks.length === 1) await nextRun;
+      return run(...args);
+    });
+    owner.tell(h.actor.id, "newer mailbox event 1");
+    await vi.waitFor(() => expect(tasks).toHaveLength(1), { timeout: 5000 });
+    expect(tasks[0]).toContain("newer mailbox event 1");
+    expect(tasks[0]).toContain("context only, not current activation facts");
+    expect(tasks[0]).toContain(JSON.stringify(store.resultFile(child.id)));
+    const context = JSON.parse(tasks[0]!.split("context only, not current activation facts):\n\n")[1]!);
+    expect(context[0].activation).toEqual(originalActivation);
+    expect(JSON.parse(fs.readFileSync(queueFile(), "utf8")).latestActivationSequence).toBeGreaterThan(originalActivation.sequence);
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(true); // No inference yet.
+    owner.tell(h.actor.id, "newer mailbox event 2");
+    release();
+    await vi.waitFor(() => expect(owner.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(tasks).toHaveLength(2);
+    expect(tasks[1]).toContain("newer mailbox event 2");
+    expect(tasks.filter((task) => task.includes(JSON.stringify(store.resultFile(child.id))))).toHaveLength(1);
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    expect(owner.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
+    await owner.close();
+    const after = h.makeOwner();
+    cleanups.push(() => after.close());
+    after.tell(h.actor.id, "post-consumption mailbox event");
+    await vi.waitFor(() => expect(after.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(tasks).toHaveLength(3);
+    expect(tasks[2]).not.toContain(JSON.stringify(store.resultFile(child.id)));
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("moves a freshness-refused handoff into the next valid activation's context", async () => {
+    const h = await setup(residency, true, {
+      version: 1, source: "({activation,current}) => activation.sequence === current.latestActivationSequence",
+    });
+    const child = await h.spawn("LARGE_RESULT");
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    await h.runtime.shutdown();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    cleanups.push(async () => { release(); });
+    let blocked = false;
+    const put = h.mesh.put.bind(h.mesh);
+    vi.spyOn(h.mesh, "put").mockImplementation(async (...args) => {
+      if (!blocked && (args[0].value as { status?: string }).status === "running" && store.received(child.id)) {
+        blocked = true;
+        await gate; // Supersede the handoff before its freshness check, not after inference.
+      }
+      return put(...args);
+    });
+    const tasks: string[] = [];
+    const run = AgentManager.prototype.run.bind(h.ownerAgents);
+    vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => {
+      tasks.push(args[0].task);
+      return run(...args);
+    });
+    h.endActivation();
+    await vi.waitFor(() => expect(blocked).toBe(true), { timeout: 5000 });
+    h.owner.tell(h.actor.id, "newest authorized mailbox work");
+    release();
+    await vi.waitFor(() => expect(h.owner.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toContain("newest authorized mailbox work");
+    expect(tasks[0]).toContain(JSON.stringify(store.resultFile(child.id)));
+    expect(h.owner.messages(h.actor.id).some((m) => m.source === "child-completion" && m.stale)).toBe(true);
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("expires deferred handoffs with the archive TTL instead of retaining stale work forever", async () => {
+    const h = await setup(residency, true, { version: 1, source: '({activation}) => activation.source !== "child-completion"' });
+    const child = await h.spawn("LARGE_RESULT");
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    await h.runtime.shutdown();
+    h.endActivation();
+    await vi.waitFor(() => {
+      expect(store.received(child.id)).toBe(true);
+      expect(h.owner.status(h.actor.id).status).toBe("idle");
+    }, { timeout: 5000 });
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(true);
+    await h.owner.close();
+    const old = new Date(Date.now() - DEFAULT_FABRIC_CONFIG.retention.actorRunArchiveMs - 1000);
+    for (const file of fs.readdirSync(store.directory)) fs.utimesSync(path.join(store.directory, file), old, old);
+    const restarted = h.makeOwner(); // Startup runs the normal archive retention sweep.
+    cleanups.push(() => restarted.close());
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    expect(fs.readdirSync(path.dirname(h.actor.sessionFile!)).filter((file) => file.startsWith("queue-"))).toEqual([]);
+    const tasks: string[] = [];
+    const run = AgentManager.prototype.run.bind(h.ownerAgents);
+    vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => {
+      tasks.push(args[0].task);
+      return run(...args);
+    });
+    restarted.tell(h.actor.id, "new work after expiry");
+    await vi.waitFor(() => expect(restarted.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).not.toContain(JSON.stringify(store.resultFile(child.id)));
   });
 
   it("keeps a stopped actor's unread completion stored instead of falling back to Main", async () => {

@@ -25,7 +25,13 @@ interface ChildResultMessage {
   result: FabricSandboxResult;
 }
 
-type ChildMessage = ChildCallMessage | ChildResultMessage;
+interface ChildResponseAckMessage {
+  type: "response_ack";
+  id: number;
+  responseId: number;
+}
+
+type ChildMessage = ChildCallMessage | ChildResultMessage | ChildResponseAckMessage;
 
 const HOST_TASK_SETTLE_GRACE_MS = 250;
 
@@ -104,6 +110,8 @@ export class NodeProcessRuntime {
     let settled = false;
     let finishing = false;
     const hostTasks = new Set<Promise<void>>();
+    let nextResponseId = 0;
+    const pendingReceipts = new Map<number, { id: number; commit: () => void }>();
 
     const guestBundle = options.transpiledCode === undefined
       ? transpileFabricCodeWithSourceMap(code)
@@ -119,6 +127,7 @@ export class NodeProcessRuntime {
           result = executionDeadline.timeoutResult([]);
         }
         settled = true;
+        pendingReceipts.clear();
         executionDeadline.clear();
         if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
         if (!hostAbortController.signal.aborted && hostTasks.size > 0) {
@@ -143,12 +152,17 @@ export class NodeProcessRuntime {
           error: `Process IPC failed: ${error.message}`,
         });
         try {
+          if (delivered) {
+            const responseId = ++nextResponseId;
+            message = { ...message, responseId };
+            pendingReceipts.set(responseId, { id: message.id, commit: delivered });
+          }
           child.send(message, (error) => {
             if (settled || finishing) return;
             if (error) { failSend(error); return; }
             if (!child.connected) return;
             if (executionDeadline.reached) { expireDeadline(); return; }
-            delivered?.();
+            // Write completion is not admission; wait for the guest ack.
           });
         } catch (error) { failSend(error instanceof Error ? error : new Error(String(error))); }
       };
@@ -174,6 +188,14 @@ export class NodeProcessRuntime {
         if (settled || finishing || typeof raw !== "object" || raw === null) return;
         const message = raw as ChildMessage;
         if (executionDeadline.reached) { expireDeadline(); return; }
+        if (message.type === "response_ack") {
+          if (!child.connected) return;
+          const receipt = pendingReceipts.get(message.responseId);
+          if (!receipt || receipt.id !== message.id) return;
+          pendingReceipts.delete(message.responseId);
+          receipt.commit();
+          return;
+        }
         if (message.type === "result") {
           finishing = true;
           executionDeadline.clear();

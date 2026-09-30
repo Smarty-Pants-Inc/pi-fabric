@@ -80,6 +80,10 @@ async def _responses(reader):
                 continue
             if message.get("ok") is True:
                 future.set_result(message.get("value"))
+                # Resolution admits this response. Send the correlated receipt
+                # before a resumed guest call or terminal result can overtake it.
+                if "responseId" in message:
+                    await _send({"type": "response_ack", "id": message["id"], "responseId": message["responseId"]})
             else:
                 future.set_exception(_HostError(message.get("error", "Host call failed"), message.get("bashExit")))
     except Exception as error:

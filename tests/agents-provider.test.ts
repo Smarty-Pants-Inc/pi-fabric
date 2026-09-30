@@ -444,7 +444,7 @@ describe("queued terminal observation receipts", () => {
   describe.each(["cpython", "node-process"] as const)("%s", backend => {
     it.skipIf(backend === "cpython" && process.platform === "win32").each(
       (["wait", "join", "status"] as const).flatMap(action =>
-        (["write failure", "transport closure", "ceiling cancellation", "confirmed delivery"] as const).map(outcome => [action, outcome] as const)),
+        (["write failure", "transport closure", "ceiling cancellation", "written then expired", "written then closed", "confirmed delivery"] as const).map(outcome => [action, outcome] as const)),
     )("keeps exactly one completion for terminal agents.%s after %s until confirmed delivery", async (action, outcome) => {
           vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
           const { AgentCompletionInbox } = await import("../src/agents/completion-inbox.js");
@@ -509,8 +509,13 @@ describe("queued terminal observation receipts", () => {
           try {
             const message = await Promise.race([response, execution.then(result => { throw new Error(`Ended before response queued: ${result.error}`); })]);
             expect(message.ok, JSON.stringify(message)).toBe(true);
-            // Submission is not delivery, even while the transport is still open.
-            if (outcome === "confirmed delivery") expect(consumed, "queued receipt").not.toHaveBeenCalled();
+            // Neither submission nor a successful native write is admission.
+            expect(consumed, "queued receipt").not.toHaveBeenCalled();
+            const admit = (ack: unknown) => {
+              if (backend === "cpython") channel.push(`${JSON.stringify(ack)}\n`);
+              else child.emit("message", ack);
+            };
+            const ack = { type: "response_ack", id: message.id, responseId: message.responseId };
             if (outcome === "write failure") {
               confirm(new Error("queued IPC write failed"));
               child.emit("exit", 1, null); child.emit("close", 1, null);
@@ -521,8 +526,27 @@ describe("queued terminal observation receipts", () => {
             } else if (outcome === "ceiling cancellation") {
               timer.fireAt(deadlineAt);
               confirm();
+            } else if (outcome === "written then expired") {
+              confirm();
+              expect(consumed, "write is not admission").not.toHaveBeenCalled();
+              timer.fireAt(deadlineAt);
+              admit(ack); // The ack after the ceiling cannot revive the receipt.
+            } else if (outcome === "written then closed") {
+              confirm();
+              expect(consumed, "write is not admission").not.toHaveBeenCalled();
+              channel.destroy(); child.connected = false;
+              child.emit("exit", 1, null); child.emit("close", 1, null);
+              if (backend === "node-process") admit(ack);
             } else {
               confirm();
+              expect(consumed, "write is not admission").not.toHaveBeenCalled();
+              admit({ ...ack, id: message.id + 1 });
+              admit({ ...ack, responseId: message.responseId + 1 });
+              expect(consumed, "uncorrelated ack").not.toHaveBeenCalled();
+              admit(ack);
+              // CPython frames use a stream; let its data event run first.
+              await new Promise<void>(resolve => setImmediate(resolve));
+              admit(ack);
               expect(consumed).toHaveBeenCalledExactlyOnceWith(handle.id);
               const result = { type: "result", result: { terminationReason: "completed", value: message.value, logs: [] } };
               if (backend === "cpython") channel.push(`${JSON.stringify(result)}\n`);
@@ -530,7 +554,7 @@ describe("queued terminal observation receipts", () => {
             }
             const result = await execution;
             expect(result.success).toBe(outcome === "confirmed delivery");
-            if (outcome === "ceiling cancellation") expect(result.error).toMatch(/MainExecutionCeilingError/);
+            if (outcome === "ceiling cancellation" || outcome === "written then expired") expect(result.error).toMatch(/MainExecutionCeilingError/);
             const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
             boundary(); boundary();
             expect(sendMessage).toHaveBeenCalledTimes(outcome === "confirmed delivery" ? 0 : 1);
@@ -551,6 +575,97 @@ describe("queued terminal observation receipts", () => {
       }, 45_000,
     );
   });
+});
+
+// Real transports: stop the receiver after it issued the observation, then let
+// its native write succeed. A write callback while SIGSTOPped proves nothing
+// about admission. These signal controls are Linux-only, not Windows mocks.
+describe.skipIf(process.platform !== "linux")("native written-but-unadmitted observations", () => {
+  it.each((["cpython", "node-process"] as const).flatMap(backend =>
+    (["deadline", "transport close"] as const).map(outcome => [backend, outcome] as const)),
+  )("retains exactly one completion after %s write success before guest admission and %s", async (backend, outcome) => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const { AgentCompletionInbox } = await import("../src/agents/completion-inbox.js");
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const sendMessage = vi.fn();
+    const inboxContext = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, inboxContext);
+    const consumed = vi.fn((id: string) => inbox.acknowledge(id));
+    const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => inbox.enqueue(result));
+    const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
+    const registry = new ActionRegistry(); registry.register(h.provider);
+    const handle = await h.agents.spawn({ task: "native admission receipt", transport: "process" });
+    h.agents.detachSignal(handle.id);
+    await waitFor(() => completed.mock.calls.length === 1, 5_000);
+    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    let guest!: ReturnType<typeof childProcess.spawn>;
+    let wrote!: () => void;
+    const written = new Promise<void>(resolve => { wrote = resolve; });
+    const spawn = vi.mocked(childProcess.spawn).mockImplementationOnce((...args: Parameters<typeof childProcess.spawn>) => {
+      guest = actual.spawn(...args);
+      if (backend === "node-process") {
+        const send = guest.send.bind(guest);
+        guest.send = ((message: any, callback: (error: Error | null) => void) => send(message, (error) => {
+          callback(error);
+          if (message.type === "response" && !error) wrote();
+        })) as typeof guest.send;
+      } else {
+        const channel = guest.stdio[3] as Duplex;
+        const write = channel.write.bind(channel);
+        channel.write = ((frame: string, callback: (error?: Error | null) => void) => write(frame, (error) => {
+          callback(error);
+          if (JSON.parse(frame).type === "response" && !error) wrote();
+        })) as typeof channel.write;
+      }
+      return guest;
+    });
+    let deadlineAt = 0;
+    const invoke = registry.invoke.bind(registry);
+    const invocation = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, ctx) => {
+      deadlineAt = ctx.mainDeadlineAt!;
+      process.kill(guest.pid!, "SIGSTOP");
+      await waitFor(() => /\) T /.test(fs.readFileSync(`/proc/${guest.pid}/stat`, "utf8")), 5_000);
+      return invoke(ref, args, ctx);
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    if (backend === "cpython") { config.executor.kernel = "python"; config.executor.pythonRuntime = backend; }
+    else config.executor.runtime = backend;
+    config.executor.mainMaxTimeoutMs = 60_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const timer = captureRuntimeDeadline(backend);
+    const controller = new AbortController();
+    const execution = new FabricExecutionService(registry, config).execute({
+      code: backend === "cpython" ? `return await agents.wait(id=${JSON.stringify(handle.id)})` : `return await agents.wait({id:${JSON.stringify(handle.id)}});`,
+      context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "native-admission-main" } } as unknown as ExtensionContext,
+      signal: controller.signal, parentToolCallId: `native-${backend}-${outcome}`, onPartial() {},
+    });
+    try {
+      await Promise.race([written, execution.then(result => { throw new Error(`Ended before native write: ${result.error}`); })]);
+      expect(/\) T /.test(fs.readFileSync(`/proc/${guest.pid}/stat`, "utf8"))).toBe(true);
+      expect(consumed, "successful write to a stopped receiver is not admission").not.toHaveBeenCalled();
+      if (outcome === "deadline") timer.fireAt(deadlineAt);
+      else {
+        if (backend === "cpython") (guest.stdio[3] as Duplex).destroy();
+        else guest.disconnect();
+        guest.kill("SIGKILL");
+      }
+      const result = await execution;
+      expect(result.success).toBe(false);
+      if (outcome === "deadline") expect(result.error).toMatch(/MainExecutionCeilingError/);
+      expect(consumed).not.toHaveBeenCalled();
+      const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
+      boundary(); boundary();
+      expect(sendMessage).toHaveBeenCalledOnce();
+      expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([handle.id]);
+    } finally {
+      controller.abort();
+      guest?.kill("SIGKILL");
+      await execution;
+      if (guest && guest.exitCode === null && guest.signalCode === null) await new Promise<void>(resolve => guest.once("exit", () => resolve()));
+      clock.mockRestore(); timer.restore(); invocation.mockRestore(); spawn.mockImplementation(actual.spawn);
+      inbox.close(); await registry.close(); vi.unstubAllEnvs();
+    }
+  }, 45_000);
 });
 
 describe("runtime observation receipts", () => {

@@ -38,7 +38,7 @@ const fakePi = () => {
     on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
     registerCommand: (name: string, command: { handler: (args: string, context: unknown) => Promise<void> }) =>
       commands.set(name, command),
-    sendUserMessage: (text: string) => sent.push(text),
+    sendUserMessage: vi.fn((text: string, _options?: unknown) => sent.push(text)),
   };
   const emit = (name: string, context: unknown, event: unknown = {}) =>
     handlers.get(name)?.forEach((handler) => handler(event, context));
@@ -91,11 +91,12 @@ describe("release detection", () => {
 });
 
 describe("installSelfReload", () => {
-  const setup = (options: { busy?: () => number; configured?: boolean; halted?: () => boolean } = {}) => {
+  const setup = (options: { busy?: () => number; configured?: boolean; halted?: () => boolean; turnProvenance?: boolean } = {}) => {
     const old = release("aaa");
     const next = release("bbb");
     activate(old);
     const { pi, emit, commands, sent } = fakePi();
+    if (options.turnProvenance) Object.assign(pi, { hostCapabilities: { turnProvenance: 1 } });
     const selfReload = installSelfReload(pi as never, {
       busy: options.busy ?? (() => 0),
       autoReloadConfigured: () => options.configured ?? true,
@@ -103,8 +104,25 @@ describe("installSelfReload", () => {
       settingsPath: settingsPath(),
       ...(options.halted ? { halted: options.halted } : {}),
     });
-    return { old, next, emit, commands, sent, selfReload };
+    return { old, next, pi, emit, commands, sent, selfReload };
   };
+
+  it.each([false, true])("keeps Fabric commands untokenized with provenance compatibility (capable=%s)", async turnProvenance => {
+    const { next, pi, emit, commands, selfReload } = setup({ turnProvenance });
+    const context = fakeContext(`s-fabric-provenance-${turnProvenance}`, { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    emit("agent_settled", context);
+    emit("agent_settled", context);
+    expect(pi.sendUserMessage).toHaveBeenCalledExactlyOnceWith(`/${SELF_RELOAD_COMMAND} auto`,
+      { expandPromptTemplates: true, ...(turnProvenance ? { provenance: {
+        v: 1, channel: "fabric", sender: { id: `session:${context.sessionManager.getSessionId()}`,
+          name: "main", kind: "main", verified: "mesh" }, via: "followUp",
+      } } : {}) });
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(1);
+    emit("session_shutdown", context);
+  });
 
   it("reloads at settle onto the newly active release and reports old -> new once", async () => {
     const { next, emit, commands, sent, selfReload } = setup();
@@ -134,6 +152,50 @@ describe("installSelfReload", () => {
     expect(fresh.sent).toEqual([]);
   });
 
+  it("rechecks a Fabric rollback at command execution even when mtime did not change", async () => {
+    const { old, next, emit, commands, sent, selfReload } = setup();
+    const context = fakeContext("s-fabric-rollback", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next); emit("agent_settled", context); expect(sent).toHaveLength(1);
+    const stat = fs.statSync(settingsPath());
+    activate(old); fs.utimesSync(settingsPath(), stat.atime, stat.mtime);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).not.toHaveBeenCalled();
+  });
+
+  it("superseded queued Fabric keeps its idle retry without another Main turn", async () => {
+    vi.useFakeTimers();
+    const { next, emit, commands, sent, selfReload } = setup();
+    const third = release("ccc");
+    const context = fakeContext("s-fabric-superseded", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next); emit("agent_settled", context); expect(sent).toHaveLength(1);
+    activate(third);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).not.toHaveBeenCalled(); // never retarget the queued command
+    await vi.advanceTimersByTimeAsync(6_000); // no input, agent turn or second settle
+    expect(sent).toHaveLength(2);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sent).toHaveLength(2); // the exact third target is consumed once
+    emit("session_shutdown", context);
+  });
+
+  it("attempts each exact Fabric target once even across intervening failed targets", async () => {
+    const { next, emit, commands, sent, selfReload } = setup();
+    const third = release("ccc");
+    const context = fakeContext("s-fabric-exact-attempt", { idle: true, pending: false });
+    context.reload.mockRejectedValue(new Error("native failure"));
+    selfReload.sessionStart("startup", context as never);
+    for (const target of [next, third]) {
+      activate(target); emit("agent_settled", context);
+      await expect(commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context)).rejects.toThrow("native failure");
+    }
+    activate(next); emit("agent_settled", context);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(sent).toHaveLength(2); expect(context.reload).toHaveBeenCalledTimes(2);
+  });
   it("waits for task agents and actor runs, then reloads while the Main stays idle", async () => {
     vi.useFakeTimers();
     let busy = 1;

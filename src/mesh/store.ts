@@ -1,3 +1,4 @@
+import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -65,6 +66,8 @@ export interface MeshReadOptions {
 }
 
 export interface MeshStoreOptions {
+  /** Captured at construction, never reloaded. Defaults to B68-compatible protocol 1. */
+  lockProtocol?: MeshLockProtocol;
   maxEventLogBytes?: number;
   retainedEventLogBytes?: number;
   maxStateBytes?: number;
@@ -451,6 +454,7 @@ export class MeshStore {
   readonly #counterPath: string;
   readonly #generationPath: string;
   readonly #lockPath: string;
+  readonly #lockProtocol: MeshLockProtocol;
   readonly #signalPath: string;
   /** Per parsed state: prefix selections (bounded) and namespace digests. Keyed by identity. */
   #memo = new WeakMap<MeshStateFile, { selections: Map<string, MeshStateEntry[]>; digests: Map<string, string> }>();
@@ -485,6 +489,10 @@ export class MeshStore {
     readonly maxReadEvents: number,
     options: MeshStoreOptions = {},
   ) {
+    // ponytail: keep this tiny validation local; importing config's runtime adds eager graph edges.
+    const lockProtocol = options.lockProtocol === undefined ? 1 : options.lockProtocol;
+    if (lockProtocol !== 1 && lockProtocol !== 2) throw new Error("mesh.lockProtocol must be 1 or 2");
+    this.#lockProtocol = lockProtocol;
     this.#eventsPath = path.join(root, "events.jsonl");
     this.#statePath = path.join(root, "state.json");
     this.#counterPath = path.join(root, "sequence");
@@ -514,6 +522,10 @@ export class MeshStore {
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
     this.#readCacheMs = Math.max(0, Math.floor(options.readCacheMs ?? 0));
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  }
+
+  get lockProtocol(): MeshLockProtocol {
+    return this.#lockProtocol;
   }
 
   /** The reuse window of reads (MeshStoreOptions.readCacheMs), for readers of files beside the state. */
@@ -1469,7 +1481,7 @@ export class MeshStore {
     const deadline = Date.now() + this.#lockTimeoutMs;
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
-    const startTime = processStartTime(process.pid);
+    const startTime = this.#lockProtocol === 2 ? processStartTime(process.pid) : undefined;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     // Attempts and the largest gap between two of them: a large gap means this waiter stalled
     // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -1483,32 +1495,41 @@ export class MeshStore {
       attempts += 1;
       lastAttemptAt = attemptAt;
       try {
-        // Never expose an ownerless canonical directory: a stalled initializer must not
-        // resume its owner write through a name that legacy recovery gave to a successor.
-        const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
-        try {
-          fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
-            encoding: "utf8", flag: "wx", mode: 0o600,
+        if (this.#lockProtocol === 1) {
+          // B68 wire: exclusive canonical mkdir, then a three-line owner at that name.
+          fs.mkdirSync(this.#lockPath, { mode: 0o700 });
+          fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
+            encoding: "utf8", mode: 0o600,
           });
-          // POSIX rename can replace an EMPTY directory, but a fresh ownerless legacy
-          // lock may be an in-flight creator. Route every observed canonical path through
-          // the original owner/stale checks instead of publishing over it.
+        } else {
+          // Never expose an ownerless canonical directory: a stalled initializer must not
+          // resume its owner write through a name that legacy recovery gave to a successor.
+          const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
           try {
-            fs.lstatSync(this.#lockPath);
-            throw Object.assign(new Error("Fabric mesh lock already exists"), { code: "EEXIST" });
-          } catch (error) {
-            if (errorCode(error) !== "ENOENT") throw error;
+            fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
+              encoding: "utf8", flag: "wx", mode: 0o600,
+            });
+            // POSIX rename can replace an EMPTY directory, but a fresh ownerless legacy
+            // lock may be an in-flight creator. Route every observed canonical path through
+            // the original owner/stale checks instead of publishing over it.
+            try {
+              fs.lstatSync(this.#lockPath);
+              throw Object.assign(new Error("Fabric mesh lock already exists"), { code: "EEXIST" });
+            } catch (error) {
+              if (errorCode(error) !== "ENOENT") throw error;
+            }
+            // New-format competitors publish nonempty owners atomically. This does not fence
+            // old-format writers that create an empty canonical after the absence check.
+            fs.renameSync(staging, this.#lockPath);
+          } finally {
+            fs.rmSync(staging, { recursive: true, force: true });
           }
-          // New-format competitors publish nonempty owners atomically. This does not fence
-          // old-format writers that create an empty canonical after the absence check.
-          fs.renameSync(staging, this.#lockPath);
-        } finally {
-          fs.rmSync(staging, { recursive: true, force: true });
         }
         break;
       } catch (error) {
         const code = errorCode(error);
-        if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES") throw error;
+        if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
+          (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
         if (this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
           throw Object.assign(new Error(
@@ -1535,7 +1556,11 @@ export class MeshStore {
     } finally {
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");
-        if (owner === ownerRecord) {
+        if (this.#lockProtocol === 1) {
+          if (owner.startsWith(`${token}\n`)) {
+            fs.rmSync(this.#lockPath, { recursive: true, force: true });
+          }
+        } else if (owner === ownerRecord) {
           // Detach the complete owned directory before unlinking anything inside it.
           // Interrupted/resumed recursive cleanup must never follow the canonical name.
           const released = `${this.#lockPath}.released.${token}`;

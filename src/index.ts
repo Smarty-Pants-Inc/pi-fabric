@@ -681,7 +681,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // A self-reload (smarty-dev#2160) re-arms the actors this Main hosts and reports on the mesh.
     const selfReloaded = selfReload.sessionStart(event?.reason ?? "", context);
     if (selfReloaded && context.hasUI) {
-      const notice = `Fabric reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
+      const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
       context.ui.notify(notice, "info");
       // The TUI's own "Reloaded ..." status line replaces an info notice; the footer keeps it
       // until the user's next input.
@@ -1212,6 +1212,10 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // Escape's stop-the-world halt of actors or Jev observers (mesh off too); the user's next
     // input lifts it (review/astra on pi-fabric#158, #160).
     halted: () => escapeLatched || state.escapeHalted,
+    // The pinned public Pi UI API cannot query global native/extension dialogs, custom UI or
+    // the external editor. A resource-originated reload MUST fail closed until the host supplies
+    // a supported query covering all of these holds. Fabric's legacy package watch is unchanged.
+    reloadTargetUiHold: () => "unsupported-host:global-dialog/editor-hold-query",
   });
 }
 

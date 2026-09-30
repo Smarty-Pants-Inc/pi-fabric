@@ -159,6 +159,9 @@ describe("RootInbox", () => {
     expect(entries).toHaveLength(2);
     const ids = batch.events.map(event => event.id);
     expect(sessionHoldsInboxBatch(entries, ids)).toBe(true);
+    expect(rootInboxSession(entries).holdsBatch(ids)).toBe(true);
+    expect(rootInboxSession(entries.slice(0, 1)).holdsBatch(ids)).toBe(false);
+    expect(rootInboxSession(entries, 1).holdsBatch(ids)).toBe(false);
     expect(sessionHoldsInboxBatch(entries.slice(0, 1), ids)).toBe(false);
     expect(sessionHoldsInboxBatch(entries, ids, 1)).toBe(false);
     expect(sessionHoldsInboxBatch([{ type: "message", customType: "pi-fabric-inbox", details: { ids } }], ids)).toBe(false);

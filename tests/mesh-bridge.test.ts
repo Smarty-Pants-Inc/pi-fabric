@@ -4,9 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   type BridgeSide,
+  BRIDGE_LEASE_MS,
   MeshBridge,
   RemoteBridgeSide,
   serveBridgeAgent,
@@ -14,7 +15,7 @@ import {
 } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { runBridge, transportCommand } from "../src/mesh-bridge.js";
-import { readHostLeases } from "../src/topology/host-leases.js";
+import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readParticipantFiles, writeParticipantFile } from "../src/topology/participant-files.js";
@@ -27,6 +28,7 @@ const cleanups: Array<() => void> = [];
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) cleanup();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  vi.restoreAllMocks();
 });
 
 const scratch = (): string => {
@@ -79,6 +81,7 @@ interface SetupOptions {
   local?: (hub: MeshStore, remoteName: string) => StoreBridgeSide;
   agent?: (far: MeshStore) => StoreBridgeSide;
   pollMs?: number;
+  presenceMs?: number;
 }
 
 const setup = (cursorPath?: string, options: SetupOptions = {}) => {
@@ -110,7 +113,7 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
     local: options.local?.(hub, remoteName) ?? new StoreBridgeSide(hub, remoteName),
     remote: options.wrapRemote?.(remote) ?? remote,
     cursorPath: cursorPath ?? path.join(scratch(), "cursor.json"),
-    presenceMs: 0,
+    presenceMs: options.presenceMs ?? 0,
     ...(options.pollMs ? { pollMs: options.pollMs } : {}),
     ...(options.stopMs ? { stopMs: options.stopMs } : {}),
     log: (message) => logs.push(message),
@@ -132,6 +135,111 @@ const waitFor = async (check: () => boolean): Promise<void> => {
   while (!check() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 10));
   expect(check()).toBe(true);
 };
+
+describe("presence mirror under contention (smarty-dev#2761)", () => {
+  it.each([3_000, 15_000, 60_000])("mirrors the remote %i ms lease TTL from this side's sync time, capped", async (ttl) => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { far, bridge } = setup(undefined, { presenceMs: 60_000 });
+    const root = await addRoot(far, "remote", ttl);
+    now += ttl - 1;
+    await bridge.syncPresence();
+    const lease = readHostLeases((bridge.options.local as StoreBridgeSide).store.root).get(root.hostId)!;
+    expect(lease.expiresAt).toBe(now + Math.min(ttl, BRIDGE_LEASE_MS));
+  });
+
+  it("uses the effective file lease renewal, not the old shared-state heartbeat, for TTL", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { far, hub, bridge } = setup();
+    const root = await addRoot(far, "remote", 3_000);
+    now += 600_000;
+    writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now - 1_000, expiresAt: now + 2_000 });
+    await bridge.syncPresence();
+    expect(readHostLeases(hub.root).get(root.hostId)!.expiresAt).toBe(now + 3_000);
+  });
+
+  it("admits a renewing sender after a presence write waits 20 s on the held mesh lock", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const hub = new MeshStore(scratch(), 64 * 1024, 100, { lockTimeoutMs: 60_000, staleLockMs: 60_000 });
+    const { far, bridge, remote, logs } = setup(undefined, { hub, presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const root = await addRoot(far, "remote");
+    await bridge.start();
+    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: root.identity, to: lane.hostId, data: { targetId: root.hostId, accepted: true } });
+    const presence = vi.spyOn(remote, "presence");
+    const lock = path.join(hub.root, ".lock");
+    fs.mkdirSync(lock);
+    fs.writeFileSync(path.join(lock, "owner"), `held-by-test\n${process.pid}\n${now}\n`);
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    const put = hub.put.bind(hub);
+    vi.spyOn(hub, "put").mockImplementation((input) => { entered(); return put(input); });
+    const pass = bridge.step();
+    await waiting;
+    // Real store lock contention, with 20 s of lease time advanced deterministically.
+    // Remote file renewals bypass the hub's lock, just like the production heartbeat.
+    for (let elapsed = 0; elapsed < 20_000; elapsed += 5_000) {
+      now += 5_000;
+      writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 15_000 });
+    }
+    fs.rmSync(lock, { recursive: true });
+    expect(await pass).toMatchObject({ toLocal: 1, dropped: 0 });
+    expect(presence).toHaveBeenCalledTimes(2);
+    expect(on(hub, "fabric.control.ack")).toHaveLength(1);
+    expect(logs).toEqual([]);
+  });
+
+  it("refuses a host that stops renewing within twice its TTL, even without a scheduled sync", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { hub, far, bridge, logs } = setup(undefined, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const root = await addRoot(far, "remote", 3_000);
+    await bridge.start();
+    now += 2_999;
+    await bridge.syncPresence(); // Last observation immediately before the remote expires.
+    now += 3_001; // Exactly 2x the remote's 3 s TTL from its final renewal.
+    expect((bridge.options.local as StoreBridgeSide).holds(root.hostId)).toBe(false);
+    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: root.identity, to: lane.hostId, data: { targetId: root.hostId } });
+    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 1 });
+    expect(on(hub, "fabric.control.ack")).toHaveLength(0);
+    expect(logs.join("\n")).toContain("sender is not a live participant of the remote");
+  });
+
+  it("single-flights a stale authority refresh across 100 concurrent refusal passes and never refreshes fresh messages", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { hub, far, bridge, remote, logs } = setup(undefined, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    await addRoot(far, "remote", 60_000);
+    await bridge.start();
+    await bridge.syncPresence();
+    const unknown: MeshIdentity = { id: sid("never-live"), name: "main", kind: "main" };
+    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: unknown, to: lane.hostId, data: { targetId: unknown.id } });
+    now += 5_001;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    const original = remote.presence.bind(remote);
+    const presence = vi.spyOn(remote, "presence").mockImplementation(async () => { entered(); await held; return original(); });
+    const passes = Promise.all(Array.from({ length: 100 }, () => bridge.step()));
+    await Promise.race([waiting, passes.then(() => { throw new Error("Stale authority never requested a presence refresh"); })]);
+    // Let all concurrent authority callers reach the same in-flight refresh.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    const results = await passes;
+    expect(presence).toHaveBeenCalledTimes(1);
+    expect(results.every((result) => result.toLocal === 0)).toBe(true);
+    expect(logs.join("\n")).toContain("sender is not a live participant of the remote");
+    expect(on(hub, "fabric.control.ack")).toHaveLength(0);
+    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: unknown, to: lane.hostId, data: { targetId: unknown.id } });
+    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 1 });
+    expect(presence).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("mesh bridge", () => {
   it.each(["local", "remote"] as const)("retries one typed %s mesh timeout at startup, presence and forward without loss or duplicates", async (where) => {

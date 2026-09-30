@@ -212,7 +212,14 @@ export class StoreBridgeSide implements BridgeSide {
       reserved.add(host.id).add(host.identity.id).add(host.rootId);
       if (mark !== undefined || entry.updatedBy.id !== host.identity.id) continue;
       const expiresAt = hostLeaseExpiry(leases, host);
-      if (expiresAt > now) hosts.push({ record: host, expiresAt });
+      // File-only heartbeats leave the state record old. Carry the effective lease's
+      // renewal time too, so the peer measures its TTL rather than the state's age.
+      const lease = leases.get(host.id);
+      const record = lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
+        lease.expiresAt >= host.expiresAt
+        ? { ...host, updatedAt: lease.updatedAt, expiresAt }
+        : host;
+      if (expiresAt > now) hosts.push({ record, expiresAt });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
@@ -361,8 +368,12 @@ export class StoreBridgeSide implements BridgeSide {
     const hosts = new Map<string, FabricHostRecord>();
     for (const { record, expiresAt } of presence.hosts) {
       if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
-      const until = Math.min(expiresAt, now + BRIDGE_LEASE_MS);
-      if (until <= now) continue;
+      // Mirror a still-live observation for one source TTL from this side's sync,
+      // not until the source's absolute expiry. Even a final observation just before
+      // the source expires can therefore extend a stopped host by at most one TTL.
+      const ttl = Math.min(BRIDGE_LEASE_MS, expiresAt - record.updatedAt);
+      if (expiresAt <= now || !Number.isFinite(ttl) || ttl <= 0) continue;
+      const until = now + ttl;
       hosts.set(record.id, record);
       wanted.set(keyFor(HOST_PREFIX, record.id), {
         value: { ...record, updatedAt: now, expiresAt: until, remoteHost: this.peer },
@@ -797,6 +808,7 @@ export class MeshBridge {
   #cursor: CursorFile | undefined;
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
   #presenceAt = Number.NEGATIVE_INFINITY;
+  #presenceSync: Promise<void> | undefined;
   #stopped = false;
   #wake: (() => void) | undefined;
   /** The loop's current pass, so stop() can fence it before the final withdrawal. */
@@ -847,8 +859,13 @@ export class MeshBridge {
     writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600 });
   }
 
-  /** Mirror each side's live roots into the other. */
-  async syncPresence(): Promise<void> {
+  /** Mirror each side's live roots into the other; concurrent callers share one pass. */
+  syncPresence(): Promise<void> {
+    return this.#presenceSync ??= this.#syncPresence().finally(() => { this.#presenceSync = undefined; });
+  }
+
+  async #syncPresence(): Promise<void> {
+    const syncedAt = Date.now();
     const [local, claimed] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
     const remote = admitPresence(claimed, new Set(local.reserved));
     if (this.#stopped) return;
@@ -860,7 +877,8 @@ export class MeshBridge {
     const failures = results.filter((result) => result.status === "rejected");
     const failure = failures.find((result) => !isMeshLockTimeout(result.reason)) ?? failures[0];
     if (failure) throw failure.reason;
-    this.#presenceAt = Date.now();
+    // A lock-delayed write must not make an old snapshot look freshly observed.
+    this.#presenceAt = syncedAt;
   }
 
   /**
@@ -871,6 +889,10 @@ export class MeshBridge {
   async #authority(): Promise<{ local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> }> {
     const { local } = this.options;
     if (!local.owned) throw new Error("The hub side of a bridge must report the records it holds");
+    // A page/read/write can wait on the mesh lock longer than a mirrored lease.
+    // Refresh once before denying stale authority, sharing the normal presence pass.
+    // Store lock and transport call timeouts bound it; no retry loop or fresh-message RPC.
+    if (Date.now() - this.#presenceAt > DEFAULT_PRESENCE_MS) await this.syncPresence();
     const [presence, owned] = await Promise.all([local.presence(), local.owned()]);
     return { local: presence, remote: admitPresence(owned, new Set(presence.reserved)) };
   }

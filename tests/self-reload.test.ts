@@ -134,6 +134,31 @@ describe("installSelfReload", () => {
     expect(fresh.sent).toEqual([]);
   });
 
+  it("rechecks a Fabric rollback at command execution even when mtime did not change", async () => {
+    const { old, next, emit, commands, sent, selfReload } = setup();
+    const context = fakeContext("s-fabric-rollback", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next); emit("agent_settled", context); expect(sent).toHaveLength(1);
+    const stat = fs.statSync(settingsPath());
+    activate(old); fs.utimesSync(settingsPath(), stat.atime, stat.mtime);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).not.toHaveBeenCalled();
+  });
+
+  it("attempts each exact Fabric target once even across intervening failed targets", async () => {
+    const { next, emit, commands, sent, selfReload } = setup();
+    const third = release("ccc");
+    const context = fakeContext("s-fabric-exact-attempt", { idle: true, pending: false });
+    context.reload.mockRejectedValue(new Error("native failure"));
+    selfReload.sessionStart("startup", context as never);
+    for (const target of [next, third]) {
+      activate(target); emit("agent_settled", context);
+      await expect(commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context)).rejects.toThrow("native failure");
+    }
+    activate(next); emit("agent_settled", context);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(sent).toHaveLength(2); expect(context.reload).toHaveBeenCalledTimes(2);
+  });
   it("waits for task agents and actor runs, then reloads while the Main stays idle", async () => {
     vi.useFakeTimers();
     let busy = 1;

@@ -11,6 +11,8 @@ import { ShellEventInbox } from "../src/core/shell-inbox.js";
 import { ResultConsumption } from "../src/result-consumption.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
+import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
+import { captureMontyTransport } from "./helpers/monty-transport.js";
 const stores: FabricShellJobStore[] = [];
 const context = {} as FabricInvocationContext;
 afterEach(async () => { for (const store of stores.splice(0)) await store.close(); });
@@ -117,6 +119,65 @@ describe("shell task observation receipts", () => {
       boundary(); boundary(); expect(sendMessage).toHaveBeenCalledOnce();
     } finally { inbox.close(); vi.useRealTimers(); }
   });
+});
+
+describe.skipIf(process.platform !== "linux")("Monty returned-but-unadmitted spilled-task observations", () => {
+  it.each((["get", "wait"] as const).flatMap(action =>
+    (["expiry", "closure", "normal ack", "ack then expiry"] as const).map(outcome => [action, outcome] as const)),
+  )("completed spilled tasks.%s after Monty return before admission: %s", async (action, outcome) => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const { store, provider } = setup();
+    const { inbox, sendMessage, boundary } = pendingInbox(store);
+    const job = store.begin("bash", "Monty admission spilled output"); job.spill(); job.append(Buffer.from("retained evidence")); await job.finish(0);
+    const acknowledged = vi.fn(); store.subscribe(event => { if (event.type === "acknowledged") acknowledged(); });
+    const registry = new ActionRegistry(); registry.register(provider);
+    let countAtReturn = -1;
+    let deadlineAt = 0;
+    let ackCount = 0;
+    const timer = captureRuntimeDeadline("monty");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const control = await captureMontyTransport(() => { countAtReturn = acknowledged.mock.calls.length; }, ack => {
+      ackCount++;
+      ack(1, 0); ack(0, 1);
+      expect(acknowledged, "uncorrelated confirmations").not.toHaveBeenCalled();
+      ack(); ack();
+      expect(acknowledged).toHaveBeenCalledOnce();
+      if (outcome === "ack then expiry") timer.fireAt(deadlineAt);
+    }, outcome === "expiry" || outcome === "closure");
+    const invoke = registry.invoke.bind(registry);
+    const invocation = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, ctx) => {
+      deadlineAt = ctx.mainDeadlineAt!;
+      return invoke(ref, args, ctx);
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.kernel = "python"; config.executor.pythonRuntime = "monty"; config.executor.mainMaxTimeoutMs = 60_000;
+    const controller = new AbortController();
+    const execution = new FabricExecutionService(registry, config).execute({
+      code: `return await tools.call(ref="tasks.${action}", args={"id": ${JSON.stringify(job.id)}})`,
+      context: { cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "monty-task-admission-main" } } as unknown as ExtensionContext,
+      signal: controller.signal, parentToolCallId: `monty-task-${action}-${outcome}`, onPartial() {},
+    });
+    try {
+      await Promise.race([control.responseReturned, execution.then(result => { throw new Error(`Ended before callback returned: ${result.error}`); })]);
+      expect(countAtReturn, "callback return is not guest admission").toBe(0);
+      if (outcome === "expiry") timer.fireAt(deadlineAt);
+      if (outcome === "closure") control.closeReceiver();
+      const result = await execution;
+      expect(result.success).toBe(outcome === "normal ack");
+      if (outcome === "expiry" || outcome === "ack then expiry") expect(result.error).toMatch(/MainExecutionCeilingError/);
+      control.staleAck();
+      const admitted = outcome === "normal ack" || outcome === "ack then expiry";
+      expect(acknowledged).toHaveBeenCalledTimes(admitted ? 1 : 0);
+      expect(ackCount).toBe(admitted ? 1 : 0);
+      expect(job.info().unread).toBe(!admitted); expect(inbox.pendingCount()).toBe(admitted ? 0 : 1);
+      boundary(); boundary(); expect(sendMessage).toHaveBeenCalledTimes(admitted ? 0 : 1);
+      if (!admitted) expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([job.id]);
+    } finally {
+      controller.abort(); control.closeReceiver(); await execution;
+      invocation.mockRestore(); control.restore(); clock.mockRestore(); timer.restore();
+      inbox.close(); await registry.close(); vi.unstubAllEnvs();
+    }
+  }, 45_000);
 });
 
 describe("tasks provider", () => {

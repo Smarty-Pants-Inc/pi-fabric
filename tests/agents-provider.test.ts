@@ -44,6 +44,7 @@ import type { AgentRunRecord } from "../src/agents/types.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
+import { captureMontyTransport } from "./helpers/monty-transport.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 
@@ -663,6 +664,73 @@ describe.skipIf(process.platform !== "linux")("native written-but-unadmitted obs
       await execution;
       if (guest && guest.exitCode === null && guest.signalCode === null) await new Promise<void>(resolve => guest.once("exit", () => resolve()));
       clock.mockRestore(); timer.restore(); invocation.mockRestore(); spawn.mockImplementation(actual.spawn);
+      inbox.close(); await registry.close(); vi.unstubAllEnvs();
+    }
+  }, 45_000);
+});
+
+describe.skipIf(process.platform !== "linux")("Monty returned-but-unadmitted agent observations", () => {
+  it.each((["wait", "join", "status"] as const).flatMap(action =>
+    (["expiry", "closure", "normal ack", "ack then expiry"] as const).map(outcome => [action, outcome] as const)),
+  )("terminal agents.%s after Monty return before admission: %s", async (action, outcome) => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const { AgentCompletionInbox } = await import("../src/agents/completion-inbox.js");
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const sendMessage = vi.fn();
+    const inboxContext = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, inboxContext);
+    const consumed = vi.fn((id: string) => inbox.acknowledge(id));
+    const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => inbox.enqueue(result));
+    const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
+    const registry = new ActionRegistry(); registry.register(h.provider);
+    const handle = await h.agents.spawn({ task: "Monty admission receipt", transport: "process" });
+    h.agents.detachSignal(handle.id);
+    await waitFor(() => completed.mock.calls.length === 1, 5_000);
+    let countAtReturn = -1;
+    let deadlineAt = 0;
+    let ackCount = 0;
+    const timer = captureRuntimeDeadline("monty");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const control = await captureMontyTransport(() => { countAtReturn = consumed.mock.calls.length; }, ack => {
+      ackCount++;
+      ack(1, 0); ack(0, 1);
+      expect(consumed, "uncorrelated confirmations").not.toHaveBeenCalled();
+      ack(); ack();
+      expect(consumed).toHaveBeenCalledExactlyOnceWith(handle.id);
+      if (outcome === "ack then expiry") timer.fireAt(deadlineAt);
+    }, outcome === "expiry" || outcome === "closure");
+    const invoke = registry.invoke.bind(registry);
+    const invocation = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, ctx) => {
+      deadlineAt = ctx.mainDeadlineAt!;
+      return invoke(ref, args, ctx);
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.kernel = "python"; config.executor.pythonRuntime = "monty"; config.executor.mainMaxTimeoutMs = 60_000;
+    const controller = new AbortController();
+    const execution = new FabricExecutionService(registry, config).execute({
+      code: `return await agents.${action}(id=${JSON.stringify(handle.id)})`,
+      context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "monty-admission-main" } } as unknown as ExtensionContext,
+      signal: controller.signal, parentToolCallId: `monty-${action}-${outcome}`, onPartial() {},
+    });
+    try {
+      await Promise.race([control.responseReturned, execution.then(result => { throw new Error(`Ended before callback returned: ${result.error}`); })]);
+      expect(countAtReturn, "callback return is not guest admission").toBe(0);
+      if (outcome === "expiry") timer.fireAt(deadlineAt);
+      if (outcome === "closure") control.closeReceiver();
+      const result = await execution;
+      expect(result.success).toBe(outcome === "normal ack");
+      if (outcome === "expiry" || outcome === "ack then expiry") expect(result.error).toMatch(/MainExecutionCeilingError/);
+      control.staleAck();
+      const admitted = outcome === "normal ack" || outcome === "ack then expiry";
+      expect(consumed).toHaveBeenCalledTimes(admitted ? 1 : 0);
+      expect(ackCount).toBe(admitted ? 1 : 0);
+      const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
+      boundary(); boundary();
+      expect(sendMessage).toHaveBeenCalledTimes(admitted ? 0 : 1);
+      if (!admitted) expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([handle.id]);
+    } finally {
+      controller.abort(); control.closeReceiver(); await execution;
+      invocation.mockRestore(); control.restore(); clock.mockRestore(); timer.restore();
       inbox.close(); await registry.close(); vi.unstubAllEnvs();
     }
   }, 45_000);

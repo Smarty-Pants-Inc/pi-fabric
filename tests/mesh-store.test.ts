@@ -582,6 +582,121 @@ describe("MeshStore lock recovery", () => {
     return lockPath;
   };
 
+  it("a stalled initializer cannot overwrite a live successor after legacy stale recovery", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100 });
+    const lock = path.join(store.root, ".lock");
+    const ownerPath = path.join(lock, "owner");
+    const write = fs.writeFileSync.bind(fs);
+    const operation = vi.fn();
+    let armed = true;
+    let competitor: Promise<void> | undefined;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+      if (!armed || path.basename(String(file)) !== "owner") return write(file, data, options);
+      armed = false;
+      // HEAD stalls after canonical mkdir; the candidate stalls in its private directory.
+      // Exercise the same >30 s legacy orphan recovery in both interleavings.
+      if (!fs.existsSync(lock)) fs.mkdirSync(lock, { mode: 0o700 });
+      fs.writeFileSync(path.join(lock, "legacy-leftover"), "orphan\n");
+      const past = new Date(Date.now() - 30_001);
+      fs.utimesSync(lock, past, past);
+      competitor = other.exclusive(() => {
+        const successor = fs.readFileSync(ownerPath, "utf8");
+        const inode = fs.statSync(lock).ino;
+        write(file, data, options); // resume the old initializer while successor is live
+        expect(fs.readFileSync(ownerPath, "utf8")).toBe(successor);
+        expect(fs.statSync(lock).ino).toBe(inode);
+        expect(operation).not.toHaveBeenCalled();
+      });
+      void competitor.catch(() => undefined);
+    });
+    await store.exclusive(operation);
+    expect(armed).toBe(false);
+    expect(competitor).toBeDefined();
+    await competitor;
+    expect(operation).toHaveBeenCalledOnce();
+    const fences = fs.readdirSync(store.root).filter((name) => name.startsWith(".lock.dead."));
+    expect(fences).toHaveLength(1);
+    expect(fs.readdirSync(path.join(store.root, fences[0]!))).toContain(".recovery-fence");
+    expect(fs.readdirSync(store.root).some((name) => name.startsWith(".lock.pending."))).toBe(false);
+  });
+
+  it("a stalled initialized publication refuses a nonempty live successor", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100 });
+    const lock = path.join(store.root, ".lock");
+    const ownerPath = path.join(lock, "owner");
+    const rename = fs.renameSync.bind(fs);
+    const operation = vi.fn();
+    let armed = true;
+    let refused: unknown;
+    let competitor: Promise<void> | undefined;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (!armed || String(to) !== lock) return rename(from, to);
+      armed = false;
+      expect(fs.readFileSync(path.join(String(from), "owner"), "utf8")).toContain(`${process.pid}\n`);
+      vi.setSystemTime(Date.now() + 30_001);
+      competitor = other.exclusive(() => {
+        const successor = fs.readFileSync(ownerPath, "utf8");
+        const inode = fs.statSync(lock).ino;
+        try { rename(from, to); } catch (error) { refused = error; }
+        expect(fs.readFileSync(ownerPath, "utf8")).toBe(successor);
+        expect(fs.statSync(lock).ino).toBe(inode);
+        expect(operation).not.toHaveBeenCalled();
+      });
+      void competitor.catch(() => undefined);
+      if (refused) throw refused;
+    });
+    const result = await store.exclusive(operation).catch((error: unknown) => error);
+    expect(armed).toBe(false);
+    expect(competitor).toBeDefined();
+    await competitor;
+    expect(refused).toBeDefined();
+    expect(result).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.readdirSync(store.root).some((name) => name.startsWith(".lock.pending."))).toBe(false);
+  });
+
+  it("interrupted release never exposes an ownerless canonical or cleans a live successor on resume", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100 });
+    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100 });
+    const lock = path.join(store.root, ".lock");
+    const ownerPath = path.join(lock, "owner");
+    const remove = fs.rmSync.bind(fs);
+    let cleanupPath: string | undefined;
+    let ownerlessCanonical = false;
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      const name = String(file);
+      if (!cleanupPath && (name === lock || name.startsWith(`${lock}.released.`))) {
+        cleanupPath = name;
+        fs.unlinkSync(path.join(name, "owner")); // recursive removal interrupted after unlink
+        ownerlessCanonical = fs.existsSync(lock) && !fs.existsSync(ownerPath);
+        if (fs.existsSync(lock)) {
+          const past = new Date(Date.now() - 30_001);
+          fs.utimesSync(lock, past, past);
+        }
+        throw new Error("simulated interrupted cleanup");
+      }
+      return remove(file, options);
+    });
+    await store.exclusive(() => "released");
+    expect(cleanupPath).toBeDefined();
+    let successorUnchanged = false;
+    await other.exclusive(() => {
+      const successor = fs.readFileSync(ownerPath, "utf8");
+      const inode = fs.statSync(lock).ino;
+      remove(cleanupPath!, { recursive: true, force: true }); // resume exact old cleanup
+      successorUnchanged = fs.existsSync(ownerPath) &&
+        fs.readFileSync(ownerPath, "utf8") === successor && fs.statSync(lock).ino === inode;
+    });
+    expect(ownerlessCanonical).toBe(false);
+    expect(successorUnchanged).toBe(true);
+    expect(fs.existsSync(cleanupPath!)).toBe(false);
+  });
+
   it("bounded lock backoff keeps the uncontended first attempt immediate", async () => {
     vi.useFakeTimers();
     const store = createStore();

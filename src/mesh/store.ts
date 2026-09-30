@@ -1218,6 +1218,8 @@ export class MeshStore {
     const deadline = Date.now() + this.#lockTimeoutMs;
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
+    const startTime = processStartTime(process.pid);
+    const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     // Attempts and the largest gap between two of them: a large gap means this waiter stalled
     // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
     let attempts = 0;
@@ -1230,15 +1232,32 @@ export class MeshStore {
       attempts += 1;
       lastAttemptAt = attemptAt;
       try {
-        fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-        const startTime = processStartTime(process.pid);
-        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`, {
-          encoding: "utf8",
-          mode: 0o600,
-        });
+        // Never expose an ownerless canonical directory: a stalled initializer must not
+        // resume its owner write through a name that legacy recovery gave to a successor.
+        const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
+        try {
+          fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
+            encoding: "utf8", flag: "wx", mode: 0o600,
+          });
+          // POSIX rename can replace an EMPTY directory, but a fresh ownerless legacy
+          // lock may be an in-flight creator. Route every observed canonical path through
+          // the original owner/stale checks instead of publishing over it.
+          try {
+            fs.lstatSync(this.#lockPath);
+            throw Object.assign(new Error("Fabric mesh lock already exists"), { code: "EEXIST" });
+          } catch (error) {
+            if (errorCode(error) !== "ENOENT") throw error;
+          }
+          // New-format competitors publish nonempty owners atomically. This does not fence
+          // old-format writers that create an empty canonical after the absence check.
+          fs.renameSync(staging, this.#lockPath);
+        } finally {
+          fs.rmSync(staging, { recursive: true, force: true });
+        }
         break;
       } catch (error) {
-        if (errorCode(error) !== "EEXIST") throw error;
+        const code = errorCode(error);
+        if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES") throw error;
         if (this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
           throw Object.assign(new Error(
@@ -1265,8 +1284,12 @@ export class MeshStore {
     } finally {
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");
-        if (owner.startsWith(`${token}\n`)) {
-          fs.rmSync(this.#lockPath, { recursive: true, force: true });
+        if (owner === ownerRecord) {
+          // Detach the complete owned directory before unlinking anything inside it.
+          // Interrupted/resumed recursive cleanup must never follow the canonical name.
+          const released = `${this.#lockPath}.released.${token}`;
+          fs.renameSync(this.#lockPath, released);
+          fs.rmSync(released, { recursive: true, force: true });
         }
       } catch {
         // Another process already recovered or removed this lock.

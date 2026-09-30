@@ -1088,6 +1088,94 @@ describe("durable completion receipts", () => {
 });
 
 describe.skipIf(!hasResidentHost || process.platform === "win32")("durable participant residency", () => {
+  it.skipIf(process.platform !== "linux")("F1 preserves original completion when the compiled resident host's result save fails through graceful close and two restarts", { timeout: 60_000 }, async () => {
+    // Real compiled launcher -> real Pi -> compiled resident host; only model inference is fake.
+    // STREAM_PREVIEW supplies its own running/terminal records and full text, without fixture edits.
+    const state = await rootHarness("f1-compiled-save-failure");
+    const launches = launchLog(state.root);
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath };
+    const client = new ResidencyClient(options);
+    let reconnect: ResidencyClient | undefined;
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    const closeHost = async () => {
+      const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+      const owned = launches.owned().find((entry) => entry.pid === owner.pid)!;
+      expect(owned).toBeDefined();
+      expect(owned.argv).toContain(path.resolve("dist/residency/pi-entry.js"));
+      expect(same(owned)).toBe(true);
+      process.kill(owner.pid, "SIGTERM"); // Exercise graceful tracked-run cleanup, not crash recovery.
+      await waitFor(() => !same(owned), 20_000);
+      expect(fs.existsSync(ownerPath)).toBe(false);
+    };
+    try {
+      expect(state.config.agents.retainRuns).toBe(false); // Keep the public default.
+      const handle = await client.spawnAgent({ task: "STREAM_PREVIEW", transport: "process", residency: "durable" });
+      expect(launches.owned().some(({ argv }) => argv[0] === hostPath)).toBe(true);
+      const run = path.join(state.config.residencyRoot, "runs", handle.id);
+      const statusPath = path.join(run, "status.json");
+      const resultPath = residentResultPath(state.config.residencyRoot, handle.id);
+      const record = () => JSON.parse(fs.readFileSync(statusPath, "utf8"));
+      // Inject a genuine filesystem fault after spawn but before the worker finishes:
+      // atomic result publication cannot rename a regular file over this directory.
+      fs.mkdirSync(resultPath, { recursive: true });
+      await waitFor(() => fs.existsSync(statusPath));
+      expect(record().status).toBe("running");
+      const worker = launches.owned().find(({ argv }) => argv[0] === fakeWorker && argv[argv.indexOf("--id") + 1] === handle.id)!;
+      expect(worker).toBeDefined();
+      await waitFor(() => record().status === "completed" && !same(worker), 10_000);
+      const original = record();
+      expect(original.text).toBe("stream preview complete");
+      // Host completion publication follows onSettled, proving the failed save was attempted.
+      // Do not start the client drainer: the envelope must not become an alternate result store.
+      await waitFor(() => state.mesh.listAll(residentDeliveryPrefix(state.identity.id))
+        .some((entry) => (entry.value as { agentCompletionId?: string }).agentCompletionId === handle.id));
+      expect(fs.statSync(resultPath).isDirectory()).toBe(true);
+      const metadataPath = path.join(state.config.residencyRoot, "agents", `${handle.id}.json`);
+      expect(JSON.parse(fs.readFileSync(metadataPath, "utf8")).handle.status).toBe("running");
+      await client.close();
+      await closeHost();
+      // Remove the notification too: recovery must use the worker record, not a queued summary.
+      for (const entry of state.mesh.listAll(residentDeliveryPrefix(state.identity.id))) {
+        await state.mesh.delete({ key: entry.key });
+      }
+      expect(fs.existsSync(statusPath), "failed save must veto tracked close deleting the last result").toBe(true);
+      const expected = { id: handle.id, status: original.status, text: original.text, residency: "durable" };
+      for (let restart = 1; restart <= 2; restart++) {
+        reconnect = new ResidencyClient(options);
+        await reconnect.ensureHost();
+        expect(reconnect.statusAgent(handle.id), `restart ${restart}`).toMatchObject(expected);
+        expect(await reconnect.waitAgent(handle.id, AbortSignal.timeout(2_000))).toMatchObject(expected);
+        expect(record()).toEqual(original);
+        expect(fs.statSync(resultPath).isDirectory()).toBe(true);
+        await reconnect.close();
+        await closeHost();
+      }
+      // Counterexample: a fully valid saved copy permits the expired run's startup collection.
+      // This is a test-owned authoritative copy, not a claim that host save retries succeeded.
+      fs.rmdirSync(resultPath);
+      fs.writeFileSync(resultPath, JSON.stringify(original));
+      const expiredAt = Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000;
+      fs.utimesSync(run, expiredAt / 1_000, expiredAt / 1_000);
+      reconnect = new ResidencyClient(options);
+      await reconnect.ensureHost();
+      expect(fs.existsSync(run)).toBe(false);
+      expect(reconnect.statusAgent(handle.id)).toMatchObject(expected);
+      expect(await reconnect.waitAgent(handle.id, AbortSignal.timeout(2_000))).toMatchObject(expected);
+      await reconnect.close();
+      await closeHost();
+    } finally {
+      await reconnect?.close();
+      await client.close();
+      await stopResident(state.config);
+      for (const owned of launches.owned()) if (same(owned)) {
+        try { process.kill(owned.pid, "SIGKILL"); } catch { /* already exited */ }
+      }
+      await waitFor(() => launches.owned().every((owned) => !same(owned)), 10_000);
+      await state.participants.close();
+    }
+  });
+
   it.skipIf(process.platform !== "linux")("F1 retains a detached worker completion after SIGKILL, expiry, recovery and a second restart", { timeout: 60_000 }, async () => {
     const state = await rootHarness("f1-detached-completion");
     const launches = launchLog(state.root);

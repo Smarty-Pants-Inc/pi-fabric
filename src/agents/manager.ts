@@ -294,6 +294,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   nestedSnapshotAt?: number;
   latestRecord?: AgentRunRecord;
   latestUiRecord?: AgentRunRecord;
+  /** Keep the full completion only while its terminal-result save needs retrying. */
+  settlementSaveFailure?: { result: AgentRunResult; warning: string };
   background: boolean;
   completionNotified?: boolean;
   lastLivenessCheckAt: number;
@@ -1409,6 +1411,9 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
+    if (!this.#canCollect(managed)) {
+      throw new Error(`Cannot clean up agent ${id}: ${managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
+    }
     this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
@@ -1539,7 +1544,8 @@ export class AgentManager {
         if (storageSafe) {
           // A recovered manager does not own workers left by an earlier host.
           // All tracked transports are confirmed exited above; untracked runs stay put.
-          await Promise.all(all.map((managed) => removeTree(managed.runDirectory).catch(() => undefined)));
+          await Promise.all(all.filter((managed) => this.#canCollect(managed))
+            .map((managed) => removeTree(managed.runDirectory).catch(() => undefined)));
           try {
             if (this.#managedTempRoot && fs.readdirSync(this.#runRoot).every((name) => name === ".fabric-owner.json")) {
               fs.unlinkSync(path.join(this.#runRoot, ".fabric-owner.json"));
@@ -1610,6 +1616,7 @@ export class AgentManager {
       return typeof finishedAt === "number" && now - finishedAt >= this.#retention.oneShotRunMs;
     });
     for (const managed of expired) {
+      if (!this.#canCollect(managed)) continue;
       await removeTree(managed.runDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) this.#runs.delete(managed.id);
     }
@@ -1994,12 +2001,36 @@ export class AgentManager {
         compactUiRecord(record),
       );
     }
+    this.#saveSettledResult(managed, result);
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
-    finishAgentSettlement(managed, result);
+    const reported = this.#withTransportMetadata(result, managed) as AgentRunResult;
+    finishAgentSettlement(managed, reported);
     managed.task = "";
-    try { this.#onSettled?.(result); } catch { /* must not break the manager */ }
-    this.#notifyBackgroundComplete(managed, result);
+    this.#notifyBackgroundComplete(managed, reported);
+  }
+
+  #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
+    try {
+      this.#onSettled?.(result);
+      delete managed.settlementSaveFailure;
+      return true;
+    } catch (error) {
+      managed.settlementSaveFailure = {
+        result: structuredClone(result),
+        warning: `Terminal result save failed; run retained: ${error instanceof Error ? error.message : String(error)}`,
+      };
+      return false;
+    } finally {
+      this.#invalidateUiList();
+    }
+  }
+
+  #canCollect(managed: ManagedAgent): boolean {
+    // Settlement compacts UI caches. Retry only the original full result, never those caches.
+    if (managed.settlementSaveFailure &&
+        !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;
+    return true;
   }
 
   #notifyBackgroundComplete(managed: ManagedAgent, result: AgentRunResult): void {
@@ -2193,7 +2224,9 @@ export class AgentManager {
   #pruneRetainedUiRecords(): void {
     const settled = [...this.#runs.values()].filter((managed) => managed.settled);
     const evicted = settled.slice(0, -MAX_RETAINED_RUN_HANDLES);
-    for (const managed of evicted) this.#runs.delete(managed.id);
+    for (const managed of evicted) {
+      if (!managed.settlementSaveFailure) this.#runs.delete(managed.id);
+    }
     const retained = evicted.length > 0 ? settled.slice(evicted.length) : settled;
     if (retained.length <= MAX_RETAINED_UI_RUNS) return;
     for (const managed of retained.slice(0, -MAX_RETAINED_UI_RUNS)) {
@@ -2295,6 +2328,9 @@ export class AgentManager {
     const thinking = record.thinking ?? managed.thinking;
     return {
       ...safeRecord,
+      ...(managed.settlementSaveFailure
+        ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
+        : {}),
       cwd: managed.cwd,
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),

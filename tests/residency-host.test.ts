@@ -7,6 +7,9 @@ import { spawn } from "node:child_process";
 import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
+import { ResidencyClient } from "../src/residency/client.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 
@@ -31,6 +34,71 @@ const fixture = () => {
 };
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+describe("resident tracked result preservation", () => {
+  it.each(["LARGE_RESULT", "FAIL_DIRECTIVE"])("F1 save failure keeps the worker's %s completion through close and two host/client restarts", async (task) => {
+    const { root, config, host: first } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.agents = { ...config.agents, retainRuns: false, budgetUsd: 0 };
+    config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" };
+    let host = first;
+    let client: ResidencyClient | undefined;
+    let obstructed: string | undefined;
+    const launch = ProcessTransport.prototype.launch;
+    const fault = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      // Use the real id before the child can finish; atomic rename onto a directory must fail.
+      obstructed ??= residentResultPath(config.residencyRoot, request.id);
+      fs.mkdirSync(obstructed, { recursive: true });
+      return launch.call(this, request);
+    });
+    const connect = () => new ResidencyClient({
+      config, mesh: host.mesh, participants: host.participants,
+      mainAgent: { local: false } as FabricMainAgentTarget,
+    });
+    try {
+      await host.start();
+      client = connect();
+      const handle = await client.spawnAgent({ task, transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
+      fault.mockRestore();
+      const original = await host.agents.wait(handle.id, { timeoutMs: 5_000 });
+      expect(original.status).toBe(task === "FAIL_DIRECTIVE" ? "failed" : "completed");
+      expect(original.text).toBe(task === "LARGE_RESULT" ? "x".repeat(100_000) : "fake worker complete");
+      const run = host.agents.runDirectory(handle.id)!;
+      const worker = fs.readFileSync(path.join(run, "status.json"), "utf8");
+      expect(JSON.parse(worker)).toMatchObject({ status: original.status, text: original.text });
+      expect(original.error).toBe(JSON.parse(worker).error);
+      expect(fs.statSync(obstructed!).isDirectory()).toBe(true); // no authoritative saved result
+      // Counterexample: an unobstructed public completion must not pin all tracked runs.
+      const saved = await client.spawnAgent({ task: "saved normally", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
+      await host.agents.wait(saved.id, { timeoutMs: 5_000 });
+      const savedRun = host.agents.runDirectory(saved.id)!;
+      expect(JSON.parse(fs.readFileSync(residentResultPath(config.residencyRoot, saved.id), "utf8")).status).toBe("completed");
+      await client.close();
+      await host.close();
+      expect(fs.existsSync(savedRun)).toBe(false);
+      expect(fs.existsSync(run), "failed save must not delete the only completion").toBe(true);
+      expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
+      const expected = { id: handle.id, status: original.status, text: original.text, residency: "durable",
+        ...(original.error === undefined ? {} : { error: original.error }) };
+      for (let restart = 1; restart <= 2; restart++) {
+        host = new ResidentHost(config);
+        await host.start();
+        client = connect();
+        expect(client.statusAgent(handle.id), `restart ${restart}`).toMatchObject(expected);
+        expect(await client.waitAgent(handle.id, AbortSignal.timeout(2_000))).toMatchObject(expected);
+        expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
+        expect(fs.statSync(obstructed!).isDirectory()).toBe(true);
+        await client.close();
+        await host.close();
+      }
+    } finally {
+      fault.mockRestore();
+      await client?.close();
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 20_000);
+});
+
 describe("resident orphan retention", () => {
   it("F1 retains a public task's only completion until a valid saved terminal result authorizes collection", async () => {
     const { root, config, host } = fixture();

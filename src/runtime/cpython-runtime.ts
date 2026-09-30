@@ -248,8 +248,15 @@ export class CPythonRuntime implements FabricKernelRuntime {
             return;
           }
           if (executionDeadline.reached) { expireDeadline(); return; }
-          channel.write(frame, (error) => { if (error) failPipe(`CPython IPC failed: ${error.message}`); });
-          delivered?.();
+          channel.write(frame, (error) => {
+            if (settled || finishing) return;
+            if (error) { failPipe(`CPython IPC failed: ${error.message}`); return; }
+            // Submission can remain queued until teardown. Only a successful
+            // write on the still-live transport admits the consumption receipt.
+            if (!channel || channel.destroyed || !channel.writable) return;
+            if (executionDeadline.reached) { expireDeadline(); return; }
+            delivered?.();
+          });
         } catch (error) { fail(`CPython IPC serialization failed: ${errorText(error)}`); }
       };
       const handleMessage = (message: unknown): void => {

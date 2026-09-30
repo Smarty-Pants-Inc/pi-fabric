@@ -1350,6 +1350,12 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         try { assign(); return action(); } finally { restoreAssignments(); }
       };
       const declaration = ["export", "readonly", "declare", "typeset", "local"].includes(name);
+      // Unwrapping identifies dangerous consumers, not current-shell execution.
+      // Only a bare direct builtin with no unproved execution boundary can prove
+      // declaration writes or grant NEW readonly attributes; metadata remains data.
+      let declarationProved = declaration && name !== "local" && stage.words[0] === words[0] &&
+        words[0]?.text === name && !words[0]?.quoted && words[0]?.assignment !== false &&
+        !assignments.length && !childBinding && !redirectBinding;
       const standalone = !name || (!declaration && assignments.some((word) => /^\w+\+?=\(/.test(word.pattern)));
       if (standalone) assign();
       // Prefixes/arrays on declarations are outside the proved assignment subset. Do
@@ -1370,8 +1376,11 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           if ([...arg.pattern.matchAll(REFERENCE)].length) { unsupported = true; break; }
           if (arg.text === "--" || !/^[-+][a-zA-Z]+$/.test(arg.text)) break;
           if (arg.text.startsWith("-") && /[pfF]/.test(arg.text)) diagnostic = true;
-          if (!/^[-+][rx]+$/.test(arg.text) && !/^-[pfF]+$/.test(arg.text)) unsupported = true;
+          // Attribute flags are not universal builtin options. Only declare/typeset
+          // have proved literal -r/-x scalar forms; local's function context is unknown.
+          if (!(["declare", "typeset"].includes(name) && /^-[rx]+$/.test(arg.text)) && !/^-[pfF]+$/.test(arg.text)) unsupported = true;
         }
+        if (unsupported) declarationProved = false;
         if (unsupported && !diagnostic) { opaqueAttributes = true; markBindingsUnknown(true); }
         for (const arg of args) {
           if (options && arg.text === "--") { options = false; continue; }
@@ -1389,15 +1398,15 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
             const value = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=(.*)$/s.exec(word.pattern);
             const array = value?.[3]?.startsWith("(");
             if (value) {
-              if (array || assignments.length) markUnknown(value[1]!);
+              if (array || !declarationProved) markUnknown(value[1]!);
               else bind(value[1]!, value[3]!, value[2] !== undefined);
             }
             const key = value?.[1] ?? (/^[A-Za-z_][A-Za-z0-9_]*$/.test(word.text) ? word.text : undefined);
-            if (key && assignments.length) markUnknown(key);
+            if (key && !declarationProved) markUnknown(key);
             // An unresolved declaration operand may name any existing mutable cell.
             // It cannot leave an earlier literal/ownership proof available for approval.
             if (!key && [...word.pattern.matchAll(REFERENCE)].length) markBindingsUnknown();
-            if (attribute && key) markReadonly(key);
+            if (attribute && key && declarationProved) markReadonly(key);
           }
         }
       }

@@ -116,7 +116,11 @@ describe("terminal run log mixed-format completion reuse", () => {
       expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: count });
       expect(reads.mock.results.reduce((sum, result) => sum + Number(result.value), 0)).toBeLessThanOrEqual(3 * Buffer.byteLength(text));
       expect(parses.mock.calls.length).toBeLessThanOrEqual(3 * count * 4);
-      expect(reads.mock.calls.filter((args) => Number(args[4]) === 0)).toHaveLength(2);
+      // Node's last typed overload uses an options object, while this source
+      // deliberately calls the five-argument form. Validate the actual shape.
+      const calls: readonly (readonly unknown[])[] = reads.mock.calls;
+      expect(calls.every((args) => args.length === 5 && typeof args[4] === "number")).toBe(true);
+      expect(calls.filter((args) => args[4] === 0)).toHaveLength(2);
       expect(reads.mock.calls.length).toBeLessThanOrEqual(2 * Math.ceil(Buffer.byteLength(text) / (64 * 1024)) + count);
     } finally {
       reads.mockRestore();

@@ -226,6 +226,31 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  it("does not spawn after cancellation during Windows IPC listener binding", async () => {
+    const controller = new AbortController();
+    const originalListen = net.Server.prototype.listen;
+    let server: net.Server | undefined;
+    // Exercise the real asynchronous Windows pre-spawn boundary on every OS.
+    vi.stubGlobal("process", new Proxy(process, {
+      get(target, key) { return key === "platform" ? "win32" : Reflect.get(target, key); },
+    }));
+    vi.spyOn(net.Server.prototype, "listen").mockImplementation(function (this: net.Server, ...args) {
+      server = this;
+      this.once("listening", () => controller.abort());
+      return originalListen.apply(this, args);
+    });
+    const spawn = vi.mocked(childProcess.spawn); spawn.mockClear();
+    try {
+      expect(await run("return 1", echo, { signal: controller.signal })).toMatchObject({ terminationReason: "aborted" });
+      expect(spawn.mock.calls.length).toBe(0);
+      await new Promise<void>((done) => setImmediate(done));
+      expect(server?.listening).toBe(false);
+    } finally {
+      if (server?.listening) await new Promise<void>((done) => server!.close(() => done()));
+      vi.unstubAllGlobals();
+    }
+  });
+
   it.skipIf(process.platform === "win32")("kills same-group subprocesses when cancelled", async () => {
     const controller = new AbortController();
     let pid: number | undefined;

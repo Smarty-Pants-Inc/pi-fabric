@@ -78,6 +78,25 @@ export class NodeProcessRuntime {
     const interpreterPath = this.#interpreter === "bun"
       ? await resolveScriptRuntime(runtimeOptions)
       : resolveScriptRuntimeSync(runtimeOptions);
+    // Bun resolution is async: recheck before acquiring any child process.
+    if (options.signal?.aborted) {
+      return {
+        value: undefined,
+        logs: [],
+        terminationReason: "aborted",
+        error: "Execution cancelled",
+      };
+    }
+    // Preparation still consumes the execution budget even though it precedes spawn.
+    const startedAt = Date.now();
+    // Complete fallible guest preparation before spawn. There must be no
+    // ownerless child if transpilation, stack mapping or setup throws.
+    const guestBundle = options.transpiledCode === undefined
+      ? transpileFabricCodeWithSourceMap(code)
+      : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
+    const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
+    const guestLineCount = guestBundle.code.split("\n").length;
+    const setup = guestSetupSource(options.piToolCanonicalFields, options.piTools !== false);
     const child = spawn(
       interpreterPath,
       this.#interpreter === "bun"
@@ -93,18 +112,8 @@ export class NodeProcessRuntime {
           ],
       { stdio: ["ignore", "ignore", "ignore", "ipc"] },
     );
-    // Bun resolution is async, so the signal may have aborted while resolving.
-    if (options.signal?.aborted) {
-      return {
-        value: undefined,
-        logs: [],
-        terminationReason: "aborted",
-        error: "Execution cancelled",
-      };
-    }
     const hostAbortController = new AbortController();
     shareCancellationEffects(hostAbortController.signal, options.signal);
-    const startedAt = Date.now();
     let effectiveTimeoutMs = options.timeoutMs;
     let deadlineAt = startedAt + effectiveTimeoutMs;
     let deadline: NodeJS.Timeout | undefined;
@@ -112,12 +121,6 @@ export class NodeProcessRuntime {
     let settled = false;
     let finishing = false;
     const hostTasks = new Set<Promise<void>>();
-
-    const guestBundle = options.transpiledCode === undefined
-      ? transpileFabricCodeWithSourceMap(code)
-      : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
-    const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
-    const guestLineCount = guestBundle.code.split("\n").length;
 
     return new Promise<FabricSandboxResult>((resolve) => {
       const finish = (result: FabricSandboxResult, unawaitedHostCalls = false): void => {
@@ -248,10 +251,13 @@ export class NodeProcessRuntime {
         });
       });
 
+      // A synchronous startup hook can also abort before the listener is installed.
+      // From this point a child exists, so cancellation must use owned teardown.
+      if (options.signal?.aborted) { abortHandler(); return; }
       scheduleDeadline();
       send(child, {
         type: "execute",
-        setup: guestSetupSource(options.piToolCanonicalFields, options.piTools !== false),
+        setup,
         code: guestBundle.code,
         strings: options.strings ?? {},
         tokenBudget: options.tokenBudget,

@@ -118,6 +118,12 @@ export class CPythonRuntime implements FabricKernelRuntime {
     if (options.signal?.aborted) return failure("aborted", "Execution cancelled");
     // Windows cannot inherit a socket through stdio; the child connects back instead.
     const ipc = process.platform === "win32" ? await createIpcListener() : undefined;
+    // Binding is asynchronous too: cancellation here must close the listener,
+    // not start a guest just to kill it at the later abort-listener check.
+    if (options.signal?.aborted) {
+      ipc?.server.close();
+      return failure("aborted", "Execution cancelled");
+    }
 
     return new Promise<FabricSandboxResult>((resolve) => {
       const hostAbort = new AbortController();

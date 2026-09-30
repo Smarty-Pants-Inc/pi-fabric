@@ -1,3 +1,4 @@
+import * as childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,13 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { abandonResidentRequest, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
+import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+
 const deferred = () => {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
@@ -39,7 +47,7 @@ const names = (directory: string) => {
   try { return fs.readdirSync(directory); } catch { return []; }
 };
 const entries = (root: string, directory: string) => names(path.join(root, directory)).filter((file) => file.endsWith(".json"));
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.mocked(childProcess.spawn).mockReset(); });
 
 /** No fake host/response: real pickup, managers, model refresh, worker launch and ownership. */
 const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig) => void, commandTimeoutMs = 500) => {
@@ -485,12 +493,27 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
   for (const engine of engines) for (const operation of ["spawn", "create"] as const) {
     it(`${engine} normal durable ${operation} returns its handle without false uncertainty`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+      const trace = await captureDurableExecutionTrace();
+      trace.record("harness ready");
+      let execution: unknown;
+      const report = () => { try { trace.report(engine, operation, {
+        execution, decisions: decisionsFor(state),
+        files: Object.fromEntries(["requests", "processing", "responses", "agents", "runs"].map(directory => [directory, names(path.join(state.residencyRoot, directory))])),
+        participants: state.participants.list({ scope: "lineage" }).map(({ id, kind, ownerHostId, status, stale }) => ({ id, kind, ownerHostId, status, stale })),
+      }); } catch (error) { trace.report(engine, operation, { execution, snapshotError: String(error) }); } };
       try {
+        // Keep the original 5 s deadline. On CI failure the phase trace, not a
+        // larger timeout, distinguishes Python/IPC startup from a resident stall.
         const run = publicExecution(state, main, engine, 5_000);
+        trace.record("public execution entered");
         const result = await run(`return ${publicCall(engine, operation, requestArgs(state, operation))}`);
+        execution = result; trace.record("public execution returned", { success: result.success, error: result.error });
         expect(result.success, result.error).toBe(true); expect(result.error).toBeUndefined();
         const decisions = decisionsFor(state); expect(decisions).toHaveLength(1);
         expect(result.value).toMatchObject({ id: decisions[0].id });
+        if (process.env.PI_FABRIC_TEST_TRACE === "1") report();
+      } catch (error) {
+        trace.record("control failed", { error: String(error) }); report(); throw error;
       } finally { await main.close(); await state.close(); }
     });
   }

@@ -141,6 +141,45 @@ describe("native reader disk suspension", () => {
     expect(reader.suspended).toBe(true);
     reader.clear();
   });
+  it.each(["missing", "corrupt"])("bounds distinct fixed-interval rewrite hash work and fails closed with a %s checkpoint", (failure) => {
+    const file = path.join(workspace(), "session.jsonl");
+    const input = { id: "reader", status: "running", sessionFile: file };
+    const bytes = (i: number) => jsonl([header, { ...entry(0, 16), message: { role: "user", content: String(i).padStart(16, "0"), timestamp: 0 } }]);
+    fs.writeFileSync(file, bytes(0));
+    const size = fs.statSync(file).size;
+    const inode = fs.statSync(file).ino;
+    const reader = new NativeConversationReader();
+    reader.read(input, false);
+    const stringify = vi.spyOn(JSON, "stringify");
+    for (let i = 1; i <= 256; i++) {
+      fs.writeFileSync(file, bytes(i));
+      const latest = reader.loadLatest()!;
+      expect(latest.messages).toEqual([{ role: "user", content: String(i).padStart(16, "0"), timestamp: 0 }]);
+      expect(latest.entries).toHaveLength(1);
+      expect(latest.leafId).toBe("m0");
+    }
+    // Hash input is the raw record array, not a decoded history/payload. Once
+    // contradictory, this fixed interval needs no further hashes or versions.
+    const hashes = stringify.mock.calls.filter(([value]) => Array.isArray(value) && value.length === 2 && typeof value[0] === "string" && value[0].startsWith('{"type":"session"')).length;
+    stringify.mockRestore();
+    expect(fs.statSync(file).size).toBe(size);
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(hashes).toBeLessThanOrEqual(2);
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[0]!.value as string, "checkpoint");
+    if (failure === "missing") fs.unlinkSync(checkpoint);
+    else fs.writeFileSync(checkpoint, "corrupt");
+    const reads = vi.spyOn(fs, "readSync");
+    const failed = reader.read({ ...input, status: "completed" }, false);
+    expect(failed.messages).toEqual([]);
+    expect(failed.status).toBe("completed");
+    expect(failed.unavailable?.sessionFile).toBe(true);
+    expect(failed.error).toContain("Unable to restore reader history");
+    expect(reader.suspended).toBe(true);
+    expect(reads.mock.calls.length).toBe(0);
+    reader.clear();
+  });
   it("checkpoints only final-sized live tool state and replays older pages exactly after resume", () => {
     const file = path.join(workspace(), "events.jsonl");
     const oldMessage = { role: "user", content: "old" + "o".repeat(300000), timestamp: 1 };

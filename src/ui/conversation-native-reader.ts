@@ -198,6 +198,7 @@ interface RecordPage {
   /** Byte offset just past the last record included. */
   end: number;
   records: string[];
+  offsets: Array<[number, number]>;
 }
 
 /**
@@ -221,7 +222,7 @@ const readBackwardPage = (
     const buffer = Buffer.allocUnsafe(end - candidate);
     const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, candidate);
     const data = buffer.subarray(0, Math.max(0, bytesRead));
-    if (data.length === 0) return { start: candidate, end: candidate, records: [] };
+    if (data.length === 0) return { start: candidate, end: candidate, records: [], offsets: [] };
     const firstNewline = data.indexOf(0x0a);
     if (firstNewline === -1) {
       if (candidate === 0) {
@@ -229,8 +230,8 @@ const readBackwardPage = (
         // can complete it, just like a trailing partial line in a larger file.
         const raw = data.toString("utf8").replace(/\r$/, "");
         return includeFinalPartialLine && raw && parseRecord(raw)
-          ? { start: 0, end, records: [raw] }
-          : { start: 0, end: 0, records: [] };
+          ? { start: 0, end, records: [raw], offsets: [[0, end]] }
+          : { start: 0, end: 0, records: [], offsets: [] };
       }
       // One record larger than the budget: grow and retry so it loads whole.
       windowBudget = Math.min(windowBudget * 2, end);
@@ -240,12 +241,17 @@ const readBackwardPage = (
     // otherwise align forward past a possibly partial head line.
     const alignStart = candidate > 0 ? firstNewline + 1 : 0;
     const records: string[] = [];
+    const offsets: Array<[number, number]> = [];
+    const baseOffset = candidate;
     let lineStart = alignStart;
     let lastComplete = alignStart;
     for (let index = alignStart; index < data.length; index++) {
       if (data[index] !== 0x0a) continue;
       const raw = data.subarray(lineStart, index).toString("utf8").replace(/\r$/, "");
-      if (raw) records.push(raw);
+      if (raw) {
+        records.push(raw);
+        offsets.push([baseOffset + lineStart, baseOffset + index + 1]);
+      }
       lineStart = index + 1;
       lastComplete = lineStart;
     }
@@ -260,11 +266,12 @@ const readBackwardPage = (
       const tail = data.subarray(lastComplete).toString("utf8").replace(/\r$/, "");
       if (includeFinalPartialLine && tail && parseRecord(tail)) {
         records.push(tail);
+        offsets.push([candidate + lastComplete, end]);
       } else {
         endOffset = candidate + lastComplete;
       }
     }
-    return { start: candidate + alignStart, end: endOffset, records };
+    return { start: candidate + alignStart, end: endOffset, records, offsets };
   }
 };
 
@@ -283,18 +290,23 @@ const readForwardPage = (
   let windowBudget = Math.max(budget, 1);
   for (;;) {
     const limit = Math.min(size, start + windowBudget);
-    if (limit <= start) return { start, end: start, records: [] };
+    if (limit <= start) return { start, end: start, records: [], offsets: [] };
     const buffer = Buffer.allocUnsafe(limit - start);
     const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, start);
     const data = buffer.subarray(0, Math.max(0, bytesRead));
-    if (data.length === 0) return { start, end: start, records: [] };
+    if (data.length === 0) return { start, end: start, records: [], offsets: [] };
     const records: string[] = [];
+    const offsets: Array<[number, number]> = [];
+    const baseOffset = start;
     let lineStart = 0;
     let lastComplete = 0;
     for (let index = 0; index < data.length; index++) {
       if (data[index] !== 0x0a) continue;
       const raw = data.subarray(lineStart, index).toString("utf8").replace(/\r$/, "");
-      if (raw) records.push(raw);
+      if (raw) {
+        records.push(raw);
+        offsets.push([baseOffset + lineStart, baseOffset + index + 1]);
+      }
       lineStart = index + 1;
       lastComplete = lineStart;
     }
@@ -302,6 +314,7 @@ const readForwardPage = (
       const tail = data.subarray(lastComplete).toString("utf8").replace(/\r$/, "");
       if (limit >= size && tail && parseRecord(tail)) {
         records.push(tail);
+        offsets.push([start + lastComplete, start + data.length]);
         lastComplete = data.length;
       }
     }
@@ -310,7 +323,7 @@ const readForwardPage = (
       windowBudget = Math.min(windowBudget * 2, size - start);
       continue;
     }
-    return { start, end: start + lastComplete, records };
+    return { start, end: start + lastComplete, records, offsets };
   }
 };
 
@@ -342,6 +355,8 @@ interface FileWindow {
   loadedRecords?: number;
   /** Set when the file exists but could not be read. */
   unavailable: boolean;
+  /** A rejected replacement must reparse even if the original bytes return. */
+  replacementPending?: boolean;
 }
 
 type FileKind = "session" | "events";
@@ -437,7 +452,7 @@ export class NativeConversationReader {
   #suspendedMetadata: NativeReaderMetadata | undefined;
   readonly #loadedRanges = new Map<FileKind, Array<[number, number]>>();
   // Compact identity evidence survives suspension without retaining payloads.
-  readonly #loadedPages = new Map<FileKind, Array<{ start: number; end: number; digest: string }>>();
+  readonly #loadedPages = new Map<FileKind, Map<string, { start: number; end: number; digest: string | null; first: string; last: string }>>();
 
   /** Last transcript produced; undefined before the first successful read. */
   get last(): NativeConversationTranscript | undefined {
@@ -615,12 +630,18 @@ export class NativeConversationReader {
 
   #rememberRange(kind: FileKind, page: RecordPage): void {
     if (page.end <= page.start) return;
-    const pages = this.#loadedPages.get(kind) ?? [];
-    const digest = this.#pageDigest(page.records);
-    // Re-reading an identical page adds no identity evidence. Keep different
-    // digests at the same offsets so checkpoint recovery still fails closed.
-    if (pages.some((previous) => previous.start === page.start && previous.end === page.end && previous.digest === digest)) return;
-    pages.push({ start: page.start, end: page.end, digest });
+    const pages = this.#loadedPages.get(kind) ?? new Map();
+    const key = `${page.start}:${page.end}`;
+    const previous = pages.get(key);
+    if (previous) {
+      if (previous.digest !== null && previous.digest !== this.#pageDigest(page.records)) previous.digest = null;
+      return;
+    }
+    pages.set(key, {
+      start: page.start, end: page.end, digest: this.#pageDigest(page.records),
+      first: this.#recordBoundary(page.records[0] ?? ""),
+      last: this.#recordBoundary(page.records.at(-1) ?? ""),
+    });
     this.#loadedPages.set(kind, pages);
     const ranges = [...(this.#loadedRanges.get(kind) ?? []), [page.start, page.end] as [number, number]];
     ranges.sort((a, b) => a[0] - b[0]);
@@ -761,7 +782,7 @@ export class NativeConversationReader {
     this.#tools.clear();
   }
 
-  #resetEventsState(): void {
+  #resetEventsState(initialize = true): void {
     this.#treeDirty = true;
     this.#eventReplay = new NativeReaderEventReplay();
     this.#resetStreamingState();
@@ -777,11 +798,13 @@ export class NativeConversationReader {
       }
     }
     this.#eventEntryIds.clear();
-    this.#windows.delete("events");
-    this.#loadedRanges.delete("events");
-    this.#loadedPages.delete("events");
+    if (initialize) {
+      this.#windows.delete("events");
+      this.#loadedRanges.delete("events");
+      this.#loadedPages.delete("events");
+    }
     this.#error = undefined;
-    if (this.#eventsFile) this.#initWindow("events", this.#eventsFile);
+    if (initialize && this.#eventsFile) this.#initWindow("events", this.#eventsFile);
   }
 
   #initWindow(kind: FileKind, filePath: string): void {
@@ -888,8 +911,10 @@ export class NativeConversationReader {
 
   #matchesLoadedPages(kind: FileKind, descriptor: number, size: number): boolean {
     const pages = this.#loadedPages.get(kind);
-    if (!pages?.length) return false;
-    for (const previous of pages) {
+    if (!pages?.size) return false;
+    // Contradictory evidence can never validate, including after suspension.
+    if ([...pages.values()].some((page) => page.digest === null)) return false;
+    for (const previous of pages.values()) {
       if (size < previous.end) return false;
       const page = readForwardPage(descriptor, previous.start, previous.end, previous.end - previous.start);
       if (page.end !== previous.end || this.#pageDigest(page.records) !== previous.digest) return false;
@@ -904,29 +929,115 @@ export class NativeConversationReader {
     const { device, inode } = opened;
     const window = this.#windows.get(kind);
     if (!window || window.device === undefined ||
-      (window.device === device && window.inode === inode)) return false;
+      (!window.replacementPending && window.device === device && window.inode === inode)) return false;
     // Recreating an unchanged source is not compaction: the pinned tail must
     // stay before unseen appends. Only reuse byte bookmarks after proving all
     // loaded pages identical; changed payloads still take the reread path below.
-    if (this.#matchesLoadedPages(kind, opened.descriptor, opened.size)) {
+    if (!window.replacementPending && this.#matchesLoadedPages(kind, opened.descriptor, opened.size)) {
       window.device = device;
       window.inode = inode;
       window.size = opened.size;
       window.unavailable = false;
       return false;
     }
-    const loadedRecords = window.loadedRecords ?? 0;
-    if (kind === "events") this.#resetEventsState();
-    else this.#resetPaths(this.#sourceId, this.#status, this.#sessionFile, this.#eventsFile);
-    // Terminal compaction preserves record order/count, not byte offsets. A
-    // smaller tail page must not discard history the user already loaded.
-    // Re-read coverage from the new inode; never keep old parsed payloads, as
-    // an arbitrary replacement may contain entirely different records.
-    const filePath = kind === "events" ? this.#eventsFile : this.#sessionFile;
-    while (filePath && (this.#windows.get(kind)?.loadedRecords ?? 0) < loadedRecords) {
-      if (!this.#loadOlderFile(kind, filePath)) break;
+    // Relocate logical coverage, not a count backwards from the new EOF:
+    // unread arrivals must not displace either loaded history or a pinned leaf.
+    const evidence = [...(this.#loadedPages.get(kind)?.values() ?? [])];
+    const first = evidence.reduce<typeof evidence[number] | undefined>((oldest, page) => !oldest || page.start < oldest.start ? page : oldest, undefined);
+    const last = evidence.reduce<typeof evidence[number] | undefined>((newest, page) => !newest || page.end > newest.end ? page : newest, undefined);
+    const bounds = first && last ? this.#relocateBounds(opened, first.start === 0 ? undefined : first.first, last.last) : undefined;
+    if (!bounds) {
+      // Missing/reused identities are not permission to guess at the new tail.
+      // Discard replaced payloads and leave evidence for a later retry.
+      this.#clearFileState(kind);
+      window.unavailable = true;
+      window.replacementPending = true;
+      this.#setError("Replacement history boundaries are missing or ambiguous");
+      return true;
+    }
+    const pages: RecordPage[] = [];
+    let end = bounds.tail;
+    do {
+      const page = readBackwardPage(opened.descriptor, end, INITIAL_PAGE_BYTES, kind === "events");
+      pages.push(page);
+      if (page.start >= end) break;
+      end = page.start;
+    } while (end > bounds.head);
+    this.#clearFileState(kind);
+    this.#loadedPages.delete(kind);
+    this.#loadedRanges.delete(kind);
+    for (let index = 0; index < pages.length; index++) {
+      const page = pages[index]!;
+      this.#applyRecords(kind, page.records, index === 0);
+      this.#rememberRange(kind, page);
+    }
+    this.#windows.set(kind, {
+      head: pages.at(-1)!.start, tail: bounds.tail, size: opened.size,
+      device, inode, hasOlder: pages.at(-1)!.start > 0,
+      loadedRecords: pages.reduce((count, page) => count + page.records.length, 0), unavailable: false,
+    });
+    if (this.#followed) {
+      const page = readForwardPage(opened.descriptor, bounds.tail, opened.size, GROWTH_PAGE_BYTES);
+      if (page.end > bounds.tail) {
+        this.#applyRecords(kind, page.records, true);
+        this.#rememberRange(kind, page);
+        this.#windows.get(kind)!.tail = page.end;
+      }
     }
     return true;
+  }
+
+  #recordBoundary(raw: string): string {
+    const record = parseRecord(raw);
+    if (record && isSessionEntry(record)) return JSON.stringify([record.type, record.id, record.parentId, record.timestamp]);
+    const message = record?.message as Record<string, unknown> | undefined;
+    const entry = record?.entry;
+    if (record?.type === "entry_appended" && isSessionEntry(entry)) return JSON.stringify([record.type, entry.type, entry.id, entry.parentId, entry.timestamp]);
+    if (record?.type === "message_end" && message && typeof message.role === "string" && typeof message.timestamp === "number") {
+      return JSON.stringify([record.type, message.role, message.timestamp, message.toolCallId]);
+    }
+    if (record && typeof record.toolCallId === "string" && typeof record.type === "string") {
+      return JSON.stringify([record.type, record.toolCallId, record.toolName]);
+    }
+    // Partial/noncanonical records have no invented durable identity. They
+    // must match bytes; repeated matches still fail closed.
+    return this.#pageDigest([raw]);
+  }
+
+  #relocateBounds(opened: { descriptor: number; size: number }, headKey: string | undefined, tailKey: string): { head: number; tail: number } | undefined {
+    let head = headKey === undefined ? 0 : undefined;
+    let tail: number | undefined;
+    let headMatches = 0;
+    let tailMatches = 0;
+    let offset = 0;
+    while (offset < opened.size) {
+      const page = readForwardPage(opened.descriptor, offset, opened.size, GROWTH_PAGE_BYTES);
+      if (page.end <= offset) break;
+      for (let index = 0; index < page.records.length; index++) {
+        const key = this.#recordBoundary(page.records[index]!);
+        if (key === headKey) { headMatches++; head = page.offsets[index]![0]; }
+        if (key === tailKey) { tailMatches++; tail = page.offsets[index]![1]; }
+      }
+      offset = page.end;
+    }
+    return head !== undefined && tail !== undefined && head < tail &&
+      (headKey === undefined || headMatches === 1) && tailMatches === 1 ? { head, tail } : undefined;
+  }
+
+  #clearFileState(kind: FileKind): void {
+    if (kind === "events") { this.#resetEventsState(false); return; }
+    for (const id of this.#sessionEntryIds) {
+      if (this.#eventEntryIds.has(id)) continue;
+      this.#entryIds.delete(id);
+      this.#byId.delete(id);
+    }
+    this.#entries = this.#entries.filter((entry) => this.#byId.has(entry.id));
+    this.#sessionEntryIds.clear();
+    this.#sessionLeafId = undefined;
+    this.#sessionId = undefined;
+    this.#treeDirty = true;
+    this.#messagesDirty = true;
+    this.#entryProjections = new WeakMap();
   }
 
   #ingest(followLatest: boolean): void {

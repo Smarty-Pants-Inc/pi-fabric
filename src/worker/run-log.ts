@@ -233,7 +233,10 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
   };
   try {
     const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-    source = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    // Windows FlushFileBuffers (fsync) requires GENERIC_WRITE. O_RDWR grants
+    // that capability without creating, truncating, or writing the source;
+    // failure to obtain write access must retain the full log, like fsync failure.
+    source = fs.openSync(filePath, fs.constants.O_RDWR | noFollow);
     const original = fs.fstatSync(source);
     if (!original.isFile()) return outcome;
     outcome.beforeBytes = outcome.afterBytes = original.size;

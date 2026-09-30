@@ -223,6 +223,74 @@ process.stdin.on("end", () => {
 });
 
 describe("worker run log", () => {
+  it("uses a write-capable source for Windows-style FlushFileBuffers and real fsync", () => {
+    const { events, end, message } = capEvents("durable paired result", true, { terminate: true });
+    const text = write(events, true, false).text;
+    const file = logFile(text);
+    const original = fs.statSync(file);
+    const open = fs.openSync;
+    const fsync = fs.fsyncSync;
+    let source: number | undefined;
+    let sourceFlags = -1;
+    const synced: number[] = [];
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation((name, flags, mode) => {
+      const fd = open(name, flags, mode);
+      if (name === file) { source = fd; sourceFlags = Number(flags); }
+      return fd;
+    });
+    const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      // Capability repro only, not a native Windows claim. All permitted
+      // flushes execute the platform's actual fsync; no failure is swallowed.
+      if (fd === source && (sourceFlags & (fs.constants.O_RDWR | fs.constants.O_WRONLY)) === 0) {
+        throw Object.assign(new Error("FlushFileBuffers requires GENERIC_WRITE"), { code: "EBADF" });
+      }
+      fsync(fd);
+      synced.push(fd);
+    });
+    const writes = vi.spyOn(fs, "writeSync");
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.compactionSkipped).toBeUndefined();
+      expect(outcome.compacted).toBe(1);
+      expect(sourceFlags & fs.constants.O_RDWR).toBe(fs.constants.O_RDWR);
+      expect(sourceFlags & (fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_APPEND)).toBe(0);
+      const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+      expect(sourceFlags & noFollow).toBe(noFollow);
+      expect(synced).toHaveLength(2);
+      expect(synced[0]).toBe(source);
+      expect(writes.mock.calls.every(([fd]) => fd !== source)).toBe(true);
+    } finally { openSpy.mockRestore(); syncSpy.mockRestore(); writes.mockRestore(); }
+    const compacted = fs.readFileSync(file, "utf8");
+    const records = compacted.trimEnd().split("\n").map((line) => JSON.parse(line));
+    expect(records.filter((event) => event.type === "tool_execution_end")).toEqual([
+      { ...end, result: { elided: true, bytes: Buffer.byteLength(JSON.stringify(end.result)) }, resultMetadata: { terminate: true } },
+    ]);
+    expect(records.filter((event) => event.type === "message_end")).toEqual([{ type: "message_end", message }]);
+    expect(fs.statSync(file).ino).not.toBe(original.ino);
+    expect(fs.statSync(file).mode & 0o777).toBe(original.mode & 0o777);
+    expect(readEntries(compacted)).toEqual(readEntries(text));
+    expect(readTranscript(compacted).streaming).toEqual(readTranscript(text).streaming);
+  });
+
+  it("retains full bytes and inode when source write access is denied", () => {
+    const text = write(capEvents("read-only source").events, true, false).text;
+    const file = logFile(text);
+    const inode = fs.statSync(file).ino;
+    const open = fs.openSync;
+    const spy = vi.spyOn(fs, "openSync").mockImplementation((name, flags, mode) => {
+      if (name === file && (Number(flags) & fs.constants.O_RDWR) !== 0) {
+        throw Object.assign(new Error("EACCES: source write access denied"), { code: "EACCES" });
+      }
+      return open(name, flags, mode);
+    });
+    try {
+      expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 0, error: expect.stringContaining("EACCES") });
+    } finally { spy.mockRestore(); }
+    expect(fs.readFileSync(file, "utf8")).toBe(text);
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  });
   it.each(["execution", "session", "claude", "after-canonical"])("retains missing-first-start ends across a later reused-ID start (%s)", (kind) => {
     const content = [{ type: "text", text: "same output" }];
     const details = { exitCode: 0 };
@@ -339,8 +407,10 @@ describe("worker run log", () => {
     let text = write(records, true, false).text;
     if (difference === "partial") text = text.trimEnd();
     const file = logFile(text);
-    expect(compactTerminalRunLog(file, "failed").compacted).toBe(0);
+    const inode = fs.statSync(file).ino;
+    expect(compactTerminalRunLog(file, "failed")).toMatchObject({ compacted: 0, beforeBytes: Buffer.byteLength(text), afterBytes: Buffer.byteLength(text) });
     expect(fs.readFileSync(file, "utf8")).toBe(text);
+    expect(fs.statSync(file).ino).toBe(inode);
   });
 
   it("preserves opaque legacy marker fields during paired compaction", () => {
@@ -383,7 +453,7 @@ describe("worker run log", () => {
     const spy = failure === "rename"
       ? vi.spyOn(fs, "renameSync").mockImplementation(() => { throw new Error("injected rename failure"); })
       : vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-        if (++syncs === (failure === "source-fsync" ? 1 : 2)) throw new Error("injected fsync failure");
+        if (++syncs === (failure === "source-fsync" ? 1 : 2)) throw Object.assign(new Error("injected EIO fsync failure"), { code: "EIO" });
         fsync(fd);
       });
     try {

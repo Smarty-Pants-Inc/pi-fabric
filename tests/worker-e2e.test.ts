@@ -360,17 +360,10 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     const content = [{ type: "text", text: "Read image file [image/png]" }, stub];
     expect(end).toMatchObject({ toolCallId: "read-1", toolName: "read", isError: false });
     expect(canonicals[0].message).toEqual({ role: "toolResult", toolCallId: "read-1", toolName: "read", content });
-    if (result.compactionSkipped !== undefined) {
-      // Terminal deduplication is best-effort (work bounds or filesystem failure).
-      // Image projection must still be exact: never accept raw base64, lost data,
-      // or an unexplained full end from a broken canonical pairing.
-      expect(result.compactionSkipped).toMatch(
-        /^Terminal run-log compaction (?:skipped: .+ work bound exceeded; full log retained|failed; full log retained: .+)$/,
-      );
-      expect(end.result).toEqual({ content });
-    } else {
-      expect(end.result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify({ content }), "utf8") });
-    }
+    // This ordinary, uniquely paired log is well within every work bound.
+    // A platform-wide durability failure must not masquerade as an accepted fallback.
+    expect(result.compactionSkipped).toBeUndefined();
+    expect(end.result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify({ content }), "utf8") });
   }, 30_000);
 
   it.each(["oversized-final", "oversized-error"])(

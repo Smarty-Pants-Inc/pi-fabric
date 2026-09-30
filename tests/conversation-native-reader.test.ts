@@ -608,6 +608,134 @@ describe("native conversation reader — paging and rollover", () => {
     reader.clear();
   });
 
+  it.each([false, true])("preserves pinned session coverage across unread replacement (follow=%s)", (follow) => {
+    const file = path.join(makeWorkspace(), "session.jsonl");
+    const records = (prefix: string, count: number) => [sessionHeader, ...Array.from({ length: count }, (_, index) => ({
+      ...entryBase(`u${index}`, index ? `u${index - 1}` : null), type: "message",
+      message: { role: "user", content: `${prefix}-${index}:${"x".repeat(5000)}`, timestamp: index },
+    }))];
+    fs.writeFileSync(file, jsonl(records("old", 150)));
+    const reader = new NativeConversationReader();
+    const input = source({ sessionFile: file });
+    reader.read(input, false);
+    const before = reader.loadOlder()!;
+    expect(before.messages).toHaveLength(100);
+    expect(before.leafId).toBe("u149");
+    fs.appendFileSync(file, jsonl(records("new", 152).slice(-2)));
+    fs.writeFileSync(`${file}.new`, jsonl(records("new", 152)));
+    const inode = fs.statSync(file).ino;
+    fs.renameSync(`${file}.new`, file);
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const after = reader.read(input, follow);
+    expect(after.messages.filter((message) => message.timestamp >= 50 && message.timestamp < 150).map((message) => message.timestamp)).toEqual(before.messages.map((message) => message.timestamp));
+    expect(JSON.stringify(after.messages)).not.toContain("old-");
+    expect(after.messages.at(-1)?.timestamp).toBe(follow ? 151 : 149);
+    expect(after.leafId).toBe(follow ? "u151" : "u149");
+    expect(after.hasNewer).toBe(!follow);
+    const newer = reader.loadNewer()!;
+    expect(newer.messages.filter((message) => message.timestamp >= 150)).toEqual(records("new", 152).slice(-2).map((record) => (record as { message: unknown }).message));
+    expect(newer.messages.length).toBe(after.messages.length + (follow ? 0 : 2));
+    expect(reader.loadNewer()!.messages).toEqual(newer.messages);
+    expect(reader.loadOlder(3)!.messages).toHaveLength(152);
+    reader.clear();
+  });
+
+  it.each([false, true])("preserves pinned events coverage across production compaction with unread replacement (follow=%s)", (follow) => {
+    const file = path.join(makeWorkspace(), "events.jsonl");
+    const triplet = (index: number) => {
+      const toolCallId = `unread-${index}`;
+      const content = [{ type: "text", text: `body-${index}:${"x".repeat(3990)}` }];
+      const details = { retained: index };
+      return [
+        { type: "tool_execution_start", toolCallId, toolName: "bash", args: { index } },
+        { type: "tool_execution_end", toolCallId, toolName: "bash", result: { content, details }, isError: false },
+        { type: "message_end", message: { role: "toolResult", toolCallId, toolName: "bash", content, details, isError: false, timestamp: index + 1 } },
+      ];
+    };
+    fs.writeFileSync(file, jsonl(Array.from({ length: 160 }, (_, i) => triplet(i)).flat()));
+    const reader = new NativeConversationReader();
+    const input = source({ eventsFile: file, status: "completed" });
+    reader.read(input, false);
+    const before = reader.loadOlder(2)!;
+    expect(before.messages).toHaveLength(93);
+    fs.appendFileSync(file, jsonl([...triplet(160), ...triplet(161)]));
+    const inode = fs.statSync(file).ino;
+    expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 162 });
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const compacted = fs.readFileSync(file, "utf8");
+    expect(compacted).toContain('"elided":true');
+    const after = reader.read(input, follow);
+    expect(after.messages.filter((message) => message.timestamp >= 68 && message.timestamp <= 160)).toEqual(before.messages);
+    expect(after.messages.at(-1)?.timestamp).toBe(follow ? 162 : 160);
+    expect(after.hasNewer).toBe(!follow);
+    const newer = reader.loadNewer()!;
+    expect(newer.messages.filter((message) => message.timestamp > 160)).toEqual([triplet(160)[2]!.message, triplet(161)[2]!.message]);
+    expect(newer.messages.length).toBe(after.messages.length + (follow ? 0 : 2));
+    const tool = newer.streaming.tools.find((item) => item.toolCallId === "unread-161");
+    expect(tool).toMatchObject({ args: { index: 161 }, status: "completed", argsComplete: true, result: { details: { retained: 161 } } });
+    expect(JSON.stringify(tool?.result)).toContain("body-161:");
+    expect(reader.loadNewer()!.messages).toEqual(newer.messages);
+    expect(reader.loadOlder(3)!.messages).toHaveLength(162);
+    reader.clear();
+  });
+  it.each(["session", "events"] as const)("rejects ambiguous %s replacement boundaries and reparses a restored generation", (kind) => {
+    const file = path.join(makeWorkspace(), `${kind}.jsonl`);
+    const message = { role: "user", content: "old", timestamp: 1 };
+    const record = kind === "session" ? { ...entryBase("same", null), type: "message", message } : { type: "message_end", message };
+    const header = kind === "session" ? [sessionHeader] : [];
+    const original = jsonl([...header, record]);
+    fs.writeFileSync(file, original);
+    const input = source(kind === "session" ? { sessionFile: file } : { eventsFile: file });
+    const reader = new NativeConversationReader();
+    reader.read(input, false);
+    const replacement = { ...record, message: { ...message, content: "new" } };
+    fs.writeFileSync(`${file}.new`, jsonl([...header, replacement, replacement]));
+    fs.renameSync(`${file}.new`, file);
+    const failed = reader.read(input, false);
+    expect(failed.messages).toEqual([]);
+    expect(failed.error).toContain("ambiguous");
+    expect(failed.unavailable).toEqual(kind === "session" ? { sessionFile: true } : { eventsFile: true });
+    expect(reader.loadNewer()!.messages).toEqual([]);
+    fs.writeFileSync(`${file}.new`, original);
+    fs.renameSync(`${file}.new`, file);
+    const restored = reader.read(input, false);
+    expect(restored.messages).toEqual([message]);
+    expect(restored.error).toBeUndefined();
+    expect(restored.unavailable).toBeUndefined();
+    reader.clear();
+  });
+
+  it("keeps an unread durable canonical result pending after compacting a loaded execution end across suspension", () => {
+    const file = path.join(makeWorkspace(), "events.jsonl");
+    const content = [{ type: "text", text: "full-result:" + "x".repeat(4000) }];
+    const details = { exact: { audit: [1, 2, 3] } };
+    const result = { content, details };
+    fs.writeFileSync(file, jsonl([
+      { type: "tool_execution_start", toolCallId: "boundary", toolName: "bash", args: { command: "model-free" } },
+      { type: "tool_execution_update", toolCallId: "boundary", toolName: "bash", partialResult: { content: [{ type: "text", text: "partial-only" }] } },
+      { type: "tool_execution_end", toolCallId: "boundary", toolName: "bash", result, isError: false },
+    ]));
+    const reader = new NativeConversationReader();
+    const input = source({ eventsFile: file, status: "completed" });
+    const before = reader.read(input, false);
+    expect(before.streaming.tools[0]?.result).toEqual(result);
+    expect(reader.suspend()).toBe(true);
+    const canonical = { role: "toolResult", toolCallId: "boundary", toolName: "bash", content, details, isError: false, timestamp: 9 };
+    fs.appendFileSync(file, jsonl([{ type: "message_end", message: canonical }]));
+    const inode = fs.statSync(file).ino;
+    expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 1 });
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const pinned = reader.read(input, false);
+    expect(pinned.messages).toEqual([]);
+    expect(pinned.hasNewer).toBe(true);
+    expect(pinned.streaming.tools[0]?.result).toBeUndefined();
+    expect(pinned.streaming.tools[0]?.partial).toEqual({ content: [{ type: "text", text: "partial-only" }] });
+    const newer = reader.loadNewer()!;
+    expect(newer.messages).toEqual([canonical]);
+    expect(newer.streaming.tools[0]).toMatchObject({ status: "completed", args: { command: "model-free" }, result });
+    expect(reader.loadNewer()!.messages).toEqual([canonical]);
+    reader.clear();
+  });
   it("loads giant single records whole without clipping fields", () => {
     const directory = makeWorkspace();
     const huge = "y".repeat(1024 * 1024);

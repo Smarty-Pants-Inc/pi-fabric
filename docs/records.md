@@ -106,6 +106,7 @@ The service (`/etc/<org>-records/service.json`, written by the install script) h
     ],
     "alarmSeconds": 120, "refuseSeconds": 300, "refreshMs": 30000
   },
+  "anchorExport": { "directory": "/var/lib/smarty-pants-records/anchors", "intervalMs": 300000 },
   "statusFile": "/var/lib/smarty-pants-records/status/smarty-pants.status.json"
 }
 ```
@@ -189,8 +190,9 @@ form (`created_at` as its exact epoch, `extract(epoch FROM created_at)::text`: s
 under the per-org lock; migration v3 backfilled the rows before it. The first record's `prev_hash` is NULL.
 
 - `records.anchor()` (or `service-main anchor --config FILE`) returns `{ org, seq, hash, at }` for the last record.
-  The backup adapter writes it to every backup target on each run: at least every 5 min on the admission target,
-  daily on the others. A copy off the host is what makes a rewrite of the whole chain detectable.
+  The service also publishes it without a socket caller, as described below. The backup adapter copies the
+  export to every backup target: at least every 5 min on the admission target, daily on the others. A copy
+  off the host is what makes a rewrite of the whole chain detectable.
 - `records.verify({ anchors })` (or `service-main verify-chain --config FILE --anchors FILE`, exit 0 clean, 1 broken,
   3 unanchored) recomputes the chain from one snapshot and reports the first `break` (`org`, `seq`, `reason`
   `prev_hash` or `gap`, `expected`, `found`), checks each anchor (the row at that seq exists with that hash), and
@@ -203,6 +205,52 @@ under the per-org lock; migration v3 backfilled the rows before it. The first re
   nothing; any other null or malformed hash is refused. `ok` means no break and every anchor holds;
   `clean` also needs no unanchored rows. An edit after the latest anchor that no later row covers shows only as
   unanchored, so a result is clean only when it is anchored through the last row.
+
+### Service-owned anchor export (#1754 / backup F1)
+
+The records service, running as `<org>-records` (for this org, `smarty-pants-records`), computes an anchor
+**at startup and every five minutes by default**, reusing its idle watchdog tick and `RecordStore.anchor`.
+`anchorExport.directory` and `anchorExport.intervalMs` are configured **only** in the protected service
+configuration, not Fabric's caller config; restart the service to apply changes. Intervals are bounded to
+1 second–24 hours and tick timing is best-effort, not a real-time deadline. A database that has not changed
+(`seq` and `hash` identical) does not produce another line. A changed hash at the same sequence is retained.
+The installed config defaults to `/var/lib/<org>-records/anchors`. Existing configs without `anchorExport`
+but with `statusFile` automatically publish to `anchors/` beneath that status file's directory; without
+either a status path or an explicit export directory, no export is configured. The authenticated `status`
+response and the existing public status JSON both name `anchorExport.directory`, `intervalMs`, the last
+exported anchor (`last`), and any publication `error`. Tick failures retry on the next tick; a startup
+publication failure prevents startup. Archive admission being disabled does not disable anchor export.
+
+The factory's unattended **user** backup worker reads/copies `anchors-000000000001.jsonl`,
+`anchors-000000000002.jsonl`, … from that directory, in numbered order, and retains all segments. It
+needs **no principal, credential, sudo, database access or service config access**. Ignore dotfiles
+(the service's publisher lock and any unpublished temporary files). The export contains no token or record
+payload. Each UTF-8, newline-terminated JSON line is exactly the existing anchor format:
+
+```json
+{"org":"smarty-pants","seq":42,"hash":"<64 lowercase hex SHA-256 digest>","at":"2026-09-30T12:00:00.000Z"}
+```
+
+`seq` is the database sequence, `at` is the computation's ISO timestamp, and `hash` is the digest.
+An empty database exports `{ org, seq: 0, hash: null, at }`. Each segment has **at most 9,999 anchors**.
+Only the latest incomplete segment grows; full/abandoned segments are immutable. New segments are
+written to a temporary file, fsynced and atomically renamed; existing ones use `O_APPEND` and fsync.
+The directory is fsynced after publication. No earlier line or numbered segment is ever rewritten or
+deleted. The directory is owned by the records user and mode **0755**; segments are owned by that user
+and mode **0644**, explicitly set regardless of the service's umask. Parent directories must also permit
+factory traversal (the installed records home is 0755). The factory can read, but cannot write, this export.
+
+A crash/short write can leave a trailing fragment without a newline. Readers must take **only the complete,
+newline-terminated prefix** of their snapshot; never parse or discard a malformed *complete* line. On
+restart the service leaves the fragment byte-for-byte unchanged, seals that segment, and publishes later
+anchors in a new numbered segment. A crash before rename leaves only an ignored dotfile; a crash after
+publication is deduplicated from the retained anchor. Copying a growing segment also requires this prefix
+rule, and backups must not lose the retained fragments/earlier bytes. To verify, feed each segment's complete
+prefix separately to the existing `verify-chain --anchors FILE` (as the records user, or via an authenticated
+caller); do not concatenate an unbounded history into one request. Every segment must have `ok: true`
+(no chain break and all its anchors pass); the newest segment must additionally have `clean: true` to
+vouch through the database frontier. Older segments may correctly report exit 3 / `unanchored` for later
+rows. Socket authentication and the existing `anchor`/`verify` methods are unchanged.
 
 ## Commit, then nudge
 

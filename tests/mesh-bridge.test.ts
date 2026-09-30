@@ -158,6 +158,7 @@ describe("mesh bridge", () => {
       expect(sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true,
         provenance: { v: 1, channel: "fabric", sender: { id: remote.identity.id, kind: "remote", name: "main", verified: "bridge" }, via: "followUp" } });
       expect(on(hub, "fabric.control.command")[0]!.from.verified).toBe("bridge");
+      expect(on(hub, "fabric.control.command")[0]!.verification).toBe("bridge");
     } finally {
       await control.close();
       main.closeFollowUpDrain();

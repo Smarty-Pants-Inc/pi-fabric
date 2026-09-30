@@ -321,7 +321,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const messageId = randomUUID();
     const options = { deliverAs: delivery };
     // An unknown caller cannot claim this Main's identity. Pi records the unclaimed turn as terminal.
-    this.pi.sendUserMessage(text, from ? fabricProvenanceOptions(this.pi, options, fabricTurnProvenance(from, delivery)) : options);
+    this.pi.sendUserMessage(text, from ? fabricProvenanceOptions(this.pi, options, fabricTurnProvenance(from, delivery, from.verified === "bridge" ? "bridge" : "mesh")) : options);
     return { queued: true, messageId, routed: "main" };
   }
 
@@ -342,7 +342,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const item: HeldAgentMessage = {
       id: randomUUID(),
       from: sender,
-      provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery),
+      provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, sender.verified === "bridge" ? "bridge" : "mesh"),
       message,
       sentAt: Date.now(),
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),
@@ -682,12 +682,15 @@ export class MainAgentController implements FabricMainAgentTarget {
           // followUp, as before policies were journalled.
           const { deliverAs, triggerTurn, supersedes, provenance, ...rest } = item;
           const via = provenance?.via;
+          const verified = provenance?.sender?.verified;
           items.push({
             ...rest, from: sender,
-            // Whitelist admission fields even for an older or malformed journal. No journal
-            // payload can supply keyboard/voice, a principal, or Pi's receipt stamps.
-            provenance: fabricTurnProvenance(sender, via === "steer" || via === "followUp" || via === "actor" || via === "replay"
-              ? via : deliverAs === "steer" ? "steer" : "followUp"),
+            // Only a recorded admission method permits a claim. Old journals (native or
+            // bridged) are UNKNOWN; payload fields and a missing bridge marker prove nothing.
+            ...(verified === "mesh" || verified === "bridge" ? {
+              provenance: fabricTurnProvenance(sender, via === "steer" || via === "followUp" || via === "actor" || via === "replay"
+                ? via : deliverAs === "steer" ? "steer" : "followUp", verified),
+            } : {}),
             ...(Array.isArray(supersedes) ? { supersedes: supersedes.filter((id) => typeof id === "string") } : {}),
             ...(DIRECT_DELIVERIES.has(deliverAs) && typeof triggerTurn === "boolean" ? { deliverAs, triggerTurn } : {}),
           });
@@ -900,8 +903,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     // A turn has one sender. Keep legacy batching unchanged, and hand over only a homogeneous
     // FIFO prefix on capable hosts. Each successful prefix is journalled before the next send.
     if (this.supportsProvenance()) {
-      const key = JSON.stringify(this.#provenance(this.#held[0]!, delivery));
-      const different = this.#held.slice(0, count).findIndex(item => JSON.stringify(this.#provenance(item, delivery)) !== key);
+      const key = JSON.stringify(this.#provenance(this.#held[0]!));
+      const different = this.#held.slice(0, count).findIndex(item => JSON.stringify(this.#provenance(item)) !== key);
       if (different > 0) count = different;
     }
     const batch = this.#held.slice(0, count);
@@ -955,11 +958,10 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
   }
 
-  #provenance(item: HeldAgentMessage, delivery: FabricMainAgentDelivery): FabricTurnProvenance {
-    // Rebuild the whitelisted shape from the original envelope, including for old journals.
-    // A replay not held by Pi is its first receipt. Already recorded/queued entries are deduped.
-    const admitted = item.provenance ?? fabricTurnProvenance(item.from, delivery === "nextTurn" ? "actor" : delivery);
-    return { ...admitted, sender: { ...admitted.sender }, via: this.#replayed.has(item.id) ? "replay" : admitted.via };
+  #provenance(item: HeldAgentMessage): FabricTurnProvenance | undefined {
+    // A replay not held by Pi is its first receipt, not a fresh sender admission.
+    const admitted = item.provenance;
+    return admitted ? { ...admitted, sender: { ...admitted.sender }, via: this.#replayed.has(item.id) ? "replay" : admitted.via } : undefined;
   }
 
   #send(
@@ -983,6 +985,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
     });
     const first = items[0]!;
+    const provenance = this.#provenance(first);
+    const options = { deliverAs, triggerTurn };
     this.pi.sendMessage(
       {
         customType: "pi-fabric-agent-message",
@@ -1002,7 +1006,7 @@ export class MainAgentController implements FabricMainAgentTarget {
           ...(flushed ? { flushed: true } : {}),
         },
       },
-      fabricProvenanceOptions(this.pi, { deliverAs, triggerTurn }, this.#provenance(first, delivery)),
+      provenance ? fabricProvenanceOptions(this.pi, options, provenance) : options,
     );
   }
 }

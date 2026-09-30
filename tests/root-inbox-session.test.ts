@@ -74,16 +74,18 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-inbox");
     // A peer's shadow record from two minutes ago, whose steer never arrived.
     const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`) => {
+      const id = randomUUID();
       const log = path.join(meshRoot, "events.jsonl");
       const lines = fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : [];
       const sequence = (lines.length ? (JSON.parse(lines.at(-1)!) as { sequence: number }).sequence : 0) + 1;
       fs.appendFileSync(log, `${JSON.stringify({
-        id: randomUUID(), sequence, topic: "fleet.work.pi-fabric.1", kind: "handoff",
+        id, sequence, topic: "fleet.work.pi-fabric.1", kind: "handoff",
         from: { id: "session:peer", name: "main", kind: "main", sessionId: "peer" },
         ...(to ? { to } : {}),
         text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key: text }, createdAt: Date.now() - 120_000,
       })}\n`);
       fs.writeFileSync(path.join(meshRoot, "sequence"), String(sequence));
+      return id;
     };
     // The first turn activates Fabric; its settle starts the inbox at the present.
     if (extra.warm === false) return { session, faux, inboxMessages, missedWork };
@@ -103,6 +105,39 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     faux.setResponses([fauxAssistantMessage("again")]);
     await session.prompt("and again");
     expect(inboxMessages()).toHaveLength(1);
+  }, 60_000);
+
+  it("turn start never re-inserts an aggregate after split inbox receipts", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, false, { warm: false });
+    const identityId = `session:${session.sessionManager.getSessionId()}`;
+    const { createHash } = await import("node:crypto");
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const mesh = new MeshStore(process.env.PI_FABRIC_MESH_ROOT!, 64 * 1024, 100);
+    const ids = [missedWork("sender one"), missedWork("sender two")];
+    const key = "topology/inbox/" + createHash("sha256").update(identityId).digest("hex").slice(0, 32);
+    const previous = mesh.get(key);
+    const after = (previous?.value as { after?: number } | undefined)?.after ?? 0;
+    await mesh.put({ key, identity: { id: identityId, name: "main", kind: "main" }, value: {
+      after, pending: { through: mesh.latestSequence(), ids },
+    } });
+    for (const id of ids) await session.sendCustomMessage({
+      customType: "pi-fabric-inbox", content: `recorded ${id}`, display: true, details: { ids: [id] },
+    }, { triggerTurn: false });
+    expect(inboxMessages()).toHaveLength(2);
+    // Load the persisted pending batch into Fabric's real inbox. An unsuccessful warm
+    // turn must not reconcile at settle; the next before_agent_start owns the receipt.
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
+      { ...fauxAssistantMessage("warm failed"), stopReason: "error", errorMessage: "test warm failure" }]);
+    await session.prompt("warm");
+    expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeDefined();
+    expect(inboxMessages()).toHaveLength(2);
+    faux.setResponses([fauxAssistantMessage("noted")]);
+    await session.prompt("next");
+    expect(inboxMessages()).toHaveLength(2);
+    expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeUndefined();
+    faux.setResponses([fauxAssistantMessage("still noted")]);
+    await session.prompt("again");
+    expect(inboxMessages()).toHaveLength(2);
   }, 60_000);
 
   // review F3: stopping the Main must not start it again.

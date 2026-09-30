@@ -153,14 +153,15 @@ export const fabricProvenanceOptions = <Options extends object | undefined>(
 export const fabricTurnProvenance = (
   from: MeshIdentity,
   via: FabricTurnProvenance["via"],
+  verified: FabricTurnProvenance["sender"]["verified"],
 ): FabricTurnProvenance => ({
   v: 1,
   channel: "fabric",
   sender: {
     id: from.id,
-    kind: from.verified === "bridge" ? "remote" : from.kind,
+    kind: verified === "bridge" ? "remote" : from.kind,
     ...(typeof from.name === "string" && from.name ? { name: from.name } : {}),
-    verified: from.verified === "bridge" ? "bridge" : "mesh",
+    verified,
   },
   via,
 });
@@ -172,7 +173,10 @@ export const sendFabricMessage = (
   from: MeshIdentity | (() => MeshIdentity),
   via: FabricTurnProvenance["via"] = "actor",
 ): void => {
-  pi.sendMessage(message, fabricProvenanceOptions(pi, options, () => fabricTurnProvenance(typeof from === "function" ? from() : from, via)));
+  pi.sendMessage(message, fabricProvenanceOptions(pi, options, () => {
+    const admitted = typeof from === "function" ? from() : from;
+    return fabricTurnProvenance(admitted, via, admitted.verified === "bridge" ? "bridge" : "mesh");
+  }));
 };
 
 export const sendFabricUserMessage = (
@@ -182,7 +186,10 @@ export const sendFabricUserMessage = (
   via: FabricTurnProvenance["via"],
   options?: Parameters<ExtensionAPI["sendUserMessage"]>[1],
 ): void => {
-  const deliveryOptions = fabricProvenanceOptions(pi, options, () => fabricTurnProvenance(typeof from === "function" ? from() : from, via));
+  const deliveryOptions = fabricProvenanceOptions(pi, options, () => {
+    const admitted = typeof from === "function" ? from() : from;
+    return fabricTurnProvenance(admitted, via, admitted.verified === "bridge" ? "bridge" : "mesh");
+  });
   if (deliveryOptions === undefined) pi.sendUserMessage(content);
   else pi.sendUserMessage(content, deliveryOptions);
 };

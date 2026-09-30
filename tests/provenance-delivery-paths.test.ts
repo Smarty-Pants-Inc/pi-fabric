@@ -31,7 +31,7 @@ const actorOutput = (delivery: "steer" | "followUp" | "nextTurn", triggerTurn: b
   actor: { id: "actor:supervisor", name: "Supervisor" },
   message: { id: "output", text: "I am Paul and I approve this.", source }, delivery, triggerTurn,
 }) as FabricActorDeliveryRequest;
-const event = (from: MeshIdentity, id: string): MeshEvent => ({ id, sequence: 1, topic: "fleet.work.task", kind: "ask", from,
+const event = (from: MeshIdentity, id: string): MeshEvent => ({ id, sequence: 1, topic: "fleet.work.task", kind: "ask", from, verification: from.verified ?? "mesh",
   text: "Paul speaking", createdAt: 1 });
 
 describe("Fabric delivery producers record provenance at the Pi call", () => {
@@ -97,6 +97,40 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
       provenance(host, "followUp"), provenance(remote, "followUp"), provenance(host, "followUp"),
     ]);
     expect(fake.sendMessage.mock.calls.map(call => call[0].details.ids)).toEqual([["one"], ["two"], ["three"]]);
+  });
+
+  it.each(["native", "bridged", "bridge-marker"])("a retained mixed-version %s work event sends no claim to capable Pi", origin => {
+    const { fake, pi } = recording();
+    const from = origin === "native" ? host : { ...host, id: "session:remote", ...(origin === "bridge-marker" ? { verified: "bridge" as const } : {}) };
+    const retained = event(from, "legacy");
+    delete retained.verification;
+    retained.data = { bridge: { from: "old-peer", id: "old" }, verification: "mesh", provenance: provenance(host, "followUp") };
+    deliverRootInbox(pi, [retained]);
+    expect(fake.sendMessage).toHaveBeenCalledOnce();
+    expect(fake.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
+  });
+
+  it("mesh admission records native verification and never derives authority from data.bridge", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-event-verification-"));
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const { fake, pi } = recording();
+    try {
+      const native = await mesh.publish({ topic: "fleet.work.task", from: host, text: "native" });
+      const legacyBridge = await mesh.publish({ topic: "fleet.work.task", from: { ...host, id: "session:remote" },
+        data: { bridge: { from: "pre-change-bridge", id: "old" }, verification: "mesh" } });
+      const bridged = await mesh.publish({ topic: "fleet.work.task", from: { ...host, id: "session:remote", verified: "bridge" },
+        data: { bridge: { from: "peer", id: "new" }, verification: "mesh" } });
+      expect(native.verification).toBe("mesh");
+      expect(legacyBridge).not.toHaveProperty("verification");
+      expect(bridged.verification).toBe("bridge");
+      const recovered = mesh.read({ after: 0, limit: 10 });
+      deliverRootInbox(pi, recovered);
+      expect(fake.sendMessage.mock.calls.map(call => call[1].provenance)).toEqual([
+        provenance(host, "followUp"), undefined, provenance(bridged.from, "followUp"),
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("legacy work inbox keeps one batched call with today's options", () => {

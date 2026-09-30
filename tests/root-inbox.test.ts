@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { RootInbox, rootInboxMessage, rootInboxSession, sessionHoldsInboxBatch, type RootInboxSession } from "../src/topology/root-inbox.js";
 
@@ -141,6 +143,27 @@ describe("RootInbox", () => {
     expect(message.content).toContain("ETA ~09:30Z &lt;PR&gt;");
     expect(message.content).toContain("[cut at 8192 bytes; read the whole event with mesh.read(");
     expect(message.content.length).toBeLessThan(12_000);
+  });
+
+  it("recognises split per-sender receipts and does not return the pending aggregate", async () => {
+    const { mesh, clock, inbox, work } = setup();
+    const box = inbox(); await box.next(held);
+    await work("one");
+    await mesh.publish({ topic: "fleet.work.pi-fabric.1", to: me.id, from: { ...peer, id: "agent:other", kind: "agent" }, text: "two" });
+    clock.advance(1);
+    const batch = await box.next(notHeld);
+    const entries: Array<{ type: string } & ReturnType<typeof rootInboxMessage>> = [];
+    deliverRootInbox({ hostCapabilities: { turnProvenance: 1 },
+      sendMessage: (message: ReturnType<typeof rootInboxMessage>) => entries.push({ type: "custom_message", ...message }),
+    } as unknown as ExtensionAPI, batch.events);
+    expect(entries).toHaveLength(2);
+    const ids = batch.events.map(event => event.id);
+    expect(sessionHoldsInboxBatch(entries, ids)).toBe(true);
+    expect(sessionHoldsInboxBatch(entries.slice(0, 1), ids)).toBe(false);
+    expect(sessionHoldsInboxBatch(entries, ids, 1)).toBe(false);
+    expect(sessionHoldsInboxBatch([{ type: "message", customType: "pi-fabric-inbox", details: { ids } }], ids)).toBe(false);
+    expect((await box.next(rootInboxSession(entries))).events).toEqual([]);
+    expect((await inbox().next(rootInboxSession(entries))).events).toEqual([]);
   });
 
   it("finds the batch message among a session's recent entries", () => {

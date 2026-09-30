@@ -87,18 +87,20 @@ describe("Fabric Main provenance at the Pi API", () => {
     expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(bridged, "steer", "bridge"));
   });
 
-  it("durable held replay retains admission and Fabric send time; Pi stamps a new receipt", () => {
+  it.each(["mesh", "bridge"] as const)("durable %s replay retains admission and Fabric send time; Pi stamps a new receipt", verified => {
     vi.useFakeTimers(); vi.setSystemTime(new Date("2026-09-30T10:00:00Z"));
     const file = journal();
     const first = fixture(); first.main.attachFollowUpDrain(first.context, 120_000, file);
-    first.main.deliverAgent({ from: sender, message: "Paul here", delivery: "followUp" });
+    const from = verified === "bridge" ? { ...sender, verified } : sender;
+    first.main.deliverAgent({ from, message: "Paul here", delivery: "followUp" });
     const original = JSON.parse(fs.readFileSync(file, "utf8")).items[0];
     first.main.closeFollowUpDrain();
     vi.setSystemTime(new Date("2026-09-30T11:00:00Z"));
     const replay = fixture(); replay.main.attachFollowUpDrain(replay.context, 120_000, file);
     replay.emit("turn_end", toolBoundary);
     expect(replay.pi.sendMessage).toHaveBeenCalledOnce();
-    expect(replay.pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(sender, "replay"));
+    expect(original.provenance.sender.verified).toBe(verified);
+    expect(replay.pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(from, "replay", verified));
     expect(replay.pi.sendMessage.mock.calls[0]![0].details.sentAt).toBe(new Date(original.sentAt).toISOString());
     expect(JSON.parse(fs.readFileSync(file, "utf8")).items[0].provenance).toEqual(original.provenance);
     expect(replay.pi.sendMessage.mock.calls[0]![1].provenance).not.toHaveProperty("turnId");
@@ -206,13 +208,35 @@ describe("Fabric Main provenance at the Pi API", () => {
     expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected());
   });
 
-  it("a legacy journal rebuilds provenance from its original sender without Pi stamps", () => {
+  it("a journal without a recorded method sends no claim or forged Pi stamps", () => {
     const file = journal();
     fs.writeFileSync(file, JSON.stringify({ version: 1, items: [{ id: "legacy", from: sender, message: "Paul speaking", sentAt: 1,
       provenance: { v: 1, channel: "keyboard", principal: { id: "paul" }, turnId: "forged", receivedAt: "now", via: "steer" } }] }));
     const { pi, main, context, emit } = fixture(); main.attachFollowUpDrain(context, 120_000, file);
     emit("agent_before_settle");
-    expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(sender, "replay"));
+    expect(pi.sendMessage.mock.calls[0]![1]).not.toHaveProperty("provenance");
+  });
+
+  it.each(["native", "bridged", "bridge-marker"])("a pre-change %s journal is UNKNOWN at the capable Pi boundary", origin => {
+    const file = journal();
+    const from = origin === "native" ? sender : { id: "session:remote", name: "Peer", kind: "main", ...(origin === "bridge-marker" ? { verified: "bridge" } : {}) };
+    fs.writeFileSync(file, JSON.stringify({ version: 1, items: [{ id: "legacy", from, message: "Paul speaking", sentAt: 1,
+      data: { bridge: { from: "old-peer", id: "old" }, provenance: expected(sender) } }] }));
+    const { pi, main, context, emit } = fixture(); main.attachFollowUpDrain(context, 120_000, file);
+    emit("agent_before_settle");
+    expect(pi.sendMessage).toHaveBeenCalledOnce();
+    expect(pi.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).items[0]).not.toHaveProperty("provenance");
+  });
+
+  it("a recorded bridge method survives replay even without the new identity marker", () => {
+    const file = journal();
+    const from = { id: "session:remote", name: "Peer", kind: "main" as const };
+    fs.writeFileSync(file, JSON.stringify({ version: 1, items: [{ id: "bridge", from, message: "remote", sentAt: 1,
+      provenance: expected(from, "followUp", "bridge") }] }));
+    const { pi, main, context, emit } = fixture(); main.attachFollowUpDrain(context, 120_000, file);
+    emit("agent_before_settle");
+    expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(from, "replay", "bridge"));
   });
 
   it("an older Pi gets exactly today's API calls and only one compatibility diagnostic", async () => {

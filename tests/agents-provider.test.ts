@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
@@ -89,6 +90,7 @@ const setup = (
   members: FabricParticipantInfo[] = [],
   control?: FabricControlPlane,
   options?: {
+    cwd?: string;
     identity?: MeshIdentity;
     switchModel?: FabricMainAgentTarget["switchModel"];
     modelsConfig?: FabricModelsConfig;
@@ -102,7 +104,7 @@ const setup = (
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(
-    process.cwd(),
+    options?.cwd ?? process.cwd(),
     { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig },
     {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
@@ -996,6 +998,47 @@ describe("AgentsProvider runner support", () => {
 
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     expect((await provider.describe("peers", context))?.risk).toBe("read");
+  });
+
+  it.each(["followUp", "steer", "tell"])("%s refreshes an exact-id negative lookup using the same peers directory", async (action) => {
+    const id = "session:remote-root";
+    const peer = { id, host: "forge" } as FabricPeerInfo;
+    const root = { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id,
+      name: "main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
+      startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false, stale: false, remoteHost: "forge" } as FabricParticipantInfo;
+    const request = vi.fn().mockResolvedValue({ queued: true, acknowledged: true, routed: "mesh", messageId: "fresh" });
+    const { provider, participants } = setup([peer], [root], { request } as unknown as FabricControlPlane);
+    vi.spyOn(participants, "get").mockImplementation((target, _now, options) => target === id && options?.fresh ? root : undefined);
+    await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
+    await expect(provider.invoke(action, { id, message: "hello" }, context)).resolves.toMatchObject({ messageId: "fresh" });
+    expect(request).toHaveBeenCalledExactlyOnceWith(id, id, action === "steer" ? "steer" : "followUp",
+      { message: "hello", data: undefined }, id, { routedRemoteHost: "forge" });
+  });
+
+  it.each(["followUp", "steer", "tell"])("%s names a peers-listed root whose mirror is not admissible", async (action) => {
+    const peer = { id: "session:waiting", host: "forge" } as FabricPeerInfo;
+    const { provider } = setup([peer]);
+    await expect(provider.invoke(action, { id: peer.id, message: "hello" }, context)).rejects.toMatchObject({
+      name: "FabricParticipantNotYetMirroredError", code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true,
+    });
+  });
+
+  it("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch", async () => {
+    const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-moved-lane-"));
+    roots.push(lane);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: lane, stdio: "ignore" });
+    git("init", "-q");
+    git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
+    fs.mkdirSync(path.join(lane, ".local"));
+    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:launch-lead\n");
+    const base = { format: 1, kind: "root", name: "main", status: "idle", runner: "pi", transport: "host",
+      capabilities: ["steer", "followUp", "fabric"], startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false,
+      stale: false, role: "project-agent", repository: "github.com/smarty-pants-inc/pi-fabric", project: "/remote/repo", cwd: "/remote/repo" };
+    const lead = { ...base, id: "session:launch-lead", rootId: "session:launch-lead", ownerHostId: "remote", ownerIdentityId: "remote", remoteHost: "forge" } as FabricParticipantInfo;
+    const other = { ...base, id: "session:newer", rootId: "session:newer", ownerHostId: "other", ownerIdentityId: "other", startedAt: 99 } as FabricParticipantInfo;
+    const { provider } = setup([], [other, lead], undefined, { cwd: lane });
+    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:newer\n"); // must not change launch identity
+    await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).resolves.toMatchObject({ id: lead.id });
   });
 
   // smarty-dev#784: a worktree agent finds its project agent by role and project.

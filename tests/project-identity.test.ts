@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { deliveryRoot, participantProject, participantRole, projectOf, resolveProjectAgent } from "../src/topology/project-identity.js";
+import { deliveryRoot, normalizeOrigin, participantProject, participantRole, projectOf, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../src/topology/project-identity.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -74,12 +74,53 @@ describe("project identity", () => {
     expect(participantRole({})).toBeUndefined();
   });
 
+  it("normalizes HTTPS, SSH and scp origins without user credentials or .git suffixes", () => {
+    const expected = "github.com/smarty-pants-inc/pi-fabric";
+    for (const origin of ["https://GitHub.com/Smarty-Pants-Inc/pi-fabric.git/", "git@github.com:Smarty-Pants-Inc/pi-fabric.git",
+      "ssh://git@github.com:22/Smarty-Pants-Inc/pi-fabric.git", `git+https://${expected}`, expected]) {
+      expect(normalizeOrigin(origin)).toBe(expected);
+    }
+    expect(normalizeOrigin("https://example.org/Team/Repo.git")).toBe("example.org/Team/Repo");
+    expect(normalizeOrigin("ssh://git@example.org:2222/Team/Repo.git")).toBe("example.org:2222/Team/Repo");
+    expect(normalizeOrigin("https://example.org:22/Team/Repo.git")).toBe("example.org:22/Team/Repo");
+    expect(normalizeOrigin("")).toBeUndefined();
+  });
+
+  it("gives independent host checkouts and a worktree the same origin identity and reads the lane launch marker", () => {
+    const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-origin-")));
+    roots.push(base);
+    const lead = path.join(base, "lead");
+    const lane = path.join(base, "moved-lane");
+    for (const dir of [lead, lane]) { fs.mkdirSync(dir); git(dir, "init", "-q"); }
+    git(lead, "remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
+    git(lane, "remote", "add", "origin", "https://github.com/Smarty-Pants-Inc/pi-fabric.git");
+    git(lead, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
+    git(lead, "worktree", "add", "-q", path.join(base, "wt"));
+    expect(repositoryOf(lane)).toBe(repositoryOf(lead));
+    expect(repositoryOf(path.join(base, "wt"))).toBe(repositoryOf(lead));
+    fs.mkdirSync(path.join(lane, ".local"));
+    fs.mkdirSync(path.join(lane, "sub"));
+    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:launch-lead\n");
+    expect(recordedProjectLead(path.join(lane, "sub"), {})).toBe("session:launch-lead");
+    expect(recordedProjectLead(lane, { SMARTY_LEAD_SESSION: "session:explicit" })).toBe("session:explicit");
+  });
+
+  it("never elects a non-interactive auditor or a recorded lead from a different repository", () => {
+    const project = path.resolve("/p/repo");
+    const auditor = { id: "session:audit", startedAt: 2, role: "project-agent", project, interactive: false };
+    expect(() => resolveProjectAgent([auditor], project, { leadId: auditor.id }))
+      .toThrow(expect.objectContaining({ name: "FabricProjectAgentUnresolvedError" }));
+    const foreign = { ...auditor, interactive: true, repository: "github.com/other/repo" };
+    expect(() => resolveProjectAgent([foreign], project, { repository: "github.com/our/repo", leadId: foreign.id }))
+      .toThrow(expect.objectContaining({ name: "FabricProjectAgentUnresolvedError" }));
+  });
+
   // Native absolute paths: on Windows, path.resolve("/p/x") gains a drive letter.
   const P = (posix: string): string => path.resolve(posix);
   const root = (id: string, fields: { role?: string; project?: string; cwd?: string; startedAt?: number }) =>
     ({ id, startedAt: 1, ...fields });
 
-  it("resolves the project agent of the caller's project, the newest when several are live", () => {
+  it("resolves the caller's project agent with the recorded launch id when several are live", () => {
     const live = [
       root("session:org", { role: "org-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev/smarty-chief") }),
       root("session:dev-lead", { role: "project-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev"), startedAt: 5 }),
@@ -87,8 +128,27 @@ describe("project identity", () => {
       root("session:knowledge", { role: "project-agent", project: P("/p/knowledge"), cwd: P("/p/knowledge") }),
       root("session:worktree", { role: "worktree-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev/worktrees/x") }),
     ];
-    expect(resolveProjectAgent(live, P("/p/smarty-dev")).id).toBe("session:dev-lead");
+    expect(resolveProjectAgent(live, P("/p/smarty-dev"), { leadId: "session:dev-lead" }).id).toBe("session:dev-lead");
     expect(resolveProjectAgent(live, P("/p/knowledge")).id).toBe("session:knowledge");
+  });
+
+  it("resolves a moved lane by repository identity, not the lead's local path", () => {
+    const repository = "github.com/smarty-pants-inc/pi-fabric";
+    const lead = { ...root("session:lead", { role: "project-agent", project: P("/lead/checkout") }), repository };
+    expect(resolveProjectAgent([lead], P("/moved/lane"), { repository }).id).toBe(lead.id);
+  });
+
+  it("uses the recorded launch lead id to resolve ambiguous same-origin roots, including its bridge mirror", () => {
+    const repository = "github.com/smarty-pants-inc/pi-fabric";
+    const lead = { ...root("session:lead", { role: "project-agent", project: P("/lead/checkout") }), repository, remoteHost: "forge" };
+    const other = { ...root("session:other", { role: "project-agent", project: P("/other/checkout"), startedAt: 99 }), repository };
+    expect(resolveProjectAgent([other, lead], P("/moved/lane"), { repository, leadId: lead.id }).id).toBe(lead.id);
+  });
+
+  it("fails by name on ambiguous project agents instead of selecting the newest", () => {
+    const all = [root("session:a", { role: "project-agent", project: P("/p/repo") }),
+      root("session:b", { role: "project-agent", project: P("/p/repo"), startedAt: 2 })];
+    expect(() => resolveProjectAgent(all, P("/p/repo"))).toThrow(expect.objectContaining({ name: "FabricProjectAgentAmbiguousError" }));
   });
 
   // smarty-dev#878: a durable actor's messages follow its project's agent once its root is gone.

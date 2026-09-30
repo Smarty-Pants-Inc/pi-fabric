@@ -124,6 +124,17 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage("gone", "hi", undefined, "steer")).rejects.toThrow(stalled.message);
   });
 
+  it.each(["steer", "followUp"] as const)("names a peers-listed but not yet mirrored target as retryable (%s)", async (kind) => {
+    const { router, participants, control } = routing();
+    const id = "session:waiting";
+    Object.assign(participants, { peers: () => [{ id, host: "forge" }] });
+    await expect(router.routeMessage(id, "hello", undefined, kind)).rejects.toMatchObject({
+      name: "FabricParticipantNotYetMirroredError", code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true,
+      message: expect.stringContaining("not yet mirrored"),
+    });
+    expect(control.request).not.toHaveBeenCalled();
+  });
+
   // smarty-dev#447: a sender whose lease just lapsed may still be live; its owner host gets
   // the reply. A long lapse or no record at all fails with the reason.
   it("replies to a peer root whose lease lapsed moments ago through its owner host", async () => {
@@ -200,6 +211,16 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage("session:never", "reply", undefined, "followUp"))
       .rejects.toThrow("Unknown Fabric participant: session:never (no record on this mesh root");
     expect(control.request).not.toHaveBeenCalled();
+  });
+
+  it("refuses direct and incoming control delivery to a local non-interactive Main", async () => {
+    const { router, participants, main } = routing();
+    participants.get.mockReturnValue({ ...participant(), id: main.id, interactive: false, capabilities: ["fabric"] });
+    await expect(router.routeMessage(main.id, "audit must not answer", undefined, "followUp"))
+      .rejects.toMatchObject({ name: "FabricParticipantNonInteractiveError" });
+    await expect(router.acceptControl({ ...command("steer"), targetId: main.id }, { id: "sender", name: "Sender", kind: "main" }))
+      .resolves.toMatchObject({ accepted: false, error: expect.stringContaining("non-interactive") });
+    expect(main.deliverAgent).not.toHaveBeenCalled();
   });
 
   it("preserves passive Main delivery and caller identity without actor validation", async () => {

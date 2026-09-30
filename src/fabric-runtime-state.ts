@@ -900,7 +900,7 @@ export class FabricRuntimeState {
     const firstSeenAgents = new Map<string, number>();
     if (mainAgent.local) {
       this.#participants.registerSource(() => [
-        this.#participants!.root(mainAgent.info(context)),
+        this.#participants!.root(mainAgent.info(context), context.mode !== "print" && context.mode !== "json"),
       ]);
     }
     this.#participants.registerSource(() =>

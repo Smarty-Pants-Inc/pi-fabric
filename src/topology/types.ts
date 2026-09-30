@@ -32,6 +32,10 @@ export interface FabricParticipantRecord {
   role?: string;
   /** The checkout that owns the root's git common directory (smarty-dev#784). */
   project?: string;
+  /** Normalized origin identity, portable across checkout paths and hosts. */
+  repository?: string;
+  /** False for print/JSON roots: discoverable observers, never message or lead targets. */
+  interactive?: boolean;
   status: string;
   residency?: FabricParticipantResidency;
   runner: FabricAgentRunner;
@@ -95,6 +99,10 @@ export interface FabricPeerInfo {
   label?: string;
   role?: string;
   project?: string;
+  /** Normalized origin identity, portable across checkout paths and hosts. */
+  repository?: string;
+  /** False for print/JSON roots: discoverable observers, never message or lead targets. */
+  interactive?: boolean;
   kind: "peer";
   status: "idle" | "running";
   runner: "pi";

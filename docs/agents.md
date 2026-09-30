@@ -53,8 +53,8 @@ inherited value over `SMARTY_ROLE`.
 
 Task agents return status to their parent; they must not call `smarty-status` to update the
 parent's status comment. That helper keys ordinary comments by role/worktree, so a task
-agent's call would create a separate `task-agent/<worktree>` comment rather than edit the
-parent's. The parent owns and writes its status updates. No parent-role environment variable
+agent's call would create a separate `task-agent/<worktree>` comment and leave the
+parent's unchanged. The parent owns and writes its status updates. No parent-role environment variable
 is exported for status impersonation.
 
 The installed admin audit's `actor()` likewise records `PI_FABRIC_ACTOR_NAME`, else

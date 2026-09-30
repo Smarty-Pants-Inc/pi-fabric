@@ -1,0 +1,227 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { describe, expect, it, vi } from "vitest";
+import { createAgentServiceClient, createAgentServiceHandler, createAgentsProvider } from "../src/agents/service-provider.js";
+import { AgentService } from "../src/agents/service.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { MeshProvider } from "../src/providers/mesh-provider.js";
+import { MeshStore } from "../src/mesh/store.js";
+import type { FabricParticipantInfo } from "../src/topology/types.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
+
+// Synthetic replay of the nine-wrong-identifiers failure class in smarty-dev#1612,
+// not purported copies of the historical identifiers.
+const replay = [
+  ["qualified session", "session:01a0cd9c-7c24-72d5-ae80-03d729baf901"],
+  ["bare UUIDv7 session", "01a0cd9c-7c24-72d5-ae80-03d729baf902"],
+  ["actor", "aaaa1111bbbb2222cccc3333dddd4444"],
+  ["run", "bbbb1111cccc2222dddd3333eeee4444"],
+  ["full SHA", "commit 1234567890abcdef1234567890abcdef12345678"],
+  ["short SHA", "head abc1234"],
+  ["backticked SHA", "`def567890abc`"],
+  ["comment", "#issuecomment-1234567890"],
+  ["pid", "pid 987654"],
+] as const;
+const surfaces = ["legacy.steer", "legacy.followUp", "hosted.steer", "hosted.followUp", "mesh.publish"] as const;
+const session = () => SessionManager.inMemory(process.cwd());
+const invocation = (manager: SessionManager): FabricInvocationContext => ({
+  cwd: process.cwd(), signal: undefined, parentToolCallId: "outer", nestedToolCallId: "nested", update() {},
+  extensionContext: { sessionManager: manager } as unknown as ExtensionContext,
+});
+const read = (manager: SessionManager, text: string, toolName = "read") => manager.appendMessage({
+  role: "toolResult", toolCallId: "read-call", toolName, content: [{ type: "text", text }],
+  isError: false, timestamp: 1,
+});
+const harness = (surface: typeof surfaces[number], manager = session()) => {
+  const sent: string[] = [];
+  const ack = { queued: true as const, messageId: "ack", routed: "main" as const };
+  let provider;
+  if (surface.startsWith("legacy.")) {
+    type Ports = ConstructorParameters<typeof AgentsProvider>;
+    provider = new AgentsProvider({} as Ports[0], {
+      identity: { id: "session:sender", name: "Sender", kind: "main" },
+    } as Ports[1], {} as Ports[2], {
+      id: "main", local: true, matches: (id: string) => id === "main",
+      deliverAgent: ({ message }: { message: string }) => { sent.push(message); return ack; },
+    } as unknown as Ports[3], { get: () => undefined } as unknown as Ports[4], undefined, {} as Ports[6]);
+  } else if (surface.startsWith("hosted.")) {
+    provider = createAgentsProvider(createAgentServiceClient(async (_action, args) => {
+      sent.push(String(args.message)); return ack;
+    }, { steer: true, followUp: true }));
+  } else {
+    type Ports = ConstructorParameters<typeof MeshProvider>;
+    provider = new MeshProvider({ publish: async (args: { text: string }) => {
+      sent.push(args.text); return { sequence: 1, ...args };
+    } } as unknown as Ports[0], { id: "session:sender", name: "Sender", kind: "main" }, {} as Ports[2]);
+  }
+  const context = invocation(manager);
+  const action = surface.split(".")[1]!;
+  return { sent, manager, context, provider, send: (text: string) => provider.invoke(action,
+    action === "publish" ? { topic: "team", text, data: { untouched: true } } : { id: "main", message: text, ...(!surface.startsWith("hosted.") ? { data: { untouched: true } } : {}) }, context) };
+};
+
+describe("legacy routes and durable mesh delivery", () => {
+  it.each(["steer", "followUp"] as const)("preserves notices and data on every %s routing branch", async action => {
+    type Ports = ConstructorParameters<typeof AgentsProvider>;
+    const sent: Array<{ route: string; message: string; data: unknown }> = [];
+    const deliver = (route: string, message: string, data: unknown) => {
+      sent.push({ route, message, data }); return { queued: true as const, messageId: route, routed: "local" as const };
+    };
+    const remote = (id: string, kind: FabricParticipantInfo["kind"], legacy = false) => ({ id, kind, local: false,
+      capabilities: ["steer", "followUp"], ownerHostId: "owner", ownerIdentityId: "owner-id", controlProtocol: legacy ? "legacy" : "v1" }) as FabricParticipantInfo;
+    const participants = [remote("remote-root", "root"), remote("remote-child", "agent"), remote("remote-actor", "actor"), remote("legacy-root", "root", true)];
+    const provider = new AgentsProvider({
+      status: (id: string) => { if (id !== "child") throw new Error(`Unknown Fabric agent: ${id}`); return { id, name: "Child" }; },
+      steer: (_id: string, message: string, data: unknown) => deliver("child", message, data),
+      followUp: (_id: string, message: string, data: unknown) => deliver("child", message, data),
+    } as unknown as Ports[0], {
+      identity: { id: "sender", name: "Sender", kind: "main" }, validateDirectMessage() {},
+      status: (id: string) => { if (id !== "actor") throw new Error(`Unknown Fabric actor: ${id}`); return { id, name: "Actor", runner: "pi" }; },
+      tell: (_id: string, message: string, data: unknown) => deliver("actor", message, data),
+      steerRemote: (_id: string, message: string, _kind: string, data: unknown) => deliver("legacy-root", message, data),
+    } as unknown as Ports[1], {} as Ports[2], {
+      id: "main", local: true, matches: (id: string) => id === "main",
+      deliverAgent: ({ message, data }: { message: string; data: unknown }) => deliver("main", message, data),
+    } as unknown as Ports[3], { get: (id: string) => participants.find(p => p.id === id) } as unknown as Ports[4], {
+      request: async (_host: string, id: string, _kind: string, args: { message: string; data: unknown }) => deliver(id, args.message, args.data),
+    } as unknown as Ports[5], {} as Ports[6]);
+    const context = invocation(session());
+    const data = { untouched: "head def5678" };
+    for (const id of ["main", "child", "actor", "remote-root", "remote-child", "remote-actor", "legacy-root"]) {
+      expect(await provider.invoke(action, { id, message: "head abc1234", data }, context)).toHaveProperty("notice", "unverified ids: abc1234");
+    }
+    expect(sent.map(({ route }) => route)).toEqual(["main", "child", "actor", "remote-root", "remote-child", "remote-actor", "legacy-root"]);
+    expect(sent.every(item => item.message === "head abc1234\n\nunverified ids: abc1234" && item.data === data)).toBe(true);
+    const bypass = await provider.routeMessage("main", "head def5678", data, action); // Host lifecycle; no model sender context.
+    expect(bypass).not.toHaveProperty("notice");
+    expect(sent.at(-1)?.message).toBe("head def5678");
+  });
+
+  it("persists the mesh marker, leaves target/data alone, and accepts a later actual mesh read", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "id-mesh-"));
+    try {
+      type Ports = ConstructorParameters<typeof MeshProvider>;
+      const store = new MeshStore(root, 64 * 1024, 100);
+      const provider = new MeshProvider(store, { id: "sender", name: "Sender", kind: "main" }, {} as Ports[2]);
+      const manager = session();
+      const context = invocation(manager);
+      const data = { untouched: "head def5678" };
+      const receipt = await provider.invoke("publish", { topic: "team", to: "unknown-target", text: "head abc1234", data }, context);
+      expect(receipt).toHaveProperty("notice", "unverified ids: abc1234");
+      const events = await provider.invoke("read", { topic: "team" }, context);
+      expect(events).toEqual([expect.objectContaining({ text: "head abc1234\n\nunverified ids: abc1234", to: "unknown-target", data })]);
+      expect((events as object[])[0]).not.toHaveProperty("notice"); // Notice is receipt-only; marker is durable text.
+      read(manager, JSON.stringify(receipt), "fabric_exec");
+      expect(await provider.invoke("publish", { topic: "team", text: "head abc1234" }, context)).toHaveProperty("notice");
+      read(manager, JSON.stringify(events), "fabric_exec");
+      expect(await provider.invoke("publish", { topic: "team", text: "head abc1234" }, context)).not.toHaveProperty("notice");
+      expect(await provider.invoke("publish", { topic: "team", data }, context)).not.toHaveProperty("notice");
+      expect(await provider.invoke("publish", { topic: "team", text: "Ready", data }, context)).not.toHaveProperty("notice");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe("hosted service end-to-end identifier delivery", () => {
+  it.each(["steer", "followUp"] as const)("annotates hosted %s through both child and peer delivery ports", async action => {
+    const messages: Array<{ route: string; message: string }> = [];
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const peer = { id: "peer", name: "Peer", kind: "root" as const, status: "idle", capabilities: ["steer", "followUp"] as Array<"steer" | "followUp"> };
+    const service = new AgentService({ rootId: "root", port: {
+      execute: request => new Promise(resolve => {
+        request.signal.addEventListener("abort", () => resolve({ status: "stopped" }), { once: true });
+        entered();
+      }),
+      steer: async ({ message }) => { messages.push({ route: "child", message }); },
+      followUp: async ({ message }) => { messages.push({ route: "child", message }); },
+    }, topology: {
+      self: () => peer, sessions: () => [peer], peers: () => [peer],
+      deliver: async ({ message }) => { messages.push({ route: "peer", message }); return peer; },
+    } });
+    try {
+      const client = createAgentServiceClient(createAgentServiceHandler(service, "root"), service.capabilities);
+      const provider = createAgentsProvider(client);
+      const child = await client.spawn({ task: "synthetic port only, no model/process" });
+      await ready;
+      const manager = session();
+      for (const id of [child.id, peer.id]) {
+        expect(await provider.invoke(action, { id, message: "head abc1234" }, invocation(manager)))
+          .toHaveProperty("notice", "unverified ids: abc1234");
+      }
+      expect(messages).toEqual(["child", "peer"].map(route => ({ route, message: "head abc1234\n\nunverified ids: abc1234" })));
+      read(manager, "abc1234fedcba9876543210123456789abcdefff", "bash");
+      expect(await provider.invoke(action, { id: peer.id, message: "head abc1234" }, invocation(manager))).not.toHaveProperty("notice");
+      expect(messages.at(-1)).toEqual({ route: "peer", message: "head abc1234" });
+      expect(await provider.invoke("peers", {}, invocation(manager))).toEqual([peer]);
+    } finally { await service.close(); }
+  });
+
+  it("does not broaden hosted capabilities or hide real delivery failures", async () => {
+    const dispatch = vi.fn(async () => { throw new Error("delivery failed"); });
+    const manager = session();
+    const unsupported = createAgentsProvider(createAgentServiceClient(dispatch));
+    await expect(unsupported.invoke("followUp", { id: "main", message: "head abc1234" }, invocation(manager)))
+      .rejects.toThrow("Unsupported hosted agents action");
+    expect(dispatch).not.toHaveBeenCalled();
+    const enabled = createAgentsProvider(createAgentServiceClient(dispatch, { followUp: true }));
+    await expect(enabled.invoke("followUp", { id: "main", message: "head abc1234" }, invocation(manager))).rejects.toThrow("delivery failed");
+    expect(dispatch).toHaveBeenCalledWith("followUp", { id: "main", message: "head abc1234\n\nunverified ids: abc1234" }, undefined);
+  });
+});
+
+describe.each(surfaces)("unverified identifier annotations: %s", surface => {
+  it.each(replay)("delivers and reports the synthetic wrong %s", async (_kind, text) => {
+    const h = harness(surface);
+    const result = await h.send(text) as { notice?: string };
+    expect(result.notice).toMatch(/^unverified ids: .+/);
+    expect(result.notice).not.toContain("check failed");
+    expect(h.sent).toEqual([`${text}\n\n${result.notice}`]);
+    expect(result.notice?.split("\n")).toHaveLength(1);
+  });
+
+  it("does not annotate real reads from agents list/peers/create, git or the GitHub API", async () => {
+    const manager = session();
+    read(manager, 'agents.list: [{"id":"aaaa1111bbbb2222cccc3333dddd4444"}]', "fabric_exec");
+    read(manager, 'agents.peers: [{"id":"session:01a0cd9c-7c24-72d5-ae80-03d729baf901"}]', "fabric_exec");
+    read(manager, 'agents.create: {"id":"bbbb1111cccc2222dddd3333eeee4444"}', "fabric_exec");
+    read(manager, "1234567890abcdef1234567890abcdef12345678\nabc1234fedcba9876543210123456789abcdefff\ndef567890abc1111222233334444555566667777", "bash");
+    read(manager, '{"id":1234567890,"pid":987654}', "github_api");
+    manager.appendCustomMessageEntry("pi-fabric-agent-message", "received session:01a0cd9c-7c24-72d5-ae80-03d729baf902", true);
+    const text = replay.map(([, value]) => value).join("; ");
+    const h = harness(surface, manager);
+    expect(await h.send(text)).not.toHaveProperty("notice");
+    expect(h.sent).toEqual([text]);
+  });
+
+  it("leaves no-identifier text untouched without accessing history", async () => {
+    const h = harness(surface);
+    vi.spyOn(h.manager, "getLeafId").mockImplementation(() => { throw new Error("must not read"); });
+    const text = "Ready for the review; no identifiers here.";
+    expect(await h.send(text)).not.toHaveProperty("notice");
+    expect(h.sent).toEqual([text]);
+  });
+
+  it("fails open when the session history check throws", async () => {
+    const h = harness(surface);
+    vi.spyOn(h.manager, "getEntry").mockImplementation(() => { throw new Error("broken history"); });
+    read(h.manager, "unrelated");
+    const result = await h.send("head abc1234") as { notice?: string };
+    expect(result.notice).toBe("unverified ids: check failed");
+    expect(h.sent).toEqual(["head abc1234\n\nunverified ids: check failed"]);
+  });
+
+  it("never counts outgoing assistant guesses or annotated send receipts as reads", async () => {
+    const h = harness(surface);
+    h.manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "head abc1234" },
+      { type: "toolCall", id: "guess", name: "fabric_exec", arguments: { code: 'await agents.followUp({id:"main",message:"head abc1234"});' } }],
+      api: "openai-responses", provider: "openai", model: "test", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 1 });
+    const first = await h.send("head abc1234") as { notice?: string };
+    read(h.manager, JSON.stringify({ text: h.sent[0], ...first }), "fabric_exec");
+    expect(await h.send("head abc1234")).toHaveProperty("notice", "unverified ids: abc1234");
+    read(h.manager, "abc1234fedcba9876543210123456789abcdefff", "bash");
+    expect(await h.send("head abc1234")).not.toHaveProperty("notice");
+  });
+});

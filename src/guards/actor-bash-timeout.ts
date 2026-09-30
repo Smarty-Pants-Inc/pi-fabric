@@ -3,6 +3,8 @@
 // bashTimeoutSeconds (exported as PI_FABRIC_ACTOR_BASH_TIMEOUT_S) overrides it, 0 turns it off.
 
 export const DEFAULT_ACTOR_BASH_TIMEOUT_S = 600;
+/** Largest whole-second timeout within Pi's signed 32-bit millisecond timer limit. */
+export const MAX_ACTOR_BASH_TIMEOUT_S = 2_147_483;
 
 
 /** The timeout (seconds) to set on a bash call that has none, or undefined to leave it as is. */
@@ -14,5 +16,6 @@ export const actorBashTimeout = (
   const raw = env.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
   const seconds = raw ? Number(raw) : DEFAULT_ACTOR_BASH_TIMEOUT_S;
   if (seconds === 0) return undefined;
-  return Number.isInteger(seconds) && seconds > 0 ? seconds : DEFAULT_ACTOR_BASH_TIMEOUT_S;
+  return Number.isInteger(seconds) && seconds > 0 && seconds <= MAX_ACTOR_BASH_TIMEOUT_S
+    ? seconds : DEFAULT_ACTOR_BASH_TIMEOUT_S;
 };

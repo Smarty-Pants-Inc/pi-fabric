@@ -6,6 +6,7 @@ import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorDirectory } from "../src/actors/directory.js";
 import type { FabricActorDeliveryRequest, FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
@@ -230,6 +231,70 @@ const setup = (
   };
 };
 
+describe("#169 round 1 agents.remove cleanup routing", () => {
+  it("discovers a resident cleanup-only marker without restart and routes its exact id using retained ownership", async () => {
+    const state = setup();
+    await state.actors.close();
+    const actorRoots = { project: path.join(state.root, "project-actors"), session: path.join(state.root, "session-actors") };
+    const owner = new ActorDirectory(["test", state.identity, state.mesh, DEFAULT_FABRIC_CONFIG.mesh, state.agents, () => {},
+      { persistent: true, rootId: state.identity.id, claimResidency: "durable" }], actorRoots, "project");
+    const passive = new ActorDirectory(["test", state.identity, state.mesh, DEFAULT_FABRIC_CONFIG.mesh, state.agents, () => {},
+      { persistent: true, rootId: state.identity.id, canManageActor: () => false }], actorRoots, "project");
+    actorManagers.push(owner, passive);
+    const actor = await owner.create({ name: "resident obligation", instructions: "Work.", residency: "durable" });
+    expect(passive.list().map((entry) => entry.id)).toContain(actor.id); // Main had the pre-removal view.
+    const dir = path.join(actorRoots.project, actor.id);
+    const rm = fs.rmSync.bind(fs);
+    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (target === dir) throw new Error("cleanup unavailable");
+      return rm(target, options);
+    });
+    try { await owner.remove(actor.id); } finally { failing.mockRestore(); }
+    const removeActor = vi.fn((id: string) => owner.remove(id));
+    const provider = new AgentsProvider(state.agents, passive, state.globalActors, state.mainAgent, state.participants,
+      state.control, state.lifecycle, undefined, { removeActor } as unknown as ResidencyClient);
+    await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
+    expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id);
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
+  });
+
+  it.each(["project", "session"] as const)("reports and retries a cleanup-only %s id through the provider, preserving its successor", async (scope) => {
+    const state = setup();
+    await state.actors.close();
+    const actorRoots = { project: path.join(state.root, "project-actors"), session: path.join(state.root, "session-actors") };
+    const directory = new ActorDirectory(["test", state.identity, state.mesh, DEFAULT_FABRIC_CONFIG.mesh, state.agents, () => {},
+      { persistent: true, rootId: state.identity.id }], actorRoots, "project");
+    actorManagers.push(directory);
+    const provider = new AgentsProvider(state.agents, directory, state.globalActors, state.mainAgent, state.participants,
+      state.control, state.lifecycle, undefined, undefined, undefined, () => DEFAULT_FABRIC_CONFIG.models);
+    const actor = await directory.create({ scope, name: "retry worker", instructions: "Work." });
+    const dir = path.join(actorRoots[scope], actor.id);
+    const rm = fs.rmSync.bind(fs);
+    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (target === dir) throw new Error("cleanup unavailable");
+      return rm(target, options);
+    });
+    try {
+      await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true, cleaned: false });
+      // No participant/presence entry remains. agents.actors must still expose the stopped obligation.
+      expect(state.participants.get(actor.id)).toBeUndefined();
+      expect(await provider.invoke("actors", {}, context)).toContainEqual(expect.objectContaining({
+        id: actor.id, scope, status: "stopped", rootId: state.identity.id, removal: expect.objectContaining({ state: expect.stringContaining("cleanup failed") }),
+      }));
+      const successor = await directory.create({ scope, name: "retry worker", instructions: "Successor." });
+      fs.writeFileSync(successor.sessionFile!, "successor history\n");
+      await expect(provider.invoke("remove", { id: actor.id.slice(0, 12) }, context)).rejects.toThrow();
+      failing.mockRestore();
+      await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
+      expect(directory.pendingRemovals()).toEqual([]);
+      expect(fs.existsSync(dir)).toBe(false);
+      expect(fs.readFileSync(successor.sessionFile!, "utf8")).toBe("successor history\n");
+      expect(directory.status("retry worker").id).toBe(successor.id);
+      expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
+    } finally { failing.mockRestore(); }
+  });
+});
 // smarty-dev#1439: agents.compact on an actor id pointed nowhere ("Unknown Fabric agent").
 describe("Main remote ASK observation ownership", () => {
   it.each([

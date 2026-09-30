@@ -94,6 +94,7 @@ import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
 import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
+import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
 
@@ -1218,6 +1219,14 @@ export class AgentsProvider implements FabricProvider {
         return this.actorManager.resetSession(String(args.id));
       case "remove": {
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
+        const cleanup = this.actorManager.cleanupObligation(String(args.id));
+        if (cleanup) {
+          if (this.actorManager.owns(cleanup.id)) return this.actorManager.remove(cleanup.id);
+          if (cleanup.residency !== "durable") throw new Error("Only the owning host can remove this actor");
+          return this.residency
+            ? this.residency.removeActor(cleanup.id)
+            : this.#residentActorClient().removeActor(cleanup.id);
+        }
         let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
         try {
           target = this.#resolveActorTarget(String(args.id));
@@ -1334,7 +1343,13 @@ export class AgentsProvider implements FabricProvider {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
-    return this.#router.routeMessage(id, message, data, kind, context, options);
+    // Host-authored lifecycle routing has no sender invocation/history. Check
+    // only model sends, before *all* local/actor/remote routing branches.
+    if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
+    const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
+    const result = await deliverWithMessageNotice(message, checked,
+      text => this.#router.routeMessage(id, text, data, kind, context, options));
+    return checked.notice ? { ...result, notice: checked.notice } : result;
   }
 
   /** Flush pending coalesced lifecycle deliveries; used by tests and shutdown. */

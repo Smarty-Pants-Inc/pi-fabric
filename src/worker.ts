@@ -423,11 +423,21 @@ const main = async (): Promise<void> => {
     applyChildPriority(process.pid, options.nice, (message) =>
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
+  // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
+  const childEnvironment = { ...process.env };
+  delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
+  if (options.actorId && options.bashTimeoutSeconds !== undefined &&
+    Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
+    childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S = String(options.bashTimeoutSeconds);
+  }
+  // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
+  // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
   const child = spawnCli(childBinary, childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
     env: {
-      ...process.env,
+      ...childEnvironment,
+      ...(options.actorName ? {} : { SMARTY_ROLE: "task-agent" }),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
@@ -459,7 +469,6 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.actorId ? { PI_FABRIC_ACTOR_ID: options.actorId } : {}),
       ...(options.actorName ? { PI_FABRIC_ACTOR_NAME: options.actorName } : {}),
-      ...(options.bashTimeoutSeconds !== undefined ? { PI_FABRIC_ACTOR_BASH_TIMEOUT_S: String(options.bashTimeoutSeconds) } : {}),
       PI_FABRIC_CAPABILITY_REQUIREMENTS: JSON.stringify(
         options.capabilityRequirements ?? [],
       ),

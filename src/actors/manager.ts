@@ -48,6 +48,7 @@ import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
+import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 
 export interface ActorMessageBindingOptions {
   /** Per-call values layered over this session binding. */
@@ -141,13 +142,24 @@ interface ManagedActor {
   draining: boolean;
 }
 
-/** Validate an actor's bashTimeoutSeconds: a non-negative integer (0 = no default timeout). */
+/** Validate an actor's bashTimeoutSeconds within Pi's timer limit (0 = no default timeout). */
 export const parseBashTimeoutSeconds = (value: unknown): number => {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-    throw new Error("bashTimeoutSeconds must be a non-negative integer (0 = no default timeout)");
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > MAX_ACTOR_BASH_TIMEOUT_S) {
+    throw new Error(`bashTimeoutSeconds must be a non-negative integer at most ${MAX_ACTOR_BASH_TIMEOUT_S} (0 = no default timeout)`);
   }
   return value;
 };
+
+interface RemovalCleanup {
+  id: string;
+  sessionDir: string;
+  presenceKey: string;
+  lastRunId?: string;
+  pending?: string;
+  owner?: { name: string; rootId: string; residency: FabricParticipantResidency; requestedAt: number };
+}
+
+type RemovalResult = { removed: boolean; cleaned?: boolean; pending?: string };
 
 /** An accepted removal whose cleanup fails is retried this often, from REMOVAL_RETRY_MS doubling. */
 const REMOVAL_RETRIES = 5;
@@ -302,6 +314,11 @@ export class ActorManager {
   readonly #draining = new Map<string, ManagedActor>();
   /** Removals that returned before their in-flight run ended, by actor id (smarty-dev#2184). */
   readonly #removals = new Map<string, Promise<void>>();
+  /** Revoked actors still owe directory/presence cleanup; persisted independently of the registry. */
+  readonly #removalCleanup = new Map<string, RemovalCleanup>();
+  readonly #revoked = new Set<string>();
+  readonly #removeCalls = new Map<string, Promise<RemovalResult>>();
+  readonly #finishCalls = new Map<string, Promise<RemovalResult>>();
   readonly #actorRoot: string;
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
@@ -611,7 +628,18 @@ export class ActorManager {
 
   list(): FabricActorInfo[] {
     this.#syncActorsFromRegistry();
-    return [...this.#actors.values()].map((actor) => this.#publicInfo(actor));
+    this.#loadCleanupObligations();
+    return this.#listedActors();
+  }
+
+  #listedActors(): FabricActorInfo[] {
+    // Revoked rows are stopped cleanup obligations, not runnable actors or presence entries.
+    return [...this.#actors.values()].map((actor) => this.#publicInfo(actor)).concat(
+      [...this.#removalCleanup.keys()].flatMap((id) => {
+        const obligation = this.cleanupObligation(id);
+        return obligation ? [obligation] : [];
+      }),
+    );
   }
 
   listOwned(): FabricActorInfo[] {
@@ -651,6 +679,8 @@ export class ActorManager {
 
   owns(id: string): boolean {
     this.#syncActorsFromRegistry();
+    // The obligation loads lazily from disk: read the map after cleanupObligation() (named pass N3-1).
+    if (this.cleanupObligation(id)) return this.#ownsCleanup(this.#removalCleanup.get(id)!);
     const actor = this.#requireActor(id);
     return this.#canManage(actor.id);
   }
@@ -1385,15 +1415,37 @@ export class ActorManager {
     return true;
   }
 
-  async stop(id: string): Promise<FabricActorInfo> {
-    const actor = this.#requireOwnedActor(id);
-    if (actor.status === "stopped") return this.#publicInfo(actor);
+  /** Registry reloads replace metadata, not the object executing this immutable ID's run. */
+  #runningActor(id: string): ManagedActor | undefined {
+    return this.#draining.get(id) ?? this.#actors.get(id);
+  }
+
+  #stopRun(actor: ManagedActor): void {
     actor.status = "stopped";
     actor.updatedAt = Date.now();
-    actor.abortController?.abort();
-    // A stopped actor wants no result from its run: a dead worker ends it, not a relaunch (#2184 8b).
+    // Explicit stop wins over an ownership abort: do not park/retry the abandoned activation.
+    if (actor.abortController) actor.cancelAbort = actor.abortController;
+    delete actor.ownershipAbort;
+    // Mark abandonment before abort, so a dead worker cannot be recovered for this owner.
     if (actor.inFlightRun) this.agents.abandon(actor.inFlightRun.id);
-    this.#drop(actor, [...this.#takeQueued(actor), ...this.#takeParked(actor.id)],
+    actor.abortController?.abort();
+  }
+
+  async #joinStoppedRun(id: string): Promise<void> {
+    const running = this.#runningActor(id);
+    if (!running) return;
+    this.#stopRun(running);
+    await running.drain?.catch(() => undefined);
+  }
+
+  async stop(id: string): Promise<FabricActorInfo> {
+    const actor = this.#requireOwnedActor(id);
+    const running = this.#runningActor(actor.id)!;
+    const stopped = actor.status === "stopped";
+    this.#stopRun(running);
+    if (running !== actor) this.#stopRun(actor);
+    if (stopped && running === actor) return this.#publicInfo(actor);
+    this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
     await this.mesh
@@ -1490,34 +1542,63 @@ export class ActorManager {
   async remove(
     id: string,
     { wait = true }: { wait?: boolean } = {},
-  ): Promise<{ removed: boolean; pending?: string }> {
+  ): Promise<RemovalResult> {
+    // Resolve aliases only against registered actors; cleanup retries require the exact full id.
+    const actorId = this.cleanupObligation(id) || this.#removeCalls.has(id) ? id : this.#requireOwnedActor(id).id;
+    // Share acceptance, not the first caller's wait policy. Every caller joins the same finisher.
+    const call = this.#removeCalls.get(actorId) ?? this.#remove(actorId);
+    this.#removeCalls.set(actorId, call);
+    let result: RemovalResult;
+    try { result = await call; } finally {
+      if (this.#removeCalls.get(actorId) === call) this.#removeCalls.delete(actorId);
+    }
+    if (!wait) return result;
+    const pending = this.#removals.get(actorId);
+    if (pending) await pending;
+    if (pending || (result.pending && result.cleaned !== false)) {
+      const actor = this.#actors.get(actorId);
+      // Retries that ran out leave the actor and its saved marker: that is not a removal.
+      if (actor?.removal) throw new Error(`Fabric actor ${actor.name} (${actor.id}): ${this.#removalState(actor)}`);
+      return this.#cleanupState(actorId);
+    }
+    return result;
+  }
+
+  async #remove(id: string): Promise<RemovalResult> {
+    if (this.cleanupObligation(id)) {
+      if (!this.#ownsCleanup(this.#removalCleanup.get(id)!)) throw new Error("Only the owning host can finish this actor's cleanup");
+      const running = this.#runningActor(id);
+      if (!this.#removals.has(id) && running?.drain) {
+        this.#stopRun(running);
+        this.#removals.set(id, this.#finishBehind(running, running.drain));
+      }
+      if (!this.#removals.has(id)) return this.#finishCleanup(this.#removalCleanup.get(id)!);
+      return this.#cleanupState(id);
+    }
     const actor = this.#requireOwnedActor(id);
     if (actor.removal) {
-      const pending = this.#removals.get(actor.id);
-      if (pending && !wait) return { removed: true, pending: this.#removalState(actor) };
-      if (pending) {
-        await pending;
-        // Retries that ran out leave the actor and its saved marker: that is not a removal.
-        if (this.#actors.get(actor.id) === actor) {
-          throw new Error(`Fabric actor ${actor.name} (${actor.id}): ${this.#removalState(actor)}`);
-        }
-        return { removed: true };
+      await this.stop(actor.id);
+      // A missing drain on reloaded metadata is not proof that the old run settled.
+      const drain = this.#runningActor(actor.id)?.drain;
+      if (!this.#removals.has(actor.id) && drain) {
+        this.#removals.set(actor.id, this.#finishBehind(actor, drain));
       }
-      // Accepted by a host that has since restarted: no run of it is left to wait for.
-      await actor.drain?.catch(() => undefined);
+      if (this.#removals.has(actor.id)) return { removed: true, pending: this.#removalState(actor) };
       return this.#finishRemove(actor);
     }
     await this.stop(actor.id);
-    const drain = actor.drain;
-    if (drain && !wait) {
+    const running = this.#runningActor(actor.id);
+    const drain = running?.drain;
+    if (drain) {
+      const inFlightRun = running.inFlightRun;
       actor.removal = {
         requestedAt: Date.now(),
-        ...(actor.inFlightRun ? { runId: actor.inFlightRun.id, runStartedAt: actor.inFlightRun.startedAt } : {}),
+        ...(inFlightRun ? { runId: inFlightRun.id, runStartedAt: inFlightRun.startedAt } : {}),
       };
       // The marker is the durable revocation: a restarted owner finishes the removal from it. The
       // removal is accepted only once it is saved (review round 1 on pi-fabric#160).
       try {
-        await this.#saveActors();
+        await this.#saveActors(new Set(), { durable: true });
       } catch (error) {
         delete actor.removal;
         throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped, but its removal was not saved: ` +
@@ -1528,7 +1609,6 @@ export class ActorManager {
       await this.#publishPresence(actor).catch(() => undefined);
       return { removed: true, pending: this.#removalState(actor) };
     }
-    await drain?.catch(() => undefined);
     return this.#finishRemove(actor);
   }
 
@@ -1541,7 +1621,8 @@ export class ActorManager {
     try {
       for (let attempt = 0; ; attempt++) {
         try {
-          await this.#finishRemove(actor);
+          const result = await this.#finishRemove(actor);
+          if (result.cleaned === false) throw new Error(result.pending);
           return;
         } catch (error) {
           actor.lastError = `removal cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -1555,15 +1636,16 @@ export class ActorManager {
     }
   }
 
-  /** Removals still waiting on their in-flight run; the resident host reports them. */
+  /** In-flight removals and revoked cleanup obligations; the resident host reports both. */
   pendingRemovals(): Array<{ id: string; name: string; requestedAt: number; runId?: string; runStartedAt?: number; state: string }> {
-    return [...this.#actors.values()].filter((actor) => actor.removal).map((actor) => ({
+    this.#loadCleanupObligations();
+    return this.#listedActors().filter((actor) => actor.removal).map((actor) => ({
       id: actor.id,
       name: actor.name,
       requestedAt: actor.removal!.requestedAt,
       ...(actor.removal!.runId ? { runId: actor.removal!.runId } : {}),
       ...(actor.removal!.runStartedAt ? { runStartedAt: actor.removal!.runStartedAt } : {}),
-      state: this.#removalState(actor),
+      state: actor.removal!.state,
     }));
   }
 
@@ -1574,17 +1656,26 @@ export class ActorManager {
 
   /** A restarted owner finishes the removals its predecessor accepted: no run survives a restart. */
   async finishPendingRemovals(): Promise<void> {
+    this.#loadCleanupObligations();
+    for (const cleanup of [...this.#removalCleanup.values()]) {
+      if (this.cleanupObligation(cleanup.id) && this.#ownsCleanup(cleanup) &&
+          !this.#removals.has(cleanup.id) && !this.#removeCalls.has(cleanup.id) && !this.#finishCalls.has(cleanup.id)) {
+        await this.remove(cleanup.id);
+      }
+    }
     for (const actor of [...this.#actors.values()]) {
-      if (actor.removal && !this.#removals.has(actor.id) && this.#canManage(actor.id)) {
-        await this.#finishRemove(actor).catch(() => undefined);
+      if (actor.removal && this.#canManage(actor.id)) {
+        // Recovery shares acceptance and finalization, including a run still alive in this host.
+        await this.remove(actor.id).catch(() => undefined);
       }
     }
   }
 
   #removalState(actor: ManagedActor): string {
     const since = actor.removal?.requestedAt ?? Date.now();
-    const runId = actor.removal?.runId ?? actor.inFlightRun?.id;
-    const age = formatAge(Date.now() - (actor.removal?.runStartedAt ?? actor.inFlightRun?.startedAt ?? since));
+    const inFlightRun = this.#runningActor(actor.id)?.inFlightRun;
+    const runId = actor.removal?.runId ?? inFlightRun?.id;
+    const age = formatAge(Date.now() - (actor.removal?.runStartedAt ?? inFlightRun?.startedAt ?? since));
     const state = runId
       ? `removal of ${actor.name} (${actor.id}) is pending behind its in-flight run ${runId} (${age})`
       : `removal of ${actor.name} (${actor.id}) is pending (${formatAge(Date.now() - since)})`;
@@ -1594,22 +1685,157 @@ export class ActorManager {
       : state;
   }
 
-  async #finishRemove(actor: ManagedActor): Promise<{ removed: boolean }> {
-    const retainedRunId = actor.lastRunId;
-    await this.#bindings.delete(actor.id);
-    this.#actors.delete(actor.id);
-    try {
-      await this.#saveActors(new Set([actor.id]));
-    } catch (error) {
-      // Not removed: keep the actor (and any saved removal marker) so the removal can finish later.
-      if (!this.#actors.has(actor.id)) this.#actors.set(actor.id, actor);
-      throw error;
+  /** Exact-id, stopped reporting row for a committed cleanup obligation. */
+  cleanupObligation(id: string): FabricActorInfo | undefined {
+    this.#syncActorsFromRegistry();
+    // A passive Main learns the resident owner's obligation from disk, even without a restart.
+    if (/^[a-f0-9]{32}$/.test(id) && !this.#removalCleanup.has(id) && this.#registryRevoked(id)) {
+      const saved = this.#readCleanup(id);
+      if (saved) { this.#removalCleanup.set(id, saved); this.#revoked.add(id); }
     }
-    this.#emitChange();
-    fs.rmSync(path.dirname(actor.sessionFile), { recursive: true, force: true });
-    await this.#writePresence(actor.id);                      // the actor is gone: a delete
-    if (retainedRunId) await this.agents.cleanup(retainedRunId).catch(() => ({ cleaned: false }));
-    return { removed: true };
+    const cleanup = this.#removalCleanup.get(id);
+    if (!cleanup || !this.#revoked.has(id) || this.#actors.has(id)) return undefined;
+    const owner = cleanup.owner;
+    const requestedAt = owner?.requestedAt ?? 0;
+    return { id, scope: this.#actorScope, name: owner?.name ?? id,
+      ...(owner ? { rootId: owner.rootId, residency: owner.residency } : {}), status: "stopped", runner: "pi", events: [], topics: [],
+      delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
+      queued: 0, messages: 0, createdAt: requestedAt, updatedAt: requestedAt,
+      removal: { requestedAt, state: cleanup.pending ?? "registry revoked; removal cleanup pending" } };
+  }
+
+  #ownsCleanup(cleanup: RemovalCleanup): boolean {
+    if (this.#ceded.has(cleanup.id)) return false;
+    const decision = this.#canManageActor?.(cleanup.id);
+    if (decision !== undefined) return decision;
+    if (this.#claimResidency !== undefined) {
+      return cleanup.owner?.rootId === this.#rootId && cleanup.owner.residency === this.#claimResidency;
+    }
+    return this.#canManageActor === undefined || cleanup.owner?.rootId === this.#rootId;
+  }
+
+  #loadCleanupObligations(): void {
+    if (!this.#persistent || !this.meshConfig.enabled) return;
+    try {
+      const registry = this.#registry.read() as { actors?: Array<{ id: string }> } | null;
+      if (!Array.isArray(registry?.actors) || !registry.actors.every((actor) => actor && typeof actor.id === "string")) return;
+      const live = new Set(registry.actors.map((actor) => actor.id));
+      const files = fs.readdirSync(this.#actorRoot);
+      for (const id of this.#removalCleanup.keys()) {
+        if (this.#revoked.has(id) && !files.includes(`removal-${id}.json`) &&
+            !this.#removeCalls.has(id) && !this.#finishCalls.has(id) && !this.#removals.has(id)) {
+          this.#removalCleanup.delete(id);
+          this.#revoked.delete(id);
+        }
+      }
+      for (const file of files) {
+        const match = /^removal-([a-f0-9]{32})\.json$/.exec(file);
+        if (!match || live.has(match[1]!)) continue;
+        // A corrupt or symlinked marker cannot suppress unrelated valid obligations.
+        const cleanup = this.#removalCleanup.get(match[1]!) ?? this.#readCleanup(match[1]!);
+        if (cleanup) { this.#removalCleanup.set(cleanup.id, cleanup); this.#revoked.add(cleanup.id); }
+      }
+    } catch { /* An unreadable registry/directory proves no revocation; retry later. */ }
+  }
+
+  #registryRevoked(id: string): boolean {
+    if (!this.#persistent || !this.meshConfig.enabled) return true;
+    try {
+      const registry = this.#registry.read() as { actors?: Array<{ id: string }> } | null;
+      return Array.isArray(registry?.actors) && registry.actors.every((actor) =>
+        actor && typeof actor.id === "string" && actor.id !== id);
+    } catch { return false; }
+  }
+
+  #readCleanup(id: string): RemovalCleanup | undefined {
+    try {
+      const file = this.#cleanupPath(id);
+      if (!fs.lstatSync(file).isFile()) return undefined; // Never follow marker symlinks.
+      const cleanup = JSON.parse(fs.readFileSync(file, "utf8")) as RemovalCleanup | null;
+      if (!cleanup || cleanup.id !== id || cleanup.sessionDir !== path.join(this.#actorRoot, id) ||
+          typeof cleanup.presenceKey !== "string" || !/^actors\/[^/]+\/[^/]+$/.test(cleanup.presenceKey) ||
+          !cleanup.presenceKey.endsWith(`/${id}`) ||
+          (cleanup.lastRunId !== undefined && typeof cleanup.lastRunId !== "string") ||
+          (cleanup.owner !== undefined && (!cleanup.owner || typeof cleanup.owner.name !== "string" ||
+            typeof cleanup.owner.rootId !== "string" || !["session", "durable"].includes(cleanup.owner.residency) ||
+            !Number.isFinite(cleanup.owner.requestedAt)))) return undefined;
+      return cleanup;
+    } catch { return undefined; } // Skip only this unreadable/malformed marker.
+  }
+
+  #cleanupPath(id: string): string {
+    return path.join(this.#actorRoot, `removal-${id}.json`);
+  }
+
+  #cleanupState(id: string): RemovalResult {
+    const cleanup = this.#removalCleanup.get(id);
+    return cleanup ? { removed: true, cleaned: false, pending: cleanup.pending ?? "removal cleanup pending" }
+      : { removed: true };
+  }
+
+  async #finishCleanup(cleanup: RemovalCleanup): Promise<RemovalResult> {
+    // A prepared marker (or a transient hole in the actor map) is not a revocation receipt.
+    if (!this.#revoked.has(cleanup.id) || !this.#registryRevoked(cleanup.id)) {
+      throw new Error(`Fabric actor ${cleanup.id}: registry revocation did not commit`);
+    }
+    try {
+      await this.#joinStoppedRun(cleanup.id);
+      await this.#bindings.delete(cleanup.id);
+      fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+      if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
+        await this.#writePresence(cleanup.id);
+        if (this.#pendingPresence.has(cleanup.id)) throw new Error("presence deletion pending");
+      } else {
+        await this.mesh.delete({ key: cleanup.presenceKey });
+      }
+      if (cleanup.lastRunId) await this.agents.cleanup(cleanup.lastRunId).catch(() => ({ cleaned: false }));
+      if (this.#persistent && this.meshConfig.enabled) fs.rmSync(this.#cleanupPath(cleanup.id), { force: true });
+      this.#removalCleanup.delete(cleanup.id);
+      this.#revoked.delete(cleanup.id);
+      this.#emitChange();
+    } catch (error) {
+      cleanup.pending = `removal cleanup failed: ${error instanceof Error ? error.message : String(error)} (a later remove or host start finishes it)`;
+    }
+    return this.#cleanupState(cleanup.id);
+  }
+
+  async #finishRemove(actor: ManagedActor): Promise<RemovalResult> {
+    const running = this.#finishCalls.get(actor.id);
+    if (running) return running;
+    const call = this.#commitRemove(actor);
+    this.#finishCalls.set(actor.id, call);
+    try { return await call; } finally { this.#finishCalls.delete(actor.id); }
+  }
+
+  async #commitRemove(actor: ManagedActor): Promise<RemovalResult> {
+    // Finalization and recovery must fence the actual old-object drain before revocation.
+    await this.#joinStoppedRun(actor.id);
+    const cleanup: RemovalCleanup = this.#removalCleanup.get(actor.id) ?? this.#readCleanup(actor.id) ?? {
+      id: actor.id, sessionDir: path.dirname(actor.sessionFile), presenceKey: this.#presenceKey(actor.id),
+      ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+    };
+    cleanup.owner ??= { name: actor.name, rootId: actor.rootId, residency: actor.residency,
+      requestedAt: actor.removal?.requestedAt ?? Date.now() };
+    // Re-establish the barrier on every attempt, including a marker left by a failed rename
+    // directory sync. A visible marker alone is not proof that the obligation is durable.
+    if (this.#persistent && this.meshConfig.enabled) {
+      writeJsonAtomic(this.#cleanupPath(actor.id), cleanup, { durable: true });
+    }
+    this.#removalCleanup.set(actor.id, cleanup);
+    if (this.#actors.has(actor.id)) {
+      this.#actors.delete(actor.id);
+      try {
+        await this.#saveActors(new Set([actor.id]));
+        if (!this.#registryRevoked(actor.id)) throw new Error(`Fabric actor ${actor.id}: registry revocation did not commit`);
+      } catch (error) {
+        // Not revoked: retain the actor and any accepted-removal marker for a later attempt.
+        if (!this.#actors.has(actor.id)) this.#actors.set(actor.id, actor);
+        throw error;
+      }
+      this.#revoked.add(actor.id);
+      this.#emitChange();
+    }
+    return this.#finishCleanup(cleanup);
   }
 
   async close(): Promise<void> {
@@ -2618,16 +2844,19 @@ export class ActorManager {
     };
   }
 
-  async #saveActors(removedIds: ReadonlySet<string> = new Set()): Promise<void> {
+  async #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: { durable?: boolean }): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     await this.#registry.withLock(() => {
+      // Finalization fences reloads and serialization, but only this save's explicit ids
+      // are authorized to revoke: their own durable write-ahead markers already exist.
+      // Preserve every other finalizer's current registry row, prepared or not.
       const owned = [...this.#actors.values()].filter((actor) =>
-        this.#ownershipDecision(actor.id),
+        !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id),
       );
       const replaced = new Set([...removedIds, ...owned.map((actor) => actor.id)]);
       const preserved = this.#registry.records().filter((record) => !replaced.has(record.id));
       const actors = [...preserved, ...owned.map((actor) => this.#serializedActor(actor))];
-      this.#registry.write(actors);
+      this.#registry.write(actors, { durable: removedIds.size > 0 || options?.durable === true });
       this.#registryFingerprint = this.#registry.fingerprint();
       for (const id of removedIds) this.#persistedRoots.delete(id);
       for (const actor of owned) this.#persistedRoots.set(actor.id, actor.rootId);
@@ -2730,6 +2959,8 @@ export class ActorManager {
       ) {
         continue;
       }
+      // A temporary hole during revocation is not an invitation to resurrect the registry row.
+      if (this.#removeCalls.has(record.id) || this.#removals.has(record.id) || this.#finishCalls.has(record.id) || this.#revoked.has(record.id)) continue;
       if (onlyMissing && this.#actors.has(record.id)) continue;
       const status = record.status === "stopped" ? "stopped" : "idle";
       const delivery: FabricActorDelivery =

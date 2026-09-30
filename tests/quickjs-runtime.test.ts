@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const options = {
   timeoutMs: 5_000,
@@ -483,45 +484,51 @@ return self.name;
   });
 
   it("extends the active deadline before a blocking host call runs", async () => {
-    const result = await new QuickJsRuntime().execute(
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new QuickJsRuntime().execute(
       `
 const ref = ["agents", "run"].join(".");
 return tools.call({ ref, args: { task: "slow" } });
 `,
-      async () =>
-        new Promise((resolve) => {
+      async () => {
+        admitted = true;
+        return new Promise((resolve) => {
           setTimeout(() => resolve({ status: "completed", text: "ok" }), 150);
-        }),
+        });
+      },
       {
         ...options,
-        timeoutMs: 50,
+        timeoutMs: 50, signal,
         minimumTimeoutMsForHostCall(ref, args) {
           return ref === "fabric.$call" && args.ref === "agents.run" ? 1_000 : undefined;
         },
       },
-    );
+    ), () => admitted);
     expect(result.error).toBeUndefined();
     expect(result.value).toMatchObject({ status: "completed", text: "ok" });
   });
 
   it("extends a late blocking host call from the call start", async () => {
-    const result = await new QuickJsRuntime().execute(
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new QuickJsRuntime().execute(
       `
 await tools.call({ ref: "demo.delay" });
 return tools.call({ ref: "agents.run", args: { task: "late" } });
 `,
-      async () =>
-        new Promise((resolve) => {
+      async () => {
+        admitted = true;
+        return new Promise((resolve) => {
           setTimeout(() => resolve({ status: "completed" }), 70);
-        }),
+        });
+      },
       {
         ...options,
-        timeoutMs: 100,
+        timeoutMs: 100, signal,
         minimumTimeoutMsForHostCall(ref) {
           return ref === "fabric.$call" ? 100 : undefined;
         },
       },
-    );
+    ), () => admitted);
     expect(result.error).toBeUndefined();
     expect(result.value).toMatchObject({ status: "completed" });
   });
@@ -584,11 +591,13 @@ await Promise.all([
   });
 
   it("aborts in-flight host calls when the sandbox deadline expires", async () => {
+    let admitted = false;
     let hostCallAborted = false;
-    const result = await new QuickJsRuntime().execute(
+    const result = await executeAfterAdmission(signal => new QuickJsRuntime().execute(
       'await tools.call({ ref: "demo.wait" });',
       async (_ref, _args, signal) =>
         new Promise((_resolve, reject) => {
+          admitted = true;
           signal.addEventListener(
             "abort",
             () => {
@@ -598,8 +607,8 @@ await Promise.all([
             { once: true },
           );
         }),
-      { ...options, timeoutMs: 50 },
-    );
+      { ...options, timeoutMs: 50, signal },
+    ), () => admitted);
     expect(result.error).toContain("timed out");
     expect(hostCallAborted).toBe(true);
   });

@@ -12,6 +12,8 @@ const driver = vi.hoisted(() => ({
   escapeReason: undefined as Error | undefined,
   runtimeReason: undefined as Error | undefined,
   mainReason: undefined as Error | undefined,
+  providerEntered: undefined as (() => void) | undefined,
+  events: [] as string[],
 }));
 
 // Model the native backends' existing lossy outer-abort handlers, including
@@ -32,14 +34,13 @@ vi.mock("../src/runtime/typescript-kernel.js", () => ({
         if (["Main-runtime-first", "Main-runtime-first-floor", "shorter-runtime-late", "Escape-late"].includes(driver.kind)) {
           // Cross the absolute deadline without allowing Main's timer to run,
           // then let the runtime watchdog be the first cancellation source.
-          const until = Date.now() + (driver.kind === "Main-runtime-first" ? 40 : 140);
-          while (Date.now() < until) {}
+          vi.setSystemTime(Date.now() + (driver.kind === "Main-runtime-first" ? 40 : 140));
         }
+        driver.events.push(driver.kind.startsWith("Escape") ? "escape-abort" : "runtime-abort");
         if (driver.kind.startsWith("Escape")) driver.escape!.abort(driver.escapeReason);
         else runtimeHost.abort(driver.runtimeReason);
         if (driver.kind === "ordinary-runtime-first-late") {
-          const until = Date.now() + 140;
-          while (Date.now() < until) {}
+          vi.setSystemTime(Date.now() + 140);
         }
       }, driver.kind === "Main-runtime-first" || driver.kind.endsWith("-late") || driver.kind === "Main-runtime-first-floor" ? 0 : 20);
       try {
@@ -59,13 +60,18 @@ describe("service provider cancellation reasons", () => {
   beforeEach(() => {
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    // Provider admission includes async discovery/approval. No deadline may run
+    // until that boundary is reached; elapsed wall time on the runner is irrelevant.
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
   });
-  afterEach(() => vi.unstubAllEnvs());
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
 
   it.each(["Main", "Main-runtime-first", "Main-runtime-first-floor", "Escape", "Escape-late", "ordinary-runtime", "ordinary-runtime-first-late", "shorter-runtime-late", "non-Main-runtime"] as const)(
     "preserves %s cancellation at the provider boundary despite lossy runtime forwarding",
     async kind => {
       driver.kind = kind;
+      driver.events = [];
+      const providerEntered = new Promise<void>(resolve => { driver.providerEntered = resolve; });
       driver.escape = new AbortController();
       driver.escapeReason = new Error("Escape requested");
       driver.runtimeReason = new Error("Execution timed out after 20ms");
@@ -76,9 +82,15 @@ describe("service provider cancellation reasons", () => {
         name: "demo", description: "local provider", async list() { return [descriptor]; }, async describe() { return descriptor; },
         async invoke(_name, _args, context) {
           return new Promise((_resolve, reject) => {
-            const abort = () => { providerReason = context.signal!.reason; reject(providerReason); };
+            driver.events.push("provider-entered");
+            const abort = () => {
+              driver.events.push("provider-aborted");
+              providerReason = context.signal!.reason;
+              reject(providerReason);
+            };
             if (context.signal!.aborted) abort();
             else context.signal!.addEventListener("abort", abort, { once: true });
+            driver.providerEntered!();
           });
         },
       });
@@ -89,11 +101,31 @@ describe("service provider cancellation reasons", () => {
       if (kind === "Main-runtime-first-floor") config.executor.hostCallTimeouts["demo.hold"] = 1_000;
       const context = { cwd: process.cwd(), mode: kind === "non-Main-runtime" ? "print" : "rpc", sessionManager: { getSessionId: () => "signals" } } as unknown as ExtensionContext;
       try {
-        const result = await new FabricExecutionService(registry, config).execute({
+        const execution = new FabricExecutionService(registry, config).execute({
           code: 'return tools.call({ ref: "demo.hold", args: {} });',
           context, signal: kind.startsWith("Escape") ? driver.escape.signal : undefined,
           parentToolCallId: `signal-${kind}`, onPartial() {},
         });
+        await Promise.race([
+          providerEntered,
+          execution.then(() => { throw new Error("Execution settled before provider admission"); }),
+        ]);
+        expect(driver.events).toEqual(["provider-entered"]);
+        expect(providerReason).toBeUndefined();
+        // Drive only the intended first timer. The runtime-first/late variants
+        // jump Date inside its callback to cross a deadline without firing Main's
+        // watchdog, just as event-loop blocking did before, but deterministically.
+        const runtimeFirst = kind === "Main-runtime-first" || kind === "Main-runtime-first-floor" || kind.endsWith("-late");
+        if (!runtimeFirst) {
+          await vi.advanceTimersByTimeAsync(19);
+          expect(driver.events).toEqual(["provider-entered"]);
+          expect(providerReason).toBeUndefined();
+        }
+        await vi.advanceTimersByTimeAsync(runtimeFirst ? 0 : 1);
+        const result = await execution;
+        expect(driver.events).toEqual(kind === "Main"
+          ? ["provider-entered", "provider-aborted"]
+          : ["provider-entered", kind.startsWith("Escape") ? "escape-abort" : "runtime-abort", "provider-aborted"]);
         expect(result.success).toBe(false);
         expect(result.trace.outcome).toBe(kind.startsWith("Escape") ? "aborted" : "timed_out");
         if (kind.startsWith("Main")) {

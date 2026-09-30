@@ -1,4 +1,4 @@
-import type { UserConfig } from "vitest/config";
+import type { ViteUserConfig as UserConfig } from "vitest/config";
 import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-temp.js";
 
 // Mutate the parent before Vitest snapshots its environment or forks any workers.

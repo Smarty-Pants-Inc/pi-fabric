@@ -314,7 +314,7 @@ const MAX_VALUE = 4096;
 
 // Local nested scripts (sh -c, eval, substitutions) inherit the cwd and variables; ssh gets neither.
 // `owned` holds the placeholders of `mktemp` substitutions; `root` is the whole tool-call command.
-type Context = { root: string; owned: Set<string>; cwd?: string | undefined; uncertainCwd?: boolean; sharedCwd?: boolean; alternatives?: ReadonlyMap<string, readonly string[]>; values: ReadonlyMap<string, string>; unknown: ReadonlySet<string>; protectedAliases?: ReadonlyMap<string, Feed>; readonlyNames?: ReadonlySet<string> | undefined; uncertainReadonly?: ReadonlySet<string> | undefined; files?: ReadonlyMap<string, Feed | undefined>; inputs?: ReadonlyMap<number, InputBinding | undefined> | undefined; sinks?: ReadonlyMap<number, OutputSink>; lookupTail?: number | undefined; tmpTail?: number | undefined };
+type Context = { immutableCells?: ReadonlySet<string>; opaqueAttributes?: boolean; root: string; owned: Set<string>; cwd?: string | undefined; uncertainCwd?: boolean; sharedCwd?: boolean; alternatives?: ReadonlyMap<string, readonly string[]>; values: ReadonlyMap<string, string>; unknown: ReadonlySet<string>; protectedAliases?: ReadonlyMap<string, Feed>; readonlyNames?: ReadonlySet<string> | undefined; uncertainReadonly?: ReadonlySet<string> | undefined; files?: ReadonlyMap<string, Feed | undefined>; detachedFiles?: ReadonlySet<string>; unprovedRedirect?: boolean; inputs?: ReadonlyMap<number, InputBinding | undefined> | undefined; sinks?: ReadonlyMap<number, OutputSink>; lookupTail?: number | undefined; tmpTail?: number | undefined };
 type PositionalTail = { lookup?: number; tmp?: number };
 
 /**
@@ -334,7 +334,7 @@ function tmpGlob(pattern: string, cwd: string | undefined): boolean {
 
 // `blocked`: a kill by pattern. `lookup`: runs a name lookup (LOOKUPS) anywhere.
 // `wipe`: a delete over a /tmp glob (smarty-dev#1998). `tmpList`: a stage or substitution may list other agents' dirs.
-type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean; sourceKnown?: boolean; output?: Feed; files?: ReadonlyMap<string, Feed | undefined>; readonlyNames?: ReadonlySet<string>; uncertainReadonly?: ReadonlySet<string>; readonlyState?: { values: ReadonlyMap<string, string>; alternatives: ReadonlyMap<string, readonly string[]>; unknown: ReadonlySet<string>; lookup: ReadonlySet<string>; tmp: ReadonlySet<string> } };
+type Verdict = { opaqueAttributes?: boolean; blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean; sourceKnown?: boolean; output?: Feed; files?: ReadonlyMap<string, Feed | undefined>; detachedFiles?: ReadonlySet<string>; readonlyNames?: ReadonlySet<string>; uncertainReadonly?: ReadonlySet<string>; readonlyState?: { values: ReadonlyMap<string, string>; alternatives: ReadonlyMap<string, readonly string[]>; unknown: ReadonlySet<string>; lookup: ReadonlySet<string>; tmp: ReadonlySet<string> } };
 type Feed = { lookup: boolean; tmp: boolean; literal?: string };
 type OutputSink = { file: string | undefined; targets?: readonly string[] | undefined } | "stdout" | "other";
 // Opening a regular file fixes its identity, not its bytes. Literal/process feeds are
@@ -343,6 +343,10 @@ type InputBinding = Feed | { file: string | undefined; fallback: Feed | undefine
 // Safe provenance does NOT imply zero bytes (a recorded file may contain many names).
 const EMPTY_FEED: Feed = { lookup: false, tmp: false };
 const NO_OUTPUT: Feed = { lookup: false, tmp: false, literal: "" };
+// Owner policy: unsupported provenance is UNKNOWN, not the generic unknown-origin
+// PID/path allowance. Both destructive possibilities survive every existing feed join;
+// there are deliberately no claimed bytes or mktemp ownership on this fact.
+const UNKNOWN_FEED: Feed = { lookup: true, tmp: true };
 // A NUL is not a shell filename. This fact conservatively records unsafe writes whose
 // target identity is unresolved; a later definite overwrite clears only THAT file's fact.
 const UNKNOWN_FILE = "\0unknown-file";
@@ -391,7 +395,7 @@ function splitFields(text: string, budget: GuardBudget, ifs?: string, limit = In
 type Command = { words: Word[]; redirects: Redirect[]; heredocs: Array<{ body: string; quoted: boolean }>; closed?: number; conditional?: boolean; continues?: boolean };
 type InputScope = { target: Word; start?: Word };
 type SourceScopes = {
-  inputs: Map<Word, InputScope>; members: Map<Word, number>; ends: Map<Token, number>; parents: Map<number, number>; outputs: Map<number, Redirect[]>;
+  inputs: Map<Word, InputScope>; members: Map<Word, number>; ends: Map<Token, number>; parents: Map<number, number>; outputs: Map<number, Redirect[]>; children: Set<number>;
 };
 
 /** Match late stdin redirects to their loop/group, never to unrelated reads in the script. */
@@ -440,6 +444,16 @@ function sourceScopes(tokens: Token[], budget: GuardBudget): SourceScopes {
       head = ["{", "do", "then", "else", "if", "elif", "!"].includes(name);
     }
   });
+  // Only annotate unsupported child binding boundaries; do not interpret job execution.
+  const children = new Set<number>();
+  for (const [start, end] of compounds) {
+    budget.spend();
+    let after = end + 1;
+    while (after < tokens.length && ("redirect" in tokens[after]! || "heredoc" in tokens[after]!)) { budget.spend(); after += 1; }
+    const before = tokens[start - 1], next = tokens[after];
+    if ((before && "op" in before && ["|", "|&"].includes(before.op)) ||
+      (next && "op" in next && ["|", "|&", "&"].includes(next.op))) children.add(start);
+  }
   const inputs = new Map<Word, InputScope>();
   const members = new Map<Word, number>();
   const active: Array<{ end: number; source: InputScope }> = [];
@@ -457,7 +471,7 @@ function sourceScopes(tokens: Token[], budget: GuardBudget): SourceScopes {
     if (current?.end === i) active.pop();
     if (group?.end === i) groups.pop();
   });
-  return { inputs, members, ends, parents, outputs };
+  return { inputs, members, ends, parents, outputs, children };
 }
 
 /** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
@@ -537,23 +551,11 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
 }
 
 /** Bash read/mapfile option values are not destinations; omitted destinations use shell defaults. */
-function readOptions(name: string, args: Word[], budget: GuardBudget): {
-  destinations: string[]; fd: number; raw: boolean; delimiter: string; count?: number;
-  exact: boolean; skip: number; limit: number; trim: boolean; array: boolean; supported: boolean;
-} {
+function readDestinations(name: string, args: Word[], budget: GuardBudget): string[] {
   budget.spend(4 * args.length + 1);
   const read = name === "read";
   const valueOptions = read ? "adinNptu" : "nOsuCcd";
   let array: string | undefined;
-  let fd = 0;
-  let raw = false;
-  let delimiter = "\n";
-  let count: number | undefined;
-  let exact = false;
-  let skip = 0;
-  let limit = Infinity;
-  let trim = false;
-  let supported = true;
   let index = 0;
   while (index < args.length) {
     budget.spend(args[index]!.text.length + 1);
@@ -563,33 +565,19 @@ function readOptions(name: string, args: Word[], budget: GuardBudget): {
     index += 1;
     for (let at = 1; at < flag.length; at++) {
       const option = flag[at]!;
-      if (read && option === "r") raw = true;
-      if (!read && option === "t") trim = true;
       if (!valueOptions.includes(option)) continue;
       const value = flag.slice(at + 1) || args[index++]?.text;
-      if (value === undefined) { supported = false; break; }
       if (read && option === "a") array = value;
-      if (option === "u") fd = /^\d+$/.test(value) ? Number(value) : -1;
-      if (option === "d") delimiter = value[0] ?? "\0";
-      if ((read && "nN".includes(option)) || (!read && "ns".includes(option))) {
-        const number = /^\d+$/.test(value) ? Number(value) : NaN;
-        if (!Number.isSafeInteger(number)) supported = false;
-        else if (read) { count = number; exact = option === "N"; }
-        else if (option === "s") skip = number;
-        else limit = number === 0 ? Infinity : number;
-      }
       break;
     }
   }
   const destinations = read && array !== undefined ? [array] : args.slice(index).map((arg) => arg.text);
   if (destinations.length === 0) destinations.push(read ? "REPLY" : "MAPFILE");
   // read -a ignores scalar names; mapfile takes only one array name. Array elements taint the base.
-  return { fd, raw, delimiter, ...(count !== undefined ? { count } : {}), exact, skip, limit, trim,
-    array: !read || array !== undefined, supported,
-    destinations: (read ? destinations : destinations.slice(0, 1)).flatMap((destination) => {
+  return (read ? destinations : destinations.slice(0, 1)).flatMap((destination) => {
     const match = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[.*\])?$/.exec(destination);
     return match ? [match[1]!] : [];
-  }) };
+  });
 }
 
 /**
@@ -609,10 +597,12 @@ function scan(script: string, depth: number, budget: GuardBudget, names: Readonl
   if (!first.lookup && !first.tmpList) return first;
   const second = scanPass(tokens, scopes, sources, depth, budget, names, tmpIn, context, { lookup: first.lookup, tmp: first.tmpList }, stdin);
   return {
+    opaqueAttributes: first.opaqueAttributes === true || second.opaqueAttributes === true,
     blocked: first.blocked || second.blocked, lookup: first.lookup || second.lookup,
     wipe: first.wipe || second.wipe, tmpList: first.tmpList || second.tmpList,
     sourceKnown: first.sourceKnown === true && second.sourceKnown === true,
     output: mergeFeed(first.output ?? EMPTY_FEED, second.output ?? EMPTY_FEED), ...(second.files ? { files: second.files } : {}),
+    ...(second.detachedFiles ? { detachedFiles: second.detachedFiles } : {}),
     ...(second.readonlyNames ? { readonlyNames: second.readonlyNames, uncertainReadonly: second.uncertainReadonly!, readonlyState: second.readonlyState! } : {}),
   };
 }
@@ -641,6 +631,11 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   const protectedAliases = new Map(context.protectedAliases);
   const readonlyNames = new Set(context.readonlyNames);
   const uncertainReadonly = new Set(context.uncertainReadonly);
+  // Unsupported binding attributes may redirect/transform any later mutable write.
+  // Keep only a shell-local hazard, never an alias destination or type interpreter.
+  let opaqueAttributes = context.opaqueAttributes === true;
+  budget.spend((context.immutableCells?.size ?? 0) + 1);
+  const immutableCells = new Set(context.immutableCells);
   const markReadonly = (key: string): void => {
     budget.spend(key.length + 2);
     // Each insertion is reserved on the original cumulative budget, including replay.
@@ -655,6 +650,12 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   let uncertainStack = false;
   let sharedStack = false;
   const files = new Map(context.files);
+  // Once a pathname is unlinked, no already-open descriptor may use its replacement
+  // as proof of safe bytes. Widen this unsupported lifetime, without file generations.
+  budget.spend((context.detachedFiles?.size ?? 0) + 1);
+  const detachedFiles = new Set(context.detachedFiles);
+  let childBinding = false;
+  let redirectBinding = context.unprovedRedirect === true;
   let stream: Feed = NO_OUTPUT;
   let streamKnown = true;
   let lookupTail = context.lookupTail;
@@ -697,12 +698,17 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     // A remote receiver gets no inherited input table, even when the caller has fd3.
     if (!local) budget.spend();
     const inner = scan(text, depth + 1, budget, innerNames, innerTmp,
-      local ? { ...context, protectedAliases, cwd, uncertainCwd, sharedCwd, alternatives, values: innerValues, unknown: innerUnknown,
+      local ? { ...context, immutableCells, protectedAliases, cwd, uncertainCwd, sharedCwd, alternatives, values: innerValues, unknown: innerUnknown,
+        opaqueAttributes: inheritReadonly && opaqueAttributes,
         readonlyNames: inheritReadonly ? readonlyNames : undefined, uncertainReadonly: inheritReadonly ? uncertainReadonly : undefined,
-        files, inputs: inputs ?? context.inputs,
+        files, detachedFiles, unprovedRedirect: redirectBinding, inputs: inputs ?? context.inputs,
         lookupTail: positionals ? tails?.lookup : lookupTail, tmpTail: positionals ? tails?.tmp : tmpTail,
-        ...(sinks ? { sinks } : {}) } : { ...context, protectedAliases, cwd: undefined, uncertainCwd: false, sharedCwd: false, alternatives: new Map(), values: new Map(), unknown: new Set(), readonlyNames: undefined, uncertainReadonly: undefined, files: new Map(), inputs: new Map(), sinks: new Map([[1, "stdout"]]) },
+        ...(sinks ? { sinks } : {}) } : { ...context, immutableCells, protectedAliases, cwd: undefined, uncertainCwd: false, sharedCwd: false, alternatives: new Map(), values: new Map(), unknown: new Set(), opaqueAttributes: false, readonlyNames: undefined, uncertainReadonly: undefined, files: new Map(), detachedFiles: new Set(), unprovedRedirect: redirectBinding, inputs: new Map(), sinks: new Map([[1, "stdout"]]) },
       local ? input : undefined);
+    if (sameShell && inner.opaqueAttributes) {
+      opaqueAttributes = true;
+      markBindingsUnknown(true);
+    }
     if (sameShell && inner.readonlyNames) {
       budget.spend(2 * (inner.readonlyNames.size + (inner.uncertainReadonly?.size ?? 0)) + 1);
       readonlyNames.clear(); uncertainReadonly.clear();
@@ -728,8 +734,9 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     verdict.lookup ||= inner.lookup;
     verdict.wipe ||= inner.wipe;
     if (local && inner.files) {
-      budget.spend(inner.files.size + 1);
+      budget.spend(inner.files.size + (inner.detachedFiles?.size ?? 0) + 1);
       for (const [file, source] of inner.files) files.set(file, source);
+      for (const file of inner.detachedFiles ?? []) detachedFiles.add(file);
     }
     return inner;
   };
@@ -864,6 +871,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     expansion.subs.forEach((sub, k) => {
       const inner = nested(sub, [], [], true, input, undefined, captureSinks, undefined, inputs);
       const name = expansion.names[k]!;
+      budget.spend(name.length + 1);
+      immutableCells.add(name);
       if (/^\s*mktemp(\s|$)/.test(sub)) context.owned.add(name);
       const returned = inner.output ?? EMPTY_FEED;
       if ("process" in expansion && expansion.process) processFeeds.set(expansion,
@@ -884,7 +893,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     return captured;
   };
   const concrete = (word: Word): boolean => ![...expand(word.pattern).matchAll(REFERENCE)]
-    .some((match) => !context.owned.has(match[2]!));
+    .some((match) => !context.owned.has(match[2]!) || lookupName(match[2]!) || tmpName(match[2]!));
   budget.spend(3 * scopes.inputs.size + 1);
   const lateTargets = new Set([...scopes.inputs.values()].map((scope) => scope.target));
   const compoundKnown = new Map<number, boolean>();
@@ -984,6 +993,11 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     budget.spend();
     if (!binding || !("file" in binding)) return binding;
     if (binding.file === undefined) return mergeFeed(binding.fallback ?? EMPTY_FEED, possibleFileFeed());
+    budget.spend(detachedFiles.size + binding.file.length + 1);
+    for (const removed of detachedFiles) {
+      budget.spend(2 * removed.length + 2);
+      if (removed === UNKNOWN_FILE || binding.file === removed || binding.file.startsWith(`${removed}/`)) return UNKNOWN_FEED;
+    }
     if (files.has(binding.file)) return files.get(binding.file);
     const possible = unknownFileFeed(binding.file);
     return possible.lookup || possible.tmp ? mergeFeed(binding.fallback ?? EMPTY_FEED, possible) : binding.fallback;
@@ -1052,8 +1066,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     budget.spend(3 * expanded.length + 2);
     return { ...source, ...literalFeed(`${unmask(expanded)}\n`) };
   };
-  // The bounded string-only printf forms cover both stdout and -v. Unsupported formats
-  // remain unresolved; %q is identity only for nonempty shell-safe path/PID characters.
+  // Only bounded string-only printf forms prove output bytes. In particular %q is
+  // an unsupported transformation, even when a particular operand looks shell-safe.
   const renderPrintf = (formatPattern: string, supplied: Word[]): string | undefined => {
     const format = expand(formatPattern);
     budget.spend(4 * format.length + 4 * supplied.length + 1);
@@ -1062,9 +1076,10 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     const argv = positionalFields(supplied, 0).words;
     budget.spend(argv.length + 1);
     const arguments_ = argv.map((arg) => expand(arg.pattern));
-    const identity = format === "%q" && arguments_.every((value) => /^[A-Za-z0-9_./-]+$/.test(unmask(value)));
-    if (!stringFormat && !identity) return undefined;
-    const fmt = identity ? "%s" : format;
+    // Shell glob selection is not literal argv. Never render its pattern as the
+    // selected filenames and then let a quoted capture erase that provenance.
+    if (!stringFormat || arguments_.some((value) => /[*?[]/.test(value))) return undefined;
+    const fmt = format;
     const conversions = [...fmt.matchAll(/%%|%s/g)].filter((match) => match[0] === "%s").length;
     const repeats = conversions ? Math.max(1, Math.ceil(arguments_.length / conversions)) : 1;
     budget.spend(4 * (fmt.length * repeats + arguments_.reduce((size, value) => size + value.length, 0)) + repeats + 1);
@@ -1072,6 +1087,20 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     let at = 0;
     for (let repeat = 0; repeat < repeats; repeat++) chunks.push(fmt.replace(/%%|%s/g, (part) => part === "%%" ? "%" : arguments_[at++] ?? ""));
     return chunks.join("").replace(/\\([nrt\\])/g, (_whole, char: string) => ({ n: "\n", r: "\r", t: "\t", "\\": "\\" })[char]!);
+  };
+  // UNKNOWN must reach quoted destructive consumers too. The old unknown Set alone
+  // only checked unquoted TMP fallback, and could silently approve these constructs.
+  const markUnknown = (variable: string): void => {
+    budget.spend(variable.length + 6);
+    if (immutableCells.has(variable) || protectedAliases.has(variable) || (readonlyNames.has(variable) && !uncertainReadonly.has(variable))) return;
+    values.delete(variable); alternatives.delete(variable); unknown.add(variable);
+    tainted.add(variable); tmpNames.add(variable);
+  };
+  const markBindingsUnknown = (mutableOnly = false): void => {
+    budget.spend(2 * (values.size + alternatives.size + unknown.size + tainted.size + tmpNames.size) + 1);
+    for (const key of new Set([...values.keys(), ...alternatives.keys(), ...unknown, ...tainted, ...tmpNames])) {
+      if (!mutableOnly || /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) markUnknown(key);
+    }
   };
   const bind = (variable: string, raw: string, append = false, writableAlternative = false): void => {
     budget.spend(4 * raw.length + 1);
@@ -1086,6 +1115,12 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       }
       return;
     }
+    // Redirection availability/success is unproved. A possibly failed builtin or
+    // assignment must not strongly replace an earlier unsafe value with safe bytes.
+    if (opaqueAttributes && /^[A-Za-z_][A-Za-z0-9_]*$/.test(variable)) {
+      markBindingsUnknown(true); markUnknown(variable); return;
+    }
+    if (childBinding || redirectBinding) { markUnknown(variable); return; }
     const lookup = fromLookup(raw.replaceAll(QUOTED, "$"));
     // A scalar assignment/printf/read does not glob its value. Exact literals are kept
     // in values and checked after the eventual operand's quote/suffix expansion. Only
@@ -1108,9 +1143,9 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
 
   // A potentially skipped command cannot strongly replace a prior variable/file fact.
   // Join after EACH command so a later consumer in the same branch sees both paths.
-  const saveConditional = (): { values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmp: Set<string>; readonlyNames: Set<string>; uncertainReadonly: Set<string>; files: Map<string, Feed | undefined>; cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; lookupTail: number | undefined; tmpTail: number | undefined } => {
+  const saveConditional = (): { opaqueAttributes: boolean; values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmp: Set<string>; readonlyNames: Set<string>; uncertainReadonly: Set<string>; files: Map<string, Feed | undefined>; cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; lookupTail: number | undefined; tmpTail: number | undefined } => {
     budget.spend(2 * (values.size + alternatives.size + unknown.size + tainted.size + tmpNames.size + readonlyNames.size + uncertainReadonly.size + files.size) + directoryStack.length + 1);
-    return { values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmp: new Set(tmpNames), readonlyNames: new Set(readonlyNames), uncertainReadonly: new Set(uncertainReadonly), files: new Map(files), cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail };
+    return { opaqueAttributes, values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmp: new Set(tmpNames), readonlyNames: new Set(readonlyNames), uncertainReadonly: new Set(uncertainReadonly), files: new Map(files), cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail };
   };
   const joinConditional = (prior: ReturnType<typeof saveConditional>, joinCwd = true): void => {
     budget.spend(2 * (readonlyNames.size + prior.readonlyNames.size + prior.uncertainReadonly.size) + 1);
@@ -1180,7 +1215,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   };
 
   let pendingCwd: { cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean } | undefined;
-  const runPipeline = (): void => {
+  const runPipeline = (background = false): void => {
     // The inherited fd is separate from replay's whole-script fallback. Captures and local
     // inline receivers inherit the actual fd; only consuming producers return its provenance.
     let actual = context.inputs?.has(0) ? consumeInput(context.inputs.get(0)) : stdin;
@@ -1189,7 +1224,18 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     stages.forEach((stage, position) => {
       budget.spend(8 * (stage.words.length + stage.redirects.length + stage.heredocs.length + 1) +
         stage.words.reduce((size, word) => size + 4 * (word.text.length + word.pattern.length), 0));
-      const prior = stage.conditional ? saveConditional() : undefined;
+      let childScope = stage.words.reduce<number | undefined>((current, word) => scopes.members.get(word) ?? current, stage.closed);
+      let compoundChild = false;
+      redirectBinding = context.unprovedRedirect === true || stage.redirects.length > 0;
+      while (childScope !== undefined) {
+        budget.spend();
+        compoundChild ||= scopes.children.has(childScope);
+        redirectBinding ||= (scopes.outputs.get(childScope)?.length ?? 0) > 0;
+        childScope = scopes.parents.get(childScope);
+      }
+      childBinding = background || stages.length > 1 || compoundChild;
+      const childPrior = childBinding ? saveConditional() : undefined;
+      const prior = stage.conditional ? childPrior ?? saveConditional() : undefined;
       const piped = position < stages.length - 1;
       // An actual incoming pipe exists even when its unresolved producer is represented only
       // by replay fallback. Known owned/recorded output sets an explicit empty feed instead.
@@ -1293,18 +1339,35 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const temporary = <T>(action: () => T): T => {
         try { assign(); return action(); } finally { restoreAssignments(); }
       };
-      const standalone = !name || assignments.some((word) => /^\w+\+?=\(/.test(word.pattern));
+      const declaration = ["export", "readonly", "declare", "typeset", "local"].includes(name);
+      const standalone = !name || (!declaration && assignments.some((word) => /^\w+\+?=\(/.test(word.pattern)));
       if (standalone) assign();
-      // Declaration builtins really bind their assignment arguments, unlike echo/printf DATA.
-      if (["export", "readonly", "declare", "typeset", "local"].includes(name)) {
+      // Prefixes/arrays on declarations are outside the proved assignment subset. Do
+      // not restore a safe caller value over a persistent or possibly failing write.
+      if (declaration) {
+        for (const prior of savedAssignments) markUnknown(prior.key);
         let attribute = name === "readonly";
         let diagnostic = false;
         let options = true;
+        let unsupported = false;
+        // Only plain scalar readonly/export attributes are supported. Printing and
+        // function-only forms do not bind scalar cells. Inspect flags before binding
+        // any operand so a later option cannot grant a fabricated scalar identity.
+        for (const arg of args) {
+          budget.spend(arg.text.length + 1);
+          // Live option/name selection is unproved too; do not resolve an option
+          // interpreter and then forget the attributes on subsequent assignments.
+          if ([...arg.pattern.matchAll(REFERENCE)].length) { unsupported = true; break; }
+          if (arg.text === "--" || !/^[-+][a-zA-Z]+$/.test(arg.text)) break;
+          if (arg.text.startsWith("-") && /[pfF]/.test(arg.text)) diagnostic = true;
+          if (!/^[-+][rx]+$/.test(arg.text) && !/^-[pfF]+$/.test(arg.text)) unsupported = true;
+        }
+        if (unsupported && !diagnostic) { opaqueAttributes = true; markBindingsUnknown(true); }
         for (const arg of args) {
           if (options && arg.text === "--") { options = false; continue; }
           if (options && /^[-+][a-zA-Z]+$/.test(arg.text)) {
             if (arg.text.startsWith("-") && arg.text.includes("r") && name !== "export") attribute = true;
-            if (arg.text.startsWith("-") && /[pf]/.test(arg.text)) diagnostic = true;
+            if (arg.text.startsWith("-") && /[pfF]/.test(arg.text)) diagnostic = true;
             continue;
           }
           options = false;
@@ -1314,13 +1377,20 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           const operands = arg.assignment ? [arg] : positionalFields([arg], 0).words;
           for (const word of operands) {
             const value = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=(.*)$/s.exec(word.pattern);
-            if (value) bind(value[1]!, value[3]!, value[2] !== undefined);
+            const array = value?.[3]?.startsWith("(");
+            if (value) {
+              if (array || assignments.length) markUnknown(value[1]!);
+              else bind(value[1]!, value[3]!, value[2] !== undefined);
+            }
             const key = value?.[1] ?? (/^[A-Za-z_][A-Za-z0-9_]*$/.test(word.text) ? word.text : undefined);
+            if (key && assignments.length) markUnknown(key);
+            // An unresolved declaration operand may name any existing mutable cell.
+            // It cannot leave an earlier literal/ownership proof available for approval.
+            if (!key && [...word.pattern.matchAll(REFERENCE)].length) markBindingsUnknown();
             if (attribute && key) markReadonly(key);
           }
         }
       }
-      const readIfs = !standalone && assignments.some((word) => /^IFS=/.test(word.text)) ? temporary(() => values.get("IFS")) : values.get("IFS");
       if (name === "set") {
         const end = args.findIndex((arg) => arg.text === "--");
         const operands = end >= 0 ? args.slice(end + 1) : args[0]?.text.startsWith("-") ? undefined : args;
@@ -1346,19 +1416,22 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         }
       }
       if (name === "printf" && args[0]?.text === "-v" && args[1]) {
-        const destination = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[.*\])?$/.exec(args[1].text)?.[1];
-        if (destination && !protectedAliases.has(destination) && (!readonlyNames.has(destination) || uncertainReadonly.has(destination))) {
+        const target = args[1].text;
+        budget.spend(3 * (target.length + args[1].pattern.length) + 1);
+        // Dynamic destinations are outside the proved scalar subset. Do not invent
+        // destination resolution or silently retain safe old cells when it is unknown.
+        const dynamicDestination = [...args[1].pattern.matchAll(REFERENCE)].length > 0;
+        const cell = dynamicDestination ? undefined : /^([A-Za-z_][A-Za-z0-9_]*)(\[.*\])?$/.exec(target);
+        const destination = cell?.[1];
+        if (!destination) markBindingsUnknown();
+        else if (!protectedAliases.has(destination) && (!readonlyNames.has(destination) || uncertainReadonly.has(destination))) {
           const supplied = args.slice(3);
           const beforeWrite = readonlyNames.has(destination) ? saveConditional() : undefined;
-          const raw = renderPrintf(args[2]?.pattern ?? "", supplied);
+          // An element write cannot replace the other real array elements. No index
+          // interpreter: widen the entire affected cell, including computed indices.
+          const raw = cell?.[2] ? undefined : renderPrintf(args[2]?.pattern ?? "", supplied);
           if (raw !== undefined) bind(destination, raw);
-          else {
-            // Unsupported formatting is unresolved, never an invented safe literal. Retain
-            // any supplied lookup/shared provenance even when the format itself is unknown.
-            bind(destination, supplied.map((arg) => arg.pattern).join(" "));
-            if (supplied.some((arg) => tmpOperand(arg.pattern))) tmpNames.add(destination);
-            unknown.add(destination); values.delete(destination);
-          }
+          else markUnknown(destination);
           if (beforeWrite) joinConditional(beforeWrite, false);
         }
       }
@@ -1389,61 +1462,13 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       }
       const reads = name === "read" || name === "mapfile" || name === "readarray";
       if (reads) {
-        const options = readOptions(name, args, budget);
-        const { fd, array } = options;
-        const destinations = options.destinations;
-        // Keep destination positions for multi-name read, but never mutate a definite
-        // readonly destination. Possible attributes retain failure and success paths.
-        const beforeWrite = destinations.some((key) => uncertainReadonly.has(key)) ? saveConditional() : undefined;
-        const selected = inputs.has(fd) ? consumeInput(inputs.get(fd)) : fd === 0 ? actual : NO_OUTPUT;
-        budget.spend(2 * (selected?.literal?.length ?? 0) + 1);
-        const literalInput = selected?.literal !== undefined ? mask(selected.literal) : undefined;
-        if (literalInput !== undefined && options.supported) {
-          // Bytes from an input stream are not shell-expanded a second time. Reserve the
-          // complete bounded transform, line/field collections and joins before allocation.
-          budget.spend(10 * literalInput.length + 2);
-          const literal = unmask(literalInput);
-          let parts: string[];
-          if (name === "read") {
-            const chars: string[] = [];
-            for (let at = 0; at < literal.length && chars.length < (options.count ?? Infinity); at++) {
-              const char = literal[at]!;
-              if (!options.raw && char === "\\" && at + 1 < literal.length) {
-                const escaped = literal[++at]!;
-                if (escaped !== "\n") chars.push(escaped);
-              } else if (!options.exact && char === options.delimiter) break;
-              else chars.push(char);
-            }
-            const line = chars.join("");
-            parts = options.exact ? [line] : splitFields(line, budget, readIfs ?? " \t\n", array ? Infinity : destinations.length);
-          } else {
-            parts = [];
-            let start = 0;
-            let line = 0;
-            while (start < literal.length && parts.length < options.limit) {
-              const delimiter = literal.indexOf(options.delimiter, start);
-              const end = delimiter < 0 ? literal.length : delimiter + 1;
-              if (line++ >= options.skip) parts.push(literal.slice(start, options.trim && delimiter >= 0 ? delimiter : end));
-              start = end;
-            }
-          }
-          if (array && destinations[0]) {
-            bind(destinations[0], mask(parts.join(" ")));
-            if (!protectedAliases.has(destinations[0]) && !readonlyNames.has(destinations[0]) && parts.some((part) => tmpOperand(mask(part)))) tmpNames.add(destinations[0]);
-          } else destinations.forEach((destination, i) => bind(destination, mask(parts[i] ?? "")));
-        } else for (const destination of destinations) {
-          if (protectedAliases.has(destination) || (readonlyNames.has(destination) && !uncertainReadonly.has(destination))) continue;
-          values.delete(destination); unknown.add(destination);
-          if (selected !== undefined) { tainted.delete(destination); tmpNames.delete(destination); }
-        }
-        const unresolvedLiteral = literalInput === undefined || !options.supported;
-        const readFeed = selected ?? (fd === 0 ? unresolved : EMPTY_FEED);
-        for (const destination of destinations) {
-          if (protectedAliases.has(destination) || (readonlyNames.has(destination) && !uncertainReadonly.has(destination))) continue;
-          if (unresolvedLiteral && readFeed.lookup) tainted.add(destination);
-          if (unresolvedLiteral && readFeed.tmp) tmpNames.add(destination);
-        }
-        if (beforeWrite) joinConditional(beforeWrite, false);
+        const destinations = readDestinations(name, positionalFields(args, 0).words, budget);
+        // Reads depend on descriptor availability, consumption, timeout and failure.
+        // None are proved here. Even a recorded literal must not erase an unsafe old
+        // value, assert its first line repeatedly, or grant ownership to the result.
+        // This also covers mapfile/readarray; option arguments are not destinations.
+        for (const destination of destinations) markUnknown(destination);
+        if (destinations.length === 0) markBindingsUnknown();
       }
       // mktemp creates one exact path; naming /tmp there does not list other agents' entries.
       // Security F3: after `cd /tmp`, a piped stage may list the cwd (`ls`, `find` without a root).
@@ -1520,11 +1545,20 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         const end = args.findIndex((arg) => arg.text === "--");
         const operands = args.filter((arg, i) => (end >= 0 && i > end) || (!(arg.text.startsWith("-") && arg.text.length > 1) && (end < 0 || i < end)));
         if (operands.some((arg) => tmpOperand(arg.pattern) || unknownOperand(arg.pattern)) || xargsTmp) verdict.wipe = true;
+        // Unlink/recreate is deliberately not modeled as a new file generation. All
+        // descriptor use of that identity widens to UNKNOWN; direct newly named file
+        // sources still use their own facts. An unresolved delete can detach any open file.
+        for (const operand of operands) {
+          const key = pathKey(operand);
+          budget.spend((key?.length ?? 0) + 1);
+          detachedFiles.add(key ?? UNKNOWN_FILE);
+        }
       }
       if (name === "find") {
         const deletes = args.some((arg, i) => arg.text === "-delete" || (["-exec", "-execdir", "-ok", "-okdir"].includes(arg.text) &&
           /(^|[\s/])(rm|unlink|shred)(\s|$)/.test(args.slice(i + 1).map((a) => a.text).join(" ").split(/\s[;+](\s|$)/)[0]!)));
         if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern)) : inTmp("."))) verdict.wipe = true;
+        if (deletes) { budget.spend(); detachedFiles.add(UNKNOWN_FILE); }
       }
       // xargs appends its input: from a lookup, `{}` and every positional parameter hold it.
       const xargsFeed = fedByXargs && pipeFeed;
@@ -1606,16 +1640,26 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         output = args.reduce((feed, arg) => mergeFeed(feed, literalSource(arg)), EMPTY_FEED);
         known = args.every(concrete);
         let rendered: string | undefined;
+        const echoArgs = name === "echo" ? positionalFields(args, 0).words : [];
+        const plainEcho = name === "echo" && echoArgs.every((arg) => {
+          const expanded = expand(arg.pattern);
+          return !/[*?[]/.test(expanded) && !unmask(expanded).includes("\\");
+        }) &&
+          !/^-[neE]+$/.test(unmask(expand(echoArgs[0]?.pattern ?? "")));
         if (name === "printf") rendered = renderPrintf(args[0]?.pattern ?? "", args.slice(1));
-        else if (args.every(concrete)) {
-          const parts = args.map((arg) => unmask(expand(arg.pattern)));
+        else if (plainEcho && args.every(concrete)) {
+          // Reuse the caller argv splitter; raw expansion bytes are not echo argv.
+          const parts = echoArgs.map((arg) => unmask(expand(arg.pattern)));
           budget.spend(3 * parts.reduce((size, part) => size + part.length + 1, 0) + 1);
           rendered = parts.join(" ") + "\n";
         }
-        if (rendered !== undefined && ![...rendered.matchAll(REFERENCE)].some((match) => !context.owned.has(match[2]!))) {
+        if (rendered !== undefined && ![...rendered.matchAll(REFERENCE)].some((match) =>
+          !context.owned.has(match[2]!) || lookupName(match[2]!) || tmpName(match[2]!))) {
           output = { ...literalFeed(unmask(rendered)), lookup: output.lookup };
           known = true;
-        } else if (name === "printf" && rendered === undefined) known = false;
+        } else if ((name === "printf" && rendered === undefined) || (name === "echo" && !plainEcho)) {
+          output = mergeFeed(output, UNKNOWN_FEED); known = false;
+        }
       } else if (fileReader) {
         output = fileFeed ?? EMPTY_FEED;
         known = explicit.length > 0 && fileFeed !== undefined;
@@ -1633,13 +1677,23 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           }, NO_OUTPUT);
           known = true;
         }
+        // Only plain cat is an identity reader. Options and every other reader's
+        // selection/formatting are unsupported, even for a recorded input file.
+        if (name !== "cat" || args.some((arg) => arg.text.startsWith("-") && !["-", "--"].includes(arg.text))) {
+          output = mergeFeed(output, UNKNOWN_FEED); known = false;
+        }
       } else if (!name && stage.redirects.some((redirect) => redirect.input)) {
         output = actual ?? EMPTY_FEED; known = actual !== undefined;
       } else if (name === "ls" || name === "find") {
-        known ||= cwd !== undefined;
-      } else if (!known && actual) {
-        output = actual.literal === "" && ["tr", "sort", "uniq", "cut", "sed"].includes(name) ? NO_OUTPUT : mergeFeed(output, actual);
-        known = true;
+        if (name === "ls" ? simpleLs : plainFind) known ||= cwd !== undefined;
+        else { output = mergeFeed(output, UNKNOWN_FEED); known = false; }
+      } else {
+        // This is a small reader, not an output interpreter. Unmodeled producers
+        // (grep/awk/sort/tr/sed/cut and arbitrary tools alike) cannot prove identity,
+        // empty output or safe ownership. Preserve input/argument taint and widen
+        // their returned provenance to UNKNOWN instead of enumerating review cases.
+        output = mergeFeed(mergeFeed(output, actual ?? EMPTY_FEED), UNKNOWN_FEED);
+        known = false;
       }
       if (stage.closed !== undefined) {
         known = compoundKnown.get(stage.closed) ?? true;
@@ -1686,7 +1740,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (chdirs.length) { cwd = parentCwd; uncertainCwd = parentUncertainCwd; sharedCwd = parentSharedCwd; directoryStack = wrapperStack!; uncertainStack = wrapperUncertainStack; sharedStack = wrapperSharedStack; }
       // A builtin may assign one of its own temporary prefix variables (read/printf -v).
       // Its new value must not escape that temporary binding into the calling shell.
-      if (!standalone && assignments.length) restoreAssignments();
+      if (!standalone && !declaration && assignments.length) restoreAssignments();
       if (prior) {
         // A later && command is reached only after this cd succeeded. Keep that routing
         // for the chain's consumer, then join the skipped path when the chain ends.
@@ -1696,6 +1750,18 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         }
         joinConditional(prior, !stage.continues);
       }
+      if (childPrior) {
+        // Shell-local child facts cannot grant safe parent replacements. Shared file
+        // effects remain live, rather than being restored with shell state.
+        budget.spend(files.size + childPrior.readonlyNames.size + childPrior.uncertainReadonly.size + 1);
+        childPrior.files = new Map(files);
+        joinConditional(childPrior);
+        opaqueAttributes = childPrior.opaqueAttributes;
+        readonlyNames.clear(); childPrior.readonlyNames.forEach((key) => readonlyNames.add(key));
+        uncertainReadonly.clear(); childPrior.uncertainReadonly.forEach((key) => uncertainReadonly.add(key));
+      }
+      childBinding = false;
+      redirectBinding = context.unprovedRedirect === true;
       if (!stage.continues && pendingCwd) {
         if (pendingCwd.cwd !== cwd || pendingCwd.uncertainCwd || uncertainCwd) {
           sharedCwd ||= pendingCwd.sharedCwd;
@@ -1707,7 +1773,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     stages = [];
   };
 
-  const groupStates: Array<{ cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmpNames: Set<string>; readonlyNames: Set<string>; uncertainReadonly: Set<string>; lookupTail: number | undefined; tmpTail: number | undefined }> = [];
+  const groupStates: Array<{ opaqueAttributes: boolean; cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmpNames: Set<string>; readonlyNames: Set<string>; uncertainReadonly: Set<string>; lookupTail: number | undefined; tmpTail: number | undefined }> = [];
   // This is a conservative control-flow annotation, not shell execution. Conditions,
   // short-circuit RHSs and loop bodies may be skipped, including zero iterations.
   const controls: Array<{ kind: string; conditional: boolean }> = [];
@@ -1733,22 +1799,26 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     }
     if ("redirect" in token) { command.conditional ||= conditional(); command.redirects.push(token); continue; }
     if ("heredoc" in token) { command.heredocs.push(token.heredoc); continue; }
+    // An array closer is part of the binding command, not a job/list boundary.
+    // Flushing here would lose a following pipe/& and grant a parent safe overwrite.
+    if (token.arrayClose) continue;
     command.continues = token.op === "&&";
     if (command.words.length > 0 || command.redirects.length > 0 || command.heredocs.length > 0 || command.closed !== undefined) stages.push(command);
     command = { words: [], redirects: [], heredocs: [] };
     statementHead = true;
-    if (token.op !== "|" && token.op !== "|&") runPipeline();
+    if (token.op !== "|" && token.op !== "|&") runPipeline(token.op === "&");
     if (["&&", "||"].includes(token.op)) shortCircuit = true;
     else if (!["|", "|&", "("].includes(token.op)) shortCircuit = false;
     if (token.op === "(") {
       controls.push({ kind: "group", conditional: conditional() });
       budget.spend(2 * (values.size + alternatives.size + unknown.size + tainted.size + tmpNames.size + readonlyNames.size + uncertainReadonly.size) + directoryStack.length + 1);
-      groupStates.push({ cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail, values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmpNames: new Set(tmpNames), readonlyNames: new Set(readonlyNames), uncertainReadonly: new Set(uncertainReadonly) });
+      groupStates.push({ opaqueAttributes, cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail, values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmpNames: new Set(tmpNames), readonlyNames: new Set(readonlyNames), uncertainReadonly: new Set(uncertainReadonly) });
     }
     if (token.op === ")" && !token.arrayClose) {
       if (controls.at(-1)?.kind === "group") controls.pop();
       const saved = groupStates.pop();
       if (saved) {
+        opaqueAttributes = saved.opaqueAttributes;
         cwd = saved.cwd; uncertainCwd = saved.uncertainCwd; sharedCwd = saved.sharedCwd; directoryStack = saved.stack; uncertainStack = saved.uncertainStack; sharedStack = saved.sharedStack; lookupTail = saved.lookupTail; tmpTail = saved.tmpTail;
         values.clear(); saved.values.forEach((value, key) => values.set(key, value));
         alternatives.clear(); saved.alternatives.forEach((value, key) => alternatives.set(key, value));
@@ -1767,6 +1837,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   verdict.output = stream;
   verdict.sourceKnown = streamKnown;
   verdict.files = files;
+  verdict.detachedFiles = detachedFiles;
+  verdict.opaqueAttributes = opaqueAttributes;
   verdict.readonlyNames = readonlyNames;
   verdict.uncertainReadonly = uncertainReadonly;
   budget.spend();
@@ -1798,10 +1870,14 @@ export const TMP_WIPE_REASON =
   "Blocked (smarty-dev#1998): this deletes by a glob in /tmp or /var/tmp (or /tmp itself), which also " +
   "deletes other agents' live dirs on a shared host. Record the path when you create it " +
   "(`D=$(mktemp -d)`), then delete only your own mktemp -d path by its exact name (\"$D\"), #1508/#1998. " +
+  "Use the simple form: run `D=$(mktemp -d)` in its own command, then `rm -rf \"$D\"`. " +
+  "Complex reads, bindings, transformations and reused descriptors are not trusted to prove a safe path. " +
   "A glob inside that dir is fine: `rm -f \"$D\"/*.json`.";
 
 export const PATTERN_KILL_REASON =
   "Blocked (smarty-dev#774): a kill by name pattern (pkill, killall, or kill of pgrep output) also kills " +
   "other owners' processes on a shared host. Start your job with `bin/smarty-reap run RECORD -- CMD` and " +
   "end it with `bin/smarty-reap stop RECORD` (only your own process group), or run `kill <PID>` with a " +
-  "PID you started and recorded (for example from `$!`).";
+  "PID you started and recorded (for example from `$!`). Use a literal recorded PID or a plain " +
+  "assignment from `$!`; complex reads, bindings, transformations and reused descriptors are not " +
+  "trusted to prove a safe PID.";

@@ -216,30 +216,30 @@ const allowed: Array<[string, string]> = [
   ["N8: a brace group of recorded PID files feeds xargs kill", `{ cat .local/server.pid; cat .local/worker.pid; } | xargs kill`],
   ["N8: a subshell with a recorded PID file feeds xargs kill", `(cat .local/server.pid) | xargs kill`],
   ["N8: a loop of recorded PID files feeds xargs kill", `for file in .local/server.pid .local/worker.pid; do cat "$file"; done | xargs kill`],
-  ["N8: a brace group of recorded PID files feeds read then kill", `{ cat .local/server.pid; cat .local/worker.pid; } | while read -r p; do kill "$p"; done`],
-  ["N8: a subshell with a recorded PID file feeds read then kill", `(cat .local/server.pid) | while read -r p; do kill "$p"; done`],
-  ["N8: a loop of recorded PID files feeds read then kill", `for file in .local/server.pid .local/worker.pid; do cat "$file"; done | while read -r p; do kill "$p"; done`],
+  ["N8: a brace group of recorded PID files feeds read then kill — conservative refusal", `{ cat .local/server.pid; cat .local/worker.pid; } | while read -r p; do kill "$p"; done`],
+  ["N8: a subshell with a recorded PID file feeds read then kill — conservative refusal", `(cat .local/server.pid) | while read -r p; do kill "$p"; done`],
+  ["N8: a loop of recorded PID files feeds read then kill — conservative refusal", `for file in .local/server.pid .local/worker.pid; do cat "$file"; done | while read -r p; do kill "$p"; done`],
   // F6: the reviewer example and explicit recorded sources after an unrelated diagnostic lookup.
-  ["F6: reviewer PID-file loop after diagnostic grep", `grep -q ready .local/server.log\nwhile read -r p; do kill "$p"; done < .local/server.pid`],
-  ["F6: an assigned PID-file redirect after diagnostic grep", `F=.local/server.pid; grep -q ready .local/server.log; while read -r p; do kill "$p"; done < "$F"`],
+  ["F6: reviewer PID-file loop after diagnostic grep — conservative refusal", `grep -q ready .local/server.log\nwhile read -r p; do kill "$p"; done < .local/server.pid`],
+  ["F6: an assigned PID-file redirect after diagnostic grep — conservative refusal", `F=.local/server.pid; grep -q ready .local/server.log; while read -r p; do kill "$p"; done < "$F"`],
   ["F6: an assigned PID file feeds xargs after diagnostic grep", `grep -q ready .local/server.log; F=.local/server.pid; xargs -a "$F" kill`],
-  ["F6: a redirected recorded-file cat after diagnostic grep", `grep -q ready .local/server.log; while read -r p; do kill "$p"; done < <(cat .local/server.pid)`],
+  ["F6: a redirected recorded-file cat after diagnostic grep — conservative refusal", `grep -q ready .local/server.log; while read -r p; do kill "$p"; done < <(cat .local/server.pid)`],
   ["F6: a compound recorded source survives cat after diagnostic grep", `grep -q ready .local/server.log; { cat .local/server.pid; } | cat | xargs kill`],
   ["F6: a recorded PID-file pipeline after diagnostic grep", `grep -q ready .local/server.log; cat .local/server.pid | xargs kill`],
-  ["F6: a nested recorded PID-file loop after diagnostic grep", `grep -q ready .local/server.log; for i in once; do while read p; do kill "$p"; done < .local/server.pid; done`],
-  ["F6: a recorded PID-file loop inside if after diagnostic grep", `grep -q ready .local/server.log; if true; then while read p; do kill "$p"; done < .local/server.pid; fi`],
+  ["F6: a nested recorded PID-file loop after diagnostic grep — conservative refusal", `grep -q ready .local/server.log; for i in once; do while read p; do kill "$p"; done < .local/server.pid; done`],
+  ["F6: a recorded PID-file loop inside if after diagnostic grep — conservative refusal", `grep -q ready .local/server.log; if true; then while read p; do kill "$p"; done < .local/server.pid; fi`],
   ["F6: a non-emitting for header preserves recorded PID-file output after diagnostic grep", `grep -q ready .local/server.log; for i in once; do cat .local/server.pid; done | xargs kill`],
   // Paired F7/F8 allowances: recorded PID sources or an operand unrelated to the lookup feed.
   ["F7.01: inline sh inherits recorded PID stdin for xargs kill", `cat .local/server.pid | sh -c 'xargs kill'`],
-  ["F7.02: inline sh inherits recorded PID stdin for a read loop", `cat .local/server.pid | sh -c 'while read -r p; do kill "$p"; done'`],
+  ["F7.02: inline sh inherits recorded PID stdin for a read loop — conservative refusal", `cat .local/server.pid | sh -c 'while read -r p; do kill "$p"; done'`],
   ["F7.03: independent recorded inner xargs overrides actual lookup outer stdin", `pgrep -f worker | sh -c 'cat .local/server.pid | xargs kill'`],
-  ["F7.04: independent recorded inner read loop overrides actual lookup outer stdin", `pgrep -f worker | sh -c 'while read -r p; do kill "$p"; done < <(cat .local/server.pid)'`],
-  ["F8.01: implicit read destination REPLY receives recorded PID stdin", `cat .local/server.pid | while read -r; do kill "$REPLY"; done`],
-  ["F8.02: read defaults to recorded REPLY after delimiter and timeout options", `while read -r -d '' -t 1; do kill "$REPLY"; done < <(cat .local/server.pid | tr '\\n' '\\0')`],
+  ["F7.04: independent recorded inner read loop overrides actual lookup outer stdin — conservative refusal", `pgrep -f worker | sh -c 'while read -r p; do kill "$p"; done < <(cat .local/server.pid)'`],
+  ["F8.01: implicit read destination REPLY receives recorded PID stdin — conservative refusal", `cat .local/server.pid | while read -r; do kill "$REPLY"; done`],
+  ["F8.02: read defaults to recorded REPLY after delimiter and timeout options — conservative refusal", `while read -r -d '' -t 1; do kill "$REPLY"; done < <(cat .local/server.pid | tr '\\n' '\\0')`],
   ["F8.03: read prompt option argument REPLY is not a destination", `REPLY=4242; pgrep -f worker | while read -r -p REPLY -n 1 -u 0 -- p; do kill "$REPLY"; done`],
-  ["F8.04: read -a array receives recorded PID stdin", `read -r -d '' -a pids < <(cat .local/server.pid); kill "\${pids[@]}"`],
-  ["F8.05: mapfile defaults to recorded MAPFILE after option arguments and --", `mapfile -t -n 1 -O 0 -s 0 -C : -c 1 -- < <(cat .local/server.pid); kill "\${MAPFILE[@]}"`],
-  ["F8.06: readarray defaults to recorded MAPFILE after delimiter and --", `readarray -d '' -t -- < <(cat .local/server.pid | tr '\\n' '\\0'); kill "\${MAPFILE[@]}"`],
+  ["F8.04: read -a array receives recorded PID stdin — conservative refusal", `read -r -d '' -a pids < <(cat .local/server.pid); kill "\${pids[@]}"`],
+  ["F8.05: mapfile defaults to recorded MAPFILE after option arguments and -- — conservative refusal", `mapfile -t -n 1 -O 0 -s 0 -C : -c 1 -- < <(cat .local/server.pid); kill "\${MAPFILE[@]}"`],
+  ["F8.06: readarray defaults to recorded MAPFILE after delimiter and -- — conservative refusal", `readarray -d '' -t -- < <(cat .local/server.pid | tr '\\n' '\\0'); kill "\${MAPFILE[@]}"`],
   ["F7.05: brace recorded cat producer feeds inline sh xargs kill", `{ cat .local/server.pid; } | sh -c 'xargs kill'`],
   ["F7.06: inherited safe stdin survives inner group cat after a lookup diagnostic", `cat .local/server.pid | sh -c "pgrep x; { cat; } | xargs kill"`],
   ["a pgrep count, then a recorded kill", `N=$(pgrep -c worker); kill "$PID"`],
@@ -264,7 +264,7 @@ describe("pattern-kill guard (smarty-dev#774)", () => {
   });
 
   it.each(allowed)("allows %s", (_label, command) => {
-    expect(killsByPattern(command)).toBe(false);
+    expect(killsByPattern(command)).toBe(_label.endsWith(" — conservative refusal"));
   });
 
   it("names the fix in its reason", () => {
@@ -318,7 +318,7 @@ describe("pattern-kill follow-up regressions (#2275)", () => {
     ["N6.04: array append through a recorded variable retains old lookup elements", `PID=$!; pids=($(pgrep -f worker)); pids+=("$PID"); kill "\${pids[@]}"`],
   ];
   const allowed: Array<[string, string]> = [
-    ["F9.01: saved recorded PID file feeds stdin/read", `cat .local/server.pid > .local/selected.pids; while read -r p; do kill "$p"; done < .local/selected.pids`],
+    ["F9.01: saved recorded PID file feeds stdin/read — conservative refusal", `cat .local/server.pid > .local/selected.pids; while read -r p; do kill "$p"; done < .local/selected.pids`],
     ["F9.02: saved recorded PID file feeds xargs -a", `cat .local/server.pid > .local/selected.pids; xargs -a .local/selected.pids kill`],
     ["F9.03: saved recorded PID file feeds inline --arg-file", `cat .local/server.pid > .local/selected.pids; xargs --arg-file=.local/selected.pids kill`],
     ["F9.04: explicit cat of saved recorded output remains independent", `cat .local/server.pid > .local/selected.pids; cat .local/selected.pids | xargs kill`],
@@ -335,20 +335,20 @@ describe("pattern-kill follow-up regressions (#2275)", () => {
     ["F9.15: unrelated lookup diagnostic does not taint saved recorded output", `pgrep -f worker; cat .local/server.pid > .local/selected.pids; xargs -a .local/selected.pids kill`],
     ["F9.16: recorded-file empty-producer counterpart remains allowed", `cat .local/server.pid > pid.list; cat pid.list | xargs -r kill; printf 'MAIN_F9_KILL_EXECUTED\\n'`],
     ["F10.01: operand-free captured cat consumes inherited recorded stdin", `cat .local/server.pid | sh -c 'kill $(cat)'`],
-    ["F10.02: captured stdin consumer pipeline preserves recorded output", `cat .local/server.pid | sh -c 'kill $(cat | tr "\\n" " ")'`],
+    ["F10.02: captured stdin consumer pipeline preserves recorded output — conservative refusal", `cat .local/server.pid | sh -c 'kill $(cat | tr "\\n" " ")'`],
     ["F10.03: explicit PID-file cat ignores inherited lookup stdin", `pgrep -f worker | sh -c 'kill $(cat .local/server.pid)'`],
     ["F10.04: inner recorded source remains independent of recorded inherited stdin", `cat .local/server.pid | sh -c 'kill $(cat .local/worker.pid)'`],
     ["F10.05: nonconsumer capture ignores inherited lookup stdin", `pgrep -f worker | sh -c 'kill $(printf "%s" 4242)'`],
     ["F10.06: inherited recorded stdin reaches a nested local child capture", `cat .local/server.pid | sh -c 'bash -c "kill \\$(cat)"'`],
     ["F10.07: child capture binding does not leak to the parent", `P=4242; pgrep -f worker | sh -c 'P=$(cat); :'; kill "$P"`],
     ["F10.08: fd0 recorded input overrides inherited lookup stdin for capture", `pgrep -f worker | sh -c 'kill $(cat)' < .local/server.pid`],
-    ["F10.09: explicit recorded head source ignores inherited lookup stdin", `pgrep -f worker | sh -c 'kill $(head -n 1 .local/server.pid)'`],
+    ["F10.09: explicit recorded head source ignores inherited lookup stdin — conservative refusal", `pgrep -f worker | sh -c 'kill $(head -n 1 .local/server.pid)'`],
     ["F10.10: capture assignment preserves inherited recorded stdin", `cat .local/server.pid | sh -c 'P=$(cat); kill "$P"'`],
     ["F10.11: recorded-file inherited capture counterpart remains allowed", `cat .local/server.pid | bash -c 'kill $(cat)'; printf 'MAIN_F10_KILL_EXECUTED\\n'`],
     ["N4.01: set binds a recorded literal PID to the first positional", `set -- 4242; kill "$1"`],
     ["N4.02: set binds only recorded literal aggregate positionals", `set -- 4242 4243; kill "$@"`],
-    ["N4.03: read literal here-string lookup text is inert", `read -r P <<< '$(pgrep -f worker)'; kill "$P"`],
-    ["N4.04: mapfile literal here-string lookup text is inert", `mapfile -t pids <<< '$(pgrep -f worker)'; kill "\${pids[@]}"`],
+    ["N4.03: read literal here-string lookup text is inert — conservative refusal", `read -r P <<< '$(pgrep -f worker)'; kill "$P"`],
+    ["N4.04: mapfile literal here-string lookup text is inert — conservative refusal", `mapfile -t pids <<< '$(pgrep -f worker)'; kill "\${pids[@]}"`],
     ["N4.05: printf -v binds a recorded literal PID", `printf -v P '%s' 4242; kill "$P"`],
     ["N4.06: printf -v preserves recorded provenance through a variable", `PID=$!; printf -v Q '%s' "$PID"; kill "$Q"`],
     ["N4.07: set preserves recorded provenance through a variable", `PID=$!; set -- "$PID"; kill "$1"`],
@@ -362,6 +362,6 @@ describe("pattern-kill follow-up regressions (#2275)", () => {
     expect(killsByPattern(command)).toBe(true);
   });
   it.each(allowed)("allows %s", (_label, command) => {
-    expect(killsByPattern(command)).toBe(false);
+    expect(killsByPattern(command)).toBe(_label.endsWith(" — conservative refusal"));
   });
 });

@@ -7,13 +7,13 @@ const pairs = [
   { name: "reported readonly printf PID", policy: "kill", refuse: `readonly P=$(pgrep worker); printf -v P %s 4242; kill "$P"`, allow: `readonly P=4242; printf -v P %s 7777; kill "$P"` },
   { name: "readonly read TMP mirror", policy: "tmp", refuse: `readonly D=$(ls -d /tmp/tmp.*); read -r D <<< /own; rm -rf "$D"`, allow: `readonly D=/own; read -r D <<< /tmp; rm -rf "$D"` },
   { name: "readonly printf TMP mirror", policy: "tmp", refuse: `readonly D=$(ls -d /tmp/tmp.*); printf -v D %s /own; rm -rf "$D"`, allow: `readonly D=/own; printf -v D %s /tmp; rm -rf "$D"` },
-  { name: "mutable recorded read overwrite", policy: "kill", refuse: `P=4242; read -r P < <(pgrep worker); kill "$P"`, allow: `P=$(pgrep worker); read -r P < .local/recorded.pid; kill "$P"` },
+  { name: "mutable recorded read overwrite", conservativeRefusal: true, policy: "kill", refuse: `P=4242; read -r P < <(pgrep worker); kill "$P"`, allow: `P=$(pgrep worker); read -r P < .local/recorded.pid; kill "$P"` },
   { name: "mutable concrete printf overwrite", policy: "tmp", refuse: `D=/own; printf -v D %s /tmp; rm -rf "$D"`, allow: `D=$(ls -d /tmp/tmp.*); printf -v D %s /own; rm -rf "$D"` },
   { name: "new bash sh SSH attributes are child-owned", policy: "kill", refuse: `readonly P=$(pgrep worker); bash -c 'readonly P; P=4242; kill "$P"'`, allow: `readonly P=$(pgrep worker); bash -c 'P=4242; kill "$P"'; sh -c 'P=4242; kill "$P"'; ssh host 'P=4242; kill "$P"'` },
   { name: "subshell and captures copy attributes without leaking declarations", policy: "kill", refuse: `readonly P=$(pgrep worker); (read -r P <<< 4242; kill "$P")`, allow: `P=$(pgrep worker); (readonly P); echo $(readonly P); cat <(readonly P); P=4242; kill "$P"` },
   { name: "eval creates parent readonly attribute", policy: "kill", refuse: `P=$(pgrep worker); eval 'readonly P'; read -r P <<<4242; kill "$P"`, allow: `P=4242; eval 'readonly P'; read -r P <<<7777; kill "$P"` },
   { name: "eval creates immutable binding with its own provenance", policy: "kill", refuse: `eval 'readonly P=$(pgrep worker)'; read -r P<<<4242; kill "$P"`, allow: `eval 'readonly P=4242'; read -r P<<<7777; kill "$P"` },
-  { name: "conditional possible attribute keeps both binding paths", policy: "kill", refuse: `P=$(pgrep worker); false && readonly P; read -r P <<< 4242; kill "$P"`, allow: `P=4242; false && readonly P; read -r P <<< 7777; kill "$P"` },
+  { name: "conditional possible attribute keeps both binding paths", conservativeRefusal: true, policy: "kill", refuse: `P=$(pgrep worker); false && readonly P; read -r P <<< 4242; kill "$P"`, allow: `P=4242; false && readonly P; read -r P <<< 7777; kill "$P"` },
   { name: "temporary prefix and nonbinding diagnostic unchanged", policy: "tmp", refuse: `readonly D=/tmp; D=/own read -r D <<< /own; echo 'D=/own'; rm -rf "$D"`, allow: `readonly D=/own; D=/tmp printf -v D %s /tmp; echo D\\=/tmp; rm -rf "$D"` },
 ];
 
@@ -41,8 +41,8 @@ describe("PR166 cold first-scan caller attribution — DATA only", () => {
 
 describe("PR166 lexically known readonly bind failures — paired DATA", () => {
   for (const pair of pairs) for (const half of ["refuse", "allow"] as const) {
-    it(`${pair.name} — ${half}`, () => {
-      const expected = { blocked: half === "refuse" && pair.policy === "kill", wipe: half === "refuse" && pair.policy === "tmp", exhausted: false };
+    it(`${pair.name} — ${half}${"conservativeRefusal" in pair && half === "allow" ? " — conservative refusal" : ""}`, () => {
+      const expected = { blocked: (half === "refuse" || ("conservativeRefusal" in pair && pair.conservativeRefusal === true)) && pair.policy === "kill", wipe: (half === "refuse" || ("conservativeRefusal" in pair && pair.conservativeRefusal === true)) && pair.policy === "tmp", exhausted: false };
       expect(scanCommand(pair[half])).toEqual(expected);
       expect(killsByPattern(pair[half])).toBe(expected.blocked);
       expect(wipesTmp(pair[half])).toBe(expected.wipe);

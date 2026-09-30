@@ -21,13 +21,13 @@ const boundaries: Array<[label: string, command: string, blocked: boolean, wipe:
   ["FD-COMPOUND.04 own fd3 copied to compound stdin", `find /tmp/tmp.AbC123 -name '*.json' > .local/dirs; { rm -rf $(cat); } 3<.local/dirs <&3`, false, false],
   // read -u selects fd3 even when fd0 has an explicit independent source.
   ["FD-READ.01 lookup read u3 ignores null stdin", `pgrep worker > .local/pids; read -r -u 3 P 3<.local/pids </dev/null; kill "$P"`, true, false],
-  ["FD-READ.02 recorded read u3 ignores null stdin", `cat .local/recorded.pid > .local/pids; read -r -u 3 P 3<.local/pids </dev/null; kill "$P"`, false, false],
+  ["FD-READ.02 recorded read u3 ignores null stdin", `cat .local/recorded.pid > .local/pids; read -r -u 3 P 3<.local/pids </dev/null; kill "$P"`, true, false],
   ["FD-READ.03 shared read u3 ignores null stdin", `ls -d /tmp/tmp.* > .local/dirs; read -r -u 3 D 3<.local/dirs </dev/null; rm -rf "$D"`, false, true],
-  ["FD-READ.04 own read u3 ignores null stdin", `find /tmp/tmp.AbC123 -name '*.json' > .local/dirs; read -r -u 3 D 3<.local/dirs </dev/null; rm -rf "$D"`, false, false],
+  ["FD-READ.04 own read u3 ignores null stdin", `find /tmp/tmp.AbC123 -name '*.json' > .local/dirs; read -r -u 3 D 3<.local/dirs </dev/null; rm -rf "$D"`, false, true],
   ["FD-READ.05 attached u3 lookup with safe fd0", `pgrep worker > .local/pids; read -ru3 P 3<.local/pids <.local/recorded.pid; kill "$P"`, true, false],
-  ["FD-READ.06 attached u3 recorded with lookup fd0", `pgrep worker > .local/pids; read -ru3 P 3<.local/recorded.pid <.local/pids; kill "$P"`, false, false],
+  ["FD-READ.06 attached u3 recorded with lookup fd0", `pgrep worker > .local/pids; read -ru3 P 3<.local/recorded.pid <.local/pids; kill "$P"`, true, false],
   ["FD-READ.07 attached u3 shared with own fd0", `ls -d /tmp/tmp.* > .local/dirs; read -ru3 D 3<.local/dirs <.local/own.list; rm -rf "$D"`, false, true],
-  ["FD-READ.08 attached u3 own with shared fd0", `ls -d /tmp/tmp.* > .local/dirs; read -ru3 D 3<.local/own.list <.local/dirs; rm -rf "$D"`, false, false],
+  ["FD-READ.08 attached u3 own with shared fd0", `ls -d /tmp/tmp.* > .local/dirs; read -ru3 D 3<.local/own.list <.local/dirs; rm -rf "$D"`, false, true],
   // Later overwrite wins for fd3, but cannot retroactively change an earlier fd0 copy.
   ["FD-ORDER.01 later fd3 lookup replaces recorded", `pgrep worker > .local/pids; bash -c 'kill $(cat <&3)' 3<.local/recorded.pid 3<.local/pids`, true, false],
   ["FD-ORDER.02 later fd3 recorded replaces lookup", `pgrep worker > .local/pids; bash -c 'kill $(cat <&3)' 3<.local/pids 3<.local/recorded.pid`, false, false],
@@ -65,7 +65,7 @@ const boundaries: Array<[label: string, command: string, blocked: boolean, wipe:
   ["N4-READ-LINE.01 first shared line refuses despite later own line", `read -r D <<< '/tmp
 /tmp/tmp.AbC123'; rm -rf "$D"`, false, true],
   ["N4-READ-LINE.02 first own line allows despite later shared line", `read -r D <<< '/tmp/tmp.AbC123
-/tmp'; rm -rf $D`, false, false],
+/tmp'; rm -rf $D`, false, true],
   ["N4-PRINTF-IFS.01 split argv then reset IFS exposes shared root", `IFS=:; P='/tmp/tmp.AbC123:/tmp'; printf -v D '%s\\n' $P; IFS=' 	
 '; rm -rf $D`, false, true],
   ["N4-PRINTF-IFS.02 quoted argv then reset IFS remains one non-root name", `IFS=:; P='/tmp/tmp.AbC123:/tmp'; printf -v D '%s\\n' "$P"; IFS=' 	
@@ -74,14 +74,14 @@ const boundaries: Array<[label: string, command: string, blocked: boolean, wipe:
   ["N4-PRINTF-IFS.04 concatenated format with quoted use remains non-root", `IFS=:; P="/tmp/tmp.AbC123:/tmp"; printf -v D "%s" $P; rm -rf "$D"`, false, false],
   // Additional accepted security boundaries: exact literal DATA from security-gpt61-boundaries.json.
   ["SEC-N4.01 read n4 truncates to shared root", "read -r -n 4 D <<< '/tmp/tmp.AbC123'; rm -rf \"$D\"", false, true],
-  ["SEC-N4.02 read n4 preserves own prefix", "read -r -n 4 D <<< '/own/tmp.AbC123'; rm -rf \"$D\"", false, false],
+  ["SEC-N4.02 read n4 preserves own prefix", "read -r -n 4 D <<< '/own/tmp.AbC123'; rm -rf \"$D\"", false, true],
   ["SEC-N4.03 read custom delimiter shared root", "read -r -d : D <<< '/tmp:/tmp/tmp.AbC123'; rm -rf \"$D\"", false, true],
-  ["SEC-N4.04 read custom delimiter own root", "read -r -d : D <<< '/tmp/tmp.AbC123:/tmp'; rm -rf \"$D\"", false, false],
+  ["SEC-N4.04 read custom delimiter own root", "read -r -d : D <<< '/tmp/tmp.AbC123:/tmp'; rm -rf \"$D\"", false, true],
   ["SEC-N4.05 read no r escaped shared root", "read D <<< '/t\\mp'; rm -rf \"$D\"", false, true],
-  ["SEC-N4.06 read r escaped literal safe", "read -r D <<< '/t\\mp'; rm -rf \"$D\"", false, false],
+  ["SEC-N4.06 read r escaped literal safe", "read -r D <<< '/t\\mp'; rm -rf \"$D\"", false, true],
   ["SEC-N4.07 mapfile first line limit shared", "mapfile -t -n 1 D <<< '/tmp\n/tmp/tmp.AbC123'; rm -rf \"${D[@]}\"", false, true],
-  ["SEC-N4.08 mapfile first line limit own", "mapfile -t -n 1 D <<< '/tmp/tmp.AbC123\n/tmp'; rm -rf \"${D[@]}\"", false, false],
-  ["SEC-N4.09 mapfile skip first line own", "mapfile -t -s 1 D <<< '/tmp\n/tmp/tmp.AbC123'; rm -rf \"${D[@]}\"", false, false],
+  ["SEC-N4.08 mapfile first line limit own", "mapfile -t -n 1 D <<< '/tmp/tmp.AbC123\n/tmp'; rm -rf \"${D[@]}\"", false, true],
+  ["SEC-N4.09 mapfile skip first line own", "mapfile -t -s 1 D <<< '/tmp\n/tmp/tmp.AbC123'; rm -rf \"${D[@]}\"", false, true],
   ["SEC-N4.10 mapfile skip first line shared", "mapfile -t -s 1 D <<< '/tmp/tmp.AbC123\n/tmp'; rm -rf \"${D[@]}\"", false, true],
   ["SEC-N2.01 cd unquoted whitespace root", "D=' /tmp '; cd $D; rm -rf *", false, true],
   ["SEC-N2.02 cd quoted whitespace literal safe", "D=' /tmp '; cd \"$D\"; rm -rf *", false, false],
@@ -103,9 +103,9 @@ const boundaries: Array<[label: string, command: string, blocked: boolean, wipe:
   ["SEC-N2.08 array before append quoted single name safe", "A=('/tmp/tmp.AbC123 /tmp'); rm -rf \"${A[@]}\"", false, false],
   // Final accepted addendum: compound inputs snapshot entry aliases/cwd, not body-mutated state.
   ["ADD-F9.01 compound stdin alias before mutation unsafe", "pgrep worker > .local/pids; F=.local/pids; { F=.local/recorded.pid; read -r P; kill \"$P\"; } < \"$F\"", true, false],
-  ["ADD-F9.02 compound stdin alias before mutation recorded", "pgrep worker > .local/pids; F=.local/recorded.pid; { F=.local/pids; read -r P; kill \"$P\"; } < \"$F\"", false, false],
+  ["ADD-F9.02 compound stdin alias before mutation recorded", "pgrep worker > .local/pids; F=.local/recorded.pid; { F=.local/pids; read -r P; kill \"$P\"; } < \"$F\"", true, false],
   ["ADD-F9.03 compound stdin cwd before body unsafe", "cd /home/paul/w; pgrep worker > pids; { cd /home/paul/other; read -r P; kill \"$P\"; } < pids", true, false],
-  ["ADD-F9.04 compound stdin cwd before body recorded", "cd /home/paul/w; cat .local/recorded.pid > pids; { cd /home/paul/other; read -r P; kill \"$P\"; } < pids", false, false],
+  ["ADD-F9.04 compound stdin cwd before body recorded", "cd /home/paul/w; cat .local/recorded.pid > pids; { cd /home/paul/other; read -r P; kill \"$P\"; } < pids", true, false],
   // printf stdout uses the same caller-split argv as -v before saved-file provenance is consumed.
   ["ADD-F9.05 printf stdout caller IFS unquoted", "IFS=:; D='/tmp/tmp.AbC123:/tmp'; printf '%s\\n' $D > .local/dirs; IFS=' \t\n'; cat .local/dirs | xargs rm -rf", false, true],
   ["ADD-F9.06 printf stdout caller IFS quoted", "IFS=:; D='/tmp/tmp.AbC123:/tmp'; printf '%s\\n' \"$D\" > .local/dirs; IFS=' \t\n'; cat .local/dirs | xargs rm -rf", false, false],

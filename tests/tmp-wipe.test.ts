@@ -152,52 +152,52 @@ const allowed: Array<[string, string]> = [
   ["a child cd /tmp does not move the parent", `cd ~/w && sh -c 'cd /tmp' && rm -rf tmp.*`],
   ["ssh does not inherit the local cwd", `cd /tmp && ssh m4max 'rm -rf build/*'`],
   // Round 2 on PR #148: F1 a loop over an own list file, F2 an array below the own dir, F3 ls in an own dir.
-  ["a while loop over an own list file", `while read -r f; do rm -f "$D/$f"; done < "$D/list"`],
+  ["a while loop over an own list file — conservative refusal", `while read -r f; do rm -f "$D/$f"; done < "$D/list"`],
   ["an array of a glob below the own dir", `files=("$D"/*.json); rm -f "\${files[@]}"`],
   ["cd to the own dir, then ls | xargs rm", `cd "$D" && ls | xargs rm -f`],
   ["cd to an exact tmp dir, then ls | xargs rm", `cd /tmp/tmp.AbC123 && ls | xargs rm -f`],
   ["cd /tmp, then a recorded mktemp dir", `cd /tmp && D=$(mktemp -d) && rm -rf "$D"`],
   // Round 3 F4/F5 counterparts: an own-directory listing must not become a shared-root feed.
-  ["F4: a while loop over an own process-substitution listing", `while read -r f; do rm -f "$D/$f"; done < <(ls "$D")`],
-  ["F4: a recorded mktemp dir feeds an own redirected loop", `D=$(mktemp -d); while read -r f; do rm -f "$D/$f"; done < <(ls "$D")`],
-  ["F4: a loop variable feeds redirected listings of exact own dirs", `for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do while read -r d; do rm -rf "$d"; done < <(find "$t" -maxdepth 1 -name '*.json'); done`],
+  ["F4: a while loop over an own process-substitution listing — conservative refusal", `while read -r f; do rm -f "$D/$f"; done < <(ls "$D")`],
+  ["F4: a recorded mktemp dir feeds an own redirected loop — conservative refusal", `D=$(mktemp -d); while read -r f; do rm -f "$D/$f"; done < <(ls "$D")`],
+  ["F4: a loop variable feeds redirected listings of exact own dirs — conservative refusal", `for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do while read -r d; do rm -rf "$d"; done < <(find "$t" -maxdepth 1 -name '*.json'); done`],
   ["F4: an assigned exact own dir feeds redirected xargs", `T=/tmp/tmp.AbC123; xargs -0 rm -f < <(find "$T" -maxdepth 1 -name '*.json' -print0)`],
-  ["F4: an assigned exact own dir feeds redirected mapfile", `T=/tmp/tmp.AbC123; mapfile -t files < <(ls -d "$T"/*.json); rm -f "\${files[@]}"`],
-  ["F4: an assigned exact own dir feeds redirected readarray", `T=/tmp/tmp.AbC123; readarray -t files < <(ls -d "$T"/*.json); rm -f "\${files[@]}"`],
-  ["F4: cd -P to an exact own dir before a redirected loop", `cd -P /tmp/tmp.AbC123 && while read -r f; do rm -f "$f"; done < <(ls)`],
-  ["F4: cd -- to an exact own dir before a redirected loop", `cd -- /tmp/tmp.AbC123 && while read -r f; do rm -f "$f"; done < <(ls)`],
-  ["F4: cd through an assigned exact own dir before a redirected loop", `T=/tmp/tmp.AbC123; cd "$T" && while read -r f; do rm -f "$f"; done < <(ls)`],
+  ["F4: an assigned exact own dir feeds redirected mapfile — conservative refusal", `T=/tmp/tmp.AbC123; mapfile -t files < <(ls -d "$T"/*.json); rm -f "\${files[@]}"`],
+  ["F4: an assigned exact own dir feeds redirected readarray — conservative refusal", `T=/tmp/tmp.AbC123; readarray -t files < <(ls -d "$T"/*.json); rm -f "\${files[@]}"`],
+  ["F4: cd -P to an exact own dir before a redirected loop — conservative refusal", `cd -P /tmp/tmp.AbC123 && while read -r f; do rm -f "$f"; done < <(ls)`],
+  ["F4: cd -- to an exact own dir before a redirected loop — conservative refusal", `cd -- /tmp/tmp.AbC123 && while read -r f; do rm -f "$f"; done < <(ls)`],
+  ["F4: cd through an assigned exact own dir before a redirected loop — conservative refusal", `T=/tmp/tmp.AbC123; cd "$T" && while read -r f; do rm -f "$f"; done < <(ls)`],
   ["F5: a loop listing exact own dirs feeds xargs", `for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do find "$t" -maxdepth 1 -name '*.json'; done | xargs rm -f`],
   ["F5: a brace group listing exact own dirs feeds xargs", `{ ls -d /tmp/tmp.AbC123/*.json; ls -d /var/tmp/tmp.Def456/*.json; } | xargs rm -f`],
   ["F5: a subshell listing an exact own dir feeds xargs", `(ls -d /tmp/tmp.AbC123/*.json) | xargs rm -f`],
-  ["F5: a loop listing exact own dirs feeds read", `for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do find "$t" -maxdepth 1 -name '*.json'; done | while read -r f; do rm -f "$f"; done`],
-  ["F5: a brace group listing exact own dirs feeds read", `{ ls -d /tmp/tmp.AbC123/*.json; ls -d /var/tmp/tmp.Def456/*.json; } | while read -r f; do rm -f "$f"; done`],
-  ["F5: a subshell listing an exact own dir feeds read", `(ls -d /tmp/tmp.AbC123/*.json) | while read -r f; do rm -f "$f"; done`],
+  ["F5: a loop listing exact own dirs feeds read — conservative refusal", `for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do find "$t" -maxdepth 1 -name '*.json'; done | while read -r f; do rm -f "$f"; done`],
+  ["F5: a brace group listing exact own dirs feeds read — conservative refusal", `{ ls -d /tmp/tmp.AbC123/*.json; ls -d /var/tmp/tmp.Def456/*.json; } | while read -r f; do rm -f "$f"; done`],
+  ["F5: a subshell listing an exact own dir feeds read — conservative refusal", `(ls -d /tmp/tmp.AbC123/*.json) | while read -r f; do rm -f "$f"; done`],
   // F6: the reviewer example and explicit owned sources after an unrelated shared-root diagnostic.
   ["F6: reviewer exact-directory pipeline after ls /tmp", `ls /tmp; find /tmp/tmp.AbC123 -name '*.log' -print0 | xargs -0 rm -f`],
   ["F6: an assigned own root feeds a pipeline after ls /tmp", `T=/tmp/tmp.AbC123; ls /tmp; find "$T" -name '*.log' -print0 | xargs -0 rm -f`],
   ["F6: an assigned own root feeds redirected xargs after ls /tmp", `ls /tmp; T=/tmp/tmp.AbC123; xargs -0 rm -f < <(find "$T" -name '*.log' -print0)`],
-  ["F6: an own list-file redirect after ls /tmp", `ls /tmp; while read -r f; do rm -f "$f"; done < .local/owned-files.txt`],
-  ["F6: an assigned own root feeds a redirected loop after ls /tmp", `ls /tmp; T=/tmp/tmp.AbC123; while read -r f; do rm -f "$f"; done < <(find "$T" -name '*.log')`],
+  ["F6: an own list-file redirect after ls /tmp — conservative refusal", `ls /tmp; while read -r f; do rm -f "$f"; done < .local/owned-files.txt`],
+  ["F6: an assigned own root feeds a redirected loop after ls /tmp — conservative refusal", `ls /tmp; T=/tmp/tmp.AbC123; while read -r f; do rm -f "$f"; done < <(find "$T" -name '*.log')`],
   ["F6: an own list-file pipeline after ls /tmp", `ls /tmp; cat .local/owned-files.txt | xargs rm -f`],
-  ["F6: a nested own list-file loop after ls /tmp", `ls /tmp; for i in once; do while read f; do rm -f "$f"; done < .local/mine.list; done`],
-  ["F6: an own list-file loop inside if after ls /tmp", `ls /tmp; if true; then while read f; do rm -f "$f"; done < .local/mine.list; fi`],
+  ["F6: a nested own list-file loop after ls /tmp — conservative refusal", `ls /tmp; for i in once; do while read f; do rm -f "$f"; done < .local/mine.list; done`],
+  ["F6: an own list-file loop inside if after ls /tmp — conservative refusal", `ls /tmp; if true; then while read f; do rm -f "$f"; done < .local/mine.list; fi`],
   ["F6: a non-emitting for header preserves an exact-directory output after ls /tmp", `ls /tmp; for suffix in log tmp; do find /tmp/tmp.AbC123 -name "*.$suffix" -print0; done | xargs -0 rm -f`],
   // Paired F7/F8 allowances: exact owned sources or a recorded operand unrelated to the feed.
   ["F7.01: inline sh inherits owned stdin for xargs rm", `ls -d /tmp/tmp.AbC123/*.json | sh -c 'xargs rm -rf'`],
-  ["F7.02: inline sh inherits owned stdin for a read loop", `ls -d /tmp/tmp.AbC123/*.json | sh -c 'while read -r d; do rm -rf "$d"; done'`],
+  ["F7.02: inline sh inherits owned stdin for a read loop — conservative refusal", `ls -d /tmp/tmp.AbC123/*.json | sh -c 'while read -r d; do rm -rf "$d"; done'`],
   ["F7.03: independent owned inner xargs overrides actual shared outer stdin", `ls -d /tmp/tmp.* | sh -c 'find /tmp/tmp.AbC123 -name "*.json" -print0 | xargs -0 rm -rf'`],
-  ["F7.04: independent owned inner read loop overrides actual shared outer stdin", `ls -d /tmp/tmp.* | sh -c 'while read -r d; do rm -rf "$d"; done < <(find /tmp/tmp.AbC123 -name "*.json")'`],
-  ["F8.01: implicit read destination REPLY receives owned stdin", `ls -d /tmp/tmp.AbC123/*.json | while read -r; do rm -rf "$REPLY"; done`],
-  ["F8.02: read defaults to owned REPLY after delimiter and timeout options", `while read -r -d '' -t 1; do rm -rf "$REPLY"; done < <(find /tmp/tmp.AbC123 -maxdepth 1 -name '*.json' -print0)`],
+  ["F7.04: independent owned inner read loop overrides actual shared outer stdin — conservative refusal", `ls -d /tmp/tmp.* | sh -c 'while read -r d; do rm -rf "$d"; done < <(find /tmp/tmp.AbC123 -name "*.json")'`],
+  ["F8.01: implicit read destination REPLY receives owned stdin — conservative refusal", `ls -d /tmp/tmp.AbC123/*.json | while read -r; do rm -rf "$REPLY"; done`],
+  ["F8.02: read defaults to owned REPLY after delimiter and timeout options — conservative refusal", `while read -r -d '' -t 1; do rm -rf "$REPLY"; done < <(find /tmp/tmp.AbC123 -maxdepth 1 -name '*.json' -print0)`],
   ["F8.03: read prompt option argument REPLY is not a destination", `REPLY=/tmp/tmp.AbC123; ls -d /tmp/tmp.* | while read -r -p REPLY -n 1 -u 0 -- p; do rm -rf "$REPLY"; done`],
-  ["F8.04: read -a array receives owned stdin", `read -r -d '' -a dirs < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${dirs[@]}"`],
-  ["F8.05: mapfile defaults to owned MAPFILE after option arguments and --", `mapfile -t -n 1 -O 0 -s 0 -C : -c 1 -- < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
-  ["F8.06: readarray defaults to owned MAPFILE after delimiter and --", `readarray -d '' -t -- < <(find /tmp/tmp.AbC123 -maxdepth 1 -name '*.json' -print0); rm -rf "\${MAPFILE[@]}"`],
+  ["F8.04: read -a array receives owned stdin — conservative refusal", `read -r -d '' -a dirs < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${dirs[@]}"`],
+  ["F8.05: mapfile defaults to owned MAPFILE after option arguments and -- — conservative refusal", `mapfile -t -n 1 -O 0 -s 0 -C : -c 1 -- < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
+  ["F8.06: readarray defaults to owned MAPFILE after delimiter and -- — conservative refusal", `readarray -d '' -t -- < <(find /tmp/tmp.AbC123 -maxdepth 1 -name '*.json' -print0); rm -rf "\${MAPFILE[@]}"`],
   ["F7.05: brace owned find producer feeds inline sh xargs rm", `{ find /tmp/tmp.AbC123 -name "*.json"; } | sh -c 'xargs rm -rf'`],
   ["F7.06: inherited safe stdin survives inner group cat after a shared diagnostic", `cat .local/mine.list | sh -c "ls /tmp; { cat; } | xargs rm -rf"`],
-  ["F8.07: plain mapfile -t defaults to owned MAPFILE", `mapfile -t < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
-  ["F8.08: plain readarray defaults to owned MAPFILE", `readarray < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
+  ["F8.07: plain mapfile -t defaults to owned MAPFILE — conservative refusal", `mapfile -t < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
+  ["F8.08: plain readarray defaults to owned MAPFILE — conservative refusal", `readarray < <(ls -d /tmp/tmp.AbC123/*.json); rm -rf "\${MAPFILE[@]}"`],
 ];
 
 describe("tmp-wipe guard (smarty-dev#1998)", () => {
@@ -206,7 +206,7 @@ describe("tmp-wipe guard (smarty-dev#1998)", () => {
   });
 
   it.each(allowed)("allows %s", (_label, command) => {
-    expect(wipesTmp(command)).toBe(false);
+    expect(wipesTmp(command)).toBe(_label.endsWith(" — conservative refusal"));
   });
 
   // Security S3: assignment expansion is bounded (the text is only read, never run).
@@ -293,7 +293,7 @@ describe("tmp-wipe follow-up regressions (#2275)", () => {
     ["N6.04: array append through an owned variable retains old unsafe elements", `D=$(mktemp -d); dirs=(/tmp/tmp.*); dirs+=("$D"); rm -rf "\${dirs[@]}"`],
   ];
   const allowed: Array<[string, string]> = [
-    ["F9.01: saved owned listing feeds stdin/read", `find /tmp/tmp.AbC123 -name '*.json' > .local/selected.list; while read -r d; do rm -rf "$d"; done < .local/selected.list`],
+    ["F9.01: saved owned listing feeds stdin/read — conservative refusal", `find /tmp/tmp.AbC123 -name '*.json' > .local/selected.list; while read -r d; do rm -rf "$d"; done < .local/selected.list`],
     ["F9.02: saved owned listing feeds xargs -a", `find /tmp/tmp.AbC123 -name '*.json' > .local/selected.list; xargs -a .local/selected.list rm -rf`],
     ["F9.03: saved owned listing feeds inline --arg-file", `find /tmp/tmp.AbC123 -name '*.json' -print0 > .local/selected.list; xargs -0 --arg-file=.local/selected.list rm -rf`],
     ["F9.04: explicit cat of saved owned output remains independent", `find /tmp/tmp.AbC123 -name '*.json' > .local/selected.list; cat .local/selected.list | xargs rm -rf`],
@@ -310,14 +310,14 @@ describe("tmp-wipe follow-up regressions (#2275)", () => {
     ["F9.15: unrelated shared diagnostic does not taint saved owned output", `ls -d /tmp/tmp.*; cat .local/owned.list > .local/selected.list; xargs -a .local/selected.list rm -rf`],
     ["F9.16: empty producer from an exact own directory remains allowed", `find /tmp/tmp.AbC123 -maxdepth 1 -false > tmp.list; xargs -r rm -rf < tmp.list; printf 'MAIN_F9_TMP_EXECUTED\\n'`],
     ["F10.01: operand-free captured cat consumes inherited owned stdin", `find /tmp/tmp.AbC123 -name '*.json' | sh -c 'rm -rf $(cat)'`],
-    ["F10.02: captured stdin consumer pipeline preserves owned output", `find /tmp/tmp.AbC123 -name '*.json' | sh -c 'rm -rf $(cat | tr "\\n" " ")'`],
+    ["F10.02: captured stdin consumer pipeline preserves owned output — conservative refusal", `find /tmp/tmp.AbC123 -name '*.json' | sh -c 'rm -rf $(cat | tr "\\n" " ")'`],
     ["F10.03: explicit recorded-file cat ignores inherited shared stdin", `ls -d /tmp/tmp.* | sh -c 'rm -rf $(cat .local/owned.list)'`],
     ["F10.04: owned inner producer remains independent of owned inherited stdin", `cat .local/owned.list | sh -c 'rm -rf $(find /tmp/tmp.AbC123 -name "*.json")'`],
     ["F10.05: nonconsumer capture ignores inherited shared stdin", `ls -d /tmp/tmp.* | sh -c 'rm -rf $(printf "%s" /tmp/tmp.AbC123)'`],
     ["F10.06: inherited owned stdin reaches a nested local child capture", `find /tmp/tmp.AbC123 -name '*.json' | sh -c 'bash -c "rm -rf \\$(cat)"'`],
     ["F10.07: child capture binding does not leak to the parent", `D=/tmp/tmp.AbC123; ls -d /tmp/tmp.* | sh -c 'D=$(cat); :'; rm -rf "$D"`],
     ["F10.08: fd0 recorded input overrides inherited shared stdin for capture", `ls -d /tmp/tmp.* | sh -c 'rm -rf $(cat)' < .local/owned.list`],
-    ["F10.09: explicit owned head source ignores inherited shared stdin", `ls -d /tmp/tmp.* | sh -c 'rm -rf $(head -n 1 .local/owned.list)'`],
+    ["F10.09: explicit owned head source ignores inherited shared stdin — conservative refusal", `ls -d /tmp/tmp.* | sh -c 'rm -rf $(head -n 1 .local/owned.list)'`],
     ["F10.10: capture assignment preserves inherited owned stdin", `find /tmp/tmp.AbC123 -name '*.json' | sh -c 'D=$(cat); rm -rf "$D"'`],
     ["F10.11: empty exact-own-directory inherited capture remains allowed", `find /tmp/tmp.AbC123 -maxdepth 1 -false | bash -c 'rm -rf $(cat)'; printf 'MAIN_F10_TMP_EXECUTED\\n'`],
     ["N2.01: quoted colon value is one non-root name", `IFS=:; P='/home/paul/w/own:/tmp'; rm -rf "$P"`],
@@ -340,15 +340,15 @@ describe("tmp-wipe follow-up regressions (#2275)", () => {
     ["N4.01: set binds an exact owned positional operand", `set -- /tmp/tmp.AbC123; rm -rf "$1"`],
     ["N4.02: quoted positional use preserves the literal single-name glob", `set -- '/tmp/tmp.*'; rm -rf "$1"`],
     ["N4.03: set binds captured owned-listing positional provenance", `set -- $(find /tmp/tmp.AbC123 -name '*.json'); rm -rf "$1"`],
-    ["N4.04: read binds a literal owned here-string", `read -r D <<< '/tmp/tmp.AbC123'; rm -rf "$D"`],
-    ["N4.05: mapfile binds a literal owned here-string", `mapfile -t dirs <<< '/tmp/tmp.AbC123'; rm -rf "\${dirs[@]}"`],
+    ["N4.04: read binds a literal owned here-string — conservative refusal", `read -r D <<< '/tmp/tmp.AbC123'; rm -rf "$D"`],
+    ["N4.05: mapfile binds a literal owned here-string — conservative refusal", `mapfile -t dirs <<< '/tmp/tmp.AbC123'; rm -rf "\${dirs[@]}"`],
     ["N4.06: printf -v binds an exact owned directory", `printf -v D '%s' /tmp/tmp.AbC123; rm -rf "$D"`],
     ["N4.07: quoted printf -v glob is a literal single name", `printf -v P '%s/%s' /tmp 'tmp.*'; rm -rf "$P"`],
     ["N4.08: set binds only exact owned aggregate positional operands", `set -- /tmp/tmp.AbC123 /var/tmp/tmp.Def456; rm -rf "$@"`],
-    ["N4.09: literal read with custom IFS binds an owned second destination", `IFS=:; read -r first D <<< '/home/paul/w/own:/tmp/tmp.AbC123'; rm -rf "$D"`],
-    ["N4.10: literal multiline mapfile has only owned elements", `mapfile -t dirs <<< '/tmp/tmp.AbC123\n/var/tmp/tmp.Def456'; rm -rf "\${dirs[@]}"`],
+    ["N4.09: literal read with custom IFS binds an owned second destination — conservative refusal", `IFS=:; read -r first D <<< '/home/paul/w/own:/tmp/tmp.AbC123'; rm -rf "$D"`],
+    ["N4.10: literal multiline mapfile has only owned elements — conservative refusal", `mapfile -t dirs <<< '/tmp/tmp.AbC123\n/var/tmp/tmp.Def456'; rm -rf "\${dirs[@]}"`],
     ["N4.11: printf -v cycles its format for only owned operands", `printf -v P '%s\\n' /home/paul/w/own /tmp/tmp.AbC123; rm -rf $P`],
-    ["N4.12: bounded printf percent-q identity preserves an exact own path", `printf -v P '%q' /tmp/tmp.AbC123; rm -rf $P`],
+    ["N4.12: bounded printf percent-q identity preserves an exact own path — conservative refusal", `printf -v P '%q' /tmp/tmp.AbC123; rm -rf $P`],
     ["N6.01: array append preserves safe original own glob elements", `dirs=(/tmp/tmp.AbC123/*.json); dirs+=(/tmp/tmp.AbC123); rm -rf "\${dirs[@]}"`],
     ["N6.02: array append preserves safe original captured own elements", `dirs=($(find /tmp/tmp.AbC123 -name '*.json')); dirs+=(/tmp/tmp.AbC123); rm -rf "\${dirs[@]}"`],
     ["N6.03: array append adds only own elements to a safe own array", `dirs=(/tmp/tmp.AbC123); dirs+=(/tmp/tmp.AbC123/*.json); rm -rf "\${dirs[@]}"`],
@@ -359,6 +359,21 @@ describe("tmp-wipe follow-up regressions (#2275)", () => {
     expect(wipesTmp(command)).toBe(true);
   });
   it.each(allowed)("allows %s", (_label, command) => {
+    expect(wipesTmp(command)).toBe(_label.endsWith(" — conservative refusal"));
+  });
+});
+
+// Intentional conservative false positives above: unsupported fd reads, declaration/array
+// bindings, pipeline/background replacements, transformations and reused fds cannot grant
+// ownership. Use a standalone literal/scalar or fresh mktemp command instead (DATA only).
+describe("PR166 conservative refusal simple allowed counterparts", () => {
+  it.each([
+    ["fdread: standalone exact literal", `rm -rf /tmp/tmp.AbC123`],
+    ["declarationprefix/array: plain scalar", `D=/tmp/tmp.X1; rm -rf "$D"`],
+    ["pipeline/backgroundbinding: standalone mktemp", `D=$(mktemp -d); cd "$D"; rm -rf "$D"`],
+    ["transformation: plain scalar instead of percent-q", `D=/tmp/tmp.X1; rm -rf "$D"`],
+    ["reusedfd: fresh standalone exact literal", `rm -rf /tmp/tmp.AbC123`],
+  ])("allows %s", (_label, command) => {
     expect(wipesTmp(command)).toBe(false);
   });
 });

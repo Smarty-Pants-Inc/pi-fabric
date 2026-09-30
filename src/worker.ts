@@ -81,6 +81,13 @@ const loadWorkerRecovery = async (): Promise<WorkerRecoveryModule> => {
   return import(sourceModulePath) as Promise<WorkerRecoveryModule>;
 };
 
+type WorkerToolCallStreamGuardModule = typeof import("./worker/tool-call-stream-guard.js");
+const loadToolCallStreamGuard = async (): Promise<WorkerToolCallStreamGuardModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/tool-call-stream-guard.js");
+  const sourceModulePath = "./worker/tool-call-stream-guard.ts";
+  return import(sourceModulePath) as Promise<WorkerToolCallStreamGuardModule>;
+};
+
 type AgentResultModule = typeof import("./agents/result.js");
 
 const loadAgentResult = async (): Promise<AgentResultModule> => {
@@ -242,7 +249,7 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -251,6 +258,7 @@ const main = async (): Promise<void> => {
     loadWorkerEventProjection(),
     loadWorkerRecovery(),
     loadWorkerRunLog(),
+    loadToolCallStreamGuard(),
   ]);
   runRecordHelpers = loadedRunRecordHelpers;
   const {
@@ -519,8 +527,22 @@ const main = async (): Promise<void> => {
   let killTimer: NodeJS.Timeout | undefined;
   let closeTimer: NodeJS.Timeout | undefined;
   const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error));
+  const toolCallStreamGuard = new ToolCallStreamGuard((error) => {
+    if (terminalStatus) return;
+    terminalStatus = "failed";
+    terminalError = error.message;
+    record.error = error.message;
+    record.errorCode = error.code;
+    update();
+    appendLog(`${JSON.stringify({ type: "fabric_runaway_error", errorCode: error.code,
+      error: error.message, model: error.model, effort: error.effort, bytes: error.bytes,
+      elapsedMs: error.elapsedMs, contentIndex: error.contentIndex })}\n`);
+    process.stderr.write(`${error.name}: ${error.message}\n`);
+    killChild();
+  }, () => ({ model: record.model ?? "unknown", effort: record.thinking ?? "unknown" }));
   const killChild = (): void => {
     recoveryWatchdog.dispose();
+    toolCallStreamGuard.dispose();
     if (closeTimer) clearTimeout(closeTimer);
     terminateChild(child, "SIGTERM");
     killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
@@ -991,6 +1013,10 @@ const main = async (): Promise<void> => {
         modelControl.observeAssistant(message as Record<string, unknown>);
       }
     }
+    if (!terminalStatus) {
+      toolCallStreamGuard.observe(event);
+      if (terminalStatus) return;
+    }
     if (event.type === "message_update" && !terminalStatus) {
       const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
       if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
@@ -1286,6 +1312,7 @@ const main = async (): Promise<void> => {
   let oversized: { chars: number; prefix: string } | undefined;
   let oversizedCount = 0;
   const startOversizedEvent = (text: string): void => {
+    toolCallStreamGuard.discardedEvent();
     oversized = { chars: text.length, prefix: text.slice(0, MAX_EVENT_LINE_CHARS) };
   };
   const finishOversizedEvent = (): void => {
@@ -1405,6 +1432,7 @@ const main = async (): Promise<void> => {
   if (killTimer) clearTimeout(killTimer);
   if (closeTimer) clearTimeout(closeTimer);
   recoveryWatchdog.dispose();
+  toolCallStreamGuard.dispose();
   if (options.runner === "pi" && !modelControl.ready && !terminalStatus) {
     terminalStatus = "failed";
     terminalError = `Child Pi exited before requested model admission completed; task was not sent${stderr.trim() ? `: ${stderr.trim()}` : ""}`;

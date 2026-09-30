@@ -243,6 +243,8 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   /** Resolved Fabric kernel, absent for non-Fabric runners. */
   kernel?: FabricKernel;
   id: string;

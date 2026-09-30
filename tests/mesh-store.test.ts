@@ -584,8 +584,8 @@ describe("MeshStore lock recovery", () => {
 
   it("a stalled initializer cannot overwrite a live successor after legacy stale recovery", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
-    const store = createStore({ lockTimeoutMs: 100 });
-    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100 });
+    const store = createStore({ lockTimeoutMs: 100, lockProtocol: 2 });
+    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100, lockProtocol: 2 });
     const lock = path.join(store.root, ".lock");
     const ownerPath = path.join(lock, "owner");
     const write = fs.writeFileSync.bind(fs);
@@ -624,8 +624,8 @@ describe("MeshStore lock recovery", () => {
 
   it("a stalled initialized publication refuses a nonempty live successor", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
-    const store = createStore({ lockTimeoutMs: 100 });
-    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100 });
+    const store = createStore({ lockTimeoutMs: 100, lockProtocol: 2 });
+    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100, lockProtocol: 2 });
     const lock = path.join(store.root, ".lock");
     const ownerPath = path.join(lock, "owner");
     const rename = fs.renameSync.bind(fs);
@@ -661,8 +661,8 @@ describe("MeshStore lock recovery", () => {
 
   it("interrupted release never exposes an ownerless canonical or cleans a live successor on resume", async () => {
     vi.useFakeTimers({ now: 1_000_000 });
-    const store = createStore({ lockTimeoutMs: 100 });
-    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100 });
+    const store = createStore({ lockTimeoutMs: 100, lockProtocol: 2 });
+    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100, lockProtocol: 2 });
     const lock = path.join(store.root, ".lock");
     const ownerPath = path.join(lock, "owner");
     const remove = fs.rmSync.bind(fs);
@@ -819,7 +819,7 @@ describe("MeshStore lock recovery", () => {
   });
 
   it.skipIf(process.platform !== "linux")("publishes Linux start time and distinguishes a reused PID from its live incarnation", async () => {
-    const store = createStore();
+    const store = createStore({ lockProtocol: 2 });
     const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
     const startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]!;
     await store.exclusive(() => {

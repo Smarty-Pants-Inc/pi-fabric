@@ -13,6 +13,9 @@ export const AUTO_RELOAD_OPT_OUT_ENV = "PI_FABRIC_NO_AUTO_RELOAD";
 export const SELF_RELOAD_COMMAND = "fabric-release-reload";
 export const RELOADED_TOPIC = "ops.fabric.reloaded";
 export const SELF_RELOAD_STATUS = "fabric-reload";
+export const RELOAD_HELD_TOPIC = "ops.fabric.reload_held";
+/** A reload held this long by background work is reported once per target (smarty-dev#2216). */
+export const RELOAD_HELD_NOTICE_MS = 10 * 60_000;
 const PACKAGE_NAME = "pi-fabric";
 const RETRY_MS = 5_000;
 
@@ -146,6 +149,12 @@ export interface SelfReloadDeps {
   autoReloadConfigured(): boolean;
   moduleUrl: string;
   settingsPath?: string;
+  /** Best-effort mesh publish of RELOAD_HELD_TOPIC; the runtime skips it when the mesh is off. */
+  publishHeld?(data: { reason: string; heldForMs: number; target: string }): void;
+  /** Test override of RELOAD_HELD_NOTICE_MS. */
+  heldNoticeMs?: number;
+  /** The user's Escape stop-the-world halt of actors and Jev observers is in force. */
+  halted?(): boolean;
 }
 
 /**
@@ -157,6 +166,24 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
   let watch: ActiveReleaseWatch | undefined;
   let noticed: string | undefined;
   let retry: ReturnType<typeof setInterval> | undefined;
+  let held: { target: string; since: number; reported: boolean } | undefined;
+  // An explicit stop (Escape, a failed run) holds the automatic reload until the user speaks again:
+  // a reload would re-arm the halted actors and the inbox wake (review/astra on pi-fabric#158).
+  let stopped = false;
+  const userHalted = (): boolean => stopped || (deps.halted?.() ?? false);
+  /** An unbounded job (a dev server, tail -f) can hold the reload forever: say so once. */
+  const noteHeld = (context: ExtensionContext, target: string, busy: number): void => {
+    const now = Date.now();
+    if (held?.target !== target) held = { target, since: now, reported: false };
+    const heldForMs = now - held.since;
+    if (held.reported || heldForMs < (deps.heldNoticeMs ?? RELOAD_HELD_NOTICE_MS)) return;
+    held.reported = true;
+    const reason = `${busy} task agent(s), actor run(s), shell job(s) or Jev run(s) still running`;
+    if (context.hasUI) {
+      context.ui.notify(`Fabric reload to ${releaseLabel(target)} held ${Math.round(heldForMs / 60_000)} min: ${reason} (stop them or /reload)`, "warning");
+    }
+    deps.publishHeld?.({ reason, heldForMs, target });
+  };
   // Pi keeps isIdle() true while a prompt is in preflight and while agent_settled handlers run; a
   // reload then would pull the runner out from under that prompt (review/astra on pi-fabric#158).
   // Pi runs this extension command before it marks a preflight, so the command's own prompt does not count.
@@ -173,7 +200,10 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     const target = watch?.check();
     if (!target || autoReloadOptedOut(deps.autoReloadConfigured())) return true;
     if (attemptedSelfReload(context.sessionManager.getSessionId(), target)) return true;
-    if (deps.busy() > 0 || context.hasPendingMessages()) return false;
+    if (userHalted()) return true; // the user's next input settles a run that re-checks
+    const busy = deps.busy();
+    if (busy > 0) noteHeld(context, target, busy);
+    if (busy > 0 || context.hasPendingMessages()) return false;
     pi.sendUserMessage(`/${SELF_RELOAD_COMMAND} auto`, { expandPromptTemplates: true });
     return true;
   };
@@ -187,8 +217,10 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     }
   });
 
-  pi.on("agent_settled", (_event, context) => {
+  pi.on("agent_settled", (event, context) => {
     stopRetry();
+    const outcome = (event as { outcome?: string }).outcome;
+    if (outcome === "aborted" || outcome === "error") stopped = true;
     // Pi defers a prompt sent while agent_settled handlers run until they finish.
     if (!request(context)) armRetry(context);
   });
@@ -213,7 +245,9 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
 
   pi.on("session_shutdown", () => stopRetry());
   let statusShown = false;
-  pi.on("input", (_event, context) => {
+  pi.on("input", (event, context) => {
+    // Only the user resumes: an extension's own prompt (Fabric's inbox follow-up) does not.
+    if ((event as { source?: string }).source !== "extension") stopped = false;
     if (!statusShown) return;
     statusShown = false;
     if (context.hasUI) context.ui.setStatus(SELF_RELOAD_STATUS, undefined);
@@ -226,6 +260,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       const target = watch?.check();
       const say = (message: string) => { if (!auto && context.hasUI) context.ui.notify(message, "info"); };
       if (!watch || !target) return say("No newer Fabric release is active.");
+      if (auto && userHalted()) return;
       if (!safe(context)) {
         // A run that started after the settle can end with no Main turn: keep checking (round 2 note).
         if (auto) armRetry(context);
@@ -246,6 +281,8 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     sessionStart(reason: string, context: ExtensionContext): { old: string; new: string } | undefined {
       stopRetry();
       noticed = undefined;
+      held = undefined;
+      stopped = false;
       const loaded = loadedFabricRoot(deps.moduleUrl);
       if (!loaded || !selfReloadEligible(context.mode)) {
         watch = undefined;

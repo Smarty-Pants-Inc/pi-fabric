@@ -22,6 +22,7 @@ import {
   type ResidentHostOwner,
 } from "../src/residency/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { launchLog, same, startedAtMs } from "./helpers/owned-processes.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
@@ -341,6 +342,271 @@ describe("durable completion receipts", () => {
       await client.close();
       await state.participants.close();
     }
+  });
+
+  // smarty-dev#2236: one text reply from a resident actor (lucky-asc-router on gpt-6-sol, run
+  // 5b660655: one run, one outgoing message, one fabric.actor.output) reached Main twice, 1.5 s
+  // apart, because the client delivered a record before deleting it: any drain that saw the record
+  // again delivered it again. A record is delivered only by the drainer that claims it.
+  describe("a resident actor's delivery record", () => {
+    const actorReply = async (state: RootHarness, policy: { delivery: "steer" | "followUp"; triggerTurn: boolean } = { delivery: "followUp", triggerTurn: true }) => {
+      const id = "sol-text-reply";
+      const key = `${residentDeliveryPrefix(state.identity.id)}${id}`;
+      await state.mesh.put({
+        key, identity: { id: residentHostId(state.identity.id), name: "resident", kind: "main" }, ifVersion: 0,
+        value: {
+          format: RESIDENT_HOST_FORMAT, id, rootId: state.identity.id,
+          from: { id: "a50e8177eef74cf3a5adb16c068961f7", name: "lucky-asc-router", kind: "actor" },
+          ...policy, message: "asc-router: <redacted one-line relay>", createdAt: 1,
+        },
+      });
+      return key;
+    };
+
+    // A real Main whose Pi only queues what it is sent (prompt preflight, a settle): nothing is in
+    // the session until the test appends it. Review round 2 on pi-fabric#160 (finding 1, S1).
+    type Sent = { message: { details: Record<string, any> }; options?: { deliverAs?: string; triggerTurn?: boolean } | undefined };
+    const realMain = async (state: RootHarness, entries: unknown[], modules?: { MainAgentController: typeof import("../src/main-agent.js").MainAgentController }, idle = true) => {
+      const { MainAgentController } = modules ?? await import("../src/main-agent.js");
+      const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => void>>();
+      const sent: Sent[] = [];
+      const pi = {
+        on: (name: string, fn: (event: unknown, ctx: unknown) => void) => { handlers.set(name, [...(handlers.get(name) ?? []), fn]); },
+        sendMessage: (message: Sent["message"], options: Sent["options"]) => { sent.push({ message, options }); },
+        getThinkingLevel: () => "off",
+      };
+      const ctx = { isIdle: () => idle, hasPendingMessages: () => false, signal: { aborted: false }, sessionManager: { getEntries: () => entries } };
+      const main = new MainAgentController(pi as never, state.identity.id, true, repo, state.identity.sessionId);
+      main.attachFollowUpDrain(ctx as never, 60_000, path.join(state.config.meshRoot, "main-followups", "root.json"));
+      const emit = (name: string, event: unknown) => { for (const fn of handlers.get(name) ?? []) fn(event, ctx); };
+      const append = (item: Sent) => entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: item.message.details });
+      return { main, sent, emit, append };
+    };
+    const settle = { outcome: "completed", context: { pendingMessages: [] } };
+
+    it("is delivered once when its delete fails after it was read", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-delete-fails");
+      const key = await actorReply(state);
+      const main = await realMain(state, []);
+      const original = state.mesh.delete.bind(state.mesh);
+      let failures = 1;
+      vi.spyOn(state.mesh, "delete").mockImplementation(async (input) => {
+        if (failures-- > 0) throw new Error("Timed out waiting for the Fabric mesh lock");
+        return original(input);
+      });
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      try {
+        client.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(main.sent).toHaveLength(1);
+        expect(main.sent[0]!.message.details.deliveryId).toBe(`resident:${state.identity.id}:sol-text-reply`);
+      } finally {
+        await client.close();
+        await state.participants.close();
+      }
+    });
+
+    it("is delivered once when a second drainer read it before the first deleted it", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-stale-drainer");
+      const key = await actorReply(state);
+      const main = await realMain(state, []);
+      const stale = state.mesh.listAll(residentDeliveryPrefix(state.identity.id));
+      const first = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      // A second store on the same mesh whose recent-parse cache still holds the record.
+      const staleMesh = new MeshStore(state.config.meshRoot, state.meshConfig.maxEventBytes, state.meshConfig.maxReadEvents);
+      vi.spyOn(staleMesh, "listAll").mockImplementation(() => structuredClone(stale));
+      const second = new ResidencyClient({ config: state.config, mesh: staleMesh, participants: state.participants, mainAgent: main.main });
+      try {
+        first.start();
+        await waitFor(() => state.mesh.get(key) === undefined && main.sent.length > 0);
+        await first.close();
+        second.start();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(main.sent).toHaveLength(1);
+      } finally {
+        await first.close();
+        await second.close();
+        await state.participants.close();
+      }
+    });
+
+    // Review round 1 on pi-fabric#160: a Main that dies before it took the reply must find it after
+    // its restart (a delete-first claim lost it).
+    it("survives a Main that dies before taking it, and reaches the restarted Main once", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-main-dies");
+      const key = await actorReply(state);
+      const dying = { ...state.mainAgent, deliverAgent: () => { throw new Error("Main process exited"); } };
+      const before = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: dying });
+      try {
+        before.start();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      } finally {
+        await before.close();
+      }
+      expect(state.mesh.get(key)).toBeDefined();
+      const main = await realMain(state, []);
+      const after = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      try {
+        after.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(main.sent).toHaveLength(1);
+      } finally {
+        await after.close();
+        await state.participants.close();
+      }
+    });
+
+    // Review round 2 on pi-fabric#160: deliverAgent returned while the reply sat only in Pi's
+    // volatile queue behind a prompt preflight; the record was deleted, then Main died.
+    it("is journalled by Main before its record goes, and a restarted Main replays it exactly once", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-preflight-dies");
+      const key = await actorReply(state);
+      const entries: unknown[] = [];
+      const dying = await realMain(state, entries);
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: dying.main });
+      try {
+        client.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+      } finally {
+        await client.close();
+      }
+      expect(dying.sent).toHaveLength(1);                                           // queued in Pi, never in the session
+      // Main dies (no close); a new controller on the same journal and session.
+      const restarted = await realMain(state, entries);
+      restarted.emit("agent_before_settle", settle);
+      expect(restarted.sent.map((item) => item.message.details.id)).toEqual([dying.sent[0]!.message.details.id]);
+      restarted.append(restarted.sent[0]!);
+      restarted.emit("agent_settled", { outcome: "completed" });
+      restarted.emit("agent_before_settle", settle);
+      expect(restarted.sent).toHaveLength(1);
+      await state.participants.close();
+    });
+
+    // Review round 2 on pi-fabric#160: a module-local set of delivered ids does not survive a
+    // release reload, which loads a fresh copy of every module.
+    it("is not delivered twice after a failed delete and a release reload", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-release-reload");
+      const key = await actorReply(state);
+      const entries: unknown[] = [];
+      const old = await realMain(state, entries);
+      const original = state.mesh.delete.bind(state.mesh);
+      const failing = vi.spyOn(state.mesh, "delete").mockRejectedValue(new Error("Timed out waiting for the Fabric mesh lock"));
+      const before = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: old.main });
+      try {
+        before.start();
+        await waitFor(() => old.sent.length > 0 && failing.mock.calls.length > 0);
+      } finally {
+        await before.close();
+      }
+      old.append(old.sent[0]!);                                                     // the session holds it
+      old.emit("agent_settled", { outcome: "completed" });
+      failing.mockImplementation(original);
+      vi.resetModules();                                                            // a new release generation
+      const [{ ResidencyClient: FreshClient }, freshMain] = await Promise.all([
+        import("../src/residency/client.js"),
+        import("../src/main-agent.js"),
+      ]);
+      const fresh = await realMain(state, entries, freshMain);
+      const after = new FreshClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: fresh.main });
+      try {
+        after.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(fresh.sent).toHaveLength(0);
+      } finally {
+        await after.close();
+        await state.participants.close();
+      }
+    });
+
+    // Security round 3 on pi-fabric#160 (S2): a passive reply (a non-triggering followUp; a nextTurn
+    // delivery reaches Main as one, src/residency/host.ts) keeps its policy across a restart and a
+    // release reload: appended once, triggerTurn false, and no Main turn of its own.
+    it("keeps a passive reply passive when a restarted, reloaded Main replays it", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-passive-replay");
+      const key = await actorReply(state, { delivery: "followUp", triggerTurn: false });
+      const entries: unknown[] = [];
+      const dying = await realMain(state, entries, undefined, false);             // Main is streaming
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: dying.main });
+      try {
+        client.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+      } finally {
+        await client.close();
+      }
+      expect(dying.sent.map((item) => item.options)).toEqual([{ deliverAs: "followUp", triggerTurn: false }]);
+      // Main dies before Pi appends it; the restart loads a new release generation.
+      vi.resetModules();
+      const fresh = await realMain(state, entries, await import("../src/main-agent.js"), false);
+      fresh.emit("agent_before_settle", settle);
+      expect(fresh.sent.map((item) => item.message.details.id)).toEqual([dying.sent[0]!.message.details.id]);
+      expect(fresh.sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: false });
+      expect(fresh.sent[0]!.message.details.triggerTurn).toBe(false);
+      fresh.append(fresh.sent[0]!);
+      fresh.emit("agent_settled", { outcome: "completed" });
+      fresh.emit("agent_before_settle", settle);
+      expect(fresh.sent).toHaveLength(1);                                           // once, no triggering release
+      expect(fs.existsSync(path.join(state.config.meshRoot, "main-followups", "root.json"))).toBe(false);
+      await state.participants.close();
+    });
+
+    // Astra round 3 finding 2 on pi-fabric#160: shutdown closes Main's journal first; a drain in
+    // that window must keep the record, and the next Main gets it once.
+    it("is kept when Main's journal is already closed, and the next Main takes it once", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-journal-closed");
+      const key = await actorReply(state);
+      const closing = await realMain(state, []);
+      closing.main.closeFollowUpDrain();
+      const during = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: closing.main });
+      try {
+        during.start();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      } finally {
+        await during.close();
+      }
+      expect(closing.sent).toHaveLength(0);
+      expect(state.mesh.get(key)).toBeDefined();
+      const next = await realMain(state, []);
+      const after = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: next.main });
+      try {
+        after.start();
+        await waitFor(() => state.mesh.get(key) === undefined);
+        expect(next.sent).toHaveLength(1);
+      } finally {
+        await after.close();
+        await state.participants.close();
+      }
+    });
+
+    it("is kept for a later drain when Main refuses it", { timeout: 30_000 }, async () => {
+      const state = await rootHarness("delivery-refused");
+      const key = await actorReply(state);
+      const main = await realMain(state, []);
+      const deliver = main.main.deliverAgent.bind(main.main);
+      let refusals = 1;
+      let keptAtRefusal = false;
+      vi.spyOn(main.main, "deliverAgent").mockImplementation((request) => {
+        // Review round 1 on pi-fabric#160: until Main took it, the record is the only copy.
+        if (refusals-- > 0) {
+          keptAtRefusal = state.mesh.get(key) !== undefined;
+          throw new Error("Main's followUp queue is full");
+        }
+        return deliver(request);
+      });
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      try {
+        client.start();
+        await waitFor(() => main.sent.length > 0 && state.mesh.get(key) === undefined);
+        expect(keptAtRefusal).toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(main.sent).toHaveLength(1);
+      } finally {
+        await client.close();
+        await state.participants.close();
+      }
+    });
   });
 
   // review/astra on 3257dba, D1: the durable fallback cleanup keeps a possibly live worker's files.
@@ -671,6 +937,74 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     ) as { actors: Array<{ id: string }> };
     expect(registry.actors.some((candidate) => candidate.id === actor.id)).toBe(false);
     await reconnect.close();
+  });
+
+  // smarty-dev#2184 item 8: a removal waited for the actor's in-flight run and blocked every
+  // later request to the host (clients timed out; a create right after it was dropped).
+  it("returns a removal behind an in-flight run at once and keeps serving requests", { timeout: 60_000 }, async () => {
+    const testStarted = Date.now();
+    const state = await rootHarness("resident-remove-pending");
+    state.config.agents = { ...state.config.agents, timeoutMs: 120_000 };
+    // The resident host and its workers inherit this and record themselves at launch: the worker
+    // to kill is found there, never by a host-wide command-line match (pi-fabric#160 S4).
+    const launches = launchLog(state.root);
+    const savedEnv = Object.fromEntries(Object.keys(launches.env).map((key) => [key, process.env[key]]));
+    Object.assign(process.env, launches.env);
+    const client = new ResidencyClient({
+      config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath,
+    });
+    const control = new FabricControlPlane(state.mesh, state.identity, {
+      enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000,
+    });
+    control.start(() => ({ accepted: false }));
+    try {
+      const request = { name: "hung reviewer", instructions: "Review.", residency: "durable" as const, delivery: "mailbox" as const };
+      const actor = await client.createActor(request);
+      await control.request(client.hostId, actor.id, "followUp", { message: "HANG_WITH_PROGRESS" }, client.hostId);
+      await waitFor(() => state.participants.get(actor.id, undefined, { fresh: true })?.actorRun !== undefined, 30_000);
+      const runId = state.participants.get(actor.id, undefined, { fresh: true })!.actorRun!.id;
+
+      const started = Date.now();
+      const removed = await client.removeActor(actor.id);
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(removed.pending).toContain(`pending behind its in-flight run ${runId}`);
+      expect(client.hostStateNote()).toContain(`removal of hung reviewer (${actor.id}) is pending behind its in-flight run ${runId}`);
+
+      // The queue is free: a same-name create right after the removal succeeds.
+      const successor = await client.createActor(request);
+      expect(successor.id).not.toBe(actor.id);
+
+      // The old run ends (its worker is killed); the removal then finishes and cleans up.
+      // Of the processes this fixture launched, the one started as the worker of this run.
+      const workers = launches.owned().filter(({ argv }) =>
+        argv[0] === fakeWorker && argv[argv.indexOf("--id") + 1] === runId);
+      expect(workers).toHaveLength(1);
+      const worker = workers[0]!;
+      expect(startedAtMs(worker.started)).toBeGreaterThanOrEqual(testStarted - 1_000);
+      // Revalidated just before the signal: the pid still names the recorded process.
+      expect(same(worker)).toBe(true);
+      process.kill(worker.pid, "SIGKILL");
+      const registryIds = (): string[] => [state.config.actorRoot, state.config.sessionActorRoot!].flatMap((root) => {
+        try {
+          return (JSON.parse(fs.readFileSync(path.join(root, "actors.json"), "utf8")) as { actors: Array<{ id: string }> })
+            .actors.map((entry) => entry.id);
+        } catch { return []; }
+      });
+      expect(registryIds()).toContain(actor.id);
+      await waitFor(() => !registryIds().includes(actor.id), 30_000);
+      expect(registryIds()).toContain(successor.id);
+      await waitFor(() => client.hostStateNote() === "", 5_000);
+      await client.removeActor(successor.id);
+    } finally {
+      await control.close();
+      await client.close();
+      await stopResident(state.config);
+      await state.participants.close();
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   it("queues passive actor delivery until Main resumes", { timeout: 45_000 }, async () => {

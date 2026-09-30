@@ -15,6 +15,23 @@ describe("self-reload busy gate (smarty-dev#2160)", () => {
       expect(runtime.backgroundWorkCount()).toBe(0);
     } finally { await runtime.shutdown(); }
   });
+
+  it("counts a finished job until its completion event is sent (smarty-dev#2216)", async () => {
+    const runtime = new FabricRuntimeState({} as ExtensionAPI, new CapturedToolCatalog());
+    try {
+      const job = runtime.shellJobs.begin("bash", "npm test");
+      job.spill();
+      const events: string[] = [];
+      runtime.shellJobs.subscribe(event => events.push(event.type));
+      const finishing = job.finish(0); // sets finished, then awaits before it sends the event
+      expect(job.finished).toBe(true);
+      expect(events).not.toContain("finished");
+      expect(runtime.backgroundWorkCount()).toBe(1);
+      await finishing;
+      expect(events).toContain("finished");
+      expect(runtime.backgroundWorkCount()).toBe(0);
+    } finally { await runtime.shutdown(); }
+  });
 });
 
 describe("shell store runtime reinitialization", () => {

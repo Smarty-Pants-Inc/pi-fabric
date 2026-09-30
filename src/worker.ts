@@ -284,16 +284,17 @@ const main = async (): Promise<void> => {
   const task = fs.readFileSync(options.taskFile, "utf8");
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
-  writeRunRecord(options.statusFile, record);
   // Append, never overwrite: retries have distinct workers/runners, and a dead host may
-  // leave any attempt detached. Publish the worker before launching its runner.
+  // leave any attempt detached. Register this attempt before publishing runnable status.
   const workerIdentity = readProcessIdentity();
   const processJournal = path.join(path.dirname(options.statusFile), "worker-processes.jsonl");
   const recordProcesses = (runner?: unknown): void => {
-    fs.appendFileSync(processJournal, JSON.stringify({ worker: workerIdentity ?? null,
+    fs.appendFileSync(processJournal, JSON.stringify({
+      ...(options.launchAttempt ? { attempt: options.launchAttempt } : {}), worker: workerIdentity ?? null,
       ...(runner === undefined ? {} : { runner }) }) + "\n", { encoding: "utf8", mode: 0o600 });
   };
-  recordProcesses();
+  recordProcesses(); // incomplete runner evidence is already durable before spawnCli below
+  writeRunRecord(options.statusFile, record);
   const emitLifecycle = (
     event: string,
     data?: Record<string, unknown>,

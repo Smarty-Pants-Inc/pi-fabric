@@ -4,11 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import * as processIdentity from "../src/core/process-identity.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import type { FabricActorMessage } from "../src/actors/types.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -33,8 +35,8 @@ const context = { cwd: process.cwd(), update() {} } as unknown as FabricInvocati
 const kernelId = () => `${fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim()}/${fs.readlinkSync("/proc/self/ns/pid")}`;
 
 // Real disposable processes: every signal is fenced by the fixture's recorded start time.
-const child = async () => {
-  const proc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+const child = async (script = "setInterval(() => {}, 1000)") => {
+  const proc = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "ignore", "ignore", "ipc"], detached: true });
   await new Promise<void>((resolve, reject) => { proc.once("spawn", resolve); proc.once("error", reject); });
   const pid = proc.pid!;
   const owned: Owned = { pid, started: startTime(pid), at: Date.now(), argv: [] };
@@ -43,17 +45,17 @@ const child = async () => {
   cleanups.push(async () => { if (await stopOwned(owned, 1_000, 1_000)) throw new Error(`Fixture process ${pid} did not stop`); await exited; });
   return { proc, owned, identity, exited };
 };
-const dead = async (process: Awaited<ReturnType<typeof child>>) => {
+const dead = async (process: Pick<Awaited<ReturnType<typeof child>>, "owned" | "exited">) => {
   await stopOwned(process.owned, 1_000, 1_000);
   await process.exited;
 };
 
-const fixture = async (options: { liveMain?: boolean; project?: string; agentName?: string; role?: string; mismatchHost?: boolean; noIdentity?: boolean; realHost?: boolean; sessionRegistry?: boolean; sharedRuntime?: boolean } = {}) => {
+const fixture = async (options: { liveMain?: boolean; project?: string; agentName?: string; role?: string; mismatchHost?: boolean; noIdentity?: boolean; realHost?: boolean; sessionRegistry?: boolean; sharedRuntime?: boolean; fakeProcesses?: boolean } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-successor-"));
   cleanups.push(async () => fs.rmSync(root, { recursive: true, force: true }));
-  const main = await child();
-  const host = await child();
-  if (!options.liveMain) await dead(main);
+  const main = options.fakeProcesses ? fakeChild() : await child();
+  const host = options.fakeProcesses ? fakeChild() : await child();
+  if (!options.liveMain && !options.fakeProcesses) await dead(main);
   const project = fs.realpathSync(process.cwd());
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };
@@ -67,7 +69,8 @@ const fixture = async (options: { liveMain?: boolean; project?: string; agentNam
     processIdentity, status: "idle", runner: "pi", transport: "host", capabilities: ["fabric"],
     sessionId: id.slice(8), startedAt: 1, updatedAt: 1, controlProtocol: "v1", local: id === identity.id, stale: id !== identity.id,
   } as FabricParticipantInfo);
-  const caller = rootRecord(identity.id, { pid: process.pid, startTime: startTime(process.pid), kernelId: kernelId(), commandLine: fs.readFileSync(`/proc/${process.pid}/cmdline`, "utf8") });
+  const caller = rootRecord(identity.id, options.fakeProcesses ? { ...fakeChild().identity, pid: process.pid } :
+    { pid: process.pid, startTime: startTime(process.pid), kernelId: kernelId(), commandLine: fs.readFileSync(`/proc/${process.pid}/cmdline`, "utf8") });
   const predecessor = { ...rootRecord(oldId, main.identity), project: options.project ?? project,
     agentName: options.agentName ?? "knowledge-lead", role: options.role ?? "project-agent" };
   const participants: FabricParticipantSource = {
@@ -131,6 +134,14 @@ const runEvidence = (root: string, id: string, worker: Awaited<ReturnType<typeof
   fs.writeFileSync(path.join(dir, "worker-processes.jsonl"), JSON.stringify({ worker }) + "\n" + JSON.stringify({ worker, runner }) + "\n");
   return dir;
 };
+// Portable authority fakes: only native-Main admission and predecessor host death are
+// supplied by a test. Worker settlement still reads the actual injected platform semantics.
+let fakePid = 2147483600;
+const fakeChild = () => {
+  const pid = fakePid++;
+  const identity = { pid, startTime: "1", kernelId: "00000000-0000-0000-0000-000000000000/pid:[123]", commandLine: "fixture\0" };
+  return { proc: { pid }, identity, owned: { pid, started: "1", at: 1, argv: [] }, exited: Promise.resolve() };
+};
 describe.skipIf(process.platform !== "linux")("dead predecessor durable removal (#2386)", () => {
   it("does not load successor safety machinery on provider import, construction or idle", async () => {
     await fixture();
@@ -168,6 +179,79 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
     expect(fs.existsSync(path.join(f.actorRoot, f.actor.id))).toBe(false);
     expect(f.mesh.get(`actor-removals/${f.actor.id}`)?.updatedBy.id).toBe(f.identity.id);
     write.mockRestore();
+  });
+  it.each(["worker", "runner"])("keeps removal pending after a replacement %s spawn crashes before process registration", async kind => {
+    const f = await fixture();
+    await dead(f.host);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true, sessionExport: false },
+      { runRoot: path.join(f.oldDir, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs") });
+    cleanups.push(() => manager.close());
+    let spawned: Awaited<ReturnType<typeof child>> | undefined;
+    let dir = "";
+    let attempt = "";
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      dir = path.dirname(request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!);
+      attempt = request.workerArguments[request.workerArguments.indexOf("--launch-attempt") + 1]!;
+      // This is the adapter's entry, BEFORE its actual spawn. The manager intent is durable.
+      expect(JSON.parse(fs.readFileSync(path.join(dir, "worker-launches.jsonl"), "utf8").trim())).toEqual({ attempt });
+      runEvidence(path.dirname(dir), path.basename(dir), f.main.identity); // complete earlier attempt
+      if (kind === "runner") fs.appendFileSync(path.join(dir, "worker-processes.jsonl"),
+        JSON.stringify({ attempt, worker: f.main.identity }) + "\n"); // new worker registered; runner not yet
+      spawned = await child();
+      // Crash point: runnable replacement exists, but its post-spawn identity was never appended.
+      fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ id: request.id, actorId: f.actor.id,
+        name: request.name, task: "replacement crash injection", status: "running", runner: "pi", transport: "process",
+        cwd: request.cwd, startedAt: Date.now(), updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "", exitCode: null,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
+      return { kind: "process", sessionId: String(spawned.identity.pid),
+        isAlive: async () => processIdentity.processStartIdentityState(spawned!.identity) === "alive",
+        stop: async () => dead(spawned!) };
+    });
+    try {
+      await manager.spawn({ task: "replacement crash injection", transport: "process", extensions: false });
+    } finally { launch.mockRestore(); }
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const signal = vi.spyOn(process, "kill");
+    try {
+      expect(await f.remove()).toMatchObject({ removed: false, pending: expect.stringContaining(
+        kind === "worker" ? "Unregistered worker launch attempt" : "Missing runner launch evidence") });
+      expect(write).not.toHaveBeenCalled();
+      expect(signal).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(f.actorRoot, f.actor.id))).toBe(true);
+      expect(fs.existsSync(path.join(dir, "worker-launches.jsonl"))).toBe(true);
+      expect(new ActorRegistryStore(f.actorRoot).records()[0]?.rootId).toBe(f.oldId);
+      expect(f.mesh.get(`actor-removals/${f.actor.id}`)).toBeUndefined();
+      expect(processIdentity.processStartIdentityState(spawned!.identity)).toBe("alive");
+    } finally { write.mockRestore(); signal.mockRestore(); }
+    await manager.close(); // stop only the owned child; missing launch evidence still fails closed
+    expect(await f.remove()).toMatchObject({ removed: false, pending: expect.stringContaining("Removal unaccepted") });
+  });
+  it("keeps removal pending when a live runner rewrites its process title until that runner exits", async () => {
+    const f = await fixture();
+    await dead(f.host);
+    const runner = await child("process.on('message', () => { process.title = 'rewritten-runner'; process.send('rewritten'); }); setInterval(() => {}, 1000)");
+    runEvidence(path.join(f.oldDir, "runs"), "title-run", f.main.identity, runner.identity);
+    const rewritten = new Promise<void>(resolve => runner.proc.once("message", () => resolve()));
+    runner.proc.send("rewrite");
+    await rewritten;
+    expect(startTime(runner.identity.pid)).toBe(runner.identity.startTime);
+    expect(fs.readFileSync(`/proc/${runner.identity.pid}/cmdline`, "utf8")).not.toBe(runner.identity.commandLine);
+    expect(processIdentity.processIdentityState(runner.identity)).toBe("mismatch"); // still unsafe to signal
+    expect(processIdentity.processStartIdentityState(runner.identity)).toBe("alive");
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const signal = vi.spyOn(process, "kill");
+    try {
+      expect(await f.remove()).toMatchObject({ removed: false, pending: expect.stringContaining("is alive; settlement not proven") });
+      expect(write).not.toHaveBeenCalled();
+      expect(signal).not.toHaveBeenCalled();
+      expect(new ActorRegistryStore(f.actorRoot).records()[0]?.rootId).toBe(f.oldId);
+      expect(fs.existsSync(path.join(f.actorRoot, f.actor.id))).toBe(true);
+      expect(fs.existsSync(path.join(f.oldDir, "runs", "title-run", "worker-processes.jsonl"))).toBe(true);
+      expect(f.mesh.get(`actor-removals/${f.actor.id}`)).toBeUndefined();
+    } finally { write.mockRestore(); signal.mockRestore(); }
+    await dead(runner);
+    await expect(f.remove()).resolves.toEqual({ removed: true });
+    expect(fs.existsSync(path.join(f.actorRoot, f.actor.id))).toBe(false);
   });
   it("checks retained actor runs and recursively nested runners even when their parent process is dead", async () => {
     const f = await fixture();
@@ -533,5 +617,37 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
     const f = await fixture({ noIdentity: true });
     await expect(f.remove()).rejects.toThrow("recorded Main process identity");
     expect(startTime(f.host.proc.pid!)).toBe(f.host.identity.startTime);
+  });
+});
+
+describe.each(["win32", "darwin"] as const)("%s successor unknown worker evidence", platformName => {
+  it.each(["null journal", "unknown kernel"])("keeps %s removal pending without accepting or deleting", async kind => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: platformName });
+    const kernelState = processIdentity.processStartIdentityState;
+    const f = await fixture({ fakeProcesses: true });
+    const caller = f.residency.options.participants.self()!.processIdentity!;
+    const current = vi.spyOn(processIdentity, "readProcessStartIdentity").mockReturnValue(caller);
+    const mainState = vi.spyOn(processIdentity, "processStartIdentityState").mockImplementation(expected =>
+      expected.pid === f.main.identity.pid ? "dead" : kernelState(expected));
+    const hostState = vi.spyOn(processIdentity, "processIdentityState").mockImplementation(expected =>
+      expected.pid === f.host.identity.pid ? "dead" : "unknown");
+    const dir = runEvidence(path.join(f.oldDir, "runs"), "unknown-run", fakeChild().identity);
+    if (kind === "null journal") fs.writeFileSync(path.join(dir, "worker-processes.jsonl"), '{"worker":null}\n{"worker":null,"runner":null}\n');
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const signal = vi.spyOn(process, "kill");
+    try {
+      expect(await f.remove()).toMatchObject({ removed: false, pending: expect.stringContaining(
+        kind === "null journal" ? "Missing worker/runner process identity" : "is unknown; settlement not proven") });
+      expect(write).not.toHaveBeenCalled();
+      expect(signal).not.toHaveBeenCalled();
+      expect(new ActorRegistryStore(f.actorRoot).records()[0]?.rootId).toBe(f.oldId);
+      expect(fs.existsSync(path.join(f.actorRoot, f.actor.id))).toBe(true);
+      expect(fs.existsSync(dir)).toBe(true);
+      expect(f.mesh.get(`actor-removals/${f.actor.id}`)).toBeUndefined();
+    } finally {
+      signal.mockRestore(); write.mockRestore(); current.mockRestore(); mainState.mockRestore(); hostState.mockRestore();
+      Object.defineProperty(process, "platform", platform);
+    }
   });
 });

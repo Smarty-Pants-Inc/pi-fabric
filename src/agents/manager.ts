@@ -82,7 +82,7 @@ import {
   removeEmptyRunRoot,
   type TempRunSweepRequest,
 } from "../storage/retention.js";
-import { hasUnsettledRecordedProcesses } from "../storage/worker-settlement.js";
+import { hasUnsettledRecordedProcesses, recordWorkerLaunchAttempt } from "../storage/worker-settlement.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 import { effectiveAgentNice, parseAgentNice } from "./priority.js";
 import {
@@ -782,7 +782,16 @@ export class AgentManager {
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     if (this.#closing) throw new Error("Fabric agent manager is closing");
-    const pending = adapter.launch({ ...request, signal: this.#closeAbort.signal });
+    // Fence every transport (including retries) BEFORE it can spawn a detached worker.
+    // A crash after spawn but before worker registration must not reuse an old journal.
+    const statusIndex = request.workerArguments.indexOf("--status-file");
+    const statusFile = request.workerArguments[statusIndex + 1];
+    if (statusIndex < 0 || !statusFile) throw new Error("Missing worker status file for launch evidence");
+    const attempt = randomUUID();
+    recordWorkerLaunchAttempt(path.dirname(statusFile), attempt);
+    const pending = adapter.launch({ ...request,
+      workerArguments: [...request.workerArguments, "--launch-attempt", attempt],
+      signal: this.#closeAbort.signal });
     this.#launches.add(pending);
     try {
       const transport = await pending;

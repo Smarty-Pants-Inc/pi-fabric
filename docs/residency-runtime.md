@@ -106,8 +106,12 @@ work again; an old launcher carrying the dead Main's identity remains fenced.
 A dead resident host does **not** prove its detached activations stopped. Before
 acceptance, Fabric checks every predecessor resident run and the actor's retained
 run records, including every recorded launch attempt and nested worker/runner.
-Each recorded process must be kernel-proven dead or no longer match its recorded
-start time/command line. Missing, malformed, unresolved or unknown evidence returns
+The manager durably journals a unique attempt before invoking any transport that can
+spawn a worker. The worker registers that attempt before publishing status and before
+spawning its runner. Unconfirmed worker or runner spawns cannot be covered by an old
+attempt's complete journal; each pre-spawn attempt needs matching complete evidence.
+Each recorded process must be kernel-proven dead or have a different kernel start
+time. A command-line/title change alone never proves settlement. Missing, malformed, unresolved or unknown evidence returns
 `{ removed: false, pending: "Removal unaccepted: ..." }`; actor files and ownership
 remain intact. Fabric never signals these foreign workers. A later explicit remove
 can complete after they finish. A clean host close saves a durable settlement
@@ -124,7 +128,9 @@ reloads and cleanup retries use the same path. A durable
 
 Process evidence is currently Linux `/proc` evidence bound to the same kernel
 boot and PID namespace. A different host/boot/namespace is unknown, not local
-process death, and is refused. Other platforms and
+process death, and is refused. Ordinary owned cleanup on non-Linux platforms keeps
+its established transport-exit, unresolved-worker and retention checks; unsupported
+process journals do not veto it. Foreign successor settlement still fails closed. Other platforms and
 legacy dead roots without a recorded Main PID/start time are refused, rather
 than guessing a PID from a name or command pattern. New roots record their
 Main PID/start-time identity in participant/config records (without copying

@@ -83,7 +83,11 @@ input.on("line", (line) => {
   if (task.includes("REPORT_FLEET_ROLE")) {
     finishAttempt(
       successMessage(
-        JSON.stringify({ role: process.env.SMARTY_ROLE ?? null, lane: process.env.SMARTY_LANE ?? null }),
+        JSON.stringify({
+          role: process.env.SMARTY_ROLE ?? null,
+          actorName: process.env.PI_FABRIC_ACTOR_NAME ?? null,
+          fabricRole: process.env.PI_FABRIC_ROLE ?? null,
+        }),
       ),
       false,
     );

@@ -1367,7 +1367,7 @@ describe("AgentManager", () => {
     });
   });
 
-  it("marks a process child as a task agent in its parent's lane (smarty-dev#2088)", async () => {
+  it("marks ordinary process children as task agents without replacing actor identity (smarty-dev#2088)", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
@@ -1378,21 +1378,35 @@ describe("AgentManager", () => {
       runRoot: root,
     });
     managers.push(manager);
-    const report = async (): Promise<unknown> => {
-      const result = await manager.run({ task: "REPORT_FLEET_ROLE", transport: "process", timeoutMs: 5_000 });
+    const report = async (actorName?: string): Promise<unknown> => {
+      const result = await manager.run({
+        task: "REPORT_FLEET_ROLE", transport: "process", timeoutMs: 5_000,
+        ...(actorName ? { actorId: "fleet-role-test", actorName } : {}),
+      });
       expect(result.status).toBe("completed");
       return JSON.parse(result.text);
     };
 
     try {
       vi.stubEnv("SMARTY_ROLE", "worktree-agent@abc123");
-      vi.stubEnv("SMARTY_LANE", undefined);
-      expect(await report()).toEqual({ role: "task-agent", lane: "worktree-agent" });
-      vi.stubEnv("SMARTY_LANE", "fabric-v2");
-      expect(await report()).toEqual({ role: "task-agent", lane: "fabric-v2" });
+      vi.stubEnv("PI_FABRIC_ACTOR_NAME", undefined);
+      vi.stubEnv("PI_FABRIC_ROLE", undefined);
+      expect(await report()).toEqual({ role: "task-agent", actorName: null, fabricRole: null });
+      expect(await report("security-review")).toEqual({
+        role: "worktree-agent@abc123", actorName: "security-review", fabricRole: null,
+      });
       vi.stubEnv("SMARTY_ROLE", undefined);
-      vi.stubEnv("SMARTY_LANE", undefined);
-      expect(await report()).toEqual({ role: "task-agent", lane: null });
+      expect(await report()).toEqual({ role: "task-agent", actorName: null, fabricRole: null });
+      expect(await report("security-review")).toEqual({
+        role: null, actorName: "security-review", fabricRole: null,
+      });
+      // These inherited identities are deliberately unchanged: the governor prioritizes actors,
+      // and participantRole prioritizes PI_FABRIC_ROLE over SMARTY_ROLE.
+      vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
+      vi.stubEnv("PI_FABRIC_ROLE", "project-agent");
+      expect(await report()).toEqual({
+        role: "task-agent", actorName: "parent-actor", fabricRole: "project-agent",
+      });
     } finally {
       vi.unstubAllEnvs();
     }

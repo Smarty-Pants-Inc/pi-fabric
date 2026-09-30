@@ -1306,6 +1306,8 @@ export class FabricRuntimeState {
     return Boolean(this.#actors?.halted) || Boolean(this.#jevObservationHost?.halted);
   }
 
+  haltMain(): void { this.#mainAgent?.halt(); }
+
   haltAdvisors(): number {
     const actors = this.#config?.mesh.enabled ? this.#actors?.haltAll().halted ?? 0 : 0;
     return actors + (this.#jevObservationHost?.halt() ?? 0);

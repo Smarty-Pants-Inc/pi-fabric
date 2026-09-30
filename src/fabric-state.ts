@@ -313,6 +313,7 @@ export class FabricState {
   }
   get advisorsHalted(): boolean { return this.#current()?.advisorsHalted ?? false; }
   get escapeHalted(): boolean { return this.#current()?.escapeHalted ?? false; }
+  haltMain(): void { this.#current()?.haltMain(); }
   haltAdvisors(): number { return this.#current()?.haltAdvisors() ?? 0; }
   noteMainActivity(context: ExtensionContext): void { this.#current()?.noteMainActivity(context); }
   dispatchHostEvent(event: FabricActorHostEvent, payload: unknown, context: ExtensionContext): number {

@@ -397,7 +397,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       enabled: () => state.initialized && (state.config.mesh.enabled || state.config.jev.enabled) && state.config.ui.haltOnEscape,
       ownsInput: () => fabricUi.ownsInput,
       // Called only for a recognized lone Escape: latch it even when nothing was left to halt.
-      halted: () => { escapeLatched = true; return state.advisorsHalted; },
+      halted: () => { escapeLatched = true; state.haltMain(); return state.advisorsHalted; },
       halt: () => state.haltAdvisors(),
     });
   };
@@ -1143,11 +1143,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   pi.on("session_shutdown", async (event, context) => {
     stopInboxWake();
+    const reason = event?.reason ?? "exit";
     let stopping = 0;
     try { stopping = state.initialized ? state.agents.runningCount() : 0; } catch { /* not initialized */ }
     if (stopping > 0 && context.hasUI) {
       context.ui.notify(
-        `${event.reason === "reload" ? "Reload" : "Shutdown"} stops ${stopping} running task agent${stopping === 1 ? "" : "s"}; ` +
+        `${reason === "reload" ? "Reload" : "Shutdown"} stops ${stopping} running task agent${stopping === 1 ? "" : "s"}; ` +
           'each spawner gets a stopped result. Spawn with residency: "durable" to keep an agent across reloads.',
         "warning",
       );
@@ -1163,7 +1164,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     directToolApproval.clear();
     toolDisplay.clear();
     try {
-      await state.shutdown(event.reason);
+      await state.shutdown(reason);
     } finally {
       uninstallHaltOnEscape();
       uninstallShellHangKeys();

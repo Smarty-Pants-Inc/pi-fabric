@@ -44,7 +44,7 @@ const fixture = async (filesOnly = false) => {
   await observer.start();
   const entries: any[] = [];
   const sent: Array<{ content: string; details: any; options: any }> = [];
-  const main = (idle = true) => {
+  const main = (idle = true, flushMs = 60_000) => {
     const handlers = new Map<string, Array<(event: any, ctx: ExtensionContext) => void>>();
     const pi = {
       on(name: string, handler: (event: any, ctx: ExtensionContext) => void) {
@@ -59,9 +59,9 @@ const fixture = async (filesOnly = false) => {
     } as unknown as ExtensionAPI;
     const context = { isIdle: () => idle, hasPendingMessages: () => false, sessionManager: { getEntries: () => entries } } as unknown as ExtensionContext;
     const controller = new MainAgentController(pi, identity.id, true, root, sessionId);
-    controller.attachFollowUpDrain(context, 60_000, path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`));
+    controller.attachFollowUpDrain(context, flushMs, path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`));
     cleanup.push(() => controller.closeFollowUpDrain());
-    return { controller, pi, context, emit: (name: string, event: any = {}) => { for (const fn of handlers.get(name) ?? []) fn(event, context); } };
+    return { controller, pi, context, setIdle: (value: boolean) => { idle = value; }, emit: (name: string, event: any = {}) => { for (const fn of handlers.get(name) ?? []) fn(event, context); } };
   };
   const plane = (who: MeshIdentity) => {
     const result = new FabricControlPlane(mesh(), who, { enabled: true, hostId: who.id, pollMs: 20 });
@@ -270,6 +270,174 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     fresh.emit("turn_end", { context: { pendingMessages: [] } });
     expect(f.sent).toHaveLength(1);
     expect(f.sent[0]!.options).toMatchObject({ deliverAs: kind, triggerTurn: false });
+  });
+
+  it.each(["aborted", "error", undefined] as const)("a busy replay cannot wake Main after a %s settle", async (outcome) => {
+    const f = await fixture();
+    const old = f.main();
+    old.controller.prepareReload();
+    const requests = (["steer", "followUp", "nextTurn"] as const).map((delivery) => ({
+      from: sender, message: `halted-${delivery}`, delivery, triggerTurn: true, deliveryId: `halted-${delivery}`,
+    }));
+    const ids = requests.map((request) => old.controller.deliverAgent(request).messageId);
+    old.controller.closeFollowUpDrain();
+    const fresh = f.main(false);
+    if (outcome !== undefined) fresh.emit("agent_before_settle", { outcome, context: { pendingMessages: [] } });
+    fresh.emit("agent_settled", { outcome });
+    expect(f.sent.map((item) => item.options)).toEqual(requests.map(({ delivery }) => ({ deliverAs: delivery, triggerTurn: false })));
+    expect(f.sent.map((item) => item.details.id)).toEqual(ids);
+    for (const request of requests) expect(fresh.controller.deliverAgent(request)).toMatchObject({ duplicate: true });
+    fresh.controller.closeFollowUpDrain();
+    f.main();
+    expect(f.sent).toHaveLength(requests.length);
+  });
+
+  it.each([false, true])("a failed compaction suppresses triggering replay (aborted=%s)", async (aborted) => {
+    const f = await fixture();
+    const old = f.main();
+    old.controller.prepareReload();
+    for (const delivery of ["steer", "followUp"] as const) old.controller.deliverAgent({
+      from: sender, message: `compact-${delivery}`, delivery, deliveryId: `compact-${delivery}`,
+    });
+    old.controller.closeFollowUpDrain();
+    const fresh = f.main(false);
+    fresh.setIdle(true);
+    fresh.emit("session_compact_failed", { reason: "manual", aborted, errorMessage: "failed" });
+    fresh.emit("agent_settled", { outcome: "completed" }); // an unrelated completion cannot lift the owner's stop
+    expect(f.sent.map((item) => item.options)).toEqual(["steer", "followUp"].map((deliverAs) => ({ deliverAs, triggerTurn: false })));
+  });
+
+  it.each([0, 60_000])("a lost direct Pi handoff is reconciled passively at a failed boundary (flushMs=%s)", async (flushMs) => {
+    const f = await fixture();
+    const old = f.main(false, flushMs);
+    const request = { from: sender, message: "lost handoff", delivery: "steer" as const, deliveryId: "lost-handoff" };
+    const first = old.controller.deliverAgent(request);
+    expect(f.sent[0]!.options.triggerTurn).toBe(true);
+    old.controller.closeFollowUpDrain();
+    f.entries.splice(0); // no durable receipt and no surviving Pi queue at the replacement boundary
+    const fresh = f.main(false, flushMs);
+    expect(f.sent).toHaveLength(1);
+    fresh.emit("agent_before_settle", { outcome: "error", context: { pendingMessages: [] } });
+    fresh.emit("agent_settled", { outcome: "error" });
+    expect(f.sent).toHaveLength(2);
+    expect(f.sent[1]!.details.id).toBe(first.messageId);
+    expect(f.sent[1]!.options).toEqual({ deliverAs: "steer", triggerTurn: false });
+    expect(fresh.controller.deliverAgent(request)).toMatchObject({ duplicate: true });
+    fresh.controller.closeFollowUpDrain();
+    f.main(true, flushMs);
+    expect(f.sent).toHaveLength(2);
+  });
+
+  it.each([0, 60_000])("cancel then reload keeps replay passive until user input (flushMs=%s)", async (flushMs) => {
+    const f = await fixture();
+    const old = f.main(false, flushMs);
+    old.emit("agent_settled", { outcome: "aborted" });
+    old.controller.prepareReload();
+    const request = { from: sender, message: "after cancel", delivery: "steer" as const, deliveryId: "cancel-gap" };
+    const admitted = old.controller.deliverAgent(request);
+    old.controller.closeFollowUpDrain();
+    const fresh = f.main(true, flushMs);
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]!.details.id).toBe(admitted.messageId);
+    expect(f.sent[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: false });
+    fresh.emit("agent_start");
+    fresh.emit("input", { source: "extension" });
+    fresh.controller.deliverAgent({ from: sender, message: "live while stopped", delivery: "followUp" });
+    expect(f.sent.at(-1)!.options.triggerTurn).toBe(false);
+    fresh.emit("input", { source: "interactive" });
+    fresh.controller.deliverAgent({ from: sender, message: "user resumed", delivery: "steer" });
+    expect(f.sent.at(-1)!.options.triggerTurn).toBe(true);
+    expect(fresh.controller.deliverAgent(request)).toMatchObject({ duplicate: true });
+  });
+
+  it("an Escape halt latch survives reload even without an aborted turn or settle", async () => {
+    const f = await fixture();
+    const old = f.main();
+    // Escape while idle has no aborted run event. Optional invocation lets this fail at the boundary on the old head.
+    (old.controller as MainAgentController & { halt?: () => void }).halt?.();
+    old.controller.prepareReload();
+    old.controller.deliverAgent({ from: sender, message: "escape-gap", delivery: "followUp", deliveryId: "escape-gap" });
+    old.controller.closeFollowUpDrain();
+    f.main();
+    expect(f.sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: false });
+  });
+
+  it("the sender class is part of the coalescing policy", async () => {
+    const f = await fixture();
+    const main = f.main(false);
+    const request = { from: sender, message: "main sender", delivery: "followUp" as const, data: { coalesceKey: "same" } };
+    const first = main.controller.deliverAgent(request);
+    const second = main.controller.deliverAgent({ ...request, from: { ...sender, kind: "agent" }, message: "agent sender" });
+    expect(second.coalesced).toBeUndefined();
+    main.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
+    expect(f.sent.flatMap((item) => item.details.items ?? [item.details]).map((item) => item.id)).toEqual([first.messageId, second.messageId]);
+  });
+
+  it("a mixed-policy reload queue survives later same-key followUps exactly once in order", async () => {
+    const f = await fixture();
+    const old = f.main();
+    old.controller.prepareReload();
+    const policies = [
+      { delivery: "steer", triggerTurn: true },
+      { delivery: "steer", triggerTurn: false },
+      { delivery: "followUp", triggerTurn: false },
+      { delivery: "nextTurn", triggerTurn: true },
+      { delivery: "nextTurn", triggerTurn: false },
+    ] as const;
+    const originals = policies.map((policy, index) => ({
+      ...policy, from: sender, message: `journal-${index}`, deliveryId: `journal-${index}`,
+      data: { coalesceKey: `policy-${index}` },
+    }));
+    const originalIds = originals.map((request) => old.controller.deliverAgent(request).messageId);
+    old.controller.closeFollowUpDrain();
+    const fresh = f.main(false);
+    expect(f.sent).toHaveLength(0);
+    const later = originals.map((request, index) => ({
+      ...request, delivery: "followUp" as const, triggerTurn: true,
+      message: `later-${index}`, deliveryId: `later-${index}`,
+    }));
+    const results = later.map((request) => fresh.controller.deliverAgent(request));
+    expect(results.map((result) => result.coalesced)).toEqual(policies.map(() => undefined));
+    expect(f.sent).toHaveLength(0);
+    fresh.emit("turn_end", { context: { pendingMessages: [] } });
+    fresh.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
+    const expectedIds = [...originalIds, ...results.map((result) => result.messageId)];
+    expect(f.sent.flatMap((item) => item.details.items ?? [item.details]).map((item) => item.id)).toEqual(expectedIds);
+    expect(f.sent.slice(0, policies.length).map((item) => item.options)).toEqual(
+      policies.map(({ delivery, triggerTurn }) => ({ deliverAs: delivery, triggerTurn })),
+    );
+    expect(f.sent.at(-1)!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    fresh.emit("turn_end", { context: { pendingMessages: [] } });
+    for (const request of [...originals, ...later]) {
+      expect(fresh.controller.deliverAgent(request)).toMatchObject({ duplicate: true });
+    }
+    fresh.controller.closeFollowUpDrain();
+    const replay = f.main(false);
+    replay.emit("turn_end", { context: { pendingMessages: [] } });
+    replay.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
+    expect(f.sent.flatMap((item) => item.details.items ?? [item.details]).map((item) => item.id)).toEqual(expectedIds);
+  });
+
+  it("a matching reload delivery policy coalesces without losing its explicit replay policy", async () => {
+    const f = await fixture();
+    const old = f.main();
+    old.controller.prepareReload();
+    const request = { from: sender, message: "original", delivery: "followUp" as const,
+      triggerTurn: true, deliveryId: "matching-original", data: { coalesceKey: "matching" } };
+    const first = old.controller.deliverAgent(request);
+    old.controller.closeFollowUpDrain();
+    const fresh = f.main(false);
+    const replacement = fresh.controller.deliverAgent({ ...request, message: "replacement", deliveryId: "matching-replacement" });
+    expect(replacement).toMatchObject({ coalesced: true, replacedMessageId: first.messageId });
+    fresh.emit("turn_end", { context: { pendingMessages: [] } });
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]!.details.id).toBe(replacement.messageId);
+    expect(f.sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(fresh.controller.deliverAgent(request)).toMatchObject({ duplicate: true });
+    fresh.emit("turn_end", { context: { pendingMessages: [] } });
+    fresh.controller.closeFollowUpDrain();
+    f.main();
+    expect(f.sent).toHaveLength(1);
   });
 
   it("keeps a fixed reload expiry through heartbeats and keeps the Main discoverable as a peer", async () => {

@@ -68,6 +68,16 @@ const pairs: Pair[] = [
     allow: `cd /own; cd /else; ls -d /tmp/tmp.* > paths; cat /own/paths | xargs rm -rf` },
 ];
 
+// Conservative false positives: read/fd provenance UNKNOWN by owner direction.
+// Original corpus IDs and command bytes remain unchanged, including historical — allow IDs.
+const conservativeFalsePositives = new Set([
+  "F11 exact conditional cwd fd3 mirror",
+  "F12 computed regular fd3 target sees after-entry PID producer",
+  "F12 computed regular fd3 target sees after-entry shared producer",
+  "F12 immutable process feed is PID bytes not saved filename contents",
+  "F12 immutable process feed is path bytes not saved filename contents",
+]);
+
 describe("PR166 lifecycle boundaries — paired DATA only", () => {
   for (const pair of pairs) {
     it(`${pair.name} — refuse`, () => {
@@ -76,7 +86,11 @@ describe("PR166 lifecycle boundaries — paired DATA only", () => {
       });
     });
     it(`${pair.name} — allow`, () => {
-      expect(scanCommand(pair.allow)).toEqual({ blocked: false, wipe: false, exhausted: false });
+      expect(scanCommand(pair.allow)).toEqual({
+        blocked: conservativeFalsePositives.has(pair.name) && pair.policy === "kill",
+        wipe: conservativeFalsePositives.has(pair.name) && pair.policy === "tmp",
+        exhausted: false,
+      });
     });
   }
 });

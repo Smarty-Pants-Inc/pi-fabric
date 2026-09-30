@@ -166,6 +166,37 @@ for (const policy of ["kill", "tmp"] as const) {
     allow: `${producer} > ${file}; { ( : ) 3< ${file} 0<&3; read -r value; ${consume}; } < .local/recorded` });
 }
 
+// Conservative false positives: read/fd provenance UNKNOWN by owner direction.
+// Original corpus IDs and command bytes remain unchanged, including historical — allow IDs.
+const conservativeFalsePositives = new Set([
+  "A1 prefix IFS controls read destinations, which persist after IFS restoration",
+  "A1 temporary variable prefix read input expands in caller, destination persists",
+  "A1 unrelated prefix read destination clears actual prior unsafe binding",
+  "A1 unrelated prefix read PID destination persists",
+  "F12 fd3 open empty then > producer before read (kill)",
+  "F12 fd3 open empty then >> producer before read (kill)",
+  "F12 entry alias identity remains live after body alias changes and append (kill)",
+  "F12 independent recorded/owned fd3 ignores other unsafe file (kill)",
+  "F12 fd3 identity snapshots entry alias, not later alias (kill)",
+  "F12 fd3 identity snapshots entry cwd, not body cwd (kill)",
+  "F12 left-to-right copied fd0 follows fd3 identity (kill)",
+  "F12 reverse duplication preserves original safe fd0 (kill)",
+  "F12 close fd3 does not close already copied fd0 (kill)",
+  "F12 closed fd3 does not supply unsafe contents (kill)",
+  "F12 subshell routing stays child-local (kill)",
+  "F12 fd3 open empty then > producer before read (tmp)",
+  "F12 fd3 open empty then >> producer before read (tmp)",
+  "F12 entry alias identity remains live after body alias changes and append (tmp)",
+  "F12 independent recorded/owned fd3 ignores other unsafe file (tmp)",
+  "F12 fd3 identity snapshots entry alias, not later alias (tmp)",
+  "F12 fd3 identity snapshots entry cwd, not body cwd (tmp)",
+  "F12 left-to-right copied fd0 follows fd3 identity (tmp)",
+  "F12 reverse duplication preserves original safe fd0 (tmp)",
+  "F12 close fd3 does not close already copied fd0 (tmp)",
+  "F12 closed fd3 does not supply unsafe contents (tmp)",
+  "F12 subshell routing stays child-local (tmp)",
+]);
+
 describe("PR166 R1 paired DATA regressions", () => {
   for (const pair of pairs) {
     it(`${pair.name} — refuse`, () => {
@@ -174,7 +205,11 @@ describe("PR166 R1 paired DATA regressions", () => {
       expect(pair.policy === "kill" ? verdict.blocked : verdict.wipe).toBe(true);
     });
     it(`${pair.name} — allow`, () => {
-      expect(scanCommand(pair.allow)).toEqual({ blocked: false, wipe: false, exhausted: false });
+      expect(scanCommand(pair.allow)).toEqual({
+        blocked: conservativeFalsePositives.has(pair.name) && pair.policy === "kill",
+        wipe: conservativeFalsePositives.has(pair.name) && pair.policy === "tmp",
+        exhausted: false,
+      });
     });
   }
 });

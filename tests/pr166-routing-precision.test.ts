@@ -57,13 +57,20 @@ const pairs: Pair[] = [
   },
 ];
 
+// Conservative false positives: read/fd provenance UNKNOWN by owner direction.
+// Original corpus IDs and command bytes remain unchanged, including historical — allow IDs.
+const conservativeFalsePositives = new Set([
+  "regular descriptor observes later unsafe bytes on ambiguous route, recorded overwrite remains allowed",
+]);
+
 describe("PR166 routing precision — paired DATA only", () => {
   for (const pair of pairs) {
     for (const disposition of ["refuse", "allow"] as const) {
       it(`${pair.name} — ${disposition}`, () => {
         const command = pair[disposition];
-        const blocked = disposition === "refuse" && pair.policy === "kill";
-        const wipe = disposition === "refuse" && pair.policy === "tmp";
+        const refused = disposition === "refuse" || conservativeFalsePositives.has(pair.name);
+        const blocked = refused && pair.policy === "kill";
+        const wipe = refused && pair.policy === "tmp";
         expect(scanCommand(command)).toEqual({ blocked, wipe, exhausted: false });
         expect(killsByPattern(command)).toBe(blocked);
         expect(wipesTmp(command)).toBe(wipe);

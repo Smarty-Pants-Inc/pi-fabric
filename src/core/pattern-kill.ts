@@ -661,8 +661,18 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   let lookupTail = context.lookupTail;
   let tmpTail = context.tmpTail;
   const tailHas = (name: string, tail: number | undefined): boolean => tail !== undefined && /^[0-9]+$/.test(name) && Number(name) >= tail;
-  const lookupName = (name: string): boolean => tainted.has(name) || protectedAliases.get(name)?.lookup === true || tailHas(name, lookupTail);
-  const tmpName = (name: string): boolean => tmpNames.has(name) || protectedAliases.get(name)?.tmp === true || tailHas(name, tmpTail);
+  // Opaque attributes can affect an untracked mutable cell too. Carry the same
+  // UNKNOWN possibilities at every reference lookup, not only at tracked writes.
+  // Captures, positionals and caller-attribution cells are not mutable shell names;
+  // only an actual definite readonly attribute exempts an ordinary shell cell.
+  const opaqueReference = (name: string): boolean => {
+    if (!opaqueAttributes) return false;
+    budget.spend(name.length + 1);
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && !immutableCells.has(name) && !protectedAliases.has(name) &&
+      !(readonlyNames.has(name) && !uncertainReadonly.has(name));
+  };
+  const lookupName = (name: string): boolean => tainted.has(name) || protectedAliases.get(name)?.lookup === true || tailHas(name, lookupTail) || opaqueReference(name);
+  const tmpName = (name: string): boolean => tmpNames.has(name) || protectedAliases.get(name)?.tmp === true || tailHas(name, tmpTail) || opaqueReference(name);
 
   const nested = (text: string, extra: readonly string[] = [], tmpExtra: readonly string[] = [], local = true, input?: Feed, positionals?: Word[], sinks?: ReadonlyMap<number, OutputSink>, tails?: PositionalTail, inputs?: ReadonlyMap<number, InputBinding | undefined>, inheritReadonly = true, sameShell = false): Verdict => {
     budget.spend(2 * (tainted.size + tmpNames.size + extra.length + tmpExtra.length + values.size + alternatives.size + unknown.size) + 1);

@@ -6,13 +6,24 @@
 //   - merge consecutive message_update deltas of one content block into one line,
 //   - keep only the latest tool_execution_update per tool call,
 //   - drop toolResult message_start (its message_end follows at once, same message),
-//   - elide tool_execution_end.result (canonical toolResult message_end holds its
-//     content/details; preserve other result fields in resultMetadata),
+//   - elide tool_execution_end.result except near the worker's character cap
+//     (canonical toolResult message_end holds content/details; preserve extras),
 //   - drop turn_end.message (the assistant message_end just before repeats it),
 // and flush what is held at least every RUN_LOG_FLUSH_MS, so live tails still
 // stream. Held lines are written before the next other line, so every other line
 // keeps its order; a held delta and a held tool update may swap with each other.
 export const RUN_LOG_FLUSH_MS = 500;
+
+// Shared with stdout admission: this is a UTF-16 character cap, not a byte cap.
+export const MAX_EVENT_LINE_CHARS = 4 * 1024 * 1024;
+// Pi's canonical envelope reuses IDs/name/content/details/usage from the end;
+// only role/timestamp and envelope syntax grow (at most 65 chars for Pi's
+// record results, including a 24-char JSON number timestamp and missing content
+// normalized to []; message_start is two chars larger than message_end).
+// ponytail: reserve 128 chars and keep near-cap ends whole, rather than buffer
+// parallel completions awaiting canonical admission. This covers envelope-cap
+// loss, not a missing canonical event after interruption or other filtering.
+const CANONICAL_ENVELOPE_RESERVE_CHARS = 128;
 
 const DELTA_TYPES = new Set(["text_delta", "thinking_delta", "toolcall_delta"]);
 
@@ -77,7 +88,8 @@ export const createRunLogWriter = (
       }
       flush();
       if (event?.type === "message_start" && isRecord(event.message) && event.message.role === "toolResult") return;
-      if (event?.type === "tool_execution_end" && event.result !== undefined) {
+      if (event?.type === "tool_execution_end" && event.result !== undefined &&
+        line.length <= MAX_EVENT_LINE_CHARS - CANONICAL_ENVELOPE_RESERVE_CHARS) {
         // Count the JSON payload's UTF-8 bytes, not JS UTF-16 code units.
         // Never mutate the live event: the worker still consumes the raw result.
         const bytes = Buffer.byteLength(JSON.stringify(event.result), "utf8");

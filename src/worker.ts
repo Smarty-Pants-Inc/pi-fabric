@@ -125,7 +125,6 @@ const loadVedaCli = async (): Promise<VedaCliModule> => {
 };
 
 const MAX_STDERR_CHARS = 20_000;
-const MAX_EVENT_LINE_CHARS = 4 * 1024 * 1024;
 const STEER_READ_CHUNK_BYTES = 256 * 1024;
 const MAX_STEER_LINE_BYTES = 64 * 1024;
 const MAX_STEER_COMMANDS_PER_POLL = 256;
@@ -241,7 +240,7 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter, MAX_EVENT_LINE_CHARS }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),

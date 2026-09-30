@@ -257,6 +257,55 @@ describe("conversation renderer retained-row cache", () => {
     expect(updates.mock.instances[2]).toBe(component);
   });
 
+  it.each(["completed", "failed"] as const)("finalizes a no-output %s compact end on the same native component before canonical hydration", (status) => {
+    const { renderer } = setup();
+    const updates = vi.spyOn(ToolExecutionComponent.prototype, "updateResult");
+    const renders = vi.spyOn(ToolExecutionComponent.prototype, "render");
+    const running = { ...tool("no-output"), executionStarted: true, argsComplete: true };
+    const active = nativeTranscript([], { streaming: { active: true, tools: [running] } });
+    renderer.render(active, 80, options);
+    const component = renders.mock.instances[0]!;
+    const native = component as unknown as { isPartial: boolean; result?: { content: unknown[]; isError: boolean } };
+    expect(native.isPartial).toBe(true);
+    expect(native.result).toBeUndefined();
+    expect(updates).not.toHaveBeenCalled();
+    renderer.render(active, 80, options);
+    expect(native.isPartial).toBe(true);
+    expect(updates).not.toHaveBeenCalled();
+
+    const waiting = { ...running, status, isError: status === "failed" };
+    const gap = nativeTranscript([], { streaming: { active: false, tools: [waiting] } });
+    const runningRenders = renders.mock.calls.length;
+    const finalStatusLines = renderer.render(gap, 80, options);
+    expect(renders).toHaveBeenCalledTimes(runningRenders + 1);
+    expect(waiting.result).toBeUndefined();
+    expect(updates).toHaveBeenCalledTimes(1);
+    expect(updates.mock.calls[0]).toEqual([{ content: [], isError: waiting.isError }, false]);
+    expect(updates.mock.instances[0]).toBe(component);
+    expect(native.isPartial).toBe(false);
+    expect(native.result).toEqual({ content: [], isError: waiting.isError });
+    // Static generic rows must be repainted at finality, then stay warm; no
+    // subsequent canonical event is required to clear native pending state.
+    expect(renders.mock.instances.at(-1)).toBe(component);
+    const gapRenders = renders.mock.calls.length;
+    expect(renderer.render(gap, 80, options)).toEqual(finalStatusLines);
+    expect(renderer.render({ ...gap, status: "idle" }, 80, options)).toEqual(finalStatusLines);
+    expect(renders).toHaveBeenCalledTimes(gapRenders);
+    expect(updates).toHaveBeenCalledTimes(1);
+
+    const canonical = { ...result("no-output", "later canonical body"), isError: waiting.isError };
+    const hydrated = nativeTranscript([canonical], { streaming: { active: false, tools: [waiting] } });
+    const lines = renderer.render(hydrated, 80, options);
+    expect(text(lines)).toContain("later canonical body");
+    expect(updates).toHaveBeenCalledTimes(2);
+    expect(updates.mock.calls[1]).toEqual([{ content: canonical.content, isError: canonical.isError }, false]);
+    expect(updates.mock.instances[1]).toBe(component);
+    const hydratedRenders = renders.mock.calls.length;
+    expect(renderer.render(hydrated, 80, options)).toEqual(lines);
+    expect(renders).toHaveBeenCalledTimes(hydratedRenders);
+    expect(updates).toHaveBeenCalledTimes(2);
+  });
+
   it("transitions pending partial calls through args completion and error-only changes", () => {
     const contexts: Array<{ executionStarted: boolean; argsComplete: boolean; isError: boolean }> = [];
     const { renderer } = setup({ getToolDefinition: () => ({

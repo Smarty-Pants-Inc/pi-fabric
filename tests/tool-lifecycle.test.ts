@@ -99,6 +99,17 @@ const executeThroughPiLifecycle = async (details: unknown) => {
 };
 
 describe("Fabric outer tool lifecycle", () => {
+  it("recognizes Pi 0.99 native parent IDs without reauthorizing nested work as top-level", async () => {
+    const authorize = vi.fn(), approve = vi.fn();
+    const lifecycle = new FabricToolLifecycle(() => true, () => ({ authorize }), () => ({ approve }));
+    await lifecycle.toolCall({ type: "tool_call", toolCallId: "outer", toolName: "fabric_exec", input: {} });
+    for (const parentToolCallId of ["outer", "outer/1"]) {
+      await lifecycle.toolCall({ type: "tool_call", toolCallId: `${parentToolCallId}/1`, parentToolCallId, toolName: "fixture", input: {} });
+    }
+    expect(authorize).not.toHaveBeenCalled(); expect(approve).not.toHaveBeenCalled();
+    await lifecycle.toolCall({ type: "tool_call", toolCallId: "other/1", parentToolCallId: "other", toolName: "fixture", input: {} }, {} as ExtensionContext);
+    expect(authorize).toHaveBeenCalledOnce(); expect(approve).toHaveBeenCalledOnce();
+  });
   it.each([
     ["type error", failedDetails("failed")],
     ["runtime error", failedDetails("failed")],

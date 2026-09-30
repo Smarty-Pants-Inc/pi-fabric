@@ -256,6 +256,9 @@ export class JevProgramManager {
           clearTimeout(timer);
           observation?.close();
           context.signal?.removeEventListener("abort", abort);
+          // Providers release what this run acquired (interactive sessions, leases),
+          // exactly as they do when a fabric_exec invocation ends.
+          await registry.endInvocation(`jev:${id}`).catch(() => undefined);
           await runLease.release();
           info.endedAt = Date.now();
           this.#prune();

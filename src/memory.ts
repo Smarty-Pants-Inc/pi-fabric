@@ -20,6 +20,8 @@ export type {
   MemorySourceSnapshot,
   PortableMemorySource,
 } from "./memory/portable.js";
+export { createConfiguredMemorySourceRegistry, createFileSystemMemorySource } from "./memory/fs-source.js";
+export type { FileSystemMemorySourceOptions } from "./memory/fs-source.js";
 export { createMemorySourceClient } from "./memory/client.js";
 export type {
   MemorySourceCallOptions,

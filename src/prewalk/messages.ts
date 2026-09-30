@@ -108,10 +108,11 @@ export const filterPrewalkContinuationMessages = <Message>(
 };
 
 // Planning directives (arm advisory, plan checkpoint) are phase-scoped
-// guidance for the frontier model while its arm cycle is live. Once a handoff
-// claims the arm — or the arm is off — carrying them into requests invites the
-// executor to treat planning as still open. Persisted history is untouched:
-// only the request projection drops them, mirroring the stale-continuation
+// guidance while the frontier model owes a plan. Recording the plan, claiming
+// the arm, or turning it off retires requests to plan. Explicitly ungated arm
+// advisories remain visible while armed: they describe handoff, not planning.
+// Persisted history is untouched: only the request projection drops them,
+// mirroring the stale-continuation
 // filter above and upstream prewalk's transient plan nudge.
 const isPrewalkPlanningDirective = <Message>(
   message: Message,
@@ -128,12 +129,18 @@ const isPrewalkPlanningDirective = <Message>(
 
 export const filterPrewalkPlanningDirectives = <Message>(
   messages: Message[],
-  visible: boolean,
+  armed: boolean,
+  planRequired: boolean,
 ): { messages: Message[]; changed: boolean } => {
-  if (visible) return { messages, changed: false };
+  if (armed && planRequired) return { messages, changed: false };
   let changed = false;
   const filtered = messages.filter((message) => {
     if (!isPrewalkPlanningDirective(message)) return true;
+    const custom = message as { customType: string; details?: { requirePlan?: boolean } };
+    if (
+      armed && custom.customType === PREWALK_ARMED_MESSAGE_TYPE &&
+      custom.details?.requirePlan === false
+    ) return true;
     changed = true;
     return false;
   });

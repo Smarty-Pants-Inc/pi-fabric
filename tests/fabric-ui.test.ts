@@ -692,6 +692,39 @@ describe("Fabric dynamic UI", () => {
     expect(shouldShowFabricWidget(current, "auto")).toBe(false);
   });
 
+  it("keeps completed agents visible after a later run starts", () => {
+    const current = snapshot();
+    current.actors = [];
+    current.state = [];
+    const completed = {
+      ...current.agents[0]!,
+      id: "agent-completed",
+      name: "finished-reviewer",
+      status: "completed" as const,
+      finishedAt: current.now - 5_000,
+    };
+    current.agents = [completed];
+    const widget = new FabricWidget(theme, () => current, 6);
+    expect(widget.render(72).join("\n")).toContain("finished-reviewer");
+
+    current.runs = [
+      {
+        ...current.runs[0]!,
+        id: "run-2",
+        name: "Follow-up run",
+        calls: [],
+        items: [],
+        startedAt: current.now,
+        updatedAt: current.now,
+      },
+      current.runs[0]!,
+    ];
+    widget.invalidate();
+    const lines = widget.render(72).join("\n");
+    expect(lines).toContain("Follow-up run");
+    expect(lines).toContain("finished-reviewer");
+  });
+
   it("hides explicitly dismissed runs and resurfaces later ones", () => {
     const current = snapshot();
     const run = current.runs[0];

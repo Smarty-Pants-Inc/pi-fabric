@@ -6,7 +6,9 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import type { PiShellToolName } from "./pi-tools.js";
-import { ShellMonitor, type ShellMonitorOptions, type ShellMonitorBatch } from "./shell-monitor.js";
+import { SHELL_MONITOR_PREVIEWS, ShellMonitor, type ShellMonitorOptions, type ShellMonitorBatch } from "./shell-monitor.js";
+import { ShellReplay, type ShellReplayPage } from "./shell-replay.js";
+import type { DurableShellBridge } from "../jev-fabric/bridge.js";
 
 export { DEFAULT_SHELL_HANG_MS, SHELL_HANG_MAX_MS } from "./shell-limits.js";
 const SHELL_HANG_SNAPSHOT_BYTES = 8_000;
@@ -14,6 +16,39 @@ export const SHELL_TAIL_BYTES = 1024 * 1024;
 export const SHELL_LOG_BYTES = 8 * 1024 * 1024;
 export const SHELL_COMPLETED_HANDLES = 256;
 const SHELL_SPILL_PID_WAIT_MS = 10_000;
+/** Output kept readable by offset after a task finishes, like jev-fabric's 32 KiB receipt tails. */
+export const SHELL_FINISHED_READ_BYTES = 32 * 1024;
+/** Largest single tasks.read page. */
+export const SHELL_READ_MAX_BYTES = 64 * 1024;
+
+/**
+ * One page of a task's combined output by byte offset, in jev-fabric's read
+ * record shape. Offsets count every byte since launch and never reset; bytes
+ * that left the retained window are disclosed in `omittedBytes`.
+ */
+export interface FabricShellReadRecord {
+  id: string;
+  stream: "output";
+  offset: number;
+  bytes: number;
+  omittedBytes: number;
+  text?: string;
+  data?: string;
+  next: number;
+  eof: boolean;
+  state: FabricShellJobStatus;
+}
+
+// Stop before an incomplete trailing UTF-8 sequence so text pages never split a character.
+const utf8Boundary = (buffer: Buffer): number => {
+  for (let back = 1; back <= Math.min(3, buffer.length); back++) {
+    const byte = buffer[buffer.length - back]!;
+    if ((byte & 0xc0) === 0x80) continue;
+    const need = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1;
+    return need > back ? buffer.length - back : buffer.length;
+  }
+  return buffer.length;
+};
 const SHELL_COMPLETED_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const LOG_HEADER = "[Bounded shell log: starts with retained pre-spill tail; 8 MiB total cap, then further output is omitted. Not a full-output archive.]\n";
 const LOG_TRUNCATED = "\n[Shell log truncated: disk limit reached; subsequent output omitted.]\n";
@@ -54,7 +89,21 @@ export const parseShellPid = (text: string): number | undefined => {
 
 type FabricShellJobStatus = "running" | "spilled" | "exited" | "failed" | "killed" | "timed_out";
 
+/** A task whose process is owned by a jev-fabric store, not this Pi process. */
+export interface FabricDurableTaskInfo {
+  home: string;
+  /** jev-fabric job ID once `start` has returned. */
+  jobId?: string;
+  /** Reattached after a restart or from another harness, rather than launched here. */
+  adopted?: boolean;
+}
+
 export interface FabricShellJobOptions {
+  /** Stable task ID when reattaching a durable task; otherwise random. */
+  id?: string;
+  /** Original start time when reattaching a durable task. */
+  startedAt?: number;
+  durable?: FabricDurableTaskInfo;
   cwd?: string;
   ownerId?: string;
   description?: string;
@@ -85,6 +134,7 @@ export interface FabricShellJobInfo {
   lastOutputAt?: number;
   monitor?: ShellMonitorOptions;
   lastEvent?: ShellMonitorBatch & { at: number };
+  durable?: FabricDurableTaskInfo;
   eventCount: number;
   unread: boolean;
   stopping: boolean;
@@ -95,6 +145,8 @@ export interface FabricShellJobHandle {
   readonly tool: PiShellToolName;
   readonly command: string;
   readonly abort: AbortController;
+  readonly detached: AbortController;
+  readonly durable: FabricDurableTaskInfo | undefined;
   readonly startedAt: number;
   readonly pidPath: string;
   pid?: number;
@@ -117,8 +169,11 @@ class FabricShellJob implements FabricShellJobHandle {
   readonly tool: PiShellToolName;
   readonly command: string;
   readonly abort = new AbortController();
-  readonly startedAt = Date.now();
+  /** Aborted when this session lets go of a durable process without stopping it. */
+  readonly detached = new AbortController();
+  readonly startedAt: number;
   readonly pidPath: string;
+  readonly durable: FabricDurableTaskInfo | undefined;
   pid?: number;
   logPath?: string;
   spilled = false;
@@ -131,6 +186,11 @@ class FabricShellJob implements FabricShellJobHandle {
   status: FabricShellJobStatus = "running";
   #tail = Buffer.alloc(0);
   #omitted = false;
+  /** Total bytes appended since launch; the end offset of the read window. */
+  #written = 0;
+  /** After finish: a short copy of the tail, readable by offset only. */
+  #finished = Buffer.alloc(0);
+  readonly #outputWaiters = new Set<() => void>();
   readonly #directory: string;
   #descriptor: number | undefined;
   #logBytes = 0;
@@ -142,19 +202,24 @@ class FabricShellJob implements FabricShellJobHandle {
   #timedOut = false;
   lastOutputAt?: number;
   lastEvent?: ShellMonitorBatch & { at: number };
-  eventCount = 0;
+  readonly #replay = new ShellReplay();
   unread = false;
 
+  get eventCount(): number { return this.#replay.cursor; }
+
   constructor(tool: PiShellToolName, command: string, readonly onChange: (type: FabricShellJobEvent["type"], output?: string) => void, tempRoot: string, readonly options: FabricShellJobOptions = {}) {
-    this.id = randomUUID();
+    this.id = options.id ?? randomUUID();
+    this.startedAt = options.startedAt ?? Date.now();
+    this.durable = options.durable ? { ...options.durable } : undefined;
     this.tool = tool;
     this.command = command;
     this.#directory = createScratch("shell", tempRoot);
     this.pidPath = path.join(this.#directory, "child.pid");
     if (options.monitor) {
       this.#monitor = new ShellMonitor(options.monitor, (batch) => {
-        this.lastEvent = { ...batch, at: Date.now() };
-        this.eventCount += batch.lines.length + batch.omitted;
+        const previews = batch.lines.slice(-SHELL_MONITOR_PREVIEWS);
+        this.lastEvent = { lines: previews, omitted: batch.omitted + batch.lines.length - previews.length, at: Date.now() };
+        this.#replay.record(batch.lines, batch.omitted);
         this.unread = true;
         // The terminal event includes final output; do not race a second wakeup.
         if (!this.finished) this.onChange("monitor");
@@ -177,6 +242,18 @@ class FabricShellJob implements FabricShellJobHandle {
     return true;
   }
 
+  /** Pages retained monitor lines after a cursor, disclosing lost positions. */
+  replay(after: number): ShellReplayPage { return this.#replay.page(after); }
+
+  /** Releases a durable process to its jev-fabric store; it keeps running. */
+  detach(): void {
+    if (this.finished || !this.durable) return;
+    if (this.#deadline) clearTimeout(this.#deadline);
+    this.#deadline = undefined;
+    this.#monitor?.close(false);
+    this.detached.abort(new Error("Detached from the Pi session"));
+  }
+
   acknowledge(): void {
     this.unread = false;
     this.onChange("acknowledged");
@@ -194,6 +271,50 @@ class FabricShellJob implements FabricShellJobHandle {
       data.subarray(Math.max(0, data.length - SHELL_TAIL_BYTES)),
     ]);
     this.#writeLog(data);
+    this.#written += data.length;
+    if (data.length > 0) this.#notifyOutput();
+  }
+
+  #notifyOutput(): void {
+    for (const wake of [...this.#outputWaiters]) wake();
+  }
+
+  /** Bytes appended since launch: the cursor just past the newest output. */
+  get written(): number { return this.#written; }
+
+  /** Reads combined output from a byte offset; never blocks and never consumes. */
+  read(offset: number, max = SHELL_READ_MAX_BYTES, encoding: "text" | "base64" = "text"): FabricShellReadRecord {
+    const window = this.finished ? this.#finished : this.#tail;
+    const start = this.#written - window.length;
+    const from = Math.min(Math.max(offset, start), this.#written);
+    const limit = Math.max(1, Math.min(SHELL_READ_MAX_BYTES, Math.floor(max)));
+    let slice = window.subarray(from - start, Math.min(window.length, from - start + limit));
+    if (encoding === "text" && !(this.finished && from + slice.length === this.#written)) slice = slice.subarray(0, utf8Boundary(slice));
+    const next = from + slice.length;
+    return {
+      id: this.id, stream: "output", offset: from, bytes: slice.length,
+      omittedBytes: Math.max(0, Math.min(from, start) - Math.min(offset, this.#written)),
+      ...(encoding === "base64" ? { data: slice.toString("base64") } : { text: slice.toString("utf8") }),
+      next, eof: this.finished && next >= this.#written, state: this.status,
+    };
+  }
+
+  /** Resolves when output past `offset` exists or the task finishes; never stops the task. */
+  whenOutput(offset: number, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+    if (this.#written > offset || this.finished) return Promise.resolve();
+    signal?.throwIfAborted();
+    return new Promise((resolve, reject) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        this.#outputWaiters.delete(done);
+        signal?.removeEventListener("abort", abort);
+        resolve();
+      };
+      const abort = (): void => { done(); reject(signal?.reason ?? new Error("Task observation cancelled")); };
+      const timer = setTimeout(done, timeoutMs);
+      this.#outputWaiters.add(done);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
   }
 
   #writeLog(data: Buffer): void {
@@ -336,6 +457,8 @@ class FabricShellJob implements FabricShellJobHandle {
     if (footer) this.#writeLog(Buffer.from(footer.endsWith("\n") ? footer : `${footer}\n`));
     if (this.#descriptor !== undefined) { try { fs.closeSync(this.#descriptor); } catch {} }
     this.#descriptor = undefined;
+    // Release the live tail; keep a short window readable by offset (the bounded log holds the rest).
+    this.#finished = Buffer.from(this.#tail.subarray(Math.max(0, this.#tail.length - SHELL_FINISHED_READ_BYTES)));
     this.#tail = Buffer.alloc(0);
     this.#omitted = false;
     if (!this.#spill.signal.aborted) this.#spill.abort();
@@ -343,6 +466,7 @@ class FabricShellJob implements FabricShellJobHandle {
     if (this.logPath) closeScratch(this.#directory);
     else { try { fs.rmSync(this.#directory, { recursive: true, force: true }); } catch {} }
     this.announced = true;
+    this.#notifyOutput();
     this.onChange("finished", [output, footer?.slice(-1000)].filter(Boolean).join("\n"));
   }
 
@@ -365,6 +489,7 @@ class FabricShellJob implements FabricShellJobHandle {
       tool: this.tool,
       command: this.command,
       ...this.options,
+      ...(this.durable ? { durable: { ...this.durable } } : {}),
       ...(this.options.monitor ? { monitor: { ...this.options.monitor } } : {}),
       ...(this.lastOutputAt !== undefined ? { lastOutputAt: this.lastOutputAt } : {}),
       ...(this.lastEvent ? { lastEvent: { ...this.lastEvent, lines: [...this.lastEvent.lines] } } : {}),
@@ -411,6 +536,8 @@ export class FabricShellJobStore {
   readonly #listeners = new Set<(event: FabricShellJobEvent) => void>();
   #closed = false;
   readonly #closing = new AbortController();
+  /** Optional jev-fabric backend for durable tasks; absent on Windows and managed hosts. */
+  durable: DurableShellBridge | undefined;
 
   subscribe(listener: (event: FabricShellJobEvent) => void): () => void {
     this.#listeners.add(listener);
@@ -437,6 +564,7 @@ export class FabricShellJobStore {
   begin(tool: PiShellToolName, command: string, options: FabricShellJobOptions = {}): FabricShellJob {
     if (this.#closed) throw new Error("Shell job store is closed");
     this.#prune();
+    if (options.id !== undefined && this.#jobs.has(options.id)) throw new Error(`Shell task already tracked: ${options.id}`);
     const job = new FabricShellJob(tool, command, (type, output) => {
       this.#emit({ type, job: job.info(), ...(output ? { output } : {}) });
       if (type === "finished") this.#prune();
@@ -531,9 +659,13 @@ export class FabricShellJobStore {
     this.#listeners.clear();
     const live = this.live();
     for (const job of live) {
-      if (!job.abort.signal.aborted) job.abort.abort(new Error("Fabric session ended"));
+      // A durable process belongs to its jev-fabric store and outlives this session.
+      if (job.durable) job.detach();
+      else if (!job.abort.signal.aborted) job.abort.abort(new Error("Fabric session ended"));
     }
-    await Promise.allSettled(live.map((job) => job.finish(null, "\n\n[Process ended: session closed]\n")));
+    await Promise.allSettled(live.map((job) => job.finish(null, job.durable
+      ? `\n\n[Detached: jev-fabric job ${job.durable.jobId ?? "(starting)"} keeps running outside this session]\n`
+      : "\n\n[Process ended: session closed]\n")));
     this.#jobs.clear();
   }
 }

@@ -27,6 +27,16 @@ const rejected = (dir: string, reason: string): void => {
 };
 
 describe("published build artifact guards", () => {
+  it("uses host-only wildcard peers and exact Pi 0.99 development dependencies", () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+    for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-agent-core", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"]) {
+      expect(manifest.dependencies[name]).toBeUndefined();
+      expect(manifest.peerDependencies[name]).toBe("*");
+      expect(manifest.devDependencies[name]).toBe(name === "typebox" ? "1.3.27" : "0.99.0");
+      expect(manifest.overrides?.[name]).toBeUndefined();
+      expect(manifest.resolutions?.[name]).toBeUndefined();
+    }
+  });
   it("rejects a public export omitted from the compiled tree", () => {
     const dir = fixture();
     const file = path.join(dir, "package.json");

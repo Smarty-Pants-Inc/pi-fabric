@@ -33,6 +33,12 @@ export type FabricAgentTransport =
   | "localterm"
   | "herdr";
 export type FabricAgentRunner = "pi" | "claude" | "veda";
+
+/** How a child run's reported model is checked against the requested key.
+ * Strict fails the run on a mismatch. Permissive records the reported
+ * attribution instead, so virtual provider keys can resolve to a concrete
+ * backend at stream time. */
+export type FabricModelAdmission = "strict" | "permissive";
 export type FabricUiWidgetMode = "auto" | "always" | "hidden";
 type FabricToolDisplayMode = "full" | "compact";
 export type FabricResultFormat = "auto" | "yaml" | "json" | "text";
@@ -48,6 +54,12 @@ interface FabricExecutorConfig {
   kernel: FabricKernel;
   pythonRuntime: FabricPythonRuntime;
   cpython: { binary: string };
+  /** Optional jev-fabric backend for durable tasks and sessions (macOS/Linux).
+   * `binary` empty or "auto" picks the user's compatible install outside the
+   * workspace, then the bundled package; an explicit path never falls back.
+   * `home` empty means JEV_FABRIC_HOME, else `<cwd>/.jev-fabric-native`, the
+   * same store other harnesses share. `timeoutMs` is the default job lifetime. */
+  jevFabric: { binary: string; home: string; timeoutMs: number };
   /** TypeScript backend only; ignored by the Python kernel. */
   runtime: FabricExecutorRuntime;
   timeoutMs: number;
@@ -102,8 +114,19 @@ export interface FabricMcpJevConfig {
   semanticMinProbability: number;
 }
 
+const nativeMcpServersValue = (value: unknown): string[] => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 256 || value.some(name =>
+    typeof name !== "string" || !/^[A-Za-z0-9_-]+$/.test(name.trim()))) {
+    throw new Error("mcp.nativeServers must be an array of at most 256 exact Pi MCP server names (letters, digits, _ and -)");
+  }
+  return [...new Set(value.map((name: string) => name.trim()))];
+};
+
 export interface FabricMcpConfig {
   enabled: boolean;
+  /** Opt-in exact server names owned by Pi, never mcporter fallback targets. */
+  nativeServers?: string[];
   configPath?: string;
   disableOAuth: boolean;
   allowDynamicServers: boolean;
@@ -179,6 +202,8 @@ export interface FabricAgentConfig {
   sessionExportDir: string;
   /** Unix niceness 0-19 for every child agent; 0 leaves priority unchanged. */
   nice: number;
+  /** Admission policy for the model a child process actually reports. */
+  modelAdmission: FabricModelAdmission;
 }
 
 export interface FabricToolCaptureConfig {
@@ -289,6 +314,16 @@ interface FabricEntropyConfig {
   compile: boolean;
 }
 
+/** One configured portable memory source (see docs/memory-recall.md). */
+export interface FabricMemorySourceConfig {
+  /** Registry id used as `args.source` in source-qualified memory calls. */
+  id: string;
+  /** Adapter kind; `"fs"` walks a local directory of session JSONL files. */
+  kind: "fs";
+  /** Absolute directory the `fs` adapter enumerates recursively. */
+  root: string;
+}
+
 export interface FabricMemoryConfig {
   enabled: boolean;
   indexDir?: string;
@@ -307,6 +342,8 @@ export interface FabricMemoryConfig {
   regexMaxHaystackTerms?: number;
   regexMaxHaystackBytes?: number;
   regexTimeoutMs?: number;
+  /** Configured portable sources; present enables source-qualified calls. */
+  sources?: FabricMemorySourceConfig[];
 }
 
 export interface FabricSpeculationConfig {
@@ -395,6 +432,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     kernel: "typescript",
     pythonRuntime: "monty",
     cpython: { binary: "python3" },
+    jevFabric: { binary: "", home: "", timeoutMs: 3_600_000 },
     runtime: "quickjs",
     timeoutMs: 120_000,
     maxTimeoutMs: 900_000,
@@ -415,6 +453,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   mcp: {
     enabled: true,
+    nativeServers: [],
     disableOAuth: true,
     allowDynamicServers: true,
     callTimeoutMs: 120_000,
@@ -457,6 +496,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     sessionExport: true,
     sessionExportDir: "",
     nice: 0,
+    modelAdmission: "strict",
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
   records: structuredClone(DEFAULT_RECORDS_CONFIG),
@@ -645,6 +685,12 @@ const stringValue = (value: unknown): string | undefined =>
 const runnerValue = (value: unknown, fallback: FabricAgentRunner): FabricAgentRunner =>
   value === "pi" || value === "claude" || value === "veda" ? value : fallback;
 
+const modelAdmissionValue = (
+  value: unknown,
+  fallback: FabricModelAdmission,
+): FabricModelAdmission =>
+  value === "strict" || value === "permissive" ? value : fallback;
+
 const prewalkModeValue = (
   value: unknown,
   fallback: FabricPrewalkMode,
@@ -724,9 +770,50 @@ const riskValue = (value: unknown, fallback: FabricRisk): FabricRisk =>
     ? value
     : fallback;
 
+const MEMORY_SOURCE_ID_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
+
+/**
+ * Parse `memory.sources`. A wrong-typed value stays absent like every other
+ * memory key, but a present array with malformed entries is a hard config
+ * error: a silently dropped source would surface only as a confusing
+ * `source_not_found` at call time. The id charset is the portable registry's
+ * SOURCE_ID_PATTERN restricted to lowercase.
+ */
+const memorySourcesValue = (value: unknown): FabricMemorySourceConfig[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const sources: FabricMemorySourceConfig[] = [];
+  const seen = new Set<string>();
+  value.forEach((raw, index) => {
+    const entry = objectValue(raw);
+    const where = `memory.sources[${index}]`;
+    const id = stringValue(entry.id);
+    if (!id || !MEMORY_SOURCE_ID_PATTERN.test(id)) {
+      throw new Error(
+        `Invalid ${where}: id must be 1-128 chars of lowercase letters, digits, dot, underscore, or dash, starting with a letter or digit`,
+      );
+    }
+    if (entry.kind !== "fs") {
+      throw new Error(
+        `Invalid ${where}: unknown kind ${JSON.stringify(entry.kind ?? null)}; expected "fs"`,
+      );
+    }
+    const root = stringValue(entry.root);
+    if (!root || !path.isAbsolute(root)) {
+      throw new Error(`Invalid ${where}: root must be an absolute directory path`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`Invalid ${where}: duplicate source id ${JSON.stringify(id)}`);
+    }
+    seen.add(id);
+    sources.push({ id, kind: "fs", root });
+  });
+  return sources.length > 0 ? sources : undefined;
+};
+
 export const normalizeFabricConfig = (input: Record<string, unknown>): FabricConfig => {
   const executor = objectValue(input.executor);
   const cpython = objectValue(executor.cpython);
+  const jevFabric = objectValue(executor.jevFabric);
   const executorKernel = executorKernelValue(executor.kernel, DEFAULT_FABRIC_CONFIG.executor.kernel);
   const executorMaxTimeoutMs = boundedInteger(
     executor.maxTimeoutMs,
@@ -749,6 +836,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const actors = objectValue(input.actors);
   const mesh = objectValue(input.mesh);
   const memory = objectValue(input.memory);
+  const memorySources = memorySourcesValue(memory.sources);
   const entropy = objectValue(input.entropy);
   const repairs = objectValue(input.repairs);
   const modelsSection = objectValue(input.models);
@@ -865,6 +953,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       cpython: {
         binary: stringValue(cpython.binary)?.trim() ?? DEFAULT_FABRIC_CONFIG.executor.cpython.binary,
       },
+      jevFabric: {
+        binary: stringValue(jevFabric.binary)?.trim() ?? DEFAULT_FABRIC_CONFIG.executor.jevFabric.binary,
+        home: stringValue(jevFabric.home)?.trim() ?? "",
+        timeoutMs: boundedInteger(jevFabric.timeoutMs, DEFAULT_FABRIC_CONFIG.executor.jevFabric.timeoutMs, 1_000, MAX_EXECUTOR_TIMEOUT_MS),
+      },
       runtime: executorRuntime,
       maxTimeoutMs: boundedInteger(
         executor.maxTimeoutMs,
@@ -934,6 +1027,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     },
     mcp: {
       enabled: booleanValue(mcp.enabled, DEFAULT_FABRIC_CONFIG.mcp.enabled),
+      nativeServers: nativeMcpServersValue(mcp.nativeServers),
       ...(configPath ? { configPath } : {}),
       disableOAuth: booleanValue(mcp.disableOAuth, DEFAULT_FABRIC_CONFIG.mcp.disableOAuth),
       allowDynamicServers: booleanValue(
@@ -1078,6 +1172,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           ? agents.sessionExportDir
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
+      modelAdmission: modelAdmissionValue(
+        agents.modelAdmission,
+        DEFAULT_FABRIC_CONFIG.agents.modelAdmission,
+      ),
     },
     jev: normalizeJevConfig(input.jev),
     records: normalizeRecordsConfig(input.records),
@@ -1223,6 +1321,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     memory: {
       enabled: booleanValue(memory.enabled, DEFAULT_FABRIC_CONFIG.memory.enabled),
       ...(memoryIndexDir ? { indexDir: memoryIndexDir } : {}),
+      ...(memorySources ? { sources: memorySources } : {}),
       maxSessions: boundedInteger(
         memory.maxSessions,
         DEFAULT_FABRIC_CONFIG.memory.maxSessions,
@@ -1582,6 +1681,9 @@ export const saveFabricConfig = (
   const input = readJsonObjectFile(targetPath);
   const existing = migrateFabricConfigDocument(input?.document ?? {}).document;
   const merged = mergeObjects(existing, partial) as Record<string, unknown>;
+  // Reject invalid ownership before the settings UI replaces a working file.
+  // Do not normalize the whole document: saved layers must remain sparse.
+  nativeMcpServersValue(objectValue(merged.mcp).nativeServers);
   // Never stamp down: preserve version markers written by newer builds.
   merged.configVersion = Math.max(
     typeof merged.configVersion === "number" ? merged.configVersion : 0,

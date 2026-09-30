@@ -48,7 +48,7 @@ export interface FabricConversationTarget {
   canStop: boolean;
   readOnlyReason?: string;
   stale?: boolean;
-  /** Latest activity timestamp; enables an unread marker in the target picker. */
+  /** Latest activity timestamp; orders the target picker and enables unread markers. */
   updatedAt?: number;
 }
 
@@ -234,7 +234,7 @@ const isMainTarget = (target: FabricConversationTarget | undefined): boolean =>
 
 interface PickerRow {
   target: FabricConversationTarget;
-  depth: number;
+  active: boolean;
 }
 
 export class FabricConversationView implements Component, Focusable {
@@ -249,6 +249,7 @@ export class FabricConversationView implements Component, Focusable {
   private editorEpoch = -1;
   private pickerInput: Input | undefined;
   private pickerRows: PickerRow[] = [];
+  private pickerOrder: { id: string; active: boolean }[] = [];
   private pickerSelectedId: string | undefined;
   private mode: "conversation" | "picker" = "conversation";
   private currentId: string | undefined;
@@ -461,8 +462,10 @@ export class FabricConversationView implements Component, Focusable {
     this.ensureEditorEpoch();
     this.updateTargets();
     if (event.type === "wheel") {
-      if (this.mode === "picker") this.movePickerSelection((event.wheelDelta ?? 0) < 0 ? -1 : 1);
-      else this.scrollBy(event.wheelDelta ?? 0);
+      if (this.mode === "picker") {
+        this.refreshPicker();
+        this.movePickerSelection((event.wheelDelta ?? 0) < 0 ? -1 : 1);
+      } else this.scrollBy(event.wheelDelta ?? 0);
       this.tui.requestRender();
       return { handled: true };
     }
@@ -1241,6 +1244,14 @@ export class FabricConversationView implements Component, Focusable {
     this.pickerInput.onSubmit = () => this.pickSelected();
     if (this.editor) this.editor.focused = false;
     this.pickerSelectedId = this.currentId ?? this.nonMainTargets()[0]?.id;
+    // Freeze membership, groups and recency for this visit. Live metadata still
+    // refreshes, but completions, new runs and search cannot reshuffle the list.
+    this.pickerOrder = [...this.targetsById.values()]
+      .map((target) => ({ target, active: isMainTarget(target) || (!target.stale && isActiveStatus(target.status)) }))
+      .sort((left, right) => Number(right.active) - Number(left.active) ||
+        (right.target.updatedAt ?? 0) - (left.target.updatedAt ?? 0))
+      .map(({ target, active }) => ({ id: target.id, active }));
+    this.pickerKey = "";
     this.refreshPicker();
   }
 
@@ -1248,6 +1259,7 @@ export class FabricConversationView implements Component, Focusable {
     this.mode = "conversation";
     this.pickerInput = undefined;
     this.pickerRows = [];
+    this.pickerOrder = [];
     this.pickerKey = "";
     this.pickerSelectedId = undefined;
     if (this.editor) this.editor.focused = this.focusState;
@@ -1258,35 +1270,16 @@ export class FabricConversationView implements Component, Focusable {
     const key = JSON.stringify([this.targetsKey, search]);
     if (key === this.pickerKey) return;
     this.pickerKey = key;
-    const rows: PickerRow[] = [];
-    const targets = this.currentTargets();
-    const children = new Map<string, FabricConversationTarget[]>();
-    for (const target of targets) {
-      if (!target.parentId) continue;
-      const siblings = children.get(target.parentId) ?? [];
-      siblings.push(target);
-      children.set(target.parentId, siblings);
-    }
-    const roots = targets.filter(
-      (target) => !target.parentId || !this.targetsById.has(target.parentId),
-    );
-    roots.sort((left, right) =>
-      Number(isMainTarget(right)) - Number(isMainTarget(left)),
-    );
-    const visited = new Set<string>();
-    const pushTree = (target: FabricConversationTarget, depth: number): void => {
-      if (visited.has(target.id)) return;
-      visited.add(target.id);
-      rows.push({ target, depth });
-      for (const child of children.get(target.id) ?? []) pushTree(child, depth + 1);
-    };
-    for (const root of roots) pushTree(root, 0);
-    for (const orphan of targets) {
-      if (!visited.has(orphan.id)) rows.push({ target: orphan, depth: 0 });
-    }
-    const filtered = search.trim()
-      ? fuzzyFilter(rows, search, (row) => `${row.target.kind} ${row.target.name} ${row.target.id}`)
-      : rows;
+    const rows: PickerRow[] = this.pickerOrder.flatMap(({ id, active }) => {
+      const target = this.targetById(id);
+      return target ? [{ target, active }] : [];
+    });
+    const matches = search.trim()
+      ? new Set(fuzzyFilter(rows, search, (row) => `${row.target.kind} ${row.target.name} ${row.target.id}`)
+        .map((row) => row.target.id))
+      : undefined;
+    // Fuzzy matching decides membership, not rank: keep the frozen group order.
+    const filtered = matches ? rows.filter((row) => matches.has(row.target.id)) : rows;
     this.pickerRows = filtered;
     // Selection identity is the target id, stable across roster updates.
     if (!filtered.some((row) => row.target.id === this.pickerSelectedId)) {
@@ -1321,6 +1314,7 @@ export class FabricConversationView implements Component, Focusable {
   }
 
   private handlePickerInput(data: string): void {
+    this.refreshPicker();
     const input = this.pickerInput;
     if (!input) {
       this.closePicker();
@@ -1515,18 +1509,38 @@ export class FabricConversationView implements Component, Focusable {
     }
     const rows = this.pickerRows;
     const selectedIndex = this.pickerSelectedIndex();
+    const entries: (PickerRow | string)[] = [];
+    let selectedLine = 0;
+    let previousGroup: boolean | undefined;
+    for (const row of rows) {
+      if (row.active !== previousGroup) entries.push(row.active ? "Active" : "Inactive");
+      previousGroup = row.active;
+      if (row.target.id === this.pickerSelectedId) selectedLine = entries.length;
+      entries.push(row);
+    }
     const listBudget = Math.max(1, budget - lines.length - 1);
-    const startIndex = Math.max(
+    let startIndex = Math.max(
       0,
-      Math.min(selectedIndex - Math.floor(listBudget / 2), rows.length - listBudget),
+      Math.min(selectedLine - Math.floor(listBudget / 2), entries.length - listBudget),
     );
-    const endIndex = Math.min(startIndex + listBudget, rows.length);
+    // Repeat the section label when scrolled into a group, without letting the
+    // extra header push the selected target out of a short viewport.
+    if (listBudget > 1 && typeof entries[startIndex] !== "string") {
+      startIndex = Math.max(startIndex, selectedLine - listBudget + 2);
+    }
+    const first = entries[startIndex];
+    const stickyHeader = listBudget > 1 && first !== undefined && typeof first !== "string";
+    if (stickyHeader) lines.push(this.theme.fg("muted", first.active ? "  Active" : "  Inactive"));
+    const endIndex = Math.min(startIndex + listBudget - Number(stickyHeader), entries.length);
     if (rows.length === 0) lines.push(this.theme.fg("muted", "  no matching targets"));
     for (let i = startIndex; i < endIndex; i++) {
-      const row = rows[i];
-      if (!row) continue;
+      const row = entries[i];
+      if (row === undefined) continue;
+      if (typeof row === "string") {
+        lines.push(this.theme.fg("muted", `  ${row}`));
+        continue;
+      }
       const selected = row.target.id === this.pickerSelectedId;
-      const indent = "  ".repeat(row.depth + 1);
       const marker = selected ? this.theme.fg("accent", "→ ") : "  ";
       const unread = this.isUnread(row.target) ? this.theme.fg("accent", " ●") : "";
       const label = isMainTarget(row.target)
@@ -1534,13 +1548,13 @@ export class FabricConversationView implements Component, Focusable {
         : `${safeText(row.target.name)} ${this.theme.fg("muted", `(${row.target.kind} · ${row.target.status})`)}`;
       lines.push(
         truncateToWidth(
-          `${indent}${marker}${selected ? this.theme.fg("accent", label) : label}${unread}`,
+          `  ${marker}${selected ? this.theme.fg("accent", label) : label}${unread}`,
           innerWidth,
           "",
         ),
       );
     }
-    if (rows.length > listBudget) {
+    if (entries.length > listBudget) {
       lines.push(this.theme.fg("muted", `  (${selectedIndex + 1}/${rows.length})`));
     }
     return lines.slice(0, budget);

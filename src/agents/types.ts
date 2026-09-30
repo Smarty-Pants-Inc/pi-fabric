@@ -66,6 +66,8 @@ export interface AgentRunRequest {
   /** With a schema on the Pi runner: the result is one fabric_reply tool call (smarty-dev#967). */
   replyTool?: boolean;
   systemPrompt?: string;
+  /** Opt in to Claude Code transcript persistence for hook-based observability. */
+  persistSession?: boolean;
   sessionFile?: string;
   /** Host-owned actor activation policy, not a one-shot provider argument. */
   inferenceContext?: "full-history" | "activation";
@@ -228,6 +230,8 @@ export interface AgentWorkerOptions {
   model?: string;
   thinking?: string;
   systemPrompt?: string;
+  persistSession?: boolean;
+  modelAdmission?: "strict" | "permissive";
   sessionFile?: string;
   inferenceContext?: "full-history" | "activation";
   sessionExportFile?: string;

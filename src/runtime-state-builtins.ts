@@ -4,17 +4,21 @@ import { createProviderComponent, type FabricProviderComponent, type FabricProvi
 import type { FabricConfig } from "./config.js";
 import type { ActionRegistry } from "./core/action-registry.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
+import { createConfiguredMemorySourceRegistry } from "./memory/fs-source.js";
 import type { MeshStore, MeshIdentity } from "./mesh/store.js";
 import type { ParticipantDirectory } from "./topology/participant-directory.js";
 import { CapturedToolsProvider } from "./providers/captured-tools-provider.js";
 import { McpDescriptorCacheStore, mcpDescriptorCachePath } from "./providers/mcp-descriptor-cache.js";
 import { McpProvider } from "./providers/mcp-provider.js";
+import { PiNativeMcpTools } from "./providers/pi-native-mcp.js";
+import { isSelectedNativeMcpTool } from "./core/native-mcp-identity.js";
 import type { MemoryProviderContext } from "./providers/memory-provider.js";
 import { WorkerMemoryProvider } from "./memory/worker-provider.js";
 import { MeshProvider } from "./providers/mesh-provider.js";
 import { PiToolsProvider } from "./providers/pi-tools-provider.js";
 import { powerShellToolDefinitionFactory } from "./providers/pi-bash-cwd.js";
 import type { FabricShellJobStore } from "./core/shell-jobs.js";
+import { SessionsProvider } from "./providers/sessions-provider.js";
 import { TasksProvider } from "./providers/tasks-provider.js";
 import { StateProvider } from "./providers/state-provider.js";
 
@@ -22,6 +26,8 @@ import type { FabricManagedHost } from "./managed-host.js";
 
 /** Built-in provider recipes and policy; the runtime chooses installation order. */
 export class RuntimeStateBuiltins {
+  /** Installed only with a jev-fabric bridge: off Windows, outside managed hosts. */
+  #sessions = false;
   constructor(
     private readonly manifest: FabricProviderComponentManifest,
     private readonly registry: ActionRegistry,
@@ -49,7 +55,7 @@ export class RuntimeStateBuiltins {
     // namespace in enforce mode.
     const capturedToolsProvider =
       effectiveFullCodeMode && (config.capture.enabled || enforceSchema)
-        ? new CapturedToolsProvider(capturedTools)
+        ? new CapturedToolsProvider(capturedTools, entry => config.mcp.enabled && isSelectedNativeMcpTool(entry.definition, config.mcp.nativeServers))
         : undefined;
     if (effectiveFullCodeMode) {
       await this.install(createProviderComponent({
@@ -73,11 +79,23 @@ export class RuntimeStateBuiltins {
         provider: "tasks", description: "Session-owned shell tasks and monitors",
         create: () => new TasksProvider(shell.jobs),
       }));
+      // Interactive children need jev-fabric, which exists only off Windows and outside managed hosts.
+      const durable = shell.jobs.durable;
+      if (durable) {
+        this.#sessions = true;
+        await this.install(createProviderComponent({
+          provider: "sessions", description: "Interactive jev-fabric children: open, write, read, wait and stop",
+          create: () => new SessionsProvider(durable, { cwd, shellOverride: () => capturedTools.get("bash") !== undefined }),
+        }));
+      }
     }
     await this.install(createProviderComponent({
       provider: "mcp",
       description: "MCP runtime and descriptor cache",
       create: () => new McpProvider(cwd, config.mcp, {
+        ...(config.mcp.nativeServers?.length
+          ? { native: new PiNativeMcpTools(capturedTools, config.mcp.nativeServers, config.mcp.callTimeoutMs) }
+          : {}),
         ...(config.mcp.cache.enabled
           ? {
               cache: new McpDescriptorCacheStore(mcpDescriptorCachePath(cwd)),
@@ -135,12 +153,16 @@ export class RuntimeStateBuiltins {
       await this.install(createProviderComponent({provider: "memory", description: "Managed current-session recall", create: () => this.managedHost!.provider("memory")}));
     } else if (config.memory.enabled) {
       const sessionFile = context.sessionManager.getSessionFile();
+      const sources = config.memory.sources && config.memory.sources.length > 0
+        ? createConfiguredMemorySourceRegistry(config.memory.sources)
+        : undefined;
       const memoryContext: MemoryProviderContext = {
         agentDir: resolveAgentDir(),
         cwd: context.cwd,
         config: config.memory,
         sessionId,
         ...(sessionFile ? { sessionFile } : {}),
+        ...(sources ? { sources } : {}),
         getLiveBranch: () => ({
           entries: context.sessionManager.getBranch(),
           leafId: context.sessionManager.getLeafId(),
@@ -162,6 +184,7 @@ export class RuntimeStateBuiltins {
   assertActive(config: FabricConfig): void {
     const expectedBuiltinProviders = new Set<string>([
       ...(config.fullCodeMode || config.schema.mode === "enforce" ? ["pi", ...(!this.managedHost ? ["tasks"] : [])] : []),
+      ...(this.#sessions ? ["sessions"] : []),
       ...(config.fullCodeMode && config.capture.enabled && config.schema.mode !== "enforce" ? ["extensions"] : []),
       "mcp",
       ...(config.mesh.enabled ? ["mesh", "state"] : ["mesh", "state"].filter((name) => this.managedHost?.has(name))),

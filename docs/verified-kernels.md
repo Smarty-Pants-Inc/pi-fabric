@@ -204,7 +204,7 @@ author-defined observational equivalence are not claimed as Bend theorems.
 
 ## Reproducible bridge
 
-The contributor toolchain pins **Bend 2.0.26**. Installed Fabric needs neither
+The contributor toolchain pins **Bend 2.0.34**. Installed Fabric needs neither
 Bend nor a Bend loader. Linux CI downloads that exact release archive and checks
 its SHA-256 before running proofs. Windows tests execute the checked-in generated
 JS and ABI; native Bend currently requires Linux, macOS, or WSL.
@@ -224,16 +224,20 @@ bun run proof:dist        # probe the actual bundled registry/compactor and kern
 `BEND_BIN` may explicitly select a trusted compiler executable. Generation sets
 `BEND_NO_TELEMETRY=1`. It never installs or updates Bend automatically.
 
-Bend's CLI emits executable JavaScript, not a library switch. A pure `IO.pure`
-main keeps the kernel definitions reachable for compilation. The build bridge:
+Bend's `-o *.mjs` backend emits an ES module whose default export table wraps
+every definition in Bend's own trampoline and host `Nat` (`BigInt`) marshalling.
+The build bridge:
 
 1. Checks the entire root proof file and its imported laws.
 2. Refuses unsafe declarations, holes, foreign effects, remote imports, and
    untracked local proof dependencies.
 3. Compiles the same kernel source that those laws import.
-4. Parses the emitted program and requires the exact pinned CLI footer.
-5. Removes only its two invocation statements and exports the compiler-produced
-   definitions through Bend's own trampoline, checking names and arities.
+4. Parses the emitted module, requires its export table as the only footer and
+   no top-level invocation statements.
+5. Keeps only the ABI entries of that table, checking names and arities. Bend
+   tags constructors with their declaring module (`lifecycle.Life`); the bridge
+   maps them to the ABI's bare tags at the boundary and refuses generation when
+   a bare tag would be ambiguous within a kernel.
 6. Tree-shakes unused runtime code and rejects host IO/imports before compacting
    compiler-local identifiers and syntax. Public ABI export names stay stable.
 7. Writes generated JS, ABI declarations, and a SHA-256 receipt over the proof

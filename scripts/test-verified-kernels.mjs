@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const env = { ...process.env, BEND_NO_TELEMETRY: "1" };
 const bend = process.env.BEND_BIN || "bend";
-if (execFileSync(bend, ["version"], { encoding: "utf8", env }).trim() !== "bend 2.0.26") throw new Error("Bend 2.0.26 required");
+if (execFileSync(bend, ["version"], { encoding: "utf8", env }).trim() !== "bend 2.0.34") throw new Error("Bend 2.0.34 required");
 const inputs = JSON.parse(readFileSync(join(root, "src/verified/generated/manifest.json"), "utf8")).inputs;
 const originals = Object.fromEntries(Object.keys(inputs).filter((path) => path.endsWith(".bend")).map((path) => [path, readFileSync(join(root, path), "utf8")]));
 const mutations = [
@@ -41,8 +41,8 @@ const mutations = [
   ["authority wrapper widening", "proofs/authority-kernel.bend", "A.derive(parent, candidate)", "A.issue(candidate)"],
   ["authority wrapper release reuse", "proofs/authority-kernel.bend", "A.release(authority)", "authority"],
   ["lifecycle uncounted work", "proofs/lifecycle.bend", "Life{phase, owner, holds, 1n+calls, revoked}, Granted{}", "Life{phase, owner, holds, calls, revoked}, Granted{}"],
-  ["lifecycle close under lease", "proofs/lifecycle.bend", "case Close{} Life{Retiring{}, False{}, 0n, 0n, revoked}:", "case Close{} Life{Retiring{}, False{}, holds, 0n, revoked}:"],
-  ["lifecycle close under work", "proofs/lifecycle.bend", "case Close{} Life{Retiring{}, False{}, 0n, 0n, revoked}:", "case Close{} Life{Retiring{}, False{}, 0n, calls, revoked}:"],
+  ["lifecycle close under lease", "proofs/lifecycle.bend", "case Shut{} Life{Retiring{}, False{}, 0n, 0n, revoked}:", "case Shut{} Life{Retiring{}, False{}, holds, 0n, revoked}:"],
+  ["lifecycle close under work", "proofs/lifecycle.bend", "case Shut{} Life{Retiring{}, False{}, 0n, 0n, revoked}:", "case Shut{} Life{Retiring{}, False{}, 0n, calls, revoked}:"],
   ["lifecycle revocation drops work", "proofs/lifecycle.bend", "Life{retiring(phase), False{}, holds, calls, True{}}", "Life{retiring(phase), False{}, holds, 0n, True{}}"],
   ["lifecycle owner release drops holds", "proofs/lifecycle.bend", "Life{phase, False{}, holds, calls, revoked}, Granted{}", "Life{phase, False{}, 0n, calls, revoked}, Granted{}"],
   ["lifecycle close not reserved", "proofs/lifecycle.bend", "Life{Closing{}, False{}, 0n, 0n, revoked}, StartClose{}", "Life{Retiring{}, False{}, 0n, 0n, revoked}, StartClose{}"],

@@ -15,6 +15,8 @@ import {
   poolToValueObservations,
   saveObservationPool,
   saveObservationPoolAsync,
+  updateObservationPoolAsync,
+  SessionObservationCache,
   type EntropyObservationWindow,
   type EntropyValueObservation,
 } from "../src/entropy/index.js";
@@ -174,6 +176,48 @@ describe("mergeObservationWindow", () => {
 });
 
 describe("observation pool store", () => {
+  it("never commits an atomic pool update when a warmed merge completes after cancellation", async () => {
+    const agentDir = makeTempDir();
+    const controller = new AbortController();
+    const cache = new SessionObservationCache();
+    const merge = cache.merge.bind(cache);
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    cache.merge = async (pool, windows, signal) => { entered(); await gate; return merge(pool, windows, signal); };
+    const pending = updateObservationPoolAsync(agentDir, [window("a", [obs("x", "mode", "fast")])], cache, controller.signal);
+    const rejected = expect(pending).rejects.toThrow(/abort/i);
+    await started; controller.abort(); release(); await rejected;
+    expect(loadObservationPool(agentDir)).toEqual({});
+    expect(fs.existsSync(path.join(agentDir, "fabric", "entropy", "observation-pool.lock"))).toBe(false);
+  });
+
+  it("rebases warmed snapshots on the locked pool without losing sibling writes", async () => {
+    const agentDir = makeTempDir();
+    const first = [window("a.jsonl", [obs("mcp.flags.set", "level", "info", 3)])];
+    const second = [window("b.jsonl", [obs("mcp.flags.set", "level", "warn", 2)])];
+    const firstCache = new SessionObservationCache();
+    const secondCache = new SessionObservationCache();
+    await Promise.all([firstCache.merge(undefined, first), secondCache.merge(undefined, second)]);
+    expect((await updateObservationPoolAsync(agentDir, first, firstCache)).written).toBe(true);
+    expect((await updateObservationPoolAsync(agentDir, second, secondCache)).written).toBe(true);
+    expect((await updateObservationPoolAsync(agentDir, first, firstCache)).written).toBe(false);
+    expect(poolToValueObservations(loadObservationPool(agentDir).file!)).toEqual([
+      obs("mcp.flags.set", "level", "info", 3), obs("mcp.flags.set", "level", "warn", 2),
+    ]);
+  });
+
+  it("leaves damaged evidence intact instead of self-repairing it into authority", async () => {
+    const agentDir = makeTempDir();
+    const target = path.join(agentDir, "fabric", "entropy", "observation-pool.json");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, "{ damaged");
+    await expect(updateObservationPoolAsync(agentDir, [])).rejects.toThrow("malformed JSON");
+    expect(fs.readFileSync(target, "utf8")).toBe("{ damaged");
+    expect(fs.existsSync(path.join(path.dirname(target), "observation-pool.lock"))).toBe(false);
+  });
+
+
   it("round-trips the pool, no-ops identical writes, and surfaces damage", async () => {
     const agentDir = makeTempDir();
     expect(loadObservationPool(agentDir)).toEqual({});

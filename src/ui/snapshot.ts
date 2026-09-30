@@ -253,8 +253,12 @@ export const createDashboardSnapshot = (
         : agent;
     });
   const localAgentIds = new Set(localAgents.map((agent) => agent.id));
+  // The dashboard retains the project's agents; the widget filters own lineage
+  // independently. Dropping peers here hides fleet state and breaks file-only refresh.
   const remoteAgents: FabricUiAgent[] = participants
-    .filter((participant) => participant.kind === "agent" && !localAgentIds.has(participant.id))
+    .filter((participant) =>
+      participant.kind === "agent" &&
+      !localAgentIds.has(participant.id))
     .map((participant) => ({
       id: participant.id,
       name: participant.name,

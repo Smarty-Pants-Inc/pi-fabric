@@ -76,6 +76,8 @@ interface FabricAgentRequest {
   instructions?: string;
   timeout_ms?: number;
   residency?: FabricParticipantResidency;
+  /** Opt in to session persistence for hook-based observability and external trace ingestion. */
+  persistSession?: boolean;
 }
 interface FabricHandoffCall {
   readonly ref: string;
@@ -528,7 +530,10 @@ type PiShellOptions = {
   monitor?: { delivery: "ui" | "wake"; timeoutMs?: number; intervalMs?: number; match?: string };
   cwd?: string; workdir?: string; directory?: string; workingDirectory?: string;
 };
-type PiBashOptions = PiShellOptions;
+type PiBashOptions = PiShellOptions & {
+  /** Owned by an external jev-fabric store (macOS/Linux): keeps running if Pi exits and reattaches on resume. Implies background. */
+  durable?: boolean;
+};
 type PiPowerShellOptions = PiShellOptions;
 type PiGrepOptions = { path?: string; glob?: string; globPattern?: string; ignoreCase?: boolean; ic?: boolean; caseInsensitive?: boolean; literal?: boolean; context?: number; ctx?: number; limit?: number; max?: number };
 type PiFindOptions = { path?: string; limit?: number; max?: number };
@@ -1495,6 +1500,8 @@ interface FabricPrewalkFileIdentityStatus {
   stale: boolean;
 }
 interface FabricPrewalkApi {
+  /** Only when Fabric's armed advisory or checkpoint requests an executor handoff plan.
+   * Not a task planner, checklist, or acceptance-ledger store; unavailable otherwise. */
   plan(args: {
     outcome: string;
     steps: string[];

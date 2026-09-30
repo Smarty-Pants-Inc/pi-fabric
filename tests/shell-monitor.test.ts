@@ -32,13 +32,13 @@ describe("shell monitor", () => {
     const monitor = new ShellMonitor(options(), emit);
     monitor.append(Buffer.alloc(1024 * 1024, 97));
     monitor.append(Buffer.from("\n"));
-    for (let i = 0; i < 100; i++) monitor.append(Buffer.from(`event ${i}\n`));
+    for (let i = 0; i < 300; i++) monitor.append(Buffer.from(`event ${i}\n`));
     await vi.advanceTimersByTimeAsync(1000);
     expect(emit).toHaveBeenCalledOnce();
     const batch = emit.mock.calls[0]![0];
-    expect(batch.lines).toHaveLength(8);
-    expect(batch.lines.at(-1)).toBe("event 99");
-    expect(batch.omitted).toBe(93);
+    expect(batch.lines).toHaveLength(256);
+    expect(batch.lines.at(-1)).toBe("event 299");
+    expect(batch.omitted).toBe(45);
     monitor.close();
   });
 

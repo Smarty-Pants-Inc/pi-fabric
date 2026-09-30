@@ -86,7 +86,7 @@ return { recorded, ready, text, required, claimed, hash };
         expect(controller.planReady("prewalk-guest")).toBe(true);
         const duplicate = await run(`return await prewalk.plan(${JSON.stringify(plan)})`);
         expect(duplicate.success).toBe(false);
-        expect(duplicate.error).toContain("not awaiting a plan");
+        expect(duplicate.error).toContain("Unknown Fabric action: prewalk.plan");
         controller.arm({ model: "example/executor", sessionId: "prewalk-guest", requirePlan: true });
         const invalid = await run(`return await prewalk.plan(${JSON.stringify({ ...plan, steps: [] })})`);
         expect(invalid.success).toBe(false);

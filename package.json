@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric",
-  "version": "0.97.0",
+  "version": "0.102.0",
   "description": "A programmable tool and agent runtime for Pi",
   "type": "module",
   "main": "./dist/index.js",
@@ -60,6 +60,7 @@
     "proof:dist": "node scripts/smoke-verified-kernels.mjs",
     "build": "bun run proof:artifact && node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/build.mjs && bun run assert:build-artifacts",
     "typecheck": "tsc --noEmit",
+    "test:pi99": "bun run build && vitest run tests/pi99-sdk.test.ts",
     "test:jev:live": "PI_FABRIC_JEV_LIVE=1 vitest run tests/jev-live.test.ts",
     "test:jev:dist": "node scripts/smoke-jev.mjs",
     "test:changed": "node scripts/test-affected.mjs",
@@ -135,21 +136,22 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.87.0",
-    "@earendil-works/pi-ai": "0.87.0",
-    "@earendil-works/pi-coding-agent": "0.87.0",
-    "@earendil-works/pi-tui": "0.87.0",
+    "@earendil-works/pi-ai": "0.99.0",
+    "@earendil-works/pi-agent-core": "0.99.0",
+    "@earendil-works/pi-coding-agent": "0.99.0",
+    "@earendil-works/pi-tui": "0.99.0",
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^26.1.2",
     "@types/pg": "^8.23.1",
     "esbuild": "^0.25.12",
     "knip": "^6.29.0",
-    "typebox": "1.3.8",
+    "typebox": "1.3.27",
     "vitest": "^4.1.10"
   },
   "workspaces": [
@@ -159,5 +161,8 @@
     "ajv": {
       "fast-uri": "^3.1.6"
     }
+  },
+  "optionalDependencies": {
+    "jev-fabric": "0.5.0"
   }
 }

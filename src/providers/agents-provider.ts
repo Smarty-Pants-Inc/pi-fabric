@@ -68,6 +68,7 @@ import {
 } from "../config.js";
 import {
   FUZZY_RESOLUTION_MARKERS,
+  aliasThinking,
   resolveAvailablePiModel,
   resolveFabricModel,
   type FabricModelCandidate,
@@ -180,7 +181,21 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
   throw new Error(`Invalid Fabric agent kernel: ${String(value)}`);
 };
 
-const runRequest = (args: Record<string, unknown>, context: FabricInvocationContext, manager: AgentManager, options: {allowCwd?: boolean} = {}): AgentRunRequest => normalizeAgentRunRequest({...args, timeoutMs: longerTimeoutOverride(args.timeoutMs, manager)}, { ...manager.config, ...(context.extensionContext.model ? {inheritedModel: context.extensionContext.model} : {}) }, options);
+const runRequest = (
+  args: Record<string, unknown>,
+  context: FabricInvocationContext,
+  manager: AgentManager,
+  modelsConfig: FabricModelsConfig,
+  options: {allowCwd?: boolean} = {},
+): AgentRunRequest => normalizeAgentRunRequest(
+  {...args, timeoutMs: longerTimeoutOverride(args.timeoutMs, manager)},
+  {
+    ...manager.config,
+    models: modelsConfig,
+    ...(context.extensionContext.model ? {inheritedModel: context.extensionContext.model} : {}),
+  },
+  options,
+);
 
 const handoffTask = (args: Record<string, unknown>): string => {
   const task = typeof args.task === "string" ? args.task.trim() : "";
@@ -460,8 +475,15 @@ export class AgentsProvider implements FabricProvider {
     if (runner !== "pi") return args;
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) return args;
+    const thinking = isFabricThinking(args.thinking)
+      ? args.thinking
+      : aliasThinking(this.modelsConfig().aliases, model);
     const resolved = await this.#resolvePiModel(model, context);
-    return resolved === model ? args : { ...args, model: resolved };
+    return {
+      ...args,
+      ...(thinking ? { thinking } : {}),
+      ...(resolved === model ? {} : { model: resolved }),
+    };
   }
 
   async #resolvePiRunBinding(
@@ -523,7 +545,7 @@ export class AgentsProvider implements FabricProvider {
       "pi",
     );
     delete handoffArgs.cwd;
-    const request = runRequest({ ...handoffArgs, runner: "pi" }, context, this.manager);
+    const request = runRequest({ ...handoffArgs, runner: "pi" }, context, this.manager, this.modelsConfig());
     const kernel = this.manager.resolveKernel(request);
     delete handoffArgs.kernel;
     if (kernel) handoffArgs.kernel = kernel;
@@ -555,6 +577,7 @@ export class AgentsProvider implements FabricProvider {
       ),
       context,
       this.manager,
+      this.modelsConfig(),
       { allowCwd: false },
     );
     request.runner = "pi";
@@ -634,7 +657,7 @@ export class AgentsProvider implements FabricProvider {
       case "run": {
         const main = isInteractiveMain(context.extensionContext);
         const handle = await this.manager.spawn(
-          runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager),
+          runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig()),
           // Only the branded Main ceiling is observation-only, including during launch.
           // Escape and ordinary deadlines retain zero-progress child cancellation.
           main ? withoutMainExecutionCeiling(context.signal) : context.signal,
@@ -668,7 +691,7 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager);
+        const request = runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig());
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
         const durableCwd = request.residency === "durable" && request.cwd !== undefined

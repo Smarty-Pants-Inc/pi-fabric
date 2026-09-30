@@ -12,6 +12,11 @@ export interface ShellMonitorBatch {
   omitted: number;
 }
 
+/** Lines retained per delivery interval for replay; older lines in a burst are coalesced. */
+export const SHELL_MONITOR_INTERVAL_LINES = 256;
+/** Newest previews carried by an agent-facing monitor event. */
+export const SHELL_MONITOR_PREVIEWS = 8;
+
 export const shellMonitorSchema = {
   type: "object", additionalProperties: false, required: ["delivery"],
   properties: {
@@ -75,7 +80,7 @@ export class ShellMonitor {
     if (!line || (this.options.match && !line.includes(this.options.match)) || line === this.#previous) return;
     this.#previous = line;
     const preview = line.slice(0, 480) + (truncated || line.length > 480 ? " [line truncated]" : "");
-    if (this.#lines.length === 8) { this.#lines.shift(); this.#omitted++; }
+    if (this.#lines.length === SHELL_MONITOR_INTERVAL_LINES) { this.#lines.shift(); this.#omitted++; }
     this.#lines.push(preview);
     if (!this.#timer) {
       this.#timer = setTimeout(() => { this.#timer = undefined; this.#flush(); }, this.options.intervalMs);

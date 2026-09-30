@@ -202,18 +202,19 @@ export class LifecycleBroker {
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
     const listed = new Set<string>();
     let latestSequence: number | undefined;
+    // One directory snapshot, built only after the cheap ownership/cursor gates.
+    let directory: Map<string, FabricParticipantInfo> | undefined;
     for (const entry of entries) {
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
       listed.add(subscription.id);
-      // Only the target's host drains a subscription. Pass over other hosts' targets (from
-      // memory) and caught-up subscriptions before the directory read: that read parses every
-      // participant and host record, and ran for every subscription on every poll of every
-      // host, about a quarter of a core per idle Pi on the fleet mesh (smarty-dev#557).
       if (this.participants.publishes?.(subscription.to) === false) continue;
       latestSequence ??= this.mesh.latestSequence();
       if (latestSequence <= this.#cursor(subscription)) continue;
-      const target = this.participants.get(subscription.to);
+      directory ??= new Map(
+        this.participants.list({ scope: "project" }).map((record) => [record.id, record]),
+      );
+      const target = directory.get(subscription.to) ?? this.participants.get(subscription.to);
       if (!target || target.stale || !target.local) continue;
       await this.#drainSubscription(entry, subscription);
     }

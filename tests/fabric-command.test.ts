@@ -212,38 +212,53 @@ describe("/fabric command", () => {
     );
   });
 
-  it("uses the model picker when prewalk has no configured executor", async () => {
+  // Shared harness for the interactive prewalk executor-model tests: one
+  // /fabric registration with mockable picker surfaces.
+  const registerPrewalkPicker = async ({
+    custom,
+    hasUI = true,
+    models = [
+      { provider: "openai", id: "executor" },
+      { provider: "anthropic", id: "other" },
+    ],
+    prewalkModel,
+    selectResult,
+  }: {
+    custom?: unknown;
+    hasUI?: boolean;
+    models?: Array<{ provider: string; id: string }>;
+    prewalkModel?: string;
+    selectResult?: string;
+  }) => {
     let handler: ((argumentsText: string, context: ExtensionContext) => Promise<void>) | undefined;
     const sendMessage = vi.fn();
+    const sendUserMessage = vi.fn();
     const pi = {
-      sendUserMessage: vi.fn(),
+      sendUserMessage,
       sendMessage,
       registerCommand: vi.fn((_name: string, definition: { handler: typeof handler }) => {
         handler = definition.handler;
       }),
     } as unknown as ExtensionAPI;
+    vi.stubEnv("PI_CODING_AGENT_DIR", await mkdtemp(path.join(os.tmpdir(), "fabric-command-prewalk-")));
     const arm = vi.fn();
-    const select = vi.fn().mockResolvedValue("openai/executor");
+    const select = vi.fn().mockResolvedValue(selectResult);
+    const notify = vi.fn();
     const state = {
       ensure: vi.fn().mockResolvedValue(undefined),
       config: {
         fullCodeMode: true,
         schema: { mode: "off" },
-        prewalk: { mode: "in-place" },
+        prewalk: { mode: "in-place", model: prewalkModel },
         agents: { enabled: true },
       },
       prewalk: { arm, status: vi.fn(), cancel: vi.fn() },
     } as unknown as FabricState;
     const context = {
-      hasUI: true,
-      modelRegistry: {
-        getAvailable: () => [
-          { provider: "openai", id: "executor" },
-          { provider: "anthropic", id: "other" },
-        ],
-      },
+      hasUI,
+      modelRegistry: { getAvailable: () => models },
       sessionManager: { getSessionId: () => "session-1", getBranch: () => [] },
-      ui: { select, setStatus: vi.fn(), notify: vi.fn() },
+      ui: { select, custom, setStatus: vi.fn(), notify },
     } as unknown as ExtensionContext;
 
     registerFabricCommand(pi, {
@@ -254,7 +269,35 @@ describe("/fabric command", () => {
       suspendToolCapture: vi.fn(),
       autoArmPrewalk: vi.fn(async () => {}),
     });
-    await handler!("prewalk", context);
+    return { handler: handler!, context, arm, select, custom, sendMessage, sendUserMessage, notify };
+  };
+
+  // Drives a FabricModelSelector custom dialog with a single keypress.
+  const customPickerDriver = (input: string) =>
+    vi.fn(
+      (
+        factory: (
+          tui: unknown,
+          theme: unknown,
+          keybindings: unknown,
+          done: (result: unknown) => void,
+        ) => { handleInput: (data: string) => void },
+      ) =>
+        new Promise((resolve) => {
+          const theme = {
+            fg: (_color: string, text: string) => text,
+            bg: (_color: string, text: string) => text,
+            bold: (text: string) => text,
+          };
+          factory(undefined, theme, undefined, (result) => resolve(result)).handleInput(input);
+        }),
+    );
+
+  it("falls back to the plain model picker when custom dialogs are unavailable", async () => {
+    const { handler, context, arm, select, sendMessage } = await registerPrewalkPicker({
+      selectResult: "openai/executor",
+    });
+    await handler("prewalk", context);
 
     expect(select).toHaveBeenCalledWith("Prewalk executor model", [
       "anthropic/other",
@@ -273,6 +316,96 @@ describe("/fabric command", () => {
       }),
       { deliverAs: "nextTurn" },
     );
+    vi.unstubAllEnvs();
+  });
+
+  it("opens the searchable FabricModelSelector when custom dialogs are available", async () => {
+    const { handler, context, arm, select, sendMessage, custom } = await registerPrewalkPicker({
+      custom: customPickerDriver("\r"),
+    });
+    await handler("prewalk", context);
+
+    expect(custom).toHaveBeenCalledTimes(1);
+    expect(select).not.toHaveBeenCalled();
+    expect(arm).toHaveBeenCalledWith({
+      model: "anthropic/other",
+      mode: "in-place",
+      sessionId: "session-1",
+    });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: PREWALK_ARMED_MESSAGE_TYPE,
+        content: prewalkArmedPrompt("in-place", "anthropic/other"),
+        display: false,
+      }),
+      { deliverAs: "nextTurn" },
+    );
+    vi.unstubAllEnvs();
+  });
+
+  it("arms nothing when the rich picker is cancelled", async () => {
+    const { handler, context, arm, select, sendMessage, sendUserMessage } =
+      await registerPrewalkPicker({ custom: customPickerDriver("\x1b") });
+    await handler("prewalk", context);
+
+    expect(arm).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(select).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+
+  it("falls back to the plain picker when the custom dialog throws", async () => {
+    const { handler, context, arm, select, sendMessage } = await registerPrewalkPicker({
+      custom: vi.fn(() => Promise.reject(new Error("custom dialog failed"))),
+    });
+    await handler("prewalk", context);
+
+    expect(select).toHaveBeenCalledWith("Prewalk executor model", [
+      "anthropic/other",
+      "openai/executor",
+    ]);
+    expect(arm).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+
+  it("notifies instead of prompting when no models are available", async () => {
+    const { handler, context, arm, select, notify } = await registerPrewalkPicker({ models: [] });
+    await handler("prewalk", context);
+
+    expect(notify).toHaveBeenCalledWith(
+      "Prewalk needs an explicit Pi executor model. Configure prewalk.model in /fabric settings.",
+      "error",
+    );
+    expect(select).not.toHaveBeenCalled();
+    expect(arm).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+
+  it("notifies instead of prompting when the host has no UI", async () => {
+    const { handler, context, arm, select, notify } = await registerPrewalkPicker({ hasUI: false });
+    await handler("prewalk", context);
+
+    expect(notify).toHaveBeenCalledWith(
+      "Prewalk needs prewalk.model in non-interactive mode.",
+      "error",
+    );
+    expect(select).not.toHaveBeenCalled();
+    expect(arm).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+
+  it("rejects a configured model without provider/model form", async () => {
+    const { handler, context, arm, select, notify } = await registerPrewalkPicker({
+      prewalkModel: "executor-model",
+    });
+    await handler("prewalk", context);
+
+    expect(notify).toHaveBeenCalledWith("prewalk.model must use provider/model form.", "error");
+    expect(select).not.toHaveBeenCalled();
+    expect(arm).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
   });
 
   it("acknowledges queued prewalk requests after the arm completes", async () => {

@@ -232,6 +232,7 @@ export const saveCompiledSurface = (
 export const saveCompiledSurfaceAsync = async (
   agentDir: string,
   file: CompiledSurfaceFile,
+  signal?: AbortSignal,
 ): Promise<SavedCompiledSurface> =>
   withExclusiveFileLockAsync(
     {
@@ -243,7 +244,9 @@ export const saveCompiledSurfaceAsync = async (
       staleMs: COMPILED_STALE_LOCK_MS,
     },
     async () => {
+      signal?.throwIfAborted();
       const loaded = await loadCompiledSurfaceAsync(agentDir);
+      signal?.throwIfAborted();
       if (loaded.error) throw new Error(loaded.error);
       const target = compiledPath(compiledSurfaceDirectory(agentDir));
       const serialized = `${JSON.stringify(file, null, 2)}\n`;
@@ -254,6 +257,7 @@ export const saveCompiledSurfaceAsync = async (
       } catch {
         // Missing file: proceed to write.
       }
+      signal?.throwIfAborted();
       await writeJsonAtomicAsync(target, file, {
         space: 2,
         newline: true,

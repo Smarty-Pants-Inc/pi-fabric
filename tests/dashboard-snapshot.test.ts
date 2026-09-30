@@ -249,7 +249,7 @@ describe("dashboard snapshot agent ownership", () => {
       format: 1,
       id: `remote-${index}`,
       kind: "agent",
-      rootId: "session:peer",
+      rootId: "session:test",
       ownerHostId: "session:peer",
       ownerIdentityId: "session:peer",
       parentId: "session:peer",
@@ -270,6 +270,40 @@ describe("dashboard snapshot agent ownership", () => {
     expect(snapshot.agents).toHaveLength(240);
     expect(snapshot.agents.some((agent) => agent.id === local.id)).toBe(true);
     expect(snapshot.agents.filter((agent) => agent.local === false)).toHaveLength(239);
+  });
+
+  it("retains foreign agents for the dashboard while the widget excludes their lineage", () => {
+    const local = {
+      ...record("local-agent"),
+      startedAt: 1,
+      updatedAt: 2,
+      status: "running" as const,
+    };
+    const foreign: FabricParticipantInfo[] = Array.from({ length: 3 }, (_, index) => ({
+      format: 1,
+      id: `foreign-${index}`,
+      kind: "agent",
+      rootId: "session:other",
+      ownerHostId: "session:other",
+      ownerIdentityId: "session:other",
+      parentId: "session:other",
+      name: `foreign-${index}`,
+      status: "running",
+      runner: "pi",
+      transport: "process",
+      capabilities: ["steer", "followUp", "stop"],
+      startedAt: 1_000 + index,
+      updatedAt: 2_000 + index,
+      controlProtocol: "v1",
+      local: false,
+      stale: false,
+    }));
+
+    const snapshot = createDashboardSnapshot(fakeState([], [local], [], [], foreign), []);
+
+    expect(snapshot.agents.map((agent) => agent.id)).toEqual([local.id, ...foreign.map(agent => agent.id)]);
+    expect(snapshot.agents.filter(agent => agent.rootId === undefined || agent.rootId === snapshot.main.id)
+      .map(agent => agent.id)).toEqual([local.id]);
   });
 
   it("does not overlay private local actor state when another host owns it", () => {

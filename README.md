@@ -67,9 +67,15 @@ To select Python, put this in `~/.pi/agent/fabric.json` or a trusted project's `
 
 Python defaults to [Monty](https://github.com/pydantic/monty), a sandboxed Python subset with VM resource limits and no ambient filesystem, network, or process access. It is **not CPython**: arbitrary imports, third-party packages, and some Python features are unavailable. Full **CPython 3.10+** requires explicit `executor.pythonRuntime: "cpython"` and runs trusted native code with full OS privileges outside schema enforce, like TypeScript's Node/Bun escape hatches. CPython enforcement additionally requires macOS `sandbox-exec` or Linux `bwrap`, failing closed without isolation. Missing Monty dependencies never trigger a native fallback. `executor.runtime` only affects TypeScript. See [the kernel guide](docs/kernels.md).
 
+Pi's native MCP can optionally supply selected servers beneath the same Fabric API: set `mcp.nativeServers` to exact server names already configured in Pi. Other servers stay on mcporter; failed native calls never switch transports. See [MCP ownership and compatibility](docs/configuration.md#opt-in-pi-owned-servers).
+
 ## Install
 
-Requires Node.js 24+ and Pi 0.80.6+. Monty's optional native package installs on supported platforms; only the explicit CPython escape hatch requires CPython 3.10+. Fabric also checks a detectable Pi host version at startup and warns when an older host may ignore continuation APIs such as actor `triggerTurn`.
+Requires Node.js 24+ and Pi 0.99.0+. Monty's optional native package installs on supported platforms; only the explicit CPython escape hatch requires CPython 3.10+. Fabric warns when a detectable host is older than the required native loadout and nested-execution contracts.
+
+**0.102.0 — opt-in Pi-owned MCP:** select native servers with `mcp.nativeServers` while keeping Fabric's API, policy pipeline, names/descriptions, and result normalization. Existing defaults remain unchanged. Native identities are indexed by registration snapshot, with live exposure and schema checks; SDK reload and settings-save guards are included.
+
+**0.101.1 — Pi 0.99 compatibility:** full-code and Schema enforce modes declare only `fabric_exec`, including with native codemode, tool search, MCP, late registrations, and active-tool changes. Captured tools remain available as `extensions.<name>(...)` inside Fabric, with host middleware applied. Pi packages and TypeBox are host-supplied peers, never bundled. Run `bun run test:pi99` for the offline compiled-extension SDK and bundled-CLI regression. The same compiled package also passes an isolated Pi 0.99.1 SDK/CLI gate; development pins remain 0.99.0.
 
 ```bash
 pi install npm:pi-fabric

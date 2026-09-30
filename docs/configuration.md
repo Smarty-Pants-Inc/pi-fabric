@@ -53,9 +53,11 @@ Monty is always sandboxed, including under schema enforce, and does not require 
 
 Every raised deadline is capped by `executor.maxTimeoutMs` (default `900000`, i.e. 15 minutes: the former undocumented clamp, now explicit), which itself can be raised up to the hard implementation maximum of 24 hours. Values above a cap are visibly normalized down to the cap during config load and the effective values are shown in `/fabric` settings, never silently surprising. A per-invocation request or ref floor takes effect even when the ref is unknown to Fabric, so captured tools, MCP calls, and future host calls all run within an intentionally longer deadline without Fabric knowing their argument semantics. Existing `pi.bash` behavior (extending the deadline from an explicit `timeout` argument) is unchanged, and deadline expiry still cancels the active host call and any child process it owns.
 
-**Interactive Main only** (TUI or RPC, not task agents or actors): `executor.mainMaxTimeoutMs` is a fixed whole-program ceiling, default `600000` (10 minutes). It overrides the orchestration floor, per-invocation requests, exact-ref floors, and explicit shell-timeout floors, including programs that repeatedly wait or sleep. It normalizes to `60000`–`executor.maxTimeoutMs`; if the executor maximum is itself below 60 seconds, that smaller maximum wins. Hitting this ceiling returns `MainExecutionCeilingError` and ends only the foreground program/observation: spawned agents, durable runs, and detached tasks keep running, and agents report their results as completion messages. Check `agents.status` / `agents.list`. Main `agents.run`, `agents.wait`, and `agents.join` also bound each observation to 60 seconds and return live status with `waitTimedOut: true`, without consuming the later result. Noninteractive runs and task/actor/residency hosts retain their existing behavior.
+**Interactive Main only** (TUI or RPC, not task agents or actors): `executor.mainMaxTimeoutMs` is a fixed whole-program ceiling, default `600000` (10 minutes). It overrides orchestration, per-invocation, exact-ref, and shell-timeout floors. It normalizes to `60000`–`executor.maxTimeoutMs` (a smaller executor maximum wins). Hitting it ends only the foreground program/observation: spawned agents, durable runs and detached tasks keep running and report completion. Main `agents.run`, `agents.wait`, and `agents.join` also cap each observation at 60 seconds, returning live status with `waitTimedOut: true` without consuming the later result. Noninteractive task/actor/residency hosts retain their behavior.
 
-`executor.shellHangMs` (default `120000` / 2 minutes, max `600000` / 10 minutes, `0` disables) is a nested-shell wait budget, not a program deadline. When a `pi.bash` / `pi.powershell` await exceeds it, Fabric **settles the await successfully** (`ok: true`) with a still-running notice, pid, and live output path while the process keeps writing that file. `background: true` (alias `run_in_background`) detaches immediately with the same envelope. Inspect with `pi.read(logPath)` and stop by running `kill <pid>` through `pi.bash`. Do not poll. An explicit shell `timeout` remains a hard cap. **ctrl+b twice** spills early (tmux-safe); **ctrl+k** kills the waiting command. Session shutdown aborts leftover processes. Captured shell overrides normally keep their own execution semantics; an extension can opt into [Fabric-owned bash execution with middleware](shell-middleware.md) to preserve its environment/output filters while gaining the same background handling.
+`executor.shellHangMs` (default `120000`, max `600000`, `0` disables) bounds a nested-shell await, not the program. A longer `pi.bash` / `pi.powershell` call settles successfully with a still-running notice, pid and live output path. `background: true` detaches immediately. An explicit shell `timeout` remains a hard cap. **ctrl+b twice** spills early; **ctrl+k** kills the waiting command. Shutdown aborts leftover processes except `durable: true` tasks, which detach to jev-fabric. Shell overrides can opt into [Fabric-owned execution with middleware](shell-middleware.md).
+
+`executor.jevFabric` configures optional [durable tasks](background-tasks.md#durable-tasks-through-jev-fabric) and [interactive sessions](shell-composition.md). `binary` (default `""`, also `"auto"`) chooses a compatible install outside the workspace, then the bundled package; an explicit executable name or trusted absolute path is used or fails without fallback. `home` empty uses `JEV_FABRIC_HOME`, else `<cwd>/.jev-fabric-native`. `timeoutMs` (default one hour, up to 24 hours) is a durable job's lifetime when no explicit `timeout` is given. Nothing runs or loads until first use.
 
 The precedence across all sources is:
 
@@ -77,6 +79,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
   "executor": {
     "kernel": "typescript",
     "cpython": { "binary": "python3" },
+    "jevFabric": { "binary": "jev-fabric", "home": "", "timeoutMs": 3600000 },
     "runtime": "quickjs",
     "timeoutMs": 120000,
     "maxTimeoutMs": 900000,
@@ -206,6 +209,12 @@ where absent values do not participate. Outside interactive Main, orchestration 
   },
   "actors": {
     "maxSessionBytes": 20971520
+  },
+  "memory": {
+    "enabled": true,
+    "sources": [
+      { "id": "laptop", "kind": "fs", "root": "/home/me/pi-archive" }
+    ]
   }
 }
 ```
@@ -255,6 +264,8 @@ Unknown definitions stay visible as waiting. They do not fail the Fabric runtime
 `prewalk.detectShellWrites` defaults to `true`. When armed, a `fabric_exec` boundary that ran a successful `pi.bash` or `pi.powershell` without an audited `pi.edit` / `pi.write` / `schema.commit` claims the handoff if file size or mtime stats drifted from the arm-time baseline. This routes shell heredocs and formatter binaries to the executor as well. The report's `trigger.files` lists the bounded drifted paths. An audited mutation consumes the shell-write drift window, so earlier edits cannot re-fire on a later read-only shell boundary. Fabric's own state directory never registers and does not consume the tracked-file cap. Other tool directories follow the project's ignore rules, so a Git work tree excludes them through `.gitignore`. Set this option to `false` to accept audited mutations only.
 
 `prewalk.requirePlan` defaults to `true`. An armed task owes a recorded plan before its mutation boundary can hand off, whether the trigger is an audited `pi.edit` / `pi.write` / `schema.commit` or shell drift under `detectShellWrites`. A boundary reached without a plan is withheld: Fabric delivers a hidden plan checkpoint to Main that asks for `prewalk.plan({ outcome, steps, verification, risks })` inside `fabric_exec`. That recorded plan is the readiness signal: Fabric snapshots it at claim time and delivers it in the executor's hidden continuation or child task, so delivery does not depend on the outer tool result surviving. The arm stays armed across the checkpoint and the frontier model keeps working. Fabric asks at most twice per task, then hands off unplanned with a visible warning so an armed session cannot stall. A recorded plan survives a failed handoff that returns to armed, and Fabric drops it when the captured task changes; cancelling, re-arming, or reloading Fabric resets readiness so the next task plans again. Checkpoint delivery is a hidden custom message, never a system prompt. Set this option to `false` to hand off on the first mutation. `prewalk.status` inside `fabric_exec` reports `planRequired`, `planReady`, and the reminder count for the current session.
+
+`prewalk.plan` is an executor handoff checkpoint, not a general task planner, checklist, or acceptance-ledger store. Maintain ordinary acceptance checks in reasoning or concise progress notes without a tool call. Submit a handoff plan only when Fabric's armed advisory or checkpoint requests it; no preliminary `prewalk.status` call is needed. Discovery (`tools.list`, `tools.search`, `tools.catalog`, and `tools.describe`) exposes `prewalk.plan` only while the current session owes one. Once recorded, the action and planning directives retire until the next arm/task needs a plan; host validation still rejects stale calls. `prewalk.status` remains available for diagnostics.
 
 `prewalk.compactOnReturn` defaults to `true`. When an in-place continuation settles, Fabric requests a compaction with the configured `compaction.engine` and commits it while the executor is still the active model. Main's restored model receives the compacted transcript. Set this option to `false` when Main must receive the complete transcript.
 
@@ -366,9 +377,9 @@ const result = await extensions.project_status({ verbose: true });
 return result.text;
 ```
 
-The result keeps `content`, exposes text content as `text`, and carries `details`, `isError`, `terminate`, and source provenance. Fabric runs the captured definition's `prepareArguments()` and original executor with its owning extension context. Pi's `tool_call`, `tool_result`, and `tool_execution_*` lifecycle handlers also apply to nested captured calls.
+The result keeps `content`, exposes text content as `text`, and carries `details`, `structuredContent` when supplied, `isError`, `terminate`, and source provenance. On Pi 0.99, callable captures use native `ctx.executeTool()` with nested IDs, validation, middleware, and usage accounting. Shells and tools with `prepareArguments()` retain Fabric's adapted execution boundary to preserve scoped cwd, nonzero-exit settlement before redaction, and exactly-once preparation. Both paths use the owning extension's tool context and apply `tool_call`, `tool_result`, and `tool_execution_*` handlers. Tools withdrawn with native `exposure: "hidden"` are not captured.
 
-In full code mode, Fabric captures and hides extension overrides of core tools together with their built-in counterparts. Inside Fabric, `pi.read`, `pi.bash`, and the other built-ins route through a captured override when one exists. `extensions.read` exposes the override's full native result shape. `capture.keepVisible` can re-activate non-core extension tools, so the model may also call them directly on Pi's native path. Core tool names stay excluded as long as full code mode owns them.
+In full code mode and Schema enforce mode, `fabric_exec` is the only model-declared tool. Pi 0.99 native `prepareLoadout` and per-request transcript projection hide all other declarations without removing tools from the native callable set. This includes native `codemode`, `tool_search`, MCP tools, and late registrations; `setActiveTools()` cannot open a second model-facing path. Inside Fabric, `pi.read`, `pi.bash`, and other built-ins still route through captured overrides when present. `extensions.read` exposes the override's native result shape. Native MCP tools are also callable by their captured names, for example `extensions.mcp__server__tool(...)`.
 
 A compatible exact-name core override is an additive extension of its existing `pi.<name>` slot. In effective full-code execution (including Schema enforce mode, which treats execution as full-code even when `fullCodeMode` is false), the current override schema contributes a bounded, schema-derived object overload without replacing Fabric's built-in positional, bare-string, shorthand, or alias forms. Fabric keeps each slot's established normalized result contract (`string` for read-like tools and `{ ok, output, details }` for bash/edit/write). The registry still validates the normalized arguments authoritatively; Fabric does not prove that an override schema is a superset of the built-in schema. Schema enforce mode still applies its host gate: read-like core refs remain available, while protected mutations and external effects are blocked or must use the schema transaction path. An override's `promptSnippet` and `promptGuidelines`, when present, are appended as guidance for the corresponding `pi.<name>` identity and are not advertised as a second extension tool. Registration, replacement, reload, and removal are observed on the next execution and prompt build; no generated declaration or prompt state is persisted. Generated overloads widen the known numeric fields (`offset`, `limit`, `timeout`, `context`) to `number | string`, matching built-in runtime normalization; an override with a stricter numeric schema still rejects the string form at registry validation, so read the error and retry. Each generated overload takes a single object argument; the built-in two-argument signature such as `pi.read(args, options?)` remains available from the base slot unchanged.
 
@@ -377,8 +388,8 @@ A compatible exact-name core override is an additive extension of its existing `
 Fabric risk classes are `read`, `write`, `execute`, `network`, and `agent`. Approval policy values are `allow`, `ask`, `auto`, or `deny`. Policies cover actions invoked inside `fabric_exec` and top-level model-requested tools left on Pi's native path. Native calls keep Pi's original implementation, result shape, and renderer. Fabric adds only the supported interception hook that runs before execution.
 
 - Captured and directly registered tools default to the conservative `execute` risk because Pi tool definitions do not declare effects. Add exact tool-name overrides under `capture.risks`. Fovea's verified graph-navigation tools (`fovea_sketch`, `fovea_focus`, `fovea_dwell`, and `fovea_impact`) are read-only exceptions that default to `read`.
-- Set `capture.hideFromModel` to `false` to index non-core extension tools without hiding them from the model's active set.
-- Names in `capture.keepVisible` stay in the model-facing active set of both Fabric and Pi. Pi core names are the exception: they remain Fabric-owned in full code mode.
+- `capture.hideFromModel` and `capture.keepVisible` remain accepted legacy preferences, but cannot override exclusive full-code or Schema enforce mode. Native active tools stay registered/callable while their declarations are hidden.
+- In orchestration-only mode, Pi's active set and each tool's native exposure govern model visibility.
 - Extension tool names appear in the prompt as a names-only roster; descriptions and schemas are resolved on demand via `tools.list` / `tools.search` / `tools.describe` before first use.
 - An `ask` policy emits a warning notification and opens an explicit **Allow once** / **Allow for this session** / **Deny** permission prompt. These options match Claude-style approval scopes. **Allow once** authorizes only the requested action. **Allow for this session** keeps that risk class authorized until the current Pi session ends. The TUI uses an inline wizard. RPC clients receive the equivalent `select` dialog.
 - Fabric serializes concurrent requests so a one-time approval never silently widens to sibling calls. Session-wide grants apply to native calls and to `fabric_exec`. Escape, dismissal, unavailable interactive UI, and session restart all fail closed.
@@ -455,7 +466,7 @@ Reader checkpoints are lossless live state: they are **never pressure-evicted**.
 
 ## Agents
 
-`agents.runner` selects the default harness: `"pi"`, `"claude"`, or `"veda"`. `agents.model` is the optional Pi `provider/id` override. `agents.claude.model` is the optional canonical Claude runtime key. `agents.claude.binary` defaults to `claude`. You can supply an absolute path or a wrapper. `PI_FABRIC_CLAUDE_BINARY` overrides it for the current process. `/fabric settings` enumerates Claude models from that binary in the background and stores the two runner defaults independently.
+`agents.runner` selects the default harness: `"pi"`, `"claude"`, or `"veda"`. `agents.model` is the optional Pi `provider/id` override. `agents.claude.model` is the optional canonical Claude runtime key. `agents.claude.binary` defaults to `claude`. You can supply an absolute path or a wrapper. `PI_FABRIC_CLAUDE_BINARY` overrides it for the current process. `/fabric settings` enumerates Claude models from that binary in the background and stores the two runner defaults independently. `agents.modelAdmission` defaults to `strict`: a Pi child run fails when the model it reports after selection differs from the requested key. Set it to `permissive` when a virtual provider key (for example a `pi-multiprovider` entry) resolves to a concrete backend at stream time; Fabric then records the reported attribution and continues, including when a later assistant frame names that backend. Permissive admission still fails a child that reports no model or starts work before admission.
 
 The `veda` runner drives the [Veda CLI](https://github.com/kennyfrc/veda) as the child harness. `agents.veda.binary` defaults to `veda`. An absolute path or wrapper works, and `PI_FABRIC_VEDA_BINARY` overrides it for the current process. `agents.veda.backend` selects which backend Veda wraps: `agy` (Antigravity CLI, the default), `codex`, `claude-code`, `droid`, `pi`, or another backend registered by the installed Veda build. Fabric passes this value through unchanged and never hardcodes AGY. `agents.veda.model` is an optional backend-specific model or Veda alias. When you omit it, Veda selects its own backend default. `agents.veda.persona` picks the global Veda persona: `navigator-plan`, `navigator-chat` (default), `reviewer`, `worker`, or a custom persona under `~/.config/veda/personas/<name>/AGENTS.md`. Per-run selection overrides it through `agents.run({ persona })`. You can also edit the Veda backend, persona, and model in the Fabric settings panel under Agents. Each child runs one headless `veda --json` prompt with an isolated `fabric-<run-id>` session, so parallel children never share Veda selection or conversation state. Veda sessions lack persistence, and steering is unsupported. Veda children are **not** recursively Fabric-equipped (`recursive: true` is rejected), and they cannot back persistent actors.
 
@@ -503,7 +514,28 @@ See [agents, actors & mesh](agents.md) for the runner and transport details.
 
 ## MCP
 
-- `mcp.disableOAuth`: when true, MCP calls can use cached credentials. New interactive OAuth flows stay disabled.
+### Opt-in Pi-owned servers
+
+By default Fabric still uses mcporter. To borrow specific servers already configured in Pi's `mcp.json`, set exact server names in Fabric configuration, or use **/fabric settings → MCP → Pi-owned servers**:
+
+```json
+{ "mcp": { "nativeServers": ["github", "project-docs"] } }
+```
+
+Run `/fabric reload` after changing this selection. Configuring or enabling a native server itself remains Pi's job (`/mcp`, `pi mcp`, and `/reload`). SDK hosts must supply Pi's `createMcpExtension()` and bind extensions; Fabric does not install it or start another native client. No existing MCP configuration or credentials are migrated. An empty list restores the default ownership.
+
+Selected servers keep Fabric's `mcp.<server>.<tool>` names, sanitizer aliases, discovery, static argument checking, normalized `{ text, content, structuredContent }` results, and `display: { name, description }` execution metadata. Raw MCP identity comes from Pi's namespace/label metadata, not its potentially hashed tool identifier. Tool descriptions and input schemas come from the live native registration; Pi's `CallToolResult` output-schema envelope is unwrapped. Genuine schema differences invalidate old normal-form plans rather than being concealed. Other servers keep the existing mcporter behavior. Selected tools are advertised once under `mcp.*`; existing `extensions.mcp__...` references remain callable when extension capture is enabled, but are not repeated in discovery or the extension roster.
+
+Both Fabric policy and Pi's tool middleware apply. Native redactions, progress, nested usage and cancellation remain authoritative; one Fabric invocation emits one Fabric trace operation. Read-only MCP annotations do not change Fabric's conservative network risk. Pi-owned tools remain subject to hidden/deferred exposure and child tool allowlists. A missing, withdrawn, blocked or failed native tool never falls back to mcporter, even if mcporter has a server with the same name. Fabric does not connect or revalidate that duplicate. Ambiguous sanitized names require exact names via `mcp.call` (an exact legacy server name retains precedence over a native alias). Resolving a native server alias may load mcporter's configuration names to check ambiguity, but does not connect those servers.
+
+Fabric still owns its call deadline. Reload/shutdown cancels its borrowed calls without disconnecting Pi's shared servers. `mcp.servers()` includes selected native servers with `transport: "pi"` (an ownership marker, not a wire protocol), tool counts, and `stale: true` when no callable tools are currently registered. `mcp.reload()` only reloads mcporter; it does not reconnect Pi servers. `mcp.register()` cannot replace a Pi-owned name. Native resource tools remain on Pi's existing captured surface; they are not renamed into per-server tool namespaces.
+
+Pi owns native startup connections and OAuth; this option does not make Pi's own session-start connections lazy. Fabric adds no connection work to registration or idle hooks. Use `/mcp login` for native authentication. To prevent *Pi itself* from also connecting a legacy-owned server, disable/remove its entry in Pi's MCP configuration; Fabric never changes that user setting.
+
+### mcporter and shared options
+
+- `mcp.nativeServers`: exact Pi-owned server names, default `[]`. Invalid selections fail rather than silently changing ownership.
+- `mcp.disableOAuth`: for mcporter, calls may use cached credentials but cannot launch new interactive OAuth flows. Pi-owned servers use Pi's authentication settings instead.
 - `mcp.callTimeoutMs`: per-call timeout bound.
 - `mcp.allowDynamicServers`: permit `mcp.register()` of ephemeral servers.
 - `mcp.enabled`: set to `false` to disable the MCP surface.
@@ -524,8 +556,8 @@ See the [TypeScript MCP reference](../skillsets/typescript/fabric-exec/reference
 
 ## UI
 
-- `ui.widget` is `auto`, `always`, or `hidden`. `auto` shows active or retained Fabric runs and worker activity. Active one-shot agents and actor workers occupy rows. Their recent nested tools appear beneath them when enabled.
-- `ui.refreshMs` defaults to `500` and sets how often the widget and dashboard refresh while this session has its own activity or the dashboard is open. Activity that exists only on other hosts refreshes once per participant heartbeat (5 seconds), because those records change no faster.
+- `ui.widget` is `auto`, `always`, or `hidden`. `auto` shows active or retained Fabric runs and worker activity. Rows list agents from this session's lineage plus actor workers. Completed agents remain listed, newest first, until the row budget or explicit dismissal retires them. Their recent nested tools appear beneath them when enabled.
+- `ui.refreshMs` defaults to `500` and sets refresh frequency while this session has its own activity or the dashboard is open. Activity only on other hosts refreshes once per participant heartbeat (5 seconds).
 - `ui.maxRows` defaults to `6` and clamps the widget to `1..20` rows. The effective budget is also bounded by half the live terminal height, so a short pane or a tmux split cannot let the animated box fill the viewport and keep pi's scroll region moving under the editor. Rows beyond the budget collapse into a dim `+N` marker on the last line.
 - `ui.showAgentToolPreview` defaults to `true` and controls the child-agent and actor tool rows in both the parent `fabric_exec` card and the widget. Recursive agents render their full descendant tree, bounded by the preview depth/node budget. The version 2 config migration renamed this key from `ui.showNestedToolCalls`.
 - `ui.toolDisplay` is `"compact"` (default) or `"full"`. Compact elevates the declared display name and description and keeps bounded nested tool detail visible; full retains the outer Fabric program transcript. Pi's tool-expand keybinding (`ctrl+o` by default) expands a compact card to the full transcript and collapses it again. Invalid values fall back to `"compact"`. If configuration fails to load, rendering falls back to full so a degraded startup never hides the transcript. Change it under `/fabric settings` → **UI**; successful changes apply immediately to live and completed cards.
@@ -599,6 +631,18 @@ configuration, never a caller's. It needs the mesh. See [records](records.md).
 ## Actors
 
 `actors.maxSessionBytes` limits the size of a persistent actor's Pi session file, in bytes. The default is `20971520` (20 MiB). Set it to `0` to disable the limit. Before a run starts, Fabric checks the session file. A larger file gets the same reset as `agents.resetSession()`, with trigger `size`: Fabric archives the file and the run starts a fresh session. So Fabric never starts a run that must compact a session past the limit. Durable actors use the same setting. See [fresh actor sessions](agents.md#fresh-actor-sessions).
+
+## Memory sources
+
+`memory.enabled` (default: true) toggles the `memory.*` provider. `memory.sources` registers portable host sources so remote or archived session trees answer source-qualified calls such as `memory.recall({ source: "laptop", ... })`; `memory.sessions` and `memory.expand` accept the same `source` argument. Without `sources`, memory behavior is unchanged: source-less calls keep their filesystem scopes and source-qualified calls fail with `source_not_found`.
+
+Each entry has three keys:
+
+- `id`: the `args.source` label. Lowercase letters, digits, dot, `_`, or dash; must start with a letter or digit and be unique across entries.
+- `kind`: the adapter kind. Only `"fs"` exists today; anything else is a configuration error at load time.
+- `root`: absolute path the `fs` adapter walks recursively for `*.jsonl` files. Native agent trees (`sessions/<encoded-cwd>/*.jsonl`) and flat archive directories both work; keys are root-relative paths, and traversal outside `root` is refused.
+
+The `fs` adapter derives each session's `revision` from the SHA-256 of the file bytes, so mtime-only touches keep follow pointers valid while content changes invalidate them. Enumeration is bounded by `memory.maxSessions` and reported through coverage reasons (`fs_source_max_sessions`, `fs_source_scan_capped`); a capped archive is never presented as complete. Ranking, branches, and expansion follow the normal engine paths described in [memory recall](memory-recall.md#portable-host-sources).
 
 ## Compaction
 

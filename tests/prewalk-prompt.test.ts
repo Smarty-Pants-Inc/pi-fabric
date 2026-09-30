@@ -48,7 +48,7 @@ describe("prewalk prompt isolation", () => {
 
     expect(visibleGuidelines).toHaveLength(6);
     expect(visibleGuidelineChars).toBeLessThanOrEqual(2_200);
-    expect(guidelines).toContain("acceptance ledger");
+    expect(guidelines).toContain("acceptance ledger in reasoning or concise progress notes (no tool call)");
     expect(guidelines).toContain("direct behavioral probes");
     expect(guidelines).toContain("requested public symbols, registrations, and configuration entries");
     expect(guidelines).toContain("smallest checks that cover the ledger");

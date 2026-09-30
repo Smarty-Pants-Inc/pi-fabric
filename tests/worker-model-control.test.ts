@@ -4,9 +4,14 @@ import { PiModelControl } from "../src/worker/model-control.js";
 const requested = "openai-codex/gpt-5.6-sol";
 const model = { provider: "openai-codex", id: "gpt-5.6-sol" };
 const wrong = { provider: "runinfra", id: "glm-5-3-flash" };
-const setup = (selector: string | undefined = requested, thinking: string | undefined = "high", finishStartup = true) => {
+const setup = (
+  selector: string | undefined = requested,
+  thinking: string | undefined = "high",
+  finishStartup = true,
+  admission: "strict" | "permissive" = "strict",
+) => {
   const io = { send: vi.fn(), admitted: vi.fn(), observed: vi.fn(), fail: vi.fn() };
-  const control = new PiModelControl("run", selector, thinking, io);
+  const control = new PiModelControl("run", selector, thinking, io, admission);
   const reply = (data?: unknown, success = true) => {
     const sent = io.send.mock.calls.at(-1)![0];
     control.observe({ type: "response", id: sent.id, command: sent.type, success, data, error: success ? undefined : "denied" });
@@ -23,6 +28,26 @@ const admit = (h: ReturnType<typeof setup>) => {
 };
 
 describe("Pi model admission", () => {
+  it("permits a model override without relaxing activation compaction admission", () => {
+    const io = { send: vi.fn(), admitted: vi.fn(), observed: vi.fn(), fail: vi.fn() };
+    const control = new PiModelControl("activation", requested, undefined, io, true, "permissive");
+    const reply = (data?: unknown) => {
+      const frame = io.send.mock.calls.at(-1)![0];
+      control.observe({ type: "response", id: frame.id, command: frame.type, success: true, data });
+    };
+    const activation = { autoCompactionEnabled: false, autoCompactionDisabledForProcess: true, isStreaming: false, isCompacting: false };
+    control.start(); reply({ ...activation, model: wrong });
+    reply(model); reply({ ...activation, model: wrong });
+    expect(io.fail).not.toHaveBeenCalled();
+    expect(io.admitted).toHaveBeenCalledWith("runinfra/glm-5-3-flash", undefined);
+    const invalidIo = { send: vi.fn(), admitted: vi.fn(), observed: vi.fn(), fail: vi.fn() };
+    const invalid = new PiModelControl("invalid", requested, undefined, invalidIo, true, "permissive");
+    invalid.start(); const frame = invalidIo.send.mock.calls[0]![0];
+    invalid.observe({ type: "response", id: frame.id, command: frame.type, success: true, data: { model: wrong } });
+    expect(invalidIo.admitted).not.toHaveBeenCalled();
+    expect(invalidIo.fail).toHaveBeenCalledWith(expect.stringContaining("--no-auto-compaction"));
+  });
+
   it.each([
     { autoCompactionEnabled: true },
     {},
@@ -108,6 +133,38 @@ describe("Pi model admission", () => {
     expect(h.io.admitted).not.toHaveBeenCalled();
     expect(h.io.observed).toHaveBeenCalledWith("runinfra/glm-5-3-flash");
     expect(h.io.fail).toHaveBeenCalledWith(expect.stringContaining("task was not sent"));
+  });
+
+  // Virtual providers keep the requested key while the child streams on a
+  // concrete backend. Permissive admission records that attribution.
+  it("admits and records the reported backend under permissive admission", () => {
+    const h = setup(requested, "high", true, "permissive");
+    h.reply(model);
+    h.reply();
+    h.reply({ model: wrong, thinkingLevel: "high" });
+    expect(h.io.fail).not.toHaveBeenCalled();
+    expect(h.control.ready).toBe(true);
+    expect(h.io.observed).toHaveBeenCalledWith("runinfra/glm-5-3-flash");
+    expect(h.io.admitted).toHaveBeenCalledExactlyOnceWith("runinfra/glm-5-3-flash", "high");
+  });
+
+  it("keeps permissive admission open through later assistant attribution", () => {
+    const h = setup(requested, "high", true, "permissive");
+    h.reply(model);
+    h.reply();
+    h.reply({ model: wrong, thinkingLevel: "high" });
+    h.control.observeAssistant({ role: "assistant", provider: wrong.provider, model: wrong.id });
+    expect(h.io.fail).not.toHaveBeenCalled();
+    expect(h.io.observed).toHaveBeenLastCalledWith("runinfra/glm-5-3-flash");
+  });
+
+  it("still fails closed when permissive admission sees no model at all", () => {
+    const h = setup(requested, "high", true, "permissive");
+    h.reply(model);
+    h.reply();
+    h.reply({ isStreaming: false });
+    expect(h.control.ready).toBe(false);
+    expect(h.io.fail).toHaveBeenCalledOnce();
   });
 
   it.each([undefined, {}, { model: null }, { model }, { model, isStreaming: true }, { model, isCompacting: true }])("validates get_state %#", state => {

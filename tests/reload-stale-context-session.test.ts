@@ -9,6 +9,7 @@ import {
   SessionManager,
   type AgentSession,
   type ExtensionContext,
+  type ExtensionToolContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
@@ -66,7 +67,7 @@ describe.skipIf(!built)("Fabric across /reload in a real Pi session", () => {
               oldExec = undefined;
               if (!exec) return;
               lateCall = Promise.resolve()
-                .then(() => exec.execute("late", { code: "return 1" } as never, undefined, undefined, ctx))
+                .then(() => exec.execute("late", { code: "return 1" } as never, undefined, undefined, ctx as ExtensionToolContext))
                 .then(() => "completed", (error: unknown) => String(error));
               await lateCall;
             });

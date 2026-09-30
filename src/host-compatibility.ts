@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 
-export const MINIMUM_PI_HOST_VERSION = "0.80.6";
+export const MINIMUM_PI_HOST_VERSION = "0.99.0";
 
 const PI_HOST_PACKAGE_NAMES = new Set([
   "@earendil-works/pi-coding-agent",
@@ -77,7 +77,7 @@ export const piHostCompatibilityWarning = (
   if (!version) return undefined;
   const comparison = compareVersions(version, MINIMUM_PI_HOST_VERSION);
   if (comparison === undefined || comparison >= 0) return undefined;
-  return "Pi Fabric requires Pi >= " + MINIMUM_PI_HOST_VERSION + "; detected " + version + ". Actor triggerTurn and other host continuations may be ignored. Upgrade Pi before relying on actor delivery.";
+  return "Pi Fabric requires Pi >= " + MINIMUM_PI_HOST_VERSION + "; detected " + version + ". Native tool loadouts and nested execution require Pi 0.99. Upgrade Pi before using Fabric.";
 };
 
 /** Pi 0.87.0 added agent_before_settle, where the followUp drain hands its messages back to Pi. */

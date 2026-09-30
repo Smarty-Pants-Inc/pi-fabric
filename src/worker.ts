@@ -389,7 +389,8 @@ const main = async (): Promise<void> => {
       ? claudeCli!.buildClaudeArguments({
           tools: options.tools,
           extensions: options.extensions,
-          persistentSession: Boolean(options.sessionFile),
+          // Actors and handoffs already have a session file; one-shot Claude runs opt in explicitly.
+          persistentSession: Boolean(options.sessionFile) || options.persistSession === true,
           ...(options.model ? { model: options.model } : {}),
           ...(thinking ? { thinking } : {}),
           ...(options.systemPrompt ? { systemPrompt: options.systemPrompt } : {}),
@@ -570,7 +571,7 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  }, activationWindow);
+  }, activationWindow, options.modelAdmission);
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.

@@ -78,6 +78,19 @@ export const renameAtomic = (
   }
 };
 
+/** Establish every directory link through the filesystem root, even after a failed retry.
+ * Existence is not a durability receipt; no cached/volatile ancestor is assumed durable.
+ * Windows cannot open directories for fsync, so only directory barriers are skipped.
+ */
+export const syncDirectoryChain = (directory: string): void => {
+  if (process.platform === "win32") return;
+  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
+    const fd = fs.openSync(current, fs.constants.O_RDONLY);
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    if (path.dirname(current) === current) return;
+  }
+};
+
 export const writeFileAtomic = (
   filePath: string,
   contents: string,
@@ -126,21 +139,7 @@ export const writeFileAtomic = (
       });
     }
     renameAtomic(temporary, filePath, options);
-    // ponytail: Windows cannot open directories for fsync; only directory barriers are skipped.
-    if (options?.durable && process.platform !== "win32") {
-      // Existence is not a durability receipt: a previous attempt (or process) may have
-      // left an unsynced directory link behind. Re-establish the whole chain on EVERY
-      // durable write, bottom up, through the filesystem root; no cached/volatile ancestor
-      // is assumed durable. Keep the pre-file barriers above for newly created directories.
-      let current = path.resolve(directory);
-      for (;;) {
-        const fd = fs.openSync(current, fs.constants.O_RDONLY);
-        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-        const parent = path.dirname(current);
-        if (parent === current) break;
-        current = parent;
-      }
-    }
+    if (options?.durable) syncDirectoryChain(directory);
   } finally {
     // No-op right after a successful rename; removes the temp on failure.
     fs.rmSync(temporary, { force: true });

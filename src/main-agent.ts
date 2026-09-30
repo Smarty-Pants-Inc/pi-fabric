@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import { writeFileAtomic } from "./core/atomic-write.js";
+import path from "node:path";
+import { syncDirectoryChain, writeFileAtomic } from "./core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 
@@ -269,6 +270,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   // entries of the former, bytes of the latter.
   #source: string | undefined;
   #scanned: number | undefined;
+  #sessionFileIdentity: string | undefined;
   #journal: string | undefined;
   // Delivery ids whose message the session holds, or that will never go (replaced, dropped):
   // persisted beside the journal, bounded, oldest first. With the journal's own items they make
@@ -514,7 +516,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#save();
       return deliveryId;
     }
-    if (this.#refreshDelivered().has(deliveryKey(deliveryId))) return deliveryId;
+    if (this.#refreshDelivered(true).has(deliveryKey(deliveryId))) return deliveryId;
     return undefined;
   }
 
@@ -561,12 +563,12 @@ export class MainAgentController implements FabricMainAgentTarget {
    * writes it, and does not roll it back when the write fails, so getEntries() is no receipt
    * (security round 3 S1 on pi-fabric#160). Pi also defers a new session's first write until its
    * first assistant message; until then nothing is confirmed and every item stays journalled.
-   * The file only grows within a session; a shorter file or another path starts over.
+   * Appends are indexed incrementally; a shorter file, replacement inode or another path starts over.
    *
    * An in-memory session has no durable store at all: its entry list is the only record, so it
    * counts as it did before.
    */
-  #refreshDelivered(): Set<string> {
+  #refreshDelivered(failClosed = false): Set<string> {
     try {
       const manager = this.#context?.sessionManager as
         { getEntries?: () => readonly unknown[]; getSessionFile?: () => string | undefined; isPersisted?: () => boolean } | undefined;
@@ -576,8 +578,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (this.#source !== "" || this.#scanned === undefined || entries.length < this.#scanned) this.#restartIndex("");
       for (let index = this.#scanned!; index < entries.length; index++) addDelivered(this.#delivered, entries[index] as SessionEntryLike);
       this.#scanned = entries.length;
-    } catch {
+    } catch (error) {
       // A failed session barrier supplies no receipt: keep every journalled payload.
+      // A duplicate lookup must also retain the resident source, not fall through to
+      // admitting/sending a second copy because its persisted receipt is uncertain.
+      if (failClosed) throw new Error(`Main could not confirm the session receipt: ${error instanceof Error ? error.message : String(error)}`);
       return new Set();
     }
     return this.#delivered;
@@ -587,6 +592,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#delivered = new Set();
     this.#source = source;
     this.#scanned = 0;
+    this.#sessionFileIdentity = undefined;
   }
 
   /** Read the complete lines appended to the session file since the last call, in 1 MiB chunks. */
@@ -597,15 +603,23 @@ export class MainAgentController implements FabricMainAgentTarget {
       fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      if (this.#source !== file) this.#restartIndex(file);    // not written yet: nothing persisted
+      this.#restartIndex(file);    // not written (or removed): no cached persisted receipt
       return;
     }
     try {
-      const size = fs.fstatSync(fd).size;
-      // Reading a complete line is not a stable-storage receipt. Sync before indexing new
-      // bytes (including on restart); a failure leaves the index and journal untouched.
-      if (this.#source !== file || this.#scanned === undefined || size !== this.#scanned) fs.fsyncSync(fd);
-      if (this.#source !== file || this.#scanned === undefined || size < this.#scanned) this.#restartIndex(file);
+      const stat = fs.fstatSync(fd);
+      const size = stat.size;
+      const identity = `${stat.dev}:${stat.ino}`;
+      // A readable/synced inode is not a durable receipt until its filename AND the
+      // containing directory chain are durable. Pi may create or replace this file
+      // in a separate session tree. Recheck even cached receipts; never publish an
+      // index change or retire a payload/source before both barriers succeed.
+      fs.fsyncSync(fd);
+      syncDirectoryChain(path.dirname(file));
+      if (this.#source !== file || this.#scanned === undefined || size < this.#scanned || this.#sessionFileIdentity !== identity) {
+        this.#restartIndex(file);
+      }
+      this.#sessionFileIdentity = identity;
       const buffer = Buffer.allocUnsafe(1 << 20);
       let position = this.#scanned!;
       let carry: Buffer[] = [];
@@ -860,6 +874,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#delivered = new Set();
     this.#source = undefined;
     this.#scanned = undefined;
+    this.#sessionFileIdentity = undefined;
     this.#journal = undefined;
     this.#context = undefined;
   }

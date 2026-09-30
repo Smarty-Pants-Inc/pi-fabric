@@ -109,7 +109,7 @@ describe("#169 round 3 receiver receipt durability", () => {
           if (path.dirname(directory) === directory) break;
         }
       }
-      expect(events).toEqual(["session", "consumed", ...directoryBarriers]);
+      expect(events).toEqual(["session", ...directoryBarriers, "consumed", ...directoryBarriers]);
       expect(fs.existsSync(journal)).toBe(false);
       expect(fs.readFileSync(`${journal}.delivered`, "utf8")).toContain("sync-receipt");
     } finally { syncOrder.mockRestore(); opened.mockRestore(); main.closeFollowUpDrain(); }

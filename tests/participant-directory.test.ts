@@ -409,6 +409,8 @@ describe("ParticipantDirectory root project", () => {
     roots.push(root);
     const own = path.join(root, "own-project");
     fs.mkdirSync(own);
+    // A lane-local TMPDIR may sit inside another checkout: make this fixture a distinct project.
+    fs.mkdirSync(path.join(own, ".git"));
     process.env.SMARTY_ROLE = "project-agent@5358e96a418f";
     process.env.PI_FABRIC_PROJECT = own;
     try {

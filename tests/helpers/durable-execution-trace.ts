@@ -95,9 +95,9 @@ export const captureDurableExecutionTrace = async () => {
     record("resident client response and publication complete", { id: result.id }); return result;
   });
   const managerSpawn = AgentManager.prototype.spawn;
-  vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(async function (this: AgentManager, request, signal, beforeCommit) {
+  vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(async function (this: AgentManager, request, signal, authorize, beforeCommit) {
     record("resident manager preparation entered");
-    const handle = await managerSpawn.call(this, request, signal, id => {
+    const handle = await managerSpawn.call(this, request, signal, authorize, id => {
       beforeCommit?.(id); record("resident spawn committed", { id });
     });
     record("resident manager spawn returned", { id: handle.id }); return handle;

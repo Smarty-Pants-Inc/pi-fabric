@@ -37,9 +37,11 @@ import type { ResidencyClient } from "../src/residency/client.js";
 import { ResidentOutcomeUnknownError } from "../src/residency/protocol.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
-import type { AgentRunRecord } from "../src/agents/types.js";
-import { ActionRegistry } from "../src/core/action-registry.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { FabricExecutionService } from "../src/execution-service.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import type { AgentHandleInfo } from "../src/agents/types.js";
+import type { AgentRunRecord } from "../src/agents/types.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
@@ -94,6 +96,7 @@ const setup = (
     switchModel?: FabricMainAgentTarget["switchModel"];
     modelsConfig?: FabricModelsConfig;
     agentsConfig?: Partial<FabricAgentConfig>;
+    workerPath?: string;
     writeStalled?: () => Error | undefined;
     onBackgroundComplete?: (result: import("../src/agents/types.js").AgentRunResult) => void;
     onResultConsumed?: (id: string) => void;
@@ -106,7 +109,7 @@ const setup = (
     process.cwd(),
     { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig },
     {
-      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      workerPath: options?.workerPath ?? path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
@@ -232,6 +235,153 @@ const setup = (
     actorDeliveries,
   };
 };
+
+describe("queued spawn handles (#2576)", () => {
+  const fixture = (maxConcurrent = 2, maxPerExecution = 10) => {
+    const state = setup([], [], undefined, {
+      agentsConfig: { maxConcurrent, maxPerExecution, transport: "process", budgetUsd: 0 },
+      workerPath: path.resolve("tests/fixtures/queued-worker.mjs"),
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = state.agents.config;
+    config.approvals.agent = "allow";
+    config.approvals.read = "allow";
+    config.executor.timeoutMs = 2_000;
+    const registry = new ActionRegistry();
+    registry.register(state.provider);
+    registry.register({
+      name: "probe", description: "Hold a calling program until its deadline",
+      async list() { return [{ name: "hold", description: "Wait for caller abort", risk: "read" as const, inputSchema: { type: "object", properties: {} } }]; },
+      async describe() { return (await this.list({}, context))[0]; },
+      async invoke(_name, _args, invocation) {
+        return new Promise((_resolve, reject) => {
+          const abort = () => reject(new Error("calling program aborted"));
+          invocation.signal?.addEventListener("abort", abort, { once: true });
+          if (invocation.signal?.aborted) abort();
+        });
+      },
+    });
+    const service = new FabricExecutionService(registry, config);
+    const run = (code: string) => service.execute({ code, signal: undefined,
+      parentToolCallId: "queued-spawn-program", context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false } as ExtensionContext,
+      onPartial() {},
+    });
+    const gate = (index: number) => path.join(state.root, `release-${index}`);
+    const request = (index: number) => ({ task: JSON.stringify({ gate: gate(index) }), name: `queued-${index}`, transport: "process", nice: 7 });
+    const spawn = (index: number) => state.provider.invoke("spawn", request(index), context) as Promise<AgentHandleInfo>;
+    const receipt = async (pending: Promise<AgentHandleInfo>) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([pending, new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("spawn blocked on admission")), 1_000);
+        })]);
+      } finally { clearTimeout(timer); }
+    };
+    const release = (index: number) => fs.writeFileSync(gate(index), "go");
+    return { ...state, run, spawn, receipt, release, request };
+  };
+
+  it("returns five handles from one program with two running and three queued, then completes all five", async () => {
+    const state = fixture();
+    const requests = Array.from({ length: 5 }, (_, i) => state.request(i));
+    const result = await state.run(`return await Promise.all(${JSON.stringify(requests)}.map(request => agents.spawn(request)));`);
+    expect(result.success, result.error).toBe(true);
+    const handles = result.value as AgentHandleInfo[];
+    expect(handles.map((handle) => handle.status)).toEqual(["running", "running", "queued", "queued", "queued"]);
+    const listed = await state.provider.invoke("list", { scope: "local" }, context) as AgentHandleInfo[];
+    expect(listed.map((handle) => handle.status)).toEqual(["running", "running", "queued", "queued", "queued"]);
+    expect((await Promise.all(handles.slice(2).map((handle) => state.provider.invoke("status", { id: handle.id }, context))) as AgentHandleInfo[]).map((handle) => handle.queuePosition)).toEqual([1, 2, 3]);
+    let finished = false;
+    const waiting = (state.provider.invoke("join", { id: handles[4]!.id, timeoutMs: 5_000 }, context) as Promise<AgentRunRecord>).then((value) => { finished = true; return value; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(finished).toBe(false);
+    for (let i = 0; i < 5; i++) state.release(i);
+    expect((await waiting).status).toBe("completed");
+    expect((await Promise.all(handles.map((handle) => state.agents.wait(handle.id)))).map((value) => value.status)).toEqual(Array(5).fill("completed"));
+  });
+
+  it("preserves queued spawns after the calling program's short deadline", async () => {
+    const state = fixture(1);
+    const requests = Array.from({ length: 3 }, (_, i) => state.request(i));
+    const result = await state.run(`await Promise.all(${JSON.stringify(requests)}.map(request => agents.spawn(request))); return await tools.call({ref: "probe.hold", args: {}});`);
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/timed out/);
+    const handles = state.agents.list();
+    expect(handles).toHaveLength(3);
+    expect(handles.map((handle) => handle.status)).toEqual(["running", "queued", "queued"]);
+    for (let i = 0; i < 3; i++) state.release(i);
+    expect((await Promise.all(handles.map((handle) => state.agents.wait(handle.id)))).map((value) => value.status)).toEqual(Array(3).fill("completed"));
+  });
+
+  it("cancels a queued agent without ever creating its process and updates queue positions", async () => {
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const state = fixture(1);
+    const first = await state.spawn(0);
+    const cancelled = await state.receipt(state.spawn(1));
+    const third = await state.receipt(state.spawn(2));
+    expect(await state.provider.invoke("stop", { id: cancelled.id }, context)).toMatchObject({ status: "stopped" });
+    expect(state.agents.status(third.id)).toMatchObject({ status: "queued", queuePosition: 1 });
+    state.release(0); state.release(2);
+    await Promise.all([state.agents.wait(first.id), state.agents.wait(third.id)]);
+    expect(await state.agents.wait(cancelled.id)).toMatchObject({ status: "stopped" });
+    expect(launch.mock.calls.map(([request]) => request.id)).toEqual([first.id, third.id]);
+  });
+
+  it("session shutdown cancels returned queued handles without launching them", async () => {
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const state = fixture(1);
+    await state.spawn(0);
+    const queued = await state.receipt(state.spawn(1));
+    await state.agents.close();
+    expect(await state.agents.wait(queued.id)).toMatchObject({ status: "stopped" });
+    expect(launch).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts queued receipts against the per-execution budget and resets accounting for the next program", async () => {
+    const state = fixture(1, 2);
+    const requests = Array.from({ length: 3 }, (_, i) => state.request(i));
+    const result = await state.run(`for (const request of ${JSON.stringify(requests)}) await agents.spawn(request);`);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("agent budget exhausted");
+    expect(state.agents.list().map((handle) => handle.status)).toEqual(["running", "queued"]);
+    const next = await state.run(`return await agents.spawn(${JSON.stringify(state.request(2))});`);
+    expect(next.success, next.error).toBe(true);
+    expect(next.value).toMatchObject({ status: "queued", queuePosition: 2 });
+    const handles = state.agents.list();
+    for (let i = 0; i < 3; i++) state.release(i);
+    expect((await Promise.all(handles.map((handle) => state.agents.wait(handle.id)))).map((value) => value.status)).toEqual(Array(3).fill("completed"));
+  });
+
+  it("does not refund a cancelled queued receipt's execution budget", async () => {
+    const state = fixture(1, 2);
+    const result = await state.run(`
+      await agents.spawn(${JSON.stringify(state.request(0))});
+      const queued = await agents.spawn(${JSON.stringify(state.request(1))});
+      await tools.call({ref: "agents.cancel", args: {id: queued.id}});
+      return await agents.spawn(${JSON.stringify(state.request(2))});
+    `);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("agent budget exhausted");
+    expect(state.agents.list().map((handle) => handle.status)).toEqual(["running", "stopped"]);
+  });
+
+  it("admits queued workers in FIFO order while preserving concurrency and nice", async () => {
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const state = fixture(1);
+    const handles = [await state.spawn(0), await state.receipt(state.spawn(1)), await state.receipt(state.spawn(2))];
+    for (let i = 0; i < 3; i++) {
+      await vi.waitFor(() => expect(launch).toHaveBeenCalledTimes(i + 1), { timeout: 10_000 });
+      expect(state.agents.list().filter((handle) => handle.status === "running")).toHaveLength(1);
+      state.release(i);
+      expect((await state.agents.wait(handles[i]!.id)).status).toBe("completed");
+    }
+    expect(launch.mock.calls.map(([request]) => request.id)).toEqual(handles.map((handle) => handle.id));
+    for (const [request] of launch.mock.calls) {
+      const index = request.workerArguments.indexOf("--nice");
+      expect(request.workerArguments[index + 1]).toBe("7");
+    }
+  });
+});
 
 describe("#169 round 1 agents.remove cleanup routing", () => {
   it("discovers a resident cleanup-only marker without restart and routes its exact id using retained ownership", async () => {
@@ -449,6 +599,13 @@ describe("runtime observation receipts", () => {
     const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => { record("background completion", { id: result.id, status: result.status }); inbox.enqueue(result); });
     const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
     const registry = new ActionRegistry(); registry.register(h.provider);
+    let admitGuest: (() => void) | undefined;
+    registry.register({
+      name: "receipt_probe", description: "Receipt regression guest readiness",
+      async list() { return [{ name: "ready", description: "Mark guest admission", risk: "read" as const, inputSchema: { type: "object", properties: {} } }]; },
+      async describe() { return (await this.list({}, context))[0]; },
+      async invoke() { admitGuest?.(); return null; },
+    });
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.memoryLimitBytes = 128 * 1024 * 1024;
     const python = backend === "monty" || backend === "cpython";
@@ -457,20 +614,35 @@ describe("runtime observation receipts", () => {
     config.executor.mainMaxTimeoutMs = 5_000;
     const service = new FabricExecutionService(registry, config);
     const mainContext = { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "receipt-main" } } as unknown as ExtensionContext;
+    // Bound even a broken startup handshake, independently of the mocked budget
+    // clock, and leave time for cancellation/cleanup before Vitest's 45s limit.
+    const lifetime = new AbortController();
+    const lifetimeGuard = setTimeout(() => {
+      record("receipt test: startup/cleanup hang guard");
+      lifetime.abort(new Error("Receipt regression exceeded its 35-second lifetime guard"));
+    }, 35_000);
     const execute = async (parentToolCallId: string, code: string) => {
       record(`${parentToolCallId}: start`);
       const controller = new AbortController();
-      // Keep a real hang guard separate from the controlled Main budget, so a
-      // broken Windows IPC handshake still settles and emits diagnostics.
-      const guard = setTimeout(() => {
-        record(`${parentToolCallId}: hang guard`);
-        controller.abort(new Error("Receipt regression execution exceeded its 12-second hang guard"));
-      }, 12_000);
+      let guard: ReturnType<typeof setTimeout> | undefined;
+      // As with the admission-clock regressions, startup is not the tested
+      // boundary. CPython starts a fresh interpreter/Windows IPC for every call;
+      // a warmup cannot make later starts cheap. Arm the active-work guard only
+      // when a real guest host call proves admission, not before cold startup.
+      admitGuest = () => {
+        if (guard !== undefined) return;
+        record(`${parentToolCallId}: guest admitted`);
+        guard = setTimeout(() => {
+          record(`${parentToolCallId}: hang guard`);
+          controller.abort(new Error("Receipt regression execution exceeded its 12-second admitted hang guard"));
+        }, 12_000);
+      };
       try {
-        const result = await service.execute({ code, context: mainContext, signal: controller.signal, parentToolCallId, onPartial() {} });
+        const ready = python ? 'await tools.call(ref="receipt_probe.ready", args={})\n' : 'await tools.call({ ref: "receipt_probe.ready", args: {} });\n';
+        const result = await service.execute({ code: ready + code, context: mainContext, signal: AbortSignal.any([controller.signal, lifetime.signal]), parentToolCallId, onPartial() {} });
         record(`${parentToolCallId}: end`, { success: result.success, error: result.error, logs: result.logs, phases: result.phases, audits: result.audits });
         return result;
-      } finally { clearTimeout(guard); }
+      } finally { clearTimeout(guard); admitGuest = undefined; }
     };
     const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
     try {
@@ -497,6 +669,7 @@ describe("runtime observation receipts", () => {
         record("encoding host call", { ref });
         const value = await invoke(ref, args, callContext);
         record("encoding host result", { ref });
+        if (ref !== "agents.wait") return value;
         // Registry admission precedes guest promise/frame publication.
         Object.defineProperty(value, "text", { enumerable: true, get: () => encode(callContext.mainDeadlineAt!) });
         return value;
@@ -555,7 +728,7 @@ describe("runtime observation receipts", () => {
         steps, consumptionCalls: consumed.mock.calls, completionIds: completed.mock.calls.map(([result]) => result.id),
       }, null, 2));
       throw error;
-    } finally { inbox.close(); await registry.close(); vi.unstubAllEnvs(); }
+    } finally { clearTimeout(lifetimeGuard); lifetime.abort(); inbox.close(); await registry.close(); vi.unstubAllEnvs(); }
   }, 45_000);
 });
 

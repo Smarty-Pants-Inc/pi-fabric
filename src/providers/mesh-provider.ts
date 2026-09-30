@@ -218,7 +218,7 @@ export class MeshProvider implements FabricProvider {
           ...(args.data !== undefined ? { data: args.data } : {}),
         });
         const event = checked
-          ? await deliverWithMessageNotice(args.text as string, checked, publish)
+          ? await deliverWithMessageNotice(args.text as string, checked, publish, "mesh.publish")
           : await publish();
         return checked?.notice ? { ...event, notice: checked.notice } : event;
       }

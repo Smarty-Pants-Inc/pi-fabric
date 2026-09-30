@@ -1,6 +1,8 @@
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import type { AgentTransportLaunch } from "../types.js";
+import { assertTransportLaunchAllowed } from "./launch-authority.js";
 
 export interface ExecFileResult {
   stdout: string;
@@ -225,8 +227,10 @@ export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
+  authority?: Pick<AgentTransportLaunch, "signal" | "authorize">,
 ): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
+  assertTransportLaunchAllowed(authority);
   const child = spawn(runtime, [workerPath, ...workerArguments], {
     cwd,
     detached: process.platform !== "win32",

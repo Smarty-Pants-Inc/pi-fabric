@@ -35,24 +35,29 @@ export const readStoppedRuns = (
  * one through the completion inbox only when completion notices are on. Returns the callback that
  * marks a run delivered (notice flushed or result consumed), once per run.
  */
-export const restoreStoppedRuns = (options: {
+export const restoreStoppedRuns = ({ entries, notifyOnComplete, restore, enqueue, appendEntry }: {
   entries: readonly unknown[];
   notifyOnComplete: boolean;
   restore: (runs: AgentRunResult[]) => void;
   enqueue: (run: AgentRunResult, delivered: () => void) => void;
   appendEntry: (data: StoppedAgentsEntryData) => void;
 }): ((id: string) => void) => {
-  const { runs, undelivered } = readStoppedRuns(options.entries);
+  const { runs, undelivered } = readStoppedRuns(entries);
   const pending = new Set(undelivered.map((run) => run.id));
+  // This callback lives with AgentManager: capture only the writer and pending IDs,
+  // never an options object that also holds Pi's complete canonical history.
   const markDelivered = (id: string): void => {
     if (!pending.delete(id)) return;
     try {
-      options.appendEntry({ delivered: [id] });
+      appendEntry({ delivered: [id] });
     } catch { /* a stale runtime: the next start delivers it */ }
   };
-  options.restore(runs);
-  if (options.notifyOnComplete) {
-    for (const run of undelivered) options.enqueue(run, () => markDelivered(run.id));
+  restore(runs);
+  if (notifyOnComplete) {
+    for (const run of undelivered) {
+      const id = run.id;
+      enqueue(run, () => markDelivered(id));
+    }
   }
   return markDelivered;
 };

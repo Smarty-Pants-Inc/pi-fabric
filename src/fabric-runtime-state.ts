@@ -835,6 +835,9 @@ export class FabricRuntimeState {
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);
+    // A removal this Main accepted behind a run that its restart ended (a same-name create) is
+    // finished here, as a resident host does at start; ownership limits it to this Main's actors.
+    if (ownsPersistentActorRegistry) void this.#actors.finishPendingRemovals().catch(() => undefined);
     this.#registry.subscribeProviderChanges(() => {
       this.#actors?.retryCapabilityWaiters();
       this.#refreshRepairCatalog();
@@ -1294,6 +1297,15 @@ export class FabricRuntimeState {
     return (!this.#config?.mesh.enabled || Boolean(this.#actors?.halted)) && (!this.#jevObservationHost || this.#jevObservationHost.halted);
   }
 
+  /**
+   * Escape's stop-the-world halt is in force: actors or the Jev observation host are halted.
+   * Both latches outlive the cancelled runs and lift only on the user's next input, so the
+   * self-reload gate holds with the mesh off too (review/astra on pi-fabric#160).
+   */
+  get escapeHalted(): boolean {
+    return Boolean(this.#actors?.halted) || Boolean(this.#jevObservationHost?.halted);
+  }
+
   haltAdvisors(): number {
     const actors = this.#config?.mesh.enabled ? this.#actors?.haltAll().halted ?? 0 : 0;
     return actors + (this.#jevObservationHost?.halt() ?? 0);
@@ -1318,7 +1330,8 @@ export class FabricRuntimeState {
       this.#config.schema.mode === "enforce"
     ) return observed;
     const idle = context.isIdle();
-    if (!this.#actors.observeHostEvent(event, idle)) return observed;
+    const source = event === "input" && isPlainObject(payload) && typeof payload.source === "string" ? payload.source : undefined;
+    if (!this.#actors.observeHostEvent(event, idle, source)) return observed;
     const branch = context.sessionManager.getBranch();
     const { digest, transcript } = buildActorContext(
       branch as unknown[],
@@ -1463,6 +1476,9 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
+    // Stop the resident drainer (and await its drain) before the Main journal closes: a delivery
+    // must never reach a Main that can no longer journal it (review round 3 on pi-fabric#160).
+    await this.#residency?.close().catch(() => undefined);
     this.#mainAgent?.closeFollowUpDrain();
     this.#suppressResidentGuidanceSync = true;
     await this.#deactivateRepairs();
@@ -1523,9 +1539,11 @@ export class FabricRuntimeState {
   /**
    * Session-owned work a reload would cancel besides task agents and actor runs: live shell jobs
    * (background, monitors, auto-detached) and running Jev programs, observers included (smarty-dev#2160).
+   * A finished shell job counts until its notice is sent and delivered; a background Jev run until
+   * its result is read (smarty-dev#2216).
    */
   backgroundWorkCount(): number {
-    return this.#shellJobs.live().length + (this.#jevPrograms?.runningCount() ?? 0);
+    return this.#shellJobs.unannounced() + (this.#shellInbox?.pendingCount() ?? 0) + (this.#jevPrograms?.runningCount() ?? 0);
   }
 
   /** Best-effort ops event on the mesh, e.g. ops.fabric.reloaded (smarty-dev#2160). */
@@ -1578,6 +1596,9 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
+    // Stop the resident drainer (and await its drain) before the Main journal closes: a delivery
+    // must never reach a Main that can no longer journal it (review round 3 on pi-fabric#160).
+    await this.#residency?.close().catch(() => undefined);
     this.#mainAgent?.closeFollowUpDrain();
     await this.shellJobs.close();
     await this.#deactivateRepairs();

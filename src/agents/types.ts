@@ -85,6 +85,8 @@ export interface AgentRunRequest {
   inheritedSessionPins?: InheritedSessionPin[];
   /** Unix niceness 0-19; only raises agents.nice, never lowers it. */
   nice?: number;
+  /** Actor runs: default bash timeout (s), exported as PI_FABRIC_ACTOR_BASH_TIMEOUT_S; 0 = none. */
+  bashTimeoutSeconds?: number;
 }
 
 export interface AgentUsage {
@@ -221,6 +223,7 @@ export interface AgentWorkerOptions {
   maxTokens?: number;
   /** Niceness applied to the spawned child (and IO priority on Linux). */
   nice?: number;
+  bashTimeoutSeconds?: number;
   fabricExtensionPath?: string;
   model?: string;
   thinking?: string;

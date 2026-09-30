@@ -80,7 +80,8 @@ export const participantProject = (cwd: string, env: NodeJS.ProcessEnv = process
 /**
  * One host[:port]/owner/name identity across HTTPS, ssh:// and user@host:path.
  * Canonical identities (including dotless hosts) are already suffix-normalized: never strip
- * another .git from their repository name. Explicit ports and every path component survive.
+ * another .git from their repository name. Explicit ports and every path component survive,
+ * except the known GitHub SSH-over-443 alias. Only GitHub and its aliases fold path case.
  * Parse without URL, which silently removes dot segments, default ports and backslashes.
  * A numeric host:port/path spelling is canonical; scp paths with numeric owners use user@host:.
  */
@@ -121,7 +122,12 @@ export const normalizeOrigin = (origin: string): string | undefined => {
   if (segments.some((segment) => !segment || segment === "." || segment === "..")) return undefined;
   if (!canonicalIdentity) repo = repo.replace(/\.git$/i, "");
   if (repo.split("/").some((segment) => !segment || segment === "." || segment === "..")) return undefined;
-  return `${authority.toLowerCase()}/${repo.toLowerCase()}`;
+  const hostname = host[1]!.toLowerCase();
+  const github = hostname === "github.com" || hostname === "www.github.com" || hostname === "ssh.github.com";
+  // These are known equivalent endpoints; never discard a generic host's explicit port.
+  const identityHost = hostname === "www.github.com" ? `github.com${host[2] ? `:${host[2]}` : ""}`
+    : hostname === "ssh.github.com" && host[2] === "443" ? "github.com" : authority.toLowerCase();
+  return `${identityHost}/${github ? repo.toLowerCase() : repo}`;
 };
 
 const repositories = new Map<string, string | undefined>();

@@ -80,10 +80,53 @@ describe("project identity", () => {
       "ssh://git@github.com/Smarty-Pants-Inc/pi-fabric.git", `git+https://${expected}`, expected]) {
       expect(normalizeOrigin(origin)).toBe(expected);
     }
-    expect(normalizeOrigin("https://example.org/Team/Repo.git")).toBe("example.org/team/repo");
-    expect(normalizeOrigin("ssh://git@example.org:2222/Team/Repo.git")).toBe("example.org:2222/team/repo");
-    expect(normalizeOrigin("https://example.org:22/Team/Repo.git")).toBe("example.org:22/team/repo");
+    expect(normalizeOrigin("https://example.org/Team/Repo.git")).toBe("example.org/Team/Repo");
+    expect(normalizeOrigin("ssh://git@example.org:2222/Team/Repo.git")).toBe("example.org:2222/Team/Repo");
+    expect(normalizeOrigin("https://example.org:22/Team/Repo.git")).toBe("example.org:22/Team/Repo");
     expect(normalizeOrigin("")).toBeUndefined();
+  });
+
+  it.each([
+    ["ssh://git@FORGE/Team/App.git", "forge/Team/App"],
+    ["ssh://git@FORGE:2222/Team/App.git", "forge:2222/Team/App"],
+    ["git@FORGE:Team/App.git", "forge/Team/App"],
+    ["FORGE:2222/Team/App", "forge:2222/Team/App"],
+    ["https://CODE.example.net/Team/App.git", "code.example.net/Team/App"],
+  ])("#201 r3 generic origins preserve path case: %s", (origin, expected) => {
+    const identity = normalizeOrigin(origin)!;
+    expect(identity).toBe(expected);
+    expect(normalizeOrigin(identity)).toBe(identity);
+    expect(identity).not.toBe(normalizeOrigin(origin.replace("Team/App", "team/app")));
+  });
+
+  it.each([
+    "https://WWW.GitHub.com/Smarty-Pants-Inc/pi-fabric.git",
+    "git@www.github.com:Smarty-Pants-Inc/pi-fabric.git",
+    "ssh://git@www.github.com/Smarty-Pants-Inc/pi-fabric.git",
+    "www.github.com/Smarty-Pants-Inc/pi-fabric",
+    "ssh://git@SSH.GitHub.com:443/Smarty-Pants-Inc/pi-fabric.git",
+    "ssh.github.com:443/Smarty-Pants-Inc/pi-fabric",
+  ])("#201 r3 GitHub aliases share canonical identity: %s", (origin) => {
+    const identity = normalizeOrigin(origin)!;
+    expect(identity).toBe("github.com/smarty-pants-inc/pi-fabric");
+    expect(normalizeOrigin(identity)).toBe(identity);
+  });
+
+  it.each([undefined, "forge"])("#201 r3 rejects a case-distinct foreign recorded lead (remoteHost=%s)", (remoteHost) => {
+    const project = path.resolve("/lane");
+    const leadId = recordedProjectLead(project, { SMARTY_LEAD_SESSION: "session:11111111-1111-4111-8111-111111111111" })!;
+    const repository = normalizeOrigin("ssh://git@forge/Team/App.git")!;
+    const foreign = {
+      id: leadId, startedAt: 1, role: "project-agent", project, interactive: true,
+      repository: normalizeOrigin("ssh://git@forge/team/app.git")!, ...(remoteHost ? { remoteHost } : {}),
+    };
+    const own = { ...foreign, id: "session:own", repository };
+    expect(() => resolveProjectAgent([own, foreign], project, { repository, leadId }))
+      .toThrow(expect.objectContaining({
+        code: "FABRIC_PROJECT_AGENT_UNRESOLVED",
+        message: expect.stringContaining("belongs to another repository"),
+      }));
+    expect(resolveProjectAgent([own, foreign], project, { repository, leadId: own.id })).toBe(own);
   });
 
   it("gives independent host checkouts and a worktree the same origin identity and reads the lane launch marker", () => {
@@ -163,7 +206,7 @@ describe("project identity", () => {
     ["ssh://git@code.example.net:2222/team/app.git", "code.example.net:2222/team/app"],
     ["ssh://git@forge/team/app.git", "forge/team/app"],
     ["ssh://git@forge:2222/team/app.git", "forge:2222/team/app"],
-    ["https://CODE.example.net/Team/App.git", "code.example.net/team/app"],
+    ["https://CODE.example.net/Team/App.git", "code.example.net/Team/App"],
     ["https://code.example.net/team/app.git.git", "code.example.net/team/app.git"],
   ])("#201 origin normalization is idempotent for %s", (origin, expected) => {
     const identity = normalizeOrigin(origin);

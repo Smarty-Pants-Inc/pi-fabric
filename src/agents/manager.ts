@@ -304,6 +304,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 }
 
 interface QueuedAgent {
+  /** Also guard cleanup if writing the persistent unresolved marker failed. */
+  cleanupPending?: string;
   info: AgentHandleInfo;
   task: string;
   enqueuedAt: number;
@@ -797,7 +799,8 @@ export class AgentManager {
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     if (this.#closing) throw new Error("Fabric agent manager is closing");
-    const pending = adapter.launch({ ...request, signal: this.#closeAbort.signal });
+    const signal = request.signal ? AbortSignal.any([request.signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
+    const pending = adapter.launch({ ...request, signal });
     this.#launches.add(pending);
     try {
       const transport = await pending;
@@ -1084,6 +1087,8 @@ export class AgentManager {
           cwd: agentCwd,
           workerPath: this.#workerPath,
           workerArguments,
+          signal,
+          ...(authorize ? { authorize: () => { assertAuthorized(); return true; } } : {}),
         };
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
@@ -1097,10 +1102,17 @@ export class AgentManager {
           lifecycle.result = queued.result;
           lifecycle.resolve = queued.resolve;
         }
-        if (signal?.aborted || this.#closing) {
-          await transport.stop();
-          if (!await transport.isAlive().catch(() => true)) this.#unregisteredTransports.delete(transport);
-          throw new Error("Agent launch aborted");
+        if (signal?.aborted || this.#closing || (authorize && !authorize())) {
+          queued?.abort.abort();
+          if (await this.#stopUnregisteredTransport(transport)) {
+            this.#unregisteredTransports.delete(transport);
+            throw new Error("Agent launch aborted");
+          }
+          // A stop acknowledgment alone is not proof of exit. Retain both sets of
+          // working files and expose the obligation through the stopped receipt.
+          throw Object.assign(new Error("Agent launch aborted; cleanup pending: worker exit unconfirmed"), {
+            launchOutcome: "unknown", cleanupPending: true, transport: transport.kind, sessionId: transport.sessionId,
+          });
         }
         const managed: ManagedAgent = {
           id,
@@ -1118,7 +1130,9 @@ export class AgentManager {
           runDirectory,
           transport,
           adapter,
-          launch,
+          // Ordinary caller abort detaches a managed worker; it must not veto
+          // that worker's later retries. Actor authority stays attached.
+          launch: { ...launch, signal: authorize ? signal : undefined },
           startupAttempts: 1,
           ...lifecycle,
           abortSignal: queued && !authorize ? undefined : signal,
@@ -1161,8 +1175,17 @@ export class AgentManager {
         // An unconfirmed launch may have started a worker that already uses the worktree
         // and run files: keep both, marked, and neither retry nor adopt it.
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome === "unknown") {
+          const obligation = error as Error & { cleanupPending?: boolean; transport?: string; sessionId?: string };
+          const queued = this.#queued.get(id);
+          if (queued) {
+            queued.cleanupPending = obligation.message;
+            queued.info = { ...queued.info, ...(worktree ? { worktree } : {}), ...(branch ? { branch } : {}) };
+          }
           try {
-            markUnresolvedWorker(runDirectory, (error as Error).message, { runId: id, ...(worktree ? { worktree } : {}) });
+            markUnresolvedWorker(runDirectory, obligation.message, {
+              runId: id, ...(worktree ? { worktree } : {}),
+              ...(obligation.cleanupPending ? { cleanupPending: true, transport: obligation.transport, sessionId: obligation.sessionId } : {}),
+            });
           } catch { /* best effort: the worktree is kept either way */ }
           throw error;
         }
@@ -1535,7 +1558,7 @@ export class AgentManager {
     if (queued) {
       if (!queued.terminal) throw new Error("Cannot clean up a queued agent");
       const runDirectory = path.join(this.#runRoot, id);
-      if (hasUnresolvedWorker(runDirectory)) {
+      if (queued.cleanupPending || hasUnresolvedWorker(runDirectory)) {
         throw new Error(`Cannot clean up agent ${id}: Fabric lost track of its worker; check ${runDirectory} before removing its files`);
       }
       this.#onResultConsumed?.(id);
@@ -1679,7 +1702,7 @@ export class AgentManager {
     const alive = await Promise.all(transports.map((transport) =>
       transport.isAlive().then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
     const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
-      runRootHasUnresolvedWorker(this.#runRoot);
+      [...this.#queued.values()].some((queued) => queued.cleanupPending) || runRootHasUnresolvedWorker(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();
@@ -1758,6 +1781,34 @@ export class AgentManager {
       this.#pruneRetainedUiRecords();
       this.#invalidateUiList();
     }
+  }
+
+  /** A cancelled launch has no ManagedAgent yet. Bound stop AND liveness calls,
+   * including hung RPCs; false/lost-contact and failed probes are not proven exits. */
+  async #stopUnregisteredTransport(transport: AgentTransportHandle): Promise<boolean> {
+    const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
+    const bounded = async <T>(operation: () => Promise<T>): Promise<T> => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("Worker exit confirmation timed out");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          operation(),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Worker exit confirmation timed out")), remaining); }),
+        ]);
+      } finally { if (timer) clearTimeout(timer); }
+    };
+    // A failed close request can still be followed by a proven exit.
+    await bounded(() => transport.stop()).catch(() => undefined);
+    try {
+      while (Date.now() < deadline) {
+        const alive = await bounded(() => transport.isAlive());
+        if (transport.lostContact?.() !== undefined) return false;
+        if (!alive) return true;
+        await delay(Math.min(transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS, deadline - Date.now()));
+      }
+    } catch { /* failed or hung liveness never authorizes deletion */ }
+    return false;
   }
 
   // After a stop: a worker whose exit is not confirmed (lost contact, or still reported

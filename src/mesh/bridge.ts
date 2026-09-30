@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -33,11 +34,6 @@ export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_STOP_MS = 5_000;
 const LOCK_RETRY_MIN_MS = 100;
 const LOCK_RETRY_MAX_MS = 2_000;
-const MESH_LOCK_TIMEOUT_CODE = "FABRIC_MESH_LOCK_TIMEOUT";
-
-// Only the store's exact typed timeout is transient; messages never grant a retry.
-const isMeshLockTimeout = (error: unknown): boolean =>
-  error instanceof Error && "code" in error && error.code === MESH_LOCK_TIMEOUT_CODE;
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -1003,6 +999,7 @@ export class MeshBridge {
   async run(): Promise<void> {
     let started = false;
     let retryMs = LOCK_RETRY_MIN_MS;
+    let reportedTimeout = false;
     while (!this.#stopped) {
       const pass = started ? this.step() : this.start();
       // stop() needs a settlement fence, not a second unhandled rejection of a failed pass.
@@ -1010,6 +1007,7 @@ export class MeshBridge {
       let delay: number;
       try {
         await pass;
+        reportedTimeout = false;
         if (!started) {
           started = true;
           retryMs = LOCK_RETRY_MIN_MS;
@@ -1022,7 +1020,10 @@ export class MeshBridge {
         if (!isMeshLockTimeout(error)) throw error;
         delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
-        this.#log(`mesh lock timeout; retrying in ${delay} ms`);
+        if (!reportedTimeout) {
+          this.#log(`mesh lock timeout; retrying in ${delay} ms: ${(error as Error).message}`);
+          reportedTimeout = true;
+        }
       }
       if (this.#stopped) break;
       await new Promise<void>((resolve) => {

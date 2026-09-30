@@ -2,6 +2,7 @@ import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
@@ -1063,6 +1064,15 @@ export class QuickJsRuntime {
               const errorHandle = context.newError(
                 error instanceof Error ? error.message : String(error),
               );
+              if (isMeshLockTimeout(error)) {
+                // Only this host-issued acquisition code crosses the error wire, not arbitrary
+                // provider properties. A guest can catch one failed call and keep executing.
+                const code = context.newString(error.code);
+                const name = context.newString("MeshLockTimeoutError");
+                context.setProp(errorHandle, "code", code);
+                context.setProp(errorHandle, "name", name);
+                code.dispose(); name.dispose();
+              }
               const exit = reference === "pi.bash" || reference === "pi.powershell"
                 ? piBashExitMetadata(error)
                 : undefined;

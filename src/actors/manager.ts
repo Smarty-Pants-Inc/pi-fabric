@@ -3,6 +3,8 @@ import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
 import os from "node:os";
 import path from "node:path";
@@ -360,6 +362,8 @@ export class ActorManager {
   /** One presence write at a time per actor id; a queued one reads the latest state. */
   readonly #presenceChains = new Map<string, Promise<void>>();
   readonly #presenceQueued = new Set<string>();
+  readonly #presenceRetries = new Map<string, MeshBackgroundRetry>();
+  readonly #notifications = new MeshBackgroundQueue("actor notification/reap");
   /** Actor ids named by the last successfully parsed registry (undefined until one is). */
   #registryIds: Set<string> | undefined;
   /** Orphan deletes, fenced to the entry version seen when it was found. */
@@ -615,8 +619,7 @@ export class ActorManager {
     this.#ownQueueRead.add(id);                                 // a new actor has no queue file
     this.#ownership.set(id, true);
     await this.#publishPresence(actor);
-    await this.mesh
-      .publish({
+    await this.#publishNotification({
         topic: "fabric.actor.lifecycle",
         kind: "created",
         from: this.identity,
@@ -1026,8 +1029,7 @@ export class ActorManager {
       { message, ...(data === undefined ? {} : { data }) },
       bindingOptions,
     );
-    void this.mesh
-      .publish({
+    void this.#publishNotification({
         topic: "fabric.actor.input",
         kind: "direct.queued",
         from: this.identity,
@@ -1124,8 +1126,7 @@ export class ActorManager {
         cleanup();
         originalReject?.(error);
       };
-      void this.mesh
-        .publish({
+      void this.#publishNotification({
           topic: "fabric.actor.input",
           kind: "direct.queued",
           from: this.identity,
@@ -1342,9 +1343,11 @@ export class ActorManager {
             : {}),
         },
       });
-    void publish(images.length > 0).catch(() =>
-      images.length > 0 ? publish(false).catch(() => undefined) : undefined,
-    );
+    void this.#notifications.enqueue(() => publish(images.length > 0).catch(error => {
+      if (isMeshLockTimeout(error)) throw error;
+      if (images.length > 0) return publish(false);
+      throw error;
+    }));
   }
 
   #acceptRelayedHostEvent(actor: ManagedActor, event: MeshEvent): void {
@@ -1448,8 +1451,7 @@ export class ActorManager {
     this.#drop(actor, [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
-    await this.mesh
-      .publish({
+    await this.#publishNotification({
         topic: "fabric.actor.lifecycle",
         kind: "stopped",
         from: this.identity,
@@ -1846,6 +1848,7 @@ export class ActorManager {
     this.#presenceTimer = undefined;
     // Let presence writes already in flight finish before the runtime goes.
     await Promise.allSettled([...this.#presenceChains.values()]);
+    await this.#notifications.close();
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
     this.#listeners.clear();
@@ -2181,8 +2184,7 @@ export class ActorManager {
             continue;
           }
           this.#recordMessage(this.#liveActor(actor), message);
-          await this.mesh
-            .publish({
+          await this.#publishNotification({
               topic: "fabric.actor.output",
               kind: message.action ?? "message",
               from: { id: actor.id, name: actor.name, kind: "actor", sessionId: this.sessionId },
@@ -2676,10 +2678,10 @@ export class ActorManager {
       if (this.#canManage(actor.id)) this.#logs.pruneRuns(actor, now);
     }
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
-      void reapDeadSessionPresence(this.mesh, this.identity, {
+      void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {
         ownSessionId: this.sessionId,
         ...(typeof this.#deadSessionReap === "object" ? { deadAfterMs: this.#deadSessionReap.deadAfterMs } : {}),
-      }).catch(() => undefined);
+      }));
     }
   }
 
@@ -2726,11 +2728,25 @@ export class ActorManager {
     this.#presenceChains.set(id, next);
     void next.finally(() => {
       if (this.#presenceChains.get(id) === next) this.#presenceChains.delete(id);
-    });
+    }).catch(error => this.#presenceRetries.get(id)?.failure(error));
     return next;
   }
 
+  #publishNotification(request: Parameters<MeshStore["publish"]>[0]): Promise<void> {
+    return this.#notifications.enqueue(() => this.mesh.publish(request));
+  }
+
   async #writePresenceNow(id: string): Promise<void> {
+    let retry = this.#presenceRetries.get(id);
+    if (!retry) {
+      retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs);
+      this.#presenceRetries.set(id, retry);
+    }
+    if (retry.waitMs > 0) {
+      this.#pendingPresence.add(id);
+      this.#schedulePresenceRetry();
+      return;
+    }
     const actor = this.#actors.get(id);
     if (actor && !this.#canManageCached(id)) {
       this.#pendingPresence.delete(id);                        // another host owns its presence
@@ -2745,6 +2761,7 @@ export class ActorManager {
       }
       this.#pendingPresence.delete(id);
       this.#orphanPresence.delete(id);
+      this.#presenceRetries.delete(id);
     } catch (error) {
       if (fence !== undefined && error instanceof Error && error.message.includes("compare-and-swap failed")) {
         // Someone wrote this entry since it was found orphaned: it is not ours to delete.
@@ -2752,6 +2769,7 @@ export class ActorManager {
         this.#orphanPresence.delete(id);
         return;
       }
+      retry.failure(error);
       this.#pendingPresence.add(id);
       this.#schedulePresenceRetry();
     }
@@ -2766,8 +2784,13 @@ export class ActorManager {
           if (this.#closing) return;
           await this.#writePresence(id);
         }
-      })();
-    }, this.#presenceRetryMs);
+      })().catch(error => {
+        // Keep the owned timer contained even if a non-mesh presence precondition fails.
+        console.warn(`[pi-fabric] actor presence retry failed: ${error instanceof Error ? error.message : String(error)}`);
+        this.#schedulePresenceRetry();
+      });
+    }, Math.max(1, [...this.#pendingPresence].reduce((wait, id) =>
+      Math.min(wait, this.#presenceRetries.get(id)?.waitMs || this.#presenceRetryMs), 5_000)));
     this.#presenceTimer.unref();
   }
 

@@ -19,6 +19,8 @@ import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mesh/store.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { FabricControlPlane, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
@@ -141,6 +143,8 @@ class ResidentHost {
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
   #closed = false;
+  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
+  readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #idleSince = Date.now();
 
@@ -242,7 +246,7 @@ class ResidentHost {
           includeSlots: false,
         }).appendText || undefined;
       },
-      onLifecycle: (event) => void this.lifecycle?.publish(event).catch(() => undefined),
+      onLifecycle: (event) => void this.lifecycle?.publishBackground(event),
       onSettled: (result) => {
         // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
         if (result.actorId) return;
@@ -367,7 +371,7 @@ class ResidentHost {
     await this.participants.start().catch(() => undefined);
     this.lifecycle.start();
     this.#requestTimer = setInterval(
-      () => void this.#pollRequests().catch(() => undefined),
+      () => void this.#backgroundRequests.run(() => this.#pollRequests()),
       REQUEST_POLL_MS,
     );
     const now = Date.now();
@@ -382,7 +386,10 @@ class ResidentHost {
     atomicWrite(this.#ownerPath, owner);
     fs.rmSync(this.#errorPath, { force: true });
     // Removals a previous host accepted: their runs ended with it.
-    void this.actors.finishPendingRemovals().finally(() => this.#writeRemovals());
+    void this.#backgroundDeliveries.enqueue(async () => {
+      await this.actors.finishPendingRemovals();
+      this.#writeRemovals();
+    });
     await this.#pollRequests();
   }
 
@@ -398,6 +405,7 @@ class ResidentHost {
       await closeWithActors(this.actors, () => this.control.close().catch(() => undefined));
     } finally {
       await this.agents.close();
+      await this.#backgroundDeliveries.close();
       await this.participants.close().catch(() => undefined);
       this.#releaseLock();
     }
@@ -543,25 +551,20 @@ class ResidentHost {
       ...(agentCompletionId ? { agentCompletionId } : {}),
       createdAt: Date.now(),
     };
-    try {
-      await this.mesh.put({
-        key: `${prefix}${id}`,
-        value: record,
-        identity: this.identity,
-        ifVersion: 0,
-      });
-    } catch {
-      await this.mesh.put({
-        key: `${prefix}${id}`,
-        value: {
-          ...record,
-          message: message.slice(0, Math.max(1, this.config.mesh.eventContextChars)),
-          data: { fabricTruncated: true },
-        },
-        identity: this.identity,
-        ifVersion: 0,
-      });
-    }
+    await this.#backgroundDeliveries.enqueue(async () => {
+      try {
+        await this.mesh.put({ key: `${prefix}${id}`, value: record, identity: this.identity, ifVersion: 0 });
+      } catch (error) {
+        // A timeout wrote nothing and needs retry, not payload truncation. Keep the same id
+        // across attempts so Main's durable journal admits the eventual record only once.
+        if (isMeshLockTimeout(error)) throw error;
+        await this.mesh.put({
+          key: `${prefix}${id}`,
+          value: { ...record, message: message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
+          identity: this.identity, ifVersion: 0,
+        });
+      }
+    });
   }
 
   async #pollRequests(): Promise<void> {

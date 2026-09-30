@@ -2,7 +2,8 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeFileAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+export { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
@@ -1523,12 +1524,7 @@ export class MeshStore {
           (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
         if (this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
-          throw Object.assign(new Error(
-            `Timed out waiting for the Fabric mesh lock${describeLockHolder(ownerPath)} ` +
-              `after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms`,
-          ), {
-            code: "FABRIC_MESH_LOCK_TIMEOUT",
-          });
+          throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
         }
         // Equal-range jitter separates competing writers without hot 10 ms retries. Keep
         // the floor at 10 ms, the ceiling at 250 ms, and never sleep past this wait's deadline.

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 
 /**
@@ -75,6 +76,9 @@ export class RootInbox {
   #saved: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
+  readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
+
+  close(): Promise<void> { return this.#notifications.close(); }
 
   constructor(
     readonly mesh: MeshStore,
@@ -98,7 +102,12 @@ export class RootInbox {
     if (state.pending) {
       // Only the session's own record of the message moves the cursor; a pending batch is
       // delivered again, however many times, until then.
-      if (!session.holdsBatch(state.pending.ids)) return { events: this.#reread(state.after, state.pending), through: state.pending.through };
+      if (!session.holdsBatch(state.pending.ids)) {
+        // A failed pending-cursor save must be retried before handing the batch on. In-memory
+        // pending alone is not durable admission (including after an acquisition timeout).
+        await this.#save(true);
+        return { events: this.#reread(state.after, state.pending), through: state.pending.through };
+      }
       state.after = Math.max(state.after, state.pending.through);
       delete state.pending;
       await this.#save(true);
@@ -131,10 +140,10 @@ export class RootInbox {
     if (batch.events.length === 0 || !idle()) return undefined;
     const reason = urgent ? "p0" : "idle";
     this.#wokeAt = this.#now();
-    void this.mesh.publish({
+    void this.#notifications.enqueue(() => this.mesh.publish({
       topic: ROOT_INBOX_WAKE_TOPIC, kind: "idle-wake", from: this.identity,
       data: { count: batch.events.length, reason, ids: batch.events.map((event) => event.id) },
-    }).catch(() => undefined);
+    }));
     return batch;
   }
 

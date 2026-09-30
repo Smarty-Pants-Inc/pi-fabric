@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import {
@@ -28,6 +30,12 @@ const subscriptionKey = (id: string): string =>
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + id;
 
 export class LifecycleBroker {
+  readonly #backgroundPoll = new MeshBackgroundRetry("lifecycle cursor poll");
+  readonly #backgroundPublish = new MeshBackgroundQueue("participant lifecycle event");
+
+  publishBackground(request: FabricLifecyclePublishRequest): Promise<void> {
+    return this.#backgroundPublish.enqueue(() => this.publish(request));
+  }
   readonly #pollMs: number;
   readonly #maxReadEvents: number;
   #timer: NodeJS.Timeout | undefined;
@@ -168,6 +176,7 @@ export class LifecycleBroker {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    await this.#backgroundPublish.close();
     await this.#publishTail;
     await this.#polling?.catch(() => undefined);
   }
@@ -182,7 +191,7 @@ export class LifecycleBroker {
     queueMicrotask(() => {
       this.#pollScheduled = false;
       if (this.#closed) return;
-      void this.#poll().catch(() => undefined);
+      void this.#backgroundPoll.run(() => this.#poll());
     });
   }
 
@@ -255,7 +264,7 @@ export class LifecycleBroker {
           ...subscription,
           afterSequence: latestSequence,
           updatedAt: Date.now(),
-        }).then(() => this.#unsaved.delete(subscription.id), () => undefined);
+        }).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
         return;
       }
 
@@ -286,7 +295,7 @@ export class LifecycleBroker {
             updatedAt: Date.now(),
             lastError: error instanceof Error ? error.message : String(error),
           };
-          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), () => undefined);
+          await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id), rethrowMeshLockTimeout);
           return;
         }
         cursor = lifecycle.sequence;
@@ -296,7 +305,7 @@ export class LifecycleBroker {
         if (subscription.once) {
           await this.mesh
             .delete({ key: entry.key, ifVersion: entry.version })
-            .catch(() => ({ deleted: false }));
+            .catch(rethrowMeshLockTimeout);
           return;
         }
       }
@@ -313,7 +322,7 @@ export class LifecycleBroker {
         ...(lastEventId !== undefined ? { lastEventId } : {}),
       };
       delete updated.lastError;
-      const next = await this.#replace(entry, updated).catch(() => undefined);
+      const next = await this.#replace(entry, updated).catch(rethrowMeshLockTimeout);
       if (!next) return;
       this.#unsaved.delete(subscription.id);
       entry = next;

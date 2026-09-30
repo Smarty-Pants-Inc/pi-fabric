@@ -1186,7 +1186,7 @@ describe("ParticipantDirectory", () => {
     fs.mkdirSync(lockPath, { mode: 0o700 });
     fs.writeFileSync(path.join(lockPath, "owner"), `stuck\n${process.pid}\n${Date.now()}\n`);
     await expect.poll(() => directory.writeStalled()?.message ?? "", { timeout: 5_000, interval: 50 })
-      .toMatch(/^Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock/);
+      .toMatch(/^Fabric mesh is write-stalled: FABRIC_MESH_LOCK_TIMEOUT: Timed out waiting for the Fabric mesh lock/);
     // Timers, the dashboard and ownership checks read these: they must never throw.
     expect(() => directory.sessions()).not.toThrow();
     expect(() => directory.peers()).not.toThrow();

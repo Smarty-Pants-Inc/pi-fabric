@@ -3,6 +3,8 @@ import path from "node:path";
 import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import type { FabricActorRunBinding } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -241,6 +243,11 @@ export class FabricControlPlane {
   #timer: NodeJS.Timeout | undefined;
   #mirrorWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
+  readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll");
+  readonly #backgroundNotifications = new MeshBackgroundQueue("control detached ack");
+  // Cancellation may become publishable after close, when an admitted command finally commits.
+  // Its queue owns that final obligation until success/deadline; idle has no timer or resources.
+  readonly #backgroundCancellations = new MeshBackgroundQueue("control cancellation");
   #closed = false;
   #handler: FabricControlHandler | undefined;
   #seenCleanupAt = 0;
@@ -277,7 +284,7 @@ export class FabricControlPlane {
     this.#handler = handler;
     if (!this.options.enabled || this.#timer) return;
     this.#closed = false;
-    this.#timer = setInterval(() => void this.#poll().catch(() => undefined), this.#pollMs);
+    this.#timer = setInterval(() => void this.#backgroundPoll.run(() => this.#poll()), this.#pollMs);
     this.#timer.unref();
   }
 
@@ -559,7 +566,7 @@ export class FabricControlPlane {
     if (pending.cancellationPublished) return;
     pending.cancellationPublished = true;
     const requestedAt = Date.now();
-    await this.mesh.publish({
+    const cancellation = {
       topic: CONTROL_TOPIC,
       kind: "cancel",
       from: this.identity,
@@ -576,7 +583,11 @@ export class FabricControlPlane {
         requestedAt,
         deadlineAt: requestedAt + this.#ackTimeoutMs,
       } satisfies FabricControlCommand,
-    }).catch(() => undefined);
+    };
+    await this.#backgroundCancellations.enqueue(() => {
+      if (Date.now() <= cancellation.data.deadlineAt) return this.mesh.publish(cancellation);
+      return undefined;
+    });
   }
 
   async close(): Promise<void> {
@@ -598,6 +609,7 @@ export class FabricControlPlane {
     await Promise.allSettled(cancellations);
     for (const active of this.#activeCommands.values()) active.controller.abort();
     await Promise.allSettled([...this.#activeHandlers]);
+    await this.#backgroundNotifications.close();
     this.#handler = undefined;
   }
 
@@ -633,7 +645,7 @@ export class FabricControlPlane {
       this.#offset = tail.nextOffset;
       if (tail.events.length < 100) break;
     }
-    await this.#cleanupSeen(Date.now()).catch(() => undefined);
+    await this.#cleanupSeen(Date.now()).catch(rethrowMeshLockTimeout);
   }
 
   #acceptAcknowledgement(event: MeshEvent): void {
@@ -890,8 +902,7 @@ export class FabricControlPlane {
         };
       }
       acceptance = this.#boundedAcceptance(acceptance);
-      try {
-        await this.#seen.put({
+      const saveOutcome = () => this.#seen.put({
           key,
           value: {
             format: 1,
@@ -905,22 +916,37 @@ export class FabricControlPlane {
           identity: this.identity,
           ifVersion: claimVersion,
         });
+      try {
+        await saveOutcome();
       } catch (error) {
-        // A conflict means another owner holds this claim; a lock timeout wrote nothing, and
-        // the command has run, so its sender still gets the outcome.
+        // A conflict belongs to another owner; a timeout wrote nothing. Preserve the actual
+        // result under the original version fence and retry it without running the handler.
         if (!isLockTimeout(error)) return;
+        void this.#backgroundNotifications.retry(() => {
+          if (Date.now() <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) return saveOutcome();
+          return undefined;
+        }, error);
+      }
+      if (command.operation === "ask") {
+        // Detached asks have already left the poll cursor. Retain just their outcome, never
+        // execute the handler again, and retry the ACK on the owned notification tick.
+        await this.#backgroundNotifications.enqueue(() => {
+          if (Date.now() <= deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) {
+            return this.#publishAcknowledgement(command, acceptance);
+          }
+          return undefined;
+        });
+        return;
       }
       try {
         await this.#publishAcknowledgement(command, acceptance);
       } catch (error) {
-        // An "ask" runs detached from the drain, which has consumed it: nothing retries it, so
-        // its outcome is not kept (its sender's result wait times out instead).
-        if (command.operation !== "ask") {
-          this.#unpublished.set(command.commandId, {
-            acceptance,
-            expiresAt: deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4,
-          });
-        }
+        // Non-detached commands remain at the poll cursor. Keep the actual outcome for
+        // its next pass, rather than executing a handler twice after an ACK lock timeout.
+        this.#unpublished.set(command.commandId, {
+          acceptance,
+          expiresAt: deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4,
+        });
         throw error;
       }
     } finally {

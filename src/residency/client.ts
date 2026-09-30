@@ -15,6 +15,8 @@ import { hasUnresolvedWorker } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
+import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
@@ -128,6 +130,7 @@ export class ResidencyClient {
   #deliveryTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
+  readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
   #closed = false;
 
   constructor(readonly options: ResidencyClientOptions) {
@@ -146,11 +149,11 @@ export class ResidencyClient {
     if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
     this.syncPiModels();
     this.#deliveryTimer = setInterval(
-      () => void this.#drainDeliveries().catch(() => undefined),
+      () => void this.#backgroundDelivery.run(() => this.#drainDeliveries()),
       Math.max(20, this.options.config.mesh.actorPollMs),
     );
     this.#deliveryTimer.unref();
-    void this.#drainDeliveries().catch(() => undefined);
+    void this.#backgroundDelivery.run(() => this.#drainDeliveries());
   }
 
   async close(): Promise<void> {
@@ -598,7 +601,11 @@ export class ResidencyClient {
     try {
       const entries = this.options.mesh.listAll(this.#deliveryPrefix);
       for (const entry of entries) {
-        try { await this.#deliver(entry); } catch { /* Retain this source for retry; other senders and steers still drain. */ }
+        try { await this.#deliver(entry); } catch (error) {
+          // The record remains durable. Back off a locked mesh; retain ordinary failed senders
+          // without blocking the other entries in this pass.
+          if (isMeshLockTimeout(error)) throw error;
+        }
       }
     } finally {
       this.#drainingDeliveries = false;

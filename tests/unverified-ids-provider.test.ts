@@ -214,7 +214,61 @@ describe("hosted service end-to-end identifier delivery", () => {
   });
 });
 
+// Count actual regex yields and span-position reads, not elapsed time. The
+// test fuse stops the old quadratic loop deterministically before it hangs CI.
+const countedMatchWork = async (label: string, run: () => Promise<void>) => {
+  const original = String.prototype.matchAll;
+  const counts = { matches: 0, positions: 0, total: 0 };
+  const tick = (kind: "matches" | "positions") => {
+    counts[kind]++;
+    if (++counts.total > 120_000) throw new Error("Test match-work fuse exceeded");
+  };
+  const spy = vi.spyOn(String.prototype, "matchAll").mockImplementation(function (this: string, regex: RegExp) {
+    const matches = original.call(this, regex);
+    return (function* () {
+      for (const match of matches) {
+        tick("matches");
+        const index = match.index;
+        Object.defineProperty(match, "index", { get: () => { tick("positions"); return index; } });
+        yield match;
+      }
+    })() as RegExpStringIterator<RegExpExecArray>;
+  });
+  try { await run(); } finally {
+    spy.mockRestore();
+    console.info("MATCH_WORK " + JSON.stringify({ label, ...counts }));
+  }
+  return counts;
+};
+
 describe.each(surfaces)("unverified identifier annotations: %s", surface => {
+  it.each(["outgoing", "history"] as const)("round-3 repeated legacy spans: %s is linear and delivered", async mode => {
+    const h = harness(surface);
+    const repeated = "comment #123456789 ".repeat(10_000);
+    if (mode === "history") read(h.manager, repeated);
+    const text = mode === "outgoing" ? repeated : "#123456789";
+    const notice = mode === "outgoing" ? "unverified ids: comment 123456789" : "unverified ids: #123456789";
+    const counts = await countedMatchWork(`${surface} repeated ${mode}`, async () => {
+      const result = await h.send(text);
+      expect(h.sent).toEqual([`${text}\n\n${(result as { notice?: string }).notice}`]);
+      expect(result).toHaveProperty("notice", notice);
+    });
+    expect(counts.total).toBeLessThanOrEqual(120_000);
+  });
+
+  it.each(["outgoing", "history", "aggregate history"] as const)("round-3 match budget: %s fails open and delivers", async mode => {
+    const h = harness(surface);
+    const repeated = "comment #123456789 ".repeat(mode === "outgoing" ? 13_500 : 10_000);
+    if (mode === "history") read(h.manager, repeated.repeat(10));
+    if (mode === "aggregate history") { read(h.manager, repeated); read(h.manager, repeated); }
+    const text = mode === "outgoing" ? repeated : "#123456789";
+    const counts = await countedMatchWork(`${surface} budget ${mode}`, async () => {
+      const notice = "unverified ids: check failed";
+      expect(await h.send(text)).toHaveProperty("notice", notice);
+      expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+    });
+    expect(counts.total).toBeLessThanOrEqual(120_000);
+  });
   it.each(replay)("delivers and reports the synthetic wrong %s", async (_kind, text) => {
     const h = harness(surface);
     const result = await h.send(text) as { notice?: string };

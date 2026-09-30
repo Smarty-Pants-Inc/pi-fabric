@@ -9,6 +9,9 @@ export const MESSAGE_ID_LIMITS = {
   identifiers: 128,
   contentBlocks: 2_000,
   metadataItems: 2_000,
+  // Aggregate regex matches, span comparisons and candidate probes, including duplicates.
+  messageMatchItems: 50_000,
+  historyMatchItems: 50_000,
 } as const;
 
 type Identifier = { kind: "session" | "actor" | "sha" | "comment" | "pid" | "issue"; value: string; repository?: string; display: string; at: number };
@@ -29,12 +32,39 @@ const issueReference = new RegExp(`(?<![\\w./-])(?:https://github\\.com/(${issue
 // A hash-number span already parsed as a legacy class is not an issue, either
 // in outgoing text or read evidence. Use the actual parser's spans so separators,
 // digit limits and boundaries stay identical; qualified issue refs remain intact.
-function* issueMatches(text: string, regex: RegExp): Generator<RegExpExecArray> {
-  let legacy: RegExpExecArray[] | undefined;
+type LegacySpan = RegExpExecArray;
+const spendMatch = (work: WorkBudget): void => {
+  if (--work.remaining < 0) throw new Error("Match work budget exceeded");
+};
+const legacySpans = (text: string, work: WorkBudget): LegacySpan[] => {
+  const spans: LegacySpan[] = [];
+  for (const match of text.matchAll(literal)) {
+    spendMatch(work);
+    if (match[0].includes("#")) spans.push(match);
+  }
+  return spans;
+};
+function* issueMatches(text: string, regex: RegExp, getLegacy: () => readonly LegacySpan[], work: WorkBudget): Generator<RegExpExecArray> {
+  let legacy: readonly LegacySpan[] | undefined;
+  let cursor = 0;
+  // Both matchAll streams are ordered and non-overlapping: each issue match
+  // and each advanced span cost one unit. Never restart a full-array search.
+  // The shared budget also caps repeated scans for different pending issues.
   for (const match of text.matchAll(regex)) {
-    legacy ??= [...text.matchAll(literal)].filter(token => token[0].includes("#"));
-    if (!legacy.some(token => match.index >= token.index &&
-      match.index + match[0].length <= token.index + token[0].length)) yield match;
+    spendMatch(work);
+    legacy ??= getLegacy();
+    const start = match.index;
+    const end = start + match[0].length;
+    while (cursor < legacy.length) {
+      spendMatch(work);
+      const span = legacy[cursor]!;
+      const spanStart = span.index;
+      const spanEnd = spanStart + span[0].length;
+      if (spanEnd <= start) { cursor++; continue; }
+      if (start < spanStart || end > spanEnd) yield match;
+      break;
+    }
+    if (cursor === legacy.length) yield match;
   }
 }
 // Read text can contain raw git / PID / JSON API output. Search only the
@@ -86,7 +116,8 @@ const identifier = (raw: string, at: number, sha = false): Identifier => {
   return { kind: sha ? "sha" : "actor", value: lower.replace(/^(?:actor|run):/, ""), display: raw, at };
 };
 
-const candidates = (text: string): Identifier[] => {
+const candidates = (text: string, work: WorkBudget): Identifier[] => {
+  const legacy: LegacySpan[] = [];
   const unique = new Map<string, Identifier>();
   const add = (id: Identifier): void => {
     const key = identifierKey(id);
@@ -97,6 +128,7 @@ const candidates = (text: string): Identifier[] => {
   const shaPositions = new Set<number>();
   for (const regex of [shaWord, shaTick]) {
     for (const match of text.matchAll(regex)) {
+      spendMatch(work);
       const id = identifier(match[1]!, match.index + match[0].indexOf(match[1]!), true);
       if (id.value.length === 32) shaPositions.add(id.at);
       add(id);
@@ -105,11 +137,14 @@ const candidates = (text: string): Identifier[] => {
   // An explicitly SHA-qualified 32-hex token is a SHA abbreviation, not also
   // an actor/run. Bare 32-hex tokens retain the actor/run interpretation.
   for (const match of text.matchAll(literal)) {
-    if (!shaPositions.has(match.index)) add(identifier(match[0], match.index));
+    spendMatch(work);
+    const start = match.index;
+    if (match[0].includes("#")) legacy.push(match);
+    if (!shaPositions.has(start)) add(identifier(match[0], start));
   }
   // Ordinary legacy identifiers need no extra repository-pattern scan.
   if (text.includes("/") || /#\d{3}/.test(text)) {
-    for (const match of issueMatches(text, issueReference)) {
+    for (const match of issueMatches(text, issueReference, () => legacy, work)) {
       const repository = match[1] ?? match[3] ?? match[5];
       const value = match[2] ?? match[4] ?? match[6] ?? match[7]!;
       add({ kind: "issue", value, ...(repository ? { repository: repository.toLowerCase() } : {}), display: `${repository ?? ""}#${value}`, at: match.index });
@@ -198,7 +233,7 @@ const withoutReceipts = (text: string, budget: WorkBudget): string => {
  */
 export function unverifiedMessageIds(text: string, session?: ReadonlySessionManager, senderId?: string): string[] {
   if (Buffer.byteLength(text) > MESSAGE_ID_LIMITS.messageBytes) throw new Error("Message budget exceeded");
-  const ids = candidates(text);
+  const ids = candidates(text, { remaining: MESSAGE_ID_LIMITS.messageMatchItems });
   if (!ids.length) return [];
   if (!session?.getLeafId || !session.getEntry) throw new Error("Sender history unavailable");
   const pending = new Map(ids.map(id => [identifierKey(id), id]));
@@ -209,6 +244,7 @@ export function unverifiedMessageIds(text: string, session?: ReadonlySessionMana
   let bytes = MESSAGE_ID_LIMITS.historyBytes as number;
   let blocks = MESSAGE_ID_LIMITS.contentBlocks as number;
   const work: WorkBudget = { remaining: MESSAGE_ID_LIMITS.metadataItems };
+  const matchWork: WorkBudget = { remaining: MESSAGE_ID_LIMITS.historyMatchItems };
   const ownSession = session.getSessionId?.();
   const ownIds = new Set([senderId, ownSession ? `session:${ownSession}` : undefined].filter((id): id is string => Boolean(id)));
   const seen = new Set<string>();
@@ -241,11 +277,16 @@ export function unverifiedMessageIds(text: string, session?: ReadonlySessionMana
       });
       if (!possibleRead.test(bounded)) continue;
       const lower = /[A-F]/.test(bounded) ? bounded.toLowerCase() : bounded;
+      // One ordered span index per readable block, lazily built only if an
+      // issue matcher actually hits. Share it across all pending issue IDs.
+      let legacy: LegacySpan[] | undefined;
+      const getLegacy = (): LegacySpan[] => legacy ??= legacySpans(bounded, matchWork);
       for (const [key, id] of pending) {
+        spendMatch(matchWork);
         // Most history blocks don't contain any candidate. Literal search avoids
         // an expensive regex scan of those blocks, even with a 2 MiB history.
         if (lower.includes(id.value) && (id.kind === "issue"
-          ? !issueMatches(bounded, matchers.get(id)!).next().done
+          ? !issueMatches(bounded, matchers.get(id)!, getLegacy, matchWork).next().done
           : matchers.get(id)!.test(bounded))) pending.delete(key);
       }
     }

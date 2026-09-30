@@ -2,6 +2,7 @@ import "./fixtures/conversation-host.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { compactTerminalRunLog } from "../src/worker/run-log.js";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   NativeConversationReader,
@@ -534,6 +535,76 @@ describe("native conversation reader — paging and rollover", () => {
     const rolled = reader.read({ ...input, eventsFile: next }, follow);
     expect(rolled.messages).toEqual([...sessionMessages, nextMessage]);
     expect(rolled.hasMore).toBe(false);
+    reader.clear();
+  });
+
+  it.each(["session", "events"] as const)("keeps pinned %s bookmarks when identical loaded bytes move to a new inode", (kind) => {
+    const file = path.join(makeWorkspace(), `${kind}.jsonl`);
+    const messages = Array.from({ length: 150 }, (_, index) => ({
+      role: "user", content: `${index}:${"x".repeat(5000)}`, timestamp: index,
+    }));
+    const records = messages.map((message, index) => kind === "events"
+      ? { type: "message_end", message }
+      : { ...entryBase(`m${index}`, index ? `m${index - 1}` : null), type: "message", message });
+    const header = kind === "session" ? [sessionHeader] : [];
+    fs.writeFileSync(file, jsonl([...header, ...records]));
+    const reader = new NativeConversationReader();
+    const input = source(kind === "session" ? { sessionFile: file } : { eventsFile: file });
+    reader.read(input, false);
+    const pinned = reader.loadOlder()!;
+    // Event envelopes are shorter than session entries, so two byte pages
+    // contain 102 event messages versus 100 session messages.
+    expect(pinned.messages).toHaveLength(kind === "session" ? 100 : 102);
+    expect(pinned.messages).toEqual(messages.slice(kind === "session" ? 50 : 48));
+    const appended = { role: "user", content: "new append", timestamp: 150 };
+    const appendRecord = kind === "events" ? { type: "message_end", message: appended }
+      : { ...entryBase("m150", "m149"), type: "message", message: appended };
+    fs.writeFileSync(`${file}.new`, jsonl([...header, ...records, appendRecord]));
+    const inode = fs.statSync(file).ino;
+    fs.renameSync(`${file}.new`, file);
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const refreshed = reader.read(input, false);
+    expect(refreshed.messages).toEqual(pinned.messages);
+    expect(refreshed.hasMore).toBe(pinned.hasMore);
+    expect(refreshed.hasNewer).toBe(true);
+    expect(reader.loadNewer()!.messages).toEqual([...pinned.messages, appended]);
+    expect(reader.read(input, true).messages).toEqual([...pinned.messages, appended]);
+    reader.clear();
+  });
+
+  it.each([false, true])("preserves 93 loaded messages through production compaction and reads the 119-message page (follow=%s)", (follow) => {
+    const file = path.join(makeWorkspace(), "events.jsonl");
+    const events = Array.from({ length: 160 }, (_, index) => {
+      const content = [{ type: "text", text: `body-${index}:${"x".repeat(3990)}` }];
+      const toolCallId = `call-${index}`;
+      return [
+        { type: "tool_execution_start", toolCallId, toolName: "bash", args: {} },
+        { type: "tool_execution_end", toolCallId, toolName: "bash", result: { content }, isError: false },
+        { type: "message_end", message: { role: "toolResult", toolCallId, toolName: "bash", content, isError: false, timestamp: index + 1 } },
+      ];
+    }).flat();
+    fs.writeFileSync(file, jsonl(events));
+    const reader = new NativeConversationReader();
+    const input = source({ eventsFile: file, status: "completed" });
+    reader.read(input, follow);
+    const before = reader.loadOlder(2)!;
+    expect(before.messages).toHaveLength(93);
+    const inode = fs.statSync(file).ino;
+    expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 160 });
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const after = reader.read(input, follow);
+    expect(after.messages).toHaveLength(119);
+    expect(after.messages.slice(-93)).toEqual(before.messages);
+    expect(after.hasMore).toBe(true);
+    expect(after.hasNewer).toBe(false);
+    expect(after.revision).toBeGreaterThan(before.revision);
+    expect(reader.loadOlder(2)!.messages).toHaveLength(160);
+    const appended = { role: "user", content: "new-path-offset", timestamp: 999 };
+    fs.appendFileSync(file, jsonl([{ type: "message_end", message: appended }]));
+    const pinned = reader.read(input, false);
+    expect(pinned.messages).toHaveLength(160);
+    expect(pinned.hasNewer).toBe(true);
+    expect(reader.loadNewer()!.messages).toEqual([...pinned.messages, appended]);
     reader.clear();
   });
 

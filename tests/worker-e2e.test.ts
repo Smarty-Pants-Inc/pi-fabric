@@ -352,10 +352,25 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(log.length).toBeLessThan(10_000);
     const events = log.trim().split("\n").map((line) => JSON.parse(line));
     const stub = { type: "image", elided: true, bytes: ((5 * 1024 * 1024 + 4) * 3) / 4, mimeType: "image/png" };
-    const end = events.find((event) => event.type === "tool_execution_end");
-    const canonical = events.find((event) => event.type === "message_end" && event.message?.role === "toolResult");
-    expect(end?.result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify({ content: canonical.message.content }), "utf8") });
-    expect(canonical?.message.content[1]).toEqual(stub);
+    const ends = events.filter((event) => event.type === "tool_execution_end");
+    const canonicals = events.filter((event) => event.type === "message_end" && event.message?.role === "toolResult");
+    expect(ends).toHaveLength(1);
+    expect(canonicals).toHaveLength(1);
+    const end = ends[0];
+    const content = [{ type: "text", text: "Read image file [image/png]" }, stub];
+    expect(end).toMatchObject({ toolCallId: "read-1", toolName: "read", isError: false });
+    expect(canonicals[0].message).toEqual({ role: "toolResult", toolCallId: "read-1", toolName: "read", content });
+    if (result.compactionSkipped !== undefined) {
+      // Terminal deduplication is best-effort (work bounds or filesystem failure).
+      // Image projection must still be exact: never accept raw base64, lost data,
+      // or an unexplained full end from a broken canonical pairing.
+      expect(result.compactionSkipped).toMatch(
+        /^Terminal run-log compaction (?:skipped: .+ work bound exceeded; full log retained|failed; full log retained: .+)$/,
+      );
+      expect(end.result).toEqual({ content });
+    } else {
+      expect(end.result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify({ content }), "utf8") });
+    }
   }, 30_000);
 
   it.each(["oversized-final", "oversized-error"])(

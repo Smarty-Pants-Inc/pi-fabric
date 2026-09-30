@@ -99,10 +99,48 @@ describe("native reader disk suspension", () => {
     expect(reader.suspend()).toBe(true);
     expect(content(reader.last!)).toEqual(content(unavailable));
     fs.writeFileSync(file, jsonl([...records, entry(150)]));
-    expect(reader.read(source(file), false).messages).toHaveLength(pinned.messages.length);
-    expect(reader.loadNewer()!.messages).toHaveLength(pinned.messages.length + 1);
+    const recreated = reader.read(source(file), false);
+    expect(recreated.messages).toHaveLength(pinned.messages.length);
+    expect(content(recreated)).toEqual(content(pinned));
+    expect(recreated.unavailable).toBeUndefined();
+    expect(recreated.status).toBe("running");
+    expect(recreated.revision).toBeGreaterThan(unavailable.revision);
+    const newer = reader.loadNewer()!;
+    expect(newer.messages).toHaveLength(pinned.messages.length + 1);
+    expect(newer.messages).toEqual([...pinned.messages, entry(150).message]);
+    expect(newer.hasNewer).toBe(false);
+    expect(reader.read(source(file), false).messages).toEqual(newer.messages);
+    fs.appendFileSync(file, jsonl([entry(151)]));
+    expect(reader.read(source(file), false).hasNewer).toBe(true);
+    expect(reader.loadNewer()!.messages).toEqual([...newer.messages, entry(151).message]);
     expect(reader.suspend()).toBe(true);
     expect(reader.loadOlder()!.historyComplete).toBe(true);
+    reader.clear();
+  });
+
+  it.each(["missing", "corrupt"])("fails closed on a %s checkpoint with rewritten loaded ranges", (failure) => {
+    const file = path.join(workspace(), "session.jsonl");
+    fs.writeFileSync(file, jsonl([header, ...Array.from({ length: 150 }, (_, i) => entry(i))]));
+    const reader = new NativeConversationReader();
+    reader.read(source(file), false);
+    reader.loadOlder();
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[0]!.value as string, "checkpoint");
+    if (failure === "missing") fs.unlinkSync(checkpoint);
+    else fs.writeFileSync(checkpoint, "corrupt");
+    // Same inode, same record sizes, but different payloads: never replay them
+    // as though they were the checkpoint's original loaded history.
+    fs.writeFileSync(file, jsonl([header, ...Array.from({ length: 150 }, (_, i) => ({
+      ...entry(i), message: { ...entry(i).message, content: entry(i).message.content.replace(/x/g, "y") },
+    }))]));
+    const failed = reader.read({ ...source(file), status: "completed" }, false);
+    expect(failed.messages).toEqual([]);
+    expect(failed.error).toContain("Unable to restore reader history");
+    expect(failed.error!.length).toBeLessThanOrEqual(201);
+    expect(failed.unavailable?.sessionFile).toBe(true);
+    expect(failed.status).toBe("completed");
+    expect(reader.suspended).toBe(true);
     reader.clear();
   });
 

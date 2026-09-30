@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { NativeReaderEventReplay } from "./conversation-native-reader-replay.js";
 import { NativeReaderCheckpoint } from "./conversation-native-reader-checkpoint.js";
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
@@ -435,6 +436,8 @@ export class NativeConversationReader {
   #checkpoint: NativeReaderCheckpoint<NativeReaderState> | undefined;
   #suspendedMetadata: NativeReaderMetadata | undefined;
   readonly #loadedRanges = new Map<FileKind, Array<[number, number]>>();
+  // Compact identity evidence survives suspension without retaining payloads.
+  readonly #loadedPages = new Map<FileKind, Array<{ start: number; end: number; digest: string }>>();
 
   /** Last transcript produced; undefined before the first successful read. */
   get last(): NativeConversationTranscript | undefined {
@@ -612,6 +615,9 @@ export class NativeConversationReader {
 
   #rememberRange(kind: FileKind, page: RecordPage): void {
     if (page.end <= page.start) return;
+    const pages = this.#loadedPages.get(kind) ?? [];
+    pages.push({ start: page.start, end: page.end, digest: this.#pageDigest(page.records) });
+    this.#loadedPages.set(kind, pages);
     const ranges = [...(this.#loadedRanges.get(kind) ?? []), [page.start, page.end] as [number, number]];
     ranges.sort((a, b) => a[0] - b[0]);
     const merged: Array<[number, number]> = [];
@@ -631,11 +637,12 @@ export class NativeConversationReader {
       const opened = openDescriptor(filePath);
       if (!opened || "error" in opened) throw new Error(`${filePath}: ${opened?.error ?? "unavailable"}`);
       try {
+        // Inode reuse is possible after unlink: identity alone cannot prove
+        // a damaged checkpoint's byte ranges still contain the loaded history.
+        if (!this.#matchesLoadedPages(kind, opened.descriptor, opened.size)) {
+          throw new Error(`${filePath}: loaded range no longer available`);
+        }
         for (const [head, tail] of ranges) {
-          const window = this.#windows.get(kind);
-          if (window?.device !== opened.device || window?.inode !== opened.inode || opened.size < tail) {
-            throw new Error(`${filePath}: loaded range no longer available`);
-          }
           let offset = head;
           while (offset < tail) {
             const page = readForwardPage(opened.descriptor, offset, tail, GROWTH_PAGE_BYTES);
@@ -709,6 +716,7 @@ export class NativeConversationReader {
     this.#checkpoint = undefined;
     this.#suspendedMetadata = undefined;
     this.#loadedRanges.clear();
+    this.#loadedPages.clear();
     this.#sourceId = sourceId;
     this.#status = status;
     this.#sessionFile = sessionFile;
@@ -767,6 +775,7 @@ export class NativeConversationReader {
     this.#eventEntryIds.clear();
     this.#windows.delete("events");
     this.#loadedRanges.delete("events");
+    this.#loadedPages.delete("events");
     this.#error = undefined;
     if (this.#eventsFile) this.#initWindow("events", this.#eventsFile);
   }
@@ -823,7 +832,7 @@ export class NativeConversationReader {
       return false;
     }
     try {
-      if (this.#replaceWindowIfNeeded(kind, opened.device, opened.inode)) return true;
+      if (this.#replaceWindowIfNeeded(kind, opened)) return true;
       if (!window.hasOlder || window.head <= 0) return false;
       const page = readBackwardPage(opened.descriptor, window.head, OLDER_PAGE_BYTES, false);
       if (page.start >= window.head) return false;
@@ -853,7 +862,7 @@ export class NativeConversationReader {
     try {
       // Check identity even when pinned or size grew: terminal compaction can
       // shorten the file OR grow a near-empty end into the compact marker.
-      if (this.#replaceWindowIfNeeded(kind, opened.device, opened.inode)) return true;
+      if (this.#replaceWindowIfNeeded(kind, opened)) return true;
       window.size = opened.size;
       window.unavailable = false;
       if (!followLatest || opened.size <= window.tail) return false;
@@ -869,10 +878,39 @@ export class NativeConversationReader {
     }
   }
 
-  #replaceWindowIfNeeded(kind: FileKind, device: number, inode: number): boolean {
+  #pageDigest(records: string[]): string {
+    return createHash("sha256").update(JSON.stringify(records)).digest("hex");
+  }
+
+  #matchesLoadedPages(kind: FileKind, descriptor: number, size: number): boolean {
+    const pages = this.#loadedPages.get(kind);
+    if (!pages?.length) return false;
+    for (const previous of pages) {
+      if (size < previous.end) return false;
+      const page = readForwardPage(descriptor, previous.start, previous.end, previous.end - previous.start);
+      if (page.end !== previous.end || this.#pageDigest(page.records) !== previous.digest) return false;
+    }
+    return true;
+  }
+
+  #replaceWindowIfNeeded(
+    kind: FileKind,
+    opened: { descriptor: number; device: number; inode: number; size: number },
+  ): boolean {
+    const { device, inode } = opened;
     const window = this.#windows.get(kind);
     if (!window || window.device === undefined ||
       (window.device === device && window.inode === inode)) return false;
+    // Recreating an unchanged source is not compaction: the pinned tail must
+    // stay before unseen appends. Only reuse byte bookmarks after proving all
+    // loaded pages identical; changed payloads still take the reread path below.
+    if (this.#matchesLoadedPages(kind, opened.descriptor, opened.size)) {
+      window.device = device;
+      window.inode = inode;
+      window.size = opened.size;
+      window.unavailable = false;
+      return false;
+    }
     const loadedRecords = window.loadedRecords ?? 0;
     if (kind === "events") this.#resetEventsState();
     else this.#resetPaths(this.#sourceId, this.#status, this.#sessionFile, this.#eventsFile);

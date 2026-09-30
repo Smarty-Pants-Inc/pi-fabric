@@ -18,8 +18,11 @@ export function captureRuntimeDeadline(backend: string) {
     expect(scheduled, "runtime deadline was armed").toBeDefined();
     const current = scheduled!;
     clearTimeout(current.timer);
-    const clock = vi.spyOn(Date, "now").mockReturnValue(at);
-    try { current.callback(); } finally { clock.mockRestore(); }
+    // Preserve a surrounding admission clock: restoring a nested vi.spyOn
+    // would remove that outer spy instead of returning to its frozen/resumed time.
+    const now = Date.now;
+    Date.now = () => at;
+    try { current.callback(); } finally { Date.now = now; }
   };
   return {
     ready: () => scheduled !== undefined,

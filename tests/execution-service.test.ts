@@ -11,6 +11,7 @@ import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import type { FabricActionDescriptor, FabricProvider } from "../src/protocol.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const cpythonAvailable = spawnSync("python3", ["-I", "-B", "-c", "import sys"]).status === 0;
 const montyAvailable = await import("@pydantic/monty/node").then(() => true, () => false);
@@ -660,15 +661,15 @@ return "unreachable";
     config.executor.timeoutMs = 500;
     config.executor.mainMaxTimeoutMs = 100; // Tiny test-only policy: no ten-minute wall-clock test.
     config.executor.hostCallTimeouts = { "extensions.slowext": 900_000, "tasks.wait": 900_000 };
-    const safety = new AbortController();
-    const safetyTimer = setTimeout(() => safety.abort(), 600);
     try {
-      const result = await new FabricExecutionService(registry, config).execute({
+      // Spend the unchanged ceiling only after the guest is repeatedly calling
+      // the provider, not during cold compilation/admission on a loaded runner.
+      const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
         code, requestedTimeoutMs: 86_400_000,
-        signal: safety.signal, parentToolCallId: "main-fixed-ceiling",
+        signal, parentToolCallId: "main-fixed-ceiling",
         context: { cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
         onPartial() {},
-      });
+      }), () => waits > 1);
       expect(result.typeErrors).toBeUndefined();
       expect(result.success).toBe(false);
       expect(result.trace.outcome).toBe("timed_out");
@@ -677,7 +678,7 @@ return "unreachable";
       expect(waits).toBeGreaterThan(1);
       expect(waits).toBeLessThan(15);
       expect(child.status).toBe("running");
-    } finally { clearTimeout(safetyTimer); vi.unstubAllEnvs(); }
+    } finally { vi.unstubAllEnvs(); }
   });
 
   for (const backend of ["node-process", "monty", "cpython"] as const) {
@@ -696,19 +697,19 @@ return "unreachable";
       config.executor.mainMaxTimeoutMs = 500;
       if (backend === "node-process") config.executor.runtime = backend;
       else { config.executor.kernel = "python"; config.executor.pythonRuntime = backend; }
-      const safety = new AbortController();
-      const timer = setTimeout(() => safety.abort(), 2_000);
       try {
-        const result = await new FabricExecutionService(registry, config).execute({
+        // Native startup is outside the test clock. Require repeated real
+        // provider calls before allowing the fixed 500ms Main budget to run.
+        const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
           code: backend === "node-process" ? 'while (true) await agents.wait({ id: "child" });' : 'while True:\n    await agents.wait(id="child")',
-          signal: safety.signal, parentToolCallId: "native-main-ceiling",
+          signal, parentToolCallId: "native-main-ceiling",
           context: { cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
           onPartial() {},
-        });
+        }), () => waits > 1);
         expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
         expect(result.trace.outcome).toBe("timed_out");
         expect(waits).toBeGreaterThan(1);
-      } finally { clearTimeout(timer); vi.unstubAllEnvs(); }
+      } finally { vi.unstubAllEnvs(); }
     });
   }
 

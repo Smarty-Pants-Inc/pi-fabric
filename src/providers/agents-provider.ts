@@ -1352,7 +1352,7 @@ export class AgentsProvider implements FabricProvider {
     if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
     const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
     const result = await deliverWithMessageNotice(message, checked,
-      text => this.#router.routeMessage(id, text, data, kind, context, options));
+      text => this.#router.routeMessage(id, text, data, kind, context, options), `agents.${kind}`);
     return checked.notice ? { ...result, notice: checked.notice } : result;
   }
 

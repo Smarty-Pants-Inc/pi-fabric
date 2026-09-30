@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
+import * as typeChecker from "../src/runtime/type-checker.js";
+import { ExecutionDeadline } from "../src/runtime/execution-deadline.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const options = {
   timeoutMs: 5_000,
@@ -28,6 +31,104 @@ describe("QuickJsRuntime", () => {
 
     expect(result.terminationReason).toBe("runtime_error");
     expect(result.error).toBe("QuickJS timeout must be positive");
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -5])("rejects non-positive setup timeout %s", async (setupTimeoutMs) => {
+    const result = await new QuickJsRuntime().execute("return 1;", async () => undefined, { ...options, setupTimeoutMs });
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toBe("QuickJS setup timeout must be positive");
+  });
+
+  it("cannot replace a supplied shared execution deadline with separate setup budgeting", async () => {
+    const result = await new QuickJsRuntime().execute("return 1;", async () => undefined, {
+      ...options,
+      executionDeadline: new ExecutionDeadline(options),
+      setupTimeoutMs: 2_000,
+    });
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toContain("cannot replace a shared execution deadline");
+  });
+
+  it("rejects slow host setup before admitting the prepared program", async () => {
+    const transpile = typeChecker.transpileFabricCodeWithSourceMap;
+    vi.spyOn(typeChecker, "transpileFabricCodeWithSourceMap").mockImplementationOnce((code) => {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+      return transpile(code);
+    });
+    const hostCall = vi.fn(async () => 1);
+    const result = await new QuickJsRuntime().execute('return tools.call({ ref: "demo.run" });', hostCall, {
+      ...options, timeoutMs: 100, setupTimeoutMs: 50,
+    });
+    expect(result.terminationReason).toBe("timed_out");
+    expect(result.error).toBe("Execution timed out after 50ms");
+    expect(hostCall).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "while (true) {}",
+    "const initialized = (() => { while (true) {} })();",
+  ])("uses the execution budget for guest top-level work, not setup: %s", async (topLevelWork) => {
+    const startedAt = Date.now();
+    const result = await new QuickJsRuntime().execute("return 1;", async () => undefined, {
+      ...options, timeoutMs: 100, setupTimeoutMs: 2_000,
+      transpiledCode: `${topLevelWork}\nasync function __piFabricMain() { return 1; }`,
+    });
+    expect(result.terminationReason).toBe("timed_out");
+    expect(result.error).toBe("Execution timed out after 100ms");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it("does not revive a setup phase that crosses an absolute ceiling", async () => {
+    let now = Date.now();
+    const ceilingReason = new Error("host absolute ceiling");
+    const maximumDeadlineAt = now + 100;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const transpile = typeChecker.transpileFabricCodeWithSourceMap;
+    vi.spyOn(typeChecker, "transpileFabricCodeWithSourceMap").mockImplementationOnce((code) => {
+      now += 150;
+      return transpile(code);
+    });
+    const hostCall = vi.fn(async () => 1);
+    const result = await new QuickJsRuntime().execute('return tools.call({ ref: "demo.run" });', hostCall, {
+      ...options, setupTimeoutMs: 2_000, maximumDeadlineAt, maximumDeadlineReason: ceilingReason,
+    });
+    expect(result.terminationReason).toBe("timed_out");
+    expect(result.deadlineReason).toBe(ceilingReason);
+    expect(hostCall).not.toHaveBeenCalled();
+  });
+
+  it("keeps the absolute ceiling when switching from setup to execution", async () => {
+    let now = Date.now();
+    const ceilingReason = new Error("host absolute ceiling");
+    const maximumDeadlineAt = now + 250;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const transpile = typeChecker.transpileFabricCodeWithSourceMap;
+    vi.spyOn(typeChecker, "transpileFabricCodeWithSourceMap").mockImplementationOnce((code) => {
+      now += 150;
+      return transpile(code);
+    });
+    const hostCall = vi.fn(async () => { now += 100; return 1; });
+    const result = await new QuickJsRuntime().execute('return tools.call({ ref: "demo.run" });', hostCall, {
+      ...options, setupTimeoutMs: 2_000, maximumDeadlineAt, maximumDeadlineReason: ceilingReason,
+    });
+    expect(hostCall).toHaveBeenCalledOnce();
+    expect(result.terminationReason).toBe("timed_out");
+    expect(result.deadlineReason).toBe(ceilingReason);
+  });
+
+  it("does not invoke a program cancelled during setup", async () => {
+    const controller = new AbortController();
+    const transpile = typeChecker.transpileFabricCodeWithSourceMap;
+    vi.spyOn(typeChecker, "transpileFabricCodeWithSourceMap").mockImplementationOnce((code) => {
+      controller.abort();
+      return transpile(code);
+    });
+    const hostCall = vi.fn(async () => 1);
+    const result = await new QuickJsRuntime().execute('return tools.call({ ref: "demo.run" });', hostCall, {
+      ...options, setupTimeoutMs: 2_000, signal: controller.signal,
+    });
+    expect(result.terminationReason).toBe("aborted");
+    expect(hostCall).not.toHaveBeenCalled();
   });
 
   it("rejects negative log limits like the Monty kernel", async () => {
@@ -483,45 +584,51 @@ return self.name;
   });
 
   it("extends the active deadline before a blocking host call runs", async () => {
-    const result = await new QuickJsRuntime().execute(
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new QuickJsRuntime().execute(
       `
 const ref = ["agents", "run"].join(".");
 return tools.call({ ref, args: { task: "slow" } });
 `,
-      async () =>
-        new Promise((resolve) => {
+      async () => {
+        admitted = true;
+        return new Promise((resolve) => {
           setTimeout(() => resolve({ status: "completed", text: "ok" }), 150);
-        }),
+        });
+      },
       {
         ...options,
-        timeoutMs: 50,
+        timeoutMs: 50, signal,
         minimumTimeoutMsForHostCall(ref, args) {
           return ref === "fabric.$call" && args.ref === "agents.run" ? 1_000 : undefined;
         },
       },
-    );
+    ), () => admitted);
     expect(result.error).toBeUndefined();
     expect(result.value).toMatchObject({ status: "completed", text: "ok" });
   });
 
   it("extends a late blocking host call from the call start", async () => {
-    const result = await new QuickJsRuntime().execute(
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new QuickJsRuntime().execute(
       `
 await tools.call({ ref: "demo.delay" });
 return tools.call({ ref: "agents.run", args: { task: "late" } });
 `,
-      async () =>
-        new Promise((resolve) => {
+      async () => {
+        admitted = true;
+        return new Promise((resolve) => {
           setTimeout(() => resolve({ status: "completed" }), 70);
-        }),
+        });
+      },
       {
         ...options,
-        timeoutMs: 100,
+        timeoutMs: 100, signal,
         minimumTimeoutMsForHostCall(ref) {
           return ref === "fabric.$call" ? 100 : undefined;
         },
       },
-    );
+    ), () => admitted);
     expect(result.error).toBeUndefined();
     expect(result.value).toMatchObject({ status: "completed" });
   });
@@ -584,11 +691,13 @@ await Promise.all([
   });
 
   it("aborts in-flight host calls when the sandbox deadline expires", async () => {
+    let admitted = false;
     let hostCallAborted = false;
-    const result = await new QuickJsRuntime().execute(
+    const result = await executeAfterAdmission(signal => new QuickJsRuntime().execute(
       'await tools.call({ ref: "demo.wait" });',
       async (_ref, _args, signal) =>
         new Promise((_resolve, reject) => {
+          admitted = true;
           signal.addEventListener(
             "abort",
             () => {
@@ -598,8 +707,8 @@ await Promise.all([
             { once: true },
           );
         }),
-      { ...options, timeoutMs: 50 },
-    );
+      { ...options, timeoutMs: 50, signal },
+    ), () => admitted);
     expect(result.error).toContain("timed out");
     expect(hostCallAborted).toBe(true);
   });

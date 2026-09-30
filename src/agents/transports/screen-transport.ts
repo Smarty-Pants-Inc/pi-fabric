@@ -6,6 +6,8 @@ import type {
 import { EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS } from "../constants.js";
 import { commandAvailable, executeFile, scriptSpawnArgs } from "./process-utils.js";
 
+import { assertTransportLaunchAllowed } from "./launch-authority.js";
+
 const sessionName = (id: string): string => `pi-fabric-${id.slice(0, 12)}`;
 
 export class ScreenTransport implements AgentTransportAdapter {
@@ -17,9 +19,11 @@ export class ScreenTransport implements AgentTransportAdapter {
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     const session = sessionName(request.id);
+    const command = await scriptSpawnArgs(request.workerPath, request.workerArguments);
+    assertTransportLaunchAllowed(request);
     await executeFile(
       "screen",
-      ["-DmS", session, ...(await scriptSpawnArgs(request.workerPath, request.workerArguments))],
+      ["-DmS", session, ...command],
       { cwd: request.cwd },
     );
     return {

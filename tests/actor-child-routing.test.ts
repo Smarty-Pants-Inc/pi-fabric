@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
@@ -30,7 +31,7 @@ afterEach(async () => {
 // Real provider -> AgentManager -> process worker, with the environment an actor's
 // activation worker supplies. Both session (Main owned) and durable (resident owned)
 // actors must keep their child results within the actor, not its lineage Main.
-const setup = async (residency: "session" | "durable", notifyOnComplete = true, validWhile?: FabricActorValidWhileSource, responseMode: "text" | "directive" = "text") => {
+const setup = async (residency: "session" | "durable", notifyOnComplete = true, validWhile?: FabricActorValidWhileSource, responseMode: "text" | "directive" = "text", ownerMaxConcurrent = DEFAULT_FABRIC_CONFIG.agents.maxConcurrent) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-child-"));
   roots.push(root);
   const rootId = "session:root-main";
@@ -39,7 +40,7 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
   const actorScopeRoot = residency === "durable" ? actorRoot : path.join(actorRoot, "root-main");
   const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
   const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 };
-  const ownerAgents = new AgentManager(root, DEFAULT_FABRIC_CONFIG.agents, {
+  const ownerAgents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: ownerMaxConcurrent }, {
     workerPath: fixture, runRoot: path.join(root, "owner-runs"), mainAgentId: rootId,
   });
   cleanups.push(() => ownerAgents.close());
@@ -468,6 +469,89 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(consumed).toBe(1);
     expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
     expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("preserves bound spawner metadata and the foreground receipt fence on a stopped queued child", async () => {
+    const h = await setup(residency);
+    const fence = vi.fn();
+    const consumed = vi.fn();
+    const agents = new AgentManager(h.invocation.cwd, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: fixture, runRoot: path.join(h.invocation.cwd, "queued-child-runs"),
+      onBeforeResultReturned: fence, onResultConsumed: consumed,
+    });
+    cleanups.push(() => agents.close());
+    const blocker = await agents.spawn({ task: "HANG", transport: "process" });
+    const queued = await agents.spawn({ task: "queued actor child", transport: "process" });
+    const spawner = { id: h.actor.id, kind: "actor", runId: h.actorRunId };
+    expect(queued).toMatchObject({ status: "queued", queuePosition: 1, spawner });
+    expect(agents.status(queued.id)).toMatchObject({ status: "queued", spawner });
+    await agents.stop(queued.id);
+    let commit!: () => void;
+    expect(await agents.wait(queued.id, { deferConsumption: (consume) => { commit = consume; } })).toMatchObject({
+      status: "stopped", spawner,
+    });
+    expect(fence).toHaveBeenCalledWith(queued.id);
+    expect(consumed).not.toHaveBeenCalled();
+    commit();
+    expect(consumed).toHaveBeenCalledExactlyOnceWith(queued.id);
+    await agents.stop(blocker.id);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("revokes a queued activation without consuming its deferred child handoff, then consumes it once after resume", async () => {
+    const h = await setup(residency, true, undefined, "text", 1);
+    const child = await h.spawn("LARGE_RESULT");
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    await h.runtime.shutdown();
+    h.resolveModel.mockRejectedValue(new Error("defer before inference"));
+    h.endActivation();
+    await vi.waitFor(() => {
+      expect(store.received(child.id)).toBe(true);
+      expect(h.owner.status(h.actor.id).status).toBe("idle");
+      expect(h.owner.status(h.actor.id).lastError).toContain("defer before inference");
+    }, { timeout: 5000 });
+    h.resolveModel.mockImplementation(async (model) => model);
+    const tasks: string[] = [];
+    const run = AgentManager.prototype.run.bind(h.ownerAgents);
+    vi.spyOn(h.ownerAgents, "run").mockImplementation(async (...args) => {
+      tasks.push(args[0].task);
+      return run(...args);
+    });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const blocker = await h.ownerAgents.spawn({ task: "HANG", transport: "process" });
+    h.owner.tell(h.actor.id, "activation revoked before inference");
+    await vi.waitFor(() => expect(h.ownerAgents.list().some((r) => r.actorId === h.actor.id && r.status === "queued")).toBe(true));
+    const queued = h.ownerAgents.list().find((r) => r.actorId === h.actor.id && r.status === "queued")!;
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toContain(JSON.stringify(store.resultFile(child.id)));
+    expect(h.owner.haltAll().halted).toBe(1);
+    expect(await h.ownerAgents.wait(queued.id)).toMatchObject({ status: "stopped" });
+    await vi.waitFor(() => expect(h.owner.inFlightCount()).toBe(0));
+    await h.ownerAgents.stop(blocker.id);
+    expect(launch.mock.calls.map(([request]) => request.id)).toEqual([blocker.id]);
+    expect(JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"))).toMatchObject({
+      text: "x".repeat(100000), value: { output: "x".repeat(100000) },
+    });
+    const queueFile = path.join(path.dirname(h.actor.sessionFile!),
+      fs.readdirSync(path.dirname(h.actor.sessionFile!)).find((file) => file.startsWith("queue-"))!);
+    expect(JSON.parse(fs.readFileSync(queueFile, "utf8")).items).toEqual([
+      expect.objectContaining({ id: child.id, deferredHandoff: true }),
+    ]);
+    h.owner.dispatchHostEvent("input", { source: "user" });
+    await h.owner.ask(h.actor.id, "new authorized activation consumes retained context");
+    // ask resolves on the outgoing message, before the drain's receipt/cleanup finally.
+    await vi.waitFor(() => expect(h.owner.inFlightCount()).toBe(0));
+    expect(tasks).toHaveLength(2);
+    expect(tasks[1]).toContain(JSON.stringify(store.resultFile(child.id)));
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
+    await h.owner.ask(h.actor.id, "following activation must not repeat context");
+    await vi.waitFor(() => expect(h.owner.inFlightCount()).toBe(0));
+    expect(tasks).toHaveLength(3);
+    expect(tasks[2]).not.toContain(JSON.stringify(store.resultFile(child.id)));
+    expect(launch.mock.calls.some(([request]) => request.id === queued.id)).toBe(false);
+    expect(h.owner.messages(h.actor.id).filter((m) => m.id === child.id && m.direction === "in")).toHaveLength(1);
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 

@@ -825,7 +825,17 @@ const disposeQuickJsContext = (context: any): void => {
   }
 };
 
-export type QuickJsSandboxOptions = FabricSandboxOptions;
+export type QuickJsSandboxOptions = FabricSandboxOptions & {
+  /**
+   * Opt-in allowance for trusted host bridge setup and transpilation, separate
+   * from timeoutMs. The execution budget starts before evaluating any guest
+   * program code (including top-level statements and initializers). QuickJS
+   * compilation in evalCode also uses that execution budget. Cannot replace
+   * a shared executionDeadline.
+   * Both phases remain clamped by maximumDeadlineAt, if supplied.
+   */
+  setupTimeoutMs?: number;
+};
 
 export class QuickJsRuntime {
   async execute(
@@ -865,6 +875,22 @@ export class QuickJsRuntime {
         error: "QuickJS timeout must be positive",
       };
     }
+    if (options.setupTimeoutMs !== undefined && (!Number.isFinite(options.setupTimeoutMs) || options.setupTimeoutMs < 1)) {
+      return {
+        value: undefined,
+        logs: [],
+        terminationReason: "runtime_error",
+        error: "QuickJS setup timeout must be positive",
+      };
+    }
+    if (options.setupTimeoutMs !== undefined && options.executionDeadline) {
+      return {
+        value: undefined,
+        logs: [],
+        terminationReason: "runtime_error",
+        error: "QuickJS separate setup budget cannot replace a shared execution deadline",
+      };
+    }
     if (options.maxLogChars !== undefined && (!Number.isSafeInteger(options.maxLogChars) || options.maxLogChars < 0)) {
       return {
         value: undefined,
@@ -890,7 +916,9 @@ export class QuickJsRuntime {
     const runtime = context.runtime;
     const jsonObject = context.getProp(context.global, "JSON");
     const jsonParse = context.getProp(jsonObject, "parse");
-    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
+    let executionDeadline = options.executionDeadline ?? new ExecutionDeadline(
+      options.setupTimeoutMs === undefined ? options : { ...options, timeoutMs: options.setupTimeoutMs },
+    );
     let interruptedByDeadline = false;
     // Timers cannot police an uninterrupted chain of already-resolved host
     // promises. Every boundary and the CPU interrupt use this same deadline.
@@ -1115,7 +1143,22 @@ export class QuickJsRuntime {
         : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
       const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
       const guestLineCount = guestBundle.code.split("\n").length;
-      const wrappedCode = `${guestBundle.code}\nPromise.race([__piFabricMain(), globalThis.__fabricExecutionGate])`;
+      const invokeCode = "Promise.race([__piFabricMain(), globalThis.__fabricExecutionGate])";
+      const wrappedCode = `${guestBundle.code}\n${invokeCode}`;
+      if (options.setupTimeoutMs !== undefined) {
+        // evalCode compiles AND evaluates: serialized source can escape the main
+        // wrapper and run top-level statements/initializers. Only trusted host
+        // preparation may use the setup allowance; all guest evaluation below
+        // (including compilation in evalCode) must use the execution deadline.
+        // Never reset an expired setup deadline (including an absolute ceiling).
+        if (deadlineReached()) throw executionDeadline.reason;
+        if (options.signal?.aborted) {
+          cancelled = true;
+          throw new Error("Execution cancelled");
+        }
+        executionDeadline.clear();
+        executionDeadline = new ExecutionDeadline(options);
+      }
       cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
       const evaluation = context.evalCode(wrappedCode, "pi-fabric-guest.js");
       pumpJobs();

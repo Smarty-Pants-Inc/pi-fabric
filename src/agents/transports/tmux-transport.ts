@@ -10,6 +10,8 @@ import {
   workerCommand,
 } from "./process-utils.js";
 
+import { assertTransportLaunchAllowed } from "./launch-authority.js";
+
 const sessionName = (id: string): string => `pi-fabric-${id.slice(0, 12)}`;
 
 export class TmuxTransport implements AgentTransportAdapter {
@@ -21,6 +23,8 @@ export class TmuxTransport implements AgentTransportAdapter {
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     const session = sessionName(request.id);
+    const command = await workerCommand(request.workerPath, request.workerArguments);
+    assertTransportLaunchAllowed(request);
     await executeFile("tmux", [
       "new-session",
       "-d",
@@ -28,7 +32,7 @@ export class TmuxTransport implements AgentTransportAdapter {
       session,
       "-c",
       request.cwd,
-      await workerCommand(request.workerPath, request.workerArguments),
+      command,
     ]);
     return {
       kind: this.kind,

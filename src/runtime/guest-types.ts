@@ -245,6 +245,8 @@ interface FabricLifecycleSubscription {
 interface FabricAgentHandle {
   /** Immediate spawning participant, distinct from rootId. */
   spawner?: { id: string; kind: "main" | "agent" | "actor"; runId?: string };
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   /** Resolved Fabric kernel, absent for non-Fabric runners. */
   kernel?: FabricKernel;
   id: string;

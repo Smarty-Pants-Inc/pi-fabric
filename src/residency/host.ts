@@ -141,6 +141,7 @@ class ResidentHost {
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
   #closed = false;
+  #retiring = false;
   #started = false;
   #idleSince = Date.now();
 
@@ -393,13 +394,21 @@ class ResidentHost {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.actors.fenceActivations();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
     while (this.#pollingRequests) await delay(10);
     await this.participants.quiesce().catch(() => undefined);
     await this.lifecycle.close().catch(() => undefined);
     try {
-      await closeWithActors(this.actors, () => this.control.close().catch(() => undefined));
+      if (this.#retiring) {
+        // No admitted run remains. Drain control delivery while actor queues are still writable;
+        // actor close first would acknowledge a late tell whose event could no longer persist.
+        await this.control.close().catch(() => undefined);
+        await this.actors.close();
+      } else {
+        await closeWithActors(this.actors, () => this.control.close().catch(() => undefined));
+      }
     } finally {
       await this.agents.close();
       await this.participants.close().catch(() => undefined);
@@ -597,9 +606,16 @@ class ResidentHost {
   }
 
   #releaseChanged(): boolean {
-    const current = readJson<Partial<ResidentHostConfig>>(path.join(this.config.residencyRoot, "config.json"));
-    return typeof current?.fabricExtensionPath === "string" &&
-      current.fabricExtensionPath !== this.config.fabricExtensionPath;
+    if (!this.#retiring) {
+      const current = readJson<Partial<ResidentHostConfig>>(path.join(this.config.residencyRoot, "config.json"));
+      this.#retiring = typeof current?.fabricExtensionPath === "string" &&
+        current.fabricExtensionPath !== this.config.fabricExtensionPath;
+    }
+    // Fence BOTH scopes before observing quiescence, not after onIdle resolves. Mesh,
+    // lifecycle and control still deliver to durable queues during the subsequent shutdown.
+    // This is irreversible: a config rewrite cannot re-arm an owner already retiring.
+    if (this.#retiring) this.actors.fenceActivations();
+    return this.#retiring;
   }
 
   #checkIdle(): void {
@@ -623,11 +639,15 @@ class ResidentHost {
     } catch {
       // Missing request directory is empty.
     }
-    if (activeActor || activeAgent || pendingRequest) {
+    if (activeActor || activeAgent || this.actors.inFlightCount() > 0 || pendingRequest) {
       this.#idleSince = Date.now();
       return;
     }
-    if (Date.now() - this.#idleSince >= IDLE_EXIT_MS) this.onIdle();
+    if (Date.now() - this.#idleSince >= IDLE_EXIT_MS) {
+      this.#retiring = true;
+      this.actors.fenceActivations();
+      this.onIdle();
+    }
   }
 
   async #processRequest(filePath: string): Promise<void> {

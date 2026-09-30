@@ -92,6 +92,66 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("actor retirement admission fence", () => {
+  it.each(["resolved", "rejected"] as const)("retains an event when %s async model preparation crosses the fence", async (outcome) => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered = false;
+    let armed = false;
+    const { actors, agents, root } = setup(true, undefined, undefined, {
+      resolvePiModel: async model => {
+        if (armed) {
+          entered = true; await gate;
+          if (outcome === "rejected") throw new Error("model refresh failed while retiring");
+        }
+        return model;
+      },
+    });
+    const admitted = vi.spyOn(agents, "run");
+    try {
+      const actor = await actors.create({ name: "preparing", instructions: "Reply", responseMode: "text", model: "provider/visible" });
+      armed = true;
+      actors.tell(actor.id, "retained preparation");
+      await waitFor(() => entered);
+      actors.fenceActivations();
+      release();
+      await waitFor(() => actors.inFlightCount() === 0);
+      expect(admitted).not.toHaveBeenCalled();
+      expect(actors.messages(actor.id).filter(message => message.direction === "out")).toEqual([]);
+      const items = queueFiles(root, actor.id).flatMap(({ text }) => JSON.parse(text).items);
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({ payload: { message: "retained preparation" }, attempts: 0 });
+      expect(items[0].resumed).toBeUndefined();
+      // Neither interactive resume nor capability retries may lift the irreversible fence.
+      actors.dispatchHostEvent("input", { source: "user" });
+      actors.retryCapabilityWaiters();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(admitted).not.toHaveBeenCalled();
+    } finally { release(); admitted.mockRestore(); }
+  });
+
+  it("lets a pre-fence permit waiter finish without cancellation but does not admit the next event", async () => {
+    const { actors, agents, root } = setup(true, undefined, undefined, undefined, {}, { maxConcurrent: 1 });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const blocker = await agents.spawn({ task: "HANG", transport: "process" });
+      const actor = await actors.create({ name: "permit waiter", instructions: "Reply", responseMode: "text" });
+      actors.tell(actor.id, "admitted before retirement");
+      await waitFor(() => agents.list().some(run => run.actorId === actor.id && run.status === "queued"));
+      const activation = agents.list().find(run => run.actorId === actor.id)!;
+      actors.fenceActivations();
+      actors.tell(actor.id, "retained after retirement");
+      await agents.stop(blocker.id);
+      await waitFor(() => actors.inFlightCount() === 0, 10_000);
+      expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.runId)).toHaveLength(1);
+      expect(launch.mock.calls.map(([request]) => request.id)).toEqual([blocker.id, activation.id]);
+      const items = queueFiles(root, actor.id).flatMap(({ text }) => JSON.parse(text).items);
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({ payload: { message: "retained after retirement" }, attempts: 0 });
+    } finally { launch.mockRestore(); }
+  });
+});
+
 describe("queued actor activation revocation (#181 F1)", () => {
   it.each(["stop", "remove", "halt"] as const)("never launches after %s behind a full permit pool", async (operation) => {
     const { actors, agents } = setup(false, undefined, undefined, undefined, {}, { maxConcurrent: 1 });

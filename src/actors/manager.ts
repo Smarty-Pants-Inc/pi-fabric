@@ -373,6 +373,7 @@ export class ActorManager {
   readonly #delivered = new Set<string>();
   #closing = false;
   #releaseBlocked = false;
+  #activationFenced = false;
   readonly #closeGraceMs: number;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
   // mesh dispatch are frozen so interrupted actors are not re-armed by the
@@ -1475,6 +1476,14 @@ export class ActorManager {
   }
 
   /**
+   * Irreversibly fence new run admission, not delivery: events keep their durable queues for
+   * the replacement. Already admitted runs (including permit waiters) finish naturally.
+   */
+  fenceActivations(): void {
+    this.#activationFenced = true;
+  }
+
+  /**
    * Actors with a run in flight or a queue being drained in this runtime: a reload would stop
    * them (smarty-dev#1830, #2160).
    */
@@ -2015,6 +2024,7 @@ export class ActorManager {
       this.#draining.has(actor.id) ||
       actor.status === "stopped" ||
       this.#closing ||
+      this.#activationFenced ||
       !this.#canManage(actor.id)
     ) {
       return;
@@ -2035,11 +2045,12 @@ export class ActorManager {
         actor.queue.length > 0 &&
         actor.status !== "stopped" &&
         !this.#closing &&
+        !this.#activationFenced &&
         this.#canManage(actor.id)
       ) {
         const reset = this.#resetAtBoundary(actor);
         if (reset) await reset;
-        if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing) break;
+        if (actor.queue.length === 0 || (actor.status as string) === "stopped" || this.#closing || this.#activationFenced) break;
         const item = actor.queue.shift();
         this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
@@ -2073,6 +2084,7 @@ export class ActorManager {
           continue;
         }
         let runId: string | undefined;
+        let admitted = false;
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
         // A run ended by a stop (agents.stop, a signal) is interrupted, not failing.
@@ -2110,8 +2122,17 @@ export class ActorManager {
           }
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
           item.binding = await this.#resolvedRunBinding(actor, item.binding);
+          // Async preparation may straddle retirement. No run has been admitted yet: put the
+          // untouched event back, then let finally persist it without a replay-attempt marker.
+          if (this.#activationFenced) {
+            this.#liveActor(actor).queue.unshift(item);
+            break;
+          }
           delete item.admissionRefused;
           this.#persistQueue(actor.id);
+          // Linearize admission here. Retirement must not revoke this generation's launch
+          // authorization afterwards: even a queued permit is now work we drain naturally.
+          admitted = true;
           const result = await this.agents.run(
             this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
@@ -2229,6 +2250,10 @@ export class ActorManager {
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          if (this.#activationFenced && !admitted) {
+            this.#liveActor(actor).queue.unshift(item);
+            break;
+          }
           if (actor.cancelAbort === abortController) {
             delete actor.cancelAbort;
             if (!runCompleted && !item.resolve && !item.reject) {

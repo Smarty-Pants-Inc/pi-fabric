@@ -24,6 +24,10 @@ import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
   RESIDENT_HOST_FORMAT,
+  ResidentActorAuthorizationError,
+  assertResidentActorMain,
+  assertResidentActorToolCeiling,
+  type ResidentActorCaller,
   residentDeliveryPrefix,
   residentHostId,
   residentRemovalsPath,
@@ -611,6 +615,20 @@ class ResidentHost {
     if (Date.now() - this.#idleSince >= IDLE_EXIT_MS) this.onIdle();
   }
 
+  #authorizeResidentSetter(caller: ResidentActorCaller | undefined): void {
+    assertResidentActorMain(caller, this.config.rootId);
+    // Verify the actual root session's existing control identity, not merely
+    // inherited mainAgent.id. get(fresh) validates the record's writer and host
+    // lease through the same directory used by native Fabric control routing.
+    const root = this.participants.get(this.config.rootId, Date.now(), { fresh: true });
+    if (!caller || caller.identity.sessionId !== this.config.sessionId ||
+      !root || root.stale || root.remoteHost !== undefined || root.kind !== "root" ||
+      root.rootId !== this.config.rootId || root.sessionId !== this.config.sessionId ||
+      root.ownerIdentityId !== caller.identity.id || root.ownerHostId !== caller.hostId) {
+      throw new ResidentActorAuthorizationError();
+    }
+  }
+
   async #processRequest(filePath: string): Promise<void> {
     const command = readJson<ResidentCommand>(filePath);
     const requestId = command?.requestId ?? path.basename(filePath, ".json");
@@ -701,6 +719,11 @@ class ResidentHost {
           completedAt: Date.now(),
         };
       } else if (command.operation !== "removeActor") {
+        if (command.operation === "setInstructions" || command.operation === "setModel" ||
+          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools") {
+          this.#authorizeResidentSetter(command.caller);
+          if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
+        }
         const actor = this.actors.status(String(command.id));
         if (actor.rootId !== this.config.rootId || !this.actors.owns(actor.id)) {
           throw new Error(`Resident host does not own root actor ${actor.id}`);
@@ -745,6 +768,7 @@ class ResidentHost {
         requestId,
         ok: false,
         error: errorMessage(error),
+        ...(error instanceof ResidentActorAuthorizationError ? { errorCode: error.code } : {}),
         completedAt: Date.now(),
       };
     }

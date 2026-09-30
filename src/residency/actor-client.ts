@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
+import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import {
   abandonResidentRequest,
+  ResidentActorAuthorizationError,
+  assertResidentActorToolCeiling,
+  type ResidentActorCaller,
   RESIDENT_HOST_FORMAT,
   residentHostStateNote,
   residentRoot,
@@ -32,6 +36,7 @@ const readJson = <T>(filePath: string): T | undefined => {
  */
 export class ResidentActorClient {
   readonly #rootId: string;
+  readonly #toolCeiling = readChildToolAllowlist();
   readonly #requestsPath: string;
   readonly #responsesPath: string;
   readonly #ownerPath: string;
@@ -60,9 +65,13 @@ export class ResidentActorClient {
     catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
   }
 
-  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal): Promise<FabricActorInfo> {
+  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
+    // Nested proxies cannot manufacture the Main's control identity. A genuine
+    // Main fallback must supply the identity captured by its provider.
+    if (this.#toolCeiling !== undefined && caller) caller = { ...caller, toolCeiling: [...this.#toolCeiling] };
+    if (mutation.operation === "setTools") assertResidentActorToolCeiling(mutation.tools, caller?.toolCeiling);
     const response = await this.#send({
-      ...mutation, format: RESIDENT_HOST_FORMAT, requestId: randomUUID(),
+      ...mutation, ...(caller ? { caller } : {}), format: RESIDENT_HOST_FORMAT, requestId: randomUUID(),
       rootId: this.#rootId, createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Resident host returned no actor from setter");
@@ -125,7 +134,10 @@ export class ResidentActorClient {
         const response = readJson<ResidentCommandResponse>(responsePath);
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           fs.rmSync(responsePath, { force: true });
-          if (!response.ok) throw new Error(response.error ?? "Resident host rejected actor request");
+          if (!response.ok) {
+            if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
+            throw new Error(response.error ?? "Resident host rejected actor request");
+          }
           return response;
         }
         const owner = readJson<{ pid?: number }>(this.#ownerPath);

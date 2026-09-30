@@ -214,6 +214,37 @@ interface ResidentCreateActorCommand {
   createdAt: number;
 }
 
+/** Existing Pi runtime control identity, captured by the provider, never from action args. */
+export interface ResidentActorCaller {
+  identity: MeshIdentity;
+  hostId: string;
+  /** Frozen optional-tool authority; absence means an unrestricted Main. */
+  toolCeiling?: string[];
+}
+
+export class ResidentActorAuthorizationError extends Error {
+  readonly code = "RESIDENT_ACTOR_FORBIDDEN" as const;
+  constructor(message = "Only the actual owning Main can mutate a resident actor") {
+    super(message);
+    this.name = "ResidentActorAuthorizationError";
+  }
+}
+
+export const assertResidentActorMain = (caller: ResidentActorCaller | undefined, rootId: string): void => {
+  if (!caller || caller.identity?.kind !== "main" || caller.identity.id !== rootId) {
+    throw new ResidentActorAuthorizationError();
+  }
+};
+
+export const assertResidentActorToolCeiling = (tools: string[], ceiling: readonly string[] | undefined): void => {
+  if (ceiling === undefined) return;
+  if (!Array.isArray(ceiling) || !ceiling.every((tool) => typeof tool === "string") ||
+    !Array.isArray(tools) || !tools.every((tool) => typeof tool === "string" &&
+      (tool.trim() === "fabric_exec" || ceiling.includes(tool.trim())))) {
+    throw new ResidentActorAuthorizationError("Actor tools cannot exceed the caller's tool ceiling");
+  }
+};
+
 /** Root-owned registry operations; these never start a resident host. */
 export type ResidentActorMutation =
   | { operation: "setInstructions"; id: string; instructions: string }
@@ -223,6 +254,7 @@ export type ResidentActorMutation =
   | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null };
 
 type ResidentActorMutationCommand = ResidentActorMutation & {
+  caller?: ResidentActorCaller;
   format: typeof RESIDENT_HOST_FORMAT;
   requestId: string;
   rootId: string;
@@ -258,6 +290,7 @@ export interface ResidentCommandResponse {
   pending?: string;
   cleaned?: boolean;
   error?: string;
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN";
   completedAt: number;
 }
 

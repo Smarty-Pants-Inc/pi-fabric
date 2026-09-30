@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { formatAge, residentHostId } from "../residency/protocol.js";
+import { formatAge, residentHostId, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
+import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
@@ -365,6 +366,7 @@ export const messageTargetArgs = (
 
 export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
+  readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
   readonly name = "agents";
   readonly description =
@@ -1160,7 +1162,7 @@ export class AgentsProvider implements FabricProvider {
           return this.globalActors.update(template.id, { model: resolved });
         }
         const resident = this.#residentActorOwner(id);
-        if (resident) return resident.client.setActor({
+        if (resident) return this.#setResidentActor(resident, {
           operation: "setModel", id: resident.id, ...(model ? { model } : {}),
           scope: args.scope === "project" ? "project" : "session",
         }, context.signal);
@@ -1185,7 +1187,7 @@ export class AgentsProvider implements FabricProvider {
           return this.globalActors.update(id, { thinking: thinking as NonNullable<FabricActorRequest["thinking"]> });
         }
         const resident = this.#residentActorOwner(id);
-        if (resident) return resident.client.setActor({
+        if (resident) return this.#setResidentActor(resident, {
           operation: "setThinking", id: resident.id, ...(isFabricThinking(thinking) ? { thinking } : {}),
           scope: args.scope === "project" ? "project" : "session",
         }, context.signal);
@@ -1193,11 +1195,12 @@ export class AgentsProvider implements FabricProvider {
       }
       case "setTools": {
         const tools = stringArray(args.tools) ?? [];
+        assertResidentActorToolCeiling(tools, this.#toolCeiling === undefined ? undefined : [...this.#toolCeiling]);
         if (args.scope === "global") {
           return this.globalActors.update(String(args.id), { tools });
         }
         const resident = this.#residentActorOwner(String(args.id));
-        if (resident) return resident.client.setActor({ operation: "setTools", id: resident.id, tools }, context.signal);
+        if (resident) return this.#setResidentActor(resident, { operation: "setTools", id: resident.id, tools }, context.signal);
         return this.actorManager.setTools(String(args.id), tools);
       }
       case "setNice": {
@@ -1228,7 +1231,7 @@ export class AgentsProvider implements FabricProvider {
         const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
         if (args.scope === "global") return this.globalActors.update(String(args.id), { activationFilter });
         const resident = this.#residentActorOwner(String(args.id));
-        if (resident) return resident.client.setActor({ operation: "setActivationFilter", id: resident.id, activationFilter }, context.signal);
+        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter }, context.signal);
         return this.actorManager.setActivationFilter(String(args.id), activationFilter);
       }
       case "setEvents": {
@@ -1293,7 +1296,7 @@ export class AgentsProvider implements FabricProvider {
         }
         if (global) return this.globalActors.update(id, { instructions });
         const resident = this.#residentActorOwner(id);
-        if (resident) return resident.client.setActor({ operation: "setInstructions", id: resident.id, instructions }, context.signal);
+        if (resident) return this.#setResidentActor(resident, { operation: "setInstructions", id: resident.id, instructions }, context.signal);
         return this.actorManager.setInstructions(id, instructions);
       }
       case "import": {
@@ -1492,6 +1495,26 @@ export class AgentsProvider implements FabricProvider {
     const client = this.residency ?? this.#liveResidentActorClient();
     if (!client) throw new Error("Root resident host is not live");
     return { id: actor?.id ?? participant!.id, client };
+  }
+
+  #setResidentActor(
+    resident: { id: string; client: Pick<ResidentActorClient, "setActor"> },
+    mutation: ResidentActorMutation,
+    signal?: AbortSignal,
+  ): Promise<FabricActorInfo> {
+    // mainAgent.id is inherited by actors/tasks. Native setters require local
+    // execution ownership; proxying must not turn inherited lineage into that authority.
+    if (!this.mainAgent.local) throw new ResidentActorAuthorizationError();
+    const self = this.participants.self();
+    const caller: ResidentActorCaller = {
+      identity: { ...this.actorManager.identity }, hostId: self.ownerHostId,
+      ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
+    };
+    assertResidentActorMain(caller, this.mainAgent.id);
+    if (self.kind !== "root" || self.id !== caller.identity.id || self.rootId !== this.mainAgent.id) {
+      throw new ResidentActorAuthorizationError();
+    }
+    return resident.client.setActor(mutation, signal, caller);
   }
 
   #residentActorClient(): ResidentActorClient {

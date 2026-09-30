@@ -297,6 +297,91 @@ describe.skipIf(process.platform === "win32")("resident host start timeout", () 
 // node_modules shims hangs before the child starts, so the launcher never
 // reaches its spawn trace. Durable residency E2E stays POSIX-only until that
 // spawn path is resolved; the launcher logic tests below run everywhere.
+describe("resident setter Main authorization", () => {
+  it.each(["self", "sibling"] as const)("refuses read-only Fabric child setTools escalation to %s and preserves next activation tools", { timeout: 20_000 }, async (target) => {
+    const state = await rootHarness(`setter-child-${target}`);
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify(state.config));
+    const controller = new AbortController();
+    // Start the unrestricted owner before constructing the restricted child.
+    const running = runResidentHostFromConfigPath(configPath, controller.signal);
+    const mainClient = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
+    const child = await mainClient.createActor({ name: "read-only Fabric child", instructions: "Read only.", residency: "durable", extensions: true, tools: ["read"], model: "provider/visible" });
+    const sibling = await mainClient.createActor({ name: "read-only sibling", instructions: "Read only.", residency: "durable", extensions: true, tools: ["read"], model: "provider/visible" });
+    vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", state.identity.id);
+    vi.stubEnv("PI_FABRIC_MESH_ROOT", state.config.meshRoot);
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", '["read","fabric_exec"]');
+    const childIdentity: MeshIdentity = { id: child.id, name: child.name, kind: "actor", sessionId: "child-activation" };
+    const agents = new AgentManager(repo, state.config.agents, { workerPath: fakeWorker, runRoot: path.join(state.root, "child-runs") });
+    const passive = new ActorDirectory(["child-activation", childIdentity, state.mesh, state.meshConfig, agents, () => {},
+      { persistent: true, rootId: state.identity.id, canManageActor: () => false }],
+      { project: state.config.actorRoot, session: state.config.sessionActorRoot! }, "project");
+    const participants = new ParticipantDirectory(state.mesh, { enabled: true, hostId: "runtime:child-activation", rootId: state.identity.id, identity: childIdentity });
+    const lifecycle = new LifecycleBroker(state.mesh, childIdentity, participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const childMain = { ...state.mainAgent, local: false };
+    const provider = new AgentsProvider(agents, passive, new GlobalActorRegistry(state.root, 64 * 1024), childMain, participants, undefined, lifecycle);
+    const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "child", nestedToolCallId: "setTools", extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
+    const control = new FabricControlPlane(state.mesh, state.identity, { enabled: true, hostId: state.identity.id, pollMs: 20 });
+    control.start(() => ({ accepted: false }));
+    try {
+      const id = target === "self" ? child.id : sibling.id;
+      await expect(provider.invoke("setTools", { id, tools: ["read", "write", "bash"] }, context)).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
+      // Even same-ceiling setters require the actual owning Main.
+      await expect(provider.invoke("setTools", { id, tools: ["read"] }, context)).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
+      expect((await mainClient.actorStatus(id)).tools).toEqual(["read"]);
+      const reply = await control.requestResult<FabricActorMessage>(residentHostId(state.identity.id), id, "ask", { message: "ECHO_MODEL security next activation" });
+      const runFile = path.join((target === "self" ? child : sibling).logDir!, reply.runId!, "status.json");
+      await waitFor(() => fs.existsSync(runFile));
+      expect(JSON.parse(fs.readFileSync(runFile, "utf8"))).toMatchObject({ tools: ["read", "fabric_exec"] });
+      expect((await mainClient.actorStatus(id)).tools).toEqual(["read"]);
+    } finally {
+      vi.unstubAllEnvs();
+      controller.abort(); await running;
+      await Promise.all([control.close(), mainClient.close(), passive.close(), lifecycle.close(), participants.close(), state.participants.close()]);
+      await agents.close();
+    }
+  });
+
+  it("host rejects missing, child, laundered and foreign control identities and above-ceiling tools independently of provider", { timeout: 20_000 }, async () => {
+    const state = await rootHarness("setter-host-auth");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify(state.config));
+    const controller = new AbortController();
+    const running = runResidentHostFromConfigPath(configPath, controller.signal);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
+      const actor = await client.createActor({ name: "host auth target", instructions: "Read only.", residency: "durable", tools: ["read"] });
+      const rootCaller = { identity: state.identity, hostId: state.identity.id };
+      const callers = [undefined,
+        { identity: { id: actor.id, name: "child", kind: "actor", sessionId: "child" }, hostId: "runtime:child" },
+        { identity: { ...state.identity, sessionId: "child" }, hostId: state.identity.id },
+        { identity: state.identity, hostId: "runtime:child" },
+        { identity: { ...state.identity, id: "session:foreign" }, hostId: "session:foreign" },
+        { ...rootCaller, toolCeiling: ["read"] }];
+      for (const [index, caller] of callers.entries()) {
+        const requestId = `host-auth-${index}`;
+        fs.writeFileSync(path.join(state.config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify({
+          format: RESIDENT_HOST_FORMAT, rootId: state.identity.id, requestId, createdAt: Date.now(), operation: "setTools", id: actor.id, tools: ["read", "bash"], caller,
+        }));
+        const responsePath = path.join(state.config.residencyRoot, "responses", `${requestId}.json`);
+        await waitFor(() => fs.existsSync(responsePath));
+        expect(JSON.parse(fs.readFileSync(responsePath, "utf8"))).toMatchObject({ ok: false, errorCode: "RESIDENT_ACTOR_FORBIDDEN" });
+        expect((await client.actorStatus(actor.id)).tools).toEqual(["read"]);
+      }
+      // Typed host rejection must survive the concrete proxy, not only JSON.
+      await expect(new ResidentActorClient(state.config.meshRoot, state.identity.id).setActor({ operation: "setTools", id: actor.id, tools: ["bash"] })).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
+      await expect(client.setActor({ operation: "setTools", id: actor.id, tools: ["read"] })).resolves.toMatchObject({ tools: ["read"] });
+    } finally {
+      controller.abort(); await running;
+      await client.close(); await state.participants.close();
+    }
+  });
+});
+
 describe("#169 round 2 public cleanup outcome", () => {
   it.each(["main", "nested"] as const)("carries failed cleanup and exact-id retry through the real %s client and provider", { timeout: 15_000 }, async (caller) => {
     const state = await rootHarness(`public-cleanup-${caller}`);

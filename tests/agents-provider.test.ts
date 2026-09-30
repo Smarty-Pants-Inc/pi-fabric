@@ -3988,8 +3988,35 @@ describe("own-root resident setters and authoritative status", () => {
       { operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"] },
     ]);
     await state.provider.invoke("setModel", { id: state.actor.id, model: "provider/model-b", scope: "project" }, context);
-    expect(state.setActor).toHaveBeenLastCalledWith({ operation: "setModel", id: state.actor.id, model: "provider/model-b", scope: "project" }, context.signal);
+    expect(state.setActor).toHaveBeenLastCalledWith({ operation: "setModel", id: state.actor.id, model: "provider/model-b", scope: "project" }, context.signal, { identity: state.identity, hostId: state.identity.id });
+    expect(state.setActor.mock.calls.every(([, , caller]) => caller?.identity.id === state.mainAgent.id && caller.identity.kind === "main")).toBe(true);
     expect(state.actors.status(state.actor.id)).toMatchObject({ model: "provider/session", projectDefaults: { model: "provider/project" } });
+  });
+
+  it.each(["inherited Main", "actor with local flag", "task with local flag", "different root identity"])("rejects resident setters from %s with a typed error before routing", async (caller) => {
+    const state = await remoteState();
+    if (caller === "inherited Main") state.mainAgent.local = false;
+    if (caller === "actor with local flag") state.identity.kind = "actor";
+    if (caller === "task with local flag") state.identity.kind = "agent";
+    if (caller === "different root identity") state.identity.id = "session:other";
+    for (const [operation, args] of [["setInstructions", { instructions: "After" }], ["setModel", { model: "provider/model-b" }],
+      ["setThinking", { thinking: "max" }], ["setTools", { tools: ["read"] }], ["setActivationFilter", { activationFilter: ["hold"] }]] as const) {
+      await expect(state.provider.invoke(operation, { id: state.actor.id, ...args }, context)).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
+    }
+    expect(state.setActor).not.toHaveBeenCalled();
+  });
+
+  it("refuses tools beyond the caller ceiling even for native and global setters", async () => {
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", '["read","fabric_exec"]');
+    try {
+      const { provider, actors, globalActors } = setup();
+      const actor = await actors.create({ name: "native ceiling", instructions: "Read only.", tools: ["read"] });
+      const template = globalActors.create({ name: "template ceiling", instructions: "Read only.", tools: ["read"] });
+      await expect(provider.invoke("setTools", { id: actor.id, tools: ["read", "bash"] }, context)).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
+      await expect(provider.invoke("setTools", { id: template.id, scope: "global", tools: ["write"] }, context)).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
+      expect(actors.status(actor.id).tools).toEqual(["read"]);
+      expect(globalActors.resolve(template.id)?.tools).toEqual(["read"]);
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("returns host effective status/list rather than a stale Main overlay", async () => {

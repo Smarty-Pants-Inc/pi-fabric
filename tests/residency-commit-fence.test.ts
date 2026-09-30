@@ -552,6 +552,70 @@ describe("round 1 public cancellation contract", () => {
     } finally { controller.abort(); await main.close(); await state.close(); }
   });
 
+  it("abandoned cleanup join preserves completion even when the client timeout writes the fence", { timeout: 15_000 }, async () => {
+    const state = await harness(false, undefined, 200);
+    const delivered = vi.spyOn(state.client.options.mainAgent, "deliverAgent");
+    const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
+    state.client.start();
+    try {
+      const handle = await state.client.spawnAgent({ task: "LIVE_WITH_PROGRESS join-only completion", model: state.model });
+      const outcome = state.client.cleanupAgent(handle.id).catch((error: Error) => error);
+      await waitFor(() => entries(state.residencyRoot, "processing").length > 0);
+      const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
+      expect((await outcome as Error).message).toContain("Timed out");
+      expect(JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", `${requestId}.json`), "utf8")))
+        .toMatchObject({ state: "abandoned" });
+      await waitFor(() => state.client.settledAgent(handle.id) !== undefined);
+      await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      // Delivery polling is independent of host settlement. This bound also lets
+      // the unsafe base complete normally, so the assertion exposes lost delivery.
+      await delay(1_000);
+      expect(delivered.mock.calls.filter(([delivery]) => (delivery.data as { id?: string })?.id === handle.id)).toHaveLength(1);
+      expect(cleanup).not.toHaveBeenCalled(); expect(state.client.hasAgent(handle.id)).toBe(true);
+    } finally { await state.close(); }
+  });
+
+  it("durable create never enters activation compensation when committed removal would be unknown", async () => {
+    const state = await harness(false, undefined, 200); const main = mainProvider(state);
+    const activationFailure = new Error("injected activation failure");
+    const ensure = vi.spyOn(state.client, "ensureActor").mockImplementation(async (id) => {
+      await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
+      throw activationFailure;
+    });
+    let removalError: unknown;
+    const originalClientRemove = state.client.removeActor.bind(state.client);
+    const remove = vi.spyOn(state.client, "removeActor").mockImplementation(async (id) => {
+      try { return await originalClientRemove(id); }
+      catch (error) { removalError = error; throw error; }
+    });
+    const reclaim = vi.spyOn(main.actors, "reclaim");
+    // The old public path compensates by asking the real host to remove. Pause
+    // that handler after its committed fence; timing out is not safe to reclaim.
+    const originalRemove = ActorDirectory.prototype.remove;
+    vi.spyOn(ActorDirectory.prototype, "remove").mockImplementation(async function (this: ActorDirectory, ...args) {
+      if (this !== main.actors) await state.release.promise;
+      return originalRemove.apply(this, args);
+    });
+    try {
+      const result = await main.invoke("agents.create", requestArgs(state, "create")).catch((error: Error) => error);
+      if (remove.mock.calls.length > 0) {
+        // Bind the base failure to the exact adverse condition, not merely an
+        // ordinary ownership refusal: removal committed, IDs reached the client,
+        // then the old provider concealed them and reclaimed anyway.
+        const removed = entries(state.residencyRoot, "decisions").map(file => JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", file), "utf8")))
+          .find(decision => decision.operation === "removeActor");
+        expect(removed).toMatchObject({ state: "committed" });
+        expect(removalError).toMatchObject({ name: "ResidentOutcomeUnknownError", requestId: removed.requestId, id: removed.id });
+        expect(result).toBe(activationFailure);
+      }
+      expect(reclaim).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled(); expect(ensure).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ residency: "durable" });
+      const decisions = entries(state.residencyRoot, "decisions").map(file => JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", file), "utf8")));
+      expect(decisions).toEqual([expect.objectContaining({ operation: "createActor", state: "committed", id: (result as { id: string }).id })]);
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
+    } finally { state.release.resolve(); await main.close(); await state.close(); }
+  });
+
   it("durable host still validates capability requirements before its fence", async () => {
     const state = await harness(false);
     const main = mainProvider(state);

@@ -53,6 +53,64 @@ and reconnection.
 The host exits after its normal idle grace once it owns no live durable actor or
 running durable agent.
 
+## Removing actors after a Main rotation
+
+A named native Main can explicitly remove a durable actor created by a dead
+predecessor of the **same recorded project, agent name and fleet role**:
+
+```ts
+await agents.remove({ id: "<actor-id>", successor: true });
+```
+
+This is **remove-only**, not adoption. It covers durable actors stored in
+both project and predecessor-session registries (including an old session's
+`actors.json` that the new Main does not normally load). Foreign session
+storage is looked up only by **exact full actor ID**, inside the configured
+physical actor root, and a temporary manager denies all runnable ownership
+and does not reap the caller's unrelated presence.
+Accepted cleanup there can be retried with the same full ID after a reload;
+Fabric does not eagerly scan every old session registry at startup.
+
+Omitting `successor` keeps the existing ownership rules. Global templates and nested/remote callers cannot use this
+permission. Use the actor's full ID, especially when retrying cleanup.
+
+The path requires fresh absence of the predecessor Main's participants and
+leases **and** proof that its recorded Main PID/start-time identity is dead.
+An expired lease alone is not proof: a paused Main is refused as `owned by a
+live root`. Both roots must have the same nonempty recorded `agentName` and
+`role`; actor and root project identities and the actor registry must match.
+Malformed/unreadable ownership or lease evidence fails closed.
+
+Before accepting removal, Fabric retires the predecessor's residency root and
+stops its host by the exact PID recorded in `owner.json`/`host.lock`, only after
+checking its kernel start time, complete command line, and ownership token.
+It sends SIGTERM, waits up to 30 seconds for normal host/worker shutdown, and
+**does not force-kill** an uncooperative host. A mismatched/reused PID is never
+signalled. The retirement marker prevents an old launcher from restarting
+that root's host; other actors of that old resident host also stop. This is an
+intentional root-wide shutdown, not permission to execute its remaining work.
+
+The registry lock rechecks the proof and accepts a stopped removal atomically.
+The normal `ActorManager.remove` transaction then handles pending removals,
+registry revocation and durable cleanup obligations. No queued activation is
+adopted or run. Only the requesting Main may finish that accepted deletion;
+reloads and cleanup retries use the same path. A durable
+`actor-removals/<actor-id>` mesh receipt records the successor identity.
+
+Process evidence is currently Linux `/proc` evidence bound to the same kernel
+boot and PID namespace. A different host/boot/namespace is unknown, not local
+process death, and is refused. Other platforms and
+legacy dead roots without a recorded Main PID/start time are refused, rather
+than guessing a PID from a name or command pattern. New roots record their
+Main PID/start-time identity in participant/config records (without copying
+Main command-line arguments); hosts record their full process identity in both
+owner and lock records. There is no unsafe legacy override or `agents.adopt`
+API in this change.
+
+When replacing several actors, **abort before any create if a remove throws
+or returns `cleaned: false`/`pending`**. Do not swallow removal failures and
+create duplicate review/security actors.
+
 ## Validation
 
 Run:

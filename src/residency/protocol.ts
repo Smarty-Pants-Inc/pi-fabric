@@ -8,6 +8,8 @@ import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
+import type { ProcessIdentity } from "../core/process-identity.js";
+import type { FabricParticipantRecord } from "../topology/types.js";
 export const sleepUnlessAborted = (ms: number, signal?: AbortSignal): Promise<void> =>
   // Executor form: the configured lib is ES2022, which has no
   // Promise.withResolvers, and an abort listener plus a timer need shared
@@ -133,6 +135,8 @@ export interface ResidentHostConfig {
   sessionId: string;
   cwd: string;
   projectRoot: string;
+  /** Native Main identity at host launch; kept even after its participant record is removed. */
+  rootOwner?: FabricParticipantRecord;
   /** The root's fleet role; only a project agent's hosts adopt a project's orphans (smarty-dev#878). */
   role?: string;
   /** The root's project (participantProject), which can differ from its cwd's (smarty-dev#977). */
@@ -162,6 +166,7 @@ export interface ResidentHostOwner {
   format: typeof RESIDENT_HOST_FORMAT;
   hostId: string;
   pid: number;
+  processIdentity?: ProcessIdentity;
   token: string;
   startedAt: number;
   readyAt: number;

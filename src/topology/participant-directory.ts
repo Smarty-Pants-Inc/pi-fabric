@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readProcessStartIdentity } from "../core/process-identity.js";
 import { participantProject, participantRole } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
@@ -162,7 +163,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "model", "thinking", "parentId"]) ||
+    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "agentName", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -378,6 +379,7 @@ export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 export class ParticipantDirectory implements FabricParticipantSource {
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
+  readonly #processIdentity = readProcessStartIdentity();
   readonly #heartbeatMs: number;
   readonly #leaseMs: number;
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
@@ -885,7 +887,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo): FabricParticipantRecord {
+  root(main: FabricMainAgentInfo, agentName?: string): FabricParticipantRecord {
     const role = participantRole();
     return {
       format: 1,
@@ -895,6 +897,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
       name: "main",
+      ...(agentName?.trim() ? { agentName: agentName.trim() } : {}),
+      ...(this.#processIdentity ? { processIdentity: this.#processIdentity } : {}),
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",

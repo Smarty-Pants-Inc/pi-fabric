@@ -757,12 +757,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "remove",
     description:
-      'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry.',
+      'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template. Native Main may pass successor: true to remove a durable actor of a provably dead predecessor with the same recorded project, agent name and role; this stops its identity-verified resident host first. Never adopts runnable work.',
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         scope: { type: "string", enum: ["project", "global"] },
+        successor: { type: "boolean" },
       },
       required: ["id"],
       additionalProperties: false,

@@ -1,5 +1,6 @@
 import type { FabricAgentRunner, FabricAgentTransport } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
+import type { ProcessStartIdentity } from "../core/process-identity.js";
 import type { AgentUsage } from "../agents/types.js";
 
 export type FabricParticipantKind = "root" | "agent" | "actor";
@@ -23,6 +24,10 @@ export interface FabricParticipantRecord {
   ownerIdentityId: string;
   parentId?: string;
   name: string;
+  /** Stable Main session/agent name, independent of the generic "main" routing name. */
+  agentName?: string;
+  /** Recorded by the native root process; a successor never infers this from a PID pattern. */
+  processIdentity?: ProcessStartIdentity;
   /**
    * Project-scoped Linear-style label (e.g. "PQS-2") minted once per root
    * participant via the mesh peer sequence. Never reused after a peer leaves.

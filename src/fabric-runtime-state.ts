@@ -863,6 +863,7 @@ export class FabricRuntimeState {
             format: RESIDENT_HOST_FORMAT,
             rootId: mainAgentId,
             sessionId,
+            rootOwner: this.#participants.root(mainAgent.info(context), this.pi.getSessionName?.()),
             cwd: context.cwd,
             projectRoot,
             ...(participantRole() ? { role: participantRole()! } : {}),
@@ -900,7 +901,7 @@ export class FabricRuntimeState {
     const firstSeenAgents = new Map<string, number>();
     if (mainAgent.local) {
       this.#participants.registerSource(() => [
-        this.#participants!.root(mainAgent.info(context)),
+        this.#participants!.root(mainAgent.info(context), this.pi.getSessionName?.()),
       ]);
     }
     this.#participants.registerSource(() =>

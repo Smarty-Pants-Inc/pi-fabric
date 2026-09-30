@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { GUEST_TYPE_DECLARATIONS, guestTypeDeclarations } from "../src/runtime/guest-types.js";
 import {
   normalizeTypeScriptPath,
@@ -6,6 +7,14 @@ import {
 } from "../src/runtime/type-checker.js";
 
 describe("Fabric guest type checker", () => {
+  it("types explicit successor removal and rejects a non-boolean opt-in", () => {
+    expect(AGENTS_ACTION_DESCRIPTORS.find((action) => action.name === "remove")?.inputSchema)
+      .toMatchObject({ properties: { successor: { type: "boolean" } }, required: ["id"], additionalProperties: false });
+    const accepted = typeCheckFabricCode('return agents.remove({ id: "actor-id", successor: true });', GUEST_TYPE_DECLARATIONS, true);
+    expect(accepted.errors).toEqual([]);
+    const rejected = typeCheckFabricCode('return agents.remove({ id: "actor-id", successor: "true" });', GUEST_TYPE_DECLARATIONS, true);
+    expect(rejected.errors.length).toBeGreaterThan(0);
+  });
   it("types explicit opt-in shell monitors and generic task controls", () => {
     const result = typeCheckFabricCode(`
 const result = await pi.bash({cmd: "watch", description: "Watch CI", monitor: {delivery: "ui", match: "CI:", intervalMs: 5000, timeoutMs: 300000}});

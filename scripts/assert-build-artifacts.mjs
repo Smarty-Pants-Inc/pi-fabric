@@ -36,6 +36,7 @@ const lazy = [
   "agents/result.js",
   "agents/veda-cli.js",
   "fabric-runtime-state.js",
+  "residency/successor-removal.js",
   "components/configuration.js",
   "providers/jev-provider.js",
   "jev/client.js",

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
+import { readProcessIdentity } from "../core/process-identity.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -153,6 +154,8 @@ class ResidentHost {
     this.identity = { id: this.hostId, name: "Fabric resident host", kind: "agent" };
     this.#ownerPath = path.join(config.residencyRoot, "owner.json");
     this.#lockPath = path.join(config.residencyRoot, "host.lock");
+    // Record/fence this process before managers can restore queues or write actor metadata.
+    this.#acquireLock();
     this.#errorPath = path.join(config.residencyRoot, "error.json");
     this.#requestsPath = path.join(config.residencyRoot, "requests");
     this.#processingPath = path.join(config.residencyRoot, "processing");
@@ -331,7 +334,6 @@ class ResidentHost {
 
   async start(): Promise<void> {
     if (this.#started) return;
-    this.#acquireLock();
     this.#started = true;
     fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
     fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
@@ -371,10 +373,12 @@ class ResidentHost {
       REQUEST_POLL_MS,
     );
     const now = Date.now();
+    const processIdentity = readProcessIdentity();
     const owner: ResidentHostOwner = {
       format: RESIDENT_HOST_FORMAT,
       hostId: this.hostId,
       pid: process.pid,
+      ...(processIdentity ? { processIdentity } : {}),
       token: this.#token,
       startedAt: now,
       readyAt: now,
@@ -759,6 +763,8 @@ class ResidentHost {
   }
 
   #acquireLock(): void {
+    const retired = path.join(this.config.residencyRoot, "retired.json");
+    if (fs.existsSync(retired)) throw new Error("Fabric resident root was retired by a successor Main");
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
     const existing = readJson<ResidentHostOwner>(this.#ownerPath);
     if (existing && processAlive(existing.pid)) {
@@ -766,7 +772,7 @@ class ResidentHost {
     }
     try {
       const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-      fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid }));
+      fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid, processIdentity: readProcessIdentity() }));
       fs.closeSync(descriptor);
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "EEXIST") {
@@ -776,11 +782,15 @@ class ResidentHost {
         }
         fs.rmSync(this.#lockPath, { force: true });
         const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
-        fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid }));
+        fs.writeFileSync(descriptor, JSON.stringify({ token: this.#token, pid: process.pid, processIdentity: readProcessIdentity() }));
         fs.closeSync(descriptor);
       } else {
         throw error;
       }
+    }
+    if (fs.existsSync(retired)) {
+      this.#releaseLock();
+      throw new Error("Fabric resident root was retired by a successor Main");
     }
   }
 
@@ -801,22 +811,23 @@ const runResidentHost = async (
   const idle = new Promise<void>((resolve) => {
     finishIdle = resolve;
   });
-  const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry);
-  await host.start();
-  if (signal?.aborted) {
-    await host.close();
-    return;
+  let finishStop!: () => void;
+  const stopped = new Promise<void>((resolve) => { finishStop = resolve; });
+  // Install before startup: a successor may see host.lock while this host is still loading.
+  signal?.addEventListener("abort", finishStop, { once: true });
+  process.once("SIGTERM", finishStop);
+  process.once("SIGINT", finishStop);
+  let host: ResidentHost | undefined;
+  try {
+    host = new ResidentHost(config, () => finishIdle?.(), modelRegistry);
+    await host.start();
+    if (!signal?.aborted) await Promise.race([idle, stopped]);
+  } finally {
+    signal?.removeEventListener("abort", finishStop);
+    process.removeListener("SIGTERM", finishStop);
+    process.removeListener("SIGINT", finishStop);
+    await host?.close();
   }
-  await Promise.race([
-    idle,
-    new Promise<void>((resolve) => {
-      const finish = (): void => resolve();
-      signal?.addEventListener("abort", finish, { once: true });
-      process.once("SIGTERM", finish);
-      process.once("SIGINT", finish);
-    }),
-  ]);
-  await host.close();
 };
 
 export const runResidentHostFromConfigPath = async (

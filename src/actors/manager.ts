@@ -77,6 +77,29 @@ interface ActorQueueItem {
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricPythonRuntime } from "../config.js";
 
+interface SuccessorRemoval {
+  fromRootId: string;
+  by: MeshIdentity;
+  presenceKey: string;
+  earlierPresenceKeys?: string[];
+}
+
+const validSuccessorRemoval = (value: unknown): value is SuccessorRemoval => {
+  const successor = value as Partial<SuccessorRemoval> | null;
+  return !!successor && typeof successor.fromRootId === "string" &&
+    successor.by?.kind === "main" && typeof successor.by.id === "string" && typeof successor.by.name === "string" &&
+    typeof successor.presenceKey === "string" && /^actors\/[^/]+\/[a-f0-9]{32}$/.test(successor.presenceKey) &&
+    (successor.earlierPresenceKeys === undefined || (Array.isArray(successor.earlierPresenceKeys) &&
+      successor.earlierPresenceKeys.every((key) => typeof key === "string" && /^actors\/[^/]+\/[a-f0-9]{32}$/.test(key) &&
+        key.split("/")[2] === successor.presenceKey!.split("/")[2])));
+};
+
+const inheritRemovalPresence = (successor: SuccessorRemoval, earlier: SuccessorRemoval | undefined): void => {
+  if (!earlier) return;
+  successor.earlierPresenceKeys = [...new Set([...(successor.earlierPresenceKeys ?? []),
+    earlier.presenceKey, ...(earlier.earlierPresenceKeys ?? [])])].filter((key) => key !== successor.presenceKey);
+};
+
 interface ManagedActor {
   id: string;
   name: string;
@@ -131,7 +154,7 @@ interface ManagedActor {
   /** The run in flight, known from its spawn (smarty-dev#2184 item 8). */
   inFlightRun?: { id: string; startedAt: number };
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
-  removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
+  removal?: { requestedAt: number; runId?: string; runStartedAt?: number; successor?: SuccessorRemoval };
   lastError?: string;
   abortController?: AbortController;
   /** The in-flight run an ownership change aborted: its event is parked, not failed. */
@@ -156,7 +179,7 @@ interface RemovalCleanup {
   presenceKey: string;
   lastRunId?: string;
   pending?: string;
-  owner?: { name: string; rootId: string; residency: FabricParticipantResidency; requestedAt: number };
+  owner?: { name: string; rootId: string; project?: string; residency: FabricParticipantResidency; requestedAt: number; successor?: SuccessorRemoval };
 }
 
 type RemovalResult = { removed: boolean; cleaned?: boolean; pending?: string };
@@ -337,6 +360,7 @@ export class ActorManager {
   readonly #meshMonitor: ActorMeshMonitor;
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
+  readonly #reapOrphanPresenceEnabled: boolean;
   readonly #logs: ActorLogStore;
   readonly #acquireCapabilityView:
     | ((
@@ -416,6 +440,8 @@ export class ActorManager {
        * On for the primary scope manager of a persistent runtime; the window is for tests.
        */
       reapDeadSessionPresence?: boolean | { deadAfterMs: number };
+      /** Off for a removal-only reader of another session registry sharing this identity. */
+      reapOrphanPresence?: boolean;
       retention?: FabricRetentionConfig;
       /** Reset an actor's session at a run boundary past this size; 0 disables (smarty-dev#1439). */
       maxSessionBytes?: number;
@@ -444,6 +470,7 @@ export class ActorManager {
     this.#role = options.role;
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
+    this.#reapOrphanPresenceEnabled = options.reapOrphanPresence ?? true;
     this.#logs = new ActorLogStore(
       mesh,
       meshConfig,
@@ -1534,6 +1561,59 @@ export class ActorManager {
     return { halted };
   }
 
+  /** Host-only fenced revocation, after the caller has stopped and verified its dead predecessor. */
+  async removeSuccessor(
+    id: string,
+    expectedRootId: string,
+    { presenceKey, assertSafe }: { presenceKey: string; assertSafe: () => void },
+  ): Promise<RemovalResult> {
+    if (!this.#persistent || !this.meshConfig.enabled || this.identity.kind !== "main" || this.identity.id !== this.#rootId || !this.#project) {
+      throw new Error("Successor removal requires the persistent native Main registry");
+    }
+    const successor: SuccessorRemoval = { fromRootId: expectedRootId, by: { ...this.identity }, presenceKey };
+    if (!validSuccessorRemoval(successor) || !presenceKey.endsWith(`/${id}`)) throw new Error("Invalid successor removal identity");
+    const completed = await this.#registry.withLock(() => {
+      // Recheck after waiting for the registry lock: a revived root or racing claimant wins.
+      assertSafe();
+      const records = this.#registry.records();
+      const current = records.find((record) => record.id === id);
+      if (!current) {
+        const cleanup = this.#readCleanup(id);
+        if (cleanup && this.#registryRevoked(id)) {
+          if (cleanup.owner?.rootId === this.#rootId && cleanup.owner.successor?.by.id === this.identity.id) return false;
+          if (cleanup.owner?.rootId !== expectedRootId || cleanup.owner.residency !== "durable" || cleanup.owner.project !== this.#project) {
+            throw new Error("Successor cleanup ownership changed before acceptance");
+          }
+          inheritRemovalPresence(successor, cleanup.owner.successor);
+          cleanup.owner = { ...cleanup.owner, rootId: this.#rootId, successor };
+          writeJsonAtomic(this.#cleanupPath(id), cleanup, { durable: true });
+          this.#removalCleanup.set(id, cleanup);
+          this.#revoked.add(id);
+          return false;
+        }
+        const receipt = this.mesh.get(`actor-removals/${id}`, { fresh: true })?.value as { successor?: SuccessorRemoval } | undefined;
+        if (receipt?.successor?.by.id === this.identity.id && receipt.successor.fromRootId === expectedRootId) return true;
+        throw new Error("Successor removal ownership changed before acceptance");
+      }
+      const accepted = (current.removal as ManagedActor["removal"])?.successor;
+      if (current.rootId === this.#rootId && accepted?.by.id === this.identity.id && accepted.fromRootId === expectedRootId) return false;
+      if (current.rootId !== expectedRootId || current.residency !== "durable" || current.project !== this.#project) {
+        throw new Error("Successor removal ownership changed before acceptance");
+      }
+      const removal = current.removal as ManagedActor["removal"];
+      if (validSuccessorRemoval(removal?.successor)) inheritRemovalPresence(successor, removal.successor);
+      // Accept stopped + removal atomically. This is never a runnable adoption. Only the requesting
+      // Main may finish it, including on reload; a resident host must not race its cleanup.
+      const next = { ...current, rootId: this.#rootId, status: "stopped", updatedAt: Date.now(),
+        removal: { ...removal, requestedAt: removal?.requestedAt ?? Date.now(), successor } };
+      this.#registry.write(records.map((record) => record.id === id ? next : record), { durable: true });
+    });
+    if (completed) return { removed: true };
+    this.#registryFingerprint = undefined;
+    this.#syncActorsFromRegistry();
+    return this.remove(id);
+  }
+
   /**
    * Remove an actor. With `wait: false` (the resident host, smarty-dev#2184 item 8) a removal
    * behind an in-flight run stops the actor, returns at once with the pending state, and
@@ -1698,7 +1778,7 @@ export class ActorManager {
     const owner = cleanup.owner;
     const requestedAt = owner?.requestedAt ?? 0;
     return { id, scope: this.#actorScope, name: owner?.name ?? id,
-      ...(owner ? { rootId: owner.rootId, residency: owner.residency } : {}), status: "stopped", runner: "pi", events: [], topics: [],
+      ...(owner ? { rootId: owner.rootId, residency: owner.residency, ...(owner.project ? { project: owner.project } : {}) } : {}), status: "stopped", runner: "pi", events: [], topics: [],
       delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
       queued: 0, messages: 0, createdAt: requestedAt, updatedAt: requestedAt,
       removal: { requestedAt, state: cleanup.pending ?? "registry revoked; removal cleanup pending" } };
@@ -1706,6 +1786,9 @@ export class ActorManager {
 
   #ownsCleanup(cleanup: RemovalCleanup): boolean {
     if (this.#ceded.has(cleanup.id)) return false;
+    if (cleanup.owner?.successor) {
+      return cleanup.owner.rootId === this.#rootId && cleanup.owner.successor.by.id === this.identity.id;
+    }
     const decision = this.#canManageActor?.(cleanup.id);
     if (decision !== undefined) return decision;
     if (this.#claimResidency !== undefined) {
@@ -1757,8 +1840,10 @@ export class ActorManager {
           !cleanup.presenceKey.endsWith(`/${id}`) ||
           (cleanup.lastRunId !== undefined && typeof cleanup.lastRunId !== "string") ||
           (cleanup.owner !== undefined && (!cleanup.owner || typeof cleanup.owner.name !== "string" ||
-            typeof cleanup.owner.rootId !== "string" || !["session", "durable"].includes(cleanup.owner.residency) ||
-            !Number.isFinite(cleanup.owner.requestedAt)))) return undefined;
+            typeof cleanup.owner.rootId !== "string" || (cleanup.owner.project !== undefined && typeof cleanup.owner.project !== "string") || !["session", "durable"].includes(cleanup.owner.residency) ||
+            !Number.isFinite(cleanup.owner.requestedAt) ||
+            (cleanup.owner.successor !== undefined && (!validSuccessorRemoval(cleanup.owner.successor) ||
+              cleanup.owner.successor.by.id !== cleanup.owner.rootId || !cleanup.owner.successor.presenceKey.endsWith(`/${id}`)))))) return undefined;
       return cleanup;
     } catch { return undefined; } // Skip only this unreadable/malformed marker.
   }
@@ -1788,6 +1873,15 @@ export class ActorManager {
       } else {
         await this.mesh.delete({ key: cleanup.presenceKey });
       }
+      if (cleanup.owner?.successor) {
+        const successor = cleanup.owner.successor;
+        for (const key of new Set([successor.presenceKey, ...(successor.earlierPresenceKeys ?? [])])) {
+          if (key !== cleanup.presenceKey) await this.mesh.delete({ key });
+        }
+        // A stable per-actor receipt survives successful cleanup, with the successor as writer.
+        await this.mesh.put({ key: `actor-removals/${cleanup.id}`, identity: successor.by,
+          value: { id: cleanup.id, requestedAt: cleanup.owner.requestedAt, successor } });
+      }
       if (cleanup.lastRunId) await this.agents.cleanup(cleanup.lastRunId).catch(() => ({ cleaned: false }));
       if (this.#persistent && this.meshConfig.enabled) fs.rmSync(this.#cleanupPath(cleanup.id), { force: true });
       this.#removalCleanup.delete(cleanup.id);
@@ -1814,8 +1908,14 @@ export class ActorManager {
       id: actor.id, sessionDir: path.dirname(actor.sessionFile), presenceKey: this.#presenceKey(actor.id),
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
     };
+    if (actor.removal?.successor) {
+      inheritRemovalPresence(actor.removal.successor, cleanup.owner?.successor);
+      delete cleanup.owner;
+    }
     cleanup.owner ??= { name: actor.name, rootId: actor.rootId, residency: actor.residency,
-      requestedAt: actor.removal?.requestedAt ?? Date.now() };
+      ...(actor.project ? { project: actor.project } : {}),
+      requestedAt: actor.removal?.requestedAt ?? Date.now(),
+      ...(actor.removal?.successor ? { successor: actor.removal.successor } : {}) };
     // Re-establish the barrier on every attempt, including a marker left by a failed rename
     // directory sync. A visible marker alone is not proof that the obligation is durable.
     if (this.#persistent && this.meshConfig.enabled) {
@@ -2774,7 +2874,7 @@ export class ActorManager {
   // Reaps only against a registry that was read and parsed: an unreadable or malformed
   // actors.json proves nothing about which actors exist, so their presence stays.
   #reapOrphanPresence(): void {
-    if (this.#closing || !this.meshConfig.enabled || !this.#persistent || !this.#registryIds) return;
+    if (!this.#reapOrphanPresenceEnabled || this.#closing || !this.meshConfig.enabled || !this.#persistent || !this.#registryIds) return;
     const prefix = `actors/${this.sessionId}/`;
     let entries: MeshStateEntry[];
     try {
@@ -3064,6 +3164,7 @@ export class ActorManager {
           ? {
               removal: {
                 requestedAt: record.removal.requestedAt,
+                ...(validSuccessorRemoval(record.removal.successor) ? { successor: record.removal.successor } : {}),
                 ...(typeof record.removal.runId === "string" ? { runId: record.removal.runId } : {}),
                 ...(typeof record.removal.runStartedAt === "number" ? { runStartedAt: record.removal.runStartedAt } : {}),
               },
@@ -3418,6 +3519,9 @@ export class ActorManager {
   #ownershipDecision(id: string): boolean {
     if (this.#ceded.has(id)) return false;
     const actor = this.#actors.get(id);
+    if (actor?.removal?.successor) {
+      return actor.rootId === this.#rootId && actor.removal.successor.by.id === this.identity.id;
+    }
     const decision = this.#canManageActor?.(id);
 
     // The participant directory is authoritative when it has a live opinion.
@@ -3452,7 +3556,7 @@ export class ActorManager {
     ) {
       return;
     }
-    if (actor.rootId === this.#rootId) return;
+    if (actor.rootId === this.#rootId || actor.removal?.successor) return;
     // Only residency-matched rows: Main adopts "session" actors, the resident
     // host adopts "durable" actors.
     if (actor.residency !== this.#claimResidency) return;

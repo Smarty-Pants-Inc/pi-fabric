@@ -499,8 +499,22 @@ export class MainAgentController implements FabricMainAgentTarget {
   #admitted(deliveryId: string): string | undefined {
     const item = [...this.#unverified, ...this.#sent, ...this.#held].find((item) =>
       item.deliveryId === deliveryId || item.supersedes?.includes(deliveryId));
-    if (item) return item.id;
-    if (this.#consumed.has(deliveryId) || this.#refreshDelivered().has(deliveryKey(deliveryId))) return deliveryId;
+    if (item) {
+      // A replayed rename can be visible even though its post-rename barriers failed.
+      // Reading it (or a failed best-effort replay save) is not a durability receipt.
+      // Re-establish the complete journal barrier chain before duplicate acceptance
+      // lets the resident client delete its source; propagate failure for a later drain.
+      this.#save();
+      return item.id;
+    }
+    if (this.#consumed.has(deliveryId)) {
+      // The same uncertainty applies to a recovered consumed-ID replacement, even
+      // with no payload journal left. Force its own barriers, not just the journal's.
+      this.#consumedDirty = true;
+      this.#save();
+      return deliveryId;
+    }
+    if (this.#refreshDelivered().has(deliveryKey(deliveryId))) return deliveryId;
     return undefined;
   }
 

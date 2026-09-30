@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -500,6 +500,29 @@ describe("durable completion receipts", () => {
       return { main, sent, emit, append };
     };
     const settle = { outcome: "completed", context: { pendingMessages: [] } };
+
+    it.skipIf(process.platform === "win32").each(["held", "direct", "consumed"])("#180 S3 / #177 S1 refuses uncertain %s replay after a fresh Main/residency restart", { timeout: 20_000 }, async (mode) => {
+      const state = await rootHarness(`replay-post-rename-${mode}`);
+      const key = await actorReply(state, mode === "direct"
+        ? { delivery: "steer", triggerTurn: true }
+        : { delivery: "followUp", triggerTurn: true });
+      const configPath = path.join(state.root, "fixture-config.json");
+      fs.writeFileSync(configPath, JSON.stringify(state.config));
+      const run = (phase: string) => {
+        const child = spawnSync("bun", [path.resolve("tests/fixtures/main-residency-replay.ts"), configPath, key, mode, phase], { encoding: "utf8", timeout: 8_000 });
+        expect(child.error).toBeUndefined();
+        expect(child.status, child.stderr).toBe(0);
+        return JSON.parse(child.stdout) as { pid: number; refused: { sourceSurvives: boolean; acknowledgments: number; deletes: number }; recovered: { acknowledgments: number; deletes: number; delivered: number } };
+      };
+      try {
+        const before = run("prepare");
+        expect(state.mesh.get(key)).toBeDefined();
+        const after = run("recover");
+        expect(after.pid).not.toBe(before.pid); // No module/controller state survives.
+        expect(after.refused).toEqual({ sourceSurvives: true, acknowledgments: 0, deletes: 0 });
+        expect(after.recovered).toEqual({ acknowledgments: 1, deletes: 1, delivered: mode === "consumed" ? 0 : 1 });
+      } finally { await state.participants.close(); }
+    });
 
     it.each(process.platform === "win32" ? ["file"] : ["file", "directory"])("#169 round 3 keeps the resident source when Main's %s journal barrier fails", { timeout: 15_000 }, async (barrier) => {
       const state = await rootHarness(`delivery-barrier-${barrier}`);

@@ -23,6 +23,16 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it("types the FIFO position on a queued spawn receipt", () => {
+    const result = typeCheckFabricCode(
+      `const handle = await agents.spawn({ task: "work" });
+       const position: number | undefined = handle.queuePosition;
+       return position;`,
+      GUEST_TYPE_DECLARATIONS,
+      true,
+    );
+    expect(result.errors).toEqual([]);
+  });
   it("binds every implemented action in the TypeScript prelude", () => {
     const agents = slice(GUEST_SETUP, "globalThis.agents = Object.freeze({", "\n});");
     const bound = names(agents, /^ {2}"?([A-Za-z_$][\w$]*)"?:/gm);

@@ -44,8 +44,21 @@ describe("release safety metadata", () => {
     expect(JSON.parse(fs.readFileSync(receipt, "utf8"))).toEqual({ ...before, safetyCritical: true });
   });
 
+  it("allows an old Main on a host with no chronology or installed critical release", () => {
+    const f = fixture();
+    for (const label of ["z-loaded", "m-critical", "a-active"]) fs.unlinkSync(path.join(f.base, `${label}.receipt.json`));
+    fs.rmSync(path.join(f.releases, "m-critical"), { recursive: true });
+    fs.writeFileSync(path.join(f.base, "releases-safety.json"), JSON.stringify({ releases: {
+      "m-critical": { safetyCritical: true }, // shipped mark, never installed on this host
+    } }));
+    expect(inspectStaleMain(f.loaded, f.settings)).toMatchObject({ refused: false, criticalReleases: [] });
+    fs.mkdirSync(path.join(f.releases, "m-critical"));
+    expect(inspectStaleMain(f.loaded, f.settings)?.refused).toBe(true); // installed but order unknown
+  });
+
   it("fails closed on missing, invalid and tied chronology, without changing equality", () => {
     const f = fixture();
+    fs.writeFileSync(path.join(f.base, "releases-safety.json"), JSON.stringify({ releases: { "m-critical": { safetyCritical: true } } }));
     fs.unlinkSync(path.join(f.base, "z-loaded.receipt.json"));
     expect(inspectStaleMain(f.loaded, f.settings)).toMatchObject({ refused: true, reason: expect.stringContaining("missing install/activation time") });
     fs.writeFileSync(path.join(f.base, "z-loaded.receipt.json"), JSON.stringify({ installedAt: "invalid" }));

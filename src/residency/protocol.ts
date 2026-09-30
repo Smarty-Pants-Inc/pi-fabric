@@ -165,6 +165,8 @@ export interface ResidentHostOwner {
   token: string;
   startedAt: number;
   readyAt: number;
+  /** The immutable entry path this owner actually loaded, not the mutable config selector. */
+  fabricExtensionPath?: string;
 }
 
 interface ResidentSpawnCommand {

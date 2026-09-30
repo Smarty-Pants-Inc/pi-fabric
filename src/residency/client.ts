@@ -145,6 +145,11 @@ export class ResidencyClient {
   start(): void {
     if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
     this.syncPiModels();
+    const owner = this.#liveOwner();
+    if (owner?.fabricExtensionPath && owner.fabricExtensionPath !== this.options.config.fabricExtensionPath) {
+      // Reload recovery must not require a new spawn/create to resurrect parked durable work.
+      void this.ensureHost().catch(() => undefined);
+    }
     this.#deliveryTimer = setInterval(
       () => void this.#drainDeliveries().catch(() => undefined),
       Math.max(20, this.options.config.mesh.actorPollMs),
@@ -183,7 +188,17 @@ export class ResidencyClient {
     if (this.#closed) throw new Error("Fabric residency client is closed");
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
-    const existing = this.#liveOwner();
+    let existing = this.#liveOwner();
+    if (existing?.fabricExtensionPath && existing.fabricExtensionPath !== this.options.config.fabricExtensionPath) {
+      // The old owner observes this config write and drains. Never route a new-release
+      // command to it, or kill its live runs to hurry the reload.
+      const deadline = Date.now() + startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
+      do {
+        if (Date.now() >= deadline) throw new Error("Fabric resident host is draining for release reload; retry after its running work finishes");
+        await delay(STATUS_POLL_MS);
+        existing = this.#liveOwner();
+      } while (existing?.fabricExtensionPath && existing.fabricExtensionPath !== this.options.config.fabricExtensionPath);
+    }
     if (existing) return existing;
     fs.rmSync(this.#errorPath, { force: true });
     const launcher = await spawnDetached(

@@ -297,6 +297,30 @@ describe.skipIf(process.platform === "win32")("resident host start timeout", () 
 // node_modules shims hangs before the child starts, so the launcher never
 // reaches its spawn trace. Durable residency E2E stays POSIX-only until that
 // spawn path is resolved; the launcher logic tests below run everywhere.
+describe("resident host release recovery", () => {
+  it("drains an obsolete resident host after Main reload even with a durable actor", { timeout: 10_000 }, async () => {
+    const state = await rootHarness("release-recovery");
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify(state.config));
+    const controller = new AbortController();
+    const running = runResidentHostFromConfigPath(configPath, controller.signal);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    try {
+      await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
+      const actor = await client.createActor({ name: "survives release reload", instructions: "Reply", residency: "durable" });
+      expect(actor.residency).toBe("durable");
+      fs.writeFileSync(configPath, JSON.stringify({ ...state.config, fabricExtensionPath: path.join(state.root, "new-release", "dist", "index.js") }));
+      await waitFor(() => !fs.existsSync(path.join(state.config.residencyRoot, "owner.json")), 1_000);
+      await running;
+      expect(fs.existsSync(path.join(state.config.actorRoot, actor.id))).toBe(true);
+    } finally {
+      controller.abort(); await running;
+      await client.close(); await state.participants.close();
+    }
+  });
+});
+
 describe("#169 round 2 public cleanup outcome", () => {
   it.each(["main", "nested"] as const)("carries failed cleanup and exact-id retry through the real %s client and provider", { timeout: 15_000 }, async (caller) => {
     const state = await rootHarness(`public-cleanup-${caller}`);

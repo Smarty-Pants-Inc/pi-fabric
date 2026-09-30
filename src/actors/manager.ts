@@ -1,5 +1,6 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
+import { StaleMainRefusal } from "../lifecycle/stale-main.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
@@ -72,6 +73,8 @@ interface ActorQueueItem {
   reject?: (error: Error) => void;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
   resumed?: boolean;
+  /** Admission never launched a run; reloads must not exhaust the interrupted-run budget. */
+  admissionRefused?: boolean;
 }
 
 import type { FabricKernel } from "../runtime/kernel.js";
@@ -369,6 +372,7 @@ export class ActorManager {
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
   #closing = false;
+  #releaseBlocked = false;
   readonly #closeGraceMs: number;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
   // mesh dispatch are frozen so interrupted actors are not re-armed by the
@@ -2106,6 +2110,8 @@ export class ActorManager {
           }
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
           item.binding = await this.#resolvedRunBinding(actor, item.binding);
+          delete item.admissionRefused;
+          this.#persistQueue(actor.id);
           const result = await this.agents.run(
             this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
@@ -2223,6 +2229,15 @@ export class ActorManager {
               this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
               continue;
             }
+          }
+          if (error instanceof StaleMainRefusal && !runId) {
+            actor.lastError = message;
+            this.#releaseBlocked = true;
+            item.admissionRefused = true;
+            // No launch happened. Persist events for the replacement runtime, without a
+            // failed activation or a hot retry under this same immutable release.
+            this.#park(actor, [item], message, true);
+            continue;
           }
           const ownershipAborted = actor.ownershipAbort === abortController;
           if (ownershipAborted) delete actor.ownershipAbort;
@@ -3163,6 +3178,7 @@ export class ActorManager {
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
+            ...(item.admissionRefused ? { admissionRefused: true } : {}),
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
           }))];
         } catch {
@@ -3255,7 +3271,7 @@ export class ActorManager {
         typeof value.id !== "string" || typeof value.source !== "string" || held.has(value.id) ||
         typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null
       ) continue;
-      const attempts = (typeof value.attempts === "number" ? value.attempts : 0) + 1;
+      const attempts = (typeof value.attempts === "number" ? value.attempts : 0) + (value.admissionRefused ? 0 : 1);
       const item = {
         id: value.id,
         source: value.source,
@@ -3267,6 +3283,7 @@ export class ActorManager {
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
         attempts,
+        ...(value.admissionRefused ? { admissionRefused: true } : {}),
       } as ActorQueueItem & { attempts: number };
       if (attempts > 3) {
         this.#recordDropped(actor, item, "it was restored after three restarts that did not finish it");
@@ -3593,13 +3610,13 @@ export class ActorManager {
   // moved past them, so a transient ownership change must not drop them: they wait here
   // and run again once this host owns the actor. Caller items (ask, steer) are rejected
   // as before, so their caller hears about the move (smarty-dev#442).
-  #park(actor: ManagedActor, items: readonly ActorQueueItem[], reason: string): void {
+  #park(actor: ManagedActor, items: readonly ActorQueueItem[], reason: string, preserve = false): void {
     const parked = this.#parked.get(actor.id) ?? [];
     for (const item of items) {
       if (item.resolve || item.reject) item.reject?.(new Error(reason));
       else parked.push(item);
     }
-    while (parked.length > this.meshConfig.actorQueueLimit + this.#overflowCap() + parked.filter((queued) => queued.resumed).length) {
+    while (!preserve && parked.length > this.meshConfig.actorQueueLimit + this.#overflowCap() + parked.filter((queued) => queued.resumed).length) {
       this.#recordDropped(actor, parked.shift()!, `${reason}; the parked queue is full`);
     }
     if (parked.length > 0) this.#parked.set(actor.id, parked);
@@ -3757,10 +3774,10 @@ export class ActorManager {
   }
 
   #scheduleRestoreParked(): void {
-    if (this.#parked.size === 0 || this.#closing) return;
+    if (this.#parked.size === 0 || this.#closing || this.#releaseBlocked) return;
     queueMicrotask(() => {
       // An interrupt holds parked work until the user resumes (the halt gate).
-      if (this.#halted || this.#closing) return;
+      if (this.#halted || this.#closing || this.#releaseBlocked) return;
       for (const [id, items] of [...this.#parked]) {
         const actor = this.#actors.get(id);
         if (!actor || actor.status === "stopped" || !this.#canManageCached(id)) continue;

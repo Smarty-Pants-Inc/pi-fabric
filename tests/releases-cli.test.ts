@@ -27,8 +27,8 @@ const fixture = () => {
     fs.writeFileSync(path.join(dir, "cmdline"), args.join("\0") + "\0");
     fs.writeFileSync(path.join(dir, "environ"), Object.entries({ PI_CODING_AGENT_DIR: profile, ...environment }).map(([key, value]) => `${key}=${value}`).join("\0"));
   };
-  const worker = (pid: number, parent: number, release: string, mainId = "main:session-one") => process(pid, parent,
-    ["node", path.join(root, "releases", release, "dist/worker.js"), "--id", `run-${pid}`, "--main-agent-id", mainId]);
+  const worker = (pid: number, parent: number, release: string, mainId = "session:session-one") => process(pid, parent,
+    ["node", path.join(root, "releases", release, "dist", "worker.js"), "--id", `run-${pid}`, "--main-agent-id", mainId]);
   const record = (pid: number, sessionId: string, loaded = "old", start = String(pid * 100)) => {
     fs.mkdirSync(mainReleaseRecordDir(settingsPath), { recursive: true });
     fs.writeFileSync(path.join(mainReleaseRecordDir(settingsPath), `${pid}.json`), JSON.stringify({
@@ -44,15 +44,32 @@ describe("read-only release report", () => {
     f.process(10, 1, ["pi"]);
     f.record(10, "session-one");
     f.worker(20, 10, "old");
-    f.process(21, 10, ["node", path.join(f.root, "releases", "old", "dist/worker.js"), "--id", "actor-run", "--main-agent-id", "main:session-one", "--actor-id", "actor-one"]);
+    f.process(21, 10, ["node", path.join(f.root, "releases", "old", "dist", "worker.js"), "--id", "actor-run", "--main-agent-id", "session:session-one", "--actor-id", "actor-one"]);
     f.process(30, 20, ["pi"], { PI_FABRIC_PARENT_RUN: "run-20" });
     expect(processStart(10, f.procRoot)).toBe("1000");
     const report = collectHostReleases({ ...f, host: "host-one" });
     expect(report.mains).toHaveLength(1);
-    expect(report.mains[0]).toMatchObject({ pid: 10, mainId: "main:session-one", loaded: "old", active: "active", evidence: "runtime-record" });
+    expect(report.mains[0]).toMatchObject({ pid: 10, mainId: "session:session-one", loaded: "old", active: "active", evidence: "runtime-record" });
     expect(report.mains[0]?.workers).toHaveLength(2);
     expect(report.mains[0]?.workers[1]).toMatchObject({ actorId: "actor-one", loaded: "old" });
     expect(formatReleaseReports([report])).toContain("old=2");
+  });
+
+  it("joins detached resident workers to the recorded Main using session lineage ids", () => {
+    const f = fixture();
+    f.process(10, 1, ["pi"]);
+    f.record(10, "session-one");
+    const hostRoot = path.join(f.root, "resident");
+    fs.mkdirSync(hostRoot);
+    const config = path.join(hostRoot, "config.json");
+    fs.writeFileSync(config, JSON.stringify({ rootId: "session:session-one", fabricExtensionPath: path.join(f.root, "releases", "new", "dist", "index.js") }));
+    fs.writeFileSync(path.join(hostRoot, "owner.json"), JSON.stringify({ pid: 40, fabricExtensionPath: path.join(f.root, "releases", "old", "dist", "index.js") }));
+    // Native Pi sets process.title, so Linux argv can be only "pi": owner metadata must suffice.
+    f.process(40, 1, ["pi"], { PI_FABRIC_RESIDENT_CONFIG: config });
+    f.worker(41, 40, "old", "session:session-one");
+    const report = collectHostReleases(f);
+    expect(report.mains).toHaveLength(1);
+    expect(report.mains[0]).toMatchObject({ pid: 10, mainId: "session:session-one", workers: [{ pid: 41, mainId: "session:session-one" }], residentHosts: [{ pid: 40, mainId: "session:session-one", loaded: "old" }] });
   });
 
   it("labels legacy inference and unknowns honestly and rejects reused PID records", () => {
@@ -73,6 +90,16 @@ describe("read-only release report", () => {
     expect(report.mains.find(main => main.mainId === "main:remote")).toMatchObject({ pid: null, loaded: "remote-old", evidence: "worker-inferred" });
     expect(JSON.stringify(report)).not.toContain("incorrect");
     expect(JSON.stringify(report)).not.toContain("exited-session");
+  });
+
+  it("recognizes Windows argv separators with synthetic proc facts on every platform", () => {
+    const f = fixture();
+    f.process(10, 1, ["C:\\pi-runtime\\node_modules\\pi-coding-agent\\dist\\cli.js"]);
+    f.record(10, "session-one");
+    f.process(20, 1, ["node", "C:\\fabric\\releases\\old\\dist\\worker.js", "--id", "windows-run", "--main-agent-id", "session:session-one"]);
+    const report = collectHostReleases(f);
+    expect(report.mains).toHaveLength(1);
+    expect(report.mains[0]).toMatchObject({ mainId: "session:session-one", loaded: "old", workers: [{ runId: "windows-run", loaded: "old" }] });
   });
 
   it("aggregates offline snapshots per host and performs no writes", () => {

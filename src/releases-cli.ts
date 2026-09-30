@@ -14,6 +14,7 @@ export interface WorkerRelease {
   active: string;
   actorId?: string;
 }
+export interface ResidentHostRelease { pid: number; mainId: string; loaded: string; active: string }
 export interface MainRelease {
   pid: number | null;
   mainId: string;
@@ -21,10 +22,12 @@ export interface MainRelease {
   evidence: "runtime-record" | "worker-inferred" | "unknown";
   active: string;
   workers: WorkerRelease[];
+  residentHosts?: ResidentHostRelease[];
 }
 export interface HostReleaseReport { host: string; generatedAt: string; mains: MainRelease[]; skippedProcesses: number }
 
-const selectedEnv = new Set(["PI_CODING_AGENT_DIR", "PI_FABRIC_PARENT_RUN", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID"]);
+const selectedEnv = new Set(["PI_CODING_AGENT_DIR", "PI_FABRIC_PARENT_RUN", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID", "PI_FABRIC_RESIDENT_CONFIG"]);
+const normalizedArg = (arg: string): string => arg.replace(/\\/g, "/");
 const flag = (args: string[], name: string): string | undefined => {
   const index = args.indexOf(name);
   return index < 0 ? undefined : args[index + 1];
@@ -36,6 +39,7 @@ const activeLabel = (settings: string): string => {
 
 /** Read only selected non-secret environment keys and native argv; never inspect prompt/history. */
 export const collectHostReleases = (options: { procRoot?: string; settingsPath?: string; host?: string } = {}): HostReleaseReport => {
+  if (!options.procRoot && process.platform !== "linux") throw new Error("Live fabric-releases census requires Linux /proc; use --snapshot on other platforms");
   const procRoot = options.procRoot ?? "/proc";
   const settings = options.settingsPath ?? path.join(resolveAgentDir(), "settings.json");
   const processes = new Map<number, ProcessInfo>();
@@ -80,23 +84,46 @@ export const collectHostReleases = (options: { procRoot?: string; settingsPath?:
     ? path.join(process.env.PI_CODING_AGENT_DIR, "settings.json") : settings);
   for (const process of processes.values()) {
     const record = records.get(process.pid);
-    const pi = process.args.slice(0, 2).some(arg => path.basename(arg) === "pi" || /(?:pi-coding-agent|pi-runtime).*\/cli\.js$/.test(arg));
+    const pi = process.args.slice(0, 2).map(normalizedArg).some(arg => path.posix.basename(arg) === "pi" || /(?:pi-coding-agent|pi-runtime).*\/cli\.js$/.test(arg));
+    if (process.env.PI_FABRIC_RESIDENT_CONFIG) continue; // a resident Pi is not a second Main
     if (!record && (!pi || process.env.PI_FABRIC_PARENT_RUN || process.env.PI_FABRIC_ACTOR_ID)) continue;
-    const mainId = record ? `main:${record.sessionId}` : `pid:${process.pid}`;
+    const mainId = record ? `session:${record.sessionId}` : `pid:${process.pid}`;
     const main: MainRelease = {
       pid: process.pid, mainId,
       loaded: record ? releaseLabel(record.loadedRoot) : "unknown",
       evidence: record ? "runtime-record" : "unknown",
-      active: activeLabel(profile(process)), workers: [],
+      active: activeLabel(profile(process)), workers: [], residentHosts: [],
     };
     mains.set(mainId, main);
     mainsByPid.set(process.pid, main);
   }
   for (const process of processes.values()) {
-    const workerFile = process.args.find(arg => /\/releases\/[^/]+\/dist\/worker\.js$/.test(arg));
+    const configPath = process.env.PI_FABRIC_RESIDENT_CONFIG;
+    const entry = process.args.map(normalizedArg).find(arg => /\/dist\/residency\/pi-entry\.js$/.test(arg));
+    if (!configPath) continue;
+    try {
+      // Read only Fabric's non-secret lineage configuration, never Pi auth or history.
+      const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as { rootId?: unknown };
+      const owner = JSON.parse(fs.readFileSync(path.join(path.dirname(configPath), "owner.json"), "utf8")) as { pid?: unknown; fabricExtensionPath?: unknown };
+      if (typeof config.rootId !== "string" || owner.pid !== process.pid) continue;
+      let main = mains.get(config.rootId);
+      if (!main) {
+        main = { pid: null, mainId: config.rootId, loaded: "unknown", evidence: "unknown", active: activeLabel(profile(process)), workers: [], residentHosts: [] };
+        mains.set(config.rootId, main);
+      }
+      // Native Pi may replace argv with process.title. The owner records its immutable
+      // launch-time extension path; NEVER infer it from the mutable config selector.
+      const loaded = typeof owner.fabricExtensionPath === "string"
+        ? path.posix.basename(path.posix.dirname(path.posix.dirname(normalizedArg(owner.fabricExtensionPath))))
+        : entry ? path.posix.basename(path.posix.dirname(path.posix.dirname(path.posix.dirname(entry)))) : "unknown";
+      main.residentHosts!.push({ pid: process.pid, mainId: config.rootId, loaded, active: activeLabel(profile(process)) });
+    } catch { skippedProcesses += 1; }
+  }
+  for (const process of processes.values()) {
+    const workerFile = process.args.map(normalizedArg).find(arg => /\/releases\/[^/]+\/dist\/worker\.js$/.test(arg));
     if (!workerFile || !flag(process.args, "--id")) continue;
     // The worker entry path, not its child's Pi version or today's profile, proves its loaded Fabric.
-    const loaded = releaseLabel(path.dirname(path.dirname(workerFile)));
+    const loaded = path.posix.basename(path.posix.dirname(path.posix.dirname(workerFile)));
     const lineage = flag(process.args, "--main-agent-id") ?? process.env.PI_FABRIC_MAIN_AGENT_ID ?? "unknown";
     let main = mains.get(lineage);
     if (!main) {
@@ -126,6 +153,7 @@ export const collectHostReleases = (options: { procRoot?: string; settingsPath?:
       main.evidence = "worker-inferred";
     }
     main.workers.sort((a, b) => a.pid - b.pid);
+    main.residentHosts?.sort((a, b) => a.pid - b.pid);
   }
   return { host: options.host ?? os.hostname(), generatedAt: new Date().toISOString(),
     mains: [...mains.values()].sort((a, b) => (a.pid ?? Infinity) - (b.pid ?? Infinity) || a.mainId.localeCompare(b.mainId)), skippedProcesses,
@@ -139,6 +167,8 @@ export const formatReleaseReports = (reports: HostReleaseReport[]): string => {
     for (const worker of main.workers) counts.set(worker.loaded, (counts.get(worker.loaded) ?? 0) + 1);
     lines.push([report.host, main.mainId, main.pid ?? "remote/detached", main.loaded, main.active, main.evidence,
       [...counts].map(([release, count]) => `${release}=${count}`).join(",") || "none"].join(" "));
+    for (const host of main.residentHosts ?? []) lines.push([report.host, host.mainId, host.pid, host.loaded, host.active, "resident-host", "none"].join(" "));
+    for (const worker of main.workers) lines.push([report.host, worker.mainId, worker.pid, worker.loaded, worker.active, `worker:${worker.runId}`, worker.actorId ? `actor:${worker.actorId}` : "task"].join(" "));
   }
   return `${lines.join("\n")}\n`;
 };

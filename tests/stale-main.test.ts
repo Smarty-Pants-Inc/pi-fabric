@@ -87,6 +87,49 @@ describe("stale Main task admission", () => {
     if (loaded === "B65") await expect(result).rejects.toThrow(/safetyCritical/);
     else expect(await result).toHaveProperty("notice", notice);
   });
+  it("parks refused actor events and runs them once after a release reload", async () => {
+    const { manager, base, releases, settingsPath } = setup("B65");
+    const identity = { id: "session:retry", name: "Main", kind: "main" as const, sessionId: "retry" };
+    const mesh = new MeshStore(path.join(base, "mesh"), 64 * 1024, 100);
+    const meshConfig = { ...DEFAULT_FABRIC_CONFIG.mesh, enabled: true, actorPollMs: 20 };
+    const options = { actorRoot: path.join(base, "actors"), persistent: true, rootId: identity.id };
+    const actors = new ActorManager("retry", identity, mesh, meshConfig, manager, () => {}, options);
+    actorManagers.push(actors);
+    const actor = await actors.create({ name: "Preserved event", instructions: "Reply", responseMode: "text" });
+    const run = vi.spyOn(manager, "run");
+    actors.tell(actor.id, "preserve-this-event", { label: "retry" });
+    await vi.waitFor(() => expect(actors.status(actor.id).lastError).toMatch(/safetyCritical/));
+    const queueFile = () => fs.readdirSync(path.join(options.actorRoot, actor.id)).find(name => name.startsWith("queue-"));
+    expect(queueFile()).toBeDefined();
+    const saved = JSON.parse(fs.readFileSync(path.join(options.actorRoot, actor.id, queueFile()!), "utf8"));
+    expect(saved.items).toHaveLength(1);
+    expect(saved.items[0].payload).toMatchObject({ message: "preserve-this-event" });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(run).toHaveBeenCalledTimes(1); // no hot retry against a still-stale runtime
+    await actors.close();
+    // Multiple reloads that remain stale are NOT interrupted executions and cannot discard work.
+    for (let index = 0; index < 4; index += 1) {
+      const stillOld = new ActorManager("retry", identity, mesh, meshConfig, manager, () => {}, options);
+      actorManagers.push(stillOld);
+      await vi.waitFor(() => expect(stillOld.status(actor.id).lastError).toMatch(/safetyCritical/));
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(queueFile()).toBeDefined();
+      expect(JSON.parse(fs.readFileSync(path.join(options.actorRoot, actor.id, queueFile()!), "utf8")).items).toHaveLength(1);
+      await stillOld.close();
+    }
+    const current = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
+      runRoot: path.join(base, "new-runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      fabricExtensionPath: path.join(releases, "active", "dist/index.js"), releaseSettingsPath: settingsPath,
+    });
+    managers.push(current);
+    const resumedRun = vi.spyOn(current, "run");
+    const resumed = new ActorManager("retry", identity, mesh, meshConfig, current, () => {}, options);
+    actorManagers.push(resumed);
+    await vi.waitFor(() => expect(resumed.messages(actor.id).some(message => message.direction === "out" && message.runId)).toBe(true));
+    expect(resumedRun).toHaveBeenCalledTimes(1);
+    expect(queueFile()).toBeUndefined();
+  });
+
   it("adds a notice, not a refusal, after the last critical release; reports once per active", async () => {
     const { manager, publishStaleMain, activate } = setup("after-critical");
     const handle = await manager.spawn({ task: "Allowed task", transport: "process" });

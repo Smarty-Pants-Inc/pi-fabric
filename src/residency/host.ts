@@ -381,6 +381,7 @@ class ResidentHost {
       token: this.#token,
       startedAt: now,
       readyAt: now,
+      fabricExtensionPath: this.config.fabricExtensionPath,
     };
     atomicWrite(this.#ownerPath, owner);
     fs.rmSync(this.#errorPath, { force: true });
@@ -571,6 +572,8 @@ class ResidentHost {
     if (this.#pollingRequests || this.#closed) return;
     this.#pollingRequests = true;
     try {
+      // Main reload writes the new entry path. Stop taking new commands while old runs drain.
+      if (this.#releaseChanged()) return;
       let entries: string[];
       try {
         entries = fs.readdirSync(this.#requestsPath).filter((entry) => entry.endsWith(".json"));
@@ -593,7 +596,21 @@ class ResidentHost {
     }
   }
 
+  #releaseChanged(): boolean {
+    const current = readJson<Partial<ResidentHostConfig>>(path.join(this.config.residencyRoot, "config.json"));
+    return typeof current?.fabricExtensionPath === "string" &&
+      current.fabricExtensionPath !== this.config.fabricExtensionPath;
+  }
+
   #checkIdle(): void {
+    if (this.#releaseChanged()) {
+      // An idle durable subscription is not in-flight work. Keep its registry and parked
+      // queue on disk, finish live runs, then release ownership for the reloaded Main.
+      const running = this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
+        this.actors.listOwned().some(actor => actor.status === "running");
+      if (!running) this.onIdle();
+      return;
+    }
     const activeActor = this.actors
       .listOwned()
       .some((actor) => actor.residency === "durable" && actor.status !== "stopped");

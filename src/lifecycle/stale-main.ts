@@ -96,7 +96,12 @@ const installedTime = (row: ReleaseMetadata | undefined): number | undefined => 
   return time === undefined ? undefined : Date.parse(time);
 };
 
-const reloadPath = `Let this Main settle safely, then /${SELF_RELOAD_COMMAND} (or /reload after its running work finishes). Do not resolve a newer worker under this Main.`;
+const reloadPath = `Let this Main settle safely, then /${SELF_RELOAD_COMMAND} (or /reload after its running work finishes); its resident host drains and restarts on the reloaded release. Do not resolve a newer worker under this Main.`;
+
+/** A pre-launch admission failure, never an executed/failed actor activation. */
+export class StaleMainRefusal extends Error {
+  readonly code = "FABRIC_STALE_MAIN";
+}
 
 /** Pure admission decision, reread at actual launch so activation during a queue wait is covered. */
 export const inspectStaleMain = (loadedRoot: string | undefined, settingsPath: string): StaleMainNotice | undefined => {
@@ -104,7 +109,7 @@ export const inspectStaleMain = (loadedRoot: string | undefined, settingsPath: s
   const activeRoot = activeFabricRoot(settingsPath);
   if (!activeRoot) {
     if (path.basename(path.dirname(loadedRoot)) === "releases") {
-      throw new Error(`Fabric spawn refused: cannot determine the fleet's active release from ${settingsPath}. Repair the packages selector; ${reloadPath}`);
+      throw new StaleMainRefusal(`Fabric spawn refused: cannot determine the fleet's active release from ${settingsPath}. Repair the packages selector; ${reloadPath}`);
     }
     return undefined;
   }
@@ -122,12 +127,20 @@ export const inspectStaleMain = (loadedRoot: string | undefined, settingsPath: s
   try {
     if (path.dirname(loadedRoot) !== path.dirname(activeRoot)) throw new Error("loaded and active releases have different release directories");
     const rows = readReleaseCatalog(path.dirname(activeRoot));
+    // Shipped, undated safety marks describe fleet history, not an installation on every host.
+    // A receipt/time or a surviving release directory is host-local installation evidence.
+    // Without any installed critical release there is no safety gap to establish; merely-old
+    // Mains still get the notice on fresh/receipt-less hosts. Installed ambiguous gaps fail closed.
+    const critical = [...rows].filter(([release, row]) => row.safetyCritical === true && (
+      installedTime(row) !== undefined || fs.existsSync(path.join(path.dirname(activeRoot), release)) ||
+      fs.existsSync(path.join(path.dirname(path.dirname(activeRoot)), `${release}.receipt.json`))
+    ));
+    if (critical.length === 0) return result;
     const start = installedTime(rows.get(loaded));
     const end = installedTime(rows.get(active));
     if (start === undefined || end === undefined) throw new Error(`missing install/activation time for ${start === undefined ? loaded : active}`);
     if (end < start) throw new Error("active release is a rollback; forward safety gap cannot be established");
     if (end === start) throw new Error("loaded and active releases have tied install/activation times");
-    const critical = [...rows].filter(([, row]) => row.safetyCritical === true);
     for (const [release, row] of critical) {
       const time = installedTime(row);
       if (time === undefined) throw new Error(`missing install/activation time for safetyCritical release ${release}`);
@@ -184,7 +197,7 @@ export class StaleMainGuard {
         try { void Promise.resolve(this.publish(status)).catch(() => undefined); } catch { /* best effort ops */ }
       }
     }
-    if (status.refused) throw new Error(`${status.notice}. ${status.reason}`);
+    if (status.refused) throw new StaleMainRefusal(`${status.notice}. ${status.reason}`);
     return status.notice;
   }
 }

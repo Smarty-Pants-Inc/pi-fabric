@@ -25,7 +25,7 @@ const terminal = (request: AgentRunRequest, id: number): AgentRunResult => ({
   id: `probe-${id}`, name: request.name ?? "probe", task: request.task, status: "completed",
   runner: "pi", transport: "process", cwd: process.cwd(), startedAt: Date.now(), updatedAt: Date.now(),
   turns: 1, toolCalls: 0, text: "done", usage: {
-    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+    input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
     cost: 0,
   },
 });

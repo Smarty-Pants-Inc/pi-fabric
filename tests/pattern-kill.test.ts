@@ -272,3 +272,96 @@ describe("pattern-kill guard (smarty-dev#774)", () => {
     expect(PATTERN_KILL_REASON).toMatch(/kill <PID>/);
   });
 });
+
+// #2275 follow-ups: paired shell-command DATA, never execute these strings.
+// N2/N3 literal-name and cwd distinctions are path-only, covered in tmp-wipe.test.ts.
+// Keep the original corpus above byte-for-byte; IDs pair the two verdicts below.
+describe("pattern-kill follow-up regressions (#2275)", () => {
+  const refused: Array<[string, string]> = [
+    ["F9.01: saved lookup feeds stdin/read", `pgrep -f worker > .local/selected.pids; while read -r p; do kill "$p"; done < .local/selected.pids`],
+    ["F9.02: saved lookup feeds xargs -a", `pgrep -f worker > .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.03: saved lookup feeds inline --arg-file", `pgrep -f worker > .local/selected.pids; xargs --arg-file=.local/selected.pids kill`],
+    ["F9.04: explicit cat of saved lookup cannot clear provenance", `pgrep -f worker > .local/selected.pids; cat .local/selected.pids | xargs kill`],
+    ["F9.05: resolved aliases identify the same saved lookup", `F=.local/selected.pids; G="$F"; pgrep -f worker > "$F"; xargs -a "$G" kill`],
+    ["F9.06: append lookup output retains unsafe file provenance", `cat .local/server.pid > .local/selected.pids; pgrep -f worker >> .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.07: explicit fd1 writes actual lookup stdout", `pgrep -f worker 1> .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.08: stdout file differs from an unrelated fd3 file", `pgrep -f worker > .local/selected.pids 3> .local/diagnostic.log; xargs -a .local/selected.pids kill`],
+    ["F9.09: brace producer saves lookup output", `{ pgrep -f worker; } > .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.10: loop producer saves lookup output", `for name in worker server; do pgrep -f "$name"; done > .local/selected.pids; cat .local/selected.pids | xargs kill`],
+    ["F9.11: subshell producer saves lookup output", `(pgrep -f worker) > .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.12: lookup stdout actually reaches the pipe", `pgrep -f worker | cat | xargs kill`],
+    ["F9.13: captured cat reads saved lookup output", `pgrep -f worker > .local/selected.pids; kill $(cat .local/selected.pids)`],
+    ["F9.14: unsafe overwrite replaces recorded output", `cat .local/server.pid > .local/selected.pids; pgrep -f worker > .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.15: unrelated recorded diagnostic does not clear saved lookup", `pgrep -f worker > .local/selected.pids; cat .local/server.pid; xargs -a .local/selected.pids kill`],
+    ["F9.16: exact native empty-producer regression retains lookup provenance", `grep __guard_followups_no_match__ /dev/null > pid.list; cat pid.list | xargs -r kill; printf 'MAIN_F9_KILL_EXECUTED\\n'`],
+    ["F10.01: operand-free captured cat consumes inherited lookup stdin", `pgrep -f worker | sh -c 'kill $(cat)'`],
+    ["F10.02: captured stdin consumer pipeline preserves lookup output", `pgrep -f worker | sh -c 'kill $(cat | tr "\\n" " ")'`],
+    ["F10.03: cat dash explicitly consumes inherited lookup stdin", `pgrep -f worker | sh -c 'kill $(cat -)'`],
+    ["F10.04: inner lookup taints capture with recorded inherited stdin", `cat .local/server.pid | sh -c 'kill $(pgrep -f worker)'`],
+    ["F10.05: captured lookup versus independent nonconsumer", `pgrep -f worker | sh -c 'kill $(pgrep -f worker)'`],
+    ["F10.06: inherited lookup stdin reaches a nested local child capture", `pgrep -f worker | sh -c 'bash -c "kill \\$(cat)"'`],
+    ["F10.07: capture binding is unsafe inside its consuming child", `P=4242; pgrep -f worker | sh -c 'P=$(cat); kill "$P"'`],
+    ["F10.08: fd3 input does not replace inherited lookup stdin for capture", `pgrep -f worker | sh -c 'kill $(cat)' 3< .local/server.pid`],
+    ["F10.09: captured head consumes inherited lookup stdin", `pgrep -f worker | sh -c 'kill $(head -n 1)'`],
+    ["F10.10: capture assignment preserves inherited lookup stdin", `pgrep -f worker | sh -c 'P=$(cat); kill "$P"'`],
+    ["F10.11: exact native empty-producer inherited capture regression", `grep __guard_followups_no_match__ /dev/null | bash -c 'kill $(cat)'; printf 'MAIN_F10_KILL_EXECUTED\\n'`],
+    ["N4.01: set binds captured lookup to the first positional", `set -- $(pgrep -f worker); kill "$1"`],
+    ["N4.02: set binds captured lookup to aggregate positionals", `set -- 4242 $(pgrep -f worker); kill "$@"`],
+    ["N4.03: read here-string binds executed lookup output", `read -r P <<< "$(pgrep -f worker)"; kill "$P"`],
+    ["N4.04: mapfile here-string binds executed lookup output", `mapfile -t pids <<< "$(pgrep -f worker)"; kill "\${pids[@]}"`],
+    ["N4.05: printf -v binds executed lookup output", `printf -v P '%s' "$(pgrep -f worker)"; kill "$P"`],
+    ["N4.06: printf -v preserves lookup provenance through a variable", `P=$(pgrep -f worker); printf -v Q '%s' "$P"; kill "$Q"`],
+    ["N4.07: set preserves lookup provenance through a variable", `P=$(pgrep -f worker); set -- "$P"; kill "$1"`],
+    ["N6.01: array append preserves unsafe original lookup elements", `pids=($(pgrep -f worker)); pids+=(4242); kill "\${pids[@]}"`],
+    ["N6.02: array append preserves unsafe captured elements after recorded append", `pids=($(pgrep -f worker)); pids+=($(cat .local/server.pid)); kill "\${pids[@]}"`],
+    ["N6.03: array append adds lookup elements to a recorded array", `pids=(4242); pids+=($(pgrep -f worker)); kill "\${pids[@]}"`],
+    ["N6.04: array append through a recorded variable retains old lookup elements", `PID=$!; pids=($(pgrep -f worker)); pids+=("$PID"); kill "\${pids[@]}"`],
+  ];
+  const allowed: Array<[string, string]> = [
+    ["F9.01: saved recorded PID file feeds stdin/read", `cat .local/server.pid > .local/selected.pids; while read -r p; do kill "$p"; done < .local/selected.pids`],
+    ["F9.02: saved recorded PID file feeds xargs -a", `cat .local/server.pid > .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.03: saved recorded PID file feeds inline --arg-file", `cat .local/server.pid > .local/selected.pids; xargs --arg-file=.local/selected.pids kill`],
+    ["F9.04: explicit cat of saved recorded output remains independent", `cat .local/server.pid > .local/selected.pids; cat .local/selected.pids | xargs kill`],
+    ["F9.05: resolved aliases identify the same saved recorded output", `F=.local/selected.pids; G="$F"; cat .local/server.pid > "$F"; xargs -a "$G" kill`],
+    ["F9.06: append recorded output to a recorded file remains safe", `cat .local/server.pid > .local/selected.pids; cat .local/worker.pid >> .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.07: fd2 does not save lookup stdout as file contents", `pgrep -f worker 2> .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.08: fd3 output does not contaminate a preexisting recorded file", `pgrep -f worker 3> .local/diagnostic.log; xargs -a .local/server.pid kill`],
+    ["F9.09: brace producer saves recorded output", `{ cat .local/server.pid; } > .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.10: loop producer saves recorded output", `for file in .local/server.pid .local/worker.pid; do cat "$file"; done > .local/selected.pids; cat .local/selected.pids | xargs kill`],
+    ["F9.11: subshell producer saves recorded output", `(cat .local/server.pid) > .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.12: redirected lookup stdout does not reach the outgoing pipe", `pgrep -f worker > .local/selected.pids | cat | xargs kill`],
+    ["F9.13: captured cat reads saved recorded output", `cat .local/server.pid > .local/selected.pids; kill $(cat .local/selected.pids)`],
+    ["F9.14: recorded overwrite replaces unsafe output", `pgrep -f worker > .local/selected.pids; cat .local/server.pid > .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.15: unrelated lookup diagnostic does not taint saved recorded output", `pgrep -f worker; cat .local/server.pid > .local/selected.pids; xargs -a .local/selected.pids kill`],
+    ["F9.16: recorded-file empty-producer counterpart remains allowed", `cat .local/server.pid > pid.list; cat pid.list | xargs -r kill; printf 'MAIN_F9_KILL_EXECUTED\\n'`],
+    ["F10.01: operand-free captured cat consumes inherited recorded stdin", `cat .local/server.pid | sh -c 'kill $(cat)'`],
+    ["F10.02: captured stdin consumer pipeline preserves recorded output", `cat .local/server.pid | sh -c 'kill $(cat | tr "\\n" " ")'`],
+    ["F10.03: explicit PID-file cat ignores inherited lookup stdin", `pgrep -f worker | sh -c 'kill $(cat .local/server.pid)'`],
+    ["F10.04: inner recorded source remains independent of recorded inherited stdin", `cat .local/server.pid | sh -c 'kill $(cat .local/worker.pid)'`],
+    ["F10.05: nonconsumer capture ignores inherited lookup stdin", `pgrep -f worker | sh -c 'kill $(printf "%s" 4242)'`],
+    ["F10.06: inherited recorded stdin reaches a nested local child capture", `cat .local/server.pid | sh -c 'bash -c "kill \\$(cat)"'`],
+    ["F10.07: child capture binding does not leak to the parent", `P=4242; pgrep -f worker | sh -c 'P=$(cat); :'; kill "$P"`],
+    ["F10.08: fd0 recorded input overrides inherited lookup stdin for capture", `pgrep -f worker | sh -c 'kill $(cat)' < .local/server.pid`],
+    ["F10.09: explicit recorded head source ignores inherited lookup stdin", `pgrep -f worker | sh -c 'kill $(head -n 1 .local/server.pid)'`],
+    ["F10.10: capture assignment preserves inherited recorded stdin", `cat .local/server.pid | sh -c 'P=$(cat); kill "$P"'`],
+    ["F10.11: recorded-file inherited capture counterpart remains allowed", `cat .local/server.pid | bash -c 'kill $(cat)'; printf 'MAIN_F10_KILL_EXECUTED\\n'`],
+    ["N4.01: set binds a recorded literal PID to the first positional", `set -- 4242; kill "$1"`],
+    ["N4.02: set binds only recorded literal aggregate positionals", `set -- 4242 4243; kill "$@"`],
+    ["N4.03: read literal here-string lookup text is inert", `read -r P <<< '$(pgrep -f worker)'; kill "$P"`],
+    ["N4.04: mapfile literal here-string lookup text is inert", `mapfile -t pids <<< '$(pgrep -f worker)'; kill "\${pids[@]}"`],
+    ["N4.05: printf -v binds a recorded literal PID", `printf -v P '%s' 4242; kill "$P"`],
+    ["N4.06: printf -v preserves recorded provenance through a variable", `PID=$!; printf -v Q '%s' "$PID"; kill "$Q"`],
+    ["N4.07: set preserves recorded provenance through a variable", `PID=$!; set -- "$PID"; kill "$1"`],
+    ["N6.01: array append preserves recorded original PID elements", `pids=(4242); pids+=(4243); kill "\${pids[@]}"`],
+    ["N6.02: array append preserves recorded captured elements", `pids=($(cat .local/server.pid)); pids+=($(cat .local/worker.pid)); kill "\${pids[@]}"`],
+    ["N6.03: array append adds recorded elements to a recorded array", `pids=(4242); pids+=($(cat .local/server.pid)); kill "\${pids[@]}"`],
+    ["N6.04: array append through a recorded variable keeps a recorded array safe", `PID=$!; pids=(4242); pids+=("$PID"); kill "\${pids[@]}"`],
+  ];
+
+  it.each(refused)("refuses %s", (_label, command) => {
+    expect(killsByPattern(command)).toBe(true);
+  });
+  it.each(allowed)("allows %s", (_label, command) => {
+    expect(killsByPattern(command)).toBe(false);
+  });
+});

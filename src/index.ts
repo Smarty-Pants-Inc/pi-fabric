@@ -1,7 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
-import { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp } from "./core/pattern-kill.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
@@ -820,12 +819,19 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // smarty-dev#774: a kill by name pattern kills other owners' processes on a shared host. Every
   // session that loads Fabric (Mains, task agents, actors) runs this, and fabric_exec's pi.bash
   // emits the same tool_call.
-  pi.on("tool_call", (event) => {
+  let bashGuard: Promise<typeof import("./core/pattern-kill.js")> | undefined;
+  pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash") return undefined;
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
-    if (killsByPattern(command)) return { block: true, reason: PATTERN_KILL_REASON };
-    if (wipesTmp(command)) return { block: true, reason: TMP_WIPE_REASON };
+    // Load only on actual first bash use, never during registration or idle hooks.
+    const { scanCommand, GUARD_BUDGET_REASON, PATTERN_KILL_REASON, TMP_WIPE_REASON } =
+      await (bashGuard ??= import("./core/pattern-kill.js"));
+    // One budget covers both policies, nested readers, and collection/replay for this call.
+    const guard = scanCommand(command);
+    if (guard.exhausted) return { block: true, reason: GUARD_BUDGET_REASON };
+    if (guard.blocked) return { block: true, reason: PATTERN_KILL_REASON };
+    if (guard.wipe) return { block: true, reason: TMP_WIPE_REASON };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
     return reason ? { block: true, reason } : undefined;
   });

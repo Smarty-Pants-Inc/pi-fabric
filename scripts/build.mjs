@@ -32,6 +32,7 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/core/pattern-kill.ts",
   "src/core/provider-operations.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",

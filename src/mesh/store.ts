@@ -1331,16 +1331,15 @@ export class MeshStore {
 
   /**
    * The stamp of the state payload that reads now return, from this store's cache. With fresh,
-   * bypass the age window and revalidate metadata plus the canonical header, parsing on change.
-   * This UI observer returns a stamp, not authoritative payload or owner authority: legacy
-   * copied-marker or missing-marker, same-stat ABA can still reuse the cache (the baseline
-   * metadata/header observer limitation); a missing marker is not authoritative.
+   * revalidate through the ordinary read-cache window, not authoritative payload freshness.
+   * This UI observer may lag remote changes by readCacheMs; observing a cached payload does
+   * not extend its age window. Expired reads use ordinary metadata/header validation and fallback.
    * A reader records what it consumed, not what is on disk (review/astra F2 on #84).
    */
   cachedStateStamp(fresh = false): string | undefined {
     if (fresh) {
       try {
-        this.#readCachedState(true, false); // observer only; public fresh payload reads stay canonical
+        this.#readCachedState(false, false); // observer only; public fresh payload reads stay canonical
       } catch {
         return undefined;
       }

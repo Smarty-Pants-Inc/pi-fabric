@@ -13,13 +13,13 @@ const real = { statSync: fs.statSync, readFileSync: fs.readFileSync };
 const key = "topology/participants/observer";
 const identity: MeshIdentity = { id: "session:old", name: "owner", kind: "main" };
 type State = { readGeneration?: string; entries: Record<string, MeshStateEntry> };
-const setup = async () => {
+const setup = async (readCacheMs = RUNTIME_MESH_READ_CACHE_MS) => {
   fs.mkdirSync(scratch, { recursive: true });
   const root = fs.mkdtempSync(path.join(scratch, "stamp-observer-"));
   roots.push(root);
   const file = path.join(root, "state.json");
   const writer = new MeshStore(root, 64 * 1024, 100);
-  const reader = new MeshStore(root, 64 * 1024, 100, { readCacheMs: RUNTIME_MESH_READ_CACHE_MS });
+  const reader = new MeshStore(root, 64 * 1024, 100, { readCacheMs });
   await writer.put({ key, value: { owner: "old" }, identity });
   const disk = (): State => JSON.parse(String(real.readFileSync(file, "utf8")));
   const freeze = () => {
@@ -61,19 +61,27 @@ it("observer reuses an already parsed current get cache without a canonical full
   expect(count()).toBe(afterWrite + 1);
 });
 
-for (const change of ["stat", "generation"] as const) it(`observer refreshes payload on changed ${change} within TTL`, async () => {
+for (const change of ["stat", "generation"] as const) it(`observer defers changed ${change} until the ordinary TTL expires`, async () => {
   const { reader, writer, freeze, replace, count } = await setup();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
   if (change === "generation") freeze();
-  reader.get(key);
+  const old = reader.get(key);
   const stamp = reader.cachedStateStamp();
   if (change === "stat") await replace((state) => { state.entries[key]!.value = { owner: "larger-new-owner" }; });
   else await writer.put({ key, value: { owner: "new" }, identity });
   const before = count();
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(reader.get(key)).toEqual(old);
+  expect(count()).toBe(before);
+  now += RUNTIME_MESH_READ_CACHE_MS;
   const next = reader.cachedStateStamp(true);
   if (change === "stat") expect(next).not.toBe(stamp);
   else expect(next).toBe(stamp); // Metadata stamp is not a generation or authority token.
   expect(count()).toBe(before + 1);
   expect(reader.get(key)?.value).toEqual({ owner: change === "stat" ? "larger-new-owner" : "new" });
+  expect(reader.cachedStateStamp(true)).toBe(next);
+  expect(count()).toBe(before + 1);
 });
 
 for (const method of ["get", "listAll", "listAllShared", "stateToken", "confirmWritable"] as const) {
@@ -103,20 +111,34 @@ for (const method of ["get", "listAll", "listAllShared", "stateToken", "confirmW
       expect(reader.get(key)).toEqual(expected); // S1 barrier stays intact, even for ordinary reads.
     } else expect(reader[method]("topology/participants/", { fresh: true })).toEqual([expected]);
     expect(count()).toBe(before + 1);
+    if (method !== "confirmWritable") {
+      if (method === "get") expect(reader.get(key, { fresh: true })).toEqual(expected);
+      else if (method === "stateToken") {
+        reader.stateToken({ fresh: true });
+        expect(reader.get(key)).toEqual(expected);
+      } else expect(reader[method]("topology/participants/", { fresh: true })).toEqual([expected]);
+      expect(count()).toBe(before + 2); // Canonical EVERY call, not just on invalidation.
+    }
   });
 }
 
-it("markerless warm observer reuses unchanged metadata with exactly one 64-byte header read", async () => {
+it("markerless warm observer shares TTL without even a header read, then parses at expiry", async () => {
   const { reader, replace, count } = await setup();
   await replace((state) => { delete state.readGeneration; });
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
   reader.get(key);
   const stamp = reader.cachedStateStamp();
   const before = count();
   const headers = vi.spyOn(fs, "readSync");
   expect(reader.cachedStateStamp(true)).toBe(stamp);
   expect(count()).toBe(before);
-  expect(headers.mock.calls).toHaveLength(1);
-  expect(headers.mock.calls[0]!.slice(2)).toEqual([0, 64, 0]);
+  expect(headers).not.toHaveBeenCalled();
+  now += RUNTIME_MESH_READ_CACHE_MS;
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(count()).toBe(before + 1); // Unknown generation cannot waive ordinary expiry.
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(count()).toBe(before + 1);
 });
 
 for (const barrier of ["fresh", "confirmWritable"] as const) it(`markerless metadata ABA observer reuse preserves ${barrier} authority`, async () => {
@@ -143,15 +165,21 @@ for (const barrier of ["fresh", "confirmWritable"] as const) it(`markerless meta
   expect(count()).toBe(before + 1);
 });
 
-it("markerless to newly minted current UUID forces same-stat observer parse", async () => {
+it("markerless to current UUID stays old within TTL and forces same-stat parse at expiry", async () => {
   const { reader, writer, replace, freeze, disk, count } = await setup();
   await replace((state) => { delete state.readGeneration; });
   freeze();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
   reader.get(key);
   const stamp = reader.cachedStateStamp();
   await writer.put({ key, value: { owner: "new" }, identity });
   expect(disk().readGeneration).toMatch(/^[0-9a-f-]{36}$/);
   const before = count();
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(reader.get(key)?.value).toEqual({ owner: "old" });
+  expect(count()).toBe(before);
+  now += RUNTIME_MESH_READ_CACHE_MS;
   expect(reader.cachedStateStamp(true)).toBe(stamp);
   expect(count()).toBe(before + 1);
   expect(reader.get(key)?.value).toEqual({ owner: "new" });
@@ -172,6 +200,96 @@ it("expired nonfresh unknown generation still parses after markerless observer r
   now += 2;
   expect(reader.get(key)?.value).toEqual({ owner: "new" });
   expect(count()).toBe(before + 1); // Observer neither extends TTL nor waives unknown expiry.
+});
+
+for (const poll of ["ordinary", "observer"] as const) it(`legacy changed-stat observer coalesces with ${poll} expiry poll`, async () => {
+  const { reader, replace, disk, count } = await setup();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const old = reader.get(key);
+  expect(count()).toBe(1); // Warm ordinary parse.
+  const parsedAt = now;
+  const consumed = reader.cachedStateStamp();
+  const generation = disk().readGeneration;
+  await replace((state) => { state.entries[key]!.value = { owner: "legacy-larger-new-owner" }; });
+  expect(disk().readGeneration).toBe(generation); // Raw legacy replacement copies the marker.
+  const onDisk = reader.stateStamp();
+  expect(onDisk).not.toBe(consumed);
+  const before = count(); // Baseline after raw replacement; disk() reads bypass the spy.
+  for (const elapsed of [0, RUNTIME_MESH_READ_CACHE_MS / 2, RUNTIME_MESH_READ_CACHE_MS - 1]) {
+    now = parsedAt + elapsed;
+    const observed = reader.cachedStateStamp(true);
+    expect(count()).toBe(before); // ZERO extra canonical reads, even on changed stat.
+    expect(observed).toBe(consumed); // Never label old payload with disk's stamp.
+    expect(reader.get(key)).toEqual(old); // UI snapshot in the same window shares the parse.
+    expect(count()).toBe(before);
+  }
+  now += 1; // Exact original TTL boundary, not the last observer call plus TTL.
+  if (poll === "ordinary") expect(reader.get(key)?.value).toEqual({ owner: "legacy-larger-new-owner" });
+  else expect(reader.cachedStateStamp(true)).toBe(onDisk); // No ordinary poll: bounded observer lag.
+  expect(count()).toBe(before + 1);
+  expect(reader.cachedStateStamp(true)).toBe(onDisk);
+  expect(reader.get(key)?.value).toEqual({ owner: "legacy-larger-new-owner" });
+  expect(count()).toBe(before + 1); // Next observer and UI read reuse that ONE expiry parse.
+});
+
+it("readCacheMs 0 checks the canonical header on every observer and parses changed stat immediately", async () => {
+  const { reader, replace, count } = await setup(0);
+  reader.get(key);
+  const stamp = reader.cachedStateStamp();
+  const before = count();
+  const headers = vi.spyOn(fs, "readSync");
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(headers.mock.calls).toHaveLength(2);
+  for (const call of headers.mock.calls) expect(call.slice(2)).toEqual([0, 64, 0]);
+  expect(count()).toBe(before);
+  await replace((state) => { state.entries[key]!.value = { owner: "larger-new-owner" }; });
+  const afterWrite = count();
+  expect(reader.cachedStateStamp(true)).not.toBe(stamp);
+  expect(count()).toBe(afterWrite + 1);
+  expect(reader.get(key)?.value).toEqual({ owner: "larger-new-owner" });
+  expect(count()).toBe(afterWrite + 1);
+});
+
+it("confirmWritable clears a warm cache so the next observer parses canonical state", async () => {
+  const { reader, freeze, replace, count } = await setup();
+  freeze();
+  reader.get(key);
+  const stamp = reader.cachedStateStamp();
+  await replace((state) => { state.entries[key]!.value = { owner: "new" }; });
+  const before = count();
+  await reader.confirmWritable();
+  expect(reader.cachedStateStamp()).toBeUndefined();
+  expect(count()).toBe(before);
+  expect(reader.cachedStateStamp(true)).toBe(stamp); // Same stat, copied marker: still a full read.
+  expect(reader.get(key)?.value).toEqual({ owner: "new" });
+  expect(count()).toBe(before + 1);
+});
+
+it("header EIO permits within-TTL reuse but requires a canonical parse at expiry", async () => {
+  const { reader, freeze, replace, count } = await setup();
+  freeze();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const old = reader.get(key);
+  const stamp = reader.cachedStateStamp();
+  await replace((state) => { state.entries[key]!.value = { owner: "new" }; });
+  const before = count();
+  const headers = vi.spyOn(fs, "readSync").mockImplementation(() => {
+    throw Object.assign(new Error("canonical header unavailable"), { code: "EIO" });
+  });
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(reader.get(key)).toEqual(old);
+  expect(headers).not.toHaveBeenCalled();
+  expect(count()).toBe(before);
+  now += RUNTIME_MESH_READ_CACHE_MS;
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(headers.mock.calls).toHaveLength(1);
+  expect(count()).toBe(before + 1);
+  expect(reader.get(key)?.value).toEqual({ owner: "new" });
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(count()).toBe(before + 1);
 });
 
 it("unchanged public fresh payload calls still perform canonical full reads", async () => {

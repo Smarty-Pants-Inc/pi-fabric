@@ -386,6 +386,7 @@ export class AgentsProvider implements FabricProvider {
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
       (binding, runner, context) => this.#resolvePiRunBinding(binding, runner, context),
+      hostId => this.residency?.assertCurrentOwner(hostId),
     );
     this.#lifecycleScheduler = new LifecycleDeliveryScheduler(
       DEFAULT_LIFECYCLE_COALESCE_MS,
@@ -1034,6 +1035,7 @@ export class AgentsProvider implements FabricProvider {
           );
         }
         if (!participant) throw new Error(`Fabric actor ${actor!.id} has no live execution owner`);
+        this.residency?.assertCurrentOwner(participant.ownerHostId);
         if (!participant.capabilities.includes("ask")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support remote ask`);
         }

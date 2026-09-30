@@ -21,6 +21,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import * as processUtils from "../src/agents/transports/process-utils.js";
 import { projectOf } from "../src/topology/project-identity.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
@@ -297,6 +298,133 @@ describe.skipIf(process.platform === "win32")("resident host start timeout", () 
 // node_modules shims hangs before the child starts, so the launcher never
 // reaches its spawn trace. Durable residency E2E stays POSIX-only until that
 // spawn path is resolved; the launcher logic tests below run everywhere.
+// Actual historical bytes are an opt-in input, not a copy of the candidate with a field deleted.
+// TEST_LEGACY_FABRIC_RELEASE=/absolute/older/release bunx vitest run tests/residency.test.ts -t 'release recovery'
+describe("resident host release recovery regressions", () => {
+  it("refuses a provenance-less live owner when idle cannot be proved", async () => {
+    const state = await rootHarness("legacy-unknown");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(state.config.residencyRoot, "owner.json"), JSON.stringify({
+      format: 1, hostId: residentHostId(state.identity.id), pid: process.pid, token: "legacy", startedAt: Date.now(), readyAt: Date.now(),
+    }));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants,
+      mainAgent: state.mainAgent, startupTimeoutMs: 50 });
+    try {
+      await expect(client.ensureHost()).rejects.toThrow(/draining for release reload/);
+    } finally {
+      await client.close(); await state.participants.close();
+      fs.rmSync(path.join(state.config.residencyRoot, "owner.json")); // This fixture is this test process, never a child.
+    }
+  });
+
+  it.skipIf(!process.env.TEST_LEGACY_FABRIC_RELEASE || process.platform === "win32")("replaces an actual earlier-release owner with a durable actor and no provenance", { timeout: 40_000 }, async () => {
+    const state = await rootHarness("legacy-release-recovery");
+    const release = process.env.TEST_LEGACY_FABRIC_RELEASE!;
+    const legacyConfig = { ...state.config, fabricExtensionPath: path.join(release, "dist", "index.js") };
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify(legacyConfig));
+    const launcher = await processUtils.spawnDetached(path.join(release, "dist", "residency", "launcher.js"), ["--config", configPath], repo);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    try {
+      await waitFor(() => fs.existsSync(ownerPath), 15_000);
+      const oldOwner = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+      expect(oldOwner.fabricExtensionPath).toBeUndefined();
+      // The legacy nested protocol seeds its actor BEFORE the new Main starts. No candidate initialization on the old host.
+      const actor = await new ResidentActorClient(state.config.meshRoot, state.identity.id).createActor({
+        name: "legacy durable subscription", instructions: "Reply", residency: "durable", topics: ["legacy-test"],
+      });
+      client.start();
+      await waitFor(() => {
+        try { return JSON.parse(fs.readFileSync(ownerPath, "utf8")).fabricExtensionPath === state.config.fabricExtensionPath; } catch { return false; }
+      }, 20_000);
+      expect(JSON.parse(fs.readFileSync(ownerPath, "utf8")).pid).not.toBe(oldOwner.pid);
+      await waitFor(() => state.participants.get(actor.id, Date.now(), { fresh: true })?.status === "idle");
+      expect(fs.existsSync(path.join(state.config.actorRoot, actor.id))).toBe(true);
+    } finally {
+      await client.close(); await stopResident(state.config); await launcher.stop();
+      await waitFor(() => !processUtils.processIsAlive(launcher.pid), 5_000);
+      await state.participants.close();
+    }
+  });
+
+  it("keeps reload recovery alive past the drain budget and consumes the parked event once", { timeout: 15_000 }, async () => {
+    const state = await rootHarness("long-release-recovery");
+    const profile = path.join(state.root, "profile");
+    const releaseBase = path.join(state.root, "fabric");
+    const releases = path.join(releaseBase, "releases");
+    for (const release of ["old", "new"]) {
+      fs.mkdirSync(path.join(releases, release), { recursive: true });
+      fs.writeFileSync(path.join(releases, release, "package.json"), JSON.stringify({ name: "pi-fabric" }));
+    }
+    fs.mkdirSync(profile);
+    vi.stubEnv("PI_CODING_AGENT_DIR", profile);
+    const activate = (name: string) => fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ packages: [path.join(releases, name)] }));
+    fs.writeFileSync(path.join(releaseBase, "releases-safety.json"), JSON.stringify({ version: 1, releases: {
+      old: { installedAt: "2026-09-30T00:00:00Z" }, new: { installedAt: "2026-09-30T01:00:00Z", safetyCritical: true },
+    } }));
+    activate("old");
+    const oldConfig = { ...state.config, fabricExtensionPath: path.join(releases, "old", "dist", "index.js") };
+    const newConfig = { ...state.config, fabricExtensionPath: path.join(releases, "new", "dist", "index.js") };
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify(oldConfig));
+    const oldController = new AbortController(), newController = new AbortController();
+    const oldHost = runResidentHostFromConfigPath(configPath, oldController.signal);
+    let newHost: Promise<void> | undefined;
+    const oldClient = new ResidencyClient({ config: oldConfig, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const client = new ResidencyClient({ config: newConfig, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, startupTimeoutMs: 50 });
+    // Only replace process boot with an in-process host: the durable worker, queue, guard,
+    // host drain and client retry are real. This keeps the shortened boot budget deterministic.
+    const spawnProcess = processUtils.spawnDetached;
+    const boot = vi.fn();
+    const launch = vi.spyOn(processUtils, "spawnDetached").mockImplementation(async (workerPath, args, cwd) => {
+      if (workerPath === fakeWorker) return spawnProcess(workerPath, args, cwd);
+      boot();
+      newHost = runResidentHostFromConfigPath(configPath, newController.signal);
+      return { pid: process.pid, isAlive: async () => true, stop: async () => { newController.abort(); await newHost; } };
+    });
+    try {
+      await waitFor(() => fs.existsSync(ownerPath));
+      const actor = await oldClient.createActor({ name: "parked after reload", instructions: "Reply", residency: "durable",
+        topics: ["long-drain-test"], responseMode: "text", delivery: "mailbox", coalesce: false });
+      const task = await oldClient.spawnAgent({ task: "LIVE_WITH_PROGRESS", transport: "process", residency: "durable" });
+      await waitFor(() => oldClient.statusAgent(task.id).status === "running");
+      activate("new");
+      const event = await state.mesh.publish({ topic: "long-drain-test", kind: "regression", from: state.identity, text: "consume once" });
+      const queueDir = path.join(state.config.actorRoot, actor.id);
+      await waitFor(() => fs.readdirSync(queueDir).some(name => name.startsWith("queue-") &&
+        JSON.parse(fs.readFileSync(path.join(queueDir, name), "utf8")).items.some((item: { admissionRefused?: boolean }) => item.admissionRefused)));
+      client.start();
+      await delay(300); // > maximum load-scaled 50ms budget (200ms), while the 1500ms worker lives.
+      expect(oldClient.statusAgent(task.id).status).toBe("running");
+      expect(boot).not.toHaveBeenCalled();
+      await waitFor(() => boot.mock.calls.length === 1);
+      await oldHost;
+      expect(oldClient.statusAgent(task.id).status).toBe("completed");
+      await waitFor(() => {
+        const rows = new ActorRegistryStore(state.config.actorRoot).records();
+        const saved = rows.find(row => row.id === actor.id);
+        return Array.isArray(saved?.messages) && saved.messages.some(message => message.direction === "out" && message.runId);
+      });
+      await delay(200);
+      const saved = new ActorRegistryStore(state.config.actorRoot).records().find(row => row.id === actor.id)!;
+      expect((saved.messages as Array<{ direction: string; runId?: string }>).filter(message => message.direction === "out" && message.runId)).toHaveLength(1);
+      expect(fs.readdirSync(queueDir).filter(name => name.startsWith("queue-")).some(name =>
+        JSON.parse(fs.readFileSync(path.join(queueDir, name), "utf8")).items.some((item: { payload?: { id?: string } }) => item.payload?.id === event.id))).toBe(false);
+      await client.close();
+      await delay(100);
+      expect(boot).toHaveBeenCalledTimes(1); // close does not restart recovery.
+    } finally {
+      await client.close(); oldController.abort(); newController.abort();
+      await Promise.all([oldHost, newHost]); launch.mockRestore();
+      await oldClient.close(); await state.participants.close();
+    }
+  });
+});
+
 describe("resident host release recovery", () => {
   it("drains an obsolete resident host after Main reload even with a durable actor", { timeout: 10_000 }, async () => {
     const state = await rootHarness("release-recovery");

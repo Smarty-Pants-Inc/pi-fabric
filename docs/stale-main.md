@@ -30,7 +30,12 @@ existing workers or substitutes a new worker release.
 
 After a Main reload changes the resident config entry path, its obsolete resident host stops
 taking new commands, drains live runs and exits even if durable subscriptions remain. The
-reloaded Main starts the replacement host on its own release. Refused actor events are parked
+reloaded Main starts the replacement host on its own release. Recovery retries beyond the startup
+budget until ownership is replaced, and stops when that Main client closes. Legacy owners with
+no immutable release path are unknown, never current: new commands and direct actor messages
+are refused, and the host is retired only after fresh participant and settled-run records prove
+an idle boundary. Unreadable or incomplete work state keeps the refusal in place rather than
+interrupting a run. Refused actor events are parked
 in their durable queue (not failed or consumed), then retried by the replacement runtime;
 repeated stale reloads do not exhaust their interrupted-run retry budget. Caller `ask` requests
 still reject immediately so their caller hears the refusal.

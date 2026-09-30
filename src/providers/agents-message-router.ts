@@ -59,6 +59,7 @@ export class AgentMessageRouter {
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown">,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
+    readonly assertResidentOwner?: (hostId: string) => void,
   ) {}
   #recentlyLapsedRoot(id: string): FabricParticipantInfo | undefined {
     // A write-stalled mesh explains the lapse, and delivery needs the mesh: report the stall.
@@ -222,6 +223,7 @@ export class AgentMessageRouter {
       return { queued: true, messageId: result.messageId, routed: "local" };
     }
     if (!participant) throw new Error(`Fabric actor ${actor!.id} has no live execution owner`);
+    this.assertResidentOwner?.(participant.ownerHostId);
     if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
     const sessionBinding = actor?.binding;
     const resolvedBinding = actor

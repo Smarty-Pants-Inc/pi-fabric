@@ -115,6 +115,8 @@ export interface BridgeSide {
   publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
   /** Whether this link holds a live mirror answering to the id (the hub side only). */
   holds?(id: string): boolean;
+  /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
+  mirrored?(id: string): boolean;
   /** Replace this side's mirror of the peer's presence. */
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void>;
   /** Original ids of events the peer bridged into this side after a sequence, one bounded page. */
@@ -294,6 +296,10 @@ export class StoreBridgeSide implements BridgeSide {
       if (!participant || participant.ownerHostId !== id || participant.ownerIdentityId !== id) return false;
     }
     return !this.#reservedNow().has(id);
+  }
+
+  mirrored(id: string): boolean {
+    return remoteHostOf(this.store.get(keyFor(HOST_PREFIX, id), { fresh: true })?.value) === this.peer;
   }
 
   // Every id this side holds that is not this link's mirror, read now.
@@ -886,13 +892,13 @@ export class MeshBridge {
    * page: only the peer's records this side holds now, still clear of every reserved hub id. A
    * claim refused or lost in this pass is never trusted (security review round 2, F1/F2).
    */
-  async #authority(): Promise<{ local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> }> {
+  async #authority(refreshIfStale = true): Promise<{ local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> }> {
     const { local } = this.options;
     if (!local.owned) throw new Error("The hub side of a bridge must report the records it holds");
     // A page/read/write can wait on the mesh lock longer than a mirrored lease.
     // Refresh once before denying stale authority, sharing the normal presence pass.
     // Store lock and transport call timeouts bound it; no retry loop or fresh-message RPC.
-    if (Date.now() - this.#presenceAt > DEFAULT_PRESENCE_MS) await this.syncPresence();
+    if (refreshIfStale && Date.now() - this.#presenceAt > DEFAULT_PRESENCE_MS) await this.syncPresence();
     const [presence, owned] = await Promise.all([local.presence(), local.owned()]);
     return { local: presence, remote: admitPresence(owned, new Set(presence.reserved)) };
   }
@@ -904,12 +910,12 @@ export class MeshBridge {
       await this.syncPresence();
     }
     if (this.#stopped) return { toRemote: 0, toLocal: 0, dropped: 0 };
-    const toRemote = await this.#forward("toRemote", this.options.local, this.options.remote, async () => {
-      const { remote } = await this.#authority();
+    const toRemote = await this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
+      const { remote } = await this.#authority(refreshIfStale);
       return { recipients: remoteAddresses(remote) };
     });
-    const toLocal = await this.#forward("toLocal", this.options.remote, this.options.local, async () => {
-      const { local, remote } = await this.#authority();
+    const toLocal = await this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
+      const { local, remote } = await this.#authority(refreshIfStale);
       // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
       return { recipients: addresses(local), senders: senders(remote), reserved: new Set(local.reserved) };
     });
@@ -920,7 +926,7 @@ export class MeshBridge {
     direction: "toRemote" | "toLocal",
     source: BridgeSide,
     target: BridgeSide,
-    authority: () => Promise<{ recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }>,
+    authority: (refreshIfStale?: boolean) => Promise<{ recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }>,
   ): Promise<{ forwarded: number; dropped: number }> {
     const cursor = this.#cursor![direction];
     const seen = this.#seen[direction];
@@ -929,14 +935,28 @@ export class MeshBridge {
     while (true) {
       const start = cursor.after;
       const page = await source.read(start);
-      const rules = await authority();
+      let rules = await authority();
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
       }
       for (const event of page.events) {
         if (event.sequence <= cursor.after) continue;
-        const reason = this.#refusal(event, rules, direction);
+        let refreshed = false;
+        const refresh = async (): Promise<void> => {
+          refreshed = true;
+          await this.syncPresence();
+          // This event gets one refresh, even if that pass itself waited on a lock.
+          rules = await authority(false);
+        };
+        let reason = this.#refusal(event, rules, direction);
+        const lapsedId = reason === "sender is not a live participant of the remote" ? event.from.id
+          : reason === "ack target is not bound to this link" && isObject(event.data) && typeof event.data.targetId === "string" ? event.data.targetId
+          : reason === "not addressed across" && direction === "toRemote" ? event.to : undefined;
+        if (lapsedId && this.options.local.mirrored?.(lapsedId)) {
+          await refresh();
+          reason = this.#refusal(event, rules, direction);
+        }
         if (reason) {
           if (reason !== "not addressed across") {
             dropped += 1;
@@ -956,18 +976,33 @@ export class MeshBridge {
             const held = direction === "toLocal"
               ? [event.from.id, ...(event.topic === "fabric.control.ack" && isObject(event.data) && typeof event.data.targetId === "string" ? [event.data.targetId] : [])]
               : [];
-            if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
-              throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
+            const publish = async (): Promise<{ sequence: number }> => {
+              if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
+                throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
+              }
+              // Recheck the captured destination at the last seam, including after a refresh.
+              const destinationRefusal = this.#destinationRefusal(event, direction);
+              if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
+              return target.publish({
+                topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
+                ...(event.text !== undefined ? { text: event.text } : {}),
+                data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
+              }, held);
+            };
+            let published: { sequence: number };
+            try {
+              published = await publish();
+            } catch (error) {
+              // Ownership errors happen before append, under the publish lock. A mirror can
+              // lapse during that wait: refresh once, reread authority, then retry once.
+              const ids = direction === "toLocal" ? held : [event.to!];
+              if (!(error instanceof BridgeOwnershipError) || refreshed || this.#destinationRefusal(event, direction) ||
+                  !ids.some((id) => this.options.local.mirrored?.(id))) throw error;
+              await refresh();
+              if (this.#stopped) return { forwarded, dropped };
+              if (this.#refusal(event, rules, direction)) throw error;
+              published = await publish();
             }
-            // Bind the command to its captured destination, never to whichever link now holds
-            // the canonical id. Check again at the last pre-transport seam after every await.
-            const destinationRefusal = this.#destinationRefusal(event, direction);
-            if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
-            const published = await target.publish({
-              topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
-              ...(event.text !== undefined ? { text: event.text } : {}),
-              data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
-            }, held);
             seen.add(event.id);
             cursor.mark = Math.max(cursor.mark, published.sequence);
             cursor.after = event.sequence;

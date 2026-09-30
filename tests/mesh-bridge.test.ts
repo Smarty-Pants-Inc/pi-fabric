@@ -191,6 +191,114 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     expect(logs).toEqual([]);
   });
 
+  it.each(["fabric.control.command", "fabric.control.ack"])("revalidates %s after its hub publication waits 20 s while the remote renews", async (topic) => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const hub = new MeshStore(scratch(), 64 * 1024, 100, { lockTimeoutMs: 60_000, staleLockMs: 60_000 });
+    const { far, bridge, remote, logs } = setup(undefined, { hub, presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const root = await addRoot(far, "remote");
+    await bridge.start();
+    await bridge.syncPresence();
+    const source = await far.publish({ topic, kind: topic.endsWith("ack") ? "ack" : "followUp", from: root.identity, to: lane.hostId,
+      data: topic.endsWith("ack") ? { targetId: root.hostId, accepted: true } : command(lane.hostId, root.hostId) });
+    const presence = vi.spyOn(remote, "presence");
+    const lock = path.join(hub.root, ".lock");
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    const publish = hub.publish.bind(hub);
+    const publications = vi.spyOn(hub, "publish").mockImplementationOnce((input) => {
+      fs.mkdirSync(lock);
+      fs.writeFileSync(path.join(lock, "owner"), `held-by-test\n${process.pid}\n${now}\n`);
+      entered();
+      return publish(input);
+    });
+    const pass = bridge.step();
+    await waiting;
+    // This is the EVENT publication's lock, after authority passed, not a mirror put.
+    for (let elapsed = 0; elapsed < 20_000; elapsed += 5_000) {
+      now += 5_000;
+      writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 15_000 });
+    }
+    fs.rmSync(lock, { recursive: true });
+    expect(await pass).toMatchObject({ toLocal: 1, dropped: 0 });
+    expect(presence).toHaveBeenCalledTimes(1);
+    expect(publications).toHaveBeenCalledTimes(2);
+    expect(on(hub, topic).map((event) => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([source.id]);
+    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    expect(on(hub, topic)).toHaveLength(1);
+    expect(logs).toEqual([]);
+  });
+
+  it("refreshes a renewing short-TTL sender at 3.1 s before the normal presence interval", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { hub, far, bridge, remote, logs } = setup(undefined, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const root = await addRoot(far, "remote", 3_000);
+    await bridge.start();
+    await bridge.syncPresence();
+    now += 3_100;
+    writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 3_000 });
+    const presence = vi.spyOn(remote, "presence");
+    const events = [];
+    for (const topic of ["fabric.control.command", "fabric.control.ack"]) {
+      events.push(await far.publish({ topic, kind: topic.endsWith("ack") ? "ack" : "followUp", from: root.identity, to: lane.hostId,
+        data: topic.endsWith("ack") ? { targetId: root.hostId } : command(lane.hostId, root.hostId) }));
+    }
+    expect(await bridge.step()).toMatchObject({ toLocal: 2, dropped: 0 });
+    expect(presence).toHaveBeenCalledTimes(1);
+    expect(hub.read({ after: 0 }).map((event) => (event.data as { bridge: { id: string } }).bridge.id)).toEqual(events.map((event) => event.id));
+    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    expect(logs).toEqual([]);
+  });
+
+  it("refreshes a renewing short-TTL ack target even when its sender mirror is live", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { hub, far, bridge, remote, logs } = setup(undefined, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const sender = await addRoot(far, "sender", 15_000);
+    const root = await addRoot(far, "remote", 3_000);
+    await bridge.start();
+    await bridge.syncPresence();
+    now += 3_100;
+    writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 3_000 });
+    const presence = vi.spyOn(remote, "presence");
+    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: sender.identity, to: lane.hostId, data: { targetId: root.hostId } });
+    expect(await bridge.step()).toMatchObject({ toLocal: 1, dropped: 0 });
+    expect(presence).toHaveBeenCalledTimes(1);
+    expect(on(hub, "fabric.control.ack")).toHaveLength(1);
+    expect(logs).toEqual([]);
+  });
+
+  it.each(["page", "pre-transport"] as const)("refreshes a renewing short-TTL outbound recipient at the %s refusal", async (seam) => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { hub, far, bridge, remote, logs } = setup(undefined, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const root = await addRoot(far, "remote", 3_000);
+    await bridge.start();
+    await bridge.syncPresence();
+    const expire = () => {
+      now += 3_100;
+      writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 3_000 });
+    };
+    if (seam === "page") expire();
+    else {
+      const local = bridge.options.local as StoreBridgeSide;
+      const holds = local.holds.bind(local);
+      vi.spyOn(local, "holds").mockImplementationOnce((id) => { expire(); return holds(id); });
+    }
+    const presence = vi.spyOn(remote, "presence");
+    const source = await hub.publish({ topic: "fabric.control.command", kind: "followUp", from: lane.identity, to: root.hostId, data: command(root.hostId, lane.hostId) });
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    expect(presence).toHaveBeenCalledTimes(1);
+    expect(on(far, "fabric.control.command").map((event) => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([source.id]);
+    expect(await bridge.step()).toMatchObject({ toRemote: 0, dropped: 0 });
+    expect(logs).toEqual([]);
+  });
+
   it("refuses a host that stops renewing within twice its TTL, even without a scheduled sync", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -206,6 +314,56 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 1 });
     expect(on(hub, "fabric.control.ack")).toHaveLength(0);
     expect(logs.join("\n")).toContain("sender is not a live participant of the remote");
+  });
+
+  it("single-flights an expired short-TTL mirror refresh across 100 concurrent refusal passes", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { hub, far, bridge, remote } = setup(undefined, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const root = await addRoot(far, "remote", 3_000);
+    await bridge.start();
+    await bridge.syncPresence();
+    now += 3_100;
+    // The real remote stopped: all callers must refresh once and still refuse.
+    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: root.identity, to: lane.hostId, data: { targetId: root.hostId } });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    const original = remote.presence.bind(remote);
+    const presence = vi.spyOn(remote, "presence").mockImplementation(async () => { entered(); await held; return original(); });
+    const passes = Promise.all(Array.from({ length: 100 }, () => bridge.step()));
+    await Promise.race([waiting, passes.then(() => { throw new Error("Expired mirror never requested a presence refresh"); })]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    const results = await passes;
+    expect(presence).toHaveBeenCalledTimes(1);
+    expect(results.every((result) => result.toLocal === 0)).toBe(true);
+    expect(on(hub, "fabric.control.ack")).toHaveLength(0);
+  });
+
+  it("bounds publication expiry recovery to one refresh and two pre-append attempts", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { hub, far, bridge, remote, logs } = setup(undefined, { presenceMs: 60_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const root = await addRoot(far, "remote", 3_000);
+    await bridge.start();
+    await bridge.syncPresence();
+    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: root.identity, to: lane.hostId, data: { targetId: root.hostId } });
+    const publish = hub.publish.bind(hub);
+    const publications = vi.spyOn(hub, "publish").mockImplementation(async (input) => {
+      now += 3_100;
+      writeHostLease(far.root, { id: root.hostId, rootId: root.hostId, identityId: root.identity.id, updatedAt: now, expiresAt: now + 3_000 });
+      return publish(input);
+    });
+    const presence = vi.spyOn(remote, "presence");
+    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 1 });
+    expect(publications).toHaveBeenCalledTimes(2);
+    expect(presence).toHaveBeenCalledTimes(1);
+    expect(on(hub, "fabric.control.ack")).toHaveLength(0);
+    expect(logs.join("\n")).toContain("no longer bound to bridge link");
   });
 
   it("single-flights a stale authority refresh across 100 concurrent refusal passes and never refreshes fresh messages", async () => {

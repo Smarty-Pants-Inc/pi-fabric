@@ -20,6 +20,17 @@ export const agentWaitBound = (timeoutMs: unknown, max = AGENT_WAIT_MAX_MS): num
     ? Math.floor(timeoutMs) : AGENT_WAIT_DEFAULT_MS));
 
 /**
+ * Leave time for a Main observation result and guest continuation before the fixed program ceiling.
+ * Compute at observation start (after launch), not from a fresh per-call program duration. Below
+ * the 1 s observation floor the program ceiling still wins with its named error; do not busy-spin.
+ */
+export const mainAgentWaitBound = (timeoutMs: unknown, mainDeadlineAt?: number): number =>
+  Math.min(
+    agentWaitBound(timeoutMs, MAIN_AGENT_WAIT_MAX_MS),
+    Math.max(1_000, (mainDeadlineAt ?? Infinity) - Date.now() - 2_000),
+  );
+
+/**
  * An interactive Main (TUI or RPC, not a task agent or actor): its waits use MAIN_AGENT_WAIT_MAX_MS
  * and return at the bound instead of throwing. Print and JSON runs are scripts and keep the 5 min.
  */

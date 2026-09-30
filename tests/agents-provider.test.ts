@@ -1301,6 +1301,192 @@ describe("AgentsProvider runner support", () => {
     }
   });
 
+  it("returns Main agents.run before a 60 s program ceiling and continues the guest", async () => {
+    const { provider, agents, mainAgent } = setup();
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.mainMaxTimeoutMs = 60_000;
+    const service = new FabricExecutionService(registry, config);
+    const options = {
+      signal: undefined, parentToolCallId: "main-run-observation-budget", onPartial() {},
+      context: { ...context.extensionContext, cwd: process.cwd(), mode: "tui", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+    };
+    // Warm the optional runtime, then use a real local worker without clocking its process.
+    await service.execute({ ...options, code: "return 1;" });
+    const handle = await agents.spawn({ task: "HANG", transport: "process" });
+    let launching!: () => void;
+    const launched = new Promise<void>(resolve => { launching = resolve; });
+    vi.spyOn(agents, "spawn").mockImplementationOnce(async () => {
+      launching();
+      await new Promise(resolve => setTimeout(resolve, 250));
+      return handle;
+    });
+    const realWait = agents.wait.bind(agents);
+    let waitOptions: Parameters<AgentManager["wait"]>[1];
+    const waiting = new Promise<void>(resolve => {
+      vi.spyOn(agents, "wait").mockImplementation((id, options) => {
+        waitOptions = options;
+        resolve();
+        return realWait(id, options);
+      });
+    });
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const program = service.execute({
+      ...options,
+      code: `const result = await agents.run({ task: "HANG", transport: "process" });
+const after = await agents.status({ id: result.id });
+return { result, after, tail: "continued" };`,
+    });
+    try {
+      await launched;
+      await vi.advanceTimersByTimeAsync(250);
+      await waiting;
+      let settled = false;
+      void program.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(57_750);
+      // Bound the red baseline too: its program ceiling wins instead of returning the run.
+      if (!settled) await vi.advanceTimersByTimeAsync(2_000);
+      const result = await program;
+      expect(waitOptions?.timeoutMs).toBe(57_750);
+      expect(result.success).toBe(true);
+      expect(result.value).toMatchObject({
+        result: { id: handle.id, status: "running", waitTimedOut: true },
+        after: { id: handle.id, status: "running" }, tail: "continued",
+      });
+      expect(mainAgent.flushHeldAtNextBoundary).toHaveBeenCalledOnce();
+      expect(agents.status(handle.id).status).toBe("running");
+    } finally {
+      // Also settle the unfixed baseline's deadline so a red test leaves no suspended VM.
+      await vi.advanceTimersByTimeAsync(2_000);
+      await program;
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each(["wait", "join"] as const)(
+    "budgets successive Main %s observations against the same absolute ceiling", async action => {
+      const { provider, agents } = setup();
+      vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+      vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+      const handle = await agents.spawn({ task: "HANG", transport: "process" });
+      const registry = new ActionRegistry();
+      registry.register(provider);
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+      config.executor.mainMaxTimeoutMs = 60_000;
+      const service = new FabricExecutionService(registry, config);
+      const options = {
+        signal: undefined, parentToolCallId: "main-successive-observations", onPartial() {},
+        context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+      };
+      await service.execute({ ...options, code: "return 1;" });
+      const realWait = agents.wait.bind(agents);
+      const wait = vi.spyOn(agents, "wait");
+      let observing!: () => void;
+      const observation = new Promise<void>(resolve => { observing = resolve; });
+      wait.mockImplementation((id, options) => { observing(); return realWait(id, options); });
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+      const program = service.execute({
+        ...options,
+        code: `const first = await agents.${action}({ id: ${JSON.stringify(handle.id)}, timeoutMs: 1800000 });
+const second = await agents.${action}({ id: first.id, timeoutMs: 1800000 });
+return { first, second, tail: "continued" };`,
+      });
+      try {
+        await observation;
+        let settled = false;
+        void program.then(() => { settled = true; });
+        await vi.advanceTimersByTimeAsync(59_000);
+        if (!settled) await vi.advanceTimersByTimeAsync(1_000);
+        const result = await program;
+        expect(wait.mock.calls.map(([, options]) => options?.timeoutMs)).toEqual([58_000, 1_000]);
+        expect(result.success).toBe(true);
+        expect(result.value).toMatchObject({
+          first: { status: "running", waitTimedOut: true },
+          second: { status: "running", waitTimedOut: true }, tail: "continued",
+        });
+        expect(agents.status(handle.id).status).toBe("running");
+      } finally {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await program;
+        vi.useRealTimers();
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it.each(["wait", "join"] as const)(
+    "budgets a durable Main %s observation without consuming its running result", async action => {
+      const state = setup();
+      vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+      vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+      const durable = { id: "durable-child", name: "Durable child", status: "running" };
+      const stopAgent = vi.fn();
+      const acknowledgeCompletion = vi.fn();
+      const residency = {
+        hasAgent: () => true, statusAgent: () => durable, stopAgent, acknowledgeCompletion,
+        waitAgent: vi.fn((_id: string, signal: AbortSignal) => new Promise((_, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        })),
+      } as unknown as ResidencyClient;
+      const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent,
+        state.participants, state.control, state.lifecycle, undefined, residency, false);
+      const registry = new ActionRegistry();
+      registry.register(provider);
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+      config.executor.mainMaxTimeoutMs = 3_200;
+      try {
+        const result = await new FabricExecutionService(registry, config).execute({
+          code: `const result = await agents.${action}({ id: "durable-child" }); return { result, tail: "continued" };`,
+          signal: AbortSignal.timeout(5_000), parentToolCallId: "main-durable-observation-budget",
+          context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+          onPartial() {},
+        });
+        expect(result.success).toBe(true);
+        expect(result.value).toMatchObject({ result: { ...durable, waitTimedOut: true }, tail: "continued" });
+        expect(residency.waitAgent).toHaveBeenCalledOnce();
+        expect(stopAgent).not.toHaveBeenCalled();
+        expect(acknowledgeCompletion).not.toHaveBeenCalled();
+      } finally { vi.unstubAllEnvs(); }
+    },
+  );
+
+  it.each(["quickjs", "node-process", "monty", "cpython"] as const)(
+    "returns a live Main run and guest tail before a small ceiling through %s", async backend => {
+      const { provider, agents } = setup();
+      vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+      vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+      const registry = new ActionRegistry();
+      registry.register(provider);
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+      config.executor.mainMaxTimeoutMs = 3_500;
+      config.executor.memoryLimitBytes = 128 * 1024 * 1024;
+      const python = backend === "monty" || backend === "cpython";
+      if (python) { config.executor.kernel = "python"; config.executor.pythonRuntime = backend; }
+      else config.executor.runtime = backend;
+      const wait = vi.spyOn(agents, "wait");
+      try {
+        const result = await new FabricExecutionService(registry, config).execute({
+          code: python
+            ? 'result = await agents.run(task="HANG", transport="process")\nreturn {"result": result, "tail": "continued"}'
+            : 'const result = await agents.run({ task: "HANG", transport: "process" }); return { result, tail: "continued" };',
+          signal: AbortSignal.timeout(6_000), parentToolCallId: "main-small-run-budget",
+          context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+          onPartial() {},
+        });
+        expect(result.success).toBe(true);
+        expect(result.value).toMatchObject({ result: { status: "running", waitTimedOut: true }, tail: "continued" });
+        expect(wait.mock.calls[0]?.[1]?.timeoutMs).toBeGreaterThanOrEqual(1_000);
+        expect(wait.mock.calls[0]?.[1]?.timeoutMs).toBeLessThanOrEqual(1_500);
+        expect(agents.list()).toHaveLength(1);
+        expect(agents.list()[0]).toMatchObject({ status: "running" });
+      } finally { vi.unstubAllEnvs(); }
+    },
+  );
+
   it.each([
     'return agents.run({ task: "HANG", transport: "process" });',
     'const child = await agents.spawn({ task: "HANG", transport: "process" }); while (true) await agents.wait({ id: child.id });',

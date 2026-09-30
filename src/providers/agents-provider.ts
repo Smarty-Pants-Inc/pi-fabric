@@ -78,7 +78,7 @@ import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
 import {
   AGENT_WAIT_MAX_MS,
   AgentWaitBoundError,
-  MAIN_AGENT_WAIT_MAX_MS,
+  mainAgentWaitBound,
   agentWaitBound,
   describeWaitBound,
   isInteractiveMain,
@@ -644,7 +644,7 @@ export class AgentsProvider implements FabricProvider {
           name: handle.name,
         });
         context.update(agentStartedMessage(handle));
-        const timeoutMs = agentWaitBound(args.timeoutMs, MAIN_AGENT_WAIT_MAX_MS);
+        const timeoutMs = mainAgentWaitBound(args.timeoutMs, context.mainDeadlineAt);
         try {
           return await waitWithProgress(
             this.manager,
@@ -693,7 +693,9 @@ export class AgentsProvider implements FabricProvider {
         const id = String(args.id);
         // smarty-dev#2119: an interactive Main waits at most 60 s, and the bound is a normal result.
         const main = isInteractiveMain(context.extensionContext);
-        const timeoutMs = agentWaitBound(args.timeoutMs, main ? MAIN_AGENT_WAIT_MAX_MS : AGENT_WAIT_MAX_MS);
+        const timeoutMs = main
+          ? mainAgentWaitBound(args.timeoutMs, context.mainDeadlineAt)
+          : agentWaitBound(args.timeoutMs, AGENT_WAIT_MAX_MS);
         const atBound = (record: object) => this.#mainWaitAtBound(record, timeoutMs);
         if (this.residency?.hasAgent(id)) {
           const status = this.residency.statusAgent(id);

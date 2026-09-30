@@ -626,7 +626,10 @@ export class FabricExecutionService {
       sandboxResult = await runtime.execute(
         code,
         guardHostCall(async (ref, args, runtimeSignal) => {
-          const callContext = { ...baseContext, signal: providerSignal(runtimeSignal) };
+          const callContext = {
+            ...baseContext, signal: providerSignal(runtimeSignal),
+            ...(mainDeadlineAt !== undefined ? { mainDeadlineAt } : {}),
+          };
           switch (ref) {
             case "fabric.$providers":
               return traceAttempt(

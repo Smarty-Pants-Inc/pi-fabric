@@ -12,7 +12,7 @@ const roots: string[] = [];
 const real = { statSync: fs.statSync, readFileSync: fs.readFileSync };
 const key = "topology/participants/observer";
 const identity: MeshIdentity = { id: "session:old", name: "owner", kind: "main" };
-type State = { readGeneration: string; entries: Record<string, MeshStateEntry> };
+type State = { readGeneration?: string; entries: Record<string, MeshStateEntry> };
 const setup = async () => {
   fs.mkdirSync(scratch, { recursive: true });
   const root = fs.mkdtempSync(path.join(scratch, "stamp-observer-"));
@@ -105,6 +105,74 @@ for (const method of ["get", "listAll", "listAllShared", "stateToken", "confirmW
     expect(count()).toBe(before + 1);
   });
 }
+
+it("markerless warm observer reuses unchanged metadata with exactly one 64-byte header read", async () => {
+  const { reader, replace, count } = await setup();
+  await replace((state) => { delete state.readGeneration; });
+  reader.get(key);
+  const stamp = reader.cachedStateStamp();
+  const before = count();
+  const headers = vi.spyOn(fs, "readSync");
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(count()).toBe(before);
+  expect(headers.mock.calls).toHaveLength(1);
+  expect(headers.mock.calls[0]!.slice(2)).toEqual([0, 64, 0]);
+});
+
+for (const barrier of ["fresh", "confirmWritable"] as const) it(`markerless metadata ABA observer reuse preserves ${barrier} authority`, async () => {
+  const { reader, replace, freeze, disk, count } = await setup();
+  await replace((state) => { delete state.readGeneration; });
+  freeze();
+  const old = reader.get(key);
+  const stamp = reader.cachedStateStamp();
+  await replace((state) => {
+    state.entries[key]!.value = { owner: "new" };
+    state.entries[key]!.updatedBy = { ...identity, id: "session:new" };
+  });
+  const expected = disk().entries[key]!;
+  expect(disk().readGeneration).toBeUndefined();
+  const before = count();
+  expect(reader.cachedStateStamp(true)).toBe(stamp); // Non-authoritative baseline metadata ABA.
+  expect(count()).toBe(before);
+  expect(reader.get(key)).toEqual(old);
+  if (barrier === "fresh") expect(reader.get(key, { fresh: true })).toEqual(expected);
+  else {
+    await reader.confirmWritable();
+    expect(reader.get(key)).toEqual(expected);
+  }
+  expect(count()).toBe(before + 1);
+});
+
+it("markerless to newly minted current UUID forces same-stat observer parse", async () => {
+  const { reader, writer, replace, freeze, disk, count } = await setup();
+  await replace((state) => { delete state.readGeneration; });
+  freeze();
+  reader.get(key);
+  const stamp = reader.cachedStateStamp();
+  await writer.put({ key, value: { owner: "new" }, identity });
+  expect(disk().readGeneration).toMatch(/^[0-9a-f-]{36}$/);
+  const before = count();
+  expect(reader.cachedStateStamp(true)).toBe(stamp);
+  expect(count()).toBe(before + 1);
+  expect(reader.get(key)?.value).toEqual({ owner: "new" });
+});
+
+it("expired nonfresh unknown generation still parses after markerless observer reuse", async () => {
+  const { reader, replace, freeze, count } = await setup();
+  await replace((state) => { delete state.readGeneration; });
+  freeze();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  reader.get(key);
+  const before = count();
+  now += RUNTIME_MESH_READ_CACHE_MS - 1;
+  reader.cachedStateStamp(true);
+  expect(count()).toBe(before);
+  await replace((state) => { state.entries[key]!.value = { owner: "new" }; });
+  now += 2;
+  expect(reader.get(key)?.value).toEqual({ owner: "new" });
+  expect(count()).toBe(before + 1); // Observer neither extends TTL nor waives unknown expiry.
+});
 
 it("unchanged public fresh payload calls still perform canonical full reads", async () => {
   const { reader, count } = await setup();

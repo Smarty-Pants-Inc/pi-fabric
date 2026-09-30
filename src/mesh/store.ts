@@ -1333,7 +1333,8 @@ export class MeshStore {
    * The stamp of the state payload that reads now return, from this store's cache. With fresh,
    * bypass the age window and revalidate metadata plus the canonical header, parsing on change.
    * This UI observer returns a stamp, not authoritative payload or owner authority: legacy
-   * copied-marker, same-stat ABA can still reuse the cache (the baseline limitation).
+   * copied-marker or missing-marker, same-stat ABA can still reuse the cache (the baseline
+   * metadata/header observer limitation); a missing marker is not authoritative.
    * A reader records what it consumed, not what is on disk (review/astra F2 on #84).
    */
   cachedStateStamp(fresh = false): string | undefined {
@@ -1358,10 +1359,11 @@ export class MeshStore {
       before = stampOf(fs.statSync(this.#statePath));
       // Metadata alone can repeat (ABA): a same-stamp cache is reused only while the canonical
       // header still names the payload's own generation (a 64-byte peek, not a parse). A payload
-      // without a marker (legacy) is UNKNOWN: it is never reused on metadata, always re-parsed.
+      // without a marker (legacy) is UNKNOWN: expired nonfresh reads always re-parse it.
+      // Only the UI observer (fresh, !canonical) may reuse matching metadata + missing header.
       const cached = this.#stateCache;
       if (
-        !canonical && cached?.stamp === before && cached.generation !== undefined && cached.generation === this.#canonicalGeneration()
+        !canonical && cached?.stamp === before && (cached.generation !== undefined || fresh) && cached.generation === this.#canonicalGeneration()
       ) return cached.state;
     } catch (error) {
       this.#stateCache = undefined;

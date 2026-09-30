@@ -123,6 +123,8 @@ export interface AgentRunRecord {
   name: string;
   task: string;
   status: AgentRunStatus;
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;
@@ -172,6 +174,8 @@ export interface AgentHandleInfo {
   id: string;
   name: string;
   status: AgentRunStatus;
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;

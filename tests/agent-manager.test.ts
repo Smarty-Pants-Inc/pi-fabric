@@ -138,6 +138,108 @@ describe("AgentManager", () => {
     expect(listener).toHaveBeenCalledTimes(beforeCleanup);
   });
 
+  it("owns a returned queued handle independently of the caller's abort signal", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const caller = new AbortController();
+    const queued = await manager.spawn({ task: "complete after caller abort", transport: "process" }, caller.signal);
+    expect(queued.status).toBe("queued");
+    caller.abort();
+    expect(manager.listForUi().find((run) => run.id === queued.id)).toMatchObject({ status: "queued", queuePosition: 1 });
+    await manager.stop(first.id);
+    expect((await manager.wait(queued.id)).status).toBe("completed");
+  });
+
+  it("cancels an admitted queued run during model preparation without launching its worker", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    let resume!: () => void;
+    let preparing!: () => void;
+    const gate = new Promise<void>((resolve) => { resume = resolve; });
+    const ready = new Promise<void>((resolve) => { preparing = resolve; });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async (model) => { if (model === "test/queued") { preparing(); await gate; } },
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "queued preparation", model: "test/queued", transport: "process" });
+    await manager.stop(first.id);
+    await ready;
+    const stopped = manager.stop(queued.id);
+    resume();
+    expect((await stopped).status).toBe("stopped");
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(manager.runningCount()).toBe(0);
+  });
+
+  it.each([new Error("queued model preparation failed"), null])("settles and notifies a detached queued launch failure exactly once (%s)", async (failure) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const complete = vi.fn();
+    const settled = vi.fn();
+    const lifecycle = vi.fn();
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async (model) => { if (model === "test/broken") throw failure; },
+      onBackgroundComplete: complete, onSettled: settled, onLifecycle: lifecycle,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "queued failure", model: "test/broken", transport: "process" });
+    manager.detachSignal(queued.id);
+    await manager.stop(first.id);
+    await vi.waitFor(() => expect(manager.status(queued.id).status).toBe("failed"));
+    expect(complete.mock.calls.filter(([result]) => result.id === queued.id)).toHaveLength(1);
+    expect(settled.mock.calls.filter(([result]) => result.id === queued.id)).toHaveLength(1);
+    expect(lifecycle).toHaveBeenCalledWith(expect.objectContaining({ event: "run.failed", runId: queued.id }));
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "failed", error: failure instanceof Error ? failure.message : String(failure) });
+    expect(await manager.cleanup(queued.id)).toMatchObject({ cleaned: true });
+    expect(manager.list().some((run) => run.id === queued.id)).toBe(false);
+  });
+
+  it("preserves queued launch-uncertainty artifacts and refuses cleanup", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, retainRuns: false }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "uncertain queued launch", transport: "process" });
+    vi.spyOn(ProcessTransport.prototype, "launch").mockRejectedValueOnce(Object.assign(new Error("launch outcome unknown"), { launchOutcome: "unknown" }));
+    await manager.stop(first.id);
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "failed", error: "launch outcome unknown" });
+    const runDirectory = path.join(root, queued.id);
+    expect(fs.existsSync(runDirectory)).toBe(true);
+    await expect(manager.cleanup(queued.id)).rejects.toThrow("lost track of its worker");
+    await manager.close();
+    expect(fs.existsSync(runDirectory)).toBe(true);
+  });
+
+  it("reattaches completion notification when a queued wait reaches its bound after admission", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const complete = vi.fn();
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onBackgroundComplete: complete,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "LIVE_WITH_PROGRESS", transport: "process" });
+    const waiting = expect(manager.wait(queued.id, { timeoutMs: 500 })).rejects.toThrow("is still running after");
+    await manager.stop(first.id);
+    await waiting;
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledWith(expect.objectContaining({ id: queued.id, status: "completed" })), { timeout: 10_000 });
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "completed" });
+  });
+
   it("runs a worker through the direct process transport", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

@@ -92,16 +92,25 @@ const assertFirstSend = (attempts, target, host, killedAt, boundMs = 10_000) => 
 // END FIRST SEND VALIDATOR
 
 // BEGIN POSTKILL LEDGER — bounded actual-store read, cross-checked against its fresh log suffix.
-const validateLedgerEvent = (e) => {
+const validateLedgerEvent = (e, senderFindings = []) => {
   const object = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
   const string = (v) => typeof v === "string" && v.trim().length > 0;
   const optional = (v, key, test) => !Object.hasOwn(v, key) || test(v[key]);
   if (!object(e) || !string(e.id) || !string(e.topic) || !string(e.kind) ||
       !Number.isSafeInteger(e.sequence) || e.sequence <= 0 || !Number.isFinite(e.createdAt) ||
-      !object(e.from) || !string(e.from.id) || !string(e.from.name) || !["main", "actor", "agent"].includes(e.from.kind) ||
-      !optional(e.from, "sessionId", (v) => typeof v === "string") ||
       !optional(e, "to", (v) => typeof v === "string") || !optional(e, "text", (v) => typeof v === "string"))
     throw new Error("malformed postkill ledger envelope");
+  const validSender = object(e.from) && string(e.from.id) && string(e.from.name) &&
+    ["main", "actor", "agent"].includes(e.from.kind) && optional(e.from, "sessionId", (v) => typeof v === "string");
+  // Narrow authorization: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/2625.
+  // ops.owner carries this proof's pr.wake; a pr.wake kind is strict on any topic.
+  const ownTopic = ["fabric.control.command", "fabric.control.ack", "pr.wake", "ops.owner",
+    "fleet.work.smarty-dev.2045"].includes(e.topic) || e.kind === "pr.wake";
+  if (!validSender) {
+    if (ownTopic) throw new Error("malformed postkill ledger sender");
+    // Metadata only: never preserve sender or body. Do not skip command/schema checks.
+    senderFindings.push({ eventId: e.id, topic: e.topic });
+  }
   if (e.topic === "fabric.control.command") {
     const d = e.data;
     if (!object(d) || d.version !== 1 || !string(d.commandId) || !string(d.targetId) || !string(d.replyTo) ||
@@ -128,20 +137,20 @@ const captureLedger = (store) => {
     // Last committed whole record, not the sequence allocator: bounded even on a fleet log.
     const bytes = Math.min(stat.size, 4 * 1024 * 1024), buffer = Buffer.alloc(bytes);
     if (fs.readSync(fd, buffer, 0, bytes, stat.size - bytes) !== bytes) throw new Error("short postkill ledger baseline read");
-    let after = 0;
+    let after = 0; const senderFindings = [];
     if (bytes) {
       if (buffer[bytes - 1] !== 10) throw new Error("incomplete postkill ledger baseline record");
       const previous = buffer.lastIndexOf(10, bytes - 2);
       if (previous < 0 && bytes !== stat.size) throw new Error("postkill ledger baseline record exceeds 4MiB");
       const tail = buffer.subarray(previous + 1, bytes - 1), text = tail.toString("utf8");
       if (!text || !Buffer.from(text, "utf8").equals(tail)) throw new Error("malformed postkill ledger baseline record");
-      after = validateLedgerEvent(JSON.parse(text)).sequence;
+      after = validateLedgerEvent(JSON.parse(text), senderFindings).sequence;
     }
     recheck();
-    return { file, device: stat.dev, inode: stat.ino, offset: stat.size, after };
+    return { file, device: stat.dev, inode: stat.ino, offset: stat.size, after, senderFindings };
   } finally { fs.closeSync(fd); }
 };
-const readLedger = (store, start) => {
+const readLedger = (store, start, senderFindings = []) => {
   if (!Number.isSafeInteger(start.after) || start.after < 0 || !Number.isSafeInteger(start.offset) || start.offset < 0)
     throw new Error("invalid postkill ledger baseline");
   const fd = fs.openSync(start.file, "r");
@@ -162,7 +171,7 @@ const readLedger = (store, start) => {
     if (text && !text.endsWith("\n")) throw new Error("incomplete postkill ledger record");
     events = text ? text.slice(0, -1).split("\n").map((line) => {
       if (!line.trim()) throw new Error("blank postkill ledger record");
-      return validateLedgerEvent(JSON.parse(line));
+      return validateLedgerEvent(JSON.parse(line), senderFindings);
     }) : [];
     const ids = new Set(); let sequence = start.after;
     for (const e of events) {
@@ -178,9 +187,11 @@ const readLedger = (store, start) => {
   } finally { fs.closeSync(fd); }
   return actual;
 };
-const assertPostkillLedger = (events, source, target, marker, host, condition) => {
+const assertPostkillLedger = (events, source, target, marker, host, condition, senderFindings = []) => {
   const fail = (why) => { throw new Error(`postkill ledger ${source} -> ${target}: ${why}`); };
   if (!Array.isArray(events)) fail("unreadable ledger");
+  // Validate every typed command before attribution/marker filtering.
+  for (const event of events) validateLedgerEvent(event);
   const own = events.filter((e) => e.topic === "fabric.control.command" && e.from?.id === source && e.data?.targetId === target);
   const sends = own.filter((e) => e.data?.operation === "steer" && e.data?.message === marker);
   const cancels = own.filter((e) => e.data?.operation === "cancel");
@@ -199,6 +210,8 @@ const assertPostkillLedger = (events, source, target, marker, host, condition) =
       fail("cancellation not bound to the same command/destination");
   }
   return { source, target, marker, host, condition, inspectedAt: Date.now(), examinedCommandRecords: events.length,
+    unrelatedSenderFindings: { issue: "Smarty-Pants-Inc/smarty-dev#2625", count: senderFindings.length,
+      events: senderFindings.map(({ eventId, topic }) => ({ eventId, topic })) },
     steerPublications: sends.length, commandIds: ids,
     steerEventIds: sends.map((e) => e.id), cancellationPublications: cancels.length,
     cancellations: cancels.map((e) => ({ eventId: e.id, commandId: e.data.commandId, cancelCommandId: e.data.cancelCommandId,
@@ -894,8 +907,9 @@ const exclusiveLedger = ${exclusiveLedger.toString()};
 process.on("SIGTERM", stop); process.on("SIGINT", stop);
 const store = new MeshStore(${JSON.stringify(cfg.remoteMesh)}, 256 * 1024, 500, { lockTimeoutMs: 2000 });
 const start = ${JSON.stringify(start ?? null)};
-const value = await exclusiveLedger(store, () => start ? assertPostkillLedger(readLedger(store, start), ${JSON.stringify(b.id)},
-  ${JSON.stringify(a.id)}, ${JSON.stringify(marker ?? null)}, ${JSON.stringify(cfg.localName)}, ${JSON.stringify(condition ?? null)}) : captureLedger(store), gate, cancelWait);
+const senderFindings = [...(start?.senderFindings ?? [])];
+const value = await exclusiveLedger(store, () => start ? assertPostkillLedger(readLedger(store, start, senderFindings), ${JSON.stringify(b.id)},
+  ${JSON.stringify(a.id)}, ${JSON.stringify(marker ?? null)}, ${JSON.stringify(cfg.localName)}, ${JSON.stringify(condition ?? null)}, senderFindings) : captureLedger(store), gate, cancelWait);
 console.log(JSON.stringify(value));`;
     const output = await remote(shell([cfg.remoteNode, "--input-type=module", "-e", program]));
     gate();
@@ -953,9 +967,10 @@ console.log(JSON.stringify(value));`;
   results.postkillLedgerReadNotBefore = ledgerReadNotBefore;
   const localCondition = results.checks[`firstPostkillSend-${cfg.remoteName}`].condition;
   const remoteCondition = results.checks[`firstPostkillSend-${cfg.localName}`].condition;
+  const senderFindings = [...ledgerStarts.local.senderFindings];
   check("postkillSourceLedgers", {
-    local: { window: ledgerStarts.local, ...await exclusiveLedger(store, () => assertPostkillLedger(readLedger(store, ledgerStarts.local),
-      a.id, b.id, postkillMarkers.local, cfg.remoteName, localCondition), gate, cancelWait) },
+    local: { window: ledgerStarts.local, ...await exclusiveLedger(store, () => assertPostkillLedger(readLedger(store, ledgerStarts.local, senderFindings),
+      a.id, b.id, postkillMarkers.local, cfg.remoteName, localCondition, senderFindings), gate, cancelWait) },
     remote: { window: ledgerStarts.remote, ...await remoteLedger(ledgerStarts.remote, postkillMarkers.remote, remoteCondition) },
   });
   assert(!stopping, "proof interrupted during ledger read");

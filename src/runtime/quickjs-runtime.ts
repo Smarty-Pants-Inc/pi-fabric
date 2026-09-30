@@ -826,9 +826,11 @@ const disposeQuickJsContext = (context: any): void => {
 
 export type QuickJsSandboxOptions = FabricSandboxOptions & {
   /**
-   * Opt-in setup allowance, separate from timeoutMs. Covers host/guest setup,
-   * transpilation and program compilation; timeoutMs starts just before the
-   * prepared program is invoked. Cannot replace a shared executionDeadline.
+   * Opt-in allowance for trusted host bridge setup and transpilation, separate
+   * from timeoutMs. The execution budget starts before evaluating any guest
+   * program code (including top-level statements and initializers). QuickJS
+   * compilation in evalCode also uses that execution budget. Cannot replace
+   * a shared executionDeadline.
    * Both phases remain clamped by maximumDeadlineAt, if supplied.
    */
   setupTimeoutMs?: number;
@@ -1142,16 +1144,12 @@ export class QuickJsRuntime {
       const guestLineCount = guestBundle.code.split("\n").length;
       const invokeCode = "Promise.race([__piFabricMain(), globalThis.__fabricExecutionGate])";
       const wrappedCode = `${guestBundle.code}\n${invokeCode}`;
-      cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
-      if (options.setupTimeoutMs !== undefined && deadlineReached()) throw executionDeadline.reason;
-      let evaluation = context.evalCode(
-        options.setupTimeoutMs === undefined ? wrappedCode : guestBundle.code,
-        "pi-fabric-guest.js",
-      );
-      if (options.setupTimeoutMs !== undefined && !evaluation.error) {
-        // Compile/declare the program under the setup bound before invoking it.
+      if (options.setupTimeoutMs !== undefined) {
+        // evalCode compiles AND evaluates: serialized source can escape the main
+        // wrapper and run top-level statements/initializers. Only trusted host
+        // preparation may use the setup allowance; all guest evaluation below
+        // (including compilation in evalCode) must use the execution deadline.
         // Never reset an expired setup deadline (including an absolute ceiling).
-        evaluation.value.dispose();
         if (deadlineReached()) throw executionDeadline.reason;
         if (options.signal?.aborted) {
           cancelled = true;
@@ -1159,9 +1157,9 @@ export class QuickJsRuntime {
         }
         executionDeadline.clear();
         executionDeadline = new ExecutionDeadline(options);
-        cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
-        evaluation = context.evalCode(invokeCode, "pi-fabric-invoke.js");
       }
+      cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
+      const evaluation = context.evalCode(wrappedCode, "pi-fabric-guest.js");
       pumpJobs();
       if (evaluation.error) {
         const deadlineExceeded = interruptedByCpu || deadlineReached();

@@ -116,6 +116,20 @@ describe("persistent actor validWhile", () => {
     expect(Date.now() - startedAt).toBeLessThan(2_000);
   });
 
+  it.each(["while (true) {}", "const until = Date.now() + 150; while (Date.now() < until) {}"])(
+    "SEC-186-1: budgets serialized-source top-level work as execution: %s",
+    async (topLevelWork) => {
+      // Close the predicate and main wrappers, then reopen a function to consume
+      // the generated suffix. This follows the public persisted-source path,
+      // without a host-supplied transpiledCode shortcut or transpiler mock.
+      const source = `() => true); return true; }\n${topLevelWork}\nasync function unused() { const predicate = (() => true`;
+      const startedAt = Date.now();
+      await expect(evaluateActorValidWhile({ version: 1, source }, hostFacts()))
+        .rejects.toThrow("Execution timed out after 100ms");
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+    },
+  );
+
   it("serializes a programmatic predicate before agents.create reaches the host", async () => {
     let received: Record<string, unknown> | undefined;
     const result = await new QuickJsRuntime().execute(

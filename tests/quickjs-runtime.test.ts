@@ -63,15 +63,18 @@ describe("QuickJsRuntime", () => {
     expect(hostCall).not.toHaveBeenCalled();
   });
 
-  it("interrupts pathological guest program setup under its separate bound", async () => {
+  it.each([
+    "while (true) {}",
+    "const initialized = (() => { while (true) {} })();",
+  ])("uses the execution budget for guest top-level work, not setup: %s", async (topLevelWork) => {
     const startedAt = Date.now();
     const result = await new QuickJsRuntime().execute("return 1;", async () => undefined, {
-      ...options, timeoutMs: 100, setupTimeoutMs: 50,
-      transpiledCode: "while (true) {}\nasync function __piFabricMain() { return 1; }",
+      ...options, timeoutMs: 100, setupTimeoutMs: 2_000,
+      transpiledCode: `${topLevelWork}\nasync function __piFabricMain() { return 1; }`,
     });
     expect(result.terminationReason).toBe("timed_out");
-    expect(result.error).toBe("Execution timed out after 50ms");
-    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(result.error).toBe("Execution timed out after 100ms");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
   it("does not revive a setup phase that crosses an absolute ceiling", async () => {

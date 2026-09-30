@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import type * as MontyNative from "@pydantic/monty/node";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { MAX_EXECUTOR_TIMEOUT_MS } from "../config.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
@@ -53,6 +53,7 @@ export class MontyRuntime implements FabricKernelRuntime {
     let feed: Promise<unknown> | undefined;
     let stopped: "aborted" | "timed_out" | undefined;
     const hostAbort = new AbortController();
+    shareCancellationEffects(hostAbort.signal, options.signal);
     const tasks = new Set<Promise<unknown>>();
     const logs: string[] = [];
     const partial = { stdout: "", stderr: "" };
@@ -96,7 +97,7 @@ export class MontyRuntime implements FabricKernelRuntime {
     scheduleDeadline();
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
-    let result: FabricSandboxResult;
+    let result: FabricSandboxResult | undefined;
     try {
       const { native, binaryPath } = await runAbortable(hostAbort.signal, loadNative);
       pool = await runAbortable(hostAbort.signal, async () => {
@@ -173,7 +174,8 @@ export class MontyRuntime implements FabricKernelRuntime {
     } finally {
       if (timer) clearTimeout(timer);
       options.signal?.removeEventListener("abort", abort);
-      hostAbort.abort(new Error("Monty execution ended"));
+      const interrupted = result?.terminationReason !== "completed" || hostAbort.signal.aborted || tasks.size > 0;
+      hostAbort.abort(new Error(result?.error ?? "Monty execution ended"));
       // Initiate pool closure first to prevent worker replacement. Native cleanup
       // is best effort and bounded: its failures must not replace the guest result.
       let cleanupFailed = false;
@@ -188,9 +190,10 @@ export class MontyRuntime implements FabricKernelRuntime {
       }
       workerPid = undefined;
       await settleWithin([...tasks, ...(feed ? [feed] : [])], 250);
+      if (result && interrupted) preserveCancellationOutcome(result, hostAbort.signal);
     }
     for (const text of Object.values(partial)) if (text) logs.push(text);
     if (truncated) logs.push("[Pi Fabric log output truncated]");
-    return result;
+    return result!;
   }
 }

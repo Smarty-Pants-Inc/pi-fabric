@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { cancellationError, registerCancellationEffect, runAbortable, shareCancellationEffects } from "../src/async-settlement.js";
+import { cancellationError, preserveCancellationOutcome, registerCancellationEffect, runAbortable, shareCancellationEffects } from "../src/async-settlement.js";
 import { commitResidentRequest, registerResidentCancellation, ResidentOutcomeUnknownError, type ResidentCommand } from "../src/residency/protocol.js";
 
 const roots: string[] = [];
@@ -51,6 +51,35 @@ describe("cancellation effect settlement", () => {
     for (const error of first.errors) {
       expect(error).toBeInstanceOf(ResidentOutcomeUnknownError); expect(error.cause).toBe(original);
     }
+  });
+
+  it("preserves ordinary success and safe cancellation without changing result identity", () => {
+    const controller = new AbortController();
+    const result = { value: "handle", terminationReason: "completed" as const, logs: ["retained"] };
+    registerCancellationEffect(controller.signal, () => new Error("known receipt"));
+    expect(preserveCancellationOutcome(result, controller.signal)).toBe(result);
+    expect(result.value).toBe("handle");
+    const safe = new AbortController(); safe.abort();
+    const failure = { value: undefined, terminationReason: "aborted" as const, error: "cancelled" };
+    expect(preserveCancellationOutcome(failure, safe.signal)).toBe(failure);
+    expect(failure.error).toBe("cancelled");
+  });
+
+  it("replaces false success with all terminal receipts while retaining logs and failure kind", () => {
+    const controller = new AbortController();
+    registerCancellationEffect(controller.signal, () => new Error("request-one entity-one owner-one; do not reassign"));
+    registerCancellationEffect(controller.signal, () => new Error("request-two entity-two owner-two; do not reassign"));
+    controller.abort();
+    const result: { value: unknown; terminationReason: "completed" | "runtime_error"; logs: string[]; error?: string } = {
+      value: "false success", terminationReason: "completed", logs: ["retained"],
+    };
+    expect(preserveCancellationOutcome(result, controller.signal)).toBe(result);
+    expect(result).toMatchObject({ value: undefined, terminationReason: "runtime_error", logs: ["retained"] });
+    expect(result.error).toContain("request-one entity-one owner-one");
+    expect(result.error).toContain("request-two entity-two owner-two");
+    const deadline = { value: undefined, terminationReason: "timed_out" as const, error: "timeout" };
+    preserveCancellationOutcome(deadline, controller.signal);
+    expect(deadline.terminationReason).toBe("timed_out"); expect(deadline.error).toContain("request-two");
   });
 
   it("does not label failed effect settlement as a proven safe rejection", () => {

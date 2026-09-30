@@ -1,3 +1,5 @@
+import type { FabricSandboxResult } from "./runtime/kernel.js";
+
 // Cancellation is not a safe rejection once a durable mutation may have committed.
 // Effects are shared only along one invocation's signal lineage, never with a
 // registry/provider shutdown signal (which is shared by unrelated invocations).
@@ -36,6 +38,28 @@ export const cancellationError = (signal: AbortSignal | undefined, reason: Error
   if (errors.length === 0) return reason;
   if (errors.length === 1) return errors[0]!;
   return new AggregateError(errors, errors.map((error) => error.message).join("\n"), { cause: reason });
+};
+
+/** Apply the invocation's complete receipt ledger at any engine's outer boundary.
+ * Mutate in place because QuickJS returns from try before its async finally runs.
+ * Completed runs become failures when teardown found unawaited resident work,
+ * even if its reply arrives during the grace window before cleanup aborts.
+ * Ordinary successful replies keep their handles and are not uncertainty.
+ */
+export const preserveCancellationOutcome = <T extends Pick<FabricSandboxResult, "value" | "terminationReason" | "error">>(
+  result: T,
+  signal: AbortSignal,
+  interrupted = signal.aborted,
+): T => {
+  if (!interrupted) return result;
+  const reason = new Error(result.error ?? "Fabric guest ended before its host calls settled");
+  const outcome = cancellationError(signal, reason);
+  if (outcome !== reason) {
+    result.value = undefined;
+    result.error = outcome.message;
+    if (result.terminationReason === "completed") result.terminationReason = "runtime_error";
+  }
+  return result;
 };
 
 const abortError = (signal: AbortSignal): Error => {

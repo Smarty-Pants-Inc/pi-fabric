@@ -1,7 +1,7 @@
 import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import ts from "typescript";
-import { cancellationError, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
+import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
@@ -1197,6 +1197,7 @@ export class QuickJsRuntime {
       if (timeout) clearTimeout(timeout);
       for (const timer of pendingTimers) clearTimeout(timer);
       if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
+      const unawaitedHostCalls = pendingHostPromises.size > 0;
       if (hostTasks.size > 0) {
         const settled = await settleWithin(hostTasks, HOST_TASK_SETTLE_GRACE_MS);
         if (!settled) {
@@ -1234,15 +1235,7 @@ export class QuickJsRuntime {
       }
       // A guest can finish or swallow a rejection before an unawaited host
       // mutation settles. Teardown still owes the caller every committed ID.
-      if (executionResult && hostAbortController.signal.aborted) {
-        const reason = new Error(executionResult.error ?? "Fabric guest ended before its host calls settled");
-        const outcome = cancellationError(hostAbortController.signal, reason);
-        if (outcome !== reason) {
-          executionResult.value = undefined;
-          executionResult.error = outcome.message;
-          if (executionResult.terminationReason === "completed") executionResult.terminationReason = "runtime_error";
-        }
-      }
+      if (executionResult) preserveCancellationOutcome(executionResult, hostAbortController.signal, hostAbortController.signal.aborted || unawaitedHostCalls);
       if (activePromiseHandle?.alive !== false) activePromiseHandle?.dispose();
       if (executionGate?.alive !== false) executionGate?.dispose();
       pumpJobs();

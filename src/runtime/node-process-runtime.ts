@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import { guestSetupSource } from "./quickjs-runtime.js";
@@ -103,6 +103,7 @@ export class NodeProcessRuntime {
       };
     }
     const hostAbortController = new AbortController();
+    shareCancellationEffects(hostAbortController.signal, options.signal);
     const startedAt = Date.now();
     let effectiveTimeoutMs = options.timeoutMs;
     let deadlineAt = startedAt + effectiveTimeoutMs;
@@ -119,14 +120,15 @@ export class NodeProcessRuntime {
     const guestLineCount = guestBundle.code.split("\n").length;
 
     return new Promise<FabricSandboxResult>((resolve) => {
-      const finish = (result: FabricSandboxResult): void => {
+      const finish = (result: FabricSandboxResult, unawaitedHostCalls = false): void => {
         if (settled) return;
         settled = true;
         if (deadline) clearTimeout(deadline);
         if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
-        if (!hostAbortController.signal.aborted && hostTasks.size > 0) {
+        if (!hostAbortController.signal.aborted && (result.terminationReason !== "completed" || hostTasks.size > 0 || unawaitedHostCalls)) {
           hostAbortController.abort(new Error(result.error ?? "Process execution stopped"));
         }
+        preserveCancellationOutcome(result, hostAbortController.signal);
         child.removeAllListeners();
         if (child.connected) child.disconnect();
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -165,6 +167,7 @@ export class NodeProcessRuntime {
         const message = raw as ChildMessage;
         if (message.type === "result") {
           finishing = true;
+          const unawaitedHostCalls = hostTasks.size > 0;
           if (deadline) clearTimeout(deadline);
           if (message.result.terminationReason !== "completed" && !hostAbortController.signal.aborted) {
             hostAbortController.abort(new Error(message.result.error ?? "Process execution stopped"));
@@ -184,6 +187,7 @@ export class NodeProcessRuntime {
                     ...message.result,
                     error: remapGuestErrorText(message.result.error, guestStackMap, guestLineCount),
                   },
+              unawaitedHostCalls,
             );
           })();
           return;

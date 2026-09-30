@@ -6,7 +6,7 @@ import net from "node:net";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
@@ -121,6 +121,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
 
     return new Promise<FabricSandboxResult>((resolve) => {
       const hostAbort = new AbortController();
+      shareCancellationEffects(hostAbort.signal, options.signal);
       const hostTasks = new Set<Promise<void>>();
       const callIds = new Set<number>();
       const logs: string[] = [];
@@ -163,13 +164,15 @@ export class CPythonRuntime implements FabricKernelRuntime {
         for (const line of lines) logs.push(line.replace(/\r$/, ""));
         if (retained.length !== text.length) truncated = true;
       };
-      const finish = async (result: Omit<FabricSandboxResult, "logs">): Promise<void> => {
+      const finish = async (result: Omit<FabricSandboxResult, "logs">, unawaitedHostCalls = false): Promise<void> => {
         if (settled) return;
         for (let index = 0; index < decoders.length; index++) appendLog(index, decoders[index]!.end());
         settled = true;
         if (deadline) clearTimeout(deadline);
         options.signal?.removeEventListener("abort", abort);
+        const interrupted = result.terminationReason !== "completed" || hostAbort.signal.aborted || hostTasks.size > 0 || unawaitedHostCalls;
         if (!hostAbort.signal.aborted) hostAbort.abort(new Error(result.error ?? "CPython execution ended"));
+        if (interrupted) preserveCancellationOutcome(result, hostAbort.signal);
         channel?.destroy();
         ipc?.server.close();
         child.stdout?.destroy();
@@ -246,6 +249,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
             fail("Invalid CPython terminal result"); return;
           }
           finishing = true;
+          const unawaitedHostCalls = hostTasks.size > 0;
           if (result.terminationReason !== "completed") hostAbort.abort(new Error(String(result.error ?? "Python guest failed")));
           void (async () => {
             const done = await settleWithin(hostTasks, HOST_SETTLE_MS);
@@ -259,7 +263,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
               value: result.value,
               terminationReason: result.terminationReason as "completed" | "runtime_error",
               ...(typeof result.error === "string" ? { error: result.error } : {}),
-            });
+            }, unawaitedHostCalls);
           })();
           return;
         }

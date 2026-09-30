@@ -13,7 +13,8 @@ import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentManager } from "../src/agents/manager.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
+import { FabricExecutionService } from "../src/execution-service.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
@@ -445,6 +446,164 @@ const mainProvider = (state: Awaited<ReturnType<typeof harness>>) => {
 const requestArgs = (state: Awaited<ReturnType<typeof harness>>, operation: "spawn" | "create") => ({
   residency: "durable", model: state.model,
   ...(operation === "spawn" ? { task: "round1 never silently reassign" } : { name: "round1", instructions: "round1 never silently reassign" }),
+});
+
+const engines = ["quickjs", "cpython", "monty", "node", "bun"] as const;
+type ReceiptEngine = typeof engines[number];
+const publicExecution = (state: Awaited<ReturnType<typeof harness>>, main: ReturnType<typeof mainProvider>, engine: ReceiptEngine, timeoutMs = 1_500) => {
+  const python = engine === "cpython" || engine === "monty";
+  const config = normalizeFabricConfig({
+    fullCodeMode: true, executor: { kernel: python ? "python" : "typescript", pythonRuntime: python ? engine : "monty",
+      runtime: engine === "node" ? "node-process" : engine === "bun" ? "bun-process" : "quickjs", timeoutMs, memoryLimitBytes: 256 * 1024 * 1024 },
+    agents: { timeoutMs },
+  });
+  const service = new FabricExecutionService(main.registry, config);
+  const context = { ...main.context.extensionContext, cwd: state.root, hasUI: false,
+    sessionManager: { getSessionId: () => "round2", getSessionFile: () => undefined },
+  } as unknown as FabricInvocationContext["extensionContext"];
+  let sequence = 0;
+  return (code: string, signal?: AbortSignal) => service.execute({ code, signal, context,
+    parentToolCallId: `round2-${engine}-${++sequence}`, onPartial() {},
+  });
+};
+const publicCall = (engine: ReceiptEngine, operation: "spawn" | "create", args: Record<string, unknown>) =>
+  engine === "cpython" || engine === "monty"
+    ? `await agents.${operation}(**${JSON.stringify(args)})`
+    : `await agents.${operation}(${JSON.stringify(args)})`;
+const decisionsFor = (state: Awaited<ReturnType<typeof harness>>) => entries(state.residencyRoot, "decisions")
+  .map(file => JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", file), "utf8")));
+const assertReceipts = (error: string | undefined, decisions: ReturnType<typeof decisionsFor>) => {
+  expect(error).toContain("ResidentOutcomeUnknownError");
+  expect(error).toContain("Do not retry or reassign");
+  for (const decision of decisions) {
+    expect(decision.state).toBe("committed");
+    for (const field of ["requestId", "id", "ownerHostId"]) expect(error).toContain(decision[field]);
+  }
+};
+
+describe("round 2 public execution receipt contract", { timeout: 25_000 }, () => {
+  for (const engine of engines) for (const operation of ["spawn", "create"] as const) {
+    it(`${engine} normal durable ${operation} returns its handle without false uncertainty`, async () => {
+      const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+      try {
+        const run = publicExecution(state, main, engine, 5_000);
+        const result = await run(`return ${publicCall(engine, operation, requestArgs(state, operation))}`);
+        expect(result.success, result.error).toBe(true); expect(result.error).toBeUndefined();
+        const decisions = decisionsFor(state); expect(decisions).toHaveLength(1);
+        expect(result.value).toMatchObject({ id: decisions[0].id });
+      } finally { await main.close(); await state.close(); }
+    });
+  }
+  for (const engine of engines) for (const operation of ["spawn", "create"] as const)
+    for (const ending of ["abort", "deadline"] as const) for (const before of [true, false]) {
+    it(`${engine} ${operation} ${ending} ${before ? "before" : "after"} commit`, async () => {
+      const state = await harness(before, undefined, 10_000); const main = mainProvider(state);
+      const controller = new AbortController();
+      if (!before) {
+        if (operation === "spawn") {
+          const original = AgentManager.prototype.spawn;
+          vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(async function (this: AgentManager, ...args) {
+            const handle = await original.apply(this, args); state.entered.resolve(); await state.release.promise; return handle;
+          });
+        } else {
+          const original = ActorDirectory.prototype.create;
+          vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+            const actor = await original.apply(this, args); state.entered.resolve(); await state.release.promise; return actor;
+          });
+        }
+      }
+      try {
+        const run = publicExecution(state, main, engine);
+        const outcome = run(`return ${publicCall(engine, operation, requestArgs(state, operation))}`, controller.signal);
+        await state.entered.promise;
+        const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
+        if (ending === "abort") controller.abort();
+        const result = await outcome;
+        expect(result.success).toBe(false);
+        const decisions = decisionsFor(state);
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]).toMatchObject({ requestId, state: before ? "abandoned" : "committed" });
+        if (before) {
+          expect(result.error).toContain(ending === "abort" ? "Execution cancelled" : "Execution timed out");
+          expect(result.error).not.toContain("ResidentOutcomeUnknownError");
+        } else assertReceipts(result.error, decisions);
+        state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        if (before) {
+          expect(entries(state.residencyRoot, "agents")).toEqual([]);
+          expect(names(path.join(state.residencyRoot, "runs"))).toEqual([]);
+          expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
+        } else {
+          const id = decisions[0].id;
+          await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
+          expect(state.participants.list({ scope: "lineage" }).filter(p => p.id === id)).toHaveLength(1);
+          // Reconciliation uses the same public service, not a direct client invocation.
+          const reconcile = engine === "cpython" || engine === "monty"
+            ? `return {"status": await agents.${operation === "spawn" ? "status" : "actorStatus"}(id="${id}"), "stop": await agents.stop(id="${id}")}`
+            : `return {status:await agents.${operation === "spawn" ? "status" : "actorStatus"}({id:"${id}"}),stop:await agents.stop({id:"${id}"})}`;
+          expect(await run(reconcile)).toMatchObject({ success: true, value: { status: { id } } });
+        }
+      } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+    });
+  }
+  for (const engine of engines) for (const settlesDuringGrace of [false, true]) {
+    it(`${engine} teardown exposes a committed unawaited mutation ${settlesDuringGrace ? "that settles during grace" : "still pending after grace"} rather than false success`, async () => {
+      const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+      const original = ActorDirectory.prototype.create;
+      vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+        const actor = await original.apply(this, args); state.entered.resolve(); await state.release.promise; return actor;
+      });
+      let releaseTimer: NodeJS.Timeout | undefined;
+      const descriptor = { name: "ready", description: "Wait for the real resident commit", risk: "read" as const,
+        inputSchema: { type: "object", properties: {}, additionalProperties: false } };
+      main.registry.register({ name: "probe", description: "public execution synchronization",
+        async list() { return [descriptor]; }, async describe() { return descriptor; },
+        async invoke() {
+          await state.entered.promise;
+          if (settlesDuringGrace) releaseTimer = setTimeout(state.release.resolve, 100);
+          return true;
+        },
+      });
+      try {
+        const run = publicExecution(state, main, engine, 5_000);
+        const call = publicCall(engine, "create", requestArgs(state, "create"));
+        const code = engine === "cpython"
+          ? `asyncio.create_task(${call.replace(/^await /, "")})\nawait tools.call(ref="probe.ready", args={})\nreturn "guest ended"`
+          : engine === "monty"
+            ? `${call.replace(/^await /, "")}\nawait tools.call(ref="probe.ready", args={})\nreturn "guest ended"`
+            : `void ${call.replace(/^await /, "")}; await tools.call({ref:"probe.ready",args:{}}); return "guest ended";`;
+        const result = await run(code); expect(result.success).toBe(false); expect(result.value).toBeUndefined();
+        const decisions = decisionsFor(state); expect(decisions).toHaveLength(1); assertReceipts(result.error, decisions);
+        state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
+      } finally { clearTimeout(releaseTimer); state.release.resolve(); await main.close(); await state.close(); }
+    });
+  }
+  for (const engine of engines) for (const ending of ["abort", "deadline", "failure"] as const) {
+    it(`${engine} retains every previously successful mutation not returned to caller on ${ending}`, async () => {
+      const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+      const controller = new AbortController(); const original = ActorDirectory.prototype.create; let created = 0;
+      vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+        const actor = await original.apply(this, args);
+        if (++created === 2 && ending !== "failure") { state.entered.resolve(); await state.release.promise; }
+        return actor;
+      });
+      try {
+        const run = publicExecution(state, main, engine);
+        const first = publicCall(engine, "create", { ...requestArgs(state, "create"), name: "receipt-one" });
+        const second = publicCall(engine, "create", { ...requestArgs(state, "create"), name: "receipt-two" });
+        const python = engine === "cpython" || engine === "monty";
+        const code = ending === "failure" ? `${first}${python ? '\nraise ValueError("guest failed")' : '; throw new Error("guest failed");'}`
+          : `${first}${python ? '\nreturn ' : '; return '}${second}`;
+        const outcome = run(code, controller.signal);
+        if (ending !== "failure") { await state.entered.promise; if (ending === "abort") controller.abort(); }
+        const result = await outcome; expect(result.success).toBe(false);
+        const decisions = decisionsFor(state); expect(decisions).toHaveLength(ending === "failure" ? 1 : 2);
+        assertReceipts(result.error, decisions);
+        state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(decisions.length);
+      } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+    });
+  }
 });
 
 describe("round 1 public cancellation contract", () => {

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { cancellationError, preserveCancellationOutcome, registerCancellationEffect, runAbortable, shareCancellationEffects } from "../src/async-settlement.js";
+import type { FabricSandboxResult } from "../src/runtime/kernel.js";
 import { commitResidentRequest, registerResidentCancellation, ResidentOutcomeUnknownError, type ResidentCommand } from "../src/residency/protocol.js";
 
 const roots: string[] = [];
@@ -50,7 +51,17 @@ describe("cancellation effect settlement", () => {
     }
     for (const error of first.errors) {
       expect(error).toBeInstanceOf(ResidentOutcomeUnknownError); expect(error.cause).toBe(original);
+      expect(Object.isFrozen(error.residentOutcome)).toBe(true);
     }
+    controller.abort(original);
+    const result: FabricSandboxResult = { value: "lost handle", terminationReason: "runtime_error", logs: ["retained"], error: "verbose guest cause" };
+    preserveCancellationOutcome(result, controller.signal);
+    expect(result.residentOutcomes).toEqual(["first", "second"].map(id => ({
+      state: "committed", operation: "spawn", entityKind: "agent", requestId: `request-${id}`, id: `entity-${id}`, ownerHostId: "resident:owner",
+    })));
+    // Repeated outer gates must not inflate or replace reconciliation metadata.
+    preserveCancellationOutcome(result, controller.signal);
+    expect(result.residentOutcomes).toHaveLength(2);
   });
 
   it("preserves ordinary success and safe cancellation without changing result identity", () => {
@@ -59,10 +70,12 @@ describe("cancellation effect settlement", () => {
     registerCancellationEffect(controller.signal, () => new Error("known receipt"));
     expect(preserveCancellationOutcome(result, controller.signal)).toBe(result);
     expect(result.value).toBe("handle");
+    expect(result).not.toHaveProperty("residentOutcomes");
     const safe = new AbortController(); safe.abort();
     const failure = { value: undefined, terminationReason: "aborted" as const, error: "cancelled" };
     expect(preserveCancellationOutcome(failure, safe.signal)).toBe(failure);
     expect(failure.error).toBe("cancelled");
+    expect(failure).not.toHaveProperty("residentOutcomes");
   });
 
   it("replaces false success with all terminal receipts while retaining logs and failure kind", () => {

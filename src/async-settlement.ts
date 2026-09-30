@@ -1,4 +1,4 @@
-import type { FabricSandboxResult } from "./runtime/kernel.js";
+import type { FabricResidentOutcomeReceipt, FabricSandboxResult } from "./runtime/kernel.js";
 
 // Cancellation is not a safe rejection once a durable mutation may have committed.
 // Effects are shared only along one invocation's signal lineage, never with a
@@ -40,13 +40,23 @@ export const cancellationError = (signal: AbortSignal | undefined, reason: Error
   return new AggregateError(errors, errors.map((error) => error.message).join("\n"), { cause: reason });
 };
 
+// These errors come from host-installed cancellation effects, not serialized
+// guest errors. Aggregate settlement must retain the entire receipt list.
+const residentOutcomeReceipts = (error: Error): FabricResidentOutcomeReceipt[] => {
+  if (error instanceof AggregateError) {
+    return error.errors.flatMap(cause => cause instanceof Error ? residentOutcomeReceipts(cause) : []);
+  }
+  const receipt = (error as Error & { residentOutcome?: FabricResidentOutcomeReceipt }).residentOutcome;
+  return receipt ? [receipt] : [];
+};
+
 /** Apply the invocation's complete receipt ledger at any engine's outer boundary.
  * Mutate in place because QuickJS returns from try before its async finally runs.
  * Completed runs become failures when teardown found unawaited resident work,
  * even if its reply arrives during the grace window before cleanup aborts.
  * Ordinary successful replies keep their handles and are not uncertainty.
  */
-export const preserveCancellationOutcome = <T extends Pick<FabricSandboxResult, "value" | "terminationReason" | "error">>(
+export const preserveCancellationOutcome = <T extends Pick<FabricSandboxResult, "value" | "terminationReason" | "error" | "residentOutcomes">>(
   result: T,
   signal: AbortSignal,
   interrupted = signal.aborted,
@@ -57,6 +67,8 @@ export const preserveCancellationOutcome = <T extends Pick<FabricSandboxResult, 
   if (outcome !== reason) {
     result.value = undefined;
     result.error = outcome.message;
+    const receipts = residentOutcomeReceipts(outcome);
+    if (receipts.length > 0) result.residentOutcomes = [...new Map(receipts.map(receipt => [receipt.requestId, receipt])).values()];
     if (result.terminationReason === "completed") result.terminationReason = "runtime_error";
   }
   return result;

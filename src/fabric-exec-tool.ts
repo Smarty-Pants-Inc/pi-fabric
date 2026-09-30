@@ -85,7 +85,7 @@ import {
 } from "./ui/row-balance.js";
 import { observeAnimationRows, type SpinnerTimerState, updateSpinner } from "./ui/spinner.js";
 import type { FabricToolDisplayController } from "./ui/tool-display.js";
-import { boundModelOutput, modelOutputBudget } from "./output-budget.js";
+import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { countNewlines } from "./util.js";
 
@@ -937,7 +937,10 @@ export const createFabricExecTool = (
       }
       const fullFormattedValue = formatFabricValue(result.value, selectedResultFormat);
       const failureProgress = formatFailureProgress(result.trace);
-      const fullSections = [...result.logs];
+      const residentPriority = result.residentOutcomes?.length
+        ? formatResidentOutcomePriority(result.residentOutcomes)
+        : undefined;
+      const fullSections = residentPriority ? [residentPriority, ...result.logs] : [...result.logs];
       if (fullFormattedValue.text) fullSections.push(fullFormattedValue.text);
       if (result.error) fullSections.push(`Runtime error: ${result.error}`);
       if (failureProgress) fullSections.push(failureProgress);
@@ -963,6 +966,7 @@ export const createFabricExecTool = (
       if (repeat.warn) sections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const rawOutput = sections.join("\n\n");
       const outputFormat =
+        !residentPriority &&
         formattedValue.language &&
         formattedValue.text &&
         (result.logs.length === 0 || !outputWillTruncate)
@@ -1015,6 +1019,17 @@ export const createFabricExecTool = (
         rawOutput || "(no output)",
         outputBudget,
         fullRawOutput || "(no output)",
+        undefined,
+        residentPriority ? {
+          text: residentPriority,
+          sections: [
+            logPrefix ? `Guest logs:\n${logPrefix}` : "",
+            formattedValue.text,
+            result.error ? `Runtime error: ${result.error}` : "",
+            failureProgress ?? "",
+            repeat.warn ? fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK) : "",
+          ],
+        } : undefined,
       )).text;
       // In-place prewalk continuation arrives as an in-band context message on
       // this boundary turn, so the loop must keep running: the executor's first
@@ -1067,7 +1082,7 @@ export const createFabricExecTool = (
         // text-only model still receives the description while the terminal
         // shows the kitty image.
         const textOutput =
-          singleAudit && mediaNote
+          singleAudit && mediaNote && !residentPriority
             ? mediaNote
             : (output === "(no output)" ? "" : output);
         if (textOutput) content.push({ type: "text", text: textOutput });

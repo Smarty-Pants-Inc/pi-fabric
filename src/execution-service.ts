@@ -52,6 +52,7 @@ import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import type {
   FabricKernel,
   FabricKernelRuntime,
+  FabricResidentOutcomeReceipt,
   FabricSandboxResult,
   FabricSandboxTerminationReason,
 } from "./runtime/kernel.js";
@@ -107,6 +108,7 @@ export interface FabricExecutionResult {
   elapsedMs: number;
   typeErrors?: FabricTypeError[];
   error?: string;
+  residentOutcomes?: FabricResidentOutcomeReceipt[];
   handoffRequest?: Record<string, unknown>;
   usage?: Usage;
 }
@@ -936,6 +938,7 @@ export class FabricExecutionService {
       trace: traceRecorder.seal(runOutcome, phases),
       elapsedMs: performance.now() - startedAt,
       ...(sandboxResult.error ? { error: sanitizeFabricMediaText(sandboxResult.error) } : {}),
+      ...(sandboxResult.residentOutcomes ? { residentOutcomes: sandboxResult.residentOutcomes } : {}),
       ...(handoffRequest ? { handoffRequest } : {}),
       ...(classifierUsages.length > 0
         ? { usage: aggregateUsage(classifierUsages) }

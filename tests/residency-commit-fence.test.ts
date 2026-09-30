@@ -16,6 +16,9 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { FabricExecutionService } from "../src/execution-service.js";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { FabricState } from "../src/fabric-state.js";
+import piFabric from "../src/index.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
@@ -415,7 +418,7 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
   });
 });
 
-const mainProvider = (state: Awaited<ReturnType<typeof harness>>) => {
+const mainProvider = (state: Awaited<ReturnType<typeof harness>>, caller: "main" | "nested" = "main") => {
   const manager = new AgentManager(state.root, state.config.agents, { runRoot: path.join(state.root, "local-runs") });
   const identity = { id: state.config.rootId, name: "main", kind: "main" as const };
   const actors = new ActorDirectory(["caller", identity, state.client.options.mesh, state.config.mesh, manager, () => {}, {
@@ -437,7 +440,7 @@ const mainProvider = (state: Awaited<ReturnType<typeof harness>>) => {
     { enabled: false, pollMs: 20, maxReadEvents: 100 }, async () => {});
   const global = new GlobalActorRegistry(state.root, 64 * 1024);
   const provider = new AgentsProvider(manager, actors, global, state.client.options.mainAgent,
-    state.participants, control, lifecycle, undefined, state.client, false);
+    state.participants, control, lifecycle, undefined, caller === "main" ? state.client : undefined, false);
   const registry = new ActionRegistry();
   registry.register(provider);
   const context: FabricInvocationContext = {
@@ -488,6 +491,184 @@ const assertReceipts = (error: string | undefined, decisions: ReturnType<typeof 
     for (const field of ["requestId", "id", "ownerHostId"]) expect(error).toContain(decision[field]);
   }
 };
+
+// Capture the tool actually registered by src/index.ts, including execute's
+// real formatter and production shell decorator. Only unrelated session/bootstrap
+// hooks are stubbed; registry, runtime, provider, clients and mutations are real.
+const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, main: ReturnType<typeof mainProvider>, timeoutMs = 5_000) => {
+  const config = normalizeFabricConfig({ fullCodeMode: true,
+    executor: { runtime: "quickjs", resultFormat: "json", timeoutMs, maxOutputChars: 50_000, memoryLimitBytes: 256 * 1024 * 1024 },
+    agents: { timeoutMs },
+  });
+  const execution = new FabricExecutionService(main.registry, config);
+  vi.spyOn(FabricState.prototype, "bootstrapped", "get").mockReturnValue(true);
+  vi.spyOn(FabricState.prototype, "config", "get").mockReturnValue(config);
+  vi.spyOn(FabricState.prototype, "execution", "get").mockReturnValue(execution);
+  vi.spyOn(FabricState.prototype, "ensure").mockResolvedValue(undefined);
+  vi.spyOn(FabricState.prototype, "claimHandoff").mockResolvedValue(undefined);
+  const registered = new Map<string, ToolDefinition<any, any, any>>();
+  const api = {
+    events: { emit: vi.fn(), on: vi.fn(() => () => {}) },
+    getActiveTools: vi.fn(() => ["fabric_exec"]), getAllTools: vi.fn(() => []), on: vi.fn(),
+    registerCommand: vi.fn(), registerMessageRenderer: vi.fn(), setActiveTools: vi.fn(),
+    registerTool: vi.fn((tool: ToolDefinition<any, any, any>) => registered.set(tool.name, tool)),
+  };
+  await piFabric(api as unknown as ExtensionAPI);
+  expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "fabric_exec" }));
+  const tool = registered.get("fabric_exec")!;
+  expect(tool.name).toBe("fabric_exec");
+  const context = { ...main.context.extensionContext, cwd: state.root, hasUI: false,
+    sessionManager: { getSessionId: () => "round4", getSessionFile: () => undefined },
+  } as unknown as FabricInvocationContext["extensionContext"];
+  let sequence = 0;
+  return async (code: string, signal?: AbortSignal) => {
+    const result = await tool.execute(`round4-${++sequence}`, { code }, signal, undefined, context!);
+    // Pi's ToolDefinition return type omits the runtime-supported isError flag.
+    return result as typeof result & { isError?: boolean };
+  };
+};
+const visibleText = (result: Awaited<ReturnType<Awaited<ReturnType<typeof registeredExecution>>>>) =>
+  result.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+
+describe("round 4 registered fabric_exec committed-output priority", { timeout: 25_000 }, () => {
+  it("keeps every committed receipt FIRST despite large guest logs and a long terminal error; reconciles through the registered tool", async () => {
+    const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+    let artifactPath: string | undefined;
+    try {
+      const run = await registeredExecution(state, main);
+      const args = requestArgs(state, "create");
+      const result = await run(`await agents.create(${JSON.stringify({ ...args, name: "volume-one" })});
+        await agents.create(${JSON.stringify({ ...args, name: "volume-two" })});
+        console.log("guest-logs-start" + "log line; ".repeat(2_600) + "guest-logs-end");
+        throw new Error("terminal-cause-start" + "cause detail! ".repeat(2_000) + "terminal-cause-end");`);
+      const text = visibleText(result);
+      const decisions = decisionsFor(state); expect(decisions).toHaveLength(2);
+      artifactPath = /saved to: ([^\n]+)\]/.exec(text)?.[1];
+      // Reconciliation precedes the output assertions so baseline evidence also
+      // establishes the live, committed entities behind the misleading failure.
+      const reconciled = [];
+      for (const { id } of decisions) {
+        await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
+        const reconciliation = await run(`return {status:await agents.actorStatus({id:"${id}"}),stop:await agents.stop({id:"${id}"})};`);
+        expect(reconciliation.isError).not.toBe(true);
+        const record = JSON.parse(visibleText(reconciliation));
+        expect(record.status.id).toBe(id); expect(record.stop).toMatchObject({ queued: true, acknowledged: true });
+        await waitFor(() => state.participants.get(id)?.status === "stopped");
+        const stopped = await run(`return await agents.actorStatus({id:"${id}"});`);
+        expect(stopped.isError).not.toBe(true);
+        expect(JSON.parse(visibleText(stopped))).toMatchObject({ id, status: "stopped" });
+        reconciled.push({ ...record, stopped: JSON.parse(visibleText(stopped)) });
+      }
+      if (process.env.PI_FABRIC_TEST_OUTPUT_EVIDENCE) {
+        const prefix = process.env.PI_FABRIC_TEST_OUTPUT_EVIDENCE;
+        fs.writeFileSync(`${prefix}.visible.txt`, text);
+        fs.writeFileSync(`${prefix}.json`, JSON.stringify({ visibleChars: text.length, isError: result.isError, decisions, reconciled }, null, 2));
+        if (artifactPath) fs.copyFileSync(artifactPath, `${prefix}.full-output.txt`);
+      }
+      expect(result.isError).toBe(true);
+      expect(text.length).toBeLessThanOrEqual(20_000);
+      assertReceipts(text, decisions);
+      const firstLog = text.indexOf("guest-logs-start");
+      expect(firstLog).toBeGreaterThan(0);
+      expect(text.indexOf("Do not retry or reassign")).toBeLessThan(firstLog);
+      for (const decision of decisions) for (const field of ["requestId", "id", "ownerHostId"]) {
+        expect(text.indexOf(decision[field])).toBeLessThan(firstLog);
+      }
+      expect(text).toContain("terminal-cause-start"); expect(text).toContain("terminal-cause-end");
+      expect(artifactPath).toBeDefined();
+      const full = fs.readFileSync(artifactPath!, "utf8");
+      expect(full).toContain("log line; ".repeat(2_600)); expect(full).toContain("cause detail! ".repeat(2_000));
+      assertReceipts(full, decisions);
+    } finally {
+      if (artifactPath) fs.rmSync(path.dirname(artifactPath), { recursive: true, force: true });
+      await main.close(); await state.close();
+    }
+  });
+
+  it("ordinary durable success still returns its handle without uncertainty", async () => {
+    const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+    try {
+      const run = await registeredExecution(state, main);
+      const result = await run(`return await agents.create(${JSON.stringify(requestArgs(state, "create"))});`);
+      expect(result.isError).not.toBe(true);
+      expect(visibleText(result)).not.toContain("ResidentOutcomeUnknownError");
+      expect(JSON.parse(visibleText(result))).toMatchObject({ id: decisionsFor(state)[0].id });
+    } finally { await main.close(); await state.close(); }
+  });
+});
+
+describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_000 }, () => {
+  for (const caller of ["main", "nested"] as const) for (const before of [true, false]) {
+    it(`${caller} retry cancellation ${before ? "before" : "after"} commitment preserves the accepted removal obligation`, async () => {
+      const state = await harness(false, undefined, 10_000); const main = mainProvider(state, caller);
+      if (caller === "nested") {
+        vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", state.config.rootId);
+        vi.stubEnv("PI_FABRIC_MESH_ROOT", state.config.meshRoot);
+      }
+      const controller = new AbortController();
+      let failing: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        const actor = await state.client.createActor({ ...requestArgs(state, "create"), name: "cleanup-retry", instructions: "Work.", residency: "durable" });
+        const directory = path.join(state.config.actorRoot, actor.id);
+        const rm = fs.rmSync.bind(fs);
+        failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+          if (target === directory) throw new Error("accepted cleanup remains unavailable");
+          return rm(target, options);
+        });
+        await expect(state.client.removeActor(actor.id)).resolves.toMatchObject({ removed: true, cleaned: false });
+        const accepted = decisionsFor(state).find(d => d.operation === "removeActor")!;
+        expect(accepted.state).toBe("committed");
+        expect(main.actors.cleanupObligation(actor.id)).toMatchObject({ id: actor.id, residency: "durable" });
+        expect(main.actors.owns(actor.id)).toBe(false);
+        if (before) {
+          vi.stubEnv("PI_FABRIC_TEST_RESIDENT_DELAY_STAGE", "before_commit");
+          vi.stubEnv("PI_FABRIC_TEST_RESIDENT_DELAY_MS", "500");
+        } else {
+          const original = ActorDirectory.prototype.remove;
+          vi.spyOn(ActorDirectory.prototype, "remove").mockImplementation(async function (this: ActorDirectory, ...args) {
+            state.entered.resolve(); await state.release.promise; return original.apply(this, args);
+          });
+        }
+        const outcome = main.invoke("agents.remove", { id: actor.id }, controller.signal).catch((error: Error) => error);
+        if (before) await waitFor(() => entries(state.residencyRoot, "processing").length === 1);
+        else await state.entered.promise;
+        const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
+        controller.abort(new Error("cleanup retry cancelled"));
+        const error = await outcome;
+        state.release.resolve();
+        await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        const retry = decisionsFor(state).find(d => d.requestId === requestId);
+        if (process.env.PI_FABRIC_TEST_OUTPUT_EVIDENCE) {
+          fs.writeFileSync(`${process.env.PI_FABRIC_TEST_OUTPUT_EVIDENCE}.p2-${caller}-${before ? "before" : "after"}-commit.json`, JSON.stringify({
+            caller, cancellationStage: before ? "before_commit" : "after_commit", accepted, retry,
+            error: { name: (error as Error).name, message: (error as Error).message },
+            removalMarkerRetained: fs.existsSync(path.join(state.config.actorRoot, `removal-${actor.id}.json`)),
+          }, null, 2));
+        }
+        expect(retry).toMatchObject({ state: before ? "abandoned" : "committed" });
+        expect(decisionsFor(state).find(d => d.requestId === accepted.requestId)).toEqual(accepted);
+        // Cancellation of a retry must never undo the earlier durable revocation.
+        expect(main.actors.cleanupObligation(actor.id)).toMatchObject({ id: actor.id, status: "stopped" });
+        expect(fs.existsSync(directory)).toBe(true);
+        expect(fs.existsSync(path.join(state.config.actorRoot, `removal-${actor.id}.json`))).toBe(true);
+        if (before) {
+          expect((error as Error).message).toContain("cleanup retry cancelled");
+          expect((error as Error).message).not.toContain("ResidentOutcomeUnknownError");
+        } else assertReceipts((error as Error).message, [retry]);
+        failing.mockRestore(); failing = undefined;
+        vi.stubEnv("PI_FABRIC_TEST_RESIDENT_DELAY_STAGE", undefined);
+        vi.stubEnv("PI_FABRIC_TEST_RESIDENT_DELAY_MS", undefined);
+        await expect(main.invoke("agents.remove", { id: actor.id })).resolves.toMatchObject({ removed: true });
+        expect(fs.existsSync(directory)).toBe(false);
+        // Assert authoritative cleanup, not the passive directory's cached row.
+        expect(fs.existsSync(path.join(state.config.actorRoot, `removal-${actor.id}.json`))).toBe(false);
+      } finally {
+        controller.abort(); state.release.resolve(); failing?.mockRestore(); vi.unstubAllEnvs();
+        await main.close(); await state.close();
+      }
+    });
+  }
+});
 
 describe("round 2 public execution receipt contract", { timeout: 25_000 }, () => {
   for (const engine of engines) for (const operation of ["spawn", "create"] as const) {

@@ -8,7 +8,7 @@ import type { FabricModelAliases, FabricModelCandidate } from "../core/model-res
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
-import type { FabricKernel } from "../runtime/kernel.js";
+import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
 export const sleepUnlessAborted = (ms: number, signal?: AbortSignal): Promise<void> =>
   // Executor form: the configured lib is ES2022, which has no
@@ -131,6 +131,7 @@ export const abandonResidentRequest = (
 
 /** Existing handle/actor return contracts cannot represent an unconfirmed launch. */
 export class ResidentOutcomeUnknownError extends Error {
+  readonly residentOutcome: FabricResidentOutcomeReceipt;
   readonly requestId: string;
   readonly id: string | undefined;
   readonly operation: ResidentCommand["operation"];
@@ -152,6 +153,14 @@ export class ResidentOutcomeUnknownError extends Error {
     this.id = id;
     this.operation = command.operation;
     this.ownerHostId = decision?.ownerHostId;
+    this.residentOutcome = Object.freeze({
+      requestId: command.requestId,
+      state: decision?.state === "committed" ? "committed" : "unknown",
+      operation: command.operation,
+      entityKind: kind,
+      ...(id ? { id } : {}),
+      ...(decision?.ownerHostId ? { ownerHostId: decision.ownerHostId } : {}),
+    });
   }
 }
 

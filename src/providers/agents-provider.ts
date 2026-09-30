@@ -1194,8 +1194,8 @@ export class AgentsProvider implements FabricProvider {
           if (this.actorManager.owns(cleanup.id)) return this.actorManager.remove(cleanup.id);
           if (cleanup.residency !== "durable") throw new Error("Only the owning host can remove this actor");
           return this.residency
-            ? this.residency.removeActor(cleanup.id)
-            : this.#residentActorClient().removeActor(cleanup.id);
+            ? this.residency.removeActor(cleanup.id, context.signal)
+            : this.#residentActorClient().removeActor(cleanup.id, context.signal);
         }
         let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
         try {

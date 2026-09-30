@@ -243,7 +243,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
     const provider = new AgentsProvider(state.agents, passive, state.globalActors, state.mainAgent, state.participants,
       state.control, state.lifecycle, undefined, { removeActor } as unknown as ResidencyClient);
     await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
-    expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id);
+    expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id, context.signal);
     expect(fs.existsSync(dir)).toBe(false);
     expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
   });

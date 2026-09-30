@@ -178,7 +178,7 @@ export const waitWithProgress = async (
   id: string,
   context: AgentProgressSink,
   agentToolPreviewEnabled: () => boolean,
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void } = {},
 ): Promise<AgentRunResult> => {
   const result = manager.wait(id, options);
   let lastPreviewRevision: string | undefined;

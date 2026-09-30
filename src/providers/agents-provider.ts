@@ -1508,6 +1508,7 @@ export class AgentsProvider implements FabricProvider {
       "stop",
       {},
       participant.ownerIdentityId,
+      { routedRemoteHost: participant.remoteHost ?? null },
     );
     if (this.residency?.hasAgent(id)) this.residency.acknowledgeCompletion(id);
     return result;

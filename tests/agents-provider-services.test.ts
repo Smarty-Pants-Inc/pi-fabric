@@ -133,7 +133,7 @@ describe("agents provider message routing service boundaries", () => {
     Object.assign(participants, { lastKnown: vi.fn((id: string) => id === peer.id ? { participant: peer, lapsedMs: 20_000 } : undefined) });
     control.request.mockResolvedValue({ queued: true, messageId: "delivered", routed: "mesh", acknowledged: true });
     await expect(router.routeMessage(peer.id, "reply", undefined, "followUp")).resolves.toMatchObject({ acknowledged: true, messageId: "delivered" });
-    expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp", { message: "reply", data: undefined }, "owner");
+    expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp", { message: "reply", data: undefined }, "owner", { routedRemoteHost: null });
   });
 
   // review/astra on #44: a worker replies to its own remote Main through the same lookup.
@@ -147,7 +147,7 @@ describe("agents provider message routing service boundaries", () => {
     Object.assign(participants, { lastKnown: vi.fn((id: string) => id === root.id ? { participant: root, lapsedMs: 15_000 } : undefined) });
     control.request.mockResolvedValue({ queued: true, messageId: "to-main", routed: "mesh", acknowledged: true });
     await expect(router.routeMessage(target, "result", undefined, "followUp")).resolves.toMatchObject({ messageId: "to-main" });
-    expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined }, "owner");
+    expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined }, "owner", { routedRemoteHost: null });
   });
 
   it("names why a remote Main cannot be resolved", async () => {
@@ -216,7 +216,7 @@ describe("agents provider message routing service boundaries", () => {
     const remote = participant();
     participants.get.mockReturnValue(remote);
     await router.routeMessage("main", "first", null, "followUp");
-    expect(control.request).toHaveBeenCalledWith("host", "main", "followUp", { message: "first", data: null }, "owner");
+    expect(control.request).toHaveBeenCalledWith("host", "main", "followUp", { message: "first", data: null }, "owner", { routedRemoteHost: null });
     remote.capabilities = [];
     await expect(router.routeMessage("main", "second", null, "followUp")).rejects.toThrow("does not support followUp");
     expect(control.request).toHaveBeenCalledTimes(1);
@@ -231,17 +231,36 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage(peer.id, "new authorized observation", { original: "fresh" }, "followUp",
       undefined, { triggerTurn: false })).resolves.toMatchObject({ messageId: "accepted" });
     expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp",
-      { message: "new authorized observation", data: { original: "fresh" }, triggerTurn: false }, "owner");
+      { message: "new authorized observation", data: { original: "fresh" }, triggerTurn: false }, "owner", { routedRemoteHost: null });
     expect(actors.status).not.toHaveBeenCalled();
     expect(main.deliverAgent).not.toHaveBeenCalled();
     peer.ownerHostId = "replacement-host";
     peer.ownerIdentityId = "replacement-owner";
     await router.routeMessage(peer.id, "later observation", undefined, "followUp");
     expect(control.request).toHaveBeenLastCalledWith("replacement-host", peer.id, "followUp",
-      { message: "later observation", data: undefined }, "replacement-owner");
+      { message: "later observation", data: undefined }, "replacement-owner", { routedRemoteHost: null });
     peer.capabilities = [];
     await expect(router.routeMessage(peer.id, "withdrawn", undefined, "followUp")).rejects.toThrow("does not support followUp");
     expect(control.request).toHaveBeenCalledTimes(2);
+  });
+
+  it("passes a participant's remote host separately from passive message data and rechecks capabilities", async () => {
+    const { router, participants, control, actors, main } = routing();
+    const peer = { ...participant(), id: "session:peer", rootId: "session:peer", remoteHost: "forge" };
+    const data = { remoteHost: "business-host", routedRemoteHost: "business-route" };
+    participants.get.mockImplementation(id => id === peer.id ? peer : undefined);
+    control.request.mockResolvedValue({ queued: true, messageId: "delivered", routed: "mesh", acknowledged: true });
+    await expect(router.routeMessage(peer.id, "observation", data, "followUp",
+      undefined, { triggerTurn: false })).resolves.toMatchObject({ messageId: "delivered" });
+    expect(control.request).toHaveBeenCalledWith("host", peer.id, "followUp",
+      { message: "observation", data: { remoteHost: "business-host", routedRemoteHost: "business-route" }, triggerTurn: false },
+      "owner", { routedRemoteHost: "forge" });
+    peer.capabilities = [];
+    await expect(router.routeMessage(peer.id, "withdrawn", data, "followUp",
+      undefined, { triggerTurn: false })).rejects.toThrow("does not support followUp");
+    expect(control.request).toHaveBeenCalledTimes(1);
+    expect(actors.status).not.toHaveBeenCalled();
+    expect(main.deliverAgent).not.toHaveBeenCalled();
   });
 
   it("uses the existing legacy relay for a listed peer root without a control protocol", async () => {

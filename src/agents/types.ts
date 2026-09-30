@@ -169,6 +169,8 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** Present on terminal status snapshots when the full log was retained. */
+  compactionSkipped?: string;
   id: string;
   name: string;
   status: AgentRunStatus;

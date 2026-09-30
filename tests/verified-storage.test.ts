@@ -18,6 +18,8 @@ const createStore = (options?: MeshStoreOptions, maxEventBytes = 1024): MeshStor
 };
 const statePath = (store: MeshStore): string => path.join(store.root, "state.json");
 const bytes = (store: MeshStore): string => fs.readFileSync(statePath(store), "utf8");
+const directoryBytes = (store: MeshStore): Array<[string, string]> =>
+  fs.readdirSync(store.root).map((name) => [name, fs.readFileSync(path.join(store.root, name), "utf8")]);
 const hold = (store: MeshStore): (() => void) => {
   const lock = path.join(store.root, ".lock");
   fs.mkdirSync(lock);
@@ -414,15 +416,17 @@ describe("MeshStore uses the proved transition", () => {
     const store = createStore();
     await store.put({ key: "state/a", value: 1, identity });
     fs.writeFileSync(statePath(store), damaged);
+    const before = directoryBytes(store);
     await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "state/a", value: 2 }] })).rejects.toThrow("invalid state format");
     expect(bytes(store)).toBe(damaged);
-    expect(fs.readdirSync(store.root)).toEqual(["state.json"]);
+    expect(directoryBytes(store)).toEqual(before);             // neither state nor its existing read signal changes
   });
 
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("refuses writes, and replaces nothing, when valid state cannot be read", async () => {
     const store = createStore();
     await store.put({ key: "state/a", value: 1, identity });
     const before = bytes(store);
+    const directoryBefore = directoryBytes(store);
     fs.chmodSync(statePath(store), 0o000);
     try {
       await expect(store.put({ key: "state/b", value: 1, identity })).rejects.toThrow("Failed to read Fabric mesh state");
@@ -431,7 +435,7 @@ describe("MeshStore uses the proved transition", () => {
       fs.chmodSync(statePath(store), 0o600);
     }
     expect(bytes(store)).toBe(before);
-    expect(fs.readdirSync(store.root)).toEqual(["state.json"]);
+    expect(directoryBytes(store)).toEqual(directoryBefore);
   });
 
   it("failed writes to damaged JSON do not quarantine/reset unrelated state", async () => {

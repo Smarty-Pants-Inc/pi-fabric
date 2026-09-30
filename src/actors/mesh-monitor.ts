@@ -5,6 +5,8 @@ import type { FabricMeshConfig } from "../config.js";
 import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
 const MESH_WATCH_RECONCILE_MS = 2_000;
+const CURSOR_CHECKPOINT_MS = 10_000;
+type MonitorCursor = { cursor: number; last?: { sequence: number; id: string } };
 /**
  * Work topics (smarty-dev#754 §3.2 step 3): agent-to-agent acks, asks, handoffs. They are
  * durable work, so they skip the replay window and are read back from the mesh archive.
@@ -25,13 +27,18 @@ export class ActorMeshMonitor {
   #replayFloor: number | undefined;
   /** Resumed from a saved cursor and not yet at the end of the log. */
   #catchingUp = false;
-  /** The last event handed on, so a reset or reread cursor delivers nothing twice. */
+  /** Last event passed (delivered or skipped), so resets and rereads do not deliver it twice. */
   #last: { sequence: number; id: string } | undefined;
   /** On resume: the sequence to read work events after, from the archive, before the live log. */
   #archiveAfter: number | undefined;
+  /** Last safe page boundary; live dispatch can throw after advancing the in-memory offset. */
+  #safeCursor: MonitorCursor;
+  #persistedCursor: string | undefined;
+  #persistedEventAnchor = false;
+  #lastCheckpointAt = Date.now();
 
   constructor(
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter">>,
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor">>,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
@@ -41,18 +48,28 @@ export class ActorMeshMonitor {
        */
       maxReplayAgeMs?: number | undefined;
       beforePoll(): boolean;
-      /** false: a receiver is full; while catching up, the event is offered again later. */
-      onEvent(event: MeshEvent): boolean | void;
+      /** false: full (retry unchanged); "ignored": no local delivery; true/void: handed on. */
+      onEvent(event: MeshEvent): boolean | void | "ignored";
     },
   ) {
     const saved = this.#readCursor();
-    this.#offset = saved?.cursor ?? mesh.latestOffset();
-    this.#last = saved?.last;
+    const initial: MonitorCursor = saved ?? mesh.latestCursor?.() ?? { cursor: mesh.latestOffset() };
+    this.#offset = initial.cursor;
+    this.#last = initial.last;
+    this.#persistedCursor = saved ? JSON.stringify(saved) : undefined;
+    this.#persistedEventAnchor = (saved?.last?.sequence ?? 0) > 0;
+    if (saved && !saved.last && mesh.read) {
+      // A legacy/crash seed has no sequence boundary. Its bytes may now name a different
+      // file, even before the generation bump. Replay conservatively once, not on idle polls.
+      this.#last = { sequence: 0, id: "" };
+      this.#offset = meshCursorAtStart(meshCursorGeneration(saved.cursor));
+    }
+    this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
     if (saved !== undefined && callbacks.maxReplayAgeMs !== undefined) {
       this.#replayFloor = Date.now() - callbacks.maxReplayAgeMs;
       this.#catchingUp = true;
     }
-    if (saved?.last !== undefined) this.#archiveAfter = saved.last.sequence;
+    if (saved && this.#last) this.#archiveAfter = this.#last.sequence;
   }
 
   start(): void {
@@ -83,6 +100,7 @@ export class ActorMeshMonitor {
     this.#timer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
+    if (this.#started) this.#persistCursor(true);
   }
 
   schedule(): void {
@@ -115,8 +133,8 @@ export class ActorMeshMonitor {
     this.#polling = true;
     try {
       if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
-      // Live and catch-up both read whole pages. Live advances first, so a failing dispatch
-      // never blocks the stream; the cursor file is committed after the page.
+      // Live and catch-up both read whole pages. A throwing dispatch restores the boundary
+      // before its event, so an empty later poll cannot checkpoint past failed work.
       const start = this.#offset;
       const tail = this.mesh.tail(start, this.config.maxReadEvents);
       // A rewrite restarts the stream at the retained log; the events it cut are in the archive
@@ -145,6 +163,7 @@ export class ActorMeshMonitor {
       }
       if (this.#catchingUp && tail.events.length === 0) this.#catchingUp = false;
       const catchingUp = this.#catchingUp;
+      let handedOn = false;
       if (!catchingUp) this.#offset = tail.nextOffset;
       for (const [index, event] of tail.events.entries()) {
         if (this.#delivered(event)) continue;
@@ -152,7 +171,16 @@ export class ActorMeshMonitor {
           if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
           continue;
         }
-        const accepted = this.callbacks.onEvent(event);
+        let accepted: boolean | void | "ignored";
+        try {
+          accepted = this.callbacks.onEvent(event);
+        } catch (error) {
+          // Keep only this page's consumed prefix. No second read can move the retry
+          // boundary; #last describes that prefix and suppresses duplicates on reread.
+          this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
+          this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
+          throw error;
+        }
         // A receiver that is full holds the event: while catching up, and for work events always
         // (smarty-dev#754), so work waits for room instead of being dropped.
         if (accepted === false && (catchingUp || isWork(event))) {
@@ -160,13 +188,14 @@ export class ActorMeshMonitor {
           // the cursor on it and offer it again later; earlier events are already delivered.
           // The boundary comes from this same read, so a compaction since cannot move it.
           this.#offset = index === 0 ? start : tail.cursors?.[index - 1] ?? start;
-          this.#writeCursor();
+          this.#writeCursor(handedOn);
           return;
         }
+        if (accepted !== false && accepted !== "ignored") handedOn = true;
         if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
       }
       if (catchingUp) this.#offset = tail.nextOffset;
-      this.#writeCursor();
+      this.#writeCursor(handedOn);
       // Yield to the event loop between catch-up pages, so timers such as the lease
       // heartbeat keep running through a long backlog.
       if (catchingUp) setImmediate(() => this.schedule());
@@ -175,7 +204,7 @@ export class ActorMeshMonitor {
     }
   }
 
-  // Events the stream already handed on: sequences only rise in log order, and a sequence two
+  // Events the stream already passed: sequences only rise in log order, and a sequence two
   // events share is told apart by id (at least once, never lost).
   #delivered(event: MeshEvent): boolean {
     const last = this.#last;
@@ -195,23 +224,28 @@ export class ActorMeshMonitor {
     }
     const page = this.mesh.read({ after: this.#archiveAfter, limit: this.config.maxReadEvents });
     const older = page.filter((event) => event.sequence < oldest);
+    let handedOn = false;
     for (const event of older) {
-      if (isWork(event) && !this.#delivered(event) && this.callbacks.onEvent(event) === false) {
-        this.#writeCursor();
-        return false;
+      if (isWork(event) && !this.#delivered(event)) {
+        const accepted = this.callbacks.onEvent(event);
+        if (accepted === false) {
+          this.#writeCursor(handedOn);
+          return false;
+        }
+        if (accepted !== "ignored") handedOn = true;
       }
-      // Every event older than the live log counts as handed on, work or not, so the live log's
-      // first event follows it with no gap.
+      // Every event older than the live log counts as passed, work or not, so the live log's
+      // first event follows it with no gap. Only a relevant delivery checkpoints immediately.
       this.#archiveAfter = event.sequence;
       this.#last = { sequence: event.sequence, id: event.id };
     }
     if (older.length === page.length && page.length === this.config.maxReadEvents) {
-      this.#writeCursor();
+      this.#writeCursor(handedOn);
       setImmediate(() => this.schedule());
       return false;
     }
     this.#archiveAfter = undefined;
-    this.#writeCursor();
+    this.#writeCursor(handedOn);
     return true;
   }
 
@@ -233,10 +267,24 @@ export class ActorMeshMonitor {
     }
   }
 
-  #writeCursor(): void {
+  #writeCursor(immediate = false): void {
+    this.#safeCursor = { cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) };
+    this.#persistCursor(immediate);
+  }
+
+  #persistCursor(immediate: boolean): void {
     if (!this.callbacks.cursorPath) return;
+    const serialized = JSON.stringify(this.#safeCursor);
+    if (serialized === this.#persistedCursor) return;
+    // Seed once; never batch away the first actual sequence anchor. Later ignored-only
+    // progress can wait ten seconds because restart already has a safe archive boundary.
+    const firstAnchor = !this.#persistedEventAnchor && (this.#safeCursor.last?.sequence ?? 0) > 0;
+    if (!immediate && !firstAnchor && this.#persistedCursor !== undefined && Date.now() - this.#lastCheckpointAt < CURSOR_CHECKPOINT_MS) return;
     try {
-      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, cursor: this.#offset, ...(this.#last ? { last: this.#last } : {}) }, { space: 2 });
+      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, ...this.#safeCursor }, { space: 2 });
+      this.#persistedCursor = serialized;
+      this.#persistedEventAnchor = (this.#safeCursor.last?.sequence ?? 0) > 0;
+      this.#lastCheckpointAt = Date.now();
     } catch {
       // Cursor persistence is best-effort; replay resumes from the latest safe cursor.
     }

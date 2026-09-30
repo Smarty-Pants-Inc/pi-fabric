@@ -25,6 +25,44 @@ const replay = [
   ["comment", "#issuecomment-1234567890"],
   ["pid", "pid 987654"],
 ] as const;
+const issueReferences = [
+  ["qualified issue", "Smarty-Pants-Inc/pi-fabric#2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["bare issue", "#2175", "#2175"],
+  ["issue URL", "https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["pull URL", "https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["anchored issue URL", "https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175#issuecomment-1234567890", "Smarty-Pants-Inc/pi-fabric#2175, comment 1234567890"],
+] as const;
+const mixedIssueReads = [
+  ["#2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["#2175", "another/repository#2175"],
+  ["Smarty-Pants-Inc/pi-fabric#2175", "#2175"],
+  ["Smarty-Pants-Inc/pi-fabric#2175", "https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175"],
+  ["Smarty-Pants-Inc/pi-fabric#2175", "https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2175"],
+  ["https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175", "Smarty-Pants-Inc/pi-fabric#2175"],
+  ["https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2175", "#2175"],
+] as const;
+// Only comment and pid accept hash separators in the existing legacy parser.
+const legacyHashReferences = [
+  ["comment #1234567890", "comment 1234567890", "1234567890"],
+  ["comment#1234567890", "comment 1234567890", "1234567890"],
+  ["COMMENT #123456789", "comment 123456789", "123456789"],
+  ["comment\t#1234567890", "comment 1234567890", "1234567890"],
+  ["comment:#1234567890", "comment 1234567890", "1234567890"],
+  ["comment=#1234567890", "comment 1234567890", "1234567890"],
+  ["comment-#1234567890", "comment 1234567890", "1234567890"],
+  ["comment #=#1234567890", "comment 1234567890", "1234567890"],
+  ["pid #987654", "pid 987654", "987654"],
+  ["pid#987654", "pid 987654", "987654"],
+  ["PID #123", "pid 123", "123"],
+  ["pid\t#987654", "pid 987654", "987654"],
+  ["pid:#987654", "pid 987654", "987654"],
+  ["pid=#987654", "pid 987654", "987654"],
+  ["pid-#987654", "pid 987654", "987654"],
+  ["pid #=#987654", "pid 987654", "987654"],
+  ["pid #1", "pid 1", "1"],
+  ["pid #12", "pid 12", "12"],
+  ["pid #1234567890", "pid 1234567890", "1234567890"],
+] as const;
 const surfaces = ["legacy.steer", "legacy.followUp", "hosted.steer", "hosted.followUp", "mesh.publish"] as const;
 const session = () => SessionManager.inMemory(process.cwd());
 const invocation = (manager: SessionManager): FabricInvocationContext => ({
@@ -35,8 +73,12 @@ const read = (manager: SessionManager, text: string, toolName = "read") => manag
   role: "toolResult", toolCallId: "read-call", toolName, content: [{ type: "text", text }],
   isError: false, timestamp: 1,
 });
-const harness = (surface: typeof surfaces[number], manager = session()) => {
+const harness = (surface: typeof surfaces[number], manager = session(), routeLimit = false) => {
   const sent: string[] = [];
+  const accept = (text: string) => {
+    if (routeLimit && text.includes("unverified ids:")) throw new Error("Mesh event exceeds 262144 bytes");
+    sent.push(text);
+  };
   const ack = { queued: true as const, messageId: "ack", routed: "main" as const };
   let provider;
   if (surface.startsWith("legacy.")) {
@@ -45,16 +87,16 @@ const harness = (surface: typeof surfaces[number], manager = session()) => {
       identity: { id: "session:sender", name: "Sender", kind: "main" },
     } as Ports[1], {} as Ports[2], {
       id: "main", local: true, matches: (id: string) => id === "main",
-      deliverAgent: ({ message }: { message: string }) => { sent.push(message); return ack; },
+      deliverAgent: ({ message }: { message: string }) => { accept(message); return ack; },
     } as unknown as Ports[3], { get: () => undefined } as unknown as Ports[4], undefined, {} as Ports[6]);
   } else if (surface.startsWith("hosted.")) {
     provider = createAgentsProvider(createAgentServiceClient(async (_action, args) => {
-      sent.push(String(args.message)); return ack;
+      accept(String(args.message)); return ack;
     }, { steer: true, followUp: true }));
   } else {
     type Ports = ConstructorParameters<typeof MeshProvider>;
     provider = new MeshProvider({ publish: async (args: { text: string }) => {
-      sent.push(args.text); return { sequence: 1, ...args };
+      accept(args.text); return { sequence: 1, ...args };
     } } as unknown as Ports[0], { id: "session:sender", name: "Sender", kind: "main" }, {} as Ports[2]);
   }
   const context = invocation(manager);
@@ -172,7 +214,61 @@ describe("hosted service end-to-end identifier delivery", () => {
   });
 });
 
+// Count actual regex yields and span-position reads, not elapsed time. The
+// test fuse stops the old quadratic loop deterministically before it hangs CI.
+const countedMatchWork = async (label: string, run: () => Promise<void>) => {
+  const original = String.prototype.matchAll;
+  const counts = { matches: 0, positions: 0, total: 0 };
+  const tick = (kind: "matches" | "positions") => {
+    counts[kind]++;
+    if (++counts.total > 120_000) throw new Error("Test match-work fuse exceeded");
+  };
+  const spy = vi.spyOn(String.prototype, "matchAll").mockImplementation(function (this: string, regex: RegExp) {
+    const matches = original.call(this, regex);
+    return (function* () {
+      for (const match of matches) {
+        tick("matches");
+        const index = match.index;
+        Object.defineProperty(match, "index", { get: () => { tick("positions"); return index; } });
+        yield match;
+      }
+    })() as RegExpStringIterator<RegExpExecArray>;
+  });
+  try { await run(); } finally {
+    spy.mockRestore();
+    console.info("MATCH_WORK " + JSON.stringify({ label, ...counts }));
+  }
+  return counts;
+};
+
 describe.each(surfaces)("unverified identifier annotations: %s", surface => {
+  it.each(["outgoing", "history"] as const)("round-3 repeated legacy spans: %s is linear and delivered", async mode => {
+    const h = harness(surface);
+    const repeated = "comment #123456789 ".repeat(10_000);
+    if (mode === "history") read(h.manager, repeated);
+    const text = mode === "outgoing" ? repeated : "#123456789";
+    const notice = mode === "outgoing" ? "unverified ids: comment 123456789" : "unverified ids: #123456789";
+    const counts = await countedMatchWork(`${surface} repeated ${mode}`, async () => {
+      const result = await h.send(text);
+      expect(h.sent).toEqual([`${text}\n\n${(result as { notice?: string }).notice}`]);
+      expect(result).toHaveProperty("notice", notice);
+    });
+    expect(counts.total).toBeLessThanOrEqual(120_000);
+  });
+
+  it.each(["outgoing", "history", "aggregate history"] as const)("round-3 match budget: %s fails open and delivers", async mode => {
+    const h = harness(surface);
+    const repeated = "comment #123456789 ".repeat(mode === "outgoing" ? 13_500 : 10_000);
+    if (mode === "history") read(h.manager, repeated.repeat(10));
+    if (mode === "aggregate history") { read(h.manager, repeated); read(h.manager, repeated); }
+    const text = mode === "outgoing" ? repeated : "#123456789";
+    const counts = await countedMatchWork(`${surface} budget ${mode}`, async () => {
+      const notice = "unverified ids: check failed";
+      expect(await h.send(text)).toHaveProperty("notice", notice);
+      expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+    });
+    expect(counts.total).toBeLessThanOrEqual(120_000);
+  });
   it.each(replay)("delivers and reports the synthetic wrong %s", async (_kind, text) => {
     const h = harness(surface);
     const result = await h.send(text) as { notice?: string };
@@ -180,6 +276,138 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
     expect(result.notice).not.toContain("check failed");
     expect(h.sent).toEqual([`${text}\n\n${result.notice}`]);
     expect(result.notice?.split("\n")).toHaveLength(1);
+  });
+
+  it.each(issueReferences)("flags an unread GitHub %s and clears it after a read", async (_kind, text, display) => {
+    const h = harness(surface);
+    const notice = `unverified ids: ${display}`;
+    expect(await h.send(text)).toHaveProperty("notice", notice);
+    expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+    read(h.manager, text);
+    expect(await h.send(text)).not.toHaveProperty("notice");
+    expect(h.sent.at(-1)).toBe(text);
+  });
+
+  it.each(legacyHashReferences.flatMap(([text, display, value]) =>
+    [false, true].map(alreadyRead => ({ text, display, value, alreadyRead }))))(
+    "round-2 legacy hash: $text alreadyRead=$alreadyRead belongs only to its own class", async ({ text, display, value, alreadyRead }) => {
+      const h = harness(surface);
+      if (alreadyRead) read(h.manager, JSON.stringify({ id: Number(value), pid: Number(value) }));
+      const result = await h.send(text);
+      if (alreadyRead) {
+        expect(result).not.toHaveProperty("notice");
+        expect(h.sent).toEqual([text]);
+      } else {
+        const notice = `unverified ids: ${display}`;
+        expect(result).toHaveProperty("notice", notice);
+        expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+      }
+    });
+
+  it.each(legacyHashReferences.filter(([, , value]) => value.length >= 3))(
+    "round-2 legacy read: %s is not independent issue evidence", async (evidence, _display, value) => {
+      const h = harness(surface);
+      read(h.manager, evidence);
+      const text = `#${value}; owner/repo#${value}; https://github.com/owner/repo/issues/${value}`;
+      const notice = `unverified ids: #${value}, owner/repo#${value}`;
+      expect(await h.send(text)).toHaveProperty("notice", notice);
+      expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+      // A real reference later in the same read must still count.
+      read(h.manager, `${evidence}; #${value}`);
+      expect(await h.send(text)).not.toHaveProperty("notice");
+      expect(h.sent.at(-1)).toBe(text);
+    });
+
+  it("round-2 real issues: class-named qualified repos and unsupported hash labels remain issues", async () => {
+    const h = harness(surface);
+    const text = "owner/comment#1234567890; owner/pid#987654; comment #2175; actor #2176; run #2177; session #2178; sha #2179; commit #2180; head #2181; base #2182; revision #2183; rev #2184";
+    const notice = "unverified ids: owner/comment#1234567890, comment 1234567890, owner/pid#987654, pid 987654, #2175, #2176, #2177, #2178, #2179, #2180, #2181, #2182, #2183, #2184";
+    expect(await h.send(text)).toHaveProperty("notice", notice);
+    expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+  });
+  it.each(mixedIssueReads)("normalizes mixed GitHub forms: outgoing %s, read %s", async (text, evidence) => {
+    const h = harness(surface);
+    read(h.manager, evidence);
+    expect(await h.send(text)).not.toHaveProperty("notice");
+    expect(h.sent).toEqual([text]);
+  });
+
+  it("round-1 omission: explains the missing recipient marker and logs each occurrence", async () => {
+    const log = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const h = harness(surface, session(), true);
+      const text = "o/pi-fabric#179";
+      const omitted = "unverified ids: o/pi-fabric#179 (recipient marker omitted: message at the route size limit)";
+      expect(await h.send(text)).toHaveProperty("notice", omitted);
+      expect(await h.send(text)).toHaveProperty("notice", omitted);
+      expect(h.sent).toEqual([text, text]); // One unmarked delivery per occurrence.
+      expect(log).toHaveBeenCalledTimes(2);
+      const rows = log.mock.calls.map(([line]) => JSON.parse(String(line).slice("[pi-fabric] ".length)));
+      const route = surface === "mesh.publish" ? surface : `agents.${surface.split(".")[1]}`;
+      expect(rows).toEqual([
+        { event: "recipient-marker-omitted", route, count: expect.any(Number) },
+        { event: "recipient-marker-omitted", route, count: rows[0].count + 1 },
+      ]);
+      const normal = harness(surface);
+      expect(await normal.send(text)).toHaveProperty("notice", "unverified ids: o/pi-fabric#179");
+      expect(await normal.send("Ready")).not.toHaveProperty("notice");
+      expect(log).toHaveBeenCalledTimes(2); // No count/log for normal marked or no-ID delivery.
+    } finally { log.mockRestore(); }
+  });
+
+  it("round-1 repository-only: flags unread references and clears finalized reads", async () => {
+    for (const text of ["smarty-dev#2175", "pi-fabric#179", "x#123"]) {
+      const h = harness(surface);
+      const notice = `unverified ids: ${text}`;
+      expect(await h.send(text)).toHaveProperty("notice", notice);
+      expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+      read(h.manager, text);
+      expect(await h.send(text)).not.toHaveProperty("notice");
+      expect(h.sent.at(-1)).toBe(text);
+    }
+  });
+
+  it("round-1 repository-only: normalizes reads across bare, qualified and URL forms", async () => {
+    const forms = ["#2175", "pi-fabric#2175", "Smarty-Pants-Inc/pi-fabric#2175",
+      "https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175",
+      "https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2175"];
+    for (const text of forms) for (const evidence of forms) {
+      const h = harness(surface);
+      read(h.manager, evidence);
+      expect(await h.send(text), `${text} after ${evidence}`).not.toHaveProperty("notice");
+      expect(h.sent).toEqual([text]);
+    }
+  });
+
+  it("round-1 repository-only: preserves repo and qualified owner identity", async () => {
+    for (const [text, evidence] of [
+      ["pi-fabric#2175", "smarty-dev#2175"],
+      ["pi-fabric#2175", "Smarty-Pants-Inc/smarty-dev#2175"],
+      ["Smarty-Pants-Inc/pi-fabric#2175", "other/pi-fabric#2175"],
+      ["Smarty-Pants-Inc/pi-fabric#2175", "https://github.com/other/pi-fabric/pull/2175"],
+      ["pi-fabric#2175", "pi-fabric#21750 pi-fabric#2175suffix pi-fabric#2175-thing"],
+      ["Smarty-Pants-Inc/pi-fabric#12", "pi-fabric#12 #12"],
+    ]) {
+      const h = harness(surface);
+      read(h.manager, evidence!);
+      expect(await h.send(text!)).toHaveProperty("notice", `unverified ids: ${text}`);
+      expect(h.sent).toEqual([`${text}\n\nunverified ids: ${text}`]);
+    }
+    for (const evidence of ["another/pi-fabric#2175", "https://github.com/another/pi-fabric/pull/2175", "smarty-dev#2175"]) {
+      const h = harness(surface);
+      read(h.manager, evidence);
+      const text = evidence.includes("smarty-dev") ? "#2175" : "pi-fabric#2175";
+      expect(await h.send(text)).not.toHaveProperty("notice");
+      expect(h.sent).toEqual([text]);
+    }
+  });
+
+  it("does not let an issue send receipt launder an unread GitHub reference", async () => {
+    const h = harness(surface);
+    const text = "Smarty-Pants-Inc/pi-fabric#2175";
+    const first = await h.send(text);
+    read(h.manager, JSON.stringify({ text: h.sent[0], ...first as object }), "fabric_exec");
+    expect(await h.send(text)).toHaveProperty("notice", `unverified ids: ${text}`);
   });
 
   it("does not annotate real reads from agents list/peers/create, git or the GitHub API", async () => {
@@ -199,9 +427,9 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
   it("leaves no-identifier text untouched without accessing history", async () => {
     const h = harness(surface);
     vi.spyOn(h.manager, "getLeafId").mockImplementation(() => { throw new Error("must not read"); });
-    const text = "Ready for the review; no identifiers here.";
-    expect(await h.send(text)).not.toHaveProperty("notice");
-    expect(h.sent).toEqual([text]);
+    const texts = ["Ready for the review; no identifiers here.", "2175", "#1", "#12", "# Title", "## Heading", "# 2175", "C#12", "F#123", "issue#", "x#1", "x#12", "smarty-dev#12"];
+    for (const text of texts) expect(await h.send(text)).not.toHaveProperty("notice");
+    expect(h.sent).toEqual(texts);
   });
 
   it("fails open when the session history check throws", async () => {

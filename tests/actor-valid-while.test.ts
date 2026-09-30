@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as typeChecker from "../src/runtime/type-checker.js";
 import { ActorManager } from "../src/actors/manager.js";
-import { evaluateActorValidWhile } from "../src/actors/predicate.js";
+import { evaluateActorValidWhile, validateActorValidWhile } from "../src/actors/predicate.js";
 import type { FabricActorValidityFacts } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -89,6 +90,45 @@ describe("persistent actor validWhile", () => {
     );
     expect(result).toEqual({ valid: false, reason: "recovered error" });
   });
+
+  it.each(["validation", "evaluation"] as const)("excludes slow program setup from the 100ms predicate budget during %s", async (phase) => {
+    // Transpilation is synchronous host setup, after WASM/context creation but
+    // before the predicate runs. Delay that existing seam, not engine loading.
+    const transpile = typeChecker.transpileFabricCodeWithSourceMap;
+    vi.spyOn(typeChecker, "transpileFabricCodeWithSourceMap").mockImplementationOnce((code) => {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+      return transpile(code);
+    });
+    const source = { version: 1 as const, source: "() => true" };
+    if (phase === "validation") {
+      await expect(validateActorValidWhile(source)).resolves.toBeUndefined();
+    } else {
+      await expect(evaluateActorValidWhile(source, hostFacts())).resolves.toEqual({ valid: true });
+    }
+  });
+
+  it("still interrupts an infinite-loop predicate within its unchanged 100ms budget", async () => {
+    const startedAt = Date.now();
+    await expect(evaluateActorValidWhile(
+      { version: 1, source: "() => { while (true) {} }" },
+      hostFacts(),
+    )).rejects.toThrow("Execution timed out after 100ms");
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+
+  it.each(["while (true) {}", "const until = Date.now() + 150; while (Date.now() < until) {}"])(
+    "SEC-186-1: budgets serialized-source top-level work as execution: %s",
+    async (topLevelWork) => {
+      // Close the predicate and main wrappers, then reopen a function to consume
+      // the generated suffix. This follows the public persisted-source path,
+      // without a host-supplied transpiledCode shortcut or transpiler mock.
+      const source = `() => true); return true; }\n${topLevelWork}\nasync function unused() { const predicate = (() => true`;
+      const startedAt = Date.now();
+      await expect(evaluateActorValidWhile({ version: 1, source }, hostFacts()))
+        .rejects.toThrow("Execution timed out after 100ms");
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+    },
+  );
 
   it("serializes a programmatic predicate before agents.create reaches the host", async () => {
     let received: Record<string, unknown> | undefined;

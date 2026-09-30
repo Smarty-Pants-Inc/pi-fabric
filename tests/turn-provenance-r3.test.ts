@@ -14,6 +14,7 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.
 import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { recordsInboxMessage } from "../src/records/inbox.js";
+import { RootInbox } from "../src/topology/root-inbox.js";
 import type { RecordEnvelope } from "../src/records/store.js";
 import { registerFabricCommand } from "../src/commands/fabric.js";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
@@ -33,10 +34,16 @@ const root = () => {
   cleanups.push(() => fs.rmSync(value, { recursive: true, force: true }));
   return value;
 };
-const recording = () => {
+const recording = (turnProvenance: unknown = 1) => {
+  const entries: any[] = [];
+  const queued: any[] = [];
+  const append = (message: any) => entries.push({ type: "custom_message", ...message });
   const handlers = new Map<string, Array<(event: any, ctx: ExtensionContext) => unknown>>();
   const fake = {
-    hostCapabilities: { turnProvenance: 1 }, sendMessage: vi.fn(), sendUserMessage: vi.fn(),
+    hostCapabilities: turnProvenance === null ? undefined : { turnProvenance }, sendMessage: vi.fn((message: any, options: any) => {
+      if (options?.deliverAs === "nextTurn") queued.push(message);
+      else append(message);
+    }), sendUserMessage: vi.fn(),
     events: { emit: vi.fn(), on: vi.fn(() => () => {}) },
     getActiveTools: vi.fn<() => string[]>(() => []), getAllTools: vi.fn(() => []),
     registerCommand: vi.fn(), registerMessageRenderer: vi.fn(), registerTool: vi.fn(), setActiveTools: vi.fn(),
@@ -47,7 +54,7 @@ const recording = () => {
   };
   const context = { cwd: process.cwd(), hasUI: false, isIdle: () => false, hasPendingMessages: () => false,
     getContextUsage: () => undefined,
-    sessionManager: { getSessionId: () => "receiver", getEntries: () => [], getBranch: () => [] },
+    sessionManager: { getSessionId: () => "receiver", getEntries: () => entries, getBranch: () => entries },
     ui: { notify: vi.fn(), setStatus: vi.fn() },
   } as unknown as ExtensionContext;
   const emit = async (name: string, event: any = {}) => {
@@ -55,7 +62,17 @@ const recording = () => {
     for (const handler of handlers.get(name) ?? []) results.push(await handler(event, context));
     return results;
   };
-  return { fake, pi: fake as unknown as ExtensionAPI, context, emit };
+  // Model Pi's prompt order, not just API options: legacy Pi drains nextTurn BEFORE
+  // emitBeforeAgentStart; capable Pi drains it AFTER, then appends hook results.
+  const prompt = async (event: any = { prompt: "next", systemPrompt: "", systemPromptOptions: {} }) => {
+    const consume = () => { for (const message of queued.splice(0)) append(message); };
+    if (turnProvenance !== 1) consume();
+    const results = await emit("before_agent_start", event);
+    if (turnProvenance === 1) consume();
+    for (const result of results as any[]) if (result?.message) append(result.message);
+    return entries.map(entry => ({ ...entry })); // first inference's immutable snapshot
+  };
+  return { fake, pi: fake as unknown as ExtensionAPI, context, emit, prompt, entries, queued };
 };
 // Write retained wire events, so tests do not reconstruct admission from identity or payload.
 const retain = (mesh: MeshStore, event: Omit<MeshEvent, "sequence" | "createdAt">) => {
@@ -70,8 +87,8 @@ const mainFixture = () => {
   cleanups.push(() => main.closeFollowUpDrain());
   return { ...h, dir, mesh, main };
 };
-const indexFixture = async () => {
-  const h = recording();
+const indexFixture = async (turnProvenance: unknown = 1) => {
+  const h = recording(turnProvenance);
   vi.spyOn(FabricState.prototype, "initialized", "get").mockReturnValue(true);
   vi.spyOn(FabricState.prototype, "config", "get").mockReturnValue(DEFAULT_FABRIC_CONFIG);
   vi.spyOn(FabricState.prototype, "provisionalConfig").mockReturnValue(DEFAULT_FABRIC_CONFIG);
@@ -81,6 +98,102 @@ const indexFixture = async () => {
   await piFabric(h.pi);
   return { ...h, work, records };
 };
+
+describe.each([
+  ["legacy queue-before-hook", null], ["capable queue-after-hook", 1],
+] as const)("turn-start compatibility: %s", (_order, capability) => {
+  it.each(["first inference", "no settle wake", "no next-prompt duplicate"])("root inbox: %s", async check => {
+    const h = await indexFixture(capability);
+    const mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100);
+    const inbox = new RootInbox(mesh, host, () => [host.id], { steerGraceMs: 0 });
+    inbox.start();
+    const events = [];
+    for (const from of [host, remote]) events.push(await mesh.publish({ from, to: host.id,
+      topic: "fleet.work.task", kind: "ask", text: `task from ${from.id}` }));
+    h.work.mockImplementation(session => inbox.next(session));
+    const first = await h.prompt();
+    const ids = (entries: any[]) => entries.flatMap(entry => entry.details?.ids ?? []);
+    if (check === "first inference") {
+      expect(ids(first)).toEqual(events.map(event => event.id));
+      expect(first).toHaveLength(capability === 1 ? 2 : 1); // capable sender split; legacy batch
+    }
+    await h.emit("agent_settled", { outcome: "completed" });
+    if (check === "no settle wake") {
+      expect(h.fake.sendMessage.mock.calls.filter(call => call[1]?.triggerTurn)).toEqual([]);
+      expect((mesh.get(inbox.key, { fresh: true })!.value as any).pending).toBeUndefined();
+    }
+    const next = await h.prompt();
+    if (check === "no next-prompt duplicate") expect(ids(next)).toEqual(events.map(event => event.id));
+    if (capability !== 1) expect(h.fake.sendMessage).not.toHaveBeenCalled();
+    expect(h.queued).toEqual([]);
+  });
+
+  it("completion items join the first inference and never wake or repeat", async () => {
+    const h = recording(capability);
+    const inbox = new AgentCompletionInbox(h.pi, h.context); cleanups.push(() => inbox.close());
+    const delivered = vi.fn();
+    await h.emit("turn_end", { message: { role: "assistant", stopReason: "aborted" } });
+    inbox.enqueue({ id: "worker", name: "Worker", status: "completed", text: "done", startedAt: 1, finishedAt: 2 }, delivered);
+    const first = await h.prompt();
+    expect(first.map(entry => entry.details.ids)).toEqual([["worker"]]);
+    expect(delivered).toHaveBeenCalledOnce();
+    await h.emit("agent_settled", { outcome: "completed" });
+    expect(await h.prompt()).toEqual(first);
+    expect(h.fake.sendMessage.mock.calls.filter(call => call[1]?.triggerTurn)).toEqual([]);
+    if (capability !== 1) expect(h.fake.sendMessage).not.toHaveBeenCalled();
+    expect(h.queued).toEqual([]);
+  });
+
+  it("shell items join the first inference and never wake or repeat", async () => {
+    const h = recording(capability);
+    const jobs = new FabricShellJobStore(); cleanups.push(() => jobs.close());
+    const inbox = new ShellEventInbox(h.pi, h.context, jobs); cleanups.push(() => inbox.close());
+    const job = jobs.begin("bash", "build"); job.spill(); await job.finish(0);
+    const first = await h.prompt();
+    expect(first.map(entry => entry.details.ids)).toEqual([[job.id]]);
+    expect(inbox.pendingCount()).toBe(0);
+    await h.emit("agent_settled", { outcome: "completed" });
+    expect(await h.prompt()).toEqual(first);
+    expect(h.fake.sendMessage.mock.calls.filter(call => call[1]?.triggerTurn)).toEqual([]);
+    if (capability !== 1) expect(h.fake.sendMessage).not.toHaveBeenCalled();
+    expect(h.queued).toEqual([]);
+  });
+
+  it("records items join the first inference without a stale queued copy", async () => {
+    const h = await indexFixture(capability);
+    h.records.mockResolvedValueOnce(recordsInboxMessage([{ id: "github", from: "github:user", sequence: 1,
+      createdAt: 1, data: {}, kind: "ask" } as RecordEnvelope]));
+    const first = await h.prompt();
+    expect(first.map(entry => entry.details.ids)).toEqual([["github"]]);
+    expect(await h.prompt()).toEqual(first);
+    if (capability !== 1) expect(h.fake.sendMessage).not.toHaveBeenCalled();
+    expect(h.queued).toEqual([]);
+  });
+
+  it("skill notices join the first inference", async () => {
+    const h = await indexFixture(capability); h.fake.getActiveTools.mockReturnValue(["fabric_exec"]);
+    const first = await h.prompt({ prompt: '<skill name="wrapper" location="/skills/wrapper/SKILL.md">\nReferences are relative to /skills/wrapper.\n\nLoad `/research` and follow its process.\n</skill>',
+      systemPrompt: "Base", systemPromptOptions: { skills: [
+        { name: "wrapper", description: "Wrap", filePath: "/skills/wrapper/SKILL.md" },
+        { name: "research", description: "Research", filePath: "/skills/research/SKILL.md" },
+      ] } });
+    expect(first.map(entry => entry.customType)).toEqual(["pi-fabric-skill-reference"]);
+    if (capability !== 1) expect(h.fake.sendMessage).not.toHaveBeenCalled();
+    expect(h.queued).toEqual([]);
+  });
+
+  it("proxy notices join the first inference and are not repeated", async () => {
+    const h = await indexFixture(capability); h.fake.getActiveTools.mockReturnValue(["fabric_exec"]);
+    vi.spyOn(FabricState.prototype, "cwd", "get").mockReturnValue(process.cwd());
+    vi.spyOn(CapturedToolCatalog.prototype, "list").mockReturnValue([{ name: "probe_tool", description: "Probe" } as any]);
+    const event = { prompt: '<skill name="probe">Use probe_tool</skill>', systemPrompt: "Base", systemPromptOptions: { skills: [] } };
+    const first = await h.prompt(event);
+    expect(first.map(entry => entry.customType)).toEqual(["pi-fabric-proxy"]);
+    expect(await h.prompt(event)).toEqual(first);
+    if (capability !== 1) expect(h.fake.sendMessage).not.toHaveBeenCalled();
+    expect(h.queued).toEqual([]);
+  });
+});
 
 describe("round-3 provenance at the capable Pi API boundary", () => {
   it.each(["steer", "followUp"] as const)("old-bridge control %s has no recorded method and sends no claim", async delivery => {

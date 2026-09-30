@@ -143,11 +143,10 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.emit("input");
     h.idle(false);
-    expect(h.emit("before_agent_start")).toBeUndefined();
-    expect(h.sendMessage.mock.calls[0]![0].details.ids).toEqual(["a", "b"]);
-    expect(h.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
+    expect(h.emit("before_agent_start")).toMatchObject({ message: { details: { ids: ["a", "b"] } } });
+    expect(h.sendMessage).not.toHaveBeenCalled();
     h.boundary();
-    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(h.sendMessage).not.toHaveBeenCalled();
   });
 
   // smarty-dev#733: org's turn ended aborted at 05:28Z; every later run came from voice or peer
@@ -186,9 +185,8 @@ describe("AgentCompletionInbox", () => {
     h.inbox.enqueue(result("a"));
     await vi.advanceTimersByTimeAsync(100);
     h.idle(false);
-    expect(h.emit("before_agent_start")).toBeUndefined();
-    expect(h.sendMessage.mock.calls[0]![0].details.ids).toEqual(["a"]);
-    expect(h.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
+    expect(h.emit("before_agent_start")).toMatchObject({ message: { details: { ids: ["a"] } } });
+    expect(h.sendMessage).not.toHaveBeenCalled();
   });
 
   it("still starts no run by itself after an abort while nothing else runs", async () => {

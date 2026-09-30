@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRunResult } from "./types.js";
-import { fabricHostIdentity, sendFabricMessage } from "../fabric-provenance.js";
+import { fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "../fabric-provenance.js";
 
 export const AGENT_COMPLETION_MESSAGE_TYPE = "pi-fabric-agent-complete";
 const SUMMARY_CHARS = 4_000;
@@ -55,10 +55,14 @@ export class AgentCompletionInbox {
         this.#context = ctx;
         // A prompt-started run: its results join the first inference.
         this.#suspended = false;
-        // Pi consumes nextTurn messages after the hooks; join its first inference, no wake.
-        this.#flush(message => sendFabricMessage(this.pi, message,
-          { deliverAs: "nextTurn", triggerTurn: false },
-          () => fabricHostIdentity(ctx.sessionManager.getSessionId()), "actor", "mesh"));
+        // Capable Pi drains nextTurn after hooks; legacy Pi needs the hook result.
+        let message: CompletionMessage | undefined;
+        this.#flush(value => {
+          if (!fabricProvenanceSupported(this.pi)) { message = value; return; }
+          sendFabricMessage(this.pi, value, { deliverAs: "nextTurn", triggerTurn: false },
+            () => fabricHostIdentity(ctx.sessionManager.getSessionId()), "actor", "mesh");
+        });
+        return message ? { message } : undefined;
       });
     subscribe("agent_settled", (_event, ctx) => {
         if (this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;

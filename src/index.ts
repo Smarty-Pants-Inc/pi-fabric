@@ -1,7 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import { rootInboxSession } from "./topology/root-inbox.js";
+import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
-import { fabricHostIdentity, sendFabricMessage } from "./fabric-provenance.js";
+import { fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp } from "./core/pattern-kill.js";
@@ -1077,12 +1077,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (!skillReferenceGuidance) return {
       systemPrompt: `${systemPrompt}\n\n${guidance}`,
     };
-    sendFabricMessage(pi, {
+    const message = {
       customType: SKILL_REFERENCE_CUSTOM_TYPE,
       content: skillReferenceGuidance,
       display: false,
       details: {},
-    }, { deliverAs: "nextTurn", triggerTurn: false },
+    };
+    if (!fabricProvenanceSupported(pi)) return { message, systemPrompt: `${systemPrompt}\n\n${guidance}` };
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
     () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
     return { systemPrompt: `${systemPrompt}\n\n${guidance}` };
   });
@@ -1109,12 +1111,14 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     );
     const fresh = proxyContract.take(mentioned);
     if (fresh.length === 0) return;
-    sendFabricMessage(pi, {
+    const message = {
       customType: PROXY_CONTRACT_CUSTOM_TYPE,
       content: formatProxyContractReminder(fresh),
       display: false,
       details: { names: fresh, origin: "skill" },
-    }, { deliverAs: "nextTurn", triggerTurn: false },
+    };
+    if (!fabricProvenanceSupported(pi)) return { message };
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
     () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
   });
 
@@ -1125,7 +1129,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (!state.initialized) return;
     const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
     if (!inbox?.events.length) return;
-    // Pi consumes nextTurn messages after these hooks, before the first inference.
+    // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
+    if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(inbox.events) };
     deliverRootInbox(pi, inbox.events, { deliverAs: "nextTurn", triggerTurn: false });
   });
 
@@ -1135,6 +1140,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const message = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
     if (!message) return;
     // Records have authors, not authenticated admission envelopes. Never claim this Main.
+    if (!fabricProvenanceSupported(pi)) return { message };
     sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
   });
 

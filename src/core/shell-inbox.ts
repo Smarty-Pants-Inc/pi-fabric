@@ -1,6 +1,6 @@
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricShellJobEvent, FabricShellJobStore } from "./shell-jobs.js";
-import { fabricHostIdentity, sendFabricMessage } from "../fabric-provenance.js";
+import { fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "../fabric-provenance.js";
 
 export const SHELL_MESSAGE_TYPE = "pi-fabric-shell-event";
 export const SHELL_AWARENESS_MESSAGE_TYPE = "pi-fabric-shell-awareness";
@@ -53,9 +53,14 @@ export class ShellEventInbox {
     on("input", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
     on("before_agent_start", (_event, ctx) => {
       this.#context = ctx;
-      this.#flush(message => sendFabricMessage(this.pi, message,
-        { deliverAs: "nextTurn", triggerTurn: false },
-        () => fabricHostIdentity(ctx.sessionManager.getSessionId()), "actor", "mesh"));
+      // Capable Pi drains nextTurn after hooks; legacy Pi needs the hook result.
+      let message: Message | undefined;
+      this.#flush(value => {
+        if (!fabricProvenanceSupported(this.pi)) { message = value; return; }
+        sendFabricMessage(this.pi, value, { deliverAs: "nextTurn", triggerTurn: false },
+          () => fabricHostIdentity(ctx.sessionManager.getSessionId()), "actor", "mesh");
+      });
+      return message ? { message } : undefined;
     });
     on("session_tree", (_event, ctx) => {
       this.#context = ctx;

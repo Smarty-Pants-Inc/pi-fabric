@@ -1514,7 +1514,15 @@ export class AgentManager {
       const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
       if (!this.config.retainRuns) {
         if (storageSafe) {
-          await removeTree(this.#runRoot).catch(() => undefined);
+          // A recovered manager does not own workers left by an earlier host.
+          // All tracked transports are confirmed exited above; untracked runs stay put.
+          await Promise.all(all.map((managed) => removeTree(managed.runDirectory).catch(() => undefined)));
+          try {
+            if (this.#managedTempRoot && fs.readdirSync(this.#runRoot).every((name) => name === ".fabric-owner.json")) {
+              fs.unlinkSync(path.join(this.#runRoot, ".fabric-owner.json"));
+            }
+            fs.rmdirSync(this.#runRoot); // Never recursively remove an untracked directory.
+          } catch { /* nonempty, missing, or unsafe roots are retained */ }
         }
       } else if (this.#managedTempRoot) {
         try { markRunRootClosed(this.#runRoot, Date.now(), true); } catch {}

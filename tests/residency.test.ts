@@ -10,6 +10,8 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { processStartTime } from "../src/residency/process-identity.js";
 import { projectOf } from "../src/topology/project-identity.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
@@ -792,6 +794,111 @@ describe("durable completion receipts", () => {
 });
 
 describe.skipIf(!hasResidentHost || process.platform === "win32")("durable participant residency", () => {
+  it.skipIf(process.platform !== "linux")("replaces owner and host lock whose live PID has a different start time", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-reused-pid");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
+      participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    const stale = { format: RESIDENT_HOST_FORMAT, hostId: client.hostId, pid: process.pid,
+      processStartTime: "0", token: "stale", startedAt: 0, readyAt: 0 };
+    for (const file of ["owner.json", "host.lock"]) fs.writeFileSync(path.join(state.config.residencyRoot, file), JSON.stringify(stale));
+    try {
+      const actor = await client.createActor({ name: "PID survivor", instructions: "Keep mailbox.", residency: "durable" });
+      const owner = await client.ensureHost();
+      expect(owner.pid).not.toBe(process.pid);
+      expect(owner.processStartTime).toBe(processStartTime(owner.pid));
+      await client.removeActor(actor.id);
+    } finally {
+      await client.close();
+      // The fail-on-base probe leaves the planted owner in place; never signal it.
+      const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+      if (JSON.parse(fs.readFileSync(ownerPath, "utf8")).pid === process.pid) fs.rmSync(ownerPath);
+      await stopResident(state.config); await state.participants.close();
+    }
+  });
+
+  it.each([
+    ["SIGTERM", false], ["SIGKILL", false], ["SIGKILL", true],
+  ] as const)("relaunches a dead durable host on ordinary tell after %s (fresh dead mesh lock: %s)", { timeout: 100_000 }, async (signal, deadMeshLock) => {
+    const state = await rootHarness(`resident-relaunch-${signal}`);
+    const launches = launchLog(state.root);
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    const agents = new AgentManager(repo, state.config.agents, {
+      workerPath: fakeWorker, runRoot: path.join(state.root, "parent-runs"),
+      mainAgentId: state.identity.id, meshRoot: state.config.meshRoot,
+      projectRoot: repo, hostId: state.identity.id, identityId: state.identity.id,
+    });
+    const actors = new ActorManager(state.config.sessionId, state.identity, state.mesh,
+      state.meshConfig, agents, () => {}, {
+        actorRoot: state.config.actorRoot, persistent: true, claimResidency: "session", rootId: state.identity.id,
+        canManageActor: (id) => state.participants.get(id)?.ownerHostId === state.identity.id,
+      });
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
+      participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    // Deliberately do not start the watchdog: this is the ordinary message path.
+    const control = new FabricControlPlane(state.mesh, state.identity, {
+      enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 3_000,
+    });
+    control.start(() => ({ accepted: false }));
+    const router = new AgentMessageRouter(agents, actors, state.mainAgent, state.participants,
+      control, (binding) => binding, client);
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    const owner = () => JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+    const registry = () => JSON.parse(fs.readFileSync(path.join(state.config.actorRoot, "actors.json"), "utf8")) as
+      { actors: Array<{ id: string; messages: Array<{ text?: string; data?: { message?: string } }>; queue: unknown[] }> };
+    let senderRestart: Promise<void> | undefined;
+    try {
+      const actor = await client.createActor({ name: "restart survivor", instructions: "Keep id and mailbox.", residency: "durable", coalesce: false });
+      await router.routeMessage(actor.id, "before death", undefined, "followUp");
+      await waitFor(() => (registry().actors.find((item) => item.id === actor.id)?.messages.length ?? 0) >= 2);
+      const before = registry().actors.find((item) => item.id === actor.id)!;
+      const killed = owner();
+      // Never signal a PID that outlived our launch identity.
+      const recorded = launches.owned().find((entry) => entry.pid === killed.pid)!;
+      expect(recorded).toBeDefined();
+      expect(same(recorded)).toBe(true);
+      if (killed.processStartTime) expect(killed.processStartTime).toBe(recorded.started);
+      process.kill(killed.pid, signal);
+      await waitFor(() => !same(recorded), 20_000);
+      // Send immediately: a dead holder is still unreclaimable during MeshStore's 30 s stale
+      // window. Recovery keeps the tell pending; latency is bounded by that window plus boot/delivery.
+      if (deadMeshLock) {
+        // Deterministically model SIGKILL inside a mesh write, without changing MeshStore's fence.
+        // Pause our own mesh publishers so they cannot race this owner-file publication.
+        await state.participants.close();
+        await control.close();
+        const meshLock = path.join(state.config.meshRoot, ".lock");
+        await waitFor(() => !fs.existsSync(meshLock), 35_000);
+        fs.mkdirSync(meshLock);
+        fs.writeFileSync(path.join(meshLock, "owner"), `dead-host\n${killed.pid}\n${Date.now()}\n`);
+        // Resume the sender after publishing the complete dead identity.
+        senderRestart = state.participants.start().catch(() => undefined);
+        control.start(() => ({ accepted: false }));
+      }
+      const started = Date.now();
+      const result = await router.routeMessage(actor.id, `after ${signal}`, undefined, "followUp");
+      expect(result.queued).toBe(true);
+      expect(Date.now() - started).toBeLessThan(30_000 + 15_000);
+      await senderRestart;
+      expect(owner().pid).not.toBe(killed.pid);
+      await router.routeMessage(actor.id, "queued successor", undefined, "followUp");
+      await waitFor(() => (registry().actors.find((item) => item.id === actor.id)?.messages.length ?? 0) >= before.messages.length + 4);
+      const after = registry().actors.find((item) => item.id === actor.id)!;
+      expect(after.id).toBe(actor.id);
+      expect(after.messages.slice(0, before.messages.length)).toEqual(before.messages);
+      expect(after.messages.map((item) => item.data?.message)).toEqual(expect.arrayContaining([`after ${signal}`, "queued successor"]));
+      await client.removeActor(actor.id);
+    } finally {
+      await senderRestart;
+      await client.close();
+      await stopResident(state.config);
+      await control.close();
+      await actors.close();
+      await agents.close();
+      await state.participants.close();
+    }
+  });
+
   it("keeps a durable actor responsive after its originating Main closes", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-actor");
     const agents = new AgentManager(repo, state.config.agents, {

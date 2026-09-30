@@ -1,0 +1,224 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { spawn } from "node:child_process";
+import { lockFile } from "../src/residency/file-lock.js";
+import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
+import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const fixture = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-host-review-"));
+  const config: ResidentHostConfig = {
+    format: RESIDENT_HOST_FORMAT, rootId: "session:review", sessionId: "review",
+    cwd: process.cwd(), projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"),
+    actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
+    fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
+    retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("dist/agents/worker.js"),
+    fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+  };
+  fs.mkdirSync(config.residencyRoot);
+  const configPath = path.join(config.residencyRoot, "config.json");
+  fs.writeFileSync(configPath, JSON.stringify(config));
+  const idle = vi.fn();
+  const host = new ResidentHost(config, idle);
+  return { root, config, host, idle };
+};
+
+const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+describe("resident orphan retention", () => {
+  it("F6 sweeps old terminal untracked runs at fenced host start, preserving recent/live/unknown/unresolved runs", async () => {
+    const { root, config, host } = fixture();
+    const runs = path.join(config.residencyRoot, "runs");
+    const now = Date.now();
+    const make = (name: string, status: Record<string, unknown>, age = RESIDENT_RUN_RETENTION_MS + 60_000) => {
+      const run = path.join(runs, name);
+      fs.mkdirSync(run, { recursive: true });
+      fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(status));
+      fs.utimesSync(run, (now - age) / 1_000, (now - age) / 1_000);
+      return run;
+    };
+    const old = make("terminal-old", { status: "completed" });
+    const recent = make("terminal-recent", { status: "completed" }, 1_000);
+    const live = make("live", { status: "completed", transport: "process", sessionId: String(process.pid) });
+    const unknown = make("unknown", { status: "running" });
+    const malformed = make("malformed", { status: "completed", transport: "process", sessionId: "unknown" });
+    const deadWithoutBirth = make("dead-without-birth", { status: "running", transport: "process", sessionId: "2147483647" });
+    const unresolved = make("unresolved", { status: "completed" });
+    fs.writeFileSync(path.join(unresolved, "unresolved-worker.json"), "{}");
+    fs.utimesSync(unresolved, (now - RESIDENT_RUN_RETENTION_MS - 60_000) / 1_000, (now - RESIDENT_RUN_RETENTION_MS - 60_000) / 1_000);
+    try {
+      await host.start();
+      expect(fs.existsSync(old)).toBe(false);
+      for (const run of [recent, live, unknown, malformed, deadWithoutBirth, unresolved]) expect(fs.existsSync(run), run).toBe(true);
+      // Inject the clock: a preserved terminal survivor becomes eligible on a later host start.
+      expect(sweepResidentRuns(runs, now + RESIDENT_RUN_RETENTION_MS + 60_000)).toEqual([recent]);
+      expect(sweepResidentRuns(runs, now + 10 * RESIDENT_RUN_RETENTION_MS, 0)).toEqual([]);
+    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe("resident host ownership", () => {
+  it("ignores a config release change and continues accepting actor work", async () => {
+    const { root, config, host, idle } = fixture();
+    const next = path.join(root, "other-package");
+    fs.mkdirSync(path.join(next, "dist/residency"), { recursive: true });
+    fs.writeFileSync(path.join(next, "package.json"), JSON.stringify({ name: "pi-fabric" }));
+    fs.writeFileSync(path.join(next, "dist/residency/launcher.js"), "// must not run");
+    let handler!: Parameters<typeof host.control.start>[0];
+    const control = vi.spyOn(FabricControlPlane.prototype, "start").mockImplementation((accept) => { handler = accept; });
+    try {
+      await host.start();
+      control.mockRestore();
+      const ownerPath = path.join(config.residencyRoot, "owner.json");
+      const owner = fs.readFileSync(ownerPath, "utf8");
+      vi.spyOn(host.actors, "listOwned").mockReturnValue([{ residency: "durable", status: "idle", queued: 0 }] as ReturnType<typeof host.actors.listOwned>);
+      vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "resolveActivationBinding").mockResolvedValue({});
+      const tell = vi.spyOn(host.actors, "tell").mockReturnValue({ messageId: "accepted" } as ReturnType<typeof host.actors.tell>);
+      fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify({ ...config, fabricExtensionPath: path.join(next, "dist/index.js") }));
+      await delay(150);
+      expect(idle).not.toHaveBeenCalled();
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
+      await expect(handler({ operation: "followUp", targetId: "actor", commandId: "after-config", message: "keep working" } as Parameters<typeof handler>[0], host.identity, new AbortController().signal)).resolves.toMatchObject({ accepted: true, messageId: "accepted" });
+      expect(tell).toHaveBeenCalledOnce();
+    } finally {
+      control.mockRestore();
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects delayed and new admissions during ordinary close", async () => {
+    const { root, host } = fixture();
+    let handler!: Parameters<typeof host.control.start>[0];
+    const control = vi.spyOn(FabricControlPlane.prototype, "start").mockImplementation((accept) => { handler = accept; });
+    let resolve: ((binding: Awaited<ReturnType<typeof host.actors.resolveActivationBinding>>) => void) | undefined;
+    let closing: Promise<void> | undefined;
+    try {
+      await host.start();
+      control.mockRestore();
+      vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "resolveActivationBinding").mockImplementation(() => new Promise((done) => { resolve = done; }));
+      const tell = vi.spyOn(host.actors, "tell");
+      const admission = handler({ operation: "followUp", targetId: "actor", commandId: "delayed", message: "keep me" } as Parameters<typeof handler>[0], host.identity, new AbortController().signal);
+      closing = host.close();
+      await expect(handler({ operation: "followUp", targetId: "actor", message: "retry me" } as Parameters<typeof handler>[0], host.identity, new AbortController().signal)).resolves.toMatchObject({ accepted: false, error: "Fabric resident host is closing; retry" });
+      await expect(host.lifecycle.deliver({ to: "actor" } as Parameters<typeof host.lifecycle.deliver>[0], {} as Parameters<typeof host.lifecycle.deliver>[1])).rejects.toThrow("Fabric resident host is closing; retry");
+      resolve!({});
+      await expect(admission).resolves.toMatchObject({ accepted: false, error: "Fabric resident host is closing; retry" });
+      expect(tell).not.toHaveBeenCalled();
+      await closing;
+    } finally {
+      resolve?.({});
+      control.mockRestore();
+      await closing;
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux").each([
+    ["host.lock", true], ["host.lock", false], ["owner.json", true],
+  ] as const)("R3 refuses a live legacy owner in %s (birth identity %s)", async (file, birth) => {
+    const { root, config, host } = fixture();
+    const child = spawn("sleep", ["60"], { stdio: "ignore" });
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+      const record = JSON.stringify({ pid: child.pid, ...(birth ? { processStartTime: processStartTime(child.pid!) } : {}) });
+      const recordPath = path.join(config.residencyRoot, file);
+      fs.writeFileSync(recordPath, record);
+      await expect(host.start()).rejects.toThrow(/already running/);
+      expect(host.actors).toBeUndefined();
+      expect(fs.readFileSync(recordPath, "utf8")).toBe(record);
+      const fd = await lockFile(path.join(config.residencyRoot, "host.lock"), 0);
+      fs.closeSync(fd); // Refusal released the flock; it did not overwrite legacy bytes.
+    } finally { child.kill(); await exited; await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform !== "linux")("R2 two concurrent starters fence all actor/control execution before one wins", async () => {
+    const { root, config, host: first } = fixture();
+    const second = new ResidentHost(config);
+    const control = vi.spyOn(FabricControlPlane.prototype, "start");
+    try {
+      expect(first.actors).toBeUndefined(); expect(second.actors).toBeUndefined();
+      const results = await Promise.allSettled([first.start(), second.start()]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+      expect(rejected.reason.constructor.name).toBe("ResidentHostAlreadyRunning");
+      const loser = results[0]!.status === "rejected" ? first : second;
+      expect(loser.actors).toBeUndefined();
+      expect(control).toHaveBeenCalledTimes(1);
+    } finally { control.mockRestore(); await Promise.all([first.close(), second.close()]); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform !== "linux")("R2 stale diagnostic file naming a dead PID cannot block or replace the kernel inode", async () => {
+    const { root, config, host } = fixture();
+    const lock = path.join(config.residencyRoot, "host.lock");
+    fs.writeFileSync(lock, JSON.stringify({ pid: -1, token: "stale" }));
+    const inode = fs.statSync(lock).ino;
+    // Our own PID is not a different live legacy owner.
+    fs.writeFileSync(path.join(config.residencyRoot, "owner.json"), JSON.stringify({ pid: process.pid }));
+    try {
+      await host.start();
+      expect(fs.statSync(lock).ino).toBe(inode);
+      await host.close();
+      expect(fs.statSync(lock).ino).toBe(inode);
+    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform !== "linux")("R2 SIGKILL releases host ownership without replacing its lock file", async () => {
+    const { root, config, host: successor } = fixture();
+    const lock = path.join(config.residencyRoot, "host.lock");
+    const child = spawn("bun", ["-e", `const {ResidentHost}=await import(${JSON.stringify(path.resolve("src/residency/host.ts"))}); const host=new ResidentHost(${JSON.stringify(config)}); await host.start(); console.log('ready');`], { stdio: ["ignore", "pipe", "pipe"] });
+    const done = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => { child.stdout!.once("data", () => resolve()); child.once("error", reject); child.once("exit", () => reject(new Error("fixture died before ready"))); });
+      const inode = fs.statSync(lock).ino;
+      // Diagnostic content lies: only the OS fence must reject this contender.
+      fs.rmSync(path.join(config.residencyRoot, "owner.json"));
+      fs.writeFileSync(lock, JSON.stringify({ pid: -1, token: "corrupt-diagnostic" }));
+      await expect(successor.start()).rejects.toThrow(/already running/);
+      child.kill("SIGKILL"); await done;
+      await successor.start();
+      expect(fs.statSync(lock).ino).toBe(inode);
+    } finally { child.kill("SIGKILL"); await done; await successor.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 20_000);
+
+  // Preserve round one's unknown-Linux-identity regression: unreadable is not dead.
+  it.skipIf(process.platform !== "linux")("never reclaims a live host's lock on an unreadable start time", async () => {
+    const { root, config, host } = fixture();
+    const contender = new ResidentHost(config);
+    let eio: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await host.start();
+      const lock = path.join(config.residencyRoot, "host.lock");
+      const live = fs.readFileSync(lock, "utf8");
+      const read = fs.readFileSync.bind(fs) as typeof fs.readFileSync;
+      eio = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+        if (String(file) === `/proc/${process.pid}/stat`) throw Object.assign(new Error("EIO"), { code: "EIO" });
+        return read(file, options as never);
+      }) as typeof fs.readFileSync);
+      expect(residentProcessAlive(process.pid, "1")).toBe(true);
+      await expect(contender.start()).rejects.toThrow(/already running|starting/);
+      expect(fs.readFileSync(lock, "utf8")).toBe(live);
+    } finally { eio?.mockRestore(); await Promise.all([host.close(), contender.close()]); fs.rmSync(root, { recursive: true, force: true }); }
+    expect(residentProcessAlive(process.pid, "0")).toBe(false);
+  });
+
+  it("rejects a reused PID but accepts legacy owners without start ticks", () => {
+    expect(residentProcessAlive(process.pid)).toBe(true);
+    expect(residentProcessAlive(-1)).toBe(false);
+    if (process.platform === "linux") {
+      expect(processStartTime(process.pid)).toMatch(/^\d+$/);
+      expect(residentProcessAlive(process.pid, processStartTime(process.pid))).toBe(true);
+      expect(residentProcessAlive(process.pid, "0")).toBe(false);
+    }
+  });
+});

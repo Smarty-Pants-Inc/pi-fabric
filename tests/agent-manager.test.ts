@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -707,6 +707,32 @@ describe("AgentManager", () => {
       await first?.stop();
     }
   }, 45_000);
+
+  it.skipIf(process.platform === "win32")("R3 close preserves an untracked surviving worker directory and removes tracked terminal runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-orphan-"));
+    roots.push(root);
+    const runRoot = path.join(root, "runs");
+    const untracked = path.join(runRoot, "previous-host-worker");
+    fs.mkdirSync(untracked, { recursive: true });
+    fs.writeFileSync(path.join(untracked, "evidence"), "still in use");
+    const child = spawn("sleep", ["60"], { stdio: "ignore" });
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "complete quickly", transport: "process" });
+      expect(result.status).toBe("completed");
+      const tracked = manager.runDirectory(result.id)!;
+      await manager.close();
+      expect(child.exitCode).toBeNull();
+      expect(fs.existsSync(tracked)).toBe(false);
+      expect(fs.existsSync(untracked)).toBe(true);
+      expect(fs.readFileSync(path.join(untracked, "evidence"), "utf8")).toBe("still in use");
+    } finally { child.kill(); await exited; }
+  }, 30_000);
 
   // review/astra on e170d9e: a marked nested child keeps its completed parent's files too.
   it("keeps a completed parent run whose nested child is marked unresolved", async () => {

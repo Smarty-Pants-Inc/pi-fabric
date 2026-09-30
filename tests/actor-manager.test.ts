@@ -88,6 +88,15 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ActorManager closing ingress", () => {
+  it("P2-1 rejects tell while closing rather than accepting memory-only work", async () => {
+    const { actors } = setup(true);
+    const actor = await actors.create({ name: "Closing", instructions: "Wait", runner: "pi" });
+    await actors.close();
+    expect(() => actors.tell(actor.id, "must survive")).toThrow(/closing; retry/);
+  });
+});
+
 // smarty-dev#448: presence writes lost on a contended mesh lock left the mesh without a new
 // actor, or with a removed one.
 describe("ActorManager presence under a stalled mesh lock", () => {

@@ -162,6 +162,8 @@ export interface ResidentHostOwner {
   format: typeof RESIDENT_HOST_FORMAT;
   hostId: string;
   pid: number;
+  /** Linux /proc start ticks; absent for older hosts and on other platforms. */
+  processStartTime?: string | undefined;
   token: string;
   startedAt: number;
   readyAt: number;

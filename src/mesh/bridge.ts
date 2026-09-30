@@ -947,6 +947,8 @@ export class MeshBridge {
             cursor.after = event.sequence;
             forwarded += 1;
             this.#save();
+            // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
+            seen.delete(event.id);
           } catch (error) {
             // Too large or refused by the far side: never retried, or it would stall the source.
             if (!isPermanent(error)) throw error;

@@ -159,8 +159,10 @@ describe("mesh bridge", () => {
       const target = where === "local" ? hub : far;
       const from = where === "local" ? forge.identity : lane.identity;
       const to = where === "local" ? lane.identity.id : forge.identity.id;
-      await source.publish({ topic: "fleet.work.retry.1", kind: "ask", from, to, text: "one" });
-      await source.publish({ topic: "fleet.work.retry.1", kind: "ask", from, to, text: "two" });
+      const sent = [
+        await source.publish({ topic: "fleet.work.retry.1", kind: "ask", from, to, text: "one" }),
+        await source.publish({ topic: "fleet.work.retry.1", kind: "ask", from, to, text: "two" }),
+      ];
       let failure: unknown;
       const running = bridge.run().catch((error: unknown) => { failure = error; });
       try {
@@ -168,12 +170,92 @@ describe("mesh bridge", () => {
         await waitFor(() => calls >= 2);
         expect(times[failAt]! - times[failAt - 1]!).toBeGreaterThanOrEqual(80);
         expect(on(target, "fleet.work.retry.1").map((event) => event.text)).toEqual(["one", "two"]);
+        expect(on(target, "fleet.work.retry.1").map((event) => (event.data as { bridge: { id: string } }).bridge.id))
+          .toEqual(sent.map((event) => event.id));
         expect(logs.filter((line) => line.includes("retrying"))).toHaveLength(1);
         expect(logs.some((line) => /dropped|refused/.test(line))).toBe(false);
         expect(failure).toBeUndefined();
       } finally {
         await bridge.stop();
         await running;
+      }
+    }
+  });
+
+  it.each(["local", "remote"] as const)("releases new seen IDs only after successful %s checkpoints", async (where) => {
+    const cursorPath = path.join(scratch(), "cursor.json");
+    const { hub, far, bridge } = setup(cursorPath);
+    const lane = await addRoot(hub, "lane");
+    const forge = await addRoot(far, "forge-main");
+    await bridge.start();
+    const source = where === "local" ? far : hub;
+    const target = where === "local" ? hub : far;
+    const from = where === "local" ? forge.identity : lane.identity;
+    const to = where === "local" ? lane.identity.id : forge.identity.id;
+    const sent: MeshEvent[] = [];
+    for (let index = 0; index < 12; index++) {
+      sent.push(await source.publish({ topic: "fleet.work.seen.1", kind: "ask", from, to, text: String(index) }));
+    }
+    const known = new Set(sent.map((event) => event.id));
+    const observed = new Set<Set<string>>();
+    const add = Set.prototype.add;
+    Set.prototype.add = function (id) {
+      if (known.has(id)) add.call(observed, this);
+      return add.call(this, id);
+    };
+    try {
+      expect(await bridge.step()).toMatchObject({ [where === "local" ? "toLocal" : "toRemote"]: sent.length, dropped: 0 });
+      expect(observed.size).toBe(1);
+      for (const seen of observed) expect(sent.filter((event) => seen.has(event.id))).toEqual([]);
+      const saved = JSON.parse(fs.readFileSync(cursorPath, "utf8"));
+      expect(saved[where === "local" ? "toLocal" : "toRemote"].after).toBe(sent.at(-1)!.sequence);
+      expect(on(target, "fleet.work.seen.1").map((event) => (event.data as { bridge: { id: string } }).bridge.id))
+        .toEqual(sent.map((event) => event.id));
+    } finally {
+      Set.prototype.add = add;
+    }
+  });
+
+  it.each(["local", "remote"] as const)("retains an uncheckpointed ID on a failed %s save", async (where) => {
+    const cursorDir = scratch();
+    const cursorPath = path.join(cursorDir, "cursor.json");
+    let side!: StoreBridgeSide;
+    const wrap = (store: MeshStore, peer: string): StoreBridgeSide => (side = new StoreBridgeSide(store, peer));
+    const { hub, far, bridge } = setup(cursorPath, where === "local"
+      ? { local: wrap } : { agent: (store) => wrap(store, "dev1") });
+    const lane = await addRoot(hub, "lane");
+    const forge = await addRoot(far, "forge-main");
+    await bridge.start();
+    const source = where === "local" ? far : hub;
+    const sent = await source.publish({ topic: "fleet.work.seen.1", kind: "ask",
+      from: where === "local" ? forge.identity : lane.identity,
+      to: where === "local" ? lane.identity.id : forge.identity.id });
+    const observed = new Set<Set<string>>();
+    const add = Set.prototype.add;
+    Set.prototype.add = function (id) {
+      if (id === sent.id) add.call(observed, this);
+      return add.call(this, id);
+    };
+    const publish = side.publish.bind(side);
+    const backup = path.join(scratch(), "saved");
+    side.publish = async (...args) => {
+      const result = await publish(...args);
+      fs.renameSync(cursorDir, backup);
+      fs.writeFileSync(cursorDir, "blocks checkpoint mkdir");
+      return result;
+    };
+    try {
+      await expect(bridge.step()).rejects.toThrow(/EEXIST|ENOTDIR|not a directory/i);
+      expect(observed.size).toBe(1);
+      for (const seen of observed) expect(seen.has(sent.id)).toBe(true);
+      const saved = JSON.parse(fs.readFileSync(path.join(backup, "cursor.json"), "utf8"));
+      expect(saved[where === "local" ? "toLocal" : "toRemote"].after).toBeLessThan(sent.sequence);
+    } finally {
+      Set.prototype.add = add;
+      side.publish = publish;
+      if (fs.existsSync(backup)) {
+        fs.rmSync(cursorDir, { force: true });
+        fs.renameSync(backup, cursorDir);
       }
     }
   });
@@ -358,7 +440,7 @@ describe("mesh bridge", () => {
     const forgeRoot = await addRoot(first.far, "forge-main");
     await first.bridge.start();
     const before = fs.readFileSync(cursorPath, "utf8");
-    await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
+    const recovered = await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
     expect(await first.bridge.step()).toMatchObject({ toRemote: 1 });
     // A crash after the publish, before the cursor save: the cursor file is the older one.
     fs.writeFileSync(cursorPath, before);
@@ -371,11 +453,26 @@ describe("mesh bridge", () => {
       localName: "dev1", remoteName: "forge", presenceMs: 0, cursorPath,
       local: new StoreBridgeSide(first.hub, "forge"), remote: new RemoteBridgeSide(fromAgent, toAgent),
     });
-    await second.start();
-    expect(await second.step()).toMatchObject({ toRemote: 0 });
-    expect(on(first.far, "fabric.control.command")).toHaveLength(1);
-    await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
-    expect(await second.step()).toMatchObject({ toRemote: 1 });
+    let recoverySeen: Set<string> | undefined;
+    const add = Set.prototype.add;
+    Set.prototype.add = function (id) {
+      if (id === recovered.id) recoverySeen = this;
+      return add.call(this, id);
+    };
+    try {
+      await second.start();
+      expect(recoverySeen?.has(recovered.id)).toBe(true);
+      expect(await second.step()).toMatchObject({ toRemote: 0 });
+      expect(on(first.far, "fabric.control.command")).toHaveLength(1);
+      const fresh = await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
+      expect(await second.step()).toMatchObject({ toRemote: 1 });
+      expect(recoverySeen?.has(recovered.id)).toBe(true); // No blanket recovery-set clear.
+      expect(recoverySeen?.has(fresh.id)).toBe(false);
+      expect(on(first.far, "fabric.control.command").map((event) => (event.data as { bridge: { id: string } }).bridge.id))
+        .toEqual([recovered.id, fresh.id]);
+    } finally {
+      Set.prototype.add = add;
+    }
   });
 
   it("the agent refuses writes off the allow-list, and stamps its pinned peer name", async () => {

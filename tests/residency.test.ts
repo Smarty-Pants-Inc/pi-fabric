@@ -300,6 +300,55 @@ describe.skipIf(process.platform === "win32")("resident host start timeout", () 
 // node_modules shims hangs before the child starts, so the launcher never
 // reaches its spawn trace. Durable residency E2E stays POSIX-only until that
 // spawn path is resolved; the launcher logic tests below run everywhere.
+describe("saturated durable spawn receipt consistency (#181 F2)", () => {
+  it("revokes accepted queued work before reporting failure through the provider", { timeout: 15_000 }, async () => {
+    const state = await rootHarness("resident-saturated");
+    state.config.agents = { ...state.config.agents, maxConcurrent: 1 };
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify(state.config));
+    const controller = new AbortController();
+    const running = runResidentHostFromConfigPath(configPath, controller.signal);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const agents = new AgentManager(repo, state.config.agents, { workerPath: fakeWorker, runRoot: path.join(state.root, "passive-runs") });
+    const passive = new ActorDirectory([state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {},
+      { persistent: true, rootId: state.identity.id, canManageActor: () => false }],
+      { project: state.config.actorRoot, session: state.config.sessionActorRoot! }, "project");
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants,
+      { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(agents, passive, new GlobalActorRegistry(state.root, 64 * 1024),
+      state.mainAgent, state.participants, undefined, lifecycle, undefined, client);
+    const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "test", nestedToolCallId: "spawn",
+      extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
+    const spawned = vi.spyOn(AgentManager.prototype, "spawn");
+    try {
+      await waitFor(() => fs.existsSync(path.join(state.config.residencyRoot, "owner.json")));
+      const blocker = await client.spawnAgent({ task: "HANG", residency: "durable", transport: "process" });
+      await expect(provider.invoke("spawn", { task: "rejected durable activation", residency: "durable", transport: "process" }, context))
+        .rejects.toThrow(/no run directory|cannot queue durable spawns/);
+      const queued = await spawned.mock.results[1]!.value;
+      const hostManager = spawned.mock.contexts[1] as AgentManager;
+      expect(queued.status).toBe("queued");
+      expect(JSON.parse(fs.readFileSync(residentResultPath(state.config.residencyRoot, queued.id), "utf8")))
+        .toMatchObject({ status: "stopped" });
+      expect(() => hostManager.status(queued.id)).toThrow(/Unknown Fabric agent/);
+      expect(client.hasAgent(queued.id)).toBe(false);
+      expect(client.listAgents().map((run) => run.id)).toEqual([blocker.id]);
+      await hostManager.stop(blocker.id);
+      const successor = await client.spawnAgent({ task: "accepted after pool release", residency: "durable", transport: "process" });
+      await expect(client.waitAgent(successor.id)).resolves.toMatchObject({ status: "completed" });
+      expect(hostManager.runDirectory(queued.id)).toBeUndefined();
+      expect(fs.existsSync(path.join(state.config.residencyRoot, "runs", queued.id))).toBe(false);
+      expect(hostManager.list().some((run) => run.id === queued.id)).toBe(false);
+    } finally {
+      spawned.mockRestore();
+      controller.abort(); await running;
+      await Promise.all([client.close(), passive.close(), lifecycle.close(), state.participants.close()]);
+      await agents.close();
+    }
+  });
+});
+
 describe("#169 round 2 public cleanup outcome", () => {
   it.each(["main", "nested"] as const)("carries failed cleanup and exact-id retry through the real %s client and provider", { timeout: 15_000 }, async (caller) => {
     const state = await rootHarness(`public-cleanup-${caller}`);

@@ -178,6 +178,68 @@ describe("stale Main task admission", () => {
     expect(launch).not.toHaveBeenCalled();
     expect(manager.runningCount()).toBe(0);
   });
+  it.each([true, false])("rechecks safety and owner authority after a real permit queue (authorized=%s)", async authorized => {
+    const preparePiModel = vi.fn(async () => undefined);
+    const { manager, activate, base } = setup("after-critical", "active", { preparePiModel });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const blockers = await Promise.all([0, 1].map(index => manager.spawn({ task: "HANG", model: `test/blocker-${index}`, transport: "process" })));
+    let currentOwner = true;
+    const queued = await manager.spawn({ task: "Queued release intersection", model: "test/queued", transport: "process" }, undefined, () => currentOwner);
+    expect(queued).toMatchObject({ status: "queued", notice });
+    expect(manager.runDirectory(queued.id)).toBeUndefined();
+    fs.writeFileSync(path.join(base, "releases-safety.json"), JSON.stringify({ releases: { next: { safetyCritical: true } } }));
+    activate("next");
+    currentOwner = authorized;
+    await manager.stop(blockers[0]!.id);
+    const result = await manager.wait(queued.id);
+    expect(result).toMatchObject(authorized
+      ? { status: "failed", error: expect.stringMatching(/safetyCritical.*next/) }
+      : { status: "stopped", error: "Agent activation no longer authorized" });
+    expect(manager.runDirectory(queued.id)).toBeUndefined();
+    expect(preparePiModel).toHaveBeenCalledTimes(2);
+    expect(launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("updates a noncritical queued notice at launch without changing the loaded release", async () => {
+    const { manager, activate, releases } = setup("after-critical");
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const blockers = await Promise.all(["HANG", "HANG"].map(task => manager.spawn({ task, transport: "process" })));
+    const caller = new AbortController();
+    const queued = await manager.spawn({ task: "Queued notice", transport: "process", recursive: true }, caller.signal);
+    expect(queued).toMatchObject({ status: "queued", notice });
+    caller.abort();
+    activate("next");
+    await manager.stop(blockers[0]!.id);
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "completed", notice: expect.stringContaining("fleet runs next") });
+    expect(launch).toHaveBeenCalledTimes(3);
+    expect(launch.mock.calls[2]![0].workerArguments).toContain(path.join(releases, "after-critical", "dist/index.js"));
+  });
+
+  it("parks an actor event when its accepted queued receipt becomes safety-stale before launch", async () => {
+    const { manager, base, activate } = setup("after-critical");
+    const identity = { id: "session:queued-release", name: "Main", kind: "main" as const, sessionId: "queued-release" };
+    const mesh = new MeshStore(path.join(base, "mesh"), 64 * 1024, 100);
+    const actorRoot = path.join(base, "actors");
+    const actors = new ActorManager(identity.sessionId, identity, mesh, {
+      ...DEFAULT_FABRIC_CONFIG.mesh, enabled: true, actorPollMs: 20,
+    }, manager, () => {}, { actorRoot, persistent: true, rootId: identity.id });
+    actorManagers.push(actors);
+    const blockers = await Promise.all(["HANG", "HANG"].map(task => manager.spawn({ task, transport: "process" })));
+    const actor = await actors.create({ name: "Queued release event", instructions: "Reply", responseMode: "text" });
+    actors.tell(actor.id, "preserve-queued-event");
+    await vi.waitFor(() => expect(manager.list().some(run => run.actorId === actor.id && run.status === "queued")).toBe(true));
+    fs.writeFileSync(path.join(base, "releases-safety.json"), JSON.stringify({ releases: { next: { safetyCritical: true } } }));
+    activate("next");
+    await manager.stop(blockers[0]!.id);
+    await vi.waitFor(() => expect(actors.status(actor.id).lastError).toMatch(/safetyCritical/));
+    const queue = fs.readdirSync(path.join(actorRoot, actor.id)).find(name => name.startsWith("queue-"));
+    expect(queue).toBeDefined();
+    const saved = JSON.parse(fs.readFileSync(path.join(actorRoot, actor.id, queue!), "utf8"));
+    expect(saved.items).toHaveLength(1);
+    expect(saved.items[0]).toMatchObject({ admissionRefused: true, payload: { message: "preserve-queued-event" } });
+    expect(actors.messages(actor.id).filter(message => message.direction === "out")).toHaveLength(0);
+  });
+
   it("loaded equals active: no notice or stale event", async () => {
     const { manager, publishStaleMain } = setup("active");
     const handle = await manager.spawn({ task: "Current task", transport: "process" });

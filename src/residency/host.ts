@@ -657,7 +657,14 @@ class ResidentHost {
         }
         const handle = await this.agents.spawn({ ...command.request, residency: "durable" });
         const runDirectory = this.agents.runDirectory(handle.id);
-        if (!runDirectory) throw new Error(`Resident agent ${handle.id} has no run directory`);
+        if (!runDirectory) {
+          // Durable metadata currently requires an admitted run directory. Never
+          // report a failed spawn while leaving its accepted queue entry alive:
+          // stop revokes admission synchronously and joins any admission race.
+          await this.agents.stop(handle.id);
+          await this.agents.cleanup(handle.id);
+          throw new Error("Resident host cannot queue durable spawns while all permits are occupied; the queued request was stopped. Retry after capacity is available.");
+        }
         const worktreeGitRoot = this.agents.worktreeGitRoot(handle.id);
         const metadata: ResidentAgentMetadata = {
           format: RESIDENT_HOST_FORMAT,

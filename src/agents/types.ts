@@ -123,6 +123,8 @@ export interface AgentRunRecord {
   name: string;
   task: string;
   status: AgentRunStatus;
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;
@@ -149,6 +151,8 @@ export interface AgentRunRecord {
   error?: string;
   /** The spawning Main is behind the fleet release (smarty-dev#2665). */
   notice?: string;
+  /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM";
   /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
   warnings?: string[];
   stderr?: string;
@@ -176,6 +180,8 @@ export interface AgentHandleInfo {
   /** The spawning Main is behind the fleet release (smarty-dev#2665). */
   notice?: string;
   status: AgentRunStatus;
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;
@@ -273,8 +279,10 @@ export interface AgentTransportLaunch {
   cwd: string;
   workerPath: string;
   workerArguments: string[];
-  /** Aborted when the agent manager closes; a transport may stop waiting to launch. */
-  signal?: AbortSignal;
+  /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
+  signal?: AbortSignal | undefined;
+  /** Host activation generation check. Recheck after preparation, immediately before worker creation. */
+  authorize?: () => boolean;
 }
 
 export interface AgentTransportHandle {

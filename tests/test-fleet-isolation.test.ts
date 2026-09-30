@@ -24,6 +24,7 @@ registerHooks({ resolve(specifier, context, nextResolve) {
 const repo = process.cwd();
 const sentinel = process.env.FLEET_ISOLATION_SENTINEL;
 const entry = process.env.FLEET_ISOLATION_ENTRY;
+const testControls = JSON.parse(process.env.FLEET_ISOLATION_TEST_CONTROLS);
 const baseline = fs.readFileSync(path.join(sentinel, "agent", "fabric.json"), "utf8");
 const module = await import(pathToFileURL(entry).href);
 // These selectors grant WRITE locations; semantic project attribution is deliberately absent.
@@ -42,17 +43,20 @@ const assertIsolated = () => {
   }
   assert.equal(process.env.PI_FABRIC_PROJECT, undefined, "inherited semantic project must be scrubbed, not replaced");
   const safe = new Set(keys.filter(key => key.startsWith("PI_FABRIC_")));
-  assert.deepEqual(Object.keys(process.env).filter(key => key.startsWith("PI_FABRIC_") && !safe.has(key)), []);
+  // Test controls are separate from the private writable roots, not fleet authority.
+  for (const [key, value] of Object.entries(testControls)) assert.equal(process.env[key], value);
+  assert.deepEqual(Object.keys(process.env).filter(key => key.toUpperCase().startsWith("PI_FABRIC_") && !safe.has(key) && !Object.hasOwn(testControls, key)), []);
   for (const key of ["SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID"])
     assert.equal(process.env[key], undefined, key + " inherited fleet authority");
   return root;
 };
 const assertChildSnapshot = () => {
-  const child = spawnSync(process.execPath, ["-e", 'console.log(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("PI_FABRIC_") || ["PI_CODING_AGENT_DIR", "SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "MCPORTER_CONFIG"].includes(key)))))'], { encoding: "utf8", timeout: 3_000 });
+  const child = spawnSync(process.execPath, ["-e", 'console.log(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toUpperCase().startsWith("PI_FABRIC_") || ["PI_CODING_AGENT_DIR", "SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "MCPORTER_CONFIG"].includes(key)))))'], { encoding: "utf8", timeout: 3_000 });
   assert.equal(child.status, 0, child.stderr);
   const inherited = JSON.parse(child.stdout);
   for (const key of keys) assert.equal(inherited[key], process.env[key]);
-  assert.deepEqual(Object.keys(inherited).sort(), keys.slice().sort());
+  for (const [key, value] of Object.entries(testControls)) assert.equal(inherited[key], value);
+  assert.deepEqual(Object.keys(inherited).sort(), [...keys, ...Object.keys(testControls)].sort());
 };
 const configRoot = assertIsolated(); // MUST fail on HEAD before any real runtime writes.
 assertChildSnapshot();
@@ -145,7 +149,14 @@ test.each(["vitest.config.ts", "tests/fleet-isolation-setup.ts"])(
     try {
       fs.mkdirSync(path.join(sentinel, "agent"));
       fs.writeFileSync(path.join(sentinel, "agent", "fabric.json"), '{"sentinel":"unchanged"}\n');
-      const env: NodeJS.ProcessEnv = { ...process.env, FLEET_ISOLATION_SENTINEL: sentinel, FLEET_ISOLATION_ENTRY: path.join(repo, entry) };
+      const testControls = {
+        PI_FABRIC_JEV_LIVE: "1", PI_FABRIC_JEV_LOCALTERM: "1",
+        PI_FABRIC_ACTIVATION_TEST_PI_BINARY: "./exact artifact/native.exe",
+        PI_FABRIC_ACTIVATION_TEST_WORKER: "./exact artifact/worker.js",
+        PI_FABRIC_TEST_PG_BIN: "./exact artifact/pg bin", PI_FABRIC_TEST_PID_DELAY_MS: "600",
+      };
+      const env: NodeJS.ProcessEnv = { ...process.env, ...testControls, FLEET_ISOLATION_SENTINEL: sentinel,
+        FLEET_ISOLATION_ENTRY: path.join(repo, entry), FLEET_ISOLATION_TEST_CONTROLS: JSON.stringify(testControls) };
       for (const key of ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT", "PI_FABRIC_PROJECT",
         "PI_FABRIC_RUN_ROOT", "PI_FABRIC_AGENT_DIR", "PI_FABRIC_RESIDENT_CONFIG", "PI_FABRIC_BUDGET_FILE",
         "PI_FABRIC_REPLY_FILE", "PI_FABRIC_REPLY_SCHEMA_FILE", "PI_CODING_AGENT_DIR", "MCPORTER_CONFIG", "HERDR_SOCKET_PATH"])
@@ -154,7 +165,10 @@ test.each(["vitest.config.ts", "tests/fleet-isolation-setup.ts"])(
         "PI_FABRIC_SESSION_ID", "PI_FABRIC_HOST_ID", "PI_FABRIC_IDENTITY_ID", "PI_FABRIC_OWNER_HOST_ID",
         "PI_FABRIC_OWNER_IDENTITY_ID", "PI_FABRIC_ROLE", "PI_FABRIC_CAPABILITY_REQUIREMENTS",
         "PI_FABRIC_CAPABILITY_DIGEST", "PI_FABRIC_GRANTED_RISKS", "PI_FABRIC_TOOL_ALLOWLIST",
-        "PI_FABRIC_FUTURE_SELECTOR", "SMARTY_ROLE", "HERDR_WORKSPACE_ID"])
+        "PI_FABRIC_FUTURE_SELECTOR", "PI_FABRIC_PI_BINARY", "PI_FABRIC_NODE_BINARY",
+        "PI_FABRIC_PROFILE", "PI_FABRIC_JEV_LIVE_EXTRA", "PI_FABRIC_ACTIVATION_TEST_WORKER_EXTRA",
+        "PI_FABRIC_TEST_FUTURE", "PI_FABRIC_TEST_PG_BIN_EXTRA", "pi_fabric_future_case_selector",
+        "SMARTY_ROLE", "HERDR_WORKSPACE_ID"])
         env[key] = "production-main-sentinel";
       env.HERDR_ENV = "1";
       const child = spawnSync(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", childProbe], {

@@ -39,12 +39,24 @@ export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEM
 // avoids accumulating hundreds of listeners while retaining cleanup for every root.
 const fleetRootsKey = Symbol.for("pi-fabric.test-owned-fleet-roots");
 
+// An exact test-only channel, NOT a prefix exemption or production authority.
+// Jev owns its strict === "1" opt-ins; activation owns exact native/worker paths.
+// PostgreSQL reads its binary directory at import; the shell seam reads a delay
+// at first use and accepts only positive integers. Preserve those semantics,
+// including missing/off values, without validating existence or rewriting paths.
+const testControls = new Set([
+  "PI_FABRIC_JEV_LIVE", "PI_FABRIC_JEV_LOCALTERM",
+  "PI_FABRIC_ACTIVATION_TEST_PI_BINARY", "PI_FABRIC_ACTIVATION_TEST_WORKER",
+  "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS",
+]);
+
 /** Run at config evaluation AND before each test file's source imports. */
 export function isolateTestFleetEnvironment(): Record<string, string> {
-  // Clear the entire namespace, including future path/identity/capability selectors.
+  // Scrub production/future selectors, not the exact test-only controls above.
+  // Keep values verbatim: consumers own strict booleans and artifact selection.
   // Unsetting paths alone would fall back to the checkout or the user's Pi profile.
   for (const key of Object.keys(process.env)) {
-    if (key.toUpperCase().startsWith("PI_FABRIC_")) delete process.env[key];
+    if (key.toUpperCase().startsWith("PI_FABRIC_") && !testControls.has(key)) delete process.env[key];
   }
   for (const key of [
     "PI_CODING_AGENT_DIR", "SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH",

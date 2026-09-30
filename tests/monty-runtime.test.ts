@@ -4,6 +4,7 @@ import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MAX_EXECUTOR_TIMEOUT_MS } from "../src/config.js";
 import type { FabricHostCall, FabricSandboxOptions } from "../src/runtime/kernel.js";
 import { MontyRuntime } from "../src/runtime/monty-runtime.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const require = createRequire(import.meta.url);
 let missing: string | undefined;
@@ -168,10 +169,12 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
   });
 
   it("extends host deadlines without a fixed VM/per-turn ceiling defeating the floor", async () => {
-    const result = await run('return await schema.status()', async () => {
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => run('return await schema.status()', async () => {
+      admitted = true;
       await new Promise((resolve) => setTimeout(resolve, 350));
       return "done";
-    }, { timeoutMs: 200, minimumTimeoutMsForHostCall: () => 900 });
+    }, { timeoutMs: 200, signal, minimumTimeoutMsForHostCall: () => 900 }), () => admitted);
     expect(result).toMatchObject({ terminationReason: "completed", value: "done" });
   });
 
@@ -185,7 +188,9 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
       vi.spyOn(pool, "checkout").mockImplementation(async (opts) => { checkouts.push(opts); return checkout(opts); });
       return pool;
     });
-    expect(await run("return 1", echo, { timeoutMs: 100, minimumTimeoutMsForHostCall: () => 1000 })).toMatchObject({ value: 1, terminationReason: "completed" });
+    let admitted = false;
+    expect(await executeAfterAdmission(signal => run('await schema.status()\nreturn 1', async (...args) => { admitted = true; return echo(...args); },
+      { timeoutMs: 100, signal, minimumTimeoutMsForHostCall: () => 1000 }), () => admitted)).toMatchObject({ value: 1, terminationReason: "completed" });
     expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({ requestTimeout: MAX_EXECUTOR_TIMEOUT_MS / 1000 + 1, durationLimitGrace: null }));
     expect(checkouts[0]).toMatchObject({ limits: { maxMemory: options.memoryLimitBytes } });
     expect((checkouts[0] as { limits: object }).limits).not.toHaveProperty("maxDurationSecs");
@@ -194,7 +199,9 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
   it("hard-interrupts synchronous loops with and without extendable deadlines", async () => {
     for (const extra of [{}, { minimumTimeoutMsForHostCall: () => 500 }]) {
       const started = Date.now();
-      const result = await run('print("started")\nwhile True:\n    pass', echo, { ...extra, timeoutMs: 150 });
+      let admitted = false;
+      const result = await executeAfterAdmission(signal => run('print("started")\nawait schema.status()\nwhile True:\n    pass', async () => { admitted = true; },
+        { ...extra, timeoutMs: 150, signal }), () => admitted);
       expect(result.terminationReason).toBe("timed_out");
       expect(result.logs).toContain("started");
       expect(Date.now() - started).toBeLessThan(2000);
@@ -211,11 +218,11 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
     for (const cancel of [false, true]) {
       const controller = new AbortController();
       let hostSignal: AbortSignal | undefined;
-      const result = await run("return await schema.status()", async (_ref, _args, signal) => {
+      const result = await executeAfterAdmission(safety => run("return await schema.status()", async (_ref, _args, signal) => {
         hostSignal = signal;
         if (cancel) controller.abort();
         return new Promise(() => undefined);
-      }, { signal: controller.signal, timeoutMs: 200 });
+      }, { signal: AbortSignal.any([safety, controller.signal]), timeoutMs: 200 }), () => hostSignal !== undefined);
       expect(result.terminationReason).toBe(cancel ? "aborted" : "timed_out");
       expect(hostSignal?.aborted).toBe(true);
     }
@@ -238,7 +245,9 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
     });
     await run("return 1");
     await run('raise ValueError("fail")');
-    await run("while True: pass", echo, { timeoutMs: 100 });
+    let admitted = false;
+    await executeAfterAdmission(signal => run('await schema.status()\nwhile True: pass', async () => { admitted = true; },
+      { timeoutMs: 100, signal }), () => admitted);
     const controller = new AbortController();
     await run("return await schema.status()", async () => { controller.abort(); return null; }, { signal: controller.signal });
     expect(pids).toHaveLength(4);

@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { BunProcessRuntime, NodeProcessRuntime } from "../src/runtime/node-process-runtime.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const options = {
   timeoutMs: 5_000,
@@ -137,20 +138,22 @@ return { texts, walk };
   });
 
   it("extends the active deadline for a long host call", async () => {
-    const result = await new NodeProcessRuntime().execute(
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new NodeProcessRuntime().execute(
       'await tools.call({ ref: "pi.bash", args: { timeout: 1 } }); return "ok";',
       async () => {
+        admitted = true;
         await new Promise((resolve) => setTimeout(resolve, 1_250));
         return { output: "ok" };
       },
       {
         ...options,
-        timeoutMs: 1_000,
+        timeoutMs: 1_000, signal,
         minimumTimeoutMsForHostCall(ref) {
           return ref === "fabric.$call" ? 3_000 : undefined;
         },
       },
-    );
+    ), () => admitted);
 
     expect(result.terminationReason).toBe("completed");
     expect(result.value).toBe("ok");
@@ -231,11 +234,12 @@ await Promise.all([
   });
 
   it("forcibly terminates synchronous infinite loops", async () => {
-    const result = await new NodeProcessRuntime().execute(
-      "while (true) {}",
-      async () => undefined,
-      { ...options, timeoutMs: 50 },
-    );
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new NodeProcessRuntime().execute(
+      'await tools.call({ ref: "demo.ready" }); while (true) {}',
+      async () => { admitted = true; },
+      { ...options, timeoutMs: 50, signal },
+    ), () => admitted);
 
     expect(result.terminationReason).toBe("timed_out");
     expect(result.error).toContain("timed out after 50ms");
@@ -254,10 +258,9 @@ await Promise.all([
 
   it("terminates the child process when externally aborted", async () => {
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new Error("stop")), 25);
     const result = await new NodeProcessRuntime().execute(
-      "await new Promise(() => {});",
-      async () => undefined,
+      'await tools.call({ ref: "demo.ready" }); await new Promise(() => {});',
+      async () => { controller.abort(new Error("stop")); },
       { ...options, signal: controller.signal },
     );
 
@@ -344,11 +347,12 @@ return { models, process: typeof process };
   });
 
   it("forcibly terminates synchronous infinite loops", async () => {
-    const result = await new BunProcessRuntime().execute(
-      "while (true) {}",
-      async () => undefined,
-      { ...options, timeoutMs: 50 },
-    );
+    let admitted = false;
+    const result = await executeAfterAdmission(signal => new BunProcessRuntime().execute(
+      'await tools.call({ ref: "demo.ready" }); while (true) {}',
+      async () => { admitted = true; },
+      { ...options, timeoutMs: 50, signal },
+    ), () => admitted);
 
     expect(result.terminationReason).toBe("timed_out");
     expect(result.error).toContain("timed out after 50ms");
@@ -356,10 +360,9 @@ return { models, process: typeof process };
 
   it("terminates the child process when externally aborted", async () => {
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new Error("stop")), 25);
     const result = await new BunProcessRuntime().execute(
-      "await new Promise(() => {});",
-      async () => undefined,
+      'await tools.call({ ref: "demo.ready" }); await new Promise(() => {});',
+      async () => { controller.abort(new Error("stop")); },
       { ...options, signal: controller.signal },
     );
 

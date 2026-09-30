@@ -1006,6 +1006,102 @@ describe("Main followUp journal across a live reload in a real Pi session", () =
   });
 });
 
+// pi-fabric#184 Astra R4: rejecting /compact is not necessarily an owner stop.
+describe("Main benign compaction rejection and owner cancellation in a real Pi session", () => {
+  const cases = [0, 60_000].flatMap(flushMs => (["followUp", "steer"] as const).flatMap(delivery =>
+    (["small", "already", "declined", "owner-abort"] as const).flatMap(outcome =>
+      (outcome === "owner-abort" ? [false] : [false, true]).map(ownerHalt => ({ flushMs, delivery, outcome, ownerHalt })))));
+  it.each(cases)(
+    "$outcome compaction preserves peer $delivery permission before and after reload (flushMs=$flushMs, ownerHalt=$ownerHalt)",
+    async ({ flushMs, delivery, outcome, ownerHalt }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-compact-permission-"));
+      roots.push(root);
+      const journal = path.join(root, "journal.json");
+      const faux = fauxProvider();
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+      modelRuntime.registerNativeProvider(faux.provider);
+      const mains: MainAgentController[] = [];
+      const failures: Array<{ aborted: boolean; errorMessage?: string }> = [];
+      const operationAborts: boolean[] = [];
+      let starts = 0;
+      let session: AgentSession;
+      const loader = new DefaultResourceLoader({
+        cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{
+          name: "compact-permission",
+          factory: (pi: ExtensionAPI) => {
+            pi.on("agent_start", () => { starts++; });
+            pi.on("session_start", (_event, ctx) => {
+              const main = new MainAgentController(pi, "session:root", true, root, "root");
+              main.attachFollowUpDrain(ctx, flushMs, journal);
+              mains.push(main);
+            });
+            pi.on("session_shutdown", () => { mains.at(-1)?.closeFollowUpDrain(); });
+            pi.on("session_compact_failed", event => { failures.push(event); });
+            pi.on("session_before_compact", event => {
+              if (outcome === "owner-abort") session.abortCompaction();
+              operationAborts.push(event.signal.aborted);
+              if (outcome === "declined") return { cancel: true };
+              return { compaction: {
+                summary: "summary", firstKeptEntryId: event.preparation.firstKeptEntryId,
+                tokensBefore: event.preparation.tokensBefore,
+              } };
+            });
+          },
+        }],
+      });
+      await loader.reload();
+      ({ session } = await createAgentSession({
+        cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(root), noTools: "all",
+        settingsManager: SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: outcome === "small" ? 16_384 : 1 } }),
+      }));
+      sessions.push(session);
+      await session.bindExtensions({ shutdownHandler: () => undefined });
+      faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second"), fauxAssistantMessage("peer one"), fauxAssistantMessage("peer two")]);
+      const stopped = ownerHalt || outcome === "owner-abort";
+      try {
+        await session.prompt("first question");
+        await session.prompt("second question");
+        if (ownerHalt) mains.at(-1)!.halt(); // Escape while idle produces no aborted turn.
+        if (outcome === "already") await session.compact();
+        await expect(session.compact()).rejects.toThrow(outcome === "small" ? "Nothing to compact (session too small)" :
+          outcome === "already" ? "Already compacted" : "Compaction cancelled");
+        expect(failures).toHaveLength(1);
+        expect(failures[0]!.aborted).toBe(outcome === "declined" || outcome === "owner-abort");
+        if (outcome === "declined") expect(operationAborts).toEqual([false]);
+        if (outcome === "owner-abort") expect(operationAborts).toEqual([true]);
+        expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+        const initialStarts = starts;
+        const initialCalls = faux.state.callCount;
+        expect(initialStarts).toBe(2); // No compaction outcome itself started a run.
+        for (const phase of ["before", "after"] as const) {
+          if (phase === "after") {
+            await session.reload();
+            expect(mains).toHaveLength(2);
+            expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+          }
+          const request = { from: { id: "session:peer", name: "peer", kind: "main" as const },
+            message: `peer ${phase} reload`, delivery, deliveryId: `peer-${phase}` };
+          const result = mains.at(-1)!.deliverAgent(request);
+          expect(mains.at(-1)!.deliverAgent(request)).toMatchObject({ duplicate: true });
+          await session.waitForIdle();
+          const received = session.messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
+          expect(received).toHaveLength(phase === "before" ? 1 : 2);
+          expect(received.at(-1)).toMatchObject({ details: { id: result.messageId, triggerTurn: !stopped } });
+          const runs = stopped ? 0 : phase === "before" ? 1 : 2;
+          expect(starts - initialStarts).toBe(runs);
+          expect(faux.state.callCount - initialCalls).toBe(runs);
+        }
+      } finally {
+        await session.abort();
+        await session.waitForIdle();
+        mains.at(-1)?.closeFollowUpDrain();
+      }
+    },
+  );
+});
+
 // pi-fabric#184 Astra R3: a provider retry continues without a user input event.
 describe("Main provider recovery in a real Pi session", () => {
   it.each([0, 60_000].flatMap((flushMs) => [false, true].map((ownerHalt) => ({ flushMs, ownerHalt }))))(

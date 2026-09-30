@@ -86,39 +86,8 @@ export interface FabricMainAgentTarget {
   flushHeldAtNextBoundary?(): void;
 }
 
-export interface FabricIdentityResolution {
-  identity: MeshIdentity;
-  mainAgentId: string;
-}
-
-export const resolveFabricIdentity = (
-  sessionId: string,
-  environment: NodeJS.ProcessEnv = process.env,
-): FabricIdentityResolution => {
-  const actorId = environment.PI_FABRIC_ACTOR_ID?.trim();
-  const parentAgentId = environment.PI_FABRIC_PARENT_RUN?.trim();
-  const identity: MeshIdentity = actorId
-    ? {
-        id: actorId,
-        name: environment.PI_FABRIC_ACTOR_NAME?.trim() || actorId.slice(0, 8),
-        kind: "actor",
-        sessionId,
-      }
-    : parentAgentId
-      ? {
-          id: parentAgentId,
-          name: environment.PI_FABRIC_AGENT_NAME?.trim() || parentAgentId.slice(0, 8),
-          kind: "agent",
-          sessionId,
-        }
-      : { id: `session:${sessionId}`, name: "main", kind: "main", sessionId };
-  const inheritedMainAgentId = environment.PI_FABRIC_MAIN_AGENT_ID?.trim();
-  return {
-    identity,
-    mainAgentId:
-      inheritedMainAgentId || (identity.kind === "main" ? identity.id : `session:${sessionId}`),
-  };
-};
+// Keep identity resolution available to existing callers without making startup import the drain.
+export { resolveFabricIdentity, type FabricIdentityResolution } from "./main-agent-identity.js";
 
 const escapeXmlText = (value: string): string =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -827,7 +796,28 @@ export class MainAgentController implements FabricMainAgentTarget {
     };
     on("agent_before_settle", settleGate);
     on("agent_settled", settleGate);
-    on("session_compact_failed", () => this.halt());
+    // Observe the operation in BOTH drain modes. Pi also reports an extension's benign
+    // decline as aborted, but only the operation signal proves an owner cancellation.
+    on("session_before_compact", (event: { reason?: string; signal?: AbortSignal }) => {
+      this.#operation = event.reason === "manual" ? event.signal : undefined;
+    });
+    on("session_compact_failed", (event: { reason?: string; aborted?: boolean; willRetry?: boolean; errorMessage?: string }, ctx) => {
+      this.#context = ctx;
+      // The aborted bit alone is ambiguous: an earlier handler may decline and stop
+      // dispatch before we see the signal. Escape/halt is explicit; a seen signal
+      // proves cancellation. Never manufacture durable owner intent from a decline.
+      const ownerCancelled = ctx.signal?.aborted || this.#operation?.aborted;
+      // Exact Pi no-op outcomes, with or without the host's error envelope. A provider
+      // error merely quoting these phrases is still a terminal failure, not a no-op.
+      const message = event.errorMessage?.replace(/^Compaction failed: /, "");
+      const benign = message === "Already compacted" || message === "Nothing to compact (session too small)" ||
+        message === "Compaction cancelled";
+      if (ownerCancelled || (!event.aborted && !event.willRetry && !benign)) this.halt();
+      // Unsuccessful boundaries never wake their queued replay, even for a benign rejection.
+      // Later peer deliveries retain their own permission unless the owner really stopped.
+      if (event.reason === "manual" && ctx.isIdle()) this.#release(false);
+      this.#operation = undefined;
+    });
     if (!(flushMs > 0) || typeof this.pi.on !== "function") {
       // Drain off: what an earlier drain journalled goes to Pi's own queue, under the same rule.
       // Each stays in the journal until the session holds it (review/astra F4 on pi-fabric#102).
@@ -882,9 +872,6 @@ export class MainAgentController implements FabricMainAgentTarget {
     // leaves them to that run's boundaries.
     // The operation's own abort signal says whether the user cancelled it: Pi can report that
     // cancel after Main is idle again, or not at all (review/astra on pi-fabric#102).
-    on("session_before_compact", (event: { reason?: string; signal?: AbortSignal }) => {
-      this.#operation = event.reason === "manual" ? event.signal : undefined;
-    });
     on("session_before_tree", (event: { signal?: AbortSignal }) => { this.#operation = event.signal; });
     on("session_compact", (event: { reason?: string }, ctx) => {
       this.#context = ctx;
@@ -895,11 +882,6 @@ export class MainAgentController implements FabricMainAgentTarget {
     on("session_tree", (_event, ctx) => {
       this.#context = ctx;
       this.#wakeWhenIdle();
-    });
-    on("session_compact_failed", (event: { reason?: string }, ctx) => {
-      this.#context = ctx;
-      // Pi clears the compaction state before this event, so Main is idle here.
-      if (event.reason === "manual" && ctx.isIdle()) this.#release(false);
     });
     on("agent_start", (_event, ctx) => { this.#context = ctx; this.#suspended = false; this.#stopWake(); });
     this.#replay();
@@ -925,6 +907,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#scanned = undefined;
     this.#journal = undefined;
     this.#context = undefined;
+    this.#operation = undefined;
   }
 
   #drainActive(): boolean {
@@ -1008,10 +991,13 @@ export class MainAgentController implements FabricMainAgentTarget {
     // session_compact_failed, or held for the next run). Without the signal, success is unknown.
     if (this.#wake) return;
     const operation = this.#operation;
-    this.#operation = undefined;
+    // Retain cancellation evidence while later completion handlers still run.
     this.#wake = setInterval(() => {
       if (this.#closed || !operation || operation.aborted) this.#stopWake();
-      else if (this.#context?.isIdle()) this.#held.length ? this.#release(true) : this.#stopWake();
+      else if (this.#context?.isIdle()) {
+        if (this.#operation === operation) this.#operation = undefined;
+        this.#held.length ? this.#release(true) : this.#stopWake();
+      }
     }, 25);
     this.#wake.unref?.();
   }

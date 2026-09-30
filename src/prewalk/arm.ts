@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricState } from "../fabric-state.js";
-import { resolveFabricIdentity } from "../main-agent.js";
+import { resolveFabricIdentity } from "../main-agent-identity.js";
 import {
   PREWALK_ARMED_MESSAGE_TYPE,
   hasPrewalkArmedPrompt,

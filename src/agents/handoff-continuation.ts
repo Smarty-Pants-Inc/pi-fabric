@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resolveFabricIdentity } from "../main-agent.js";
+import { resolveFabricIdentity } from "../main-agent-identity.js";
 
 export const HANDOFF_CONTINUATION_MESSAGE_TYPE = "pi-fabric-handoff-continuation";
 

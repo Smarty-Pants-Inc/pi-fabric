@@ -311,10 +311,44 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     old.controller.closeFollowUpDrain();
     const fresh = f.main(false);
     fresh.setIdle(true);
+    const operation = new AbortController();
+    fresh.emit("session_before_compact", { reason: "manual", signal: operation.signal });
+    if (aborted) operation.abort();
     fresh.emit("session_compact_failed", { reason: "manual", aborted, errorMessage: "failed" });
     fresh.emit("agent_settled", { outcome: "completed" }); // an unrelated completion cannot lift the owner's stop
     expect(f.sent.map((item) => item.options)).toEqual(["steer", "followUp"].map((deliverAs) => ({ deliverAs, triggerTurn: false })));
   });
+
+  it.each([0, 60_000].flatMap(flushMs => [
+    { errorMessage: "Already compacted", willRetry: false, stopped: false },
+    { errorMessage: "Compaction failed: Already compacted", willRetry: false, stopped: false },
+    { errorMessage: "Nothing to compact (session too small)", willRetry: false, stopped: false },
+    { errorMessage: "Compaction failed: Nothing to compact (session too small)", willRetry: false, stopped: false },
+    { errorMessage: "Compaction cancelled", willRetry: false, stopped: false },
+    { errorMessage: "Compaction failed: provider quoted Already compacted", willRetry: false, stopped: true },
+    { errorMessage: "Compaction failed: unavailable", willRetry: false, stopped: true },
+    { errorMessage: "Compaction failed: unavailable", willRetry: true, stopped: false },
+  ].map(test => ({ flushMs, ...test }))))(
+    "compaction failure keeps boundary replay passive without inventing an owner stop ($errorMessage, retry=$willRetry, flushMs=$flushMs)",
+    async ({ flushMs, errorMessage, willRetry, stopped }) => {
+      const f = await fixture();
+      const old = f.main(true, flushMs);
+      old.controller.prepareReload();
+      const request = { from: sender, message: "boundary replay", delivery: "steer" as const, deliveryId: "compact-replay" };
+      old.controller.deliverAgent(request);
+      old.controller.closeFollowUpDrain();
+      const fresh = f.main(false, flushMs);
+      fresh.setIdle(true);
+      fresh.emit("session_compact_failed", { reason: "manual", aborted: false, errorMessage, willRetry });
+      expect(f.sent[0]!.options.triggerTurn).toBe(false);
+      fresh.controller.deliverAgent({ from: sender, message: "later peer", delivery: "followUp" });
+      expect(f.sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+      fresh.controller.closeFollowUpDrain();
+      const reloaded = f.main(true, flushMs);
+      reloaded.controller.deliverAgent({ from: sender, message: "peer after reload", delivery: "steer" });
+      expect(f.sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+    },
+  );
 
   it.each([0, 60_000])("a lost direct Pi handoff is reconciled passively at a failed boundary (flushMs=%s)", async (flushMs) => {
     const f = await fixture();

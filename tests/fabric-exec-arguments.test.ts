@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { prepareFabricExecArguments } from "../src/fabric-exec-arguments.js";
+import { prepareFabricExecArguments, resolveFabricExecPayloads } from "../src/fabric-exec-arguments.js";
 
 describe("prepareFabricExecArguments", () => {
   it("keeps canonical arguments unchanged", () => {
@@ -104,6 +104,68 @@ describe("prepareFabricExecArguments", () => {
     })).toEqual({
       code: "return 1;",
       payloads: '{"n":1}',
+    });
+  });
+
+  // smarty-dev#2340: payloads are literal; placeholder tokens and file references
+  // were passed verbatim and the program ran against the token text.
+  describe("rejects payloads-only placeholders", () => {
+    const literal = "payloads are literal: read the file with a native tool first and pass its content";
+    it.each([
+      ["__CONTENT__"],
+      ["__FILE_BODY__"],
+      ["@/tmp/body.md"],
+      ["@/"],
+      ["file:///tmp/body.md"],
+    ])("rejects %j on payloads, JSON-object strings and the strings alias", (value) => {
+      const forms = [
+        { code: "return π.body;", payloads: { ok: "fine", body: value } },
+        { code: "return π.body;", payloads: JSON.stringify({ ok: "fine", body: value }) },
+        { code: "return π.body;", strings: { ok: "fine", body: value } },
+        { code: "return π.body;", strings: JSON.stringify({ ok: "fine", body: value }) },
+      ];
+      for (const form of forms) {
+        expect(() => prepareFabricExecArguments(form)).toThrow(literal);
+        expect(() => prepareFabricExecArguments(form)).toThrow(/"body"/);
+        expect(() => prepareFabricExecArguments(form, "python")).toThrow(literal);
+        expect(() => resolveFabricExecPayloads(form)).toThrow(literal);
+      }
+    });
+
+    it("preserves empty strings and ordinary text containing tokens or paths", () => {
+      const payloads = {
+        empty: "",
+        prose: "replace __CONTENT__ with the body",
+        mention: "see @/tmp/body.md for details",
+        url: "fetch file:///tmp/x then stop",
+        twoTokens: "@/a @/b",
+        lower: "__content__",
+        dunder: "__init__.py",
+        scoped: "@scope/pkg",
+        relative: "file:relative",
+        multiline: "__CONTENT__\nmore",
+        paddedPath: "  @/tmp/body.md",
+        newlinePath: "@/tmp/body.md\n",
+        paddedToken: " __CONTENT__ ",
+        newlineToken: "__CONTENT__\n",
+        paddedUrl: "file:///tmp/x ",
+      };
+      const input = { code: "return 1;", payloads };
+      expect(prepareFabricExecArguments(input)).toBe(input);
+      expect(prepareFabricExecArguments({ code: "return 1;", strings: JSON.stringify(payloads) }))
+        .toEqual({ code: "return 1;", payloads });
+      expect(resolveFabricExecPayloads({ payloads })).toEqual(payloads);
+    });
+
+    it("treats a value with a final newline as literal text, not a single token", () => {
+      for (const value of ["@/file\n", "file:///file\n", "__READ__\n", "__READ__\r\n", "@/file\r\n"]) {
+        const payloads = { body: value };
+        expect(resolveFabricExecPayloads({ payloads })).toEqual(payloads);
+        expect(prepareFabricExecArguments({ code: "return 1;", payloads: JSON.stringify(payloads) }))
+          .toEqual({ code: "return 1;", payloads });
+      }
+      expect(() => resolveFabricExecPayloads({ payloads: { body: "@/file" } })).toThrow(/"body"/);
+      expect(() => resolveFabricExecPayloads({ payloads: { body: "__READ__" } })).toThrow(/"body"/);
     });
   });
 });

@@ -1,8 +1,8 @@
 // smarty-dev#2014: idle Mains re-parse and re-scan the shared mesh state far more than its
 // changes require. These tests pin the observable contract of two minimal read-path savings:
-//  1. confirmWritable ends the reuse window but keeps the parsed snapshot while the file's
-//     metadata is unchanged (no re-read, same stateToken); any write is still seen at once.
-//  2. prefix selections are reused within one stateToken instead of rescanning every entry,
+//  1. confirmWritable discards the snapshot: unchanged metadata is not proof of unchanged
+//     ownership when a legacy writer copies the canonical UUID (#164 Security S1).
+//  2. non-fresh prefix selections are reused within one parsed snapshot instead of rescanning every entry,
 //     with the same invalidation and copy semantics as today.
 import fs from "node:fs";
 import path from "node:path";
@@ -62,8 +62,8 @@ const seed = async (store: MeshStore, count = 40): Promise<void> => {
   });
 };
 
-describe("MeshStore.confirmWritable keeps an unchanged snapshot", () => {
-  it("does not re-read an unchanged file after confirmation and keeps the same stateToken", async () => {
+describe("MeshStore.confirmWritable revalidates canonical state", () => {
+  it("re-reads even an unchanged file after confirmation, then reuses the new snapshot", async () => {
     const root = newRoot();
     const writer = storeAt(root);
     const reader = storeAt(root, { readCacheMs: LONG_CACHE_MS });
@@ -74,9 +74,13 @@ describe("MeshStore.confirmWritable keeps an unchanged snapshot", () => {
     const reads = spyStateReads();
     expect(reader.get("a/1")?.value).toBe(1);
     expect(reader.listAll("a/").map((entry) => entry.key)).toEqual(["a/1"]);
-    expect(reads()).toBe(0);                                     // unchanged metadata: no re-read
-    expect(reader.stateToken()).toBe(token);                     // same parsed snapshot
-    expect(reader.stateToken({ fresh: true })).toBe(token);
+    // #164 Security S1: our earlier zero-read spec was a regression, not baseline semantics.
+    // A copied UUID plus repeated stat must not preserve a cached owner after confirmation.
+    expect(reads()).toBe(1);
+    const revalidated = reader.stateToken();
+    expect(revalidated).not.toBe(token);
+    expect(reader.stateToken()).toBe(revalidated);
+    expect(reads()).toBe(1);
   });
 
   it("sees another store's write made after confirmation at once, despite a long readCacheMs", async () => {
@@ -129,10 +133,19 @@ describe("MeshStore prefix selections within one stateToken", () => {
       expect(reader.listAll("p/")).toHaveLength(40);
       expect(reader.list("p/", 5).map((entry) => entry.key)).toEqual(["p/000", "p/001", "p/002", "p/003", "p/004"]);
       expect(reader.listAllShared("p/")).toHaveLength(40);
-      expect(reader.listAll("p/", { fresh: true })).toHaveLength(40);   // unchanged file: same token
     }
-    expect(reader.stateToken({ fresh: true })).toBe(token);
+    expect(reader.stateToken()).toBe(token);
     expect(scans.count()).toBe(0);
+    // #164 Security S1: explicit freshness reparses canonical bytes even for a static store;
+    // its new parsed snapshot needs a new selection scan, not reuse of a stale-owner memo.
+    for (let index = 0; index < 2; index++) {
+      scans.reset();
+      expect(reader.listAll("p/", { fresh: true })).toHaveLength(40);
+      expect(scans.count()).toBeGreaterThan(0);
+      scans.reset();
+      expect(reader.listAll("p/")).toHaveLength(40);
+      expect(scans.count()).toBe(0);
+    }
     // Another prefix may scan once, then is reused too; prefixes do not leak into each other.
     expect(reader.listAll("q/").map((entry) => entry.key)).toEqual(
       Array.from({ length: 40 }, (_, index) => `q/${String(index).padStart(3, "0")}`));

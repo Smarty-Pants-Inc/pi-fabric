@@ -56,7 +56,7 @@ interface MeshStateFile {
 }
 
 export interface MeshReadOptions {
-  /** Read the current file (re-parsing only if it changed), not a recent parse. */
+  /** Read and parse the canonical file on every call, without reusing a cached snapshot. */
   fresh?: boolean;
 }
 
@@ -91,9 +91,9 @@ const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 // commands are rejected once past their deadline.
 const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
 /**
- * Read-cache age for the stores a Fabric runtime and its resident host use: at most one parse
- * of the shared state per process per this interval (smarty-dev#251, dev1 load P0: ~50
- * processes each re-parsed the whole file on every change, about 10 times a second).
+ * Read-cache age for non-fresh reads in a Fabric runtime and its resident host. Fresh protocol
+ * decisions always read canonical state (smarty-dev#2355); ordinary polls reuse a recent parse
+ * (smarty-dev#251: ~50 processes previously parsed every change, about 10 times a second).
  * ponytail: listings may lag other hosts by up to 2 s; leases are 15 s and heartbeats 5 s.
  */
 export const RUNTIME_MESH_READ_CACHE_MS = 2_000;
@@ -260,10 +260,10 @@ const readState = (filePath: string, maxBytes: number, recoverDamage = true): Me
 // observe the committed generation (the stat stamp alone can repeat, ABA). The signal is only a
 // hint: its `generation` (first field) must equal the canonical header, so a failed, crashed or
 // capped signal publication can never hide a commit; it only forces the canonical parse.
-// A canonical file without a marker (legacy) is UNKNOWN: fresh and expired reads re-parse it,
-// never reuse it on equal metadata. ponytail: an old writer that copies an existing marker
-// unchanged is re-read whenever the stat moves; a same-stat copied-marker rewrite is
-// fundamentally unobservable here, the owner-accepted legacy ABA boundary (smarty-dev#2355).
+// Fresh authoritative payload reads always parse the canonical file: legacy writers can copy an existing marker
+// unchanged, and repeated metadata plus that marker cannot prove the payload unchanged.
+// Nonfresh expired reads re-parse markerless files; copied-marker, same-stat rewrites remain
+// outside the nonfresh cache's change detection (smarty-dev#2355).
 const MAX_SIGNAL_BYTES = 128 * 1024;
 const HEADER_BYTES = 64;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -956,8 +956,8 @@ export class MeshStore {
     return true;
   }
 
-  // fresh: skip the read cache's recent-parse reuse (readCacheMs), for a read that decides a
-  // protocol step rather than a listing. The file is still read only when it changed.
+  // fresh: read and parse the canonical file, bypassing all snapshot reuse, for a read that
+  // decides a protocol step rather than a listing.
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
     this.#validateKey(key);
     const entries = this.#readCachedState(options.fresh === true).entries;
@@ -1126,6 +1126,9 @@ export class MeshStore {
         group.push(state.entries[key]!);
       }
       const namespaces: Record<string, string> = {};
+      // ponytail: hash all entries; UUID + stat cannot authorize reused hashes after a legacy
+      // copied-marker ABA. B68 accepts this bounded writer cost (smarty-dev#2355). If it matters,
+      // use one-pass JSON encoding for primary + hashes (smarty-dev#2395), not weaker validation.
       for (const [namespace, entries] of groups) namespaces[namespace] = digestEntries(entries);
       if (statStamp(this.#statePath) !== stamp) return false;   // replaced while hashing: publish nothing
       // `generation` first: readers take it from the file's first HEADER_BYTES; it must equal the canonical readGeneration.
@@ -1176,12 +1179,6 @@ export class MeshStore {
   }
 
   /**
-   * Takes and releases the mesh lock without writing the state: evidence that the shared state is
-   * writable now, for a heartbeat that renewed only its file lease. It also expires this store's
-   * reuse window, so the next read re-checks the file's metadata (parsing only if it changed) and
-   * cannot return an earlier snapshot.
-   */
-  /**
    * Runs an operation under the mesh lock without touching the state: for a rare step that must
    * be serialized fleet-wide, such as recovering a per-key lock whose holder died.
    */
@@ -1189,10 +1186,14 @@ export class MeshStore {
     return this.#withLock(operation);
   }
 
+  /**
+   * Takes and releases the mesh lock without writing the state: evidence that the shared state is
+   * writable now, for a heartbeat that renewed only its file lease. Discards this store's cached
+   * snapshot so the next state read must read the canonical file, even if metadata is unchanged.
+   */
   async confirmWritable(): Promise<void> {
     await this.#withLock(() => {
-      // Expire, not discard: the next read re-checks the file's metadata and parses only if it changed.
-      if (this.#stateCache) this.#stateCache.parsedAt = Number.NEGATIVE_INFINITY;
+      this.#stateCache = undefined;
     });
   }
 
@@ -1329,14 +1330,16 @@ export class MeshStore {
   }
 
   /**
-   * The stamp of the state payload that reads now return, from this store's cache: with fresh,
-   * after revalidating the cache against the file (a parse only when the file changed). A reader
-   * records what it consumed, not what is on disk (review/astra F2 on #84).
+   * The stamp of the state payload that reads now return, from this store's cache. With fresh,
+   * bypass the age window and revalidate metadata plus the canonical header, parsing on change.
+   * This UI observer returns a stamp, not authoritative payload or owner authority: legacy
+   * copied-marker, same-stat ABA can still reuse the cache (the baseline limitation).
+   * A reader records what it consumed, not what is on disk (review/astra F2 on #84).
    */
   cachedStateStamp(fresh = false): string | undefined {
     if (fresh) {
       try {
-        this.#readCachedState(true);
+        this.#readCachedState(true, false); // observer only; public fresh payload reads stay canonical
       } catch {
         return undefined;
       }
@@ -1345,7 +1348,7 @@ export class MeshStore {
     return cached ? `${cached.device}:${cached.inode}:${cached.size}:${cached.modifiedAt}` : undefined;
   }
 
-  #readCachedState(fresh = false): MeshStateFile {
+  #readCachedState(fresh = false, canonical = fresh): MeshStateFile {
     const recent = this.#stateCache;
     if (!fresh && recent && this.#readCacheMs > 0 && Date.now() - recent.parsedAt < this.#readCacheMs) {
       return recent.state;
@@ -1358,7 +1361,7 @@ export class MeshStore {
       // without a marker (legacy) is UNKNOWN: it is never reused on metadata, always re-parsed.
       const cached = this.#stateCache;
       if (
-        cached?.stamp === before && cached.generation !== undefined && cached.generation === this.#canonicalGeneration()
+        !canonical && cached?.stamp === before && cached.generation !== undefined && cached.generation === this.#canonicalGeneration()
       ) return cached.state;
     } catch (error) {
       this.#stateCache = undefined;

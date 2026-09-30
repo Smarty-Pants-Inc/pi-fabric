@@ -1,7 +1,7 @@
 // Canonical generation compatibility: a missing legacy marker is UNKNOWN, not an equal
-// generation. A copied marker is usable only with unchanged canonical metadata. An old
-// writer copying a marker AND repeating the stat stamp is the owner-accepted legacy ABA
-// boundary: these tests do not claim that indistinguishable replacement is observable.
+// generation. Non-fresh reuse is bounded; fresh protocol reads must reparse even when a
+// legacy writer copies the marker AND repeats the stat stamp (#164 Security S1).
+// That authorization regression is covered in mesh-legacy-auth-revalidation.test.ts.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

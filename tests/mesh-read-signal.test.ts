@@ -693,7 +693,11 @@ describe("MeshStore read signal: a canonical replace racing the signal read", ()
       advance(3 * WINDOW_MS);
       expect(narrowReads(reader, SUBS)).toEqual(after);
       expect(reader.listAll(SUBS, { fresh: true })).toEqual(after);
-      expect(reader.stateToken()).toBe(reader.stateToken({ fresh: true }));
+      // #164 Security S1: fresh canonical revalidation creates a new snapshot even when
+      // its bytes match. Token identity is a parse memo, not proof of current ownership.
+      const cachedToken = reader.stateToken();
+      expect(reader.stateToken({ fresh: true })).not.toBe(cachedToken);
+      expect(reader.listAll(SUBS)).toEqual(after);
     });
   }
 });

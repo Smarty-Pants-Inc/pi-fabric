@@ -130,6 +130,18 @@ describe("guest agents surface", () => {
     expect(read.errors).toEqual([]);
   });
 
+  it("types sender notices on steer/followUp and mesh publish receipts", () => {
+    const read = typeCheckFabricCode(
+      `const steer: string | undefined = (await agents.steer({ id: "main", message: "head abc1234" })).notice;
+       const followUp: string | undefined = (await agents.followUp({ id: "main", message: "head abc1234" })).notice;
+       const publish: string | undefined = (await mesh.publish({ topic: "team", text: "head abc1234" })).notice;
+       return { steer, followUp, publish };`,
+      GUEST_TYPE_DECLARATIONS,
+      true,
+    );
+    expect(read.errors).toEqual([]);
+  });
+
   it("keeps the Python kernel's dynamic agents proxy in place", () => {
     expect(CPYTHON_CHILD_SOURCE).toContain('"agents"');
   });

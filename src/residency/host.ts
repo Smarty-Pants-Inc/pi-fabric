@@ -19,7 +19,7 @@ import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mesh/store.js";
-import { FabricControlPlane, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
@@ -405,7 +405,7 @@ class ResidentHost {
 
   async #acceptControl(
     command: FabricControlCommand,
-    _from: MeshIdentity,
+    from: MeshIdentity,
     signal?: AbortSignal,
   ): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
@@ -444,7 +444,8 @@ class ResidentHost {
           message,
           command.data,
           signal,
-          command.binding !== undefined ? { binding: command.binding } : {},
+          controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+            this.participants.get(from.id)?.rootId),
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -466,11 +467,11 @@ class ResidentHost {
       if (!this.actors.owns(command.targetId)) {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
-      const binding = await this.actors.resolveActivationBinding(
-        command.targetId,
-        command.binding !== undefined ? { binding: command.binding } : {},
-      );
-      const result = this.actors.tell(command.targetId, message, command.data, { binding });
+      const options = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+        this.participants.get(from.id)?.rootId);
+      // Validate now without turning the resolved owner defaults into per-call overrides.
+      await this.actors.resolveActivationBinding(command.targetId, options);
+      const result = this.actors.tell(command.targetId, message, command.data, options);
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       return { accepted: false, error: errorMessage(error) };
@@ -693,6 +694,28 @@ class ResidentHost {
           actor: actor as FabricActorInfo,
           completedAt: Date.now(),
         };
+      } else if (command.operation === "actors") {
+        response = {
+          format: RESIDENT_HOST_FORMAT, requestId, ok: true,
+          actors: this.actors.listOwned().filter((actor) => actor.rootId === this.config.rootId),
+          completedAt: Date.now(),
+        };
+      } else if (command.operation !== "removeActor") {
+        const actor = this.actors.status(String(command.id));
+        if (actor.rootId !== this.config.rootId || !this.actors.owns(actor.id)) {
+          throw new Error(`Resident host does not own root actor ${actor.id}`);
+        }
+        let updated: FabricActorInfo;
+        switch (command.operation) {
+          case "actorStatus": updated = actor; break;
+          case "setInstructions": updated = await this.actors.setInstructions(actor.id, command.instructions); break;
+          case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope); break;
+          case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope); break;
+          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter); break;
+          case "setTools": updated = await this.actors.setTools(actor.id, command.tools); break;
+          default: throw new Error("Unknown resident actor operation");
+        }
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, completedAt: Date.now() };
       } else {
         const cleanup = this.actors.cleanupObligation(command.id);
         if (!this.actors.owns(command.id) || (cleanup && cleanup.residency !== "durable")) {

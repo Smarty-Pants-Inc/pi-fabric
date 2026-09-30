@@ -67,7 +67,9 @@ interface ActorQueueItem {
   createdAt: number;
   coalesceKey?: string;
   activation: FabricActorActivation;
+  /** Only supplied fields are pinned; defaults are resolved at launch. */
   binding: FabricActorRunBinding;
+  bindingVersion?: 2;
   resolve?: (message: FabricActorMessage) => void;
   reject?: (error: Error) => void;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
@@ -685,7 +687,7 @@ export class ActorManager {
     return this.#canManage(actor.id);
   }
 
-  /** Resolve the immutable model/thinking view that a direct activation will pin. */
+  /** Resolve a caller-local view for foreign routing; own-root defaults stay dynamic. */
   resolveBinding(
     id: string,
     overrides: FabricActorRunBinding = {},
@@ -1912,9 +1914,7 @@ export class ActorManager {
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
-    const unresolved = options.binding !== undefined
-      ? this.#validatedRunBinding(options.binding)
-      : this.#runBinding(actor, options.overrides);
+    const unresolved = this.#validatedRunBinding(options.binding ?? options.overrides ?? {});
     // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
     // learns at once. A resolver that may refresh the registry is async: #drain resolves the
     // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
@@ -1936,6 +1936,7 @@ export class ActorManager {
         existing.createdAt = createdAt;
         existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
         existing.binding = binding;
+        existing.bindingVersion = 2;
         this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
         return existing;
@@ -1958,6 +1959,7 @@ export class ActorManager {
       createdAt,
       activation: this.#activation(itemId, source, payload, sequence, createdAt),
       binding,
+      bindingVersion: 2,
       ...(options.resolve ? { resolve: options.resolve } : {}),
       ...(options.reject ? { reject: options.reject } : {}),
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
@@ -2105,9 +2107,9 @@ export class ActorManager {
             delete actor.capabilityDigest;
           }
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
-          item.binding = await this.#resolvedRunBinding(actor, item.binding);
+          const launchBinding = await this.#resolvedRunBinding(actor, this.#runBinding(actor, item.binding));
           const result = await this.agents.run(
-            this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
+            this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
             (handle) => {
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
@@ -2331,6 +2333,7 @@ export class ActorManager {
   #runRequest(
     actor: ManagedActor,
     item: ActorQueueItem,
+    binding: FabricActorRunBinding,
     inferenceContext: FabricActorInferenceContext | undefined,
     capabilityRequirements?: string[],
     capabilityDigest?: string,
@@ -2361,8 +2364,8 @@ export class ActorManager {
         ? { schema: directiveSchema, ...(actor.runner === "pi" ? { replyTool: true } : {}) }
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
-      ...(item.binding.model ? { model: item.binding.model } : {}),
-      ...(item.binding.thinking ? { thinking: item.binding.thinking } : {}),
+      ...(binding.model ? { model: binding.model } : {}),
+      ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
@@ -3157,7 +3160,7 @@ export class ActorManager {
         try {
           return [JSON.parse(JSON.stringify({
             id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
-            activation: item.activation, binding: item.binding,
+            activation: item.activation, binding: item.binding, bindingVersion: 2,
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
@@ -3260,7 +3263,11 @@ export class ActorManager {
         payload: value.payload,
         createdAt: value.createdAt,
         activation: shift(value.activation as FabricActorActivation),
-        binding: typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        // Old mesh/host bindings were enqueue-time defaults. Old direct bindings may be
+        // genuine per-call values: preserve them conservatively. New records carry raw fields.
+        binding: (value.bindingVersion === 2 || value.source === "direct") &&
+          typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        bindingVersion: 2,
         ...(Array.isArray(value.images) ? { images: value.images } : {}),
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
@@ -3687,6 +3694,7 @@ export class ActorManager {
         first.createdAt = item.createdAt;
         first.activation = { ...item.activation, id: first.id };
         first.binding = item.binding;
+        first.bindingVersion = 2;
       }
       if (item.resumed) first.resumed = true;
       merged.add(item);

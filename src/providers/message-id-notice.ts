@@ -27,3 +27,27 @@ export async function outgoingMessageNotice(
   }
   return notice ? { text: `${text}\n\n${notice}`, notice } : { text };
 }
+
+// These exact host-generated refusals are pre-admission: MeshStore.publish
+// checks before reserving/persisting its event; ActorManager validates before
+// enqueueing; MainAgentController checks quotas before mutating its held queue.
+// A remote owner's explicit rejection preserves these same error messages.
+// Do NOT match timeouts, stalled-but-accepted queues or generic delivery errors:
+// their outcome may be unknown, so retrying could duplicate a delivered message.
+const admissionLimit = /^(?:Mesh event exceeds \d+ bytes|Actor message exceeds \d+ bytes after reserving the Fabric envelope|Main's followUp queue is full \([^\n]*\); Main is busy and reads followUps only at its next tool boundary\. Wait, or send a short steer\.)$/;
+
+/** Drop only the optional marker on an explicit pre-admission limit refusal. */
+export async function deliverWithMessageNotice<T>(
+  original: string,
+  checked: OutgoingMessageNotice,
+  deliver: (text: string) => T | Promise<T>,
+): Promise<T> {
+  try {
+    return await deliver(checked.text);
+  } catch (error) {
+    if (!checked.notice || checked.text === original || !(error instanceof Error) || !admissionLimit.test(error.message)) throw error;
+    // At most one unmarked attempt, with every original limit still in force.
+    // The caller retains the sender-side notice even when the marker cannot fit.
+    return deliver(original);
+  }
+}

@@ -795,7 +795,7 @@ interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricMessageDelivery {
-  /** Advisory only: unverified ids in sender history; this line also travels in the message. */
+  /** Advisory only: unverified ids in sender history; also delivered when admission permits. */
   notice?: string;
   queued: true;
   messageId: string;

@@ -11,10 +11,16 @@ unverified ids: abc1234, comment 1234567890
 ```
 
 A checker/import/history failure produces `unverified ids: check failed` in both
-places and still attempts the send. Normal delivery failures, capability gates,
-reserved mesh topics and payload limits retain their existing behavior. Targets,
-structured `data`, and host-authored lifecycle deliveries are not checked. The
-standalone `tell` alias uses the same follow-up routing and advisory behavior.
+places and still attempts the send. The delivered marker is optional at admission:
+if a marked send gets an explicit, pre-admission mesh/actor payload or Main
+follow-up quota refusal, Fabric makes one attempt with the original text and keeps
+the sender-side notice. These refusals occur before persistence/enqueueing, so no
+message is duplicated. A remote owner's explicit admission rejection follows the
+same rule. Timeouts, unknown outcomes, stalled-but-accepted queues and all other
+delivery failures are **not** retried. Original payload/queue limits, capability
+gates and reserved topics remain unchanged; an over-limit original still fails.
+Targets, structured `data`, and host-authored lifecycle deliveries are not checked.
+The standalone `tell` alias uses the same follow-up routing and advisory behavior.
 
 ## Precise, conservative classes
 
@@ -61,7 +67,9 @@ are excluded without dropping sibling reads; YAML's hoisted raw sections follow
 those nodes. A separate later tool read of durable marked text *is* evidence.
 Self-delivered messages are excluded using the sender's session/participant
 identity; batched follow-ups filter each visible self-authored envelope rather
-than treating the whole batch as if its first sender wrote it.
+than treating the whole batch as if its first sender wrote it. Native root inbox
+messages also filter self-authored `<event from_id=...>` envelopes individually,
+keeping independent peer events in the same batch as read evidence.
 
 Hard data/work bounds:
 
@@ -92,7 +100,10 @@ Fabric's send path (Smarty-Pants-Inc/smarty-dev#1612, #2175).
 
 `tests/unverified-ids-provider.test.ts` replays nine **synthetic**, not historical,
 #1612-class wrong identifiers across five surfaces: standalone steer/followUp,
-hosted steer/followUp, and mesh publish. It covers actual session reads, untouched
+hosted steer/followUp, and mesh publish. `tests/unverified-ids-admission.test.ts`
+covers near-limit mesh/actor sends, both busy-Main byte quotas, unchanged genuine
+limits, no retry of unknown delivery outcomes, and native self/mixed inbox batches.
+The provider replay covers actual session reads, untouched
 no-ID text, failure-open sends, self/receipt echoes, all standalone local/remote
 routing branches, hosted child/peer ports and actual local durable mesh writes.
 `tests/unverified-ids.test.ts` covers boundaries, budgets and mixed-format reads;

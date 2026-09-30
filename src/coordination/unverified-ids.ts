@@ -80,7 +80,7 @@ const candidates = (text: string): Identifier[] => {
   return [...unique.values()].sort((a, b) => a.at - b.at);
 };
 
-type Entry = { id?: string; parentId?: string | null; type?: string; content?: unknown; details?: unknown; message?: { role?: string; toolName?: string; content?: unknown; details?: unknown } };
+type Entry = { id?: string; parentId?: string | null; type?: string; customType?: string; content?: unknown; details?: unknown; message?: { role?: string; customType?: string; toolName?: string; content?: unknown; details?: unknown } };
 type DeliveryDetails = { from?: { id?: string; sessionId?: string }; items?: unknown[] };
 const sendRefs = new Set(["agents.steer", "agents.followUp", "agents.tell", "mesh.publish"]);
 
@@ -176,7 +176,7 @@ export function unverifiedMessageIds(text: string, session?: ReadonlySessionMana
   const seen = new Set<string>();
   let leaf = session.getLeafId();
 
-  const scan = (content: unknown, toolResult: boolean, batched: boolean): void => {
+  const scan = (content: unknown, toolResult: boolean, batched: boolean, inbox: boolean): void => {
     const parts = typeof content === "string" ? [content] : Array.isArray(content) ? content : [];
     for (const part of parts) {
       if (bytes <= 0 || blocks-- <= 0 || !pending.size) break;
@@ -194,6 +194,12 @@ export function unverifiedMessageIds(text: string, session?: ReadonlySessionMana
       if (batched) bounded = bounded.replace(/<fabric-agent-message\b[^>]*>[\s\S]*?(?:<\/fabric-agent-message>|$)/g, block => {
         const from = /\bfrom_id="([^"]*)"/.exec(block)?.[1];
         return from && ownIds.has(from) ? "\n" : block;
+      });
+      if (inbox) bounded = bounded.replace(/<event\b(?:[^<>"\\]|"(?:\\.|[^"\\])*")*>[\s\S]*?(?:<\/event>|$)/g, block => {
+        // Native rootInboxMessage has only details.ids. Authorship is in the
+        // visible event header; filter each event, not the whole mixed batch.
+        const from = /\bfrom_id=("(?:\\.|[^"\\])*")/.exec(block)?.[1];
+        return from && ownIds.has(JSON.parse(from) as string) ? "\n" : block;
       });
       if (!possibleRead.test(bounded)) continue;
       const lower = /[A-F]/.test(bounded) ? bounded.toLowerCase() : bounded;
@@ -218,7 +224,8 @@ export function unverifiedMessageIds(text: string, session?: ReadonlySessionMana
       // A single message sent to oneself is not independent read evidence.
       // Batched followUps filter each visible envelope, not just the first sender.
       const self = (details?.from?.id && ownIds.has(details.from.id)) || (ownSession && details?.from?.sessionId === ownSession);
-      if (!self || batched) scan(message ? message.content : entry.content, message?.role === "toolResult", batched);
+      const inbox = (message?.customType ?? entry.customType) === "pi-fabric-inbox";
+      if (!self || batched || inbox) scan(message ? message.content : entry.content, message?.role === "toolResult", batched, inbox);
     }
     leaf = entry.parentId ?? null;
   }

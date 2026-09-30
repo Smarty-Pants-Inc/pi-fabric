@@ -8,7 +8,7 @@ import { MeshStore, type MeshIdentity } from "../mesh/store.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../lifecycle/types.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
-import { outgoingMessageNotice } from "./message-id-notice.js";
+import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 const emptySchema = { type: "object", properties: {}, additionalProperties: false };
 const INTERNAL_STATE_PREFIXES = ["topology/", "sessions/", "actors/", "residency/"];
@@ -209,14 +209,17 @@ export class MeshProvider implements FabricProvider {
           throw new Error(`Fabric mesh topic is reserved for host coordination: ${topic}`);
         }
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
-        const event = await this.store.publish({
+        const publish = (text?: string) => this.store.publish({
           topic,
           from: this.identity,
           ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
           ...(typeof args.to === "string" ? { to: args.to } : {}),
-          ...(checked ? { text: checked.text } : {}),
+          ...(text === undefined ? {} : { text }),
           ...(args.data !== undefined ? { data: args.data } : {}),
         });
+        const event = checked
+          ? await deliverWithMessageNotice(args.text as string, checked, publish)
+          : await publish();
         return checked?.notice ? { ...event, notice: checked.notice } : event;
       }
       case "read":

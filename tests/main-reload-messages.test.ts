@@ -80,6 +80,15 @@ const fixture = async (filesOnly = false) => {
   return { owner, observer, entries, sent, main, plane, router, sendRouter, directory, mesh };
 };
 
+// Exercise the router's read-port contract even when native participant files invalidate by stat.
+const cacheRootSnapshot = (directory: ParticipantDirectory) => {
+  const get = directory.get.bind(directory);
+  const cached = get(identity.id);
+  vi.spyOn(directory, "get").mockImplementation((id, now, options) =>
+    id === identity.id && !options?.fresh ? cached : get(id, now, options),
+  );
+};
+
 describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
   it.each([false, true])("delivers followUp and steer once at shutdown, without a runtime, and just after session_start (files=%s)", async (filesOnly) => {
     const f = await fixture(filesOnly);
@@ -449,6 +458,35 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     expect(f.observer.peers().map((peer) => peer.id)).toContain(identity.id);
     await f.owner.close();
     expect(f.observer.get(identity.id, until + 1, { fresh: true })).toBeUndefined();
+  });
+
+  it.each(["followUp", "steer"] as const)("freshens a cached native idle root before %s during shutdown", async (kind) => {
+    const f = await fixture();
+    cacheRootSnapshot(f.observer);
+    expect(f.observer.get(identity.id)).toMatchObject({ status: "idle" });
+    await f.owner.quiesce();
+    expect(f.observer.get(identity.id)).toMatchObject({ status: "idle" }); // cached, not admission authority
+    await expect(f.sendRouter.routeMessage(identity.id, "gone", undefined, kind)).rejects.toThrow("is shutting down");
+    expect(f.mesh().read({ topic: "fabric.control.command", limit: 100 })).toEqual([]);
+  });
+
+  it.each(["followUp", "steer"] as const)("freshens a cached native idle root to bound %s by the reload lease", async (kind) => {
+    const f = await fixture();
+    cacheRootSnapshot(f.observer);
+    expect(f.observer.get(identity.id)).toMatchObject({ status: "idle" });
+    await f.owner.quiesce("reload");
+    expect(f.observer.get(identity.id)).toMatchObject({ status: "idle" });
+    const until = f.owner.get(identity.id, Date.now(), { fresh: true })!.reloadUntil!;
+    const request = vi.spyOn(f.sendRouter.control!, "request").mockResolvedValue({
+      queued: true, messageId: "reload-gap", routed: "mesh", acknowledged: true,
+    });
+    const before = Date.now();
+    await expect(f.sendRouter.routeMessage(identity.id, "gap", undefined, kind)).resolves.toMatchObject({ queued: true });
+    const options = request.mock.calls[0]![5]!;
+    expect(options.routedRemoteHost).toBeNull();
+    expect(options.timeoutMs).toBeGreaterThan(0);
+    expect(options.timeoutMs).toBeLessThanOrEqual(until - before);
+    expect(options.timeoutMs).toBeGreaterThanOrEqual(until - Date.now());
   });
 
   it.each(["followUp", "steer"] as const)("a real exit still rejects %s at shutdown and after removal", async (kind) => {

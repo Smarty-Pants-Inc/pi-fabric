@@ -110,6 +110,7 @@ const routerFor = (
   control: FabricControlPlane,
   self: MeshIdentity,
   children: string[] = [],
+  remoteMainId?: string,
 ) => {
   type Ports = ConstructorParameters<typeof AgentMessageRouter>;
   const known = (id: string) => {
@@ -128,7 +129,8 @@ const routerFor = (
       status: (id: string) => { throw new Error(`Unknown Fabric actor: ${id}`); },
       validateDirectMessage: vi.fn(), tell: vi.fn(), ask: vi.fn(), stop: vi.fn(), steerRemote: vi.fn(), resolveBinding: vi.fn(),
     } as unknown as Ports[1],
-    { id: self.id, local: true, matches: (id: string) => id === self.id || id === "main", deliverAgent: vi.fn() } as unknown as Ports[2],
+    { id: remoteMainId ?? self.id, local: remoteMainId === undefined,
+      matches: (id: string) => id === (remoteMainId ?? self.id) || id === "main", deliverAgent: vi.fn() } as unknown as Ports[2],
     directory,
     control,
     (binding) => binding,
@@ -260,10 +262,14 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     }
   });
 
-  it.each([
+  it.each(([
     ["forge", "withdrawal"], ["forge", "replacement"],
     ["dev1", "withdrawal"], ["dev1", "replacement"],
-  ] as const)("refuses cached %s routing before first fresh capture after %s without publication or replacement notRun replay", async (routedHost, change) => {
+  ] as const).flatMap(([host, change]) =>
+    (["steer", "followUp"] as const).flatMap((kind) =>
+      (["peer", "main"] as const).map((target) => [host, change, kind, target] as const),
+    ),
+  ))("refuses cached %s routing before first fresh capture after %s for %s to %s without publication or replacement notRun replay", async (routedHost, change, kind, target) => {
     const { meshRoot, mesh, directory, mirror, local, remote } = await setup({ heartbeatMs: 60_000, readCacheMs: 2_000, remoteId: "X" });
     // Both link orientations use canonical root X (host = identity = target).
     await mirror({ record: { remoteHost: routedHost }, host: { remoteHost: routedHost } });
@@ -282,8 +288,8 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(directory.get(remote.id)).toMatchObject({ remoteHost: routedHost });
     const sender = senderOn(mesh, local, 5_000, directory);
     const publish = vi.spyOn(sender.mesh, "publish");
-    const router = routerFor(directory, sender, local);
-    await expect(router.routeMessage(remote.id, "private payload", { destinationRemoteHost: "ryzen2" }, "followUp"))
+    const router = routerFor(directory, sender, local, [], target === "main" ? remote.id : undefined);
+    await expect(router.routeMessage(target === "main" ? "main" : remote.id, "private payload", { destinationRemoteHost: "ryzen2" }, kind))
       .rejects.toThrow(`Fabric mesh bridge routing to remote host ${routedHost} is unavailable for ${remote.id}; the routed owner could not be revalidated; this attempt was not published.`);
     expect(publish).not.toHaveBeenCalled();
     await writer.publish({ topic: "fabric.control.ack", kind: "rejected", from: remote, to: local.id,

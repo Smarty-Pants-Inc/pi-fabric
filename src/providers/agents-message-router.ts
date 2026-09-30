@@ -73,6 +73,16 @@ export class AgentMessageRouter {
     return known.participant;
   }
 
+  #rootRouteSnapshot(id: string): FabricParticipantInfo | undefined {
+    const cached = this.participants.get(id);
+    // Keep a mirrored root's original bridge for the control plane's fresh admission check.
+    // A fresh lookup here could silently reroute a cached target to a replacement bridge.
+    // Native roots still need fresh lifecycle state to enforce shutdown and reload bounds.
+    return (cached?.kind === "root" && cached.remoteHost
+      ? cached
+      : this.participants.get(id, undefined, { fresh: true })) ?? this.#recentlyLapsedRoot(id);
+  }
+
   // A bare session UUID addresses its Main `session:<uuid>` when no participant has exactly
   // that id (smarty-dev#1729). Only the same UUID is tried: never a guess across ids.
   #sessionTarget(id: string): string {
@@ -123,7 +133,7 @@ export class AgentMessageRouter {
   ): Promise<FabricAgentMessageResult> {
     id = this.#sessionTarget(id);
     const isMain = this.mainAgent.matches(id);
-    const remoteRoot = isMain ? undefined : this.participants.get(id, undefined, { fresh: true }) ?? this.#recentlyLapsedRoot(id);
+    const remoteRoot = isMain ? undefined : this.#rootRouteSnapshot(id);
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.
     if (isMain || remoteRoot?.kind === "root") {
@@ -144,8 +154,7 @@ export class AgentMessageRouter {
           ...(data === undefined ? {} : { data }),
         });
       }
-      const participant = remoteRoot ?? this.participants.get(this.mainAgent.id, undefined, { fresh: true }) ??
-        this.#recentlyLapsedRoot(this.mainAgent.id);
+      const participant = remoteRoot ?? this.#rootRouteSnapshot(this.mainAgent.id);
       if (!participant) {
         throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");
       }

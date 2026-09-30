@@ -735,9 +735,14 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publish(event).catch(() => undefined);
       },
+      // Retention is independent of notification policy (including muted completed children).
+      onSettled: (result) => {
+        if (actorChildStore && actorSpawner) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
+      },
       onBackgroundComplete: (result) => {
-        if (actorChildStore && actorSpawner) actorChildStore.enqueue(result, actorSpawner);
-        completionInbox.enqueue(result, actorChildStore ? () => actorChildStore.acknowledge(result.id) : undefined);
+        completionInbox.enqueue(result,
+          actorChildStore ? () => actorChildStore.acknowledge(result.id) : undefined,
+          actorChildStore ? () => actorChildStore.consume(result.id) : undefined);
       },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);

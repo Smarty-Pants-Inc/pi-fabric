@@ -235,6 +235,40 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage).toHaveBeenCalledOnce();
   });
 
+  it("retries a failed delivered receipt without sending the notice again", async () => {
+    const h = harness();
+    const receipt = vi.fn().mockImplementationOnce(() => { throw new Error("I/O unavailable"); });
+    const prepare = vi.fn();
+    h.inbox.enqueue(result("a"), receipt, prepare);
+    h.boundary();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(receipt).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(receipt).toHaveBeenCalledTimes(2);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("does not deliver until the durable consumption claim succeeds", async () => {
+    const h = harness();
+    const prepare = vi.fn().mockImplementationOnce(() => { throw new Error("disk unavailable"); });
+    h.inbox.enqueue(result("a"), undefined, prepare);
+    h.boundary();
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.boundary();
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("chooses at-most-once if a claimed send has an unknown outcome", () => {
+    const h = harness();
+    const receipt = vi.fn();
+    h.sendMessage.mockImplementationOnce(() => { throw new Error("accepted then failed"); });
+    h.inbox.enqueue(result("a"), receipt, vi.fn());
+    expect(() => h.boundary()).toThrow("accepted then failed");
+    h.boundary();
+    expect(receipt).toHaveBeenCalledOnce();
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+  });
+
   it("remembers abort when settled arrives with a fresh signal-free context", async () => {
     const h = harness();
     Object.defineProperty(h.context, "signal", { value: AbortSignal.abort() });

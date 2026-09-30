@@ -182,6 +182,69 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
+  it("archives muted completed children with full text/value but no activation", async () => {
+    const h = await setup(residency, false);
+    const child = await h.spawn("LARGE_RESULT");
+    await vi.waitFor(() => expect(h.runtime.agents.status(child.id).status).toBe("completed"), { timeout: 5000 });
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(fs.existsSync(store.resultFile(child.id))).toBe(true));
+    h.boundary();
+    await h.runtime.shutdown();
+    h.endActivation();
+    await vi.waitFor(() => expect(h.owner.status(h.actor.id).status).toBe("idle"));
+    const saved = JSON.parse(fs.readFileSync(store.resultFile(child.id), "utf8"));
+    expect(saved).toMatchObject({ status: "completed", spawner: { id: h.actor.id, runId: h.actorRunId } });
+    expect(saved.text).toHaveLength(100000);
+    expect(saved.value).toEqual({ output: "x".repeat(100000) });
+    expect(store.pending()).toEqual([]);
+    expect(h.owner.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("does not replay a live notice after acknowledge I/O failure and owner restart", async () => {
+    const h = await setup(residency);
+    const child = await h.spawn();
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    const acknowledge = ActorChildCompletionStore.prototype.acknowledge;
+    const failed = vi.spyOn(ActorChildCompletionStore.prototype, "acknowledge").mockImplementation(function(this: ActorChildCompletionStore, id: string) {
+      if (id === child.id) throw new Error("live receipt I/O failure");
+      acknowledge.call(this, id);
+    });
+    try {
+      h.boundary();
+      expect(h.sendMessage).toHaveBeenCalledOnce();
+      expect(failed).toHaveBeenCalledWith(child.id);
+      expect(store.received(child.id)).toBe(true);
+    } finally { failed.mockRestore(); }
+    await h.runtime.shutdown();
+    h.endActivation();
+    await vi.waitFor(() => expect(h.owner.status(h.actor.id).status).toBe("idle"));
+    await h.owner.close();
+    const restarted = h.makeOwner();
+    cleanups.push(() => restarted.close());
+    expect(store.pending()).toEqual([]);
+    expect(restarted.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
+    expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("reconciles committed native live completion ids before a mailbox activation", async () => {
+    const h = await setup(residency);
+    const child = await h.spawn();
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    fs.appendFileSync(h.actor.sessionFile!, JSON.stringify({ type: "custom_message",
+      customType: "pi-fabric-agent-complete", details: { ids: [child.id] },
+    }) + "\n");
+    await h.runtime.shutdown();
+    h.endActivation();
+    await vi.waitFor(() => expect(h.owner.status(h.actor.id).status).toBe("idle"));
+    expect(store.received(child.id)).toBe(true);
+    expect(store.pending()).toEqual([]);
+    expect(h.owner.messages(h.actor.id).filter((m) => m.id === child.id)).toEqual([]);
+  });
+
   it("wait retracts a pending result and prevents next-run mailbox duplication", async () => {
     const h = await setup(residency);
     const child = await h.spawn();

@@ -7,7 +7,7 @@ const BATCH_CHARS = 16_000;
 const IDLE_BATCH_MS = 40;
 
 type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt">;
-type PendingCompletion = { result: Completion; delivered: (() => void) | undefined };
+type PendingCompletion = { result: Completion; delivered: (() => void) | undefined; prepare: (() => void) | undefined };
 type CompletionMessage = { customType: string; content: string; display: boolean; details: { ids: string[] } };
 
 const oneLine = (text: string): string => text.replace(/[\u0000-\u001f\u007f]/g, " ");
@@ -18,6 +18,7 @@ const clip = (text: string, limit: number): string =>
 export class AgentCompletionInbox {
   readonly #pending = new Map<string, PendingCompletion>();
   readonly #acknowledged = new Set<string>();
+  readonly #receiptRetries = new Set<() => void>();
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -79,7 +80,7 @@ export class AgentCompletionInbox {
       });
   }
 
-  enqueue(result: Completion, delivered?: () => void): void {
+  enqueue(result: Completion, delivered?: () => void, prepare?: () => void): void {
     if (this.#closed) return;
     if (this.#acknowledged.has(result.id)) {
       this.#confirmDelivery(delivered);
@@ -93,7 +94,7 @@ export class AgentCompletionInbox {
         text: clip(result.text, SUMMARY_CHARS),
         ...(result.error !== undefined ? { error: clip(result.error, SUMMARY_CHARS) } : {}),
       },
-      delivered,
+      delivered, prepare,
     });
     if (this.#context.hasUI) {
       const failure = result.status !== "completed";
@@ -109,26 +110,32 @@ export class AgentCompletionInbox {
   }
 
   close(): void {
+    for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
     this.#closed = true;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     for (const unsubscribe of this.#unsubscribe) unsubscribe();
     this.#pending.clear();
     this.#acknowledged.clear();
+    this.#receiptRetries.clear();
   }
 
   #confirmDelivery(delivered: (() => void) | undefined): void {
-    try { delivered?.(); } catch {
-      // The durable envelope remains queued and retries its receipt on the next poll.
+    if (!delivered) return;
+    try { delivered(); this.#receiptRetries.delete(delivered); } catch {
+      this.#receiptRetries.add(delivered);
+      this.#schedule();
     }
   }
 
   #schedule(): void {
-    if (this.#closed || this.#timer || this.#suspended || !this.#pending.size) return;
+    if (this.#closed || this.#timer || (!this.#receiptRetries.size && (this.#suspended || !this.#pending.size))) return;
     // Never enqueue into Pi during an active tool batch. turn_end owns that path.
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
+      for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
       if (this.#context.isIdle() && !this.#context.hasPendingMessages()) this.#flush();
+      if (this.#receiptRetries.size) this.#schedule();
     }, IDLE_BATCH_MS);
     this.#timer.unref?.();
   }
@@ -146,16 +153,21 @@ export class AgentCompletionInbox {
         return `Agent ${oneLine(result.name).slice(0, 80)} (${result.id}) ${result.status} after ${seconds}s:\n${clip(summary || "no result", perResult)}`;
       }),
     ].join("\n\n");
-    deliver({
+    // Claim durable actor consumption before attempting a live send.
+    try { for (const { prepare } of batch) prepare?.(); } catch { this.#schedule(); return; }
+    try { deliver({
       customType: AGENT_COMPLETION_MESSAGE_TYPE,
       content,
       display: false,
       details: { ids: batch.map(({ result }) => result.id) },
-    });
-    for (const { result, delivered } of batch) {
-      this.#pending.delete(result.id);
-      this.#acknowledged.add(result.id);
-      this.#confirmDelivery(delivered);
+    }); } finally {
+      // ponytail: sendMessage may fail after Pi accepted the notice. Once claimed,
+      // choose at-most-once, not a later mailbox activation with duplicate effects.
+      for (const { result, delivered } of batch) {
+        this.#pending.delete(result.id);
+        this.#acknowledged.add(result.id);
+        this.#confirmDelivery(delivered);
+      }
     }
   }
 }

@@ -19,7 +19,7 @@ const ID = /^[a-f0-9]{32}$/;
  */
 export class ActorChildCompletionStore {
   readonly directory: string;
-  constructor(sessionFile: string) {
+  constructor(readonly sessionFile: string) {
     this.directory = path.join(path.dirname(sessionFile), "child-completions");
   }
 
@@ -44,18 +44,45 @@ export class ActorChildCompletionStore {
   acknowledge(id: string): void {
     if (!ID.test(id)) return;
     if (!fs.existsSync(this.#file(id))) return;
-    // Receipt first: interruption between these writes leaves an inert pending file.
-    writeJsonAtomic(this.#receipt(id), { id, acknowledgedAt: Date.now() }, { durable: true });
+    this.consume(id);
     fs.rmSync(this.#file(id), { force: true });
+  }
+
+  /** Shared live/mailbox consumption record, durable before an activation can observe it. */
+  consume(id: string): void {
+    if (!ID.test(id) || this.received(id)) return;
+    writeJsonAtomic(this.#receipt(id), { id, acknowledgedAt: Date.now() }, { durable: true });
+  }
+
+  #committedIds(): Set<string> {
+    const ids = new Set<string>();
+    // A committed native completion also proves consumption, including older workers
+    // whose post-send receipt failed. Do not infer unread from a surviving envelope.
+    let text: string;
+    try { text = fs.readFileSync(this.sessionFile, "utf8"); } catch { return ids; }
+    for (const line of text.split("\n")) {
+      try {
+        const entry = JSON.parse(line);
+        const message = entry.type === "custom_message" ? entry : entry.type === "message" ? entry.message : undefined;
+        if (message?.customType === "pi-fabric-agent-complete") {
+          for (const id of message.details?.ids ?? []) if (typeof id === "string" && ID.test(id)) ids.add(id);
+        }
+      } catch { /* Ignore an interrupted last session entry. */ }
+    }
+    return ids;
   }
 
   pending(): ActorChildCompletion[] {
     let files: string[];
     try { files = fs.readdirSync(this.directory); } catch { return []; }
-    return files.filter((file) => file.endsWith(".json") && ID.test(file.slice(0, -5))).slice(0, 100).flatMap((file) => {
+    const pending = files.filter((file) => file.endsWith(".json") && ID.test(file.slice(0, -5))).slice(0, 100);
+    if (!pending.length) return [];
+    const committed = this.#committedIds();
+    return pending.flatMap((file) => {
       const id = file.slice(0, -5);
       if (!ID.test(id)) return [];
       try {
+        if (committed.has(id)) this.consume(id);
         if (this.received(id)) {
           fs.rmSync(this.#file(id), { force: true });
           return [];

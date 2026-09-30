@@ -64,8 +64,8 @@ Ordinary process children receive `SMARTY_ROLE=task-agent`, whether the parent h
 fleet role or no role. The fleet write governor derives their lane from the child's cwd, not
 from a role or a lane environment variable. Explicit actor runs retain their inherited role
 and set `PI_FABRIC_ACTOR_NAME`; that actor identity takes precedence in the governor. An
-ordinary task spawned by an actor also inherits `PI_FABRIC_ACTOR_NAME`, so its governed
-writes still count as that actor. This is write attribution, not an authorization boundary.
+ordinary task spawned by an actor clears `PI_FABRIC_ACTOR_NAME`, so its governed
+writes count as the task-agent writer, not as the spawning actor. This is write attribution, not an authorization boundary.
 `PI_FABRIC_ROLE` is unchanged: when the parent sets it, `participantRole` still prefers that
 inherited value over `SMARTY_ROLE`.
 

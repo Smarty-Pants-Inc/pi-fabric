@@ -8,10 +8,14 @@ import { ProcessTransport } from "../../src/agents/transports/process-transport.
 import { ResidencyClient } from "../../src/residency/client.js";
 import { CPythonRuntime } from "../../src/runtime/cpython-runtime.js";
 
-/** Test-only observation: no extra waits, deadline changes or product hooks. */
+/** Test-only observation and teardown reaping; no execution deadline changes. */
 export const captureDurableExecutionTrace = async () => {
   const startedAt = performance.now();
   const events: { step: string; at: string; elapsedMs: number; details?: Record<string, unknown> }[] = [];
+  const guests: { closed: Promise<void>; diagnostics: {
+    pid: number | null; stderrTail: string; exited: boolean; closed: boolean;
+    exitCode: number | null; signal: NodeJS.Signals | null;
+  } }[] = [];
   const record = (step: string, details?: Record<string, unknown>) => {
     events.push({ step, at: new Date().toISOString(), elapsedMs: Math.round(performance.now() - startedAt), ...(details ? { details } : {}) });
   };
@@ -34,7 +38,23 @@ export const captureDurableExecutionTrace = async () => {
     const python = Array.isArray(args[1]) && args[1].includes("-I") && args[1].includes("-c");
     const label = python ? "CPython guest" : "worker";
     record(`${label} spawn requested`, { command: args[0] });
+    if (python) args[1] = [...args[1] as string[], "--fabric-startup-trace"];
     const child = actual.spawn(...args);
+    if (python) {
+      const diagnostics = { pid: child.pid ?? null, stderrTail: "", exited: false, closed: false,
+        exitCode: null as number | null, signal: null as NodeJS.Signals | null };
+      child.stderr?.on("data", (chunk: Buffer) => {
+        diagnostics.stderrTail = (diagnostics.stderrTail + chunk.toString("utf8")).slice(-4000);
+      });
+      child.once("exit", (code, signal) => {
+        diagnostics.exited = true; diagnostics.exitCode = code; diagnostics.signal = signal;
+      });
+      const closed = new Promise<void>(resolve => child.once("close", (code, signal) => {
+        diagnostics.closed = true; diagnostics.exitCode = code; diagnostics.signal = signal;
+        record(`${label} closed`, { code, signal }); resolve();
+      }));
+      guests.push({ closed, diagnostics });
+    }
     record(`${label} spawn returned`, { pid: child.pid });
     child.once("spawn", () => record(`${label} spawned`, { pid: child.pid }));
     child.once("error", error => record(`${label} error`, { error: error.message }));
@@ -91,8 +111,11 @@ export const captureDurableExecutionTrace = async () => {
   record("trace installed");
   return {
     record, events,
+    // The runtime kills on settlement but bounds its own exit wait to 250 ms.
+    // Do not remove a Windows guest's cwd until its process and pipes close.
+    waitForGuests: () => Promise.all(guests.map(guest => guest.closed)),
     report: (engine: string, operation: string, snapshot: unknown) => console.error("Durable execution trace", JSON.stringify({
-      platform: process.platform, engine, operation, events, snapshot,
+      platform: process.platform, engine, operation, events, guests: guests.map(guest => guest.diagnostics), snapshot,
     }, null, 2)),
   };
 };

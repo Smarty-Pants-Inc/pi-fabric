@@ -692,10 +692,14 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
         expect(result.success, result.error).toBe(true); expect(result.error).toBeUndefined();
         const decisions = decisionsFor(state); expect(decisions).toHaveLength(1);
         expect(result.value).toMatchObject({ id: decisions[0].id });
-        if (process.env.PI_FABRIC_TEST_TRACE === "1") report();
       } catch (error) {
-        trace.record("control failed", { error: String(error) }); report(); throw error;
-      } finally { await main.close(); await state.close(); }
+        trace.record("control failed", { error: String(error) });
+        await trace.waitForGuests(); // Include the final exit status and stderr in failure-only output.
+        report(); throw error;
+      } finally {
+        await trace.waitForGuests(); // Release the guest's cwd before Windows rmdir.
+        await main.close(); await state.close();
+      }
     });
   }
   for (const engine of engines) for (const operation of ["spawn", "create"] as const)

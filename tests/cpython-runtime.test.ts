@@ -11,6 +11,7 @@ import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { CPYTHON_CHILD_SOURCE } from "../src/runtime/cpython-child-source.js";
 import { CPythonRuntime, LINUX_BWRAP_ISOLATION_ARGS } from "../src/runtime/cpython-runtime.js";
 import type { FabricHostCall, FabricSandboxOptions } from "../src/runtime/kernel.js";
+import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -48,6 +49,69 @@ afterEach(() => {
 });
 
 describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 }, () => {
+  it("keeps guest startup diagnostics opt-in", async () => {
+    expect(await run("return await schema.status()")).toMatchObject({ terminationReason: "completed", logs: [] });
+  });
+
+  it.each(["native", "loopback"] as const)("captures guest startup timestamps and reaps its exit over %s IPC", async transport => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => {});
+    const trace = await captureDurableExecutionTrace();
+    if (transport === "loopback") vi.stubGlobal("process", new Proxy(process, {
+      get(target, key) { return key === "platform" ? "win32" : Reflect.get(target, key); },
+    }));
+    try {
+      const result = await run("await schema.status()\nreturn await schema.status()");
+      expect(result.terminationReason, result.error).toBe("completed");
+      await trace.waitForGuests();
+      expect(output).not.toHaveBeenCalled();
+      trace.report("cpython", "diagnostic-probe", result);
+      const report = JSON.parse(String(output.mock.calls[0]?.[1]));
+      const guest = report.guests[0];
+      expect(guest).toMatchObject({ exited: true, closed: true });
+      expect(guest.exitCode !== null || guest.signal !== null).toBe(true);
+      const stages = guest.stderrTail.split("\n").filter(Boolean);
+      for (const stage of stages) expect(stage).toMatch(/^\[fabric-cpython-startup\] at=\d+\.\d+ elapsedMs=\d+\.\d+ /);
+      expect(stages.map((stage: string) => stage.replace(/^.*elapsedMs=\S+ /, ""))).toEqual([
+        "interpreter start", "imports done", "event loop starting", "event loop running",
+        expect.stringMatching(transport === "loopback" || process.platform === "win32"
+          ? /^connecting to 127\.0\.0\.1:\d+$/ : /^connecting to inherited socket fd 3$/),
+        "connected", ...(transport === "loopback" || process.platform === "win32" ? ["IPC hello written"] : []),
+        "waiting for execute request", "execute request received", "first request written",
+      ]);
+      expect(guest.stderrTail).not.toContain("token");
+    } finally {
+      await trace.waitForGuests();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("waits for guest close before cwd removal and retains only the stderr tail with exit status", async () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => {});
+    const trace = await captureDurableExecutionTrace();
+    const cwd = temp();
+    const child = childProcess.spawn(binary, ["-I", "-B", "-c",
+      'import sys, time; sys.stderr.write("x" * 5000 + "\\nlast startup marker\\n"); sys.stderr.flush(); time.sleep(0.4); sys.exit(7)',
+    ], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      let reaped = false;
+      const reaping = trace.waitForGuests().then(() => { reaped = true; });
+      await new Promise<void>(resolve => child.once("spawn", () => resolve()));
+      expect(reaped).toBe(false);
+      await reaping;
+      expect(reaped).toBe(true);
+      fs.rmSync(cwd, { recursive: true, force: true });
+      expect(output).not.toHaveBeenCalled();
+      trace.report("cpython", "failed-startup-probe", {});
+      const report = JSON.parse(String(output.mock.calls[0]?.[1]));
+      expect(report.guests[0]).toMatchObject({ exited: true, closed: true, exitCode: 7, signal: null });
+      expect(report.guests[0].stderrTail).toHaveLength(4000);
+      expect(report.guests[0].stderrTail).toContain("last startup marker");
+    } finally {
+      child.kill("SIGKILL");
+      await trace.waitForGuests();
+    }
+  });
+
   it("routes the records primitive through the same host bridge", async () => {
     expect(await run('return await records.read(after=3, limit=2)')).toMatchObject({
       terminationReason: "completed", value: { ref: "records.read", args: { after: 3, limit: 2 } },

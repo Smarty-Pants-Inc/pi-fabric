@@ -34,6 +34,83 @@ afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
+describe("native reader identical-prefix paging", () => {
+  it.each([
+    ["session", "readFollow"], ["events", "readFollow"],
+    ["session", "loadNewer"], ["events", "loadNewer"],
+  ] as const)("keeps one-click older progress and one-page %s growth via %s", (kind, api) => {
+    const file = path.join(workspace(), `${kind}.jsonl`);
+    const record = (i: number) => kind === "session" ? entry(i)
+      : { type: "message_end", message: entry(i).message };
+    const records = Array.from({ length: 650 }, (_, i) => record(i));
+    const bytes = jsonl([...(kind === "session" ? [header] : []), ...records.slice(0, 150)]);
+    fs.writeFileSync(file, bytes);
+    const input = { id: "reader", status: "running", ...(kind === "session" ? { sessionFile: file } : { eventsFile: file }) };
+    const reader = new NativeConversationReader();
+    reader.read(input, false);
+    const before = reader.loadOlder()!;
+    const olderReader = new NativeConversationReader();
+    const olderBefore = olderReader.read(input, api === "readFollow");
+    const oldInode = fs.statSync(file).ino;
+    fs.writeFileSync(`${file}.new`, bytes + jsonl(records.slice(150)));
+    fs.renameSync(`${file}.new`, file);
+    const inode = fs.statSync(file).ino;
+    expect(inode).not.toBe(oldInode);
+    const realRead = fs.readSync.bind(fs);
+    const suffixReads: Array<{ position: number; length: number; replacement: boolean }> = [];
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+      const stack = new Error().stack ?? "";
+      if (fs.fstatSync(args[0]).ino === inode && stack.includes("readForwardPage") && !stack.includes("matchesLoadedPages")) {
+        suffixReads.push({ position: args[4] as number, length: args[3], replacement: stack.includes("replaceWindowIfNeeded") });
+      }
+      return realRead(...args);
+    }) as typeof fs.readSync);
+    const older = olderReader.loadOlder(1)!;
+    expect(older.messages.length).toBeGreaterThan(olderBefore.messages.length);
+    expect(older.messages.slice(-olderBefore.messages.length)).toEqual(olderBefore.messages);
+    expect(older.messages.at(-1)?.timestamp).toBe(149);
+    expect(older.leafId).toBe(olderBefore.leafId);
+    expect(older.hasNewer).toBe(true);
+    expect(suffixReads).toEqual([]); // Even prior following must not consume unseen records.
+    const grown = api === "readFollow" ? reader.read(input, true) : reader.loadNewer()!;
+    expect(suffixReads).toEqual([{ position: Buffer.byteLength(bytes), length: 1024 * 1024, replacement: true }]);
+    const added = grown.messages.filter((message) => message.timestamp >= 150);
+    expect(added.length).toBeGreaterThan(0);
+    expect(added.length).toBeLessThan(500);
+    expect(grown.messages).toEqual([...before.messages, ...records.slice(150, 150 + added.length).map((record) => record.message)]);
+    expect(grown.hasNewer).toBe(true);
+    suffixReads.length = 0;
+    const next = reader.read(input, true);
+    expect(suffixReads).toHaveLength(1);
+    expect(suffixReads[0]!.length).toBe(1024 * 1024);
+    expect(suffixReads[0]!.replacement).toBe(false);
+    expect(next.messages.slice(0, grown.messages.length)).toEqual(grown.messages);
+    expect(next.messages.length).toBeGreaterThan(grown.messages.length);
+    expect(next.hasNewer).toBe(true);
+    reads.mockRestore();
+    reader.clear();
+    olderReader.clear();
+  });
+
+  it.each(["session", "events"] as const)("does not read a new %s tail after identical EOF adoption", (kind) => {
+    const file = path.join(workspace(), `${kind}.jsonl`);
+    const bytes = jsonl(kind === "session" ? [header, entry(0, 16)] : [{ type: "message_end", message: entry(0, 16).message }]);
+    fs.writeFileSync(file, bytes);
+    const input = { id: "reader", status: "running", ...(kind === "session" ? { sessionFile: file } : { eventsFile: file }) };
+    const reader = new NativeConversationReader();
+    const before = reader.read(input, true);
+    const inode = fs.statSync(file).ino;
+    fs.writeFileSync(`${file}.new`, bytes);
+    fs.renameSync(`${file}.new`, file);
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const reads = vi.spyOn(fs, "readSync");
+    const after = reader.read(input, true);
+    expect(content(after)).toEqual(content(before));
+    expect(reads).toHaveBeenCalledTimes(1); // Loaded-page verification only.
+    expect(reads.mock.calls[0]![4]).toBe(0);
+    reader.clear();
+  });
+});
 describe("native reader disk suspension", () => {
   it.each(["relocation", "unread"] as const)("preserves poisoned evidence across a failed %s replacement transaction", (phase) => {
     const file = path.join(workspace(), "session.jsonl");

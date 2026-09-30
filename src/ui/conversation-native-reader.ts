@@ -934,7 +934,7 @@ export class NativeConversationReader {
     try {
       // Check identity even when pinned or size grew: terminal compaction can
       // shorten the file OR grow a near-empty end into the compact marker.
-      if (this.#replaceWindowIfNeeded(kind, opened)) return true;
+      if (this.#replaceWindowIfNeeded(kind, opened, followLatest)) return true;
       window.size = opened.size;
       window.unavailable = false;
       if (!followLatest || opened.size <= window.tail) return false;
@@ -970,6 +970,7 @@ export class NativeConversationReader {
   #replaceWindowIfNeeded(
     kind: FileKind,
     opened: { descriptor: number; device: number; inode: number; size: number },
+    followLatest?: boolean,
   ): boolean {
     const { device, inode } = opened;
     const window = this.#windows.get(kind);
@@ -991,7 +992,20 @@ export class NativeConversationReader {
         window.inode = inode;
         window.size = opened.size;
         window.unavailable = false;
-        return false;
+        // Growth must consume its one unread page inside this transaction:
+        // adopting the inode cannot let suffix IO escape the rollback fence.
+        if (followLatest && opened.size > window.tail) {
+          const page = readForwardPage(opened.descriptor, window.tail, opened.size, GROWTH_PAGE_BYTES);
+          if (page.end > window.tail) {
+            this.#applyRecords(kind, page.records, true);
+            this.#rememberRange(kind, page);
+            window.tail = page.end;
+            window.loadedRecords = (window.loadedRecords ?? 0) + page.records.length;
+          }
+        }
+        // loadOlder still needs its backward page in this same click. Growth
+        // is handled even when pinned/at EOF, avoiding a second unread read.
+        return followLatest !== undefined;
       }
       // Relocate logical coverage, not a count backwards from the new EOF:
       // unread arrivals must not displace either loaded history or a pinned leaf.

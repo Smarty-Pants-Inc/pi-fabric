@@ -13,6 +13,8 @@ const CONTROL_SEEN_PREFIX = "topology/control-seen/";
 const HOST_PREFIX = "topology/hosts/";
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
+// A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
+const CANCELLATION_RETENTION_MS = 60_000;
 const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
@@ -565,27 +567,28 @@ export class FabricControlPlane {
     }
     if (pending.cancellationPublished) return;
     pending.cancellationPublished = true;
-    const requestedAt = Date.now();
+    const expiresAt = Date.now() + Math.max(CANCELLATION_RETENTION_MS, 2 * this.#ackTimeoutMs);
+    const cancelCommandId = randomUUID();
     const cancellation = {
       topic: CONTROL_TOPIC,
       kind: "cancel",
       from: this.identity,
       to: pending.ownerHostId,
-      data: {
+      data: (committedAt: number): FabricControlCommand => ({
         version: 1,
-        commandId: randomUUID(),
+        commandId: cancelCommandId,
         targetId: pending.targetId,
         operation: "cancel",
         cancelCommandId: commandId,
         replyTo: this.options.hostId,
         ...(pending.destinationRemoteHost !== undefined
           ? { destinationRemoteHost: pending.destinationRemoteHost } : {}),
-        requestedAt,
-        deadlineAt: requestedAt + this.#ackTimeoutMs,
-      } satisfies FabricControlCommand,
+        requestedAt: committedAt,
+        deadlineAt: committedAt + this.#ackTimeoutMs,
+      }),
     };
     await this.#backgroundCancellations.enqueue(() => {
-      if (Date.now() <= cancellation.data.deadlineAt) return this.mesh.publish(cancellation);
+      if (Date.now() <= expiresAt) return this.mesh.publish(cancellation);
       return undefined;
     });
   }

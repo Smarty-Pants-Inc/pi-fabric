@@ -138,7 +138,9 @@ class ResidentHost {
   readonly #responsesPath: string;
   readonly #agentsPath: string;
   readonly #removalsPath: string;
-  readonly #deliveryPrefix: string;
+  readonly #deliveryOutboxPath: string;
+  readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
+  #flushingDeliveries: Promise<unknown> | undefined;
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #pollingRequests = false;
@@ -163,7 +165,7 @@ class ResidentHost {
     this.#responsesPath = path.join(config.residencyRoot, "responses");
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
-    this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
+    this.#deliveryOutboxPath = path.join(config.residencyRoot, "delivery-outbox");
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol });
     this.participants = new ParticipantDirectory(this.mesh, {
@@ -371,7 +373,10 @@ class ResidentHost {
     await this.participants.start().catch(() => undefined);
     this.lifecycle.start();
     this.#requestTimer = setInterval(
-      () => void this.#backgroundRequests.run(() => this.#pollRequests()),
+      () => {
+        void this.#backgroundRequests.run(() => this.#pollRequests());
+        void this.#retryDeliveries();
+      },
       REQUEST_POLL_MS,
     );
     const now = Date.now();
@@ -390,6 +395,7 @@ class ResidentHost {
       await this.actors.finishPendingRemovals();
       this.#writeRemovals();
     });
+    void this.#retryDeliveries();
     await this.#pollRequests();
   }
 
@@ -406,6 +412,7 @@ class ResidentHost {
     } finally {
       await this.agents.close();
       await this.#backgroundDeliveries.close();
+      await this.#flushingDeliveries;
       await this.participants.close().catch(() => undefined);
       this.#releaseLock();
     }
@@ -538,7 +545,6 @@ class ResidentHost {
     rootId = this.config.rootId,
   ): Promise<void> {
     const id = randomUUID();
-    const prefix = rootId === this.config.rootId ? this.#deliveryPrefix : residentDeliveryPrefix(rootId);
     const record: ResidentDeliveryRecord = {
       format: RESIDENT_HOST_FORMAT,
       id,
@@ -551,20 +557,48 @@ class ResidentHost {
       ...(agentCompletionId ? { agentCompletionId } : {}),
       createdAt: Date.now(),
     };
-    await this.#backgroundDeliveries.enqueue(async () => {
-      try {
-        await this.mesh.put({ key: `${prefix}${id}`, value: record, identity: this.identity, ifVersion: 0 });
-      } catch (error) {
-        // A timeout wrote nothing and needs retry, not payload truncation. Keep the same id
-        // across attempts so Main's durable journal admits the eventual record only once.
-        if (isMeshLockTimeout(error)) throw error;
-        await this.mesh.put({
-          key: `${prefix}${id}`,
-          value: { ...record, message: message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
-          identity: this.identity, ifVersion: 0,
-        });
+    // Persist before yielding: AgentManager has already marked this notification sent.
+    // Idle exit/queue pressure must not drop the host's ownership of the handoff.
+    writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record, { durable: true });
+    await this.#retryDeliveries();
+  }
+
+  #retryDeliveries(): Promise<unknown> {
+    if (this.#closed) return Promise.resolve();
+    if (this.#flushingDeliveries) return this.#flushingDeliveries;
+    const flushing = this.#deliveryRetry.run(() => this.#flushDeliveries());
+    this.#flushingDeliveries = flushing;
+    void flushing.finally(() => {
+      if (this.#flushingDeliveries === flushing) this.#flushingDeliveries = undefined;
+    }).catch(() => undefined);
+    return flushing;
+  }
+
+  async #flushDeliveries(): Promise<void> {
+    if (!fs.existsSync(this.#deliveryOutboxPath)) return;
+    for (const entry of fs.readdirSync(this.#deliveryOutboxPath).filter(entry => entry.endsWith(".json")).slice(0, 32)) {
+      const file = path.join(this.#deliveryOutboxPath, entry);
+      const record = readJson<ResidentDeliveryRecord>(file);
+      if (!record || record.format !== RESIDENT_HOST_FORMAT || `${record.id}.json` !== entry) {
+        throw new Error(`Invalid resident delivery outbox item: ${file}`);
       }
-    });
+      const key = `${residentDeliveryPrefix(record.rootId)}${record.id}`;
+      try {
+        await this.mesh.put({ key, value: record, identity: this.identity, ifVersion: 0 });
+      } catch (error) {
+        // A restart after put but before unlink replays the SAME private UUID. A CAS
+        // conflict (including a consumed tombstone) means it was handed off already.
+        if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
+          if (isMeshLockTimeout(error)) throw error;
+          await this.mesh.put({
+            key, value: { ...record, message: record.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
+            identity: this.identity, ifVersion: 0,
+          });
+        }
+      }
+      // Only a durable mesh handoff releases ownership. Main journals the stable id.
+      fs.rmSync(file);
+    }
   }
 
   async #pollRequests(): Promise<void> {

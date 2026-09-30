@@ -8,6 +8,7 @@ import { parseAnchors, type RecordsAnchor } from "../src/records/chain.js";
 import { lockFile, normalizeServiceConfig } from "../src/records/server.js";
 
 const anchor = (seq: number): RecordsAnchor => ({ org: "test", seq, hash: seq === 0 ? null : seq.toString(16).padStart(64, "0"), at: "2026-09-30T12:00:00.000Z" });
+const heartbeat = (dir: string) => JSON.parse(fs.readFileSync(path.join(dir, "HEARTBEAT.json"), "utf8"));
 const segment = (dir: string, n: number) => path.join(dir, `anchors-${String(n).padStart(12, "0")}.jsonl`);
 const prefix = (text: string): RecordsAnchor[] => text.slice(0, text.lastIndexOf("\n") + 1).split("\n").slice(0, -1).map((line) => JSON.parse(line));
 const dirs: string[] = [];
@@ -38,6 +39,66 @@ describe("records anchor export configuration", () => {
 });
 
 describe.skipIf(process.platform === "win32")("append-only records anchor segments", () => {
+  it("idle ticks refresh the heartbeat across restarts without appending segment bytes", async () => {
+    const { dir, writer } = fresh();
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-30T12:00:00.000Z"));
+    await writer.publish(anchor(0));
+    expect(heartbeat(dir)).toEqual({ org: "test", lastSeq: 0, lastHash: null, checkedAt: "2026-09-30T12:00:00.000Z" });
+    const before = fs.readFileSync(segment(dir, 1), "utf8");
+    for (const checkedAt of ["2026-09-30T12:05:00.000Z", "2026-09-30T12:10:00.000Z"]) {
+      now.mockReturnValue(Date.parse(checkedAt));
+      await new AnchorExport(dir, (file) => lockFile(file, 5)).publish({ ...anchor(0), at: checkedAt });
+      expect(heartbeat(dir)).toEqual({ org: "test", lastSeq: 0, lastHash: null, checkedAt });
+      expect(fs.readFileSync(segment(dir, 1), "utf8")).toBe(before);
+    }
+    expect(fs.readdirSync(dir).filter((file) => file.endsWith(".jsonl"))).toHaveLength(1);
+  });
+
+  it("a changed anchor appends once and updates the heartbeat frontier and checkedAt", async () => {
+    const { dir, writer } = fresh();
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-30T12:00:00.000Z"));
+    await writer.publish(anchor(0));
+    for (const changed of [anchor(1), { ...anchor(1), hash: "f".repeat(64) }]) {
+      now.mockReturnValue(Date.now() + 300_000);
+      await writer.publish(changed);
+      expect(heartbeat(dir)).toEqual({ org: "test", lastSeq: changed.seq, lastHash: changed.hash, checkedAt: new Date(Date.now()).toISOString() });
+      const before = fs.readFileSync(segment(dir, 1), "utf8");
+      now.mockReturnValue(Date.now() + 300_000);
+      await writer.publish(changed);
+      expect(heartbeat(dir).checkedAt).toBe(new Date(Date.now()).toISOString());
+      expect(fs.readFileSync(segment(dir, 1), "utf8")).toBe(before);
+    }
+    expect(prefix(fs.readFileSync(segment(dir, 1), "utf8"))).toEqual([anchor(0), anchor(1), { ...anchor(1), hash: "f".repeat(64) }]);
+  });
+
+  it("atomically replaces the heartbeat and retries a failed heartbeat rename without duplicate data", async () => {
+    const { dir, writer } = fresh();
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-30T12:00:00.000Z"));
+    await writer.publish(anchor(1));
+    const before = fs.readFileSync(path.join(dir, "HEARTBEAT.json"), "utf8");
+    now.mockReturnValue(Date.now() + 300_000);
+    const rename = fs.promises.rename.bind(fs.promises);
+    let fail = true;
+    vi.spyOn(fs.promises, "rename").mockImplementation(async (...args) => {
+      if (String(args[1]).endsWith("HEARTBEAT.json")) {
+        expect(fs.readFileSync(path.join(dir, "HEARTBEAT.json"), "utf8")).toBe(before);
+        expect(fs.statSync(args[0]).mode & 0o777).toBe(0o644);
+        expect(JSON.parse(fs.readFileSync(args[0], "utf8"))).toEqual({ org: "test", lastSeq: 2, lastHash: anchor(2).hash, checkedAt: "2026-09-30T12:05:00.000Z" });
+        if (fail) { fail = false; throw new Error("heartbeat rename failed"); }
+      }
+      await rename(...args);
+    });
+    await expect(writer.publish(anchor(2))).rejects.toThrow("heartbeat rename failed");
+    expect(fs.readFileSync(path.join(dir, "HEARTBEAT.json"), "utf8")).toBe(before);
+    expect(fs.readdirSync(dir).filter((file) => file.endsWith(".tmp"))).toEqual([]);
+    const data = fs.readFileSync(segment(dir, 1), "utf8");
+    await writer.publish(anchor(2));
+    expect(fs.readFileSync(segment(dir, 1), "utf8")).toBe(data);
+    expect(prefix(data)).toEqual([anchor(1), anchor(2)]);
+    expect(heartbeat(dir)).toEqual({ org: "test", lastSeq: 2, lastHash: anchor(2).hash, checkedAt: "2026-09-30T12:05:00.000Z" });
+    expect(fs.readdirSync(dir).filter((file) => file.endsWith(".tmp"))).toEqual([]);
+  });
+
   it("publishes the existing anchor format and deduplicates across restarts, but retains a changed digest", async () => {
     const { dir, writer } = fresh();
     await writer.publish(anchor(0));
@@ -73,13 +134,16 @@ describe.skipIf(process.platform === "win32")("append-only records anchor segmen
   it("sets records-owned 0755/0644 permissions despite a restrictive umask", async () => {
     const { dir, writer } = fresh();
     const mask = process.umask(0o077);
-    try { await writer.publish(anchor(1)); } finally { process.umask(mask); }
+    try { await writer.publish(anchor(1)); await writer.publish(anchor(1)); } finally { process.umask(mask); }
     const directory = fs.statSync(dir);
     const file = fs.statSync(segment(dir, 1));
     expect(directory.mode & 0o777).toBe(0o755);
     expect(file.mode & 0o777).toBe(0o644);
     expect(directory.uid).toBe(process.getuid!());
     expect(file.uid).toBe(process.getuid!());
+    const pulse = fs.statSync(path.join(dir, "HEARTBEAT.json"));
+    expect(pulse.mode & 0o777).toBe(0o644);
+    expect(pulse.uid).toBe(process.getuid!());
     expect(fs.statSync(path.join(dir, ".publish.lock")).mode & 0o777).toBe(0o600);
   });
 
@@ -98,13 +162,17 @@ describe.skipIf(process.platform === "win32")("append-only records anchor segmen
     const rename = fs.promises.rename.bind(fs.promises);
     vi.spyOn(fs.promises, "rename").mockImplementation(async (...args) => { events.push("rename"); await rename(...args); });
     await writer.publish(anchor(1));
-    expect(events.slice(-3)).toEqual(["sync:temp", "rename", "sync:directory"]);
-    expect(events.slice(0, -3).length).toBeGreaterThan(0);
-    expect(events.slice(0, -3).every((event) => event === "sync:ancestor")).toBe(true);
+    expect(events.slice(-6)).toEqual(["sync:temp", "rename", "sync:directory", "sync:temp", "rename", "sync:directory"]);
+    expect(events.slice(0, -6).length).toBeGreaterThan(0);
+    expect(events.slice(0, -6).every((event) => event === "sync:ancestor")).toBe(true);
     events.length = 0;
     await writer.publish(anchor(2));
-    expect(events.slice(-3)).toEqual(["O_APPEND", "sync:segment", "sync:directory"]);
-    expect(events.slice(0, -3).every((event) => event === "sync:ancestor")).toBe(true);
+    expect(events.slice(-6)).toEqual(["O_APPEND", "sync:segment", "sync:directory", "sync:temp", "rename", "sync:directory"]);
+    expect(events.slice(0, -6).every((event) => event === "sync:ancestor")).toBe(true);
+    events.length = 0;
+    await writer.publish(anchor(2));
+    expect(events.slice(-5)).toEqual(["sync:segment", "sync:directory", "sync:temp", "rename", "sync:directory"]);
+    expect(events.slice(0, -5).every((event) => event === "sync:ancestor")).toBe(true);
   });
 
   it("a killed mid-append writer leaves a valid prefix, releases its lock and never rewrites the torn tail", async () => {

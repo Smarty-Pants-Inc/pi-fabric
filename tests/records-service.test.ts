@@ -111,7 +111,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     expect((await alice.read({ id: ALICE }, {})).frontier).toBe(0);
   });
 
-  it("exports at startup and on the existing tick independently of admission, exposes its path, and stops at shutdown", async () => {
+  it("exports anchors and refreshes the heartbeat at startup and on due idle ticks independently of admission, and stops at shutdown", async () => {
     const directory = path.join(dir, "public-anchors");
     const statusFile = path.join(dir, "export-status.json");
     let now = 1_000_000;
@@ -119,25 +119,41 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     const file = path.join(directory, "anchors-000000000001.jsonl");
     const anchors = () => fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     expect(anchors()).toEqual([{ org: config.org, seq: 0, hash: null, at: expect.any(String) }]);
+    const heartbeatFile = path.join(directory, "HEARTBEAT.json");
+    const heartbeat = () => JSON.parse(fs.readFileSync(heartbeatFile, "utf8"));
+    expect(heartbeat()).toEqual({ org: config.org, lastSeq: 0, lastHash: null, checkedAt: expect.any(String) });
+    const initialHeartbeat = fs.statSync(heartbeatFile).ino;
     expect(service.gate.enabled).toBe(false);
     const alice = await connect(config, ALICE);
     await alice.append({ id: ALICE }, { ref: REF, kind: "comment", key: "export-tick", text: "landed" });
     now += 299_999;
     await service.watchdog.tick();
     expect(anchors()).toHaveLength(1);
+    expect(fs.statSync(heartbeatFile).ino).toBe(initialHeartbeat); // no check before export is due
     now++;
     await service.watchdog.tick();
     const computed = await alice.anchor({ id: ALICE }, {});
     expect(anchors()[1]).toEqual({ ...computed, at: expect.any(String) });
+    expect(heartbeat()).toEqual({ org: config.org, lastSeq: 1, lastHash: computed.hash, checkedAt: expect.any(String) });
+    expect(fs.statSync(heartbeatFile).ino).not.toBe(initialHeartbeat);
+    const changedHeartbeat = fs.statSync(heartbeatFile).ino;
+    const changedCheckedAt = Date.parse(heartbeat().checkedAt);
+    const changedBytes = fs.readFileSync(file, "utf8");
     expect((await service.status()).anchorExport).toMatchObject({ directory, intervalMs: 300_000, last: { seq: 1, hash: computed.hash } });
     now += 300_000;
     await service.watchdog.tick();
     expect(anchors()).toHaveLength(2); // unchanged database is not another anchor
+    expect(fs.readFileSync(file, "utf8")).toBe(changedBytes);
+    expect(fs.statSync(heartbeatFile).ino).not.toBe(changedHeartbeat); // idle check still atomically refreshes liveness
+    expect(heartbeat()).toEqual({ org: config.org, lastSeq: 1, lastHash: computed.hash, checkedAt: expect.any(String) });
+    expect(Date.parse(heartbeat().checkedAt)).toBeGreaterThanOrEqual(changedCheckedAt);
     await service.close(); // also drains the readable status file
     expect(JSON.parse(fs.readFileSync(statusFile, "utf8")).anchorExport).toMatchObject({ directory, last: { seq: 1 } });
     const before = fs.readFileSync(file, "utf8");
+    const heartbeatBeforeClose = fs.readFileSync(heartbeatFile, "utf8");
     await expect(service.watchdog.tick()).rejects.toThrow(/closed/);
     expect(fs.readFileSync(file, "utf8")).toBe(before);
+    expect(fs.readFileSync(heartbeatFile, "utf8")).toBe(heartbeatBeforeClose);
   });
 
   it("the scheduled watchdog publishes a changed anchor without a caller triggering a tick", async () => {

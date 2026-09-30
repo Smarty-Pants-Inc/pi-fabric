@@ -221,6 +221,25 @@ response and the existing public status JSON both name `anchorExport.directory`,
 exported anchor (`last`), and any publication `error`. Tick failures retry on the next tick; a startup
 publication failure prevents startup. Archive admission being disabled does not disable anchor export.
 
+Every successful export check (including startup and an unchanged database) also atomically replaces
+`HEARTBEAT.json` in the export directory, for example `/var/lib/<org>-records/anchors/HEARTBEAT.json`:
+
+```json
+{"org":"smarty-pants","lastSeq":42,"lastHash":"<64 lowercase hex SHA-256 digest>","checkedAt":"2026-09-30T12:00:00.000Z"}
+```
+
+`lastSeq` and `lastHash` identify the durable exported frontier (`0` and `null` for an empty database).
+`checkedAt` is the successful check's UTC ISO timestamp, not the last segment's growth time or an
+anchor's retained `at`. **Reader contract: liveness = `HEARTBEAT.checkedAt`; data = numbered segments.**
+Judge staleness against the configured schedule (for example, older than three `intervalMs` periods),
+never against segment mtime or the newest anchor's `at`: a healthy idle service need not append data.
+A missing, malformed or stale heartbeat does not establish liveness. Heartbeats are replaceable, not
+append-only history, and do not replace retained anchors for verification. Publication writes a private
+temporary file, sets mode 0644, fsyncs it, renames it over `HEARTBEAT.json`, then fsyncs the directory,
+under the same publisher lock and only after segment durability succeeds. Anchor computation or segment
+durability failures do not advance the heartbeat; heartbeat publication failures use the existing
+status/error and retry behavior.
+
 The factory's unattended **user** backup worker reads/copies `anchors-000000000001.jsonl`,
 `anchors-000000000002.jsonl`, … from that directory, in numbered order, and retains all segments. It
 needs **no principal, credential, sudo, database access or service config access**. Ignore dotfiles
@@ -237,8 +256,8 @@ Only the latest incomplete segment grows; full/abandoned segments are immutable.
 written to a temporary file, fsynced and atomically renamed; existing ones use `O_APPEND` and fsync.
 The directory is fsynced after publication. No earlier line or numbered segment is ever rewritten or
 deleted. The directory is owned by the records user and mode **0755**; segments are owned by that user
-and mode **0644**, explicitly set regardless of the service's umask. Parent directories must also permit
-factory traversal (the installed records home is 0755). The factory can read, but cannot write, this export.
+and mode **0644**, as is `HEARTBEAT.json`, explicitly set regardless of the service's umask. Parent
+directories must also permit factory traversal (the installed records home is 0755). The factory can read, but cannot write, this export.
 
 A crash/short write can leave a trailing fragment without a newline. Readers must take **only the complete,
 newline-terminated prefix** of their snapshot; never parse or discard a malformed *complete* line. On

@@ -60,6 +60,7 @@ export class AnchorExport {
         const current = await fs.promises.open(path.join(this.directory, name!), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
         try { await current.sync(); } finally { await current.close(); }
         await directory.sync();
+        await this.#publishHeartbeat(last, directory);
         return last;
       }
       const line = Buffer.from(`${JSON.stringify(anchor)}\n`, "utf8");
@@ -92,10 +93,26 @@ export class AnchorExport {
         } finally { await fs.promises.rm(temp, { force: true }); }
       }
       await directory.sync();
+      await this.#publishHeartbeat(anchor, directory);
       return anchor;
     } finally {
       if (lock !== undefined) fs.closeSync(lock);
       await directory.close();
     }
+  }
+
+  /** Liveness is independent of segment growth; publish only after the anchor is durable. */
+  async #publishHeartbeat(anchor: RecordsAnchor, directory: fs.promises.FileHandle): Promise<void> {
+    const temp = path.join(this.directory, `.heartbeat-${process.pid}-${randomBytes(8).toString("hex")}.tmp`);
+    try {
+      const pending = await fs.promises.open(temp, "wx", 0o600);
+      try {
+        await pending.writeFile(`${JSON.stringify({ org: anchor.org, lastSeq: anchor.seq, lastHash: anchor.hash, checkedAt: new Date(Date.now()).toISOString() })}\n`, "utf8");
+        await pending.chmod(0o644);
+        await pending.sync();
+      } finally { await pending.close(); }
+      await fs.promises.rename(temp, path.join(this.directory, "HEARTBEAT.json"));
+      await directory.sync();
+    } finally { await fs.promises.rm(temp, { force: true }); }
   }
 }

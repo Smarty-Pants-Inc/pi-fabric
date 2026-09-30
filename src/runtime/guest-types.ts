@@ -859,6 +859,8 @@ interface FabricAgentsApi {
     id: string;
     instructions: string;
     scope?: "project" | "global";
+    /** Required to shrink the body by more than 80%. */
+    replace?: boolean;
   }): Promise<FabricActorInfo>;
   ask(args: FabricActorMessageArgs): Promise<FabricActorMessage>;
   ask(id: string, message: string): Promise<FabricActorMessage>;

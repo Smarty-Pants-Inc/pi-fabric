@@ -39,7 +39,7 @@ export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });
 
 // A file that could not be read gives no answer to cache (`read: false`): the next lookup reads it
-// again. Only a file that was read, valid or not, is cached by its mtime and size.
+// again. Only a file that was read, valid or not, is cached by its filesystem identity.
 const parseLease = (file: string, name: string): { read: boolean; lease?: FabricHostLease | undefined } => {
   let text: string;
   try {
@@ -71,7 +71,7 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
   }
 };
 
-// Parsed files by directory and name, reused while a file's mtime is unchanged.
+// Parsed files by directory and name, reused while a file's identity and timestamps are unchanged.
 const cache = new Map<string, LeaseSlots>();
 
 /** Every host's file lease, by host id. Unreadable or misnamed files are skipped. */
@@ -118,14 +118,22 @@ export const readHostLease = (meshRoot: string, hostId: string): FabricHostLease
   return cachedLease(known, dir, name, stat);
 };
 
-type LeaseSlots = Map<string, { mtimeMs: number; size: number; lease: FabricHostLease | undefined }>;
+type LeaseSlots = Map<string, Pick<fs.Stats, "dev" | "ino" | "size" | "mtimeMs" | "ctimeMs"> & {
+  lease: FabricHostLease | undefined;
+}>;
 
 const cachedLease = (known: LeaseSlots, dir: string, name: string, stat: fs.Stats): FabricHostLease | undefined => {
   const slot = known.get(name);
-  if (slot && slot.mtimeMs === stat.mtimeMs && slot.size === stat.size) return slot.lease;
+  // Atomic replacement can preserve size and mtime. Compare file identity too; timestamps
+  // remain the fallback on filesystems (including Windows) without useful dev/ino values.
+  if (slot && slot.dev === stat.dev && slot.ino === stat.ino && slot.size === stat.size &&
+    slot.mtimeMs === stat.mtimeMs && slot.ctimeMs === stat.ctimeMs) return slot.lease;
   const parsed = parseLease(path.join(dir, name), name);
   if (!parsed.read) return slot?.lease;                     // unreadable for now: keep the last answer
-  known.set(name, { mtimeMs: stat.mtimeMs, size: stat.size, lease: parsed.lease });
+  known.set(name, {
+    dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
+    lease: parsed.lease,
+  });
   return parsed.lease;
 };
 

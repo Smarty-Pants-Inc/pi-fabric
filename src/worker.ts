@@ -430,11 +430,14 @@ const main = async (): Promise<void> => {
     Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
     childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S = String(options.bashTimeoutSeconds);
   }
+  // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
+  // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
   const child = spawnCli(childBinary, childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
     env: {
       ...childEnvironment,
+      ...(options.actorName ? {} : { SMARTY_ROLE: "task-agent" }),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),

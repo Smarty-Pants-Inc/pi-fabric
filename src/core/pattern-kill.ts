@@ -596,7 +596,7 @@ function readDestinations(name: string, args: Word[], budget: GuardBudget): stri
 // Owner scope cut: unsupported shell state refuses the WHOLE tool command. This
 // sentinel propagates out of receivers/captures, rather than becoming a safe feed.
 class ShellStateRefused extends Error {}
-const SHELL_STATE_BUILTINS = new Set(["declare", "typeset", "export", "read", "mapfile", "readarray", "eval", "source", ".", "local", "let", "getopts", "trap"]);
+const SHELL_STATE_BUILTINS = new Set(["declare", "typeset", "export", "read", "mapfile", "readarray", "eval", "source", ".", "local", "let", "getopts", "trap", "enable", "alias", "unalias", "shopt", "function", "unset", "shift", "hash", "bind"]);
 
 /** Admit syntax, never a remembered whole-command fixture or inferred execution. */
 function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Context, budget: GuardBudget,
@@ -612,7 +612,9 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
   const scalar = (word: Word): boolean => {
     budget.spend(word.pattern.length + 1);
     const match = /^([A-Za-z_][A-Za-z0-9_]*)=(?!\()(.*)$/s.exec(word.pattern);
-    return !!match && match[1] !== "IFS" && simpleWord(word);
+    // Bootstrap scripts/options can change receiver state before its first command.
+    // Refuse these explicit state assignments without interpreting bootstrap files.
+    return !!match && !["IFS", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"].includes(match[1]!) && simpleWord(word);
   };
     if (!stage.words.length) return;
     const { words, assignments } = receiver ?? unwrap(stage.words, [], budget, (words) => words);

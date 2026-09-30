@@ -51,9 +51,10 @@ export const readProcessIdentity = (pid = process.pid): ProcessIdentity | undefi
   } catch { return undefined; }
 };
 
-/** Absent is death only when the kernel proves absence; unreadable/unsupported is unknown. */
-export const processStartIdentityState = (expected: ProcessStartIdentity): "alive" | "dead" | "mismatch" | "unknown" => {
-  if (process.platform !== "linux" || !validProcessStartIdentity(expected) || expected.kernelId !== localKernelId()) return "unknown";
+/** Absent is death only when the kernel proves absence; unreadable/unsupported is unknown.
+ * The platform seam lets tests model unsupported kernels without changing filesystem semantics. */
+export const processStartIdentityState = (expected: ProcessStartIdentity, platform: NodeJS.Platform = process.platform): "alive" | "dead" | "mismatch" | "unknown" => {
+  if (platform !== "linux" || !validProcessStartIdentity(expected) || expected.kernelId !== localKernelId()) return "unknown";
   try {
     const stat = fs.readFileSync(`/proc/${expected.pid}/stat`, "utf8");
     const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");

@@ -622,23 +622,45 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
 
 describe.each(["win32", "darwin"] as const)("%s successor unknown worker evidence", platformName => {
   it.each(["null journal", "unknown kernel"])("keeps %s removal pending without accepting or deleting", async kind => {
-    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-    Object.defineProperty(process, "platform", { ...platform, value: platformName });
+    const nativePlatform = process.platform;
+    // Model worker kernel support only; durable writes must see the native host.
     const kernelState = processIdentity.processStartIdentityState;
     const f = await fixture({ fakeProcesses: true });
     const caller = f.residency.options.participants.self()!.processIdentity!;
     const current = vi.spyOn(processIdentity, "readProcessStartIdentity").mockReturnValue(caller);
     const mainState = vi.spyOn(processIdentity, "processStartIdentityState").mockImplementation(expected =>
-      expected.pid === f.main.identity.pid ? "dead" : kernelState(expected));
+      expected.pid === f.main.identity.pid ? "dead" : kernelState(expected, platformName));
     const hostState = vi.spyOn(processIdentity, "processIdentityState").mockImplementation(expected =>
       expected.pid === f.host.identity.pid ? "dead" : "unknown");
-    const dir = runEvidence(path.join(f.oldDir, "runs"), "unknown-run", fakeChild().identity);
+    const worker = fakeChild().identity;
+    // On Linux, use the real kernel so absence would otherwise prove death:
+    // only the injected unsupported platform may make this worker unknown.
+    if (nativePlatform === "linux") worker.kernelId = kernelId();
+    const dir = runEvidence(path.join(f.oldDir, "runs"), "unknown-run", worker);
     if (kind === "null journal") fs.writeFileSync(path.join(dir, "worker-processes.jsonl"), '{"worker":null}\n{"worker":null,"runner":null}\n');
     const write = vi.spyOn(ActorRegistryStore.prototype, "write");
     const signal = vi.spyOn(process, "kill");
+    const fsync = fs.fsyncSync;
+    let directorySyncs = 0;
+    let fileSyncs = 0;
+    // Reproduce Windows' directory-fsync EPERM on any host if a platform
+    // override escapes the process-identity seam into the real filesystem.
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isDirectory()) {
+        directorySyncs++;
+        if (process.platform !== nativePlatform) {
+          throw Object.assign(new Error("EPERM: spoofed platform reached directory fsync"), { code: "EPERM" });
+        }
+      } else fileSyncs++;
+      fsync(fd);
+    });
     try {
       expect(await f.remove()).toMatchObject({ removed: false, pending: expect.stringContaining(
         kind === "null journal" ? "Missing worker/runner process identity" : "is unknown; settlement not proven") });
+      expect(process.platform).toBe(nativePlatform);
+      expect(fileSyncs).toBeGreaterThan(0);
+      if (nativePlatform === "win32") expect(directorySyncs).toBe(0);
+      else expect(directorySyncs).toBeGreaterThan(0);
       expect(write).not.toHaveBeenCalled();
       expect(signal).not.toHaveBeenCalled();
       expect(new ActorRegistryStore(f.actorRoot).records()[0]?.rootId).toBe(f.oldId);
@@ -646,8 +668,8 @@ describe.each(["win32", "darwin"] as const)("%s successor unknown worker evidenc
       expect(fs.existsSync(dir)).toBe(true);
       expect(f.mesh.get(`actor-removals/${f.actor.id}`)).toBeUndefined();
     } finally {
+      sync.mockRestore();
       signal.mockRestore(); write.mockRestore(); current.mockRestore(); mainState.mockRestore(); hostState.mockRestore();
-      Object.defineProperty(process, "platform", platform);
     }
   });
 });

@@ -253,7 +253,17 @@ export interface FabricActorsConfig {
   maxSessionBytes: number;
 }
 
+export type MeshLockProtocol = 1 | 2;
+
+const meshLockProtocol = (value: unknown): MeshLockProtocol => {
+  if (value === undefined) return 1;
+  if (value === 1 || value === 2) return value;
+  throw new Error("mesh.lockProtocol must be 1 or 2");
+};
+
 export interface FabricMeshConfig {
+  /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
+  lockProtocol: MeshLockProtocol;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -496,6 +506,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxSessionBytes: 20 * 1024 * 1024,
   },
   mesh: {
+    lockProtocol: 1,
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -1152,6 +1163,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ),
     },
     mesh: {
+      lockProtocol: meshLockProtocol(mesh.lockProtocol),
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),

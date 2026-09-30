@@ -26,6 +26,17 @@ const issueRepository = `${issueOwner}/[a-z0-9_.-]+`;
 // repository-only references need at least three digits to avoid prose noise.
 const issueRepoOnly = "(?![cf]#)[a-z0-9][a-z0-9_.-]*";
 const issueReference = new RegExp(`(?<![\\w./-])(?:https://github\\.com/(${issueRepository})/(?:issues|pull)/(\\d+)|(${issueRepository})#(\\d+)|(${issueRepoOnly})#(\\d{3,})|#(\\d{3,}))(?![\\w-])`, "gi");
+// A hash-number span already parsed as a legacy class is not an issue, either
+// in outgoing text or read evidence. Use the actual parser's spans so separators,
+// digit limits and boundaries stay identical; qualified issue refs remain intact.
+function* issueMatches(text: string, regex: RegExp): Generator<RegExpExecArray> {
+  let legacy: RegExpExecArray[] | undefined;
+  for (const match of text.matchAll(regex)) {
+    legacy ??= [...text.matchAll(literal)].filter(token => token[0].includes("#"));
+    if (!legacy.some(token => match.index >= token.index &&
+      match.index + match[0].length <= token.index + token[0].length)) yield match;
+  }
+}
 // Read text can contain raw git / PID / JSON API output. Search only the
 // outgoing candidates, not every token in a potentially multi-megabyte read.
 const readMatcher = (id: Identifier): RegExp => {
@@ -42,7 +53,7 @@ const readMatcher = (id: Identifier): RegExp => {
     const repoOnly = id.value.length >= 3 && (!name || !/^[cf]$/i.test(name))
       ? `|${name ? escape(name) : issueRepoOnly}#` : "";
     const bare = id.value.length >= 3 ? "|#" : "";
-    return new RegExp(`(?<![\\w./-])(?:https://github\\.com/${repository}/(?:issues|pull)/|${repository}#${repoOnly}${bare})${id.value}(?![\\w-])`, "i");
+    return new RegExp(`(?<![\\w./-])(?:https://github\\.com/${repository}/(?:issues|pull)/|${repository}#${repoOnly}${bare})${id.value}(?![\\w-])`, "gi");
   }
   if (id.kind === "session") token = `(?:session:)?${id.value}`;
   else if (id.kind === "comment") return new RegExp(`(?:#issuecomment-|${start}(?:comment[ \\t:=#-]*)?)${id.value}${end}`, "i");
@@ -98,7 +109,7 @@ const candidates = (text: string): Identifier[] => {
   }
   // Ordinary legacy identifiers need no extra repository-pattern scan.
   if (text.includes("/") || /#\d{3}/.test(text)) {
-    for (const match of text.matchAll(issueReference)) {
+    for (const match of issueMatches(text, issueReference)) {
       const repository = match[1] ?? match[3] ?? match[5];
       const value = match[2] ?? match[4] ?? match[6] ?? match[7]!;
       add({ kind: "issue", value, ...(repository ? { repository: repository.toLowerCase() } : {}), display: `${repository ?? ""}#${value}`, at: match.index });
@@ -233,7 +244,9 @@ export function unverifiedMessageIds(text: string, session?: ReadonlySessionMana
       for (const [key, id] of pending) {
         // Most history blocks don't contain any candidate. Literal search avoids
         // an expensive regex scan of those blocks, even with a 2 MiB history.
-        if (lower.includes(id.value) && matchers.get(id)!.test(bounded)) pending.delete(key);
+        if (lower.includes(id.value) && (id.kind === "issue"
+          ? !issueMatches(bounded, matchers.get(id)!).next().done
+          : matchers.get(id)!.test(bounded))) pending.delete(key);
       }
     }
   };

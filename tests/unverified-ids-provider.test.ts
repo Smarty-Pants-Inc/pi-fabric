@@ -41,6 +41,28 @@ const mixedIssueReads = [
   ["https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175", "Smarty-Pants-Inc/pi-fabric#2175"],
   ["https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2175", "#2175"],
 ] as const;
+// Only comment and pid accept hash separators in the existing legacy parser.
+const legacyHashReferences = [
+  ["comment #1234567890", "comment 1234567890", "1234567890"],
+  ["comment#1234567890", "comment 1234567890", "1234567890"],
+  ["COMMENT #123456789", "comment 123456789", "123456789"],
+  ["comment\t#1234567890", "comment 1234567890", "1234567890"],
+  ["comment:#1234567890", "comment 1234567890", "1234567890"],
+  ["comment=#1234567890", "comment 1234567890", "1234567890"],
+  ["comment-#1234567890", "comment 1234567890", "1234567890"],
+  ["comment #=#1234567890", "comment 1234567890", "1234567890"],
+  ["pid #987654", "pid 987654", "987654"],
+  ["pid#987654", "pid 987654", "987654"],
+  ["PID #123", "pid 123", "123"],
+  ["pid\t#987654", "pid 987654", "987654"],
+  ["pid:#987654", "pid 987654", "987654"],
+  ["pid=#987654", "pid 987654", "987654"],
+  ["pid-#987654", "pid 987654", "987654"],
+  ["pid #=#987654", "pid 987654", "987654"],
+  ["pid #1", "pid 1", "1"],
+  ["pid #12", "pid 12", "12"],
+  ["pid #1234567890", "pid 1234567890", "1234567890"],
+] as const;
 const surfaces = ["legacy.steer", "legacy.followUp", "hosted.steer", "hosted.followUp", "mesh.publish"] as const;
 const session = () => SessionManager.inMemory(process.cwd());
 const invocation = (manager: SessionManager): FabricInvocationContext => ({
@@ -212,6 +234,43 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
     expect(h.sent.at(-1)).toBe(text);
   });
 
+  it.each(legacyHashReferences.flatMap(([text, display, value]) =>
+    [false, true].map(alreadyRead => ({ text, display, value, alreadyRead }))))(
+    "round-2 legacy hash: $text alreadyRead=$alreadyRead belongs only to its own class", async ({ text, display, value, alreadyRead }) => {
+      const h = harness(surface);
+      if (alreadyRead) read(h.manager, JSON.stringify({ id: Number(value), pid: Number(value) }));
+      const result = await h.send(text);
+      if (alreadyRead) {
+        expect(result).not.toHaveProperty("notice");
+        expect(h.sent).toEqual([text]);
+      } else {
+        const notice = `unverified ids: ${display}`;
+        expect(result).toHaveProperty("notice", notice);
+        expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+      }
+    });
+
+  it.each(legacyHashReferences.filter(([, , value]) => value.length >= 3))(
+    "round-2 legacy read: %s is not independent issue evidence", async (evidence, _display, value) => {
+      const h = harness(surface);
+      read(h.manager, evidence);
+      const text = `#${value}; owner/repo#${value}; https://github.com/owner/repo/issues/${value}`;
+      const notice = `unverified ids: #${value}, owner/repo#${value}`;
+      expect(await h.send(text)).toHaveProperty("notice", notice);
+      expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+      // A real reference later in the same read must still count.
+      read(h.manager, `${evidence}; #${value}`);
+      expect(await h.send(text)).not.toHaveProperty("notice");
+      expect(h.sent.at(-1)).toBe(text);
+    });
+
+  it("round-2 real issues: class-named qualified repos and unsupported hash labels remain issues", async () => {
+    const h = harness(surface);
+    const text = "owner/comment#1234567890; owner/pid#987654; comment #2175; actor #2176; run #2177; session #2178; sha #2179; commit #2180; head #2181; base #2182; revision #2183; rev #2184";
+    const notice = "unverified ids: owner/comment#1234567890, comment 1234567890, owner/pid#987654, pid 987654, #2175, #2176, #2177, #2178, #2179, #2180, #2181, #2182, #2183, #2184";
+    expect(await h.send(text)).toHaveProperty("notice", notice);
+    expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+  });
   it.each(mixedIssueReads)("normalizes mixed GitHub forms: outgoing %s, read %s", async (text, evidence) => {
     const h = harness(surface);
     read(h.manager, evidence);

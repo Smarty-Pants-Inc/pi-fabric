@@ -51,6 +51,9 @@ an outgoing SHA candidate.
 An explicitly SHA-qualified 32-hex token is a SHA abbreviation, not also an
 actor/run at that position. Raw full SHAs, naked decimal numbers, bare `#1` /
 `#12`, and heading markers such as `# Title` are not outgoing candidates.
+A hash-separated legacy comment or PID (for example `comment #1234567890`
+or `pid#987654`) belongs only to its own class, not also to the issue/PR class.
+Reading that legacy form does not establish an issue read with the same number.
 Issue and pull URLs normalize to `owner/repo#N` in notices and read matching.
 Qualified forms preserve repository identity, case-insensitively. Repository-only
 `repo#N` matches qualified references and URLs with that repository name and number,

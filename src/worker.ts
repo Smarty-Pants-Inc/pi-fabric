@@ -356,6 +356,18 @@ const main = async (): Promise<void> => {
     fs.rmSync(replyFile!, { force: true });
     piArguments.push("-e", hookPath);
   }
+  // smarty-dev#2184: every Pi actor run gets the bash timeout, also a native-tool one that runs
+  // with --no-extensions (an explicit -e still loads). It comes after Fabric's -e so Fabric's
+  // foreground-wait guard judges the caller's own timeout; with Fabric loaded, the second hook finds
+  // the timeout set and does nothing.
+  if (options.actorId) {
+    const hookPath = fileURLToPath(new URL(
+      import.meta.url.endsWith(".ts") ? "./guards/actor-bash-hook.ts" : "./guards/actor-bash-hook.js",
+      import.meta.url,
+    ));
+    if (!fs.existsSync(hookPath)) throw new Error("Actor bash timeout hook is missing");
+    piArguments.push("-e", hookPath);
+  }
   const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
   if (piTools.length > 0) piArguments.push("--tools", piTools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
@@ -411,11 +423,14 @@ const main = async (): Promise<void> => {
     applyChildPriority(process.pid, options.nice, (message) =>
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
+  // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
+  // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
   const child = spawnCli(childBinary, childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
     env: {
       ...process.env,
+      ...(options.actorName ? {} : { SMARTY_ROLE: "task-agent" }),
       ...(options.inheritedSessionPins && options.inheritedSessionPins.length > 0
         ? {
             PI_MULTIPROVIDER_SESSION_PINS: JSON.stringify(options.inheritedSessionPins),
@@ -447,6 +462,7 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.actorId ? { PI_FABRIC_ACTOR_ID: options.actorId } : {}),
       ...(options.actorName ? { PI_FABRIC_ACTOR_NAME: options.actorName } : {}),
+      ...(options.bashTimeoutSeconds !== undefined ? { PI_FABRIC_ACTOR_BASH_TIMEOUT_S: String(options.bashTimeoutSeconds) } : {}),
       PI_FABRIC_CAPABILITY_REQUIREMENTS: JSON.stringify(
         options.capabilityRequirements ?? [],
       ),

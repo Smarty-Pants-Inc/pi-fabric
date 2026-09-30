@@ -18,6 +18,8 @@ const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 // without this grace a delivered command was reported as timed out and then retried
 // (smarty-dev#367). A command not admitted by the deadline is acknowledged as expired.
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
+// Sender-local message budget, independent of commit-time wire deadlines and live leases.
+const MIRRORED_MESSAGE_BUDGET_MS = 9_000;
 // Records other hosts left in the shared state before smarty-dev#643 are checked this often.
 const LEGACY_SEEN_CLEANUP_MS = 15 * 60 * 1_000;
 // A lock wait that timed out committed nothing, so the step that hit it is retried.
@@ -37,6 +39,8 @@ export interface FabricControlCommand {
   targetId: string;
   operation: FabricControlOperation;
   replyTo: string;
+  /** Validated destination link; null binds native delivery, absent is legacy. */
+  destinationRemoteHost?: string | null;
   message?: string;
   data?: unknown;
   triggerTurn?: boolean;
@@ -131,6 +135,8 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
     typeof data.replyTo !== "string" ||
     typeof data.requestedAt !== "number" ||
     (data.deadlineAt !== undefined && typeof data.deadlineAt !== "number") ||
+    (data.destinationRemoteHost !== undefined && data.destinationRemoteHost !== null &&
+      typeof data.destinationRemoteHost !== "string") ||
     (data.operation === "cancel" && typeof data.cancelCommandId !== "string") ||
     (data.binding !== undefined &&
       (!isObject(data.binding) ||
@@ -173,6 +179,12 @@ export interface FabricControlPlaneOptions {
   hostId: string;
   pollMs?: number;
   acknowledgementTimeoutMs?: number;
+  /** Fresh, directory-validated mirror ownership, including expired leases. */
+  readMirroredOwner?: (
+    ownerHostId: string,
+    ownerIdentityId: string | undefined,
+    targetId: string,
+  ) => { remoteHost: string; expiresAt: number } | undefined;
 }
 
 export interface FabricControlInput {
@@ -183,6 +195,8 @@ export interface FabricControlInput {
 }
 
 export interface FabricControlRequestOptions {
+  /** Snapshot from the validated participant, never from message/data. */
+  routedRemoteHost?: string | null;
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -190,13 +204,16 @@ export interface FabricControlRequestOptions {
 interface PendingControlRequest {
   resolve: (acceptance: FabricControlAcceptance) => void;
   reject: (error: Error) => void;
-  /** Armed when the command's publish commits, with its wire deadline (smarty-dev#816). */
+  /** Mirrored messages prearm at admission; other requests arm after publish commits. */
   timer?: NodeJS.Timeout;
   ownerHostId: string;
   ownerIdentityId: string;
   targetId: string;
   commandPublished: boolean;
+  readonly destinationRemoteHost?: string | null;
   cancellationRequested?: boolean;
+  cancellationPublished?: boolean;
+  mirroredOwner?: { remoteHost: string; expiresAt: number };
   signal?: AbortSignal;
   onAbort?: () => void;
 }
@@ -219,6 +236,7 @@ export class FabricControlPlane {
   #offset: number;
   #lastSequence: number;
   #timer: NodeJS.Timeout | undefined;
+  #mirrorWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   #closed = false;
   #handler: FabricControlHandler | undefined;
@@ -265,14 +283,20 @@ export class FabricControlPlane {
     operation: FabricControlOperation,
     input: FabricControlInput = {},
     ownerIdentityId = ownerHostId,
+    options: FabricControlRequestOptions = {},
   ): Promise<FabricControlResult> {
+    // Shared across the bounded retry: first admission may discover a mirror even
+    // for an older caller that supplied no routing snapshot.
+    const destination = { remoteHost: options.routedRemoteHost };
     const send = () => this.#requestAcceptance(
       ownerHostId,
       targetId,
       operation,
       input,
       ownerIdentityId,
-      { timeoutMs: this.#ackTimeoutMs },
+      { ...options, timeoutMs: options.timeoutMs ?? this.#ackTimeoutMs },
+      destination,
+      true,
     );
     let sent;
     try {
@@ -331,6 +355,8 @@ export class FabricControlPlane {
     input: FabricControlInput,
     ownerIdentityId: string,
     options: FabricControlRequestOptions,
+    destination = { remoteHost: options.routedRemoteHost },
+    messageRequest = false,
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
     if (!this.options.enabled) {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
@@ -343,6 +369,27 @@ export class FabricControlPlane {
     );
     const commandId = randomUUID();
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
+    let mirroredOwner: PendingControlRequest["mirroredOwner"];
+    const unavailable = (host: string): Error => new Error(
+      `Fabric mesh bridge routing to remote host ${host} is unavailable for ${targetId}; ` +
+        "the routed owner could not be revalidated; this attempt was not published.",
+    );
+    try {
+      mirroredOwner = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, targetId);
+    } catch (error) {
+      if (typeof destination.remoteHost === "string") throw unavailable(destination.remoteHost);
+      throw error;
+    }
+    if (typeof destination.remoteHost === "string" && mirroredOwner?.remoteHost !== destination.remoteHost) {
+      throw unavailable(destination.remoteHost);
+    }
+    if (destination.remoteHost === null && mirroredOwner) {
+      throw new Error(`Fabric native routing is unavailable for ${targetId}; the routed owner changed; this attempt was not published.`);
+    }
+    if (destination.remoteHost === undefined) {
+      destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
+    }
+    const destinationRemoteHost = destination.remoteHost;
     let pendingRequest: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
       const pending: PendingControlRequest = {
@@ -352,9 +399,20 @@ export class FabricControlPlane {
         ownerIdentityId,
         targetId,
         commandPublished: false,
+        ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
+        ...(mirroredOwner ? { mirroredOwner: { ...mirroredOwner } } : {}),
       };
       pendingRequest = pending;
       this.#pending.set(commandId, pending);
+      if (pending.mirroredOwner) {
+        // Capture validated authority first, then arm before publish can wait on the mesh lock.
+        // Renewal or a failed directory read cannot extend this sender-local message budget.
+        if (messageRequest && (operation === "steer" || operation === "followUp")) {
+          pending.timer = setTimeout(() => this.#timeoutPending(commandId), MIRRORED_MESSAGE_BUDGET_MS);
+          pending.timer.unref();
+        }
+        this.#startMirrorWatchdog();
+      }
       if (options.signal) {
         const onAbort = (): void => {
           const cancelled = this.#clearPending(commandId);
@@ -371,7 +429,9 @@ export class FabricControlPlane {
     // Attach a handler now; awaiting the original promise below still preserves the rejection.
     void acceptance.catch(() => undefined);
     try {
-      await this.mesh.publish({
+      // Settlement must not wait for the original publish or a best-effort cancellation.
+      // The publish still completes once, and then cancels if settlement won while in flight.
+      const publishing = this.mesh.publish({
         topic: CONTROL_TOPIC,
         kind: operation,
         from: this.identity,
@@ -384,6 +444,7 @@ export class FabricControlPlane {
           targetId,
           operation,
           replyTo: this.options.hostId,
+          ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
           ...(input.message !== undefined ? { message: input.message } : {}),
           ...(input.data !== undefined ? { data: input.data } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
@@ -391,28 +452,21 @@ export class FabricControlPlane {
           requestedAt: committedAt,
           deadlineAt: committedAt + timeoutMs,
         }),
+      }).then(() => {
+        pendingRequest!.commandPublished = true;
+        // Other requests retain their commit-time ACK window. Never overwrite a mirrored
+        // message's admission timer, or revive a request already settled while publishing.
+        if (this.#pending.get(commandId) === pendingRequest! && !pendingRequest!.timer) {
+          pendingRequest!.timer = setTimeout(
+            () => this.#timeoutPending(commandId), timeoutMs + ackGraceMs,
+          );
+          pendingRequest!.timer.unref();
+        }
+        if (pendingRequest!.cancellationRequested) {
+          void this.#publishCancellation(commandId, pendingRequest!);
+        }
       });
-      pendingRequest!.commandPublished = true;
-      // The wait starts at commit, like the owner's deadline: the lock wait before it (bounded by
-      // the mesh lock timeout) is not taken from the timeout. A request cancelled or closed
-      // meanwhile is no longer pending and is not revived.
-      if (this.#pending.get(commandId) === pendingRequest!) {
-        pendingRequest!.timer = setTimeout(() => {
-          const timedOut = this.#clearPending(commandId);
-          if (!timedOut) return;
-          void this.#publishCancellation(commandId, timedOut);
-          // The outcome is unknown: the owner may have admitted the command before its
-          // deadline. A retry is a new command, so it can deliver the message twice.
-          timedOut.reject(new Error(
-            `Timed out waiting for the remote Fabric owner to acknowledge ${targetId}; ` +
-              "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
-          ));
-        }, timeoutMs + ackGraceMs);
-        pendingRequest!.timer.unref();
-      }
-      if (pendingRequest!.cancellationRequested) {
-        await this.#publishCancellation(commandId, pendingRequest!);
-      }
+      await Promise.race([publishing, acceptance.then(() => undefined)]);
       const acknowledged = await acceptance;
       if (!acknowledged.accepted) {
         throw new FabricControlRejection(
@@ -428,6 +482,19 @@ export class FabricControlPlane {
     }
   }
 
+  #timeoutPending(commandId: string): void {
+    const timedOut = this.#clearPending(commandId);
+    if (!timedOut) return;
+    void this.#publishCancellation(commandId, timedOut);
+    // Neither a live lease nor a missing ACK proves the handler did not run. Never replay.
+    timedOut.reject(new Error(
+      (timedOut.mirroredOwner
+        ? `Fabric mesh bridge to remote host ${timedOut.mirroredOwner.remoteHost} is not responding for ${timedOut.targetId}; `
+        : `Timed out waiting for the remote Fabric owner to acknowledge ${timedOut.targetId}; `) +
+        "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
+    ));
+  }
+
   #clearPending(commandId: string): PendingControlRequest | undefined {
     const pending = this.#pending.get(commandId);
     if (!pending) return undefined;
@@ -436,7 +503,41 @@ export class FabricControlPlane {
       pending.signal.removeEventListener("abort", pending.onAbort);
     }
     this.#pending.delete(commandId);
+    if (this.#mirrorWatchdog && ![...this.#pending.values()].some((request) => request.mirroredOwner)) {
+      clearInterval(this.#mirrorWatchdog);
+      this.#mirrorWatchdog = undefined;
+    }
     return pending;
+  }
+
+  #startMirrorWatchdog(): void {
+    if (this.#mirrorWatchdog) return;
+    // Independent of the async mesh drain: a locked write must not hide a lease lapse.
+    this.#mirrorWatchdog = setInterval(() => {
+      for (const [commandId, pending] of this.#pending) {
+        const captured = pending.mirroredOwner;
+        if (!captured) continue;
+        let current: PendingControlRequest["mirroredOwner"];
+        try {
+          current = this.options.readMirroredOwner?.(pending.ownerHostId, pending.ownerIdentityId, pending.targetId);
+        } catch {
+          // A failed read is not evidence of a lapse. The independent request timer stays armed.
+          continue;
+        }
+        // Never adopt a different link's label. Missing ownership cannot renew this lease.
+        if (current?.remoteHost === captured.remoteHost) captured.expiresAt = current.expiresAt;
+        if (captured.expiresAt > Date.now()) continue;
+        const lapsed = this.#clearPending(commandId);
+        if (!lapsed) continue;
+        void this.#publishCancellation(commandId, lapsed);
+        lapsed.reject(new Error(
+          `Fabric lease mirrored from remote host ${captured.remoteHost} lapsed for ${pending.targetId}; ` +
+            "the mesh bridge is down or the owner is unavailable; " +
+            "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
+        ));
+      }
+    }, this.#pollMs);
+    this.#mirrorWatchdog.unref();
   }
 
   async #publishCancellation(
@@ -447,6 +548,8 @@ export class FabricControlPlane {
       pending.cancellationRequested = true;
       return;
     }
+    if (pending.cancellationPublished) return;
+    pending.cancellationPublished = true;
     const requestedAt = Date.now();
     await this.mesh.publish({
       topic: CONTROL_TOPIC,
@@ -460,6 +563,8 @@ export class FabricControlPlane {
         operation: "cancel",
         cancelCommandId: commandId,
         replyTo: this.options.hostId,
+        ...(pending.destinationRemoteHost !== undefined
+          ? { destinationRemoteHost: pending.destinationRemoteHost } : {}),
         requestedAt,
         deadlineAt: requestedAt + this.#ackTimeoutMs,
       } satisfies FabricControlCommand,
@@ -531,7 +636,14 @@ export class FabricControlPlane {
       event.data.version !== 1 ||
       event.data.targetId !== pending.targetId ||
       event.from.id !== pending.ownerIdentityId ||
-      !this.#bridgeMatches(pending.ownerHostId, event.data)
+      // A validated mirror's answer authority survives record withdrawal/replacement.
+      // Known native requests require an unstamped ACK, regardless of later metadata.
+      // Only unbound legacy requests use the mutable metadata selector.
+      !(pending.mirroredOwner
+        ? isObject(event.data.bridge) && event.data.bridge.from === pending.mirroredOwner.remoteHost
+        : pending.destinationRemoteHost === null
+          ? !Object.prototype.hasOwnProperty.call(event.data, "bridge")
+          : this.#bridgeMatches(pending.ownerHostId, event.data))
     ) {
       return;
     }

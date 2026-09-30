@@ -1606,6 +1606,7 @@ describe("ActorManager", () => {
     expect(run).toHaveBeenCalledWith(
       expect.objectContaining({ capabilityRequirements: ["agents.followUp"] }),
       expect.any(AbortSignal),
+      expect.any(Function),
     );
   });
 
@@ -3763,4 +3764,147 @@ describe("ActorManager extensions flag (read-only Pi actors)", () => {
       expect(request?.extensions).toBe(false);
       expect(request?.recursive).toBe(false);
     });
+});
+
+// smarty-dev#2184 item 8: a resident-host removal waited for the actor's in-flight run and
+// blocked the host's whole request queue.
+describe("ActorManager removal behind an in-flight run", () => {
+  it("returns at once, names the run, lets a same-name create through, and finishes after the run", async () => {
+    const { actors, agents } = setup(true);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const runId = "a".repeat(32);
+    vi.spyOn(agents, "run").mockImplementation(async (_request, _signal, onSpawned) => {
+      onSpawned?.({ id: runId } as Parameters<NonNullable<typeof onSpawned>>[0]);
+      await gate;                                                  // a run that ignores its abort
+      return { id: runId, status: "stopped", text: "", usage: {} } as unknown as Awaited<ReturnType<typeof agents.run>>;
+    });
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
+    actors.tell(actor.id, "go");
+    await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
+
+    const started = Date.now();
+    const removed = await Promise.race([
+      actors.remove(actor.id, { wait: false }),
+      new Promise<"blocked">((resolve) => setTimeout(resolve, 1_500, "blocked")),
+    ]);
+    expect(removed).not.toBe("blocked");
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect((removed as { pending?: string }).pending).toMatch(
+      new RegExp(`removal of reviewer \\(${actor.id}\\) is pending behind its in-flight run ${runId} \\(\\d+s\\)`));
+    expect(actors.status(actor.id).removal?.state).toContain(runId);
+    expect(() => actors.tell(actor.id, "again")).toThrow(/pending behind its in-flight run/);
+
+    const successor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
+    expect(successor.id).not.toBe(actor.id);
+    expect(actors.status("reviewer").id).toBe(successor.id);
+
+    release();
+    await actors.removalSettled(actor.id);
+    expect(actors.list().map((entry) => entry.id)).toEqual([successor.id]);
+    expect(actors.pendingRemovals()).toEqual([]);
+  });
+
+  // Review round 1 on pi-fabric#160: an accepted removal must be durable, and a failed cleanup retried.
+  const hangingRun = (agents: AgentManager) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const runId = "b".repeat(32);
+    vi.spyOn(agents, "run").mockImplementation(async (_request, _signal, onSpawned) => {
+      onSpawned?.({ id: runId } as Parameters<NonNullable<typeof onSpawned>>[0]);
+      await gate;
+      return { id: runId, status: "stopped", text: "", usage: {} } as unknown as Awaited<ReturnType<typeof agents.run>>;
+    });
+    return { release, runId };
+  };
+  const readOnly = (dir: string) => fs.chmodSync(dir, 0o500);
+  const writable = (dir: string) => fs.chmodSync(dir, 0o700);
+
+  it.skipIf(process.platform === "win32")("refuses a pending removal whose marker cannot be saved", async () => {
+    const { actors, agents, root } = setup(true);
+    const { release, runId } = hangingRun(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
+    actors.tell(actor.id, "go");
+    await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
+    await actors.stop(actor.id);                               // only the removal's own save fails below
+    const actorRoot = path.join(root, "actors");
+    readOnly(actorRoot);
+    try {
+      await expect(actors.remove(actor.id, { wait: false })).rejects.toThrow(/removal was not saved/);
+      expect(actors.status(actor.id).removal).toBeUndefined();
+    } finally {
+      writable(actorRoot);
+    }
+    const accepted = await actors.remove(actor.id, { wait: false });
+    expect(accepted.pending).toContain(runId);
+    release();
+    await actors.removalSettled(actor.id);
+    expect(actors.list()).toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32")("retries an accepted removal whose cleanup failed", async () => {
+    const { actors, agents, root } = setup(true);
+    const { release, runId } = hangingRun(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
+    actors.tell(actor.id, "go");
+    await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
+    await actors.remove(actor.id, { wait: false });
+    const actorRoot = path.join(root, "actors");
+    readOnly(actorRoot);
+    try {
+      release();
+      await waitFor(() => /removal cleanup failed/.test(actors.status(actor.id).lastError ?? ""), 5_000);
+      expect(actors.list().map((entry) => entry.id)).toEqual([actor.id]);
+    } finally {
+      writable(actorRoot);
+    }
+    await actors.removalSettled(actor.id);
+    expect(actors.list()).toEqual([]);
+  }, 20_000);
+
+  // Review round 2 on pi-fabric#160: a waiting remove must not report success after the retries ran out.
+  it.skipIf(process.platform === "win32")("fails a waiting remove whose accepted cleanup never succeeded, and finishes on a later remove", async () => {
+    const { agents, root, mesh, identity, meshConfig } = setup(true);
+    const actors = new ActorManager("test", identity, mesh, meshConfig, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: true, removalRetryMs: 10 });
+    actorManagers.push(actors);
+    const { release, runId } = hangingRun(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
+    actors.tell(actor.id, "go");
+    await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
+    await actors.remove(actor.id, { wait: false });
+    const waiting = actors.remove(actor.id);
+    const actorRoot = path.join(root, "actors");
+    readOnly(actorRoot);
+    try {
+      release();
+      await expect(waiting).rejects.toThrow(/removal cleanup failed/);
+      expect(actors.list().map((entry) => entry.id)).toEqual([actor.id]);
+    } finally {
+      writable(actorRoot);
+    }
+    await expect(actors.remove(actor.id)).resolves.toEqual({ removed: true });
+    expect(actors.list()).toEqual([]);
+  }, 20_000);
+
+  it("finishes an accepted removal after its owner restarts, keeping a same-name successor", async () => {
+    const { actors, agents, root, mesh, identity, meshConfig } = setup(true);
+    const { release, runId } = hangingRun(agents);
+    const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
+    actors.tell(actor.id, "go");
+    await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
+    await actors.remove(actor.id, { wait: false });
+    const successor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
+    const registryIds = () => (JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")) as
+      { actors: Array<{ id: string; removal?: unknown }> }).actors.map((entry) => `${entry.id}${entry.removal ? ":removal" : ""}`);
+    expect(registryIds().sort()).toEqual([`${actor.id}:removal`, successor.id].sort());
+    // The host dies while the run is still in flight: a new owner loads the saved marker.
+    const restarted = new ActorManager("test", identity, mesh, meshConfig, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: true });
+    actorManagers.push(restarted);
+    await restarted.finishPendingRemovals();
+    expect(restarted.list().map((entry) => entry.id)).toEqual([successor.id]);
+    expect(registryIds()).toEqual([successor.id]);
+    release();
+  });
 });

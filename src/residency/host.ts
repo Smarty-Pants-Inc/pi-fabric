@@ -26,6 +26,7 @@ import {
   RESIDENT_HOST_FORMAT,
   residentDeliveryPrefix,
   residentHostId,
+  residentRemovalsPath,
   residentResultPath,
   type ResidentAgentMetadata,
   type ResidentCommand,
@@ -134,6 +135,7 @@ class ResidentHost {
   readonly #processingPath: string;
   readonly #responsesPath: string;
   readonly #agentsPath: string;
+  readonly #removalsPath: string;
   readonly #deliveryPrefix: string;
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
@@ -156,6 +158,7 @@ class ResidentHost {
     this.#processingPath = path.join(config.residencyRoot, "processing");
     this.#responsesPath = path.join(config.residencyRoot, "responses");
     this.#agentsPath = path.join(config.residencyRoot, "agents");
+    this.#removalsPath = residentRemovalsPath(config.residencyRoot);
     this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { readCacheMs: RUNTIME_MESH_READ_CACHE_MS });
@@ -170,6 +173,8 @@ class ResidentHost {
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
+      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
+        this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
     if (config.agents.budgetUsd > 0) {
       const budgetFile = path.join(config.residencyRoot, "budget.jsonl");
@@ -376,6 +381,8 @@ class ResidentHost {
     };
     atomicWrite(this.#ownerPath, owner);
     fs.rmSync(this.#errorPath, { force: true });
+    // Removals a previous host accepted: their runs ended with it.
+    void this.actors.finishPendingRemovals().finally(() => this.#writeRemovals());
     await this.#pollRequests();
   }
 
@@ -509,6 +516,7 @@ class ResidentHost {
       subscription.delivery,
       { message, data: event, triggerTurn: subscription.triggerTurn },
       target.ownerIdentityId,
+      { routedRemoteHost: target.remoteHost ?? null },
     );
   }
 
@@ -689,11 +697,20 @@ class ResidentHost {
         if (!this.actors.owns(command.id)) {
           throw new Error(`Resident host does not own ${command.id}`);
         }
-        await this.actors.remove(command.id);
+        // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
+        const removed = await this.actors.remove(command.id, { wait: false });
+        if (removed.pending) {
+          this.#writeRemovals();
+          void this.actors.removalSettled(command.id)?.finally(() => {
+            this.#writeRemovals();
+            this.participants.scheduleRefresh();
+          });
+        }
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,
           ok: true,
+          ...(removed.pending ? { pending: removed.pending } : {}),
           completedAt: Date.now(),
         };
       }
@@ -709,6 +726,13 @@ class ResidentHost {
     atomicWrite(path.join(this.#responsesPath, `${requestId}.json`), response);
     fs.rmSync(filePath, { force: true });
     this.participants.scheduleRefresh();
+  }
+
+  /** Pending removals for clients' error messages (smarty-dev#2184 item 8). */
+  #writeRemovals(): void {
+    const removals = this.actors.pendingRemovals();
+    if (removals.length === 0) fs.rmSync(this.#removalsPath, { force: true });
+    else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals });
   }
 
   #recoverInterruptedRequests(): void {

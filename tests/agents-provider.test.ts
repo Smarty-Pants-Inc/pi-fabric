@@ -920,6 +920,30 @@ describe("AgentsProvider runner support", () => {
     ).resolves.toEqual([]);
   });
 
+  // smarty-dev#2184: an actor's activation run (id = run id, name = actor name, no root) listed
+  // as a standalone agent read as "the reviewer is now <run id>, with no root session".
+  it("omits actor activation runs from agents.list; the actor is listed by agents.actors", async () => {
+    const { provider, agents } = setup();
+    const run = await agents.spawn({
+      task: "actor activation",
+      name: "playground-review-astra",
+      actorId: "7a3e1e35-actor",
+      actorName: "playground-review-astra",
+    });
+    const task = await agents.spawn({ task: "plain task", name: "worker" });
+    for (const scope of [undefined, "local", "project", "lineage"]) {
+      const listed = (await provider.invoke("list", scope ? { scope } : {}, context)) as Array<{ id: string }>;
+      expect(listed.map((record) => record.id), String(scope)).not.toContain(run.id);
+    }
+    const local = (await provider.invoke("list", {}, context)) as Array<{ id: string }>;
+    expect(local.map((record) => record.id)).toContain(task.id);
+    // A direct lookup of the run id still answers, and names its actor.
+    await expect(provider.invoke("status", { id: run.id }, context)).resolves.toMatchObject({
+      id: run.id,
+      actorId: "7a3e1e35-actor",
+    });
+  });
+
   // smarty-dev#266: during a mesh write stall, user-facing listings report it instead of [].
   it("reports a mesh write stall from user-facing listings but not from local ones", async () => {
     const stalled = new Error("Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock");
@@ -1703,6 +1727,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/session", thinking: "low" },
       }),
       "identity:owner",
+      { routedRemoteHost: null },
     );
   });
 
@@ -1718,8 +1743,10 @@ describe("AgentsProvider shared actor definitions", () => {
     const { provider } = setup([], [child], { request } as unknown as FabricControlPlane);
     for (const kind of ["steer", "followUp"] as const) {
       await expect(provider.routeMessage(child.id, `correct it (${kind})`, { key: "k" }, kind)).resolves.toMatchObject({ acknowledged: true });
-      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId);
+      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId, { routedRemoteHost: null });
     }
+    await expect(provider.stopParticipant(child.id)).resolves.toMatchObject({ acknowledged: true });
+    expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, "stop", {}, child.ownerIdentityId, { routedRemoteHost: null });
     const unsteerable = setup([], [{ ...child, capabilities: ["stop"] }], { request } as unknown as FabricControlPlane).provider;
     await expect(unsteerable.routeMessage(child.id, "no", undefined, "steer")).rejects.toThrow("does not support steer");
   });
@@ -1788,6 +1815,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "followUp",
       expect.objectContaining({ message: "queue" }),
       "identity:resident",
+      { routedRemoteHost: null },
     );
   });
 
@@ -2217,13 +2245,49 @@ describe("AgentsProvider global actors", () => {
   it("edits instructions for project and global scopes", async () => {
     const { provider, actors, globalActors } = setup();
     const actor = (await provider.invoke("create", createRequest, context)) as { id: string };
-    await provider.invoke("setInstructions", { id: actor.id, instructions: "Be brief." }, context);
+    await provider.invoke("setInstructions", { id: actor.id, instructions: "Be brief.", replace: true }, context);
     expect(actors.instructions(actor.id)).toBe("Be brief.");
 
     await provider.invoke("create", { ...createRequest, name: "templar", scope: "global" }, context);
     const globalId = globalActors.resolve("templar")!.id;
-    await provider.invoke("setInstructions", { id: globalId, instructions: "Template brief.", scope: "global" }, context);
+    await provider.invoke("setInstructions", { id: globalId, instructions: "Template brief.", scope: "global", replace: true }, context);
     expect(globalActors.resolve("templar")!.instructions).toBe("Template brief.");
+  });
+
+  // smarty-dev#2340: a >80% shrink is refused unless replace: true.
+  it("guards setInstructions against a >80% shrink in project and global scopes", async () => {
+    const { provider, actors, globalActors } = setup();
+    const long = "x".repeat(100);
+    const actor = (await provider.invoke("create", createRequest, context)) as { id: string };
+    await provider.invoke("create", { ...createRequest, name: "templar", scope: "global" }, context);
+    const globalId = globalActors.resolve("templar")!.id;
+    const read = {
+      project: () => actors.instructions(actor.id),
+      global: () => globalActors.resolve("templar")!.instructions,
+    };
+    for (const scope of ["project", "global"] as const) {
+      const id = scope === "global" ? globalId : actor.id;
+      const set = (instructions: string, extra: Record<string, unknown> = {}) =>
+        provider.invoke("setInstructions", { id, instructions, scope, ...extra }, context);
+      await set(long, { replace: true });
+      expect(read[scope]()).toBe(long);
+      // Refused: 19 chars is more than 80% shorter than 100.
+      const error = await set("y".repeat(19)).then(() => undefined, (e: Error) => e);
+      expect(error?.message).toMatch(/19/);
+      expect(error?.message).toMatch(/100/);
+      expect(error?.message).toMatch(/replace: true/);
+      expect(read[scope]()).toBe(long);
+      // Exact 80% boundary (20 of 100) is allowed.
+      await set("z".repeat(20));
+      expect(read[scope]()).toBe("z".repeat(20));
+      // Normal edit allowed.
+      await set("z".repeat(18) + "ab");
+      expect(read[scope]()).toBe("z".repeat(18) + "ab");
+      // Explicit replace allows a large shrink.
+      await set(long, { replace: true });
+      await set("tiny", { replace: true });
+      expect(read[scope]()).toBe("tiny");
+    }
   });
 
   it("removes a global template via scoped remove", async () => {

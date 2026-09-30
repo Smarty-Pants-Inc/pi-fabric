@@ -795,6 +795,8 @@ interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & { message: string; /** See FabricMessageData. */ data?: unknown };
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricMessageDelivery {
+  /** Advisory only: unverified ids in sender history; also delivered when admission permits. */
+  notice?: string;
   queued: true;
   messageId: string;
   routed?: "local" | "main" | "mesh";
@@ -859,6 +861,8 @@ interface FabricAgentsApi {
     id: string;
     instructions: string;
     scope?: "project" | "global";
+    /** Required to shrink the body by more than 80%. */
+    replace?: boolean;
   }): Promise<FabricActorInfo>;
   ask(args: FabricActorMessageArgs): Promise<FabricActorMessage>;
   ask(id: string, message: string): Promise<FabricActorMessage>;
@@ -971,7 +975,8 @@ interface FabricMeshStateEntry<T = unknown> {
 }
 interface FabricMeshApi {
   self(): Promise<FabricMeshIdentity>;
-  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent>;
+  /** An unverified-ids notice is advisory; it is also appended to the durable event text. */
+  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent & { notice?: string }>;
   read(args?: { after?: number; topic?: string; to?: string; limit?: number; max?: number }): Promise<FabricMeshEvent[]>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean; limit?: number; max?: number; include_stale?: boolean }): Promise<FabricParticipantInfo[]>;
   get<T = unknown>(args: { key: string }): Promise<FabricMeshStateEntry<T> | null>;

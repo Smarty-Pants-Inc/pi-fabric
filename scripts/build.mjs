@@ -32,6 +32,7 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/coordination/unverified-ids.ts",
   "src/core/provider-operations.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
@@ -124,6 +125,22 @@ const standalone = await build({
           : { path: args.path, external: true });
     },
   }],
+});
+
+// smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
+// ones included. Built on its own, without splitting, so it shares no chunk with index.js.
+await build({
+  entryPoints: ["src/guards/actor-bash-hook.ts"],
+  outdir: "dist",
+  outbase: "src",
+  entryNames: "[dir]/[name]",
+  bundle: true,
+  packages: "external",
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  logLevel: "info",
 });
 
 // The records service runs as its own OS user from a root-owned copy of one file:

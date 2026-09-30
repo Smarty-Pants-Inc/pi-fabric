@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js";
+import { formatAge } from "../residency/protocol.js";
+import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
@@ -92,6 +93,7 @@ import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
 import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
+import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
 
@@ -322,6 +324,7 @@ const actorRequest = (
       : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(args.nice !== undefined ? { nice: parseAgentNice(args.nice as number) } : {}), // non-numbers throw at runtime
+    ...(args.bashTimeoutSeconds !== undefined ? { bashTimeoutSeconds: parseBashTimeoutSeconds(args.bashTimeoutSeconds) } : {}),
     ...(typeof args.extensions === "boolean" ? { extensions: args.extensions } : {}),
     ...(args.inferenceContext !== undefined ? { inferenceContext: args.inferenceContext } : {}),
     ...(requires ? { requires } : {}),
@@ -593,6 +596,23 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async invoke(
+    actionName: string,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+  ): Promise<unknown> {
+    try {
+      return await this.#invoke(actionName, args, context);
+    } catch (error) {
+      // smarty-dev#2184 item 8: name a pending removal (or a long host request) that these
+      // errors come from, so a caller does not read them as a lost or foreign host.
+      if (!(error instanceof Error) || !/owned by another host/.test(error.message)) throw error;
+      const note = this.residency?.hostStateNote?.();
+      if (note) error.message = `${error.message}; ${note}`;
+      throw error;
+    }
+  }
+
+  async #invoke(
     actionName: string,
     args: Record<string, unknown>,
     context: FabricInvocationContext,
@@ -1079,7 +1099,7 @@ export class AgentsProvider implements FabricProvider {
         };
       }
       case "actors":
-        return args.scope === "global" ? this.globalActors.list() : this.actorManager.list();
+        return args.scope === "global" ? this.globalActors.list() : this.#actorsWithLiveState();
       case "messages": {
         const actor = this.actorManager.status(String(args.id));
         return this.actorManager.messages(
@@ -1191,9 +1211,15 @@ export class AgentsProvider implements FabricProvider {
       case "setInstructions": {
         const id = String(args.id);
         const instructions = String(args.instructions);
-        if (args.scope === "global") {
-          return this.globalActors.update(id, { instructions });
+        const global = args.scope === "global";
+        // smarty-dev#2340: refuse a >80% shrink unless the caller opts into replace: true.
+        const current = global ? this.globalActors.resolve(id)?.instructions : this.actorManager.instructions(id);
+        if (args.replace !== true && current !== undefined && instructions.length * 5 < current.length) {
+          throw new Error(
+            `Refusing setInstructions: new instructions (${instructions.length} chars) are more than 80% shorter than the current ${current.length} chars; pass replace: true to replace them`,
+          );
         }
+        if (global) return this.globalActors.update(id, { instructions });
         return this.actorManager.setInstructions(id, instructions);
       }
       case "import": {
@@ -1279,7 +1305,13 @@ export class AgentsProvider implements FabricProvider {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
-    return this.#router.routeMessage(id, message, data, kind, context, options);
+    // Host-authored lifecycle routing has no sender invocation/history. Check
+    // only model sends, before *all* local/actor/remote routing branches.
+    if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
+    const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
+    const result = await deliverWithMessageNotice(message, checked,
+      text => this.#router.routeMessage(id, text, data, kind, context, options));
+    return checked.notice ? { ...result, notice: checked.notice } : result;
   }
 
   /** Flush pending coalesced lifecycle deliveries; used by tests and shutdown. */
@@ -1338,6 +1370,38 @@ export class AgentsProvider implements FabricProvider {
     return actor;
   }
 
+  /**
+   * Actors, with the owner's live state for those another host runs: the registry says only
+   * idle or stopped, so a stopped actor still ending a run looked finished (smarty-dev#2184 item 8).
+   */
+  #actorsWithLiveState(): FabricActorInfo[] {
+    return this.actorManager.list().map((actor) => {
+      if (this.actorManager.owns(actor.id)) return actor;
+      const live = this.participants.get(actor.id);
+      if (!live || live.stale || live.kind !== "actor") return actor;
+      const now = Date.now();
+      const removal = live.actorRemoval ?? actor.removal;
+      const run = live.actorRun;
+      const runId = removal?.runId ?? run?.id;
+      const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
+      return {
+        ...actor,
+        status: live.status as FabricActorInfo["status"],
+        ...(run ? { inFlightRun: { ...run, ageS: Math.max(0, Math.round((now - run.startedAt) / 1_000)) } } : {}),
+        ...(removal
+          ? {
+              removal: {
+                ...removal,
+                state: runId
+                  ? `removal of ${actor.name} (${actor.id}) is pending behind its in-flight run ${runId} (${runAge})`
+                  : `removal of ${actor.name} (${actor.id}) is pending (${runAge})`,
+              },
+            }
+          : {}),
+      };
+    });
+  }
+
   #residentActorClient(): ResidentActorClient {
     const client = ResidentActorClient.fromEnv();
     if (client) return client;
@@ -1374,7 +1438,10 @@ export class AgentsProvider implements FabricProvider {
 
   #listAgents(scopeValue: unknown): Array<AgentRunRecord | AgentHandleInfo | ReturnType<FabricParticipantSource["self"]>> {
     const scope = this.#participantScope(scopeValue, "local");
-    if (scope === "local") return this.manager.list();
+    // An actor's activation run is the actor at work, not an agent: listed, it read as a new
+    // root-less agent named after the actor with its run id (smarty-dev#2184). agents.actors lists
+    // the actor; the shared directory already omits these runs (agentParticipantRecords).
+    if (scope === "local") return this.manager.list().filter((record) => !record.actorId);
     // Like agents.members: a mesh-dependent listing (project or lineage) during a write
     // stall is unknown, not short.
     const stalled = this.participants.writeStalled?.();
@@ -1448,6 +1515,7 @@ export class AgentsProvider implements FabricProvider {
       "stop",
       {},
       participant.ownerIdentityId,
+      { routedRemoteHost: participant.remoteHost ?? null },
     );
     if (this.residency?.hasAgent(id)) this.residency.acknowledgeCompletion(id);
     return result;

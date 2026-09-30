@@ -1,4 +1,5 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
+import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
@@ -109,6 +110,7 @@ interface ManagedActor {
   transport?: FabricAgentTransport;
   timeoutMs?: number;
   nice?: number;
+  bashTimeoutSeconds?: number;
   extensions?: boolean;
   inferenceContext?: FabricActorInferenceContext;
   requirements: FabricCapabilityRequirement[];
@@ -122,6 +124,10 @@ interface ManagedActor {
   createdAt: number;
   updatedAt: number;
   lastRunId?: string;
+  /** The run in flight, known from its spawn (smarty-dev#2184 item 8). */
+  inFlightRun?: { id: string; startedAt: number };
+  /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
+  removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
   lastError?: string;
   abortController?: AbortController;
   /** The in-flight run an ownership change aborted: its event is parked, not failed. */
@@ -131,6 +137,18 @@ interface ManagedActor {
   drain?: Promise<void>;
   draining: boolean;
 }
+
+/** Validate an actor's bashTimeoutSeconds: a non-negative integer (0 = no default timeout). */
+export const parseBashTimeoutSeconds = (value: unknown): number => {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error("bashTimeoutSeconds must be a non-negative integer (0 = no default timeout)");
+  }
+  return value;
+};
+
+/** An accepted removal whose cleanup fails is retried this often, from REMOVAL_RETRY_MS doubling. */
+const REMOVAL_RETRIES = 5;
+const REMOVAL_RETRY_MS = 1_000;
 
 const ACTOR_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,59}$/;
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
@@ -279,6 +297,8 @@ export class ActorManager {
   readonly #takenOver = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
+  /** Removals that returned before their in-flight run ended, by actor id (smarty-dev#2184). */
+  readonly #removals = new Map<string, Promise<void>>();
   readonly #actorRoot: string;
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
@@ -326,6 +346,7 @@ export class ActorManager {
   readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
+  #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
   #closing = false;
   readonly #closeGraceMs: number;
@@ -365,6 +386,8 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
+      /** First backoff of a failed accepted-removal cleanup (tests shorten it). */
+      removalRetryMs?: number;
       /** With meshCursorPath: on resume, replay only events newer than this (ms). */
       meshReplayAgeMs?: number;
       relayParticipantSteering?: boolean;
@@ -437,6 +460,7 @@ export class ActorManager {
     });
     this.#meshMonitor.start();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
+    this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
     setTimeout(() => this.#reapOrphanPresence(), 0).unref();
@@ -479,11 +503,13 @@ export class ActorManager {
     if (!this.meshConfig.enabled) throw new Error("Fabric mesh and actors are disabled");
     const name = request.name.trim();
     if (!ACTOR_NAME_PATTERN.test(name)) throw new Error(`Invalid Fabric actor name: ${name}`);
-    const sameName = [...this.#actors.values()].find((actor) => actor.name === name);
+    // A predecessor whose removal is pending keeps its name until its run ends (smarty-dev#2184).
+    const sameName = [...this.#actors.values()].find((actor) => actor.name === name && !actor.removal);
     if (sameName && sameName.status !== "stopped") {
       throw new Error(`A Fabric actor named ${name} is already active (${sameName.id})`);
     }
-    if (sameName?.status === "stopped") await this.remove(sameName.id);
+    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
+    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
     if (!request.instructions.trim()) throw new Error("Actor instructions must not be empty");
     if (Buffer.byteLength(request.instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
@@ -551,6 +577,7 @@ export class ActorManager {
       ...(request.transport ? { transport: request.transport } : {}),
       ...(request.timeoutMs ? { timeoutMs: request.timeoutMs } : {}),
       ...(request.nice !== undefined ? { nice: parseAgentNice(request.nice) } : {}),
+      ...(request.bashTimeoutSeconds !== undefined ? { bashTimeoutSeconds: parseBashTimeoutSeconds(request.bashTimeoutSeconds) } : {}),
       ...(typeof request.extensions === "boolean" ? { extensions: request.extensions } : {}),
       ...(request.inferenceContext !== undefined ? { inferenceContext: request.inferenceContext } : {}),
       requirements,
@@ -1178,8 +1205,9 @@ export class ActorManager {
     this.#mainIdle = idle;
   }
 
-  observeHostEvent(event: FabricActorHostEvent, idle = false): boolean {
-    if (!this.#beginHostEvent(event, idle)) return false;
+  /** `source` is the Pi input event's source: an extension's own prompt never lifts a halt. */
+  observeHostEvent(event: FabricActorHostEvent, idle = false, source?: string): boolean {
+    if (!this.#beginHostEvent(event, idle, source)) return false;
     return [...this.#actors.values()].some(
       (actor) => this.#observesHostEvent(actor, event),
     );
@@ -1194,7 +1222,11 @@ export class ActorManager {
       typeof (payload as { signal?: { idle?: unknown } }).signal?.idle === "boolean"
       ? (payload as { signal: { idle: boolean } }).signal.idle
       : undefined;
-    if (!this.#beginHostEvent(event, payloadIdle ?? event === "agent_settled")) return 0;
+    const signal = typeof payload === "object" && payload !== null
+      ? (payload as { signal?: { payload?: { source?: unknown } } }).signal
+      : undefined;
+    const source = typeof signal?.payload?.source === "string" ? signal.payload.source : undefined;
+    if (!this.#beginHostEvent(event, payloadIdle ?? event === "agent_settled", source)) return 0;
     return this.dispatchObservedHostEvent(event, payload, images);
   }
 
@@ -1314,7 +1346,7 @@ export class ActorManager {
     });
   }
 
-  #beginHostEvent(event: FabricActorHostEvent, idle: boolean): boolean {
+  #beginHostEvent(event: FabricActorHostEvent, idle: boolean, source?: string): boolean {
     if (this.#closing || !this.meshConfig.enabled) return false;
     // Streaming/message/provider hooks are frequent. The actor registry watcher
     // keeps this in-memory roster current, so events that do not participate in
@@ -1327,8 +1359,9 @@ export class ActorManager {
     this.#syncActorsFromRegistry();
     this.#refreshOwnership();
     // The user sending a new message ends a stop-the-world halt: lift the gate
-    // before dispatching so input-subscribed actors receive this event.
-    if (event === "input" && this.#halted) {
+    // before dispatching so input-subscribed actors receive this event. An
+    // extension's own prompt is not the user resuming (pi-fabric#160 S2).
+    if (event === "input" && this.#halted && source !== "extension") {
       this.#halted = false;
       this.#meshMonitor.schedule();
       this.#scheduleRestoreParked();
@@ -1347,6 +1380,8 @@ export class ActorManager {
     actor.status = "stopped";
     actor.updatedAt = Date.now();
     actor.abortController?.abort();
+    // A stopped actor wants no result from its run: a dead worker ends it, not a relaunch (#2184 8b).
+    if (actor.inFlightRun) this.agents.abandon(actor.inFlightRun.id);
     this.#drop(actor, [...this.#takeQueued(actor), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued`);
     await this.#publishPresence(actor);
@@ -1436,16 +1471,131 @@ export class ActorManager {
     return { halted };
   }
 
-  async remove(id: string): Promise<{ removed: boolean }> {
+  /**
+   * Remove an actor. With `wait: false` (the resident host, smarty-dev#2184 item 8) a removal
+   * behind an in-flight run stops the actor, returns at once with the pending state, and
+   * finishes (drain, then cleanup) when that run ends; the host's request queue never waits.
+   */
+  async remove(
+    id: string,
+    { wait = true }: { wait?: boolean } = {},
+  ): Promise<{ removed: boolean; pending?: string }> {
     const actor = this.#requireOwnedActor(id);
-    await this.stop(id);
-    await actor.drain?.catch(() => undefined);
+    if (actor.removal) {
+      const pending = this.#removals.get(actor.id);
+      if (pending && !wait) return { removed: true, pending: this.#removalState(actor) };
+      if (pending) {
+        await pending;
+        // Retries that ran out leave the actor and its saved marker: that is not a removal.
+        if (this.#actors.get(actor.id) === actor) {
+          throw new Error(`Fabric actor ${actor.name} (${actor.id}): ${this.#removalState(actor)}`);
+        }
+        return { removed: true };
+      }
+      // Accepted by a host that has since restarted: no run of it is left to wait for.
+      await actor.drain?.catch(() => undefined);
+      return this.#finishRemove(actor);
+    }
+    await this.stop(actor.id);
+    const drain = actor.drain;
+    if (drain && !wait) {
+      actor.removal = {
+        requestedAt: Date.now(),
+        ...(actor.inFlightRun ? { runId: actor.inFlightRun.id, runStartedAt: actor.inFlightRun.startedAt } : {}),
+      };
+      // The marker is the durable revocation: a restarted owner finishes the removal from it. The
+      // removal is accepted only once it is saved (review round 1 on pi-fabric#160).
+      try {
+        await this.#saveActors();
+      } catch (error) {
+        delete actor.removal;
+        throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped, but its removal was not saved: ` +
+          `${error instanceof Error ? error.message : String(error)}; remove it again`);
+      }
+      this.#removals.set(actor.id, this.#finishBehind(actor, drain));
+      this.#emitChange();
+      await this.#publishPresence(actor).catch(() => undefined);
+      return { removed: true, pending: this.#removalState(actor) };
+    }
+    await drain?.catch(() => undefined);
+    return this.#finishRemove(actor);
+  }
+
+  /**
+   * Finish an accepted removal once its run ends, retrying a failed cleanup with backoff. A cleanup
+   * that still fails keeps its saved marker: the next remove() or owner start finishes it.
+   */
+  async #finishBehind(actor: ManagedActor, drain: Promise<void>): Promise<void> {
+    await drain.catch(() => undefined);
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await this.#finishRemove(actor);
+          return;
+        } catch (error) {
+          actor.lastError = `removal cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+          if (attempt >= REMOVAL_RETRIES || this.#closing) return;
+          await new Promise((resolve) => setTimeout(resolve, this.#removalRetryMs * 2 ** attempt).unref?.());
+        }
+      }
+    } finally {
+      this.#removals.delete(actor.id);
+      this.#emitChange();
+    }
+  }
+
+  /** Removals still waiting on their in-flight run; the resident host reports them. */
+  pendingRemovals(): Array<{ id: string; name: string; requestedAt: number; runId?: string; runStartedAt?: number; state: string }> {
+    return [...this.#actors.values()].filter((actor) => actor.removal).map((actor) => ({
+      id: actor.id,
+      name: actor.name,
+      requestedAt: actor.removal!.requestedAt,
+      ...(actor.removal!.runId ? { runId: actor.removal!.runId } : {}),
+      ...(actor.removal!.runStartedAt ? { runStartedAt: actor.removal!.runStartedAt } : {}),
+      state: this.#removalState(actor),
+    }));
+  }
+
+  /** Settles when the pending removal of `id` (if any) has finished. */
+  removalSettled(id: string): Promise<void> | undefined {
+    return this.#removals.get(id);
+  }
+
+  /** A restarted owner finishes the removals its predecessor accepted: no run survives a restart. */
+  async finishPendingRemovals(): Promise<void> {
+    for (const actor of [...this.#actors.values()]) {
+      if (actor.removal && !this.#removals.has(actor.id) && this.#canManage(actor.id)) {
+        await this.#finishRemove(actor).catch(() => undefined);
+      }
+    }
+  }
+
+  #removalState(actor: ManagedActor): string {
+    const since = actor.removal?.requestedAt ?? Date.now();
+    const runId = actor.removal?.runId ?? actor.inFlightRun?.id;
+    const age = formatAge(Date.now() - (actor.removal?.runStartedAt ?? actor.inFlightRun?.startedAt ?? since));
+    const state = runId
+      ? `removal of ${actor.name} (${actor.id}) is pending behind its in-flight run ${runId} (${age})`
+      : `removal of ${actor.name} (${actor.id}) is pending (${formatAge(Date.now() - since)})`;
+    // A cleanup that failed says so, and how it will finish.
+    return actor.lastError?.startsWith("removal cleanup failed") && !this.#removals.has(actor.id)
+      ? `${state}; ${actor.lastError} (a later remove or host start finishes it)`
+      : state;
+  }
+
+  async #finishRemove(actor: ManagedActor): Promise<{ removed: boolean }> {
     const retainedRunId = actor.lastRunId;
     await this.#bindings.delete(actor.id);
     this.#actors.delete(actor.id);
+    try {
+      await this.#saveActors(new Set([actor.id]));
+    } catch (error) {
+      // Not removed: keep the actor (and any saved removal marker) so the removal can finish later.
+      if (!this.#actors.has(actor.id)) this.#actors.set(actor.id, actor);
+      throw error;
+    }
     this.#emitChange();
     fs.rmSync(path.dirname(actor.sessionFile), { recursive: true, force: true });
-    await this.#saveActors(new Set([actor.id]));
     await this.#writePresence(actor.id);                      // the actor is gone: a delete
     if (retainedRunId) await this.agents.cleanup(retainedRunId).catch(() => ({ cleaned: false }));
     return { removed: true };
@@ -1518,6 +1668,7 @@ export class ActorManager {
     if (!canManage) {
       throw new Error(`Fabric actor is owned by another host: ${actor.id}`);
     }
+    if (actor.removal) throw new Error(`Fabric actor ${actor.name} (${actor.id}): ${this.#removalState(actor)}`);
     if (actor.status === "stopped") {
       throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped`);
     }
@@ -1721,6 +1872,10 @@ export class ActorManager {
           const result = await this.agents.run(
             this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
+            (handle) => {
+              actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
+              void this.#publishPresence(actor).catch(() => undefined);
+            },
           );
           runId = result.id;
           // Captured before any check that can throw: a completed run is never parked and
@@ -1875,6 +2030,7 @@ export class ActorManager {
             await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
           }
           delete actor.abortController;
+          delete actor.inFlightRun;
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           this.#finishInFlight(actor.id, item);
@@ -1974,6 +2130,7 @@ export class ActorManager {
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
       ...(actor.nice !== undefined ? { nice: actor.nice } : {}),
+      ...(actor.bashTimeoutSeconds !== undefined ? { bashTimeoutSeconds: actor.bashTimeoutSeconds } : {}),
     };
   }
 
@@ -2429,6 +2586,7 @@ export class ActorManager {
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
       ...(actor.nice !== undefined ? { nice: actor.nice } : {}),
+      ...(actor.bashTimeoutSeconds !== undefined ? { bashTimeoutSeconds: actor.bashTimeoutSeconds } : {}),
       ...(typeof actor.extensions === "boolean" ? { extensions: actor.extensions } : {}),
       ...(actor.inferenceContext !== undefined ? { inferenceContext: actor.inferenceContext } : {}),
       ...(actor.coalesceKey ? { coalesceKey: actor.coalesceKey } : {}),
@@ -2447,6 +2605,7 @@ export class ActorManager {
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+      ...(actor.removal ? { removal: actor.removal } : {}),
     };
   }
 
@@ -2632,6 +2791,7 @@ export class ActorManager {
           : {}),
         ...(typeof record.timeoutMs === "number" ? { timeoutMs: record.timeoutMs } : {}),
         ...(typeof record.nice === "number" && Number.isFinite(record.nice) ? { nice: parseAgentNice(record.nice) } : {}),
+        ...(Number.isInteger(record.bashTimeoutSeconds) && (record.bashTimeoutSeconds as number) >= 0 ? { bashTimeoutSeconds: record.bashTimeoutSeconds as number } : {}),
         ...(typeof record.extensions === "boolean" ? { extensions: record.extensions } : {}),
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         ...(typeof record.coalesceKey === "string" && COALESCE_KEY_LOAD_PATTERN.test(record.coalesceKey)
@@ -2658,6 +2818,15 @@ export class ActorManager {
         createdAt: record.createdAt,
         updatedAt: Date.now(),
         ...(typeof record.lastRunId === "string" ? { lastRunId: record.lastRunId } : {}),
+        ...(typeof record.removal?.requestedAt === "number"
+          ? {
+              removal: {
+                requestedAt: record.removal.requestedAt,
+                ...(typeof record.removal.runId === "string" ? { runId: record.removal.runId } : {}),
+                ...(typeof record.removal.runStartedAt === "number" ? { runStartedAt: record.removal.runStartedAt } : {}),
+              },
+            }
+          : {}),
       };
       if (Array.isArray(record.messages)) {
         for (const candidate of record.messages.slice(-MESSAGE_HISTORY_LIMIT)) {
@@ -2976,6 +3145,17 @@ export class ActorManager {
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+      ...(actor.inFlightRun
+        ? {
+            inFlightRun: {
+              ...actor.inFlightRun,
+              ageS: Math.max(0, Math.round((Date.now() - actor.inFlightRun.startedAt) / 1_000)),
+            },
+          }
+        : {}),
+      ...(actor.removal
+        ? { removal: { ...actor.removal, state: this.#removalState(actor) } }
+        : {}),
       ...(actor.lastError ? { lastError: actor.lastError } : {}),
       sessionFile: actor.sessionFile,
       logDir: path.join(path.dirname(actor.sessionFile), "runs"),
@@ -3381,6 +3561,7 @@ export class ActorManager {
 
   #requireOwnedActiveActor(id: string): ManagedActor {
     const actor = this.#requireOwnedActor(id);
+    if (actor.removal) throw new Error(`Fabric actor ${actor.name} (${actor.id}): ${this.#removalState(actor)}`);
     if (actor.status === "stopped") {
       throw new Error(`Fabric actor ${actor.name} (${actor.id}) is stopped`);
     }
@@ -3394,6 +3575,9 @@ export class ActorManager {
       (actor) => actor.id.startsWith(id) || actor.name === id,
     );
     if (matches.length === 1 && matches[0]) return matches[0];
+    // A same-name successor created while its predecessor's removal is pending wins.
+    const current = matches.filter((actor) => !actor.removal);
+    if (current.length === 1 && current[0]) return current[0];
     if (matches.length > 1) throw new Error(`Ambiguous Fabric actor: ${id}`);
     throw new Error(`Unknown Fabric actor: ${id}`);
   }

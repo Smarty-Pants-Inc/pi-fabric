@@ -965,13 +965,28 @@ run runuser -u "$REC" -- "$OPT_NODE" "$MAIN" migrate --config "$CFG"
 SVC_WAS_ACTIVE=0
 if was_active "$SVC_UNIT"; then SVC_WAS_ACTIVE=1; fi
 run systemctl enable --now "$SVC_UNIT"
-# A SIGHUP before Node has loaded the service would end it: callers wait for the socket first.
+# A SIGHUP before Node has loaded the service would end it. A crashed process can leave
+# a socket inode in the persistent directory: wait for a real listener, as the org user,
+# never by opening an agent-writable path as root. One deadline bounds connects and sleeps.
 wait_socket() {
-	for _ in $(seq 1 300); do [[ -S $SOCKET ]] && return 0; sleep 0.1; done
-	[[ -S $SOCKET ]]
+	runuser -u "$ORG_USER" -- python3 -c '
+import socket, sys, time
+deadline = time.monotonic() + 30
+while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        sys.exit(1)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(min(1, remaining))
+            s.connect(sys.argv[1])
+        sys.exit(0)
+    except OSError:
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+' "$SOCKET" 2>/dev/null
 }
 if ((DRY)); then
-	echo "? if ${MARKER} lists ${SVC_UNIT} (node, the bundle or its unit changed, now or in an interrupted run) and it was already active: + systemctl restart ${SVC_UNIT}, then wait up to 30 s for ${SOCKET}"
+	echo "? if ${MARKER} lists ${SVC_UNIT} (node, the bundle or its unit changed, now or in an interrupted run) and it was already active: + systemctl restart ${SVC_UNIT}, then wait up to 30 s for a successful connection to ${SOCKET} as ${ORG_USER}"
 	marker_clear "$SVC_UNIT"
 elif marker_has "$SVC_UNIT"; then
 	if ((SVC_WAS_ACTIVE)); then
@@ -1054,7 +1069,7 @@ EOF
 done
 if ((${#OPERATORS[@]})); then
 	if ((DRY)); then
-		echo "? if ${SVC_UNIT} is active: wait up to 30 s for ${SOCKET} (the service's SIGHUP handler is in place by then), then + systemctl reload ${SVC_UNIT}  (always, so an interrupted earlier grant takes effect)"
+		echo "? if ${SVC_UNIT} is active: wait up to 30 s for a successful connection to ${SOCKET} as ${ORG_USER} (the service's SIGHUP handler is in place by then), then + systemctl reload ${SVC_UNIT}  (always, so an interrupted earlier grant takes effect)"
 	elif systemctl is-active --quiet "$SVC_UNIT"; then
 		# P2-3: reload even when no role changed here: an earlier run may have written a role and stopped before its reload.
 		wait_socket || die "${SOCKET} did not appear within 30 s; not reloading ${SVC_UNIT}"

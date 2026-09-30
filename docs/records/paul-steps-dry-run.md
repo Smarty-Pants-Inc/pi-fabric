@@ -6,8 +6,8 @@ Captured on Dev1 (no PostgreSQL installed yet), from a copy of the script at `/r
 smarty-step.sh --org smarty-pants --org-user paul --operator relay:relay:fabric --package-root <package> --node <node> --bundle-sha256 c567433b7473017ef20bf3a7cdfe48d3e3a06791fc058f24b76f7ce40df02123 --node-sha256 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c --dry-run
 ```
 
-The service-unit and verification excerpts below are updated to match the socket-directory fix
-(smarty-dev#1546); the historical build digests and other host-specific output are retained.
+The service-unit, readiness-wait and verification excerpts below are updated to match the socket-directory fix
+(smarty-dev#1546), including bounded connects rather than accepting a crashed process's socket inode; the historical build digests and other host-specific output are retained.
 There is no separate generator: this is the script's `--dry-run` output.
 
 ```
@@ -163,7 +163,7 @@ digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
 + runuser -u smarty-pants-records -- '/usr/lib/postgresql/<N>/bin/psql' -X -v ON_ERROR_STOP=1 -h /run/smarty-pants-records-pg -p 5433 -U postgres -d records -c 'DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='\''records_service'\'') THEN CREATE ROLE records_service LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT; END IF; END $$'
 + runuser -u smarty-pants-records -- /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs migrate --config /etc/smarty-pants-records/service.json
 + systemctl enable --now smarty-pants-records.service
-? if /var/lib/smarty-pants-records-installer/restart-pending lists smarty-pants-records.service (node, the bundle or its unit changed, now or in an interrupted run) and it was already active: + systemctl restart smarty-pants-records.service, then wait up to 30 s for /run/smarty-pants-records/records.sock
+? if /var/lib/smarty-pants-records-installer/restart-pending lists smarty-pants-records.service (node, the bundle or its unit changed, now or in an interrupted run) and it was already active: + systemctl restart smarty-pants-records.service, then wait up to 30 s for a successful connection to /run/smarty-pants-records/records.sock as paul
 ? remove smarty-pants-records.service from /var/lib/smarty-pants-records-installer/restart-pending (same atomic replace; rm it when empty, then fsync /var/lib/smarty-pants-records-installer)
 ## 8. Operator principals
 ? /opt/smarty-pants-records/node -e "$(smarty-step.sh --print operator-edit-js)" /etc/smarty-pants-records/service.json relay relay:fabric check  (refused if relay:fabric holds another role)
@@ -173,7 +173,7 @@ digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
 + runuser -u paul -- install -d -m 0700 ~/.config/smarty-pants-records
 + runuser -u smarty-pants-records -- cat /var/lib/smarty-pants-records/credentials/a118e63f0db39cd54725abe706530715a3bd5e9e269bd9fc6ed418548a49c37a.json | runuser -u paul -- sh -c 'umask 077 && cat > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"' sh ~/.config/smarty-pants-records/relay.json
   -> relay:fabric (relay): Fabric of paul uses it with "records": { "enabled": true, "socket": "/run/smarty-pants-records/records.sock", "relayCredentialFile": "~/.config/smarty-pants-records/relay.json" }.
-? if smarty-pants-records.service is active: wait up to 30 s for /run/smarty-pants-records/records.sock (the service's SIGHUP handler is in place by then), then + systemctl reload smarty-pants-records.service  (always, so an interrupted earlier grant takes effect)
+? if smarty-pants-records.service is active: wait up to 30 s for a successful connection to /run/smarty-pants-records/records.sock as paul (the service's SIGHUP handler is in place by then), then + systemctl reload smarty-pants-records.service  (always, so an interrupted earlier grant takes effect)
 ## 9. Verification
 ? stat -c '%A %U:%G %n' /opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs /var/lib/smarty-pants-records /var/lib/smarty-pants-records/pg /var/lib/smarty-pants-records/status /var/lib/smarty-pants-records/credentials /run/smarty-pants-records-pg /run/smarty-pants-records /etc/smarty-pants-records
 ? runuser -u paul -- /usr/lib/postgresql/<N>/bin/psql -h /run/smarty-pants-records-pg -p 5433 -U postgres -d records -c 'select 1'  (expected to fail: agent cannot reach PostgreSQL)

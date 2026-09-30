@@ -18,6 +18,8 @@ const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 // without this grace a delivered command was reported as timed out and then retried
 // (smarty-dev#367). A command not admitted by the deadline is acknowledged as expired.
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
+// Sender-local message budget, independent of commit-time wire deadlines and live leases.
+const MIRRORED_MESSAGE_BUDGET_MS = 9_000;
 // Records other hosts left in the shared state before smarty-dev#643 are checked this often.
 const LEGACY_SEEN_CLEANUP_MS = 15 * 60 * 1_000;
 // A lock wait that timed out committed nothing, so the step that hit it is retried.
@@ -202,7 +204,7 @@ export interface FabricControlRequestOptions {
 interface PendingControlRequest {
   resolve: (acceptance: FabricControlAcceptance) => void;
   reject: (error: Error) => void;
-  /** Armed when the command's publish commits, with its wire deadline (smarty-dev#816). */
+  /** Mirrored messages prearm at admission; other requests arm after publish commits. */
   timer?: NodeJS.Timeout;
   ownerHostId: string;
   ownerIdentityId: string;
@@ -294,6 +296,7 @@ export class FabricControlPlane {
       ownerIdentityId,
       { ...options, timeoutMs: options.timeoutMs ?? this.#ackTimeoutMs },
       destination,
+      true,
     );
     let sent;
     try {
@@ -353,6 +356,7 @@ export class FabricControlPlane {
     ownerIdentityId: string,
     options: FabricControlRequestOptions,
     destination = { remoteHost: options.routedRemoteHost },
+    messageRequest = false,
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
     if (!this.options.enabled) {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
@@ -400,7 +404,15 @@ export class FabricControlPlane {
       };
       pendingRequest = pending;
       this.#pending.set(commandId, pending);
-      if (pending.mirroredOwner) this.#startMirrorWatchdog();
+      if (pending.mirroredOwner) {
+        // Capture validated authority first, then arm before publish can wait on the mesh lock.
+        // Renewal or a failed directory read cannot extend this sender-local message budget.
+        if (messageRequest && (operation === "steer" || operation === "followUp")) {
+          pending.timer = setTimeout(() => this.#timeoutPending(commandId), MIRRORED_MESSAGE_BUDGET_MS);
+          pending.timer.unref();
+        }
+        this.#startMirrorWatchdog();
+      }
       if (options.signal) {
         const onAbort = (): void => {
           const cancelled = this.#clearPending(commandId);
@@ -442,23 +454,12 @@ export class FabricControlPlane {
         }),
       }).then(() => {
         pendingRequest!.commandPublished = true;
-        // The wait starts at commit, like the owner's deadline: the lock wait before it (bounded by
-        // the mesh lock timeout) is not taken from the timeout. A request cancelled or closed
-        // meanwhile is no longer pending and is not revived.
-        if (this.#pending.get(commandId) === pendingRequest!) {
-          pendingRequest!.timer = setTimeout(() => {
-            const timedOut = this.#clearPending(commandId);
-            if (!timedOut) return;
-            void this.#publishCancellation(commandId, timedOut);
-            // The outcome is unknown: the owner may have admitted the command before its
-            // deadline. A retry is a new command, so it can deliver the message twice.
-            timedOut.reject(new Error(
-              (timedOut.mirroredOwner
-                ? `Fabric mesh bridge to remote host ${timedOut.mirroredOwner.remoteHost} is not responding for ${targetId}; `
-                : `Timed out waiting for the remote Fabric owner to acknowledge ${targetId}; `) +
-                "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
-            ));
-          }, timeoutMs + ackGraceMs);
+        // Other requests retain their commit-time ACK window. Never overwrite a mirrored
+        // message's admission timer, or revive a request already settled while publishing.
+        if (this.#pending.get(commandId) === pendingRequest! && !pendingRequest!.timer) {
+          pendingRequest!.timer = setTimeout(
+            () => this.#timeoutPending(commandId), timeoutMs + ackGraceMs,
+          );
           pendingRequest!.timer.unref();
         }
         if (pendingRequest!.cancellationRequested) {
@@ -479,6 +480,19 @@ export class FabricControlPlane {
       if (cancelled) void this.#publishCancellation(commandId, cancelled);
       throw error;
     }
+  }
+
+  #timeoutPending(commandId: string): void {
+    const timedOut = this.#clearPending(commandId);
+    if (!timedOut) return;
+    void this.#publishCancellation(commandId, timedOut);
+    // Neither a live lease nor a missing ACK proves the handler did not run. Never replay.
+    timedOut.reject(new Error(
+      (timedOut.mirroredOwner
+        ? `Fabric mesh bridge to remote host ${timedOut.mirroredOwner.remoteHost} is not responding for ${timedOut.targetId}; `
+        : `Timed out waiting for the remote Fabric owner to acknowledge ${timedOut.targetId}; `) +
+        "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
+    ));
   }
 
   #clearPending(commandId: string): PendingControlRequest | undefined {
@@ -507,7 +521,7 @@ export class FabricControlPlane {
         try {
           current = this.options.readMirroredOwner?.(pending.ownerHostId, pending.ownerIdentityId, pending.targetId);
         } catch {
-          // A failed read is not evidence of a lapse. The normal ACK deadline remains armed.
+          // A failed read is not evidence of a lapse. The independent request timer stays armed.
           continue;
         }
         // Never adopt a different link's label. Missing ownership cannot renew this lease.

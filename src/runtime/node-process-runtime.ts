@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import { guestSetupSource } from "./quickjs-runtime.js";
@@ -151,6 +151,9 @@ export class NodeProcessRuntime {
       };
 
       abortHandler = () => {
+        // Preserve only the Main watchdog reason for host observers (e.g. a local actor ASK).
+        const reason = mainExecutionCeilingAbortReason(options.signal);
+        if (reason && !hostAbortController.signal.aborted) hostAbortController.abort(reason);
         finish({
           value: undefined,
           logs: [],

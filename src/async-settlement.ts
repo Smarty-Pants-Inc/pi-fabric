@@ -4,6 +4,14 @@ const abortError = (signal: AbortSignal): Error => {
   return new Error(typeof reason === "string" && reason ? reason : "Operation aborted");
 };
 
+/** The fixed Main watchdog's host-only reason; ordinary cancellation stays unchanged. */
+export const mainExecutionCeilingAbortReason = (signal: AbortSignal | undefined): Error | undefined => {
+  const reason: unknown = signal?.reason;
+  return signal?.aborted && reason instanceof Error &&
+    reason.message.startsWith("MainExecutionCeilingError: Main ceiling hit after ") &&
+    reason.message.includes("(executor.mainMaxTimeoutMs)") ? reason : undefined;
+};
+
 export const throwIfAborted = (signal: AbortSignal | undefined): void => {
   if (signal?.aborted) throw abortError(signal);
 };

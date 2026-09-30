@@ -12,6 +12,13 @@ describe("agents.wait bound", () => {
     expect(AGENT_WAIT_MAX_MS).toBe(300_000);
   });
 
+  it.each(["tui", "rpc"])("returns false for incomplete %s session contexts instead of throwing", mode => {
+    for (const sessionManager of [undefined, {}, { getSessionId: undefined }, { getSessionId: "not a method" }]) {
+      const context = { mode, sessionManager } as unknown as ExtensionContext;
+      expect(isInteractiveMain(context, {})).toBe(false);
+    }
+  });
+
   it("treats only a TUI or RPC session with no parent run or actor id as an interactive Main", () => {
     const ctx = (mode: string) => ({ mode, sessionManager: { getSessionId: () => "s" } }) as unknown as ExtensionContext;
     expect(isInteractiveMain(ctx("tui"), {})).toBe(true);

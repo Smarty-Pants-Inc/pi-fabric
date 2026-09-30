@@ -27,8 +27,8 @@
 import { GuardBudget, GuardBudgetExceeded } from "./guard-budget.js";
 export { GUARD_BUDGET_REASON } from "./guard-budget.js";
 
-type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string; quoted?: boolean; assignment?: boolean; process?: boolean; provenance?: Feed };
-type Expansion = { subs: string[]; names: string[]; text?: string; dynamic?: boolean };
+type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; unprovedLiteral?: boolean | undefined; pattern: string; quoted?: boolean; assignment?: boolean; process?: boolean; provenance?: Feed };
+type Expansion = { subs: string[]; names: string[]; text?: string; dynamic?: boolean; unprovedLiteral?: boolean | undefined };
 
 let placeholders = 0;
 /** Records a substitution and returns the placeholder that stands for its output. */
@@ -75,7 +75,16 @@ function readDouble(text: string, index: number, word: Expansion, budget: GuardB
   while (index < text.length && text[index] !== "\"") {
     budget.spend((word.text?.length ?? 0) + 1);
     const c = text[index]!;
-    if (c === "\\") { budget.spend(2); word.text = (word.text ?? "") + (text[index + 1] ?? ""); index += 2; continue; }
+    if (c === "\\") {
+      budget.spend(2);
+      // This reader does not model every double-quoted escape. In particular Bash
+      // preserves \n in a printf format; losing its slash must never prove safe bytes.
+      const unproved = !/[$`"\\\n]/.test(text[index + 1] ?? "");
+      if (unproved) word.unprovedLiteral = true;
+      // Keep the lexical slash even when exact output is declined. Inline receiver
+      // text must not acquire different format bytes when this Word is reparsed.
+      word.text = (word.text ?? "") + (unproved ? "\\" : "") + (text[index + 1] ?? ""); index += 2; continue;
+    }
     if ((c === "$" && text[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(text, start, "`", "`", budget) : readBalanced(text, start, "(", ")", budget);
@@ -692,7 +701,11 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         // positionalFields already expanded these in the CALLER, before temporary env.
         const expanded = arg.pattern.replaceAll(QUOTED, "$");
         budget.spend(3 * expanded.length + 1);
-        if (expanded.length <= MAX_VALUE && ![...expanded.matchAll(REFERENCE)].some((match) => !context.owned.has(match[2]!))) {
+        if (arg.unprovedLiteral) {
+          budget.spend(8);
+          unresolved.add(String(i)); innerNames.add(String(i)); innerTmp.add(String(i));
+          if (i > 0) { innerNames.add("@"); innerNames.add("*"); innerTmp.add("@"); innerTmp.add("*"); }
+        } else if (expanded.length <= MAX_VALUE && ![...expanded.matchAll(REFERENCE)].some((match) => !context.owned.has(match[2]!))) {
           const literal = unmask(expanded);
           bound.set(String(i), literal); if (i > 0) all.push(literal);
         } else unresolved.add(String(i));
@@ -828,15 +841,16 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       for (const pattern of expanded) {
         budget.spend(5 * pattern.length + 1);
         const provenance = {
-          lookup: fromLookup(pattern.replaceAll(QUOTED, "$")),
-          tmp: [...pattern.matchAll(REFERENCE)].some((match) => tmpName(match[2]!) && !values.has(match[2]!)) || (/[*?[]/.test(pattern) && tmpOperand(pattern)),
+          lookup: word.unprovedLiteral === true || fromLookup(pattern.replaceAll(QUOTED, "$")),
+          tmp: word.unprovedLiteral === true || [...pattern.matchAll(REFERENCE)].some((match) => tmpName(match[2]!) && !values.has(match[2]!)) || (/[*?[]/.test(pattern) && tmpOperand(pattern)),
         };
-        result.push({ text: unmask(pattern).replaceAll(QUOTED, "$"), pattern, subs: [], names: [], dynamic: word.dynamic, provenance });
+        result.push({ text: unmask(pattern).replaceAll(QUOTED, "$"), pattern, subs: [], names: [], dynamic: word.dynamic, unprovedLiteral: word.unprovedLiteral, provenance });
       }
     }
     return { words: result, tails };
   };
   const pathKey = (word: Word): string | undefined => {
+    if (word.unprovedLiteral) return undefined;
     const expanded = expand(word.pattern);
     budget.spend(6 * (expanded.length + (cwd?.length ?? 0)) + 1);
     if (!expanded || expanded === "-" || /[*?[]/.test(expanded) || [...expanded.matchAll(REFERENCE)].some((match) => !context.owned.has(match[2]!))) return undefined;
@@ -902,7 +916,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     evaluated.set(expansion, captured);
     return captured;
   };
-  const concrete = (word: Word): boolean => ![...expand(word.pattern).matchAll(REFERENCE)]
+  const concrete = (word: Word): boolean => !word.unprovedLiteral && ![...expand(word.pattern).matchAll(REFERENCE)]
     .some((match) => !context.owned.has(match[2]!) || lookupName(match[2]!) || tmpName(match[2]!));
   budget.spend(3 * scopes.inputs.size + 1);
   const lateTargets = new Set([...scopes.inputs.values()].map((scope) => scope.target));
@@ -977,7 +991,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   // A compound redirect is opened before its body: snapshot aliases/cwd and inherit its
   // descriptor routes. Closing syntax must not resolve a body-mutated alias or truncate again.
   const outputScopes = new Map<number, Map<number, OutputSink>>();
-  const applyOutputRedirects = (sinks: Map<number, OutputSink>, redirects: Redirect[]): void => {
+  const applyOutputRedirects = (sinks: Map<number, OutputSink>, redirects: Redirect[], priorUnproved = false): boolean => {
     budget.spend(4 * redirects.length + 1);
     for (const redirect of redirects) {
       if (redirect.duplicate) {
@@ -989,9 +1003,17 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         const key = pathKey(redirect.redirect);
         sinks.set(redirect.fd, { file: key, targets: key === undefined ? targetLeaves(redirect.redirect) : undefined });
         if (redirect.both) sinks.set(2, sinks.get(redirect.fd)!);
-        if (key !== undefined && !redirect.append) files.set(key, NO_OUTPUT);
+        if (key !== undefined && !redirect.append) {
+          // A previous unproved open/dup can stop redirect processing before this
+          // file is touched. Join its untouched bytes, rather than attest truncation
+          // by lexical order. A first, single-file overwrite keeps its existing proof.
+          const before = files.has(key) ? files.get(key) : unknownFileFeed(key);
+          files.set(key, priorUnproved ? mergeFeed(before ?? EMPTY_FEED, NO_OUTPUT) : NO_OUTPUT);
+        }
       }
+      priorUnproved = true;
     }
+    return priorUnproved;
   };
   const compoundSinks = (scope: number, input?: Feed): Map<number, OutputSink> => {
     openCompound(scope, input);
@@ -1044,15 +1066,22 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     let inputs = current === undefined ? new Map(context.inputs) : inputScopes.get(current)!;
     let sinks = current === undefined ? new Map<number, OutputSink>(context.sinks ?? [[1, "stdout"]]) : outputScopes.get(current)!;
     if (current === undefined && !inputs.has(0)) inputs.set(0, input);
+    let inheritedUnproved = context.unprovedRedirect === true;
+    for (let parent = current; parent !== undefined; parent = scopes.parents.get(parent)) {
+      budget.spend();
+      inheritedUnproved ||= (scopes.outputs.get(parent)?.length ?? 0) > 0;
+    }
     for (const item of pending.reverse()) {
       budget.spend(2 * (inputs.size + sinks.size) + 2);
       inputs = new Map(inputs); sinks = new Map(sinks);
       // Expand/open in entry state and descriptor order, once, never on the closing word.
+      let priorUnproved = inheritedUnproved;
       for (const redirect of scopes.outputs.get(item) ?? []) {
         evaluateExpansion(redirect.redirect, consumeInput(inputs.get(0)), sinks, inputs);
-        applyOutputRedirects(sinks, [redirect]);
+        priorUnproved = applyOutputRedirects(sinks, [redirect], priorUnproved);
         applyInputRedirects(inputs, [redirect], true);
       }
+      inheritedUnproved = priorUnproved;
       inputScopes.set(item, inputs); outputScopes.set(item, sinks);
     }
   };
@@ -1060,7 +1089,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     openCompound(scope, input);
     return inputScopes.get(scope)!;
   };
-  const literalSource = (word: Word): Feed => ({ lookup: fromLookup(word.text), tmp: tmpOperand(word.pattern) });
+  const literalSource = (word: Word): Feed => word.unprovedLiteral ? UNKNOWN_FEED : ({ lookup: fromLookup(word.text), tmp: tmpOperand(word.pattern) });
   const literalFeed = (literal: string): Feed => {
     budget.spend(4 * literal.length + 1);
     const tmp = splitFields(literal, budget, " \t\n").some((field) => {
@@ -1078,17 +1107,24 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   };
   // Only bounded string-only printf forms prove output bytes. In particular %q is
   // an unsupported transformation, even when a particular operand looks shell-safe.
-  const renderPrintf = (formatPattern: string, supplied: Word[]): string | undefined => {
-    const format = expand(formatPattern);
+  const renderPrintf = (formatWord: Word | undefined, supplied: Word[]): string | undefined => {
+    budget.spend(supplied.length + 1);
+    if (!formatWord || formatWord.unprovedLiteral || supplied.some((word) => word.unprovedLiteral)) return undefined;
+    budget.spend(3 * formatWord.pattern.length + 1);
+    if ([...formatWord.pattern.matchAll(REFERENCE)].some((match) => lookupName(match[2]!) || tmpName(match[2]!))) return undefined;
+    const format = expand(formatWord.pattern);
     budget.spend(4 * format.length + 4 * supplied.length + 1);
-    const stringFormat = !/%(?![%s])/.test(format) && !/\\(?![\\nrt])/.test(format) && ![...format.matchAll(REFERENCE)].length;
+    // Option selection (including --) is outside the literal-format subset. Do not
+    // render a terminator as output, or interpret an unproved option/format boundary.
+    const stringFormat = !format.startsWith("-") && !/%(?![%s])/.test(format) && !/\\(?![\\nrt])/.test(format) && ![...format.matchAll(REFERENCE)].length;
     // printf receives the caller's expanded argv, including only unquoted IFS splitting.
     const argv = positionalFields(supplied, 0).words;
     budget.spend(argv.length + 1);
     const arguments_ = argv.map((arg) => expand(arg.pattern));
+    budget.spend(3 * arguments_.reduce((size, value) => size + value.length, 0) + arguments_.length + 1);
     // Shell glob selection is not literal argv. Never render its pattern as the
     // selected filenames and then let a quoted capture erase that provenance.
-    if (!stringFormat || arguments_.some((value) => /[*?[]/.test(value))) return undefined;
+    if (!stringFormat || arguments_.some((value) => /[*?[]/.test(value) || unmask(value).includes("\\"))) return undefined;
     const fmt = format;
     const conversions = [...fmt.matchAll(/%%|%s/g)].filter((match) => match[0] === "%s").length;
     const repeats = conversions ? Math.max(1, Math.ceil(arguments_.length / conversions)) : 1;
@@ -1236,11 +1272,13 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         stage.words.reduce((size, word) => size + 4 * (word.text.length + word.pattern.length), 0));
       let childScope = stage.words.reduce<number | undefined>((current, word) => scopes.members.get(word) ?? current, stage.closed);
       let compoundChild = false;
-      redirectBinding = context.unprovedRedirect === true || stage.redirects.length > 0;
+      let inheritedRedirect = context.unprovedRedirect === true;
+      redirectBinding = inheritedRedirect || stage.redirects.length > 0;
       while (childScope !== undefined) {
         budget.spend();
         compoundChild ||= scopes.children.has(childScope);
-        redirectBinding ||= (scopes.outputs.get(childScope)?.length ?? 0) > 0;
+        inheritedRedirect ||= (scopes.outputs.get(childScope)?.length ?? 0) > 0;
+        redirectBinding ||= inheritedRedirect;
         childScope = scopes.parents.get(childScope);
       }
       childBinding = background || stages.length > 1 || compoundChild;
@@ -1291,7 +1329,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       budget.spend(2 * (inheritedSinks?.size ?? context.sinks?.size ?? 1) + 1);
       const stageSinks = new Map<number, OutputSink>(inheritedSinks ?? context.sinks ?? [[1, "stdout"]]);
       if (piped && stage.closed === undefined) stageSinks.set(1, "stdout");
-      if (stage.closed === undefined) applyOutputRedirects(stageSinks, stage.redirects);
+      if (stage.closed === undefined) applyOutputRedirects(stageSinks, stage.redirects, inheritedRedirect);
       const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean; positionals?: Word[]; tails?: PositionalTail }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
       const { words, fedByXargs, argFile, chdirs, assignments } = unwrap(stage.words, envScripts, budget, (words) => {
@@ -1328,7 +1366,10 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           break;
         }
         const value = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=(.*)$/s.exec(word.pattern);
-        if (value) bind(value[1]!, value[3]!, value[2] !== undefined);
+        if (value) {
+          if (word.unprovedLiteral) markUnknown(value[1]!);
+          else bind(value[1]!, value[3]!, value[2] !== undefined);
+        }
       }
       };
       budget.spend(6 * assignments.length + 1);
@@ -1404,7 +1445,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
             const value = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=(.*)$/s.exec(word.pattern);
             const array = value?.[3]?.startsWith("(");
             if (value) {
-              if (array || !declarationProved) markUnknown(value[1]!);
+              if (array || word.unprovedLiteral || !declarationProved) markUnknown(value[1]!);
               else bind(value[1]!, value[3]!, value[2] !== undefined);
             }
             const key = value?.[1] ?? (/^[A-Za-z_][A-Za-z0-9_]*$/.test(word.text) ? word.text : undefined);
@@ -1429,7 +1470,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
             values.delete(key); tainted.delete(key); tmpNames.delete(key); unknown.delete(key);
           }
           positionals.forEach((raw, i) => {
-            bind(String(i + 1), raw);
+            if (bound.words[i]?.unprovedLiteral) markUnknown(String(i + 1));
+            else bind(String(i + 1), raw);
             if (bound.words[i]?.provenance?.lookup) tainted.add(String(i + 1));
             if (bound.words[i]?.provenance?.tmp) tmpNames.add(String(i + 1));
           });
@@ -1440,6 +1482,17 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           if (bound.words.some((word) => word.provenance?.lookup)) { tainted.add("@"); tainted.add("*"); }
         }
       }
+      if (name === "printf") {
+        // Inspect the existing caller argv, without interpreting a destination.
+        // Attached/live option selection is not the proved standalone -v subset;
+        // it may write even when its option Word is an expanded scalar or disappears.
+        const head = positionalFields(args, 0).words[0];
+        budget.spend(3 * (head?.pattern.length ?? 0) + 1);
+        if ((head?.text.startsWith("-v") && args[0]?.text !== "-v") ||
+          (head && [...head.pattern.matchAll(REFERENCE)].length > 0)) {
+          opaqueAttributes = true; markBindingsUnknown(true);
+        }
+      }
       if (name === "printf" && args[0]?.text === "-v" && args[1]) {
         const target = args[1].text;
         budget.spend(3 * (target.length + args[1].pattern.length) + 1);
@@ -1448,13 +1501,13 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         const dynamicDestination = [...args[1].pattern.matchAll(REFERENCE)].length > 0;
         const cell = dynamicDestination ? undefined : /^([A-Za-z_][A-Za-z0-9_]*)(\[.*\])?$/.exec(target);
         const destination = cell?.[1];
-        if (!destination) markBindingsUnknown();
+        if (!destination) { opaqueAttributes = true; markBindingsUnknown(true); }
         else if (!protectedAliases.has(destination) && (!readonlyNames.has(destination) || uncertainReadonly.has(destination))) {
           const supplied = args.slice(3);
           const beforeWrite = readonlyNames.has(destination) ? saveConditional() : undefined;
           // An element write cannot replace the other real array elements. No index
           // interpreter: widen the entire affected cell, including computed indices.
-          const raw = cell?.[2] ? undefined : renderPrintf(args[2]?.pattern ?? "", supplied);
+          const raw = cell?.[2] ? undefined : renderPrintf(args[2], supplied);
           if (raw !== undefined) bind(destination, raw);
           else markUnknown(destination);
           if (beforeWrite) joinConditional(beforeWrite, false);
@@ -1666,12 +1719,12 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         known = args.every(concrete);
         let rendered: string | undefined;
         const echoArgs = name === "echo" ? positionalFields(args, 0).words : [];
-        const plainEcho = name === "echo" && echoArgs.every((arg) => {
+        const plainEcho = name === "echo" && !args.some((arg) => arg.unprovedLiteral) && echoArgs.every((arg) => {
           const expanded = expand(arg.pattern);
           return !/[*?[]/.test(expanded) && !unmask(expanded).includes("\\");
         }) &&
           !/^-[neE]+$/.test(unmask(expand(echoArgs[0]?.pattern ?? "")));
-        if (name === "printf") rendered = renderPrintf(args[0]?.pattern ?? "", args.slice(1));
+        if (name === "printf") rendered = renderPrintf(args[0], args.slice(1));
         else if (plainEcho && args.every(concrete)) {
           // Reuse the caller argv splitter; raw expansion bytes are not echo argv.
           const parts = echoArgs.map((arg) => unmask(expand(arg.pattern)));
@@ -1726,7 +1779,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       }
       // F9: apply descriptors in order. Opening stderr/fd3 does not save stdout; an
       // explicit 1>&3 does. Duplication copies the current destination, not a later fd
-      // binding. Every truncating open happens even if a later redirect diverts stdout.
+      // binding. A truncating open can happen even if a later redirect diverts stdout;
+      // earlier unproved redirects retain its untouched-file alternative.
       const sink = stageSinks.get(1) ?? "other";
       if (typeof sink === "object" && sink.file !== undefined) {
         const recorded = known || output.lookup || output.tmp ? output : undefined;

@@ -70,7 +70,8 @@ const boundaries: Array<[label: string, command: string, blocked: boolean, wipe:
 '; rm -rf $D`, false, true],
   ["N4-PRINTF-IFS.02 quoted argv then reset IFS remains one non-root name", `IFS=:; P='/tmp/tmp.AbC123:/tmp'; printf -v D '%s\\n' "$P"; IFS=' 	
 '; rm -rf $D`, false, false],
-  ["N4-PRINTF-IFS.03 no reset keeps newline suffixed fields non-root", `IFS=:; P="/tmp/tmp.AbC123:/tmp"; printf -v D "%s\\n" $P; rm -rf $D`, false, false],
+  // Owner-authorized conservative policy: unproved double-quoted formatting cannot grant safe bytes.
+  ["N4-PRINTF-IFS.03 conservative refusal: no reset keeps newline suffixed fields non-root", `IFS=:; P="/tmp/tmp.AbC123:/tmp"; printf -v D "%s\\n" $P; rm -rf $D`, false, true],
   ["N4-PRINTF-IFS.04 concatenated format with quoted use remains non-root", `IFS=:; P="/tmp/tmp.AbC123:/tmp"; printf -v D "%s" $P; rm -rf "$D"`, false, false],
   // Additional accepted security boundaries: exact literal DATA from security-gpt61-boundaries.json.
   ["SEC-N4.01 read n4 truncates to shared root", "read -r -n 4 D <<< '/tmp/tmp.AbC123'; rm -rf \"$D\"", false, true],

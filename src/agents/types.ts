@@ -147,6 +147,8 @@ export interface AgentRunRecord {
   replyVia?: "tool";
   value?: unknown;
   error?: string;
+  /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM";
   /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
   warnings?: string[];
   stderr?: string;

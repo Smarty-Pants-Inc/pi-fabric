@@ -24,14 +24,16 @@ afterEach(() => {
 });
 
 describe("records anchor export configuration", () => {
-  const base = { org: "test", origin: "node", socket: "/run/test.sock" };
+  const base = { org: "test", origin: "node", socket: path.join(os.tmpdir(), "test.sock") };
   it("defaults to five minutes beneath the existing public status directory, or the configured export path", () => {
     expect(normalizeServiceConfig(base).anchorExport).toBeUndefined();
-    expect(normalizeServiceConfig({ ...base, statusFile: "/var/lib/test-records/status/test.json" }).anchorExport).toEqual({ directory: "/var/lib/test-records/status/anchors", intervalMs: 300_000 });
-    expect(normalizeServiceConfig({ ...base, anchorExport: { directory: "/public/anchors", intervalMs: 600_000 } }).anchorExport).toEqual({ directory: "/public/anchors", intervalMs: 600_000 });
+    const statusFile = path.join(os.tmpdir(), "test-records", "status", "test.json");
+    const directory = path.join(os.tmpdir(), "public", "anchors");
+    expect(normalizeServiceConfig({ ...base, statusFile }).anchorExport).toEqual({ directory: path.resolve(path.dirname(statusFile), "anchors"), intervalMs: 300_000 });
+    expect(normalizeServiceConfig({ ...base, anchorExport: { directory, intervalMs: 600_000 } }).anchorExport).toEqual({ directory: path.resolve(directory), intervalMs: 600_000 });
   });
   it("bounds invalid/unsafe cadences in the existing service config", () => {
-    const config = (intervalMs: unknown) => normalizeServiceConfig({ ...base, anchorExport: { directory: "/public", intervalMs } }).anchorExport!.intervalMs;
+    const config = (intervalMs: unknown) => normalizeServiceConfig({ ...base, anchorExport: { directory: path.join(os.tmpdir(), "public"), intervalMs } }).anchorExport!.intervalMs;
     expect(config("1000")).toBe(300_000);
     expect(config(0)).toBe(1_000);
     expect(config(100_000_000)).toBe(86_400_000);

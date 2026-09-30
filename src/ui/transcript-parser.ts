@@ -124,6 +124,9 @@ export class TranscriptAccumulator {
     label: string,
     args: unknown,
   ): FabricTranscriptEntry {
+    // Every explicit start ends any prior awaiting-canonical correlation,
+    // including reused IDs whose compact end kept the entry in #tools.
+    this.#toolResultMetadata.delete(id);
     const existing = this.#tools.get(id);
     const safeArgs = args === undefined ? undefined : redactRecord(args);
     if (existing) {
@@ -132,7 +135,6 @@ export class TranscriptAccumulator {
       return existing;
     }
     this.#finishedTools.delete(id);
-    this.#toolResultMetadata.delete(id);
     const parent = this.#toolParent(id);
     const safeLabel = terminalSafe(label) || "tool";
     const entry: FabricTranscriptEntry = {

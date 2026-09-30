@@ -51,6 +51,30 @@ describe("TranscriptAccumulator canonical tool results", () => {
     expect(accumulator.snapshot()).toEqual(completed);
   });
 
+  it("clears prior compact-end metadata before a reused existing-entry start", () => {
+    const accumulator = new TranscriptAccumulator();
+    const canonical = { ...result("same"), message: { ...result("same").message, content: [{ type: "text", text: "new-body" }] } };
+    accumulator.append([
+      { ...start("same"), args: { command: "old" } },
+      { ...end("same", { elided: true, bytes: 100 }), resultMetadata: { terminate: true, opaque: { owner: "prior-call" } } },
+    ]);
+    expect(accumulator.snapshot().entries[0]?.result).toBeUndefined();
+    accumulator.append([{ ...start("same"), args: { command: "new" } }, canonical]);
+    const entries = accumulator.snapshot().entries;
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ args: { command: "new" }, status: "completed" });
+    expect(entries[0]?.result).toEqual(payload(canonical));
+  });
+
+  it("keeps duplicate-start argument updates in the same active entry", () => {
+    const accumulator = new TranscriptAccumulator();
+    accumulator.append([start("same"), { ...start("same"), args: { command: "updated" } }]);
+    expect(accumulator.snapshot().entries).toHaveLength(1);
+    expect(accumulator.snapshot().entries[0]).toMatchObject({ args: { command: "updated" }, status: "running" });
+    accumulator.append([result("same")]);
+    expect(accumulator.snapshot().entries[0]?.result).toEqual(payload(result("same")));
+  });
+
   it("clears pending metadata on overwrite, reuse, and full-result completion", () => {
     const accumulator = new TranscriptAccumulator();
     const marker = { ...end("a", { elided: true, bytes: 100 }), resultMetadata: { terminate: true } };

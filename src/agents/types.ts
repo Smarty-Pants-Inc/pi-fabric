@@ -160,6 +160,8 @@ export interface AgentRunRecord {
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
   compaction?: AgentCompactionStatus;
+  /** Terminal event-log optimization was skipped; the full original log remains. */
+  compactionSkipped?: string;
 }
 
 export interface AgentRunResult extends AgentRunRecord {

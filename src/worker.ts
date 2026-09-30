@@ -1526,7 +1526,11 @@ const main = async (): Promise<void> => {
   // this quiescent source, before publishing terminal status: manager settlement
   // and actor/residency retention can copy/remove the run as soon as it appears.
   // Failure is best-effort and must never change or mask the original run result.
-  compactTerminalRunLog(options.logFile, record.status);
+  const logCompaction = compactTerminalRunLog(options.logFile, record.status);
+  if (logCompaction.compactionSkipped || logCompaction.error) {
+    record.compactionSkipped = logCompaction.compactionSkipped ??
+      `Terminal run-log compaction failed; full log retained: ${logCompaction.error}`;
+  }
   writeRunRecord(options.statusFile, record);
   terminalWritten = true;
   process.stdout.write(`\n[pi-fabric] ${record.status}\n`);

@@ -1023,16 +1023,32 @@ export class QuickJsRuntime {
               const errorHandle = context.newError(
                 error instanceof Error ? error.message : String(error),
               );
-              const exit = reference === "pi.bash" || reference === "pi.powershell"
-                ? piBashExitMetadata(error)
-                : undefined;
-              if (exit) {
-                const metadata = jsonHandle(context, jsonObject, jsonParse, exit);
-                context.setProp(errorHandle, "__fabricBashExit", metadata);
-                metadata.dispose();
+              try {
+                // Transfer only a host Error's string classification, never its
+                // arbitrary properties or a caller-selected property key.
+                if (error instanceof Error && typeof error.name === "string") {
+                  const nameHandle = context.newString(error.name);
+                  try {
+                    context.setProp(errorHandle, "name", nameHandle);
+                  } finally {
+                    nameHandle.dispose();
+                  }
+                }
+                const exit = reference === "pi.bash" || reference === "pi.powershell"
+                  ? piBashExitMetadata(error)
+                  : undefined;
+                if (exit) {
+                  const metadata = jsonHandle(context, jsonObject, jsonParse, exit);
+                  try {
+                    context.setProp(errorHandle, "__fabricBashExit", metadata);
+                  } finally {
+                    metadata.dispose();
+                  }
+                }
+                promise.reject(errorHandle);
+              } finally {
+                errorHandle.dispose();
               }
-              promise.reject(errorHandle);
-              errorHandle.dispose();
             })
             .finally(() => {
               if (!closing) pumpJobs();

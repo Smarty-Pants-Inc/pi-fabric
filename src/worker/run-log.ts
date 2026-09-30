@@ -13,6 +13,7 @@
 // keeps its order; a held delta and a held tool update may swap with each other.
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 export const RUN_LOG_FLUSH_MS = 500;
 
@@ -107,12 +108,13 @@ interface LogRecord {
 
 // Memory is bounded by one admitted record, not run length or tool count.
 const MAX_LOG_RECORD_BYTES = MAX_EVENT_LINE_CHARS * 3 + 2;
-function* logRecords(descriptor: number, size: number): Generator<LogRecord> {
+function* logRecords(descriptor: number, size: number, checkWork: () => void): Generator<LogRecord> {
   let offset = 0;
   let start = 0;
   let pending: Buffer[] = [];
   let pendingBytes = 0;
   while (offset < size) {
+    checkWork();
     const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, size - offset));
     const count = fs.readSync(descriptor, chunk, 0, chunk.length, offset);
     if (count <= 0) throw new Error("Run log changed during compaction");
@@ -149,44 +151,58 @@ const parseLogRecord = (bytes: Buffer): EventRecord | undefined => {
   }
 };
 
-// Scan instead of an unbounded index: worst-case quadratic terminal scan time,
-// memory independent of run length. Ambiguous/reused IDs are kept in full.
+// ponytail: two streaming passes plus one exact-offset reread per unique
+// canonical. Keep only counts/positions, never payloads. Total source reads
+// are at most 3 * file size, and record visits at most 3 * admitted records.
+// Exceptional raw-full fallback bounds synchronous terminal work, not the run
+// timeout. The manager starts its independent clock after transport launch and
+// allows 1s exit grace; worker.startedAt + timeoutMs is NOT that deadline.
+export const MAX_TERMINAL_LOG_BYTES = 64 * 1024 * 1024;
+export const MAX_TERMINAL_LOG_RECORDS = 100_000;
+export const MAX_TERMINAL_LOG_WORK_MS = 500;
+
+interface ToolCorrelation {
+  ends: number;
+  starts: number;
+  lastStart: number;
+  canonicals: number;
+  canonicalOffset: number;
+  canonicalBytes: number;
+}
+
 const hasEquivalentCanonical = (
-  descriptor: number, size: number, offset: number, end: EventRecord,
+  descriptor: number, offset: number, end: EventRecord,
+  correlation: ToolCorrelation | undefined, checkWork: () => void,
 ): boolean => {
   const result = end.result;
   if (!isRecord(result) || !Array.isArray(result.content) || typeof end.toolCallId !== "string" ||
-    Object.hasOwn(end, "resultMetadata")) return false;
-  let ends = 0;
-  let starts = 0;
-  let canonicals = 0;
-  let equivalent = false;
-  for (const record of logRecords(descriptor, size)) {
-    const event = parseLogRecord(record.bytes);
-    if (!event) continue;
-    if (event.toolCallId === end.toolCallId) {
-      if (event.type === "tool_execution_end") ends++;
-      if (event.type === "tool_execution_start") starts++;
-    }
-    const message = event.message;
-    if (event.type !== "message_end" || !isRecord(message) || message.role !== "toolResult" ||
-      message.toolCallId !== end.toolCallId) continue;
-    canonicals++;
-    const { content: _content, details: _details, ...metadata } = result;
-    const rehydrated = {
-      content: message.content,
-      ...(Object.hasOwn(message, "details") ? { details: message.details } : {}),
-      ...metadata,
-    };
-    // Readers redact with an ordered node/character budget. Even semantically
-    // equal objects with different key order can render different clipped
-    // details. Require the exact reconstructed JSON shape/order, not just deep
-    // equality; otherwise conservatively retain the main-kept full result.
-    equivalent = record.offset > offset && message.toolName === end.toolName &&
-      (message.isError === true) === (end.isError === true) &&
-      JSON.stringify(rehydrated) === JSON.stringify(result);
+    Object.hasOwn(end, "resultMetadata") || !correlation || correlation.ends !== 1 ||
+    correlation.starts > 1 || correlation.canonicals !== 1 ||
+    correlation.lastStart > offset || correlation.canonicalOffset <= offset) return false;
+  checkWork();
+  const bytes = Buffer.allocUnsafe(correlation.canonicalBytes);
+  let read = 0;
+  while (read < bytes.length) {
+    checkWork();
+    const count = fs.readSync(descriptor, bytes, read, bytes.length - read, correlation.canonicalOffset + read);
+    if (count <= 0) throw new Error("Run log changed during compaction");
+    read += count;
   }
-  return ends === 1 && starts <= 1 && canonicals === 1 && equivalent;
+  const event = parseLogRecord(bytes);
+  const message = event?.message;
+  if (event?.type !== "message_end" || !isRecord(message) || message.role !== "toolResult" ||
+    message.toolCallId !== end.toolCallId) return false;
+  const { content: _content, details: _details, ...metadata } = result;
+  const rehydrated = {
+    content: message.content,
+    ...(Object.hasOwn(message, "details") ? { details: message.details } : {}),
+    ...metadata,
+  };
+  // Readers redact with an ordered node/character budget. Preserve exact JSON
+  // shape/key order, not merely semantic equality, as before.
+  return message.toolName === end.toolName &&
+    (message.isError === true) === (end.isError === true) &&
+    JSON.stringify(rehydrated) === JSON.stringify(result);
 };
 
 export interface RunLogCompaction {
@@ -194,6 +210,7 @@ export interface RunLogCompaction {
   beforeBytes: number;
   afterBytes: number;
   error?: string;
+  compactionSkipped?: string;
 }
 
 /** Only the quiescent worker finish path may call this, never a live-log tailer. */
@@ -203,26 +220,84 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
   let source: number | undefined;
   let target: number | undefined;
   let temporary: string | undefined;
+  const started = performance.now();
+  const skip = (bound: string): never => {
+    outcome.compactionSkipped = `Terminal run-log compaction skipped: ${bound} work bound exceeded; full log retained`;
+    throw new Error(outcome.compactionSkipped);
+  };
+  const checkWork = (): void => {
+    if (performance.now() - started >= MAX_TERMINAL_LOG_WORK_MS) {
+      skip(`MAX_TERMINAL_LOG_WORK_MS=${MAX_TERMINAL_LOG_WORK_MS}`);
+    }
+  };
   try {
     const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
     source = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
     const original = fs.fstatSync(source);
     if (!original.isFile()) return outcome;
     outcome.beforeBytes = outcome.afterBytes = original.size;
+    if (original.size > MAX_TERMINAL_LOG_BYTES) {
+      skip(`MAX_TERMINAL_LOG_BYTES=${MAX_TERMINAL_LOG_BYTES}`);
+    }
+    checkWork();
     // Canonical must actually exist in this durable file, not only in stdout
     // or a best-effort append callback. Fail closed if fsync is rejected.
     fs.fsyncSync(source);
+    const index = new Map<string, ToolCorrelation>();
+    const correlation = (id: string): ToolCorrelation => {
+      let entry = index.get(id);
+      if (!entry) {
+        if (index.size >= MAX_TERMINAL_LOG_RECORDS) skip(`MAX_TERMINAL_LOG_RECORDS=${MAX_TERMINAL_LOG_RECORDS} correlation entries`);
+        entry = { ends: 0, starts: 0, lastStart: -1, canonicals: 0, canonicalOffset: -1, canonicalBytes: 0 };
+        index.set(id, entry);
+      }
+      return entry;
+    };
+    let records = 0;
+    for (const record of logRecords(source, original.size, checkWork)) {
+      checkWork();
+      if (++records > MAX_TERMINAL_LOG_RECORDS) skip(`MAX_TERMINAL_LOG_RECORDS=${MAX_TERMINAL_LOG_RECORDS}`);
+      const event = parseLogRecord(record.bytes);
+      if (!event) continue;
+      if (typeof event.toolCallId === "string") {
+        if (event.type === "tool_execution_end") correlation(event.toolCallId).ends++;
+        if (event.type === "tool_execution_start") {
+          const entry = correlation(event.toolCallId);
+          entry.starts++;
+          entry.lastStart = record.offset;
+        }
+      }
+      const message = event.message;
+      // Legacy session/Claude starts also restart IDs in the existing readers.
+      // They only add a boundary: retain the original explicit-start count guard.
+      if ((event.type === "message" || event.type === "assistant") && isRecord(message) &&
+        message.role === "assistant" && Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (isRecord(part) && part.type === (event.type === "message" ? "toolCall" : "tool_use") &&
+            typeof part.id === "string") correlation(part.id).lastStart = record.offset;
+        }
+      }
+      if (event.type === "message_end" && isRecord(message) && message.role === "toolResult" &&
+        typeof message.toolCallId === "string") {
+        const entry = correlation(message.toolCallId);
+        entry.canonicals++;
+        entry.canonicalOffset = record.offset;
+        entry.canonicalBytes = record.bytes.length;
+      }
+    }
+    checkWork();
     const candidate = `${filePath}.${process.pid}.${randomUUID()}.compact.tmp`;
     target = fs.openSync(candidate, "wx", original.mode & 0o777);
     temporary = candidate; // Cleanup only after exclusive ownership established.
     let compacted = 0;
     let afterBytes = 0;
-    for (const record of logRecords(source, original.size)) {
+    for (const record of logRecords(source, original.size, checkWork)) {
+      checkWork();
       let bytes = record.bytes;
       const event = parseLogRecord(bytes);
       if (event?.type === "tool_execution_end" &&
         bytes.toString("utf8").trimEnd().length <= MAX_EVENT_LINE_CHARS - CANONICAL_ENVELOPE_RESERVE_CHARS &&
-        hasEquivalentCanonical(source, original.size, record.offset, event)) {
+        hasEquivalentCanonical(source, record.offset, event, index.get(String(event.toolCallId)), checkWork)) {
         const result = event.result as EventRecord;
         const { content: _content, details: _details, ...resultMetadata } = result;
         bytes = Buffer.from(`${JSON.stringify({
@@ -234,6 +309,7 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       }
       let written = 0;
       while (written < bytes.length) {
+        checkWork();
         const count = fs.writeSync(target, bytes, written, bytes.length - written);
         if (count <= 0) throw new Error("Incomplete compacted log write");
         written += count;
@@ -241,6 +317,7 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       afterBytes += bytes.length;
     }
     if (!compacted) return outcome;
+    checkWork();
     fs.fsyncSync(target);
     fs.closeSync(target);
     target = undefined;
@@ -255,12 +332,13 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
     // last: earlier failures preserve the full source. Old FDs retain the full
     // terminal transcript. No live rewrite, journal, fake canonical, or
     // post-rename fallible commit step that could misreport preservation.
+    checkWork();
     fs.renameSync(temporary, filePath);
     temporary = undefined;
     outcome.compacted = compacted;
     outcome.afterBytes = afterBytes;
   } catch (error) {
-    outcome.error = error instanceof Error ? error.message : String(error);
+    if (!outcome.compactionSkipped) outcome.error = error instanceof Error ? error.message : String(error);
   } finally {
     if (target !== undefined) { try { fs.closeSync(target); } catch {} }
     if (source !== undefined) { try { fs.closeSync(source); } catch {} }

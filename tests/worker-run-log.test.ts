@@ -2,10 +2,12 @@ import "./fixtures/conversation-host.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeConversationReader } from "../src/ui/conversation-native-reader.js";
 import { AgentTranscriptReader } from "../src/ui/transcript-reader.js";
-import { compactTerminalRunLog, createRunLogWriter, MAX_EVENT_LINE_CHARS } from "../src/worker/run-log.js";
+import { compactTerminalRunLog, createRunLogWriter, MAX_EVENT_LINE_CHARS, MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_LOG_RECORDS, MAX_TERMINAL_LOG_WORK_MS } from "../src/worker/run-log.js";
 import { PiEventProjection } from "../src/worker/event-projection.js";
 import { TranscriptAccumulator } from "../src/ui/transcript-parser.js";
 
@@ -117,7 +119,195 @@ const capEvents = (text: string, isError = false, extras = {}) => {
   return { events, end, message };
 };
 
+// Parent runs these after a fresh build. This is the actual worker and manager
+// with an offline RPC emitter, not an elapsed-time source probe or a Pi/model run.
+describe.skipIf(!fs.existsSync(path.resolve("dist/worker.js")))("actual worker terminal log bounds", () => {
+  it.each(["ordinary", "near-deadline", "pathological"])("keeps original terminal result and the right log generation (%s)", async (scenario) => {
+    const [{ AgentManager }, { DEFAULT_FABRIC_CONFIG }, { ProcessTransport }] = await Promise.all([
+      import("../src/agents/manager.js"), import("../src/config.js"), import("../src/agents/transports/process-transport.js"),
+    ]);
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-worker-"));
+    directories.push(directory);
+    const workerPath = path.resolve("dist/worker.js");
+    const binary = path.join(directory, "offline-rpc.mjs");
+    const clockFile = path.join(directory, "clock.json");
+    const receiptFile = path.join(directory, "before-terminal.json");
+    const runRoot = path.join(directory, "runs");
+    const timeoutMs = 8_000;
+    fs.writeFileSync(binary, `const fixture = ${JSON.stringify({ clockFile, receiptFile, runRoot, scenario, byteBound: MAX_TERMINAL_LOG_BYTES })};\n` + String.raw`
+import fs from "node:fs";
+import path from "node:path";
+import { createHash } from "node:crypto";
+const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
+const model = { provider: "offline", id: "terminal-log" };
+let thinkingLevel = "off";
+let buffer = "";
+let logFile;
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (text) => {
+  buffer += text;
+  while (buffer.includes("\n")) {
+    const newline = buffer.indexOf("\n");
+    const frame = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    const reply = (data) => emit({ type: "response", id: frame.id, command: frame.type, success: true, data });
+    if (frame.type === "get_state") reply({ model, thinkingLevel, isStreaming: false, isCompacting: false });
+    else if (frame.type === "set_model") reply(model);
+    else if (frame.type === "set_thinking_level") { thinkingLevel = frame.level; reply(); }
+    else if (frame.type === "prompt") {
+      logFile = path.join(fixture.runRoot, process.env.PI_FABRIC_PARENT_RUN, "events.jsonl");
+      emit({ type: "agent_start" });
+      const pairs = fixture.scenario === "near-deadline" ? 400 : 1;
+      for (let index = 0; index < pairs; index++) {
+        const toolCallId = "real-" + index;
+        const content = [{ type: "text", text: "x".repeat(16 * 1024) }];
+        emit({ type: "tool_execution_start", toolCallId, toolName: "bash", args: {} });
+        emit({ type: "tool_execution_end", toolCallId, toolName: "bash", result: { content, terminate: true }, isError: false });
+        emit({ type: "message_end", message: { role: "toolResult", toolCallId, toolName: "bash", content, isError: false, timestamp: index } });
+      }
+      const finish = () => {
+        emit({ type: "message_end", message: { role: "assistant", provider: model.provider, model: model.id,
+          content: [{ type: "text", text: "original terminal result" }], stopReason: "stop", usage: { input: 1, output: 1 } } });
+        emit({ type: "agent_end" });
+        emit({ type: "agent_settled" });
+      };
+      const { finishAt } = JSON.parse(fs.readFileSync(fixture.clockFile, "utf8"));
+      if (fixture.scenario === "ordinary") finish();
+      else setTimeout(finish, Math.max(0, finishAt - Date.now()));
+    }
+  }
+});
+process.stdin.on("end", () => {
+  // All worker-consumed events are drained before stdin closes. Seed an
+  // exceptional raw log beyond the byte-work limit only in this scenario.
+  if (fixture.scenario === "pathological") fs.truncateSync(logFile, fixture.byteBound + 1);
+  const bytes = fs.readFileSync(logFile);
+  fs.writeFileSync(fixture.receiptFile, JSON.stringify({ ino: fs.statSync(logFile).ino, bytes: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex") }));
+  process.exit(0);
+});
+`);
+    const launch = ProcessTransport.prototype.launch;
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async (request) => {
+      // #monitor starts immediately AFTER launch returns, with timeoutMs + 1s
+      // grace. Finish 0.5s before the earlier observed launch-based bound; do
+      // not substitute worker.startedAt or a fresh compaction-start timeout.
+      fs.writeFileSync(clockFile, JSON.stringify({ finishAt: Date.now() + timeoutMs - 500 }));
+      return launch.call(new ProcessTransport(), request);
+    });
+    const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs, retainRuns: true }, {
+      workerPath, piBinary: binary, runRoot,
+    });
+    try {
+      const result = await manager.run({ task: "offline terminal log regression", model: "offline/terminal-log", thinking: "off", transport: "process" });
+      expect(result).toMatchObject({ status: "completed", exitCode: 0, text: "original terminal result" });
+      const file = path.join(runRoot, result.id, "events.jsonl");
+      const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8")) as { ino: number; bytes: number; sha256: string };
+      const bytes = fs.readFileSync(file);
+      if (scenario === "pathological") {
+        expect(result.compactionSkipped).toContain("MAX_TERMINAL_LOG_BYTES");
+        expect(manager.listForUi()[0]?.compactionSkipped).toBe(result.compactionSkipped);
+        expect(fs.statSync(file).ino).toBe(receipt.ino);
+        expect(bytes.length).toBe(receipt.bytes);
+        expect(createHash("sha256").update(bytes).digest("hex")).toBe(receipt.sha256);
+      } else {
+        expect(result.compactionSkipped).toBeUndefined();
+        expect(fs.statSync(file).ino).not.toBe(receipt.ino);
+        expect(bytes.length).toBeLessThan(receipt.bytes);
+        const ends = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line)).filter((event) => event.type === "tool_execution_end");
+        expect(ends).toHaveLength(scenario === "near-deadline" ? 400 : 1);
+        expect(ends.every((event) => event.result.elided === true && event.resultMetadata.terminate === true)).toBe(true);
+      }
+    } finally { spy.mockRestore(); await manager.close(); }
+  }, 25_000);
+});
+
 describe("worker run log", () => {
+  it.each(["execution", "session", "claude", "after-canonical"])("retains missing-first-start ends across a later reused-ID start (%s)", (kind) => {
+    const content = [{ type: "text", text: "same output" }];
+    const details = { exitCode: 0 };
+    const end = { type: "tool_execution_end", toolCallId: "reused", toolName: "bash", result: { content, details, terminate: true }, isError: false };
+    const start = kind === "session"
+      ? { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "reused", name: "bash", arguments: {} }] } }
+      : kind === "claude"
+        ? { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "reused", name: "bash", input: {} }] } }
+        : { type: "tool_execution_start", toolCallId: "reused", toolName: "bash", args: { command: "second invocation" } };
+    const canonical = { type: "message_end", message: { role: "toolResult", toolCallId: "reused", toolName: "bash", content, details, isError: false, timestamp: 2 } };
+    const events = kind === "after-canonical" ? [end, canonical, start] : [end, start, canonical];
+    const text = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+    const before = new TranscriptAccumulator();
+    before.append(events);
+    if (kind === "execution") {
+      expect(before.entries.filter((entry) => entry.kind === "tool")).toHaveLength(2);
+      expect(before.entries[0]).toMatchObject({ result: { terminate: true } });
+    }
+    const file = logFile(text);
+    const inode = fs.statSync(file).ino;
+    expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 0, beforeBytes: Buffer.byteLength(text), afterBytes: Buffer.byteLength(text) });
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fs.readFileSync(file, "utf8")).toBe(text);
+    const after = new TranscriptAccumulator();
+    after.append(fs.readFileSync(file, "utf8").trimEnd().split("\n").map((line) => JSON.parse(line)));
+    expect(after.entries).toEqual(before.entries);
+  });
+
+  it("still compacts a unique same-lifecycle pair with no start", () => {
+    const { end, message } = capEvents("allowed missing start", false, { terminate: true });
+    const text = [end, { type: "message_end", message }].map((event) => `${JSON.stringify(event)}\n`).join("");
+    const file = logFile(text);
+    expect(compactTerminalRunLog(file, "completed").compacted).toBe(1);
+    expect(readEntries(fs.readFileSync(file, "utf8"))).toEqual(readEntries(text));
+  });
+
+  it("bounds 400 large paired results to two scans plus exact-offset canonical reads", () => {
+    const text = Array.from({ length: 400 }, (_, index) => {
+      const toolCallId = `linear-${index}`;
+      const content = [{ type: "text", text: "x".repeat(16 * 1024) }];
+      return [
+        { type: "tool_execution_start", toolCallId, toolName: "bash", args: {} },
+        { type: "tool_execution_end", toolCallId, toolName: "bash", result: { content }, isError: false },
+        { type: "message_end", message: { role: "toolResult", toolCallId, toolName: "bash", content, isError: false, timestamp: index } },
+      ].map((event) => `${JSON.stringify(event)}\n`).join("");
+    }).join("");
+    const file = logFile(text);
+    const spy = vi.spyOn(fs, "readSync");
+    const parse = vi.spyOn(JSON, "parse");
+    // Work complexity is structural; wall time is tested separately below.
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome.compacted).toBe(400);
+      expect(outcome.compactionSkipped).toBeUndefined();
+      expect(outcome.error).toBeUndefined();
+      const bytesRead = spy.mock.results.reduce((sum, result) => sum + Number(result.value), 0);
+      const positions = spy.mock.calls.map((args) => Number((args as unknown[])[4]));
+      expect(bytesRead).toBeLessThanOrEqual(3 * Buffer.byteLength(text));
+      expect(parse.mock.calls.length).toBeLessThanOrEqual(3 * 1200);
+      expect(positions.filter((position) => position === 0)).toHaveLength(2);
+      expect(positions.length).toBeLessThanOrEqual(2 * Math.ceil(Buffer.byteLength(text) / (64 * 1024)) + 400);
+    } finally { spy.mockRestore(); parse.mockRestore(); clock.mockRestore(); }
+  });
+
+  it.each(["bytes", "records", "elapsed"])("retains full bytes/inode and removes partial temp at the named %s work bound", (bound) => {
+    const text = write(capEvents("bounded fallback", false, { terminate: true }).events, true, false).text;
+    const file = logFile(text);
+    if (bound === "bytes") fs.truncateSync(file, MAX_TERMINAL_LOG_BYTES + 1);
+    if (bound === "records") fs.appendFileSync(file, "{}\n".repeat(MAX_TERMINAL_LOG_RECORDS));
+    const original = fs.readFileSync(file);
+    const inode = fs.statSync(file).ino;
+    const writeSpy = vi.spyOn(fs, "writeSync");
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => bound === "elapsed" && writeSpy.mock.calls.length > 0 ? MAX_TERMINAL_LOG_WORK_MS : 0);
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome).toMatchObject({ compacted: 0, beforeBytes: original.length, afterBytes: original.length,
+        compactionSkipped: expect.stringContaining(bound === "bytes" ? "MAX_TERMINAL_LOG_BYTES" : bound === "records" ? "MAX_TERMINAL_LOG_RECORDS" : "MAX_TERMINAL_LOG_WORK_MS") });
+      expect(outcome.error).toBeUndefined();
+      if (bound === "elapsed") expect(writeSpy).toHaveBeenCalled();
+    } finally { writeSpy.mockRestore(); clock.mockRestore(); }
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fs.readFileSync(file)).toEqual(original);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  });
   it("keeps the full live end through crash/abort before canonical and refuses nonterminal compaction", () => {
     const { events, end } = capEvents("durable crash result", false, { terminate: true });
     const live = write(events.slice(0, 2), true, false);

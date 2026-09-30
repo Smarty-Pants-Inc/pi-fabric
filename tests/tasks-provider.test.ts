@@ -1,14 +1,45 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FabricInvocationContext } from "../src/protocol.js";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { FabricExecutionService } from "../src/execution-service.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { TasksProvider } from "../src/providers/tasks-provider.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 const stores: FabricShellJobStore[] = [];
 const context = {} as FabricInvocationContext;
 afterEach(async () => { for (const store of stores.splice(0)) await store.close(); });
 const setup = () => { const store = new FabricShellJobStore(); stores.push(store); return { store, provider: new TasksProvider(store) }; };
 
 describe("tasks provider", () => {
+  it("leaves a detached task alive and its completion unread at the Main program ceiling", async () => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const { store, provider } = setup();
+    const job = store.begin("bash", "detached work");
+    job.spill();
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.mainMaxTimeoutMs = 50;
+    // Observe the actual waiter subscription, not merely provider dispatch.
+    const subscribed = vi.spyOn(store, "subscribe");
+    try {
+      const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
+        code: `return tools.call({ ref: "tasks.wait", args: { id: ${JSON.stringify(job.id)}, timeoutMs: 300_000 } });`,
+        signal, parentToolCallId: "main-task-ceiling",
+        context: { cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+        onPartial() {},
+      }), () => subscribed.mock.calls.length > 0);
+      expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
+      expect(job.abort.signal.aborted).toBe(false);
+      expect(job.info().status).toBe("spilled");
+      await job.finish(0);
+      expect(job.info()).toMatchObject({ status: "exited", unread: true });
+    } finally { vi.unstubAllEnvs(); }
+  });
   it("waits for an exit and returns bounded evidence, not a success claim", async () => {
     const { store, provider } = setup();
     const job = store.begin("bash", "work"); job.spill();

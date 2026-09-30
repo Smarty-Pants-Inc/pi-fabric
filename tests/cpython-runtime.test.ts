@@ -54,6 +54,45 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
     });
   });
 
+  it("commits loopback IPC receipts before guest continuation and preserves CRLF/Unicode values", async () => {
+    // Exercise Windows' real TCP bridge even on POSIX; an inherited fd 3 alone
+    // cannot cover its token handshake or response delivery path.
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const receipt = vi.fn();
+    const firstArgs = { text: "first\r\nUnicode π" };
+    try {
+      const result = await run('value = await schema.status(text="first\\r\\nUnicode π")\nreturn await memory.sessions(value=value)', async (ref, args) => {
+        if (ref === "schema.status") {
+          expect(args).toEqual(firstArgs);
+          return args.text;
+        }
+        // This call is issued only after the guest decoded the first response.
+        expect(receipt).toHaveBeenCalledExactlyOnceWith(firstArgs);
+        return args.value;
+      }, { onHostResultDelivered: receipt });
+      expect(result).toMatchObject({ terminationReason: "completed", value: firstArgs.text });
+      expect(receipt).toHaveBeenCalledTimes(2);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
+  it("does not commit a loopback IPC receipt when encoding crosses the deadline", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const startedAt = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
+    const receipt = vi.fn();
+    const encode = vi.fn(() => { clock.mockReturnValue(startedAt + options.timeoutMs); return "late"; });
+    const host = vi.fn(async () => ({ get text() { return encode(); } }));
+    try {
+      const result = await run("return await schema.status()", host, { onHostResultDelivered: receipt });
+      expect(host).toHaveBeenCalledOnce();
+      expect(encode).toHaveBeenCalledOnce();
+      expect(result.terminationReason).toBe("timed_out");
+      expect(receipt).not.toHaveBeenCalled();
+    } finally { clock.mockRestore(); Object.defineProperty(process, "platform", platform); }
+  });
+
   it("routes the cache primitive through the same host bridge", async () => {
     expect(await run('return await cache.status(target="self")')).toMatchObject({
       terminationReason: "completed", value: { ref: "cache.status", args: { target: "self" } },

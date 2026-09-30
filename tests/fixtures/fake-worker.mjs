@@ -125,8 +125,8 @@ if (task.includes("HANG_WITH_PROGRESS")) {
       usage: addUsage({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.001 }),
     }),
   );
-} else if (task.includes("LIVE_WITH_PROGRESS")) {
-  // A live attempt that already did work, keeps running, and finishes on its own
+} else if (task.includes("LIVE_WITH_PROGRESS") || task.includes("LIVE_WITHOUT_PROGRESS")) {
+  // A live attempt with optional progress that keeps running and finishes on its own
   // unless a stop or a kill gets there first. Attempts are counted beside the
   // status file so tests can prove whether a relaunch happened.
   process.on("SIGTERM", () => process.exit(0));
@@ -145,11 +145,13 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     cwd: args.get("cwd"),
     startedAt,
     updatedAt: startedAt,
-    turns: 4,
-    toolCalls: 2,
+    turns: task.includes("LIVE_WITHOUT_PROGRESS") ? 0 : 4,
+    toolCalls: task.includes("LIVE_WITHOUT_PROGRESS") ? 0 : 2,
     text: "",
     exitCode: null,
-    usage: { input: 40, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.002 },
+    usage: task.includes("LIVE_WITHOUT_PROGRESS")
+      ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+      : { input: 40, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.002 },
   };
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
   fs.writeFileSync(statusFile, JSON.stringify(running));

@@ -12,6 +12,11 @@ import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { createMainExecutionCeilingError } from "../src/async-settlement.js";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -432,6 +437,45 @@ describe("durable completion receipts", () => {
     });
     return { id, result, runDirectory, metadataPath, key };
   };
+
+  it.each(["wait", "join", "status"])("keeps a durable completion unread when terminal %s publication is rejected", async action => {
+    const state = await rootHarness(`rejected-durable-${action}`);
+    const seeded = await seedCompletion(state);
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const sendMessage = vi.fn();
+    const context = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, context);
+    const consumed = vi.fn((id: string) => inbox.acknowledge(id));
+    const completed = vi.fn((result, delivered) => inbox.enqueue(result, delivered));
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete: completed, onResultConsumed: consumed });
+    const agents = new AgentManager(repo, state.config.agents, { workerPath: fakeWorker, runRoot: path.join(state.root, "session-runs") });
+    const actors = new ActorManager(state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {}, { actorRoot: path.join(state.root, "session-actors"), persistent: true });
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(agents, actors, new GlobalActorRegistry(state.root, 64 * 1024), state.mainAgent, state.participants, undefined, lifecycle, () => false, client);
+    const registry = new ActionRegistry(); registry.register(provider);
+    let expired = false;
+    const ceiling = createMainExecutionCeilingError(700);
+    try {
+      client.start();
+      await waitFor(() => completed.mock.calls.length === 1);
+      await expect(registry.invoke(`agents.${action}`, { id: seeded.id }, {
+        cwd: repo, signal: undefined, parentToolCallId: "receipt", nestedToolCallId: "receipt", extensionContext: context,
+        update() {}, audits: [], maxResultChars: 100_000, async approve() {},
+        checkExecutionBudget() { if (expired) throw ceiling; },
+        observeInvocation(event) { if (event.type === "call_end" && event.success) expired = true; },
+      })).rejects.toBe(ceiling);
+      expect(consumed).not.toHaveBeenCalled();
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeUndefined();
+      expect(state.mesh.get(seeded.key)).toBeDefined();
+      const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, context);
+      boundary(); boundary();
+      expect(sendMessage).toHaveBeenCalledOnce();
+      expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([seeded.id]);
+      expect(sendMessage.mock.calls[0]![0].content).toContain("authoritative full result");
+      await waitFor(() => state.mesh.get(seeded.key) === undefined);
+      expect(JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8")).completionConsumedAt).toBeGreaterThan(0);
+    } finally { inbox.close(); await registry.close(); await client.close(); await lifecycle.close(); await actors.close(); await agents.close(); await state.participants.close(); }
+  });
 
   // smarty-dev#878: a resident host whose root is gone sends its actors' messages to the project's
   // project agent. That Main accepts an actor message from another root's resident host, and
@@ -1083,6 +1127,51 @@ describe("durable completion receipts", () => {
 });
 
 describe.skipIf(!hasResidentHost || process.platform === "win32")("durable participant residency", () => {
+  it.each([false, true])("preserves a resident-host ASK activation at the Main ceiling (queued=%s)", { timeout: 45_000 }, async queued => {
+    const state = await rootHarness(`resident-main-ceiling-${queued}`);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath });
+    const control = new FabricControlPlane(state.mesh, state.identity, { enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
+    control.start(() => ({ accepted: false }));
+    const controller = new AbortController();
+    let first: Promise<unknown> | undefined;
+    try {
+      client.start();
+      const actor = await client.createActor({ name: "durable survivor", instructions: "Reply.", residency: "durable", transport: "process", responseMode: "text", delivery: "followUp", triggerTurn: false });
+      const participant = () => state.participants.get(actor.id, undefined, { fresh: true });
+      const current = () => state.mesh.get(`actors/${state.config.sessionId}/${actor.id}`, { fresh: true })?.value as import("../src/actors/types.js").FabricActorInfo | undefined;
+      if (queued) {
+        first = control.requestResult(client.hostId, actor.id, "ask", { message: "LIVE_WITHOUT_PROGRESS" }, client.hostId, { timeoutMs: 10_000 }).catch(error => error);
+        await waitFor(() => participant()?.actorRun !== undefined);
+      }
+      const observation = control.requestResult(client.hostId, actor.id, "ask", { message: queued ? "accepted durable queue item" : "LIVE_WITHOUT_PROGRESS" }, client.hostId, { timeoutMs: 10_000, signal: controller.signal, detachOnMainCeiling: true }).catch(error => error);
+      await waitFor(() => queued ? current()?.queued === 1 : current()?.inFlightRun !== undefined);
+      const runId = current()!.inFlightRun!.id;
+      const ceiling = createMainExecutionCeilingError(700);
+      controller.abort(ceiling);
+      const rejection = await observation;
+      await delay(100);
+      expect(state.mesh.read({ topic: "fabric.control.command", limit: 50 }).filter(event => event.kind === "cancel")).toHaveLength(0);
+      expect(rejection).toBe(ceiling);
+      expect(current()!.inFlightRun!.id).toBe(runId);
+      if (queued) expect(current()!.queued).toBe(1);
+      const worker = JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "runs", runId, "status.json"), "utf8"));
+      expect(worker).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
+      await first;
+      await waitFor(() => state.deliveries.length === (queued ? 2 : 1) && participant()?.actorRun === undefined);
+      const persisted = new ActorRegistryStore(state.config.actorRoot).records().find(record => record.id === actor.id)!;
+      expect((persisted.messages as FabricActorMessage[]).filter(message => message.direction === "out")).toHaveLength(queued ? 2 : 1);
+      await delay(200);
+      expect(state.deliveries).toHaveLength(queued ? 2 : 1);
+      // An explicit remote stop still owns activation lifetime after observation expiry.
+      const again = control.requestResult(client.hostId, actor.id, "ask", { message: "HANG" }, client.hostId, { timeoutMs: 10_000 }).catch(error => error);
+      await waitFor(() => participant()?.actorRun !== undefined);
+      await control.request(client.hostId, actor.id, "stop", {}, client.hostId);
+      await again;
+      await waitFor(() => participant()?.actorRun === undefined);
+      expect(state.deliveries).toHaveLength(queued ? 2 : 1);
+      await client.removeActor(actor.id);
+    } finally { controller.abort(); await first; await control.close(); await client.close(); await state.participants.close(); await stopResident(state.config); }
+  });
   it("keeps a durable actor responsive after its originating Main closes", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-actor");
     const agents = new AgentManager(repo, state.config.agents, {

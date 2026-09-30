@@ -1,3 +1,4 @@
+import { ExecutionDeadline } from "./execution-deadline.js";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
@@ -6,7 +7,7 @@ import net from "node:net";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
@@ -110,14 +111,19 @@ export class CPythonRuntime implements FabricKernelRuntime {
       return failure("runtime_error", "CPython memory limit must be a positive safe integer");
     }
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 1) return failure("runtime_error", "CPython timeout must be positive");
-    const startedAt = Date.now();
+    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
     let command: Awaited<ReturnType<typeof launch>>;
     try { command = await launch(this.binary, this.enforce, options.cwd ?? process.cwd()); }
     catch (error) { return failure("runtime_error", errorText(error)); }
     // Resolve first, then check before spawn: no orphan on cancellation during discovery.
     if (options.signal?.aborted) return failure("aborted", "Execution cancelled");
+    if (executionDeadline.reached) return executionDeadline.timeoutResult([]);
     // Windows cannot inherit a socket through stdio; the child connects back instead.
     const ipc = process.platform === "win32" ? await createIpcListener() : undefined;
+    if (executionDeadline.reached || options.signal?.aborted) {
+      ipc?.server.close();
+      return options.signal?.aborted ? failure("aborted", "Execution cancelled") : executionDeadline.timeoutResult([]);
+    }
 
     return new Promise<FabricSandboxResult>((resolve) => {
       const hostAbort = new AbortController();
@@ -131,8 +137,6 @@ export class CPythonRuntime implements FabricKernelRuntime {
       let truncated = false;
       let settled = false;
       let finishing = false;
-      let deadline: NodeJS.Timeout | undefined;
-      let deadlineAt = startedAt + options.timeoutMs;
       let buffer = Buffer.alloc(0);
       let child: ReturnType<typeof spawn>;
       try {
@@ -166,8 +170,12 @@ export class CPythonRuntime implements FabricKernelRuntime {
       const finish = async (result: Omit<FabricSandboxResult, "logs">): Promise<void> => {
         if (settled) return;
         for (let index = 0; index < decoders.length; index++) appendLog(index, decoders[index]!.end());
+        if (result.terminationReason === "completed" && executionDeadline.reached) {
+          hostAbort.abort(executionDeadline.reason);
+          result = executionDeadline.timeoutResult([]);
+        }
         settled = true;
-        if (deadline) clearTimeout(deadline);
+        executionDeadline.clear();
         options.signal?.removeEventListener("abort", abort);
         if (!hostAbort.signal.aborted) hostAbort.abort(new Error(result.error ?? "CPython execution ended"));
         channel?.destroy();
@@ -189,9 +197,16 @@ export class CPythonRuntime implements FabricKernelRuntime {
         }
         for (const text of partialLogs) if (text) logs.push(text);
         if (truncated) logs.push("[Pi Fabric log output truncated]");
+        if (result.terminationReason === "completed" && executionDeadline.reached) {
+          result = executionDeadline.timeoutResult([]);
+        }
         resolve({ ...result, logs });
       };
-      const abort = (): void => void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
+      const abort = (): void => {
+        const reason = mainExecutionCeilingAbortReason(options.signal);
+        if (reason && !hostAbort.signal.aborted) hostAbort.abort(reason);
+        void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
+      };
       const fail = (message: string): void => void finish({ value: undefined, terminationReason: "runtime_error", error: message });
       // A child that dies at startup (bwrap without user namespaces) resets its
       // pipes before "close" reports its exit status and stderr. Let that
@@ -212,20 +227,19 @@ export class CPythonRuntime implements FabricKernelRuntime {
         child.kill("SIGKILL");
         setTimeout(() => fail(`${message}; CPython process did not report its exit`), PIPE_DIAGNOSIS_MS).unref?.();
       };
-      const scheduleDeadline = (): void => {
-        if (deadline) clearTimeout(deadline);
+      const expireDeadline = (): void => {
+        if (settled) return;
         // A recorded pipe failure is the real cause; the deadline only ends its diagnosis wait.
-        deadline = setTimeout(() => pipeError
-          ? fail(`${pipeError}; CPython process did not report its exit`)
-          : void finish({
-            value: undefined, terminationReason: "timed_out", error: `Execution timed out after ${deadlineAt - startedAt}ms`,
-          }), Math.max(0, deadlineAt - Date.now()));
-        deadline.unref?.();
+        if (pipeError) { fail(`${pipeError}; CPython process did not report its exit`); return; }
+        hostAbort.abort(executionDeadline.reason);
+        void finish(executionDeadline.timeoutResult([]));
       };
-      const send = (message: unknown): void => {
+      const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
+      const send = (message: unknown, delivered?: () => void): void => {
         // A terminal guest result closes its reply channel while issued host
         // work may still be settling. Its late replies are no longer consumed.
         if (settled || finishing || !channel || channel.destroyed) return;
+        if (executionDeadline.reached) { expireDeadline(); return; }
         try {
           const frame = JSON.stringify(message) + "\n";
           const bytes = Buffer.byteLength(frame);
@@ -233,12 +247,15 @@ export class CPythonRuntime implements FabricKernelRuntime {
             fail("CPython IPC frame or write buffer exceeds its 16 MiB frame limit");
             return;
           }
+          if (executionDeadline.reached) { expireDeadline(); return; }
           channel.write(frame, (error) => { if (error) failPipe(`CPython IPC failed: ${error.message}`); });
+          delivered?.();
         } catch (error) { fail(`CPython IPC serialization failed: ${errorText(error)}`); }
       };
       const handleMessage = (message: unknown): void => {
         if (settled || finishing) return;
         if (!record(message)) { fail("Invalid CPython IPC message"); return; }
+        if (executionDeadline.reached) { expireDeadline(); return; }
         if (message.type === "result") {
           const result = message.result;
           if (!record(result) || !["completed", "runtime_error"].includes(String(result.terminationReason)) ||
@@ -274,13 +291,11 @@ export class CPythonRuntime implements FabricKernelRuntime {
         callIds.add(id);
         try {
           const floor = options.minimumTimeoutMsForHostCall?.(ref, args);
-          if (typeof floor === "number" && Number.isFinite(floor) && Date.now() + floor > deadlineAt) {
-            deadlineAt = Date.now() + Math.max(1, Math.floor(floor));
-            scheduleDeadline();
-          }
+          if (executionDeadline.extend(floor)) scheduleDeadline();
         } catch (error) { fail(`CPython deadline policy failed: ${errorText(error)}`); return; }
+        if (executionDeadline.reached) { expireDeadline(); return; }
         const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal)).then(
-          (value) => send({ type: "response", id, ok: true, value }),
+          (value) => send({ type: "response", id, ok: true, value }, () => options.onHostResultDelivered?.(args)),
           (error) => send({ type: "response", id, ok: false, error: errorText(error), ...(isPiShellRef(ref) ? { bashExit: piBashExitMetadata(error) } : {}) }),
         ).finally(() => { hostTasks.delete(task); callIds.delete(id); });
         hostTasks.add(task);

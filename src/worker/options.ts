@@ -73,6 +73,7 @@ export const parseWorkerOptions = (
   const sessionExportFile = optional(args, "session-export-file");
   const actorId = optional(args, "actor-id");
   const actorName = optional(args, "actor-name");
+  const actorBashTimeout = optional(args, "actor-bash-timeout");
   const capabilityRequirementsSource = optional(args, "capability-requirements");
   const capabilityDigest = optional(args, "capability-digest");
   const capabilityRequirements = capabilityRequirementsSource
@@ -182,6 +183,7 @@ export const parseWorkerOptions = (
     ...(sessionExportFile ? { sessionExportFile } : {}),
     ...(actorId ? { actorId } : {}),
     ...(actorName ? { actorName } : {}),
+    ...(actorBashTimeout ? { bashTimeoutSeconds: Number(actorBashTimeout) } : {}),
     ...(capabilityRequirements
       ? { capabilityRequirements: [...new Set(capabilityRequirements as string[])] }
       : {}),

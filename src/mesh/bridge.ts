@@ -31,6 +31,13 @@ const DEFAULT_PRESENCE_MS = 5_000;
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 /** stop() waits at most this long for the loop and for each remote step of the withdrawal. */
 const DEFAULT_STOP_MS = 5_000;
+const LOCK_RETRY_MIN_MS = 100;
+const LOCK_RETRY_MAX_MS = 2_000;
+const MESH_LOCK_TIMEOUT_CODE = "FABRIC_MESH_LOCK_TIMEOUT";
+
+// Only the store's exact typed timeout is transient; messages never grant a retry.
+const isMeshLockTimeout = (error: unknown): boolean =>
+  error instanceof Error && "code" in error && error.code === MESH_LOCK_TIMEOUT_CODE;
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -529,7 +536,10 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
           try {
             reply({ id: request.id, ok: true, result: await dispatch(side, request) });
           } catch (error) {
-            reply({ id: request.id, ok: false, error: error instanceof Error ? error.message : String(error) });
+            reply({
+              id: request.id, ok: false, error: error instanceof Error ? error.message : String(error),
+              ...(isMeshLockTimeout(error) ? { code: MESH_LOCK_TIMEOUT_CODE } : {}),
+            });
           }
         });
       },
@@ -591,7 +601,7 @@ export class RemoteBridgeSide implements BridgeSide {
     lines(
       input,
       (line) => {
-        let response: { id?: unknown; ok?: unknown; result?: unknown; error?: unknown };
+        let response: { id?: unknown; ok?: unknown; result?: unknown; error?: unknown; code?: unknown };
         try {
           response = JSON.parse(line) as typeof response;
         } catch {
@@ -601,7 +611,12 @@ export class RemoteBridgeSide implements BridgeSide {
         if (!pending) return;
         this.#pending.delete(response.id as number);
         if (response.ok === true) pending.resolve(response.result);
-        else pending.reject(new Error(`Bridge agent: ${String(response.error)}`));
+        else {
+          const error = new Error(`Bridge agent: ${String(response.error)}`);
+          // The protocol carries just this safe store code, not arbitrary peer error properties.
+          if (response.code === MESH_LOCK_TIMEOUT_CODE) Object.assign(error, { code: MESH_LOCK_TIMEOUT_CODE });
+          pending.reject(error);
+        }
       },
       (error) => this.close(error ?? new Error("Bridge transport closed")),
     );
@@ -841,7 +856,10 @@ export class MeshBridge {
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
     // Both settle before a failure is reported, so no local write outlives this pass.
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote)]);
-    for (const result of results) if (result.status === "rejected") throw result.reason;
+    // A transient failure must not hide a simultaneous permanent/transport failure.
+    const failures = results.filter((result) => result.status === "rejected");
+    const failure = failures.find((result) => !isMeshLockTimeout(result.reason)) ?? failures[0];
+    if (failure) throw failure.reason;
     this.#presenceAt = Date.now();
   }
 
@@ -896,7 +914,7 @@ export class MeshBridge {
       }
       for (const event of page.events) {
         if (event.sequence <= cursor.after) continue;
-        const reason = this.#refusal(event, rules);
+        const reason = this.#refusal(event, rules, direction);
         if (reason) {
           if (reason !== "not addressed across") {
             dropped += 1;
@@ -919,15 +937,22 @@ export class MeshBridge {
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
               throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
             }
+            // Bind the command to its captured destination, never to whichever link now holds
+            // the canonical id. Check again at the last pre-transport seam after every await.
+            const destinationRefusal = this.#destinationRefusal(event, direction);
+            if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
             const published = await target.publish({
               topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
               ...(event.text !== undefined ? { text: event.text } : {}),
               data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
             }, held);
+            seen.add(event.id);
             cursor.mark = Math.max(cursor.mark, published.sequence);
             cursor.after = event.sequence;
             forwarded += 1;
             this.#save();
+            // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
+            seen.delete(event.id);
           } catch (error) {
             // Too large or refused by the far side: never retried, or it would stall the source.
             if (!isPermanent(error)) throw error;
@@ -945,10 +970,25 @@ export class MeshBridge {
     return { forwarded, dropped };
   }
 
-  #refusal(event: MeshEvent, rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }): string | undefined {
+  #destinationRefusal(event: MeshEvent, direction: "toRemote" | "toLocal"): string | undefined {
+    // This is control-plane routing metadata, not a business field on work events or ACKs.
+    // Absence alone is legacy compatibility; an explicitly present undefined is malformed.
+    if (event.topic !== "fabric.control.command" || !isObject(event.data) ||
+        !Object.hasOwn(event.data, "destinationRemoteHost")) return undefined;
+    const destination = event.data.destinationRemoteHost;
+    if (destination === null) return "command destination is native and must not cross a bridge";
+    if (typeof destination !== "string") return "command destinationRemoteHost is not a string or null";
+    const intended = direction === "toRemote" ? this.options.remoteName : this.options.localName;
+    if (destination !== intended) return `command destination is not bound to bridge link ${intended}`;
+    return undefined;
+  }
+
+  #refusal(event: MeshEvent, rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }, direction: "toRemote" | "toLocal"): string | undefined {
     if (!isBridgedTopic(event) || hasBridgeField(event)) return "not allowed";
     if (!event.to || !rules.recipients.has(event.to)) return "not addressed across";
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";
+    const destinationRefusal = this.#destinationRefusal(event, direction);
+    if (destinationRefusal) return destinationRefusal;
     if (!isIdentity(event.from)) return "no sender identity";
     if (rules.reserved?.has(event.from.id)) return "sender claims a hub identity";
     if (rules.senders && !rules.senders.has(event.from.id)) return "sender is not a live participant of the remote";
@@ -959,21 +999,40 @@ export class MeshBridge {
     return undefined;
   }
 
-  /** Step until stop() or a transport failure (thrown). */
+  /** Step until stop() or a permanent/transport failure. Lock contention retries the pass. */
   async run(): Promise<void> {
-    this.#running = this.start();
-    await this.#running;
+    let started = false;
+    let retryMs = LOCK_RETRY_MIN_MS;
     while (!this.#stopped) {
-      const pass = this.step();
-      this.#running = pass.then(() => undefined);
-      await pass;
+      const pass = started ? this.step() : this.start();
+      // stop() needs a settlement fence, not a second unhandled rejection of a failed pass.
+      this.#running = pass.then(() => undefined, () => undefined);
+      let delay: number;
+      try {
+        await pass;
+        if (!started) {
+          started = true;
+          retryMs = LOCK_RETRY_MIN_MS;
+          continue;
+        }
+        retryMs = LOCK_RETRY_MIN_MS;
+        delay = this.options.pollMs ?? DEFAULT_POLL_MS;
+      } catch (error) {
+        if (this.#stopped) return;
+        if (!isMeshLockTimeout(error)) throw error;
+        delay = retryMs;
+        retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
+        this.#log(`mesh lock timeout; retrying in ${delay} ms`);
+      }
       if (this.#stopped) break;
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, this.options.pollMs ?? DEFAULT_POLL_MS);
-        this.#wake = () => {
+        const wake = (): void => {
           clearTimeout(timer);
+          this.#wake = undefined;
           resolve();
         };
+        const timer = setTimeout(wake, delay);
+        this.#wake = wake;
       });
     }
   }
@@ -1014,4 +1073,5 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
-  error instanceof BridgeOwnershipError || error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message);
+  !isMeshLockTimeout(error) && (error instanceof BridgeOwnershipError ||
+    error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message));

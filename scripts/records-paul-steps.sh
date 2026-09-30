@@ -25,7 +25,7 @@
 #  6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
 #  7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
 #  8. per --operator: refuse an id that holds another role; issue its credential with --reissue if absent, else verify it (each under an exclusive flock on <file>.lock; publish a <file>.pending the database holds; refuse a file without the live token) (sha256(id).json, id, role and issuer checked) as <org>-records, then add the role to service.json; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
-#  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
+#  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket, connect to it as <org-user> and check no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
 # ROLLBACK STEPS (--rollback; root; a real rollback needs --yes-delete-records; the PostgreSQL packages stay installed):
 #  R1. systemctl stop both units; refuse (nothing deleted) unless is-active says inactive, failed or unknown for both; systemctl disable both
 #  R2. rm -f both unit files; systemctl daemon-reload
@@ -444,13 +444,13 @@ After=${PG_UNIT}
 Type=simple
 User=${REC}
 Group=${REC}
-RuntimeDirectory=${REC}
-RuntimeDirectoryMode=0750
 UMask=0007
 # The socket directory belongs to the org's agents' group, setgid, so the socket the service
 # creates in it is theirs to connect to; the service itself joins no group of theirs.
-ExecStartPre=+/bin/chgrp ${ORG_GROUP} ${SVCSOCK}
-ExecStartPre=+/bin/chmod 2750 ${SVCSOCK}
+# ponytail: RuntimeDirectory would reset mode/group before each command (systemd.exec).
+# install -d fixes existing directories and recreates /run after reboot; no tmpfiles entry
+# to order or roll back. RecordsServer.listen removes stale sockets and refuses live ones.
+ExecStartPre=+/usr/bin/install -d -m 2750 -o ${REC} -g ${ORG_GROUP} ${SVCSOCK}
 ExecStart=${OPT_NODE} ${MAIN} serve --config ${CFG}
 # The service re-reads roles from ${CFG} on SIGHUP (after an --operator grant).
 ExecReload=/bin/kill -HUP \$MAINPID
@@ -642,7 +642,7 @@ root_steps() {
   6. write both systemd units (a changed one first listed in restart-pending); daemon-reload; enable --now <org>-records-pg.service (restart if restart-pending lists it and it was running; then drop it from restart-pending); wait for pg_isready
   7. createdb records if absent; create role records_service if absent; run migrations as <org>-records; enable --now <org>-records.service (restart if restart-pending lists it and it was running; then drop it from restart-pending)
   8. per --operator: refuse an id that holds another role; issue its credential with --reissue if absent, else verify it (each under an exclusive flock on <file>.lock; publish a <file>.pending the database holds; refuse a file without the live token) (sha256(id).json, id, role and issuer checked) as <org>-records, then add the role to service.json; relay: <org-user> itself writes it 0600 to ~<org-user>/.config/<org>-records; reload the service if active
-  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket and no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
+  9. verify owners and modes; check that <org-user> cannot reach PostgreSQL; check both units active, pg_isready, the python3 peer audit, the service socket, connect to it as <org-user> and check no PostgreSQL TCP listener on :5432 or the records port; print the size of pg_wal (changes nothing)
 EOF
 }
 print_help() {
@@ -673,6 +673,7 @@ SUCCESS LINE: printed last by a real install, only after the step 9 checks pass;
   ${SUCCESS_LINE}
   checks: systemctl is-active ${SVC_UNIT} and ${PG_UNIT}; pg_isready as ${REC};
           python3 ctypes getsockopt as ${REC} (peer audit); ${ORG_USER} cannot reach PostgreSQL; test -S ${SOCKET};
+          connect to ${SOCKET} as ${ORG_USER} (python3, 5 s timeout; permission denied fails);
           ss -Hltnp shows no PostgreSQL TCP listener (:5432, :${PORT}); du -sh ${DATA}/pg_wal (info)
 LIMIT: archiving is off until the WAL-G step; max_wal_size = 1GB is a soft checkpoint target, not a hard WAL quota.
 
@@ -964,13 +965,28 @@ run runuser -u "$REC" -- "$OPT_NODE" "$MAIN" migrate --config "$CFG"
 SVC_WAS_ACTIVE=0
 if was_active "$SVC_UNIT"; then SVC_WAS_ACTIVE=1; fi
 run systemctl enable --now "$SVC_UNIT"
-# A SIGHUP before Node has loaded the service would end it: callers wait for the socket first.
+# A SIGHUP before Node has loaded the service would end it. A crashed process can leave
+# a socket inode in the persistent directory: wait for a real listener, as the org user,
+# never by opening an agent-writable path as root. One deadline bounds connects and sleeps.
 wait_socket() {
-	for _ in $(seq 1 300); do [[ -S $SOCKET ]] && return 0; sleep 0.1; done
-	[[ -S $SOCKET ]]
+	runuser -u "$ORG_USER" -- python3 -c '
+import socket, sys, time
+deadline = time.monotonic() + 30
+while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        sys.exit(1)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(min(1, remaining))
+            s.connect(sys.argv[1])
+        sys.exit(0)
+    except OSError:
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+' "$SOCKET" 2>/dev/null
 }
 if ((DRY)); then
-	echo "? if ${MARKER} lists ${SVC_UNIT} (node, the bundle or its unit changed, now or in an interrupted run) and it was already active: + systemctl restart ${SVC_UNIT}, then wait up to 30 s for ${SOCKET}"
+	echo "? if ${MARKER} lists ${SVC_UNIT} (node, the bundle or its unit changed, now or in an interrupted run) and it was already active: + systemctl restart ${SVC_UNIT}, then wait up to 30 s for a successful connection to ${SOCKET} as ${ORG_USER}"
 	marker_clear "$SVC_UNIT"
 elif marker_has "$SVC_UNIT"; then
 	if ((SVC_WAS_ACTIVE)); then
@@ -1053,7 +1069,7 @@ EOF
 done
 if ((${#OPERATORS[@]})); then
 	if ((DRY)); then
-		echo "? if ${SVC_UNIT} is active: wait up to 30 s for ${SOCKET} (the service's SIGHUP handler is in place by then), then + systemctl reload ${SVC_UNIT}  (always, so an interrupted earlier grant takes effect)"
+		echo "? if ${SVC_UNIT} is active: wait up to 30 s for a successful connection to ${SOCKET} as ${ORG_USER} (the service's SIGHUP handler is in place by then), then + systemctl reload ${SVC_UNIT}  (always, so an interrupted earlier grant takes effect)"
 	elif systemctl is-active --quiet "$SVC_UNIT"; then
 		# P2-3: reload even when no role changed here: an earlier run may have written a role and stopped before its reload.
 		wait_socket || die "${SOCKET} did not appear within 30 s; not reloading ${SVC_UNIT}"
@@ -1091,6 +1107,9 @@ success_check "PostgreSQL ready" runuser -u "$REC" -- "$PG_BIN/pg_isready" -h "$
 # The service reads SO_PEERCRED through python3 and ctypes: the peer audit needs both, as ${REC}.
 success_check "peer audit (python3 ctypes)" runuser -u "$REC" -- python3 -c 'import ctypes; ctypes.CDLL(None).getsockopt'
 success_check "service socket" test -S "$SOCKET"
+# A socket file and active unit do not prove that agents can traverse the directory and connect.
+# Keep stderr (including PermissionError/EACCES) and refuse the success line on any connect failure.
+success_check "service socket connect as ${ORG_USER}" runuser -u "$ORG_USER" -- python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5); s.connect(sys.argv[1]); s.close()' "$SOCKET"
 # P2-1: the records cluster listens on its Unix socket only, and the install must have created no distro
 # cluster on TCP: any listener on :5432 or :${PORT}, or any PostgreSQL TCP listener, fails loudly.
 no_pg_tcp_listener() {

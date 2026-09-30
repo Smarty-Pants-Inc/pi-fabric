@@ -53,6 +53,8 @@ Monty is always sandboxed, including under schema enforce, and does not require 
 
 Every raised deadline is capped by `executor.maxTimeoutMs` (default `900000`, i.e. 15 minutes: the former undocumented clamp, now explicit), which itself can be raised up to the hard implementation maximum of 24 hours. Values above a cap are visibly normalized down to the cap during config load and the effective values are shown in `/fabric` settings, never silently surprising. A per-invocation request or ref floor takes effect even when the ref is unknown to Fabric, so captured tools, MCP calls, and future host calls all run within an intentionally longer deadline without Fabric knowing their argument semantics. Existing `pi.bash` behavior (extending the deadline from an explicit `timeout` argument) is unchanged, and deadline expiry still cancels the active host call and any child process it owns.
 
+**Interactive Main only** (TUI or RPC, not task agents or actors): `executor.mainMaxTimeoutMs` is a fixed whole-program ceiling, default `600000` (10 minutes). It overrides the orchestration floor, per-invocation requests, exact-ref floors, and explicit shell-timeout floors, including programs that repeatedly wait or sleep. It normalizes to `60000`–`executor.maxTimeoutMs`; if the executor maximum is itself below 60 seconds, that smaller maximum wins. Hitting this ceiling returns `MainExecutionCeilingError` and ends only the foreground program/observation: spawned agents, durable runs, and detached tasks keep running, and agents report their results as completion messages. Check `agents.status` / `agents.list`. Main `agents.run`, `agents.wait`, and `agents.join` also bound each observation to 60 seconds and return live status with `waitTimedOut: true`, without consuming the later result. Noninteractive runs and task/actor/residency hosts retain their existing behavior.
+
 `executor.shellHangMs` (default `120000` / 2 minutes, max `600000` / 10 minutes, `0` disables) is a nested-shell wait budget, not a program deadline. When a `pi.bash` / `pi.powershell` await exceeds it, Fabric **settles the await successfully** (`ok: true`) with a still-running notice, pid, and live output path while the process keeps writing that file. `background: true` (alias `run_in_background`) detaches immediately with the same envelope. Inspect with `pi.read(logPath)` and stop by running `kill <pid>` through `pi.bash`. Do not poll. An explicit shell `timeout` remains a hard cap. **ctrl+b twice** spills early (tmux-safe); **ctrl+k** kills the waiting command. Session shutdown aborts leftover processes. Captured shell overrides normally keep their own execution semantics; an extension can opt into [Fabric-owned bash execution with middleware](shell-middleware.md) to preserve its environment/output filters while gaining the same background handling.
 
 The precedence across all sources is:
@@ -64,7 +66,7 @@ effective timeout = min(
 )
 ```
 
-where absent values do not participate. Orchestration programs (`agents.run` / `agents.wait` / `agents.ask`, `workflow.agent`, ...) keep their separate `agents.timeoutMs` floor, which is unaffected by `executor.maxTimeoutMs`.
+where absent values do not participate. Outside interactive Main, orchestration programs (`agents.run` / `agents.wait` / `agents.ask`, `workflow.agent`, ...) keep their separate `agents.timeoutMs` floor, which is unaffected by `executor.maxTimeoutMs`. In interactive Main, the fixed `executor.mainMaxTimeoutMs` ceiling takes precedence over every source above; repeated host calls cannot extend it.
 
 ## Full reference
 
@@ -78,6 +80,7 @@ where absent values do not participate. Orchestration programs (`agents.run` / `
     "runtime": "quickjs",
     "timeoutMs": 120000,
     "maxTimeoutMs": 900000,
+    "mainMaxTimeoutMs": 600000,
     "hostCallTimeouts": {},
     "shellHangMs": 120000,
     "memoryLimitBytes": 67108864,
@@ -189,6 +192,7 @@ where absent values do not participate. Orchestration programs (`agents.run` / `
     "actorRunArchiveMs": 604800000
   },
   "mesh": {
+    "lockProtocol": 1,
     "enabled": true,
     "announce": false,
     "actorScope": "project",
@@ -535,6 +539,21 @@ See the [interface reference](interface.md).
 Mesh data lives at `<project>/.pi/fabric/mesh` by default. Set `mesh.root` to a relative or absolute path to relocate durable topics, shared state, and actor sessions. Add `.pi/fabric/mesh/` to the project's ignore file unless you version the coordination log on purpose. Set `mesh.enabled` to `false` to disable both mesh actions and ambient actor restoration.
 
 Sessions that share one `mesh.root` share one participant directory, so each sees the others through `agents.sessions()` and can `steer` or `followUp` them. A Main normally joins that directory when it first uses Fabric. Set `mesh.announce` to `true` in the project configuration to join at session start instead, so an idle peer is reachable. Announcing loads the Fabric runtime during startup, so avoid it in a global configuration that applies to every project.
+
+`mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
+when each mesh store is constructed; editing configuration does not switch an existing
+store. Protocol 1 uses the B68 canonical-directory mkdir, three-line token/PID/time
+owner and token-prefix recursive canonical release. Protocol 2 uses fully initialized
+private-directory publication and detached release. Both retain immediate dead-holder
+recovery, recovery fences, bounded jitter/backoff and typed lock timeouts. There is no
+environment fallback, runtime marker, transition guard or hot reload for this selector.
+
+Keep `1` for compatibility with B68 writers. Protocol 2 activation is deferred to the
+coordinated rollout in smarty-dev#2570: drain/terminate all old-format-capable writers
+and prevent their restart or rollback on the shared root before selecting `2`. Mixed
+protocol 1/2 operation on one root is not safe. Standalone `mesh-bridge` does not load
+Fabric config: set `--lock-protocol 1|2` separately on each `run` and `agent` startup
+(default `1`); an SSH forced command must pin the remote agent's selection explicitly.
 
 When several projects share a root, project-scoped actors are shared too: any live Main on that root can adopt a project actor whose owner has gone. Set `mesh.actorScope` to `"session"` so new actors default to their root Pi session, which other sessions do not load or adopt. This is only the default for `agents.create`: existing project actors, and actors created with an explicit `scope: "project"`, stay shared. Session actors do not survive `/new`.
 

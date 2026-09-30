@@ -96,6 +96,21 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     return client;
   };
 
+  it("replaces a socket left by a crashed process but refuses a live listener", async () => {
+    const socket = path.join(dir, "restart.sock");
+    const crashed = spawnSync(process.execPath, ["-e", 'require("node:net").createServer().listen(process.argv[1], () => process.exit(0))', socket], { encoding: "utf8" });
+    expect(crashed.status, crashed.stderr).toBe(0);
+    expect(fs.statSync(socket).isSocket()).toBe(true);
+    const { config } = await freshService({ socket });
+    expect(fs.statSync(socket).mode & 0o777).toBe(0o660);
+    const alice = await connect(config, ALICE);
+    expect(alice.org).toBe("smarty-pants");
+    const other = await RecordsServer.open(config, { pool: new pg.Pool({ ...config.database, max: 2 }) as unknown as ClientPool });
+    cleanups.push(() => other.close());
+    await expect(other.listen()).rejects.toThrow(`records service already listening on ${socket}`);
+    expect((await alice.read({ id: ALICE }, {})).frontier).toBe(0);
+  });
+
   it("appends and reads over the socket, with a same-key retry returning the same receipt", async () => {
     const { config } = await freshService();
     const alice = await connect(config, ALICE);

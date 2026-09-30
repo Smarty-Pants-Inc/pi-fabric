@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
 const ACTOR_REGISTRY_STALE_LOCK_MS = 30_000;
@@ -117,7 +117,20 @@ export class ActorRegistryStore {
   }
 
   /** Call within withLock for read-modify-write operations. */
-  write(actors: readonly Record<string, unknown>[]): void {
-    writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2 });
+  write(actors: readonly Record<string, unknown>[], options?: { durable?: boolean }): void {
+    if (!options?.durable) {
+      writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2 });
+      return;
+    }
+    const previous = fs.readFileSync(this.#registryPath, "utf8");
+    try {
+      writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2, durable: true });
+    } catch (error) {
+      // A directory barrier can fail after rename installed the new registry. Restore the
+      // live decision under the lock; the durable cleanup marker still covers a power loss
+      // during this rollback. Never report the failed commit as accepted.
+      writeFileAtomic(this.#registryPath, previous);
+      throw error;
+    }
   }
 }

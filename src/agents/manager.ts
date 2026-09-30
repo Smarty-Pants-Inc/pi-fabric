@@ -264,6 +264,12 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Set by an explicit stop — tool, dashboard, or session shutdown. A requested
    *  stop is terminal and must never be resumed behind the operator's back. */
   stopRequested: boolean;
+  /**
+   * Its owner gave it up (a stopped or removed actor): nobody wants its result, so a worker that
+   * dies is not relaunched and the run ends failed (smarty-dev#2184 item 8b). A caller that only
+   * stopped waiting does not set this: its detached run is still resumed (review on pi-fabric#160).
+   */
+  abandoned?: boolean;
   /** Monotonic progress maxima seen for this run across attempts. The worker's
    *  own terminal record keeps its counters, but a host-synthesized stop or
    *  transport-death record resets them to zero, so recovery reads this. */
@@ -1017,6 +1023,7 @@ export class AgentManager {
           : []),
         ...(request.actorId ? ["--actor-id", request.actorId] : []),
         ...(request.actorName ? ["--actor-name", request.actorName] : []),
+        ...(request.bashTimeoutSeconds !== undefined ? ["--actor-bash-timeout", String(request.bashTimeoutSeconds)] : []),
         ...(request.capabilityRequirements
           ? ["--capability-requirements", JSON.stringify(request.capabilityRequirements)]
           : []),
@@ -1125,50 +1132,79 @@ export class AgentManager {
     }
   }
 
-  async run(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentRunResult> {
+  async run(
+    request: AgentRunRequest,
+    signal?: AbortSignal,
+    onSpawned?: (handle: AgentHandleInfo) => void,
+  ): Promise<AgentRunResult> {
     const handle = await this.spawn(request, signal);
+    onSpawned?.(handle);
     return this.wait(handle.id);
   }
 
   /**
    * Waits for a run's result and consumes it. With timeoutMs, a run still going at the bound is
    * detached instead (smarty-dev#854): it continues, nothing is consumed, and its result arrives
-   * as a completion message.
+   * as a completion message. An optional signal cancels only this observation (Main's
+   * program deadline / Escape), detaches the run, and leaves its result unconsumed.
    */
-  async wait(id: string, options: { timeoutMs?: number } = {}): Promise<AgentRunResult> {
+  async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void } = {}): Promise<AgentRunResult> {
     const previous = this.#previousRun(id);
-    if (previous) return previous;
+    if (previous) {
+      if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id));
+      else this.#onResultConsumed?.(id);
+      return previous;
+    }
     const managed = this.#requireRun(id);
-    managed.background = false;
+    if (!options.deferConsumption) managed.background = false;
+    const consumed = (): void => {
+      if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id), () => this.detachSignal(id));
+      else this.#onResultConsumed?.(id);
+    };
     if (!managed.settled) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
-      const result = options.timeoutMs === undefined
+      const result = options.timeoutMs === undefined && options.signal === undefined
         ? await managed.result
-        : await this.#boundedResult(managed, options.timeoutMs);
-      this.#onResultConsumed?.(id);
+        : await this.#boundedResult(managed, options);
+      consumed();
       return result;
     }
     const record = readRecord(managed.statusFile) ?? managed.latestRecord;
     if (!record || !terminalStatuses.has(record.status)) {
       throw new Error(`Agent ${id} settled without a result`);
     }
-    this.#onResultConsumed?.(id);
+    consumed();
     return this.#withTransportMetadata(record, managed) as AgentRunResult;
   }
 
-  #boundedResult(managed: ManagedAgent, timeoutMs: number): Promise<AgentRunResult> {
+  #boundedResult(managed: ManagedAgent, options: { timeoutMs?: number; signal?: AbortSignal }): Promise<AgentRunResult> {
+    const { timeoutMs, signal } = options;
     let timer: NodeJS.Timeout | undefined;
+    let abort: (() => void) | undefined;
     const bound = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => {
-        this.#detach(managed, "agents.wait reached its bound; the run continues");
-        reject(new AgentWaitBoundError(
-          `agents.wait: ${managed.name} is still running after ${describeWaitBound(timeoutMs)}. It continues, and its result ` +
-            "arrives as a completion message after this turn: end the turn now.",
-        ));
-      }, timeoutMs);
-      timer.unref?.();
+      // Interactive Main owns the observation, not the child. Ending its program
+      // must also end the wait without consuming a later detached completion.
+      abort = () => {
+        this.#detach(managed, "caller stopped waiting; the run continues");
+        reject(signal?.reason ?? new Error("Agent wait aborted; the run continues"));
+      };
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          this.#detach(managed, "agents.wait reached its bound; the run continues");
+          reject(new AgentWaitBoundError(
+            `agents.wait: ${managed.name} is still running after ${describeWaitBound(timeoutMs)}. It continues, and its result ` +
+              "arrives as a completion message after this turn: end the turn now.",
+          ));
+        }, timeoutMs);
+        timer.unref?.();
+      }
     });
-    return Promise.race([managed.result!, bound]).finally(() => clearTimeout(timer));
+    return Promise.race([managed.result!, bound]).finally(() => {
+      clearTimeout(timer);
+      if (abort) signal?.removeEventListener("abort", abort);
+    });
   }
 
   markForeground(id: string): void {
@@ -1187,6 +1223,15 @@ export class AgentManager {
    * and keeps going to a real terminal state; a run that never started working is
    * still stopped, because releasing it loses nothing.
    */
+  /**
+   * Its owner no longer wants this run (an actor stopped or removed while the run finishes): it
+   * may end on its own, but a worker that dies is not relaunched (smarty-dev#2184 item 8b).
+   */
+  abandon(id: string): void {
+    const managed = this.#runs.get(id);
+    if (managed && !managed.settled) managed.abandoned = true;
+  }
+
   #handleCallerAbort(id: string): void {
     const managed = this.#runs.get(id);
     if (!managed || managed.settled || this.#closing) return;
@@ -1324,7 +1369,6 @@ export class AgentManager {
   #previousRun(id: string): AgentRunResult | undefined {
     const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id);
     if (!previous) return undefined;
-    this.#onResultConsumed?.(id);
     return structuredClone(previous);
   }
 
@@ -1608,6 +1652,7 @@ export class AgentManager {
       managed.settled ||
       this.#closing ||
       managed.abortSignal?.aborted ||
+      managed.abandoned ||
       record.status !== "failed" ||
       !(
         (managed.runner === "pi" && retryablePiStartupError(record.error)) ||
@@ -1627,7 +1672,7 @@ export class AgentManager {
     if (Date.now() + retryDelayMs >= deadline) return false;
     await this.#waitForTransportExit(managed);
     await delay(retryDelayMs);
-    if (managed.settled || this.#closing || managed.abortSignal?.aborted) return false;
+    if (managed.settled || this.#closing || managed.abortSignal?.aborted || managed.abandoned) return false;
     managed.startupAttempts++;
     return this.#relaunch(managed, record);
   }
@@ -1650,6 +1695,7 @@ export class AgentManager {
       managed.settled ||
       this.#closing ||
       managed.stopRequested ||
+      managed.abandoned ||
       managed.resumeAttempts >= AGENT_RESUME_MAX_ATTEMPTS ||
       !this.#observedWork(managed) ||
       !recoverableStop(record)
@@ -1660,7 +1706,7 @@ export class AgentManager {
     if (Date.now() + retryDelayMs >= deadline) return false;
     await this.#waitForTransportExit(managed);
     await delay(retryDelayMs);
-    if (managed.settled || this.#closing || managed.stopRequested) return false;
+    if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
     managed.resumeAttempts += 1;
     const { turns, toolCalls, usage } = managed.observedProgress;
     return this.#relaunch(managed, record, {
@@ -1714,7 +1760,7 @@ export class AgentManager {
       const previousSession = managed.transport.sessionId;
       await managed.transport.stop().catch(() => undefined);
       await this.#waitForTransportExit(managed);
-      if (managed.settled || this.#closing || managed.stopRequested) return false;
+      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       // Relaunch only when the previous worker is gone for certain. A worker that did
       // not stop, or whose transport cannot say, fails the run instead of running twice.
       if (await managed.transport.isAlive().catch(() => true)) {
@@ -1742,15 +1788,15 @@ export class AgentManager {
       // the journal it landed in.
       this.#drainLifecycle(managed);
       fs.rmSync(managed.statusFile, { force: true });
-      if (managed.settled || this.#closing || managed.stopRequested) return false;
+      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
       this.#unregisteredTransports.delete(managed.transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
-      if (managed.settled || this.#closing || managed.stopRequested) {
-        // A stop landed while the relaunch was in flight. Release the child we
-        // just started so it cannot outlive the monitor and the stop path can
-        // publish its terminal record.
+      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) {
+        // A stop (or an abandonment, #2184 8b) landed while the relaunch was in flight.
+        // Release the child we just started so it cannot outlive the monitor and the
+        // stop path can publish its terminal record.
         await managed.transport.stop().catch(() => undefined);
         return false;
       }

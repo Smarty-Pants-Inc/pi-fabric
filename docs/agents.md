@@ -40,6 +40,33 @@ After a failed or aborted assistant response (including `Error: Terminated`), Fa
 
 When Pi exhausts its retries, Fabric ends the run; it no longer waits forever on an earlier `willRetry` flag. Child shutdown after RPC stdin closes is also bounded: 5 seconds for graceful exit, then SIGTERM and a further 5 seconds before SIGKILL. These failures settle `agents.wait`/`join` and notify detached callers normally; they do not automatically replay potentially side-effecting work. Already-running workers must be stopped and respawned to use the fix.
 
+### Fleet write attribution for process children
+
+Ordinary process children receive `SMARTY_ROLE=task-agent`, whether the parent has a stamped
+fleet role or no role. The fleet write governor derives their lane from the child's cwd, not
+from a role or a lane environment variable. Explicit actor runs retain their inherited role
+and set `PI_FABRIC_ACTOR_NAME`; that actor identity takes precedence in the governor. An
+ordinary task spawned by an actor also inherits `PI_FABRIC_ACTOR_NAME`, so its governed
+writes still count as that actor. This is write attribution, not an authorization boundary.
+`PI_FABRIC_ROLE` is unchanged: when the parent sets it, `participantRole` still prefers that
+inherited value over `SMARTY_ROLE`.
+
+Task agents return status to their parent; they must not call `smarty-status` to update the
+parent's status comment. That helper keys ordinary comments by role/worktree, so a task
+agent's call would create a separate `task-agent/<worktree>` comment and leave the
+parent's unchanged. The parent owns and writes its status updates. No parent-role environment variable
+is exported for status impersonation.
+
+The installed admin audit's `actor()` likewise records `PI_FABRIC_ACTOR_NAME`, else
+`SMARTY_ROLE`. Non-actor session roles rendered by `smarty-role --format fabric` (including
+security passes and acceptance auditors) therefore execute and are recorded as `task-agent`;
+the role instructions describe the assignment, not a separate process identity. This coarse
+attribution is intentional for delegated work: it identifies the actual task-agent writer
+without claiming the parent's role. It does not identify the named review assignment; retain
+that provenance in the Fabric run/task and review receipt. Work requiring a distinct session
+role in the admin audit must use a separately role-launched root session, not an ordinary task
+agent. Fabric does not change those external helpers or their audit schema.
+
 ### Image-heavy lifecycle events
 
 Pi repeats message history in `agent_end.messages` and tool results in `turn_end.toolResults`. Fabric streams past these redundant top-level fields, recording empty arrays in the worker event log. Large accumulated histories therefore do not trip the event-size guard or interrupt completion/retries. Authoritative message/tool events, final text, usage, and Pi's persisted session history are unchanged.

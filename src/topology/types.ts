@@ -51,6 +51,10 @@ export interface FabricParticipantRecord {
   usage?: AgentUsage;
   actorQueued?: number;
   actorMessages?: number;
+  /** The actor's in-flight run (smarty-dev#2184 item 8). */
+  actorRun?: { id: string; startedAt: number };
+  /** The actor's removal, pending behind its in-flight run (smarty-dev#2184 item 8). */
+  actorRemoval?: { requestedAt: number; runId?: string; runStartedAt?: number };
   controlProtocol: "v1" | "legacy";
   /**
    * Set on a root that the mesh bridge mirrors from another host's mesh (smarty-dev#2004):

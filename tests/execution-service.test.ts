@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -10,6 +11,10 @@ import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import type { FabricActionDescriptor, FabricProvider } from "../src/protocol.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
+
+const cpythonAvailable = spawnSync("python3", ["-I", "-B", "-c", "import sys"]).status === 0;
+const montyAvailable = await import("@pydantic/monty/node").then(() => true, () => false);
 
 describe("FabricExecutionService", () => {
   it("defers explicit handoff and completes every later call in the same program", async () => {
@@ -623,6 +628,177 @@ return "unreachable";
     });
     expect(result.success).toBe(false);
     expect(result.error).toContain("agent budget exhausted (1 per execution)");
+  });
+
+  it.each([
+    ['await agents.spawn({ task: "live" }); while (true) await agents.wait({ id: "child" });', false],
+    ['const ref = ["agents", "wait"].join("."); while (true) await tools.call({ ref, args: { id: "child" } });', false],
+    ['while (true) await tools.call({ ref: "tasks.wait", args: {} });', true],
+    ['while (true) await extensions.slowext({});', true],
+    ['while (true) await pi.bash({ command: "slow", timeout: 86_400 });', true],
+  ])("enforces a fixed Main ceiling across repeated waits and floors: %s", async (code, fullCodeMode) => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const registry = new ActionRegistry();
+    const child = { id: "child", status: "running" };
+    let waits = 0;
+    for (const [provider, names] of [["agents", ["spawn", "wait"]], ["tasks", ["wait"]], ["extensions", ["slowext"]], ["pi", ["bash"]]] as const) {
+      const descriptors = names.map(name => ({ name, description: name, inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const }));
+      registry.register({
+        name: provider, description: provider,
+        async list() { return descriptors; },
+        async describe(name) { return descriptors.find(d => d.name === name); },
+        async invoke(name) {
+          if (name === "spawn") return child;
+          waits++;
+          await new Promise(resolve => setTimeout(resolve, 20));
+          return provider === "pi" ? { ok: true, output: "live", details: {} } : { ...child, waitTimedOut: true };
+        },
+      });
+    }
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.fullCodeMode = fullCodeMode;
+    config.executor.timeoutMs = 500;
+    config.executor.mainMaxTimeoutMs = 100; // Tiny test-only policy: no ten-minute wall-clock test.
+    config.executor.hostCallTimeouts = { "extensions.slowext": 900_000, "tasks.wait": 900_000 };
+    try {
+      // Spend the unchanged ceiling only after the guest is repeatedly calling
+      // the provider, not during cold compilation/admission on a loaded runner.
+      const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
+        code, requestedTimeoutMs: 86_400_000,
+        signal, parentToolCallId: "main-fixed-ceiling",
+        context: { cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+        onPartial() {},
+      }), () => waits > 1);
+      expect(result.typeErrors).toBeUndefined();
+      expect(result.success).toBe(false);
+      expect(result.trace.outcome).toBe("timed_out");
+      expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
+      expect(result.error).toMatch(/completion messages.*agents.status\/list/);
+      expect(waits).toBeGreaterThan(1);
+      expect(waits).toBeLessThan(15);
+      expect(child.status).toBe("running");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  for (const backend of ["node-process", "monty", "cpython"] as const) {
+    it.skipIf(backend === "cpython" ? !cpythonAvailable : backend === "monty" && !montyAvailable)(`enforces the fixed Main ceiling through ${backend}`, async () => {
+      vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+      vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+      const registry = new ActionRegistry();
+      const descriptor = { name: "wait", description: "live agent", inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const };
+      let waits = 0;
+      registry.register({
+        name: "agents", description: "agents", async list() { return [descriptor]; }, async describe() { return descriptor; },
+        async invoke() { waits++; await new Promise(resolve => setTimeout(resolve, 25)); return { status: "running", waitTimedOut: true }; },
+      });
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+      config.executor.memoryLimitBytes = 128 * 1024 * 1024;
+      config.executor.mainMaxTimeoutMs = 500;
+      if (backend === "node-process") config.executor.runtime = backend;
+      else { config.executor.kernel = "python"; config.executor.pythonRuntime = backend; }
+      try {
+        // Native startup is outside the test clock. Require repeated real
+        // provider calls before allowing the fixed 500ms Main budget to run.
+        const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
+          code: backend === "node-process" ? 'while (true) await agents.wait({ id: "child" });' : 'while True:\n    await agents.wait(id="child")',
+          signal, parentToolCallId: "native-main-ceiling",
+          context: { cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+          onPartial() {},
+        }), () => waits > 1);
+        expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
+        expect(result.trace.outcome).toBe("timed_out");
+        expect(waits).toBeGreaterThan(1);
+      } finally { vi.unstubAllEnvs(); }
+    });
+  }
+
+  it("names the Main ceiling for a synchronous guest but preserves shorter timeouts and Escape", async () => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const registry = new ActionRegistry();
+    const descriptor = { name: "slow", description: "slow call", inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const };
+    let escape: AbortController | undefined;
+    const escapeEvents: string[] = [];
+    registry.register({
+      name: "demo", description: "demo", async list() { return [descriptor]; }, async describe() { return descriptor; },
+      async invoke(_name, _args, context) {
+        if (escape) {
+          escapeEvents.push("provider-entered");
+          expect(context.signal?.aborted).toBe(false);
+          escape.abort();
+          escapeEvents.push("escape-aborted");
+          // Cross both deadlines after Escape, without running their timers:
+          // an already-recorded cancellation must remain an abort at settlement.
+          vi.setSystemTime(Date.now() + 1_000);
+          return;
+        }
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, 500);
+          context.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(context.signal?.reason); }, { once: true });
+        });
+      },
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.timeoutMs = 500;
+    config.executor.mainMaxTimeoutMs = 50;
+    const service = new FabricExecutionService(registry, config);
+    const options = {
+      signal: undefined, parentToolCallId: "main-cpu-ceiling", onPartial() {},
+      context: { cwd: process.cwd(), mode: "tui", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+    };
+    try {
+      const cpu = await service.execute({ ...options, code: "while (true) {}" });
+      expect(cpu.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
+      expect(cpu.trace.outcome).toBe("timed_out");
+      config.executor.timeoutMs = 20;
+      config.executor.mainMaxTimeoutMs = 200;
+      const short = await service.execute({ ...options, code: 'return tools.call({ ref: "demo.slow", args: {} });' });
+      expect(short.trace.outcome).toBe("timed_out");
+      expect(short.error).not.toContain("Main ceiling hit");
+      escape = new AbortController();
+      // Keep the real clock for the CPU/short-timeout checks above. Freeze it
+      // only through provider admission here: on a loaded runner, the inherited
+      // 20ms deadline could otherwise expire before invoke can press Escape.
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      const cancelled = await service.execute({ ...options, code: 'return tools.call({ ref: "demo.slow", args: {} });', signal: escape.signal });
+      escapeEvents.push("settled");
+      expect(escapeEvents).toEqual(["provider-entered", "escape-aborted", "settled"]);
+      expect(cancelled.trace.outcome).toBe("aborted");
+      expect(cancelled.error).not.toContain("Main ceiling hit");
+    } finally { vi.useRealTimers(); vi.unstubAllEnvs(); }
+  });
+
+  it.each([
+    ["rpc", "PI_FABRIC_PARENT_RUN", "parent"],
+    ["rpc", "PI_FABRIC_ACTOR_ID", "actor"],
+    ["print", "PI_FABRIC_PARENT_RUN", ""],
+    ["json", "PI_FABRIC_PARENT_RUN", ""],
+  ])("keeps the orchestration deadline outside interactive Main: %s %s", async (mode, key, value) => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    vi.stubEnv(key, value);
+    const registry = new ActionRegistry();
+    const descriptor = { name: "run", description: "long agent", inputSchema: { type: "object", additionalProperties: true }, risk: "agent" as const };
+    registry.register({
+      name: "agents", description: "agents", async list() { return [descriptor]; },
+      async describe() { return descriptor; },
+      async invoke() { await new Promise(resolve => setTimeout(resolve, 120)); return "done"; },
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.timeoutMs = 20;
+    config.executor.mainMaxTimeoutMs = 40;
+    config.agents.timeoutMs = 1_000;
+    try {
+      const result = await new FabricExecutionService(registry, config).execute({
+        code: 'return agents.run({ task: "slow" });', signal: undefined,
+        parentToolCallId: "non-main-deadline",
+        context: { cwd: process.cwd(), mode, sessionManager: { getSessionId: () => "non-main" } } as unknown as ExtensionContext,
+        onPartial() {},
+      });
+      expect(result.success).toBe(true);
+      expect(result.value).toBe("done");
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("raises the executor deadline to the agent deadline for orchestration programs", async () => {

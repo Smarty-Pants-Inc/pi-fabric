@@ -51,11 +51,13 @@ import {
 import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import type {
   FabricKernel,
+  FabricHostCall,
   FabricKernelRuntime,
   FabricSandboxResult,
   FabricSandboxTerminationReason,
 } from "./runtime/kernel.js";
 import type { TypeScriptKernelRuntime } from "./runtime/typescript-kernel.js";
+import type { QuickJsSandboxOptions } from "./runtime/quickjs-runtime.js";
 import type { FabricTypeError, FabricTypeCheckResult } from "./runtime/type-checker.js";
 import { isInteractiveMain } from "./agents/wait-bound.js";
 
@@ -582,11 +584,49 @@ export class FabricExecutionService {
     const programSignal = mainCeiling
       ? options.signal ? AbortSignal.any([options.signal, mainCeiling.signal]) : mainCeiling.signal
       : options.signal;
+    // Native runtimes may replace an outer abort reason with "Execution
+    // cancelled". Providers must observe both sources directly, so Main's
+    // original reason survives without losing runtime-only cancellation.
+    const providerSignals = new WeakMap<AbortSignal, AbortSignal>();
+    const providerSignal = (runtimeSignal: AbortSignal): AbortSignal => {
+      if (!programSignal) return runtimeSignal;
+      let combined = providerSignals.get(runtimeSignal);
+      if (!combined) {
+        // A runtime's own watchdog can win the timer-order race at Main's
+        // absolute deadline. Publish Main's reason before forwarding that
+        // runtime cancellation; never relabel a shorter deadline or Escape.
+        const runtimeBoundary = new AbortController();
+        const forwardRuntimeAbort = (): void => {
+          if (!options.signal?.aborted && mainDeadlineAt !== undefined && Date.now() >= mainDeadlineAt) {
+            mainCeiling!.abort(new Error(mainCeilingError));
+          }
+          runtimeBoundary.abort(runtimeSignal.reason);
+        };
+        combined = AbortSignal.any([programSignal, runtimeBoundary.signal]);
+        providerSignals.set(runtimeSignal, combined);
+        if (runtimeSignal.aborted) forwardRuntimeAbort();
+        else runtimeSignal.addEventListener("abort", forwardRuntimeAbort, { once: true });
+      }
+      return combined;
+    };
+    const checkMainDeadline = (): void => {
+      if (options.signal?.aborted) options.signal.throwIfAborted();
+      if (mainDeadlineAt !== undefined && Date.now() >= mainDeadlineAt) {
+        mainCeiling!.abort(new Error(mainCeilingError));
+        throw mainCeiling!.signal.reason;
+      }
+    };
+    const guardHostCall = (dispatch: FabricHostCall): FabricHostCall => (ref, args, signal) => {
+      // Throw synchronously before allocating a dispatch promise: aborting here
+      // must not leave a rejected operation behind runAbortable's aborted race.
+      checkMainDeadline();
+      return dispatch(ref, args, signal).finally(checkMainDeadline);
+    };
     try {
       sandboxResult = await runtime.execute(
         code,
-        async (ref, args, runtimeSignal) => {
-          const callContext = { ...baseContext, signal: runtimeSignal };
+        guardHostCall(async (ref, args, runtimeSignal) => {
+          const callContext = { ...baseContext, signal: providerSignal(runtimeSignal) };
           switch (ref) {
             case "fabric.$providers":
               return traceAttempt(
@@ -910,9 +950,10 @@ export class FabricExecutionService {
             default:
               return invokeAction(ref, args, callContext);
           }
-        },
+        }),
         {
           timeoutMs: effectiveTimeoutMs,
+          ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt } : {}),
           cwd: options.context.cwd,
           memoryLimitBytes: this.config.executor.memoryLimitBytes,
           maxLogChars: this.config.executor.maxOutputChars,
@@ -923,7 +964,7 @@ export class FabricExecutionService {
           ...(options.strings ? { strings: options.strings } : {}),
           ...(options.tokenBudget !== undefined ? { tokenBudget: options.tokenBudget } : {}),
           ...(programSignal ? { signal: programSignal } : {}),
-        },
+        } satisfies QuickJsSandboxOptions,
       );
       // A synchronous guest can hit its runtime interrupt before the host timer gets
       // an event-loop turn. Name that same ceiling, but not a shorter default timeout.

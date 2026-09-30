@@ -154,6 +154,16 @@ describe("Fabric configuration", () => {
     });
     expect(floored.executor.hostCallTimeouts).toEqual({ "extensions.subagent": 300_000 });
   });
+  it("bounds the interactive Main ceiling by 60 s and the executor policy maximum", () => {
+    expect(DEFAULT_FABRIC_CONFIG.executor.mainMaxTimeoutMs).toBe(600_000);
+    expect(normalizeFabricConfig({}).executor.mainMaxTimeoutMs).toBe(600_000);
+    expect(normalizeFabricConfig({ executor: { mainMaxTimeoutMs: 1 } }).executor.mainMaxTimeoutMs).toBe(60_000);
+    expect(normalizeFabricConfig({ executor: { mainMaxTimeoutMs: 3_600_000, maxTimeoutMs: 900_000 } }).executor.mainMaxTimeoutMs).toBe(900_000);
+    expect(normalizeFabricConfig({ executor: { maxTimeoutMs: 300_000 } }).executor.mainMaxTimeoutMs).toBe(300_000);
+    // Existing smaller executor maxima remain authoritative, rather than being raised.
+    expect(normalizeFabricConfig({ executor: { maxTimeoutMs: 1_000, mainMaxTimeoutMs: 1 } }).executor.mainMaxTimeoutMs).toBe(1_000);
+  });
+
   it("floors fractional integers instead of resetting them to defaults", () => {
     const normalized = normalizeFabricConfig({
       executor: { timeoutMs: 1500.9, maxOutputChars: 2500.5 },

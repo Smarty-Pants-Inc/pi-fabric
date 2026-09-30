@@ -392,19 +392,24 @@ describe("runtime observation receipts", () => {
       h.agents.detachSignal(handle.id);
       await waitFor(() => completed.mock.calls.length === 1, 5_000);
       const invoke = registry.invoke.bind(registry);
+      const clock = vi.spyOn(Date, "now");
+      const encode = vi.fn((deadlineAt: number) => {
+        // Cross the ceiling only at the actual encoding seam, not while a
+        // fresh CPython child is still starting (including its Windows IPC).
+        clock.mockReturnValue(deadlineAt + 1);
+        return "rejected encoding";
+      });
       const encoding = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, callContext) => {
         const value = await invoke(ref, args, callContext);
-        // Cross the remaining budget at the runtime's actual encoding seam,
-        // after registry admission but before guest promise/frame publication.
-        Object.defineProperty(value, "text", { enumerable: true, get() {
-          while (Date.now() <= callContext.mainDeadlineAt! + 25) { /* serialization overrun */ }
-          return "rejected encoding";
-        } });
+        // Registry admission precedes guest promise/frame publication.
+        Object.defineProperty(value, "text", { enumerable: true, get: () => encode(callContext.mainDeadlineAt!) });
         return value;
       });
-      config.executor.mainMaxTimeoutMs = 1_000;
-      const rejected = await service.execute({ code: python ? `return await agents.wait(id=${JSON.stringify(handle.id)})` : `return await agents.wait({ id: ${JSON.stringify(handle.id)} });`, context: mainContext, signal: undefined, parentToolCallId: "receipt-encoding", onPartial() {} });
-      encoding.mockRestore();
+      let rejected: Awaited<ReturnType<typeof service.execute>>;
+      try {
+        rejected = await service.execute({ code: python ? `return await agents.wait(id=${JSON.stringify(handle.id)})` : `return await agents.wait({ id: ${JSON.stringify(handle.id)} });`, context: mainContext, signal: undefined, parentToolCallId: "receipt-encoding", onPartial() {} });
+      } finally { encoding.mockRestore(); clock.mockRestore(); }
+      expect(encode).toHaveBeenCalled();
       expect(rejected.error).toMatch(/MainExecutionCeilingError/);
       expect(consumed).not.toHaveBeenCalled();
       boundary(); boundary();
@@ -415,11 +420,32 @@ describe("runtime observation receipts", () => {
       const delivered = await h.agents.spawn({ task: "delivered receipt", transport: "process" });
       h.agents.detachSignal(delivered.id);
       await waitFor(() => completed.mock.calls.length === 2, 5_000);
-      const observed = await service.execute({ code: python ? `result = await agents.wait(id=${JSON.stringify(delivered.id)})\nwhile True:\n    pass` : `const result = await agents.wait({ id: ${JSON.stringify(delivered.id)} }); while (true) {}`, context: mainContext, signal: undefined, parentToolCallId: "receipt-delivered", onPartial() {} });
-      expect(observed.error).toMatch(/MainExecutionCeilingError/);
-      expect(consumed).toHaveBeenCalledExactlyOnceWith(delivered.id);
-      boundary(); boundary();
-      expect(sendMessage).toHaveBeenCalledOnce();
+      let continued!: (deadlineAt: number) => void;
+      const continuation = new Promise<number>(resolve => { continued = resolve; });
+      const guestContinuation = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, callContext) => {
+        if (ref !== "agents.list") return invoke(ref, args, callContext);
+        // This second guest call proves wait's response actually reached the
+        // guest. Keep its continuation pending until the real watchdog aborts.
+        const pending = new Promise<never>((_resolve, reject) => {
+          callContext.signal!.addEventListener("abort", () => reject(callContext.signal!.reason), { once: true });
+        });
+        continued(callContext.mainDeadlineAt!);
+        return pending;
+      });
+      const timer = captureRuntimeDeadline(backend);
+      const execution = service.execute({ code: python ? `result = await agents.wait(id=${JSON.stringify(delivered.id)})\nreturn await agents.list()` : `const result = await agents.wait({ id: ${JSON.stringify(delivered.id)} }); return await agents.list();`, context: mainContext, signal: undefined, parentToolCallId: "receipt-delivered", onPartial() {} });
+      try {
+        const deadlineAt = await Promise.race([continuation, execution.then(result => {
+          throw new Error(`Guest ended before delivered continuation: ${result.error}`);
+        })]);
+        expect(consumed).toHaveBeenCalledExactlyOnceWith(delivered.id);
+        timer.fireAt(deadlineAt);
+        const observed = await execution;
+        expect(observed.error).toMatch(/MainExecutionCeilingError/);
+        expect(consumed).toHaveBeenCalledExactlyOnceWith(delivered.id);
+        boundary(); boundary();
+        expect(sendMessage).toHaveBeenCalledOnce();
+      } finally { timer.restore(); guestContinuation.mockRestore(); await execution; }
     } finally { inbox.close(); await registry.close(); vi.unstubAllEnvs(); }
   });
 });

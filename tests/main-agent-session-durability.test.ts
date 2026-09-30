@@ -35,7 +35,7 @@ const replace = (root: string, manager: SessionManager, details: unknown) => {
   // rename. Have a real SessionManager persist that new inode, then install it identically.
   const replacement = SessionManager.create(root, manager.getSessionDir());
   persist(replacement, details);
-  fs.renameSync(replacement.getSessionFile()!, manager.getSessionFile()!);
+  fs.renameSync(replacement.getSessionFile()!, fs.realpathSync(manager.getSessionFile()!));
 };
 const controller = (root: string, manager: SessionManager) => {
   const handlers = new Map<string, Array<(event: unknown, context: ExtensionContext) => void>>();
@@ -79,13 +79,33 @@ const waitFor = async (predicate: () => boolean) => {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 };
-const cases = ["creation", "replacement"].flatMap((operation) => ["leaf", "ancestor"].map((barrier) => ({ operation, barrier })));
+const cases = ["creation", "replacement"].flatMap((operation) => ["leaf", "ancestor"].flatMap((barrier) =>
+  [false, true].map((symlink) => ({ operation, barrier, symlink, namespace: symlink ? "symlinked" : "ordinary" })),
+));
+const session = (root: string, symlink: boolean) => {
+  const directory = path.join(root, "physical", "sessions");
+  if (!symlink) return { manager: SessionManager.create(root, directory), directory };
+  const aliases = path.join(root, "aliases", "sessions");
+  fs.mkdirSync(directory, { recursive: true });
+  fs.mkdirSync(aliases, { recursive: true });
+  const file = path.join(aliases, "session.jsonl");
+  // A freshly created physical file is initialized through the supported explicit
+  // symlink path by the real SessionManager. Its namespace has not been confirmed.
+  const target = path.join(directory, "session.jsonl");
+  fs.writeFileSync(target, "");
+  fs.symlinkSync(target, file);
+  return { manager: SessionManager.open(file, aliases, root), directory };
+};
+const receiptChain = (manager: SessionManager) => {
+  const file = manager.getSessionFile()!;
+  const physical = fs.realpathSync(file);
+  return [...directoryChain(path.dirname(physical)), ...(physical === file ? [] : directoryChain(path.dirname(file)))];
+};
 
 describe("#180 S4 persisted session namespace durability", () => {
-  it.skipIf(process.platform === "win32").each(cases)("retains the journal payload on persistent $operation $barrier barrier failure, then retires once", ({ operation, barrier }) => {
+  it.skipIf(process.platform === "win32").each(cases)("retains the journal payload on persistent $namespace $operation $barrier barrier failure, then retires once", ({ operation, barrier, symlink }) => {
     const root = rootDirectory();
-    const directory = path.join(root, "separate", "sessions");
-    const manager = SessionManager.create(root, directory);
+    const { manager, directory } = session(root, symlink);
     const state = controller(root, manager);
     state.main.deliverAgent({ from: actor, message: "reply", delivery: "steer", deliveryId: "retire-once" });
     const details = state.sent[0]!.details;
@@ -107,7 +127,7 @@ describe("#180 S4 persisted session namespace durability", () => {
       expect(probe.events).not.toContain("payload-retirement");
       probe.recover();
       state.settle();
-      const chain = directoryChain(directory);
+      const chain = receiptChain(manager);
       expect(probe.events.slice(0, chain.length + 1)).toEqual(["session-file", ...chain]);
       expect(probe.events.indexOf("payload-retirement")).toBeGreaterThan(chain.length);
       expect(fs.existsSync(state.journal)).toBe(false);
@@ -118,10 +138,9 @@ describe("#180 S4 persisted session namespace durability", () => {
     } finally { retired.mockRestore(); probe.restore(); state.main.closeFollowUpDrain(); }
   });
 
-  it.skipIf(process.platform === "win32").each(cases)("retains the resident source and acknowledges nothing on persistent session-only $operation $barrier failure, then acknowledges once", async ({ operation, barrier }) => {
+  it.skipIf(process.platform === "win32").each(cases)("retains the resident source and acknowledges nothing on persistent session-only $namespace $operation $barrier failure, then acknowledges once", async ({ operation, barrier, symlink }) => {
     const root = rootDirectory();
-    const directory = path.join(root, "separate", "sessions");
-    const manager = SessionManager.create(root, directory);
+    const { manager, directory } = session(root, symlink);
     const id = "reply";
     const deliveryId = `resident:session:root:${id}`;
     const details = { id: "session-message", deliveryId };
@@ -172,7 +191,7 @@ describe("#180 S4 persisted session namespace durability", () => {
       expect(fs.existsSync(state.journal)).toBe(false);
       probe.recover();
       await waitFor(() => mesh.get(key) === undefined);
-      const chain = directoryChain(directory);
+      const chain = receiptChain(manager);
       expect(probe.events.slice(0, chain.length + 1)).toEqual(["session-file", ...chain]);
       expect(probe.events.slice(chain.length + 1)).toEqual(["acknowledgment", "source-delete"]);
       expect(delivered.mock.results.filter((result) => result.type === "return")).toHaveLength(1);
@@ -182,6 +201,46 @@ describe("#180 S4 persisted session namespace durability", () => {
     } finally {
       await client.close(); removed.mockRestore(); delivered.mockRestore(); probe.restore(); state.main.closeFollowUpDrain();
     }
+  });
+
+  it.skipIf(process.platform === "win32").each(["resolution", "opened-inode", "barrier-retarget"])("fails closed on a symlink receipt %s mismatch and recovers without redelivery", (failure) => {
+    const root = rootDirectory();
+    const { manager } = session(root, true);
+    const state = controller(root, manager);
+    const file = manager.getSessionFile()!;
+    const physical = fs.realpathSync(file);
+    const other = path.join(root, "other.jsonl");
+    fs.writeFileSync(other, fs.readFileSync(physical));
+    const request = { from: actor, message: "reply", delivery: "steer" as const, deliveryId: "bind-once" };
+    state.main.deliverAgent(request);
+    persist(manager, state.sent[0]!.details);
+    const realpath = fs.realpathSync.bind(fs);
+    const sync = fs.fsyncSync.bind(fs);
+    let fail = true;
+    const resolved = vi.spyOn(fs, "realpathSync").mockImplementation((target, options) => {
+      if (fail && String(target) === file) {
+        if (failure === "resolution") throw new Error("receipt resolution unavailable");
+        if (failure === "opened-inode") return other;
+      }
+      return realpath(target, options);
+    });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      sync(fd);
+      if (fail && failure === "barrier-retarget" && fs.fstatSync(fd).isDirectory()) {
+        fs.unlinkSync(file); fs.symlinkSync(other, file);
+      }
+    });
+    try {
+      state.settle();
+      expect(fs.readFileSync(state.journal, "utf8")).toContain("bind-once");
+      expect(fs.existsSync(`${state.journal}.delivered`)).toBe(false);
+      fail = false;
+      if (failure === "barrier-retarget") { fs.unlinkSync(file); fs.symlinkSync(physical, file); }
+      state.settle();
+      expect(fs.existsSync(state.journal)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(`${state.journal}.delivered`, "utf8")).ids).toEqual(["bind-once"]);
+      expect(state.sent).toHaveLength(1);
+    } finally { synced.mockRestore(); resolved.mockRestore(); state.main.closeFollowUpDrain(); }
   });
 
   it("keeps Windows receipt handles writable but noncreating/nontruncating, and skips unsupported directory fsync", () => {

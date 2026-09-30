@@ -610,12 +610,25 @@ export class MainAgentController implements FabricMainAgentTarget {
       const stat = fs.fstatSync(fd);
       const size = stat.size;
       const identity = `${stat.dev}:${stat.ino}`;
-      // A readable/synced inode is not a durable receipt until its filename AND the
-      // containing directory chain are durable. Pi may create or replace this file
-      // in a separate session tree. Recheck even cached receipts; never publish an
-      // index change or retire a payload/source before both barriers succeed.
+      // Opening the host's lexical session path follows file symlinks. Bind the
+      // receipt to that physical inode before syncing its actual namespace; the
+      // alias tree alone says nothing about a target created/replaced elsewhere.
+      const physical = fs.realpathSync(file);
+      const matchesReceipt = (target: string): boolean => {
+        const resolved = fs.statSync(target);
+        return resolved.dev === stat.dev && resolved.ino === stat.ino;
+      };
+      if (!matchesReceipt(physical)) throw new Error("Session receipt inode changed during resolution");
       fs.fsyncSync(fd);
-      syncDirectoryChain(path.dirname(file));
+      syncDirectoryChain(path.dirname(physical));
+      // Also confirm any newly created/replaced alias and its containing links.
+      // We cannot assume a previously existing alias is already durable.
+      if (path.resolve(file) !== physical) syncDirectoryChain(path.dirname(file));
+      // A concurrent replacement/retarget during the barriers supplies no receipt.
+      // Recheck cached receipts too, before publishing an index or retiring data.
+      if (fs.realpathSync(file) !== physical || !matchesReceipt(physical)) {
+        throw new Error("Session receipt inode changed during namespace barriers");
+      }
       if (this.#source !== file || this.#scanned === undefined || size < this.#scanned || this.#sessionFileIdentity !== identity) {
         this.#restartIndex(file);
       }

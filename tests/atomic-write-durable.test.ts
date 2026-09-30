@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { renameAtomic, writeFileAtomic, writeJsonAtomic, writeJsonAtomicAsync } from "../src/core/atomic-write.js";
+import { renameAtomic, syncDirectoryChain, writeFileAtomic, writeJsonAtomic, writeJsonAtomicAsync } from "../src/core/atomic-write.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { MeshStore } from "../src/mesh/store.js";
 
@@ -14,6 +14,53 @@ const directoryChain = (directory: string): string[] => {
     if (path.dirname(current) === current) return chain;
   }
 };
+
+describe("#180 S4 physical directory ancestry", () => {
+  it.skipIf(process.platform === "win32").each(["target-leaf", "target-ancestor", "alias-parent"])("fails closed and retries %s across nested directory symlinks", (barrier) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-symlink-chain-"));
+    const aliases = path.join(root, "aliases");
+    const intermediate = path.join(root, "intermediate");
+    const target = path.join(root, "physical", "leaf");
+    fs.mkdirSync(aliases);
+    fs.mkdirSync(intermediate);
+    fs.mkdirSync(target, { recursive: true });
+    fs.symlinkSync(intermediate, path.join(aliases, "first"), "dir");
+    fs.symlinkSync(target, path.join(intermediate, "second"), "dir");
+    const directory = path.join(aliases, "first", "second");
+    const failingPath = { "target-leaf": target, "target-ancestor": path.dirname(target), "alias-parent": intermediate }[barrier]!;
+    const events: string[] = [];
+    const descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs);
+    const sync = fs.fsyncSync.bind(fs);
+    let fail = true;
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode);
+      descriptors.set(fd, String(file));
+      return fd;
+    });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const file = descriptors.get(fd)!;
+      events.push(file);
+      if (fail && file === failingPath) throw new Error("physical namespace barrier unavailable");
+      sync(fd);
+    });
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        expect(() => syncDirectoryChain(directory)).toThrow("physical namespace barrier unavailable");
+        expect(events).toContain(failingPath);
+        events.length = 0;
+      }
+      fail = false;
+      syncDirectoryChain(directory);
+      events.push("acknowledged");
+      // Both physical targets and the directories containing both symlinks matter.
+      expect(events).toEqual([...directoryChain(target), intermediate, aliases, "acknowledged"]);
+    } finally {
+      synced.mockRestore(); opened.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("#169 security S1 directory-link retries and P3 rename contract", () => {
   const cases = ["outer", "inner", "parent"].flatMap((barrier) =>

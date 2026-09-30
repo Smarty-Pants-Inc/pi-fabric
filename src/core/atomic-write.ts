@@ -84,10 +84,21 @@ export const renameAtomic = (
  */
 export const syncDirectoryChain = (directory: string): void => {
   if (process.platform === "win32") return;
-  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
-    const fd = fs.openSync(current, fs.constants.O_RDONLY);
-    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    if (path.dirname(current) === current) return;
+  const synced = new Set<string>();
+  for (let alias = path.resolve(directory); ; alias = path.dirname(alias)) {
+    // Lexical ancestry can omit the target tree of a directory symlink. Confirm
+    // its physical ancestry first, then the namespaces containing the aliases.
+    const physical = fs.realpathSync(alias);
+    for (let current = physical; ; current = path.dirname(current)) {
+      if (!synced.has(current)) {
+        const fd = fs.openSync(current, fs.constants.O_RDONLY);
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        synced.add(current);
+      }
+      if (path.dirname(current) === current) break;
+    }
+    // With no remaining symlink components, the full containing chain is done.
+    if (alias === physical) return;
   }
 };
 

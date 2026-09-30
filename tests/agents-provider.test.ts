@@ -137,6 +137,7 @@ const setup = (
       };
     },
     ...(options?.switchModel ? { switchModel: options.switchModel } : {}),
+    flushHeldAtNextBoundary: vi.fn(),
   };
   const actors = new ActorManager("test", identity, mesh, meshConfig, agents, () => {}, {
     actorRoot: path.join(root, "actors"),
@@ -919,6 +920,30 @@ describe("AgentsProvider runner support", () => {
     ).resolves.toEqual([]);
   });
 
+  // smarty-dev#2184: an actor's activation run (id = run id, name = actor name, no root) listed
+  // as a standalone agent read as "the reviewer is now <run id>, with no root session".
+  it("omits actor activation runs from agents.list; the actor is listed by agents.actors", async () => {
+    const { provider, agents } = setup();
+    const run = await agents.spawn({
+      task: "actor activation",
+      name: "playground-review-astra",
+      actorId: "7a3e1e35-actor",
+      actorName: "playground-review-astra",
+    });
+    const task = await agents.spawn({ task: "plain task", name: "worker" });
+    for (const scope of [undefined, "local", "project", "lineage"]) {
+      const listed = (await provider.invoke("list", scope ? { scope } : {}, context)) as Array<{ id: string }>;
+      expect(listed.map((record) => record.id), String(scope)).not.toContain(run.id);
+    }
+    const local = (await provider.invoke("list", {}, context)) as Array<{ id: string }>;
+    expect(local.map((record) => record.id)).toContain(task.id);
+    // A direct lookup of the run id still answers, and names its actor.
+    await expect(provider.invoke("status", { id: run.id }, context)).resolves.toMatchObject({
+      id: run.id,
+      actorId: "7a3e1e35-actor",
+    });
+  });
+
   // smarty-dev#266: during a mesh write stall, user-facing listings report it instead of [].
   it("reports a mesh write stall from user-facing listings but not from local ones", async () => {
     const stalled = new Error("Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock");
@@ -1194,6 +1219,39 @@ describe("AgentsProvider runner support", () => {
     await provider.invoke("wait", { id: handle.id }, invocationContext);
     await provider.invoke("cleanup", { id: handle.id }, invocationContext);
   });
+
+  // smarty-dev#2119: an interactive Main's wait is capped at 60 s and the bound is a normal result.
+  it("returns the live status at the bound in an interactive Main; a task agent's wait still throws", async () => {
+    const { provider, mainAgent } = setup();
+    const mainContext = (mode: string) => ({
+      ...context,
+      extensionContext: { ...context.extensionContext, mode, sessionManager: { getSessionId: () => "test" } } as unknown as ExtensionContext,
+    });
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    try {
+      for (const mode of ["tui", "rpc"]) {
+        const handle = await provider.invoke("spawn", { task: "LIVE_WITH_PROGRESS", transport: "process" }, mainContext(mode)) as { id: string };
+        const started = Date.now();
+        const result = await provider.invoke("wait", { id: handle.id, timeoutMs: 1_000 }, mainContext(mode)) as Record<string, unknown>;
+        expect(Date.now() - started).toBeLessThan(1_400);
+        expect(result).toMatchObject({ id: handle.id, status: "running", waitTimedOut: true });
+        expect(result.note).toMatch(/Still running after 1 s; Main waits are capped at 60 s/);
+        expect(mainAgent.flushHeldAtNextBoundary).toHaveBeenCalledTimes(mode === "tui" ? 1 : 2);
+        await expect(provider.invoke("wait", { id: handle.id }, mainContext(mode))).resolves.toMatchObject({ status: "completed" });
+      }
+      // Print mode is a script, not an interactive Main: the #854 error is unchanged.
+      const scripted = await provider.invoke("spawn", { task: "LIVE_WITH_PROGRESS", transport: "process" }, mainContext("print")) as { id: string };
+      await expect(provider.invoke("wait", { id: scripted.id, timeoutMs: 1_000 }, mainContext("print"))).rejects.toThrow(/is still running after 1 s\. It continues/);
+      // A task agent (PI_FABRIC_PARENT_RUN set) in RPC mode keeps the #854 error too.
+      vi.stubEnv("PI_FABRIC_PARENT_RUN", "parent-run");
+      const child = await provider.invoke("spawn", { task: "LIVE_WITH_PROGRESS", transport: "process" }, mainContext("rpc")) as { id: string };
+      await expect(provider.invoke("wait", { id: child.id, timeoutMs: 1_000 }, mainContext("rpc"))).rejects.toThrow(/is still running after 1 s\. It continues/);
+      expect(mainAgent.flushHeldAtNextBoundary).toHaveBeenCalledTimes(2);           // print and task-agent waits flush nothing
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 30_000);
 
   it("exposes the compact option on handoff only and validates it before deferring", async () => {
     const { provider, root } = setup();

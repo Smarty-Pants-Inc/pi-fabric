@@ -82,6 +82,14 @@ describe("kernel speculation boundaries", () => {
     const registry = new ActionRegistry();
     const install = vi.spyOn(registry, "setSpeculation");
     const scan = vi.spyOn(LiteralCallScanner.prototype, "push");
+    // smarty-dev#883: the scanner module loads in the background, and a cold
+    // import on a loaded runner outlasted vi.waitFor's 1 s. Wait for it to land.
+    const loaded = deferred<void>();
+    const setScannerFactory = FabricSpeculationStreamTap.prototype.setScannerFactory;
+    vi.spyOn(FabricSpeculationStreamTap.prototype, "setScannerFactory").mockImplementation(function (this: FabricSpeculationStreamTap, factory) {
+      setScannerFactory.call(this, factory);
+      loaded.resolve();
+    });
     const service = new RuntimeStateSpeculation(registry,
       () => config.speculation, () => undefined, () => true, "python");
     const speculate = vi.spyOn(registry, "speculate").mockResolvedValue(undefined);
@@ -89,10 +97,9 @@ describe("kernel speculation boundaries", () => {
     expect(install).toHaveBeenCalledOnce();
     service.tap!.handleMessageUpdate(event("toolcall_start"), context);
     service.tap!.handleMessageUpdate(event("toolcall_delta", JSON.stringify({ code: 'await pi.read(path="x")' })), context);
-    await vi.waitFor(() => {
-      service.tap!.flushCatchUp(context);
-      expect(speculate).toHaveBeenCalledOnce();
-    });
+    await loaded.promise;
+    service.tap!.flushCatchUp(context);
+    expect(speculate).toHaveBeenCalledOnce();
     expect(speculate.mock.calls[0]?.slice(0, 2)).toEqual(["pi.read", { path: "x" }]);
     expect(scan).not.toHaveBeenCalled();
     service.reset();

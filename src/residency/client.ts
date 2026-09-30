@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -21,6 +22,7 @@ import {
   isResidentHostId,
   residentDeliveryPrefix,
   residentHostId,
+  residentHostStateNote,
   residentResultPath,
   sleepUnlessAborted,
   type ResidentAgentMetadata,
@@ -36,6 +38,14 @@ import {
 // extension loading can exceed 10s on slow runners (e.g. CI Windows), so give
 // startup a generous budget. Idle exit still reclaims the processes.
 const STARTUP_TIMEOUT_MS = 30_000;
+// smarty-dev#883: the start is CPU-bound process boot, so its wall time grows
+// with contention (a 1 s boot took 16 s at load 5 per core). Scale the budget
+// by the 1-minute load per core, capped. Windows reports no load average (0).
+// ponytail: load is a coarse proxy, but it needs no progress protocol.
+const startupBudgetMs = (base: number): number => {
+  const loadPerCore = os.loadavg()[0]! / Math.max(1, os.availableParallelism());
+  return Math.round(base * Math.min(4, Math.max(1, loadPerCore)));
+};
 const COMMAND_TIMEOUT_MS = 30_000;
 const STATUS_POLL_MS = 100;
 const AGENT_ID_PATTERN = /^[a-f0-9]{32}$/;
@@ -100,6 +110,8 @@ export interface ResidencyClientOptions {
   onBackgroundComplete?: (result: AgentRunResult, delivered: () => void) => void;
   onResultConsumed?: (id: string) => void;
   hostPath?: string;
+  /** Start budget before load scaling; tests shorten it. */
+  startupTimeoutMs?: number;
 }
 
 export class ResidencyClient {
@@ -174,21 +186,40 @@ export class ResidencyClient {
     const existing = this.#liveOwner();
     if (existing) return existing;
     fs.rmSync(this.#errorPath, { force: true });
-    await spawnDetached(
+    const launcher = await spawnDetached(
       this.#hostPath,
       ["--config", this.#configPath],
       this.options.config.cwd,
     );
-    const deadline = Date.now() + STARTUP_TIMEOUT_MS;
-    while (Date.now() < deadline) {
+    // The budget counts from the launcher's first sign of life (its
+    // launcher-started trace), so its own boot does not consume it.
+    const budget = startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
+    let deadline = Date.now() + budget;
+    let started = false;
+    let launcherExited = false;
+    while (true) {
       const owner = this.#liveOwner();
       if (owner) return owner;
       const failure = readJson<{ error?: unknown }>(this.#errorPath);
       if (typeof failure?.error === "string") {
+        await launcher.stop();
         throw new Error(`Fabric resident host failed to start: ${failure.error}`);
       }
+      // A launcher that exited leaves nothing to wait for; its last owner
+      // and error states were read above.
+      if (launcherExited) break;
+      launcherExited = !(await launcher.isAlive());
+      if (launcherExited) continue;
+      if (!started && this.#launcherStarted(launcher.pid)) {
+        started = true;
+        deadline = Date.now() + budget;
+      }
+      if (Date.now() >= deadline) break;
       await delay(STATUS_POLL_MS);
     }
+    // Work must not outlive its owner: end the launcher this call spawned (its
+    // own process group, which holds its Pi child) before reporting the timeout.
+    await launcher.stop();
     // Surface any launcher-recorded child output so a silent slow start (or a
     // quiet child crash) is diagnosable from the error alone.
     const readIfPresent = (name: string): string => {
@@ -202,7 +233,7 @@ export class ResidencyClient {
       launcherLog ? `Launcher log: ${launcherLog}` : "",
       ownerState ? `Owner state: ${ownerState}` : "Owner state: absent",
     ].filter(Boolean).join(" | ");
-    throw new Error(`Timed out starting Fabric resident host ${this.hostId}. ${diagnostics}`);
+    throw new Error(`${launcherExited ? "Launcher exited while starting" : `Timed out after ${budget}ms starting`} Fabric resident host ${this.hostId}. ${diagnostics}`);
   }
 
   #refreshPiModels(): void {
@@ -347,9 +378,9 @@ export class ResidencyClient {
     };
   }
 
-  async removeActor(id: string): Promise<{ removed: boolean }> {
+  async removeActor(id: string): Promise<{ removed: boolean; pending?: string }> {
     await this.ensureHost();
-    await this.#command({
+    const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "removeActor",
       requestId: randomUUID(),
@@ -357,7 +388,12 @@ export class ResidencyClient {
       id,
       createdAt: Date.now(),
     });
-    return { removed: true };
+    return { removed: true, ...(response.pending ? { pending: response.pending } : {}) };
+  }
+
+  /** Pending removals and a long request on the host, for error messages (smarty-dev#2184). */
+  hostStateNote(): string {
+    return residentHostStateNote(this.options.config.residencyRoot);
   }
 
   async cleanupAgent(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
@@ -442,7 +478,9 @@ export class ResidencyClient {
         if (!owner) throw new Error("Fabric resident host exited while processing a request");
         await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
       }
-      throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}`);
+      const note = this.hostStateNote();
+      throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}` +
+        ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
       abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
       throw error;
@@ -528,6 +566,17 @@ export class ResidencyClient {
     return metadata;
   }
 
+  #launcherStarted(pid: number): boolean {
+    let log: string;
+    try { log = fs.readFileSync(path.join(this.options.config.residencyRoot, "launcher.log"), "utf8"); } catch { return false; }
+    return log.split("\n").some((line) => {
+      try {
+        const entry = JSON.parse(line) as { event?: unknown; pid?: unknown };
+        return entry.event === "launcher-started" && entry.pid === pid;
+      } catch { return false; }
+    });
+  }
+
   #liveOwner(): ResidentHostOwner | undefined {
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (
@@ -591,12 +640,18 @@ export class ResidencyClient {
         return;
       }
     }
+    // smarty-dev#2236: one record reached Main twice (a failed delete, or a second drainer that
+    // listed it through the 2 s read cache before the delete). The record stays the durable copy
+    // until Main durably admitted it: deliverAgent journals it under the record's stable id before
+    // it returns, keeps it until the session holds it, and admits one id once across restarts and
+    // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
     this.options.mainAgent.deliverAgent({
       from: value.from,
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,
       ...(value.data === undefined ? {} : { data: value.data }),
+      deliveryId: `resident:${this.options.config.rootId}:${value.id}`,
     });
     await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
   }

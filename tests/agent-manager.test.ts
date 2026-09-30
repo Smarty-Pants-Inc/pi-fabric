@@ -817,6 +817,114 @@ describe("AgentManager", () => {
   },
   30_000);
 
+  // smarty-dev#2184 item 8b: a removed actor's run (its caller aborted after progress, so it was
+  // detached) was relaunched when its worker died, so it ran on and its removal never finished.
+  it("ends an abandoned run as failed when its worker dies, with no relaunch", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+    });
+    managers.push(manager);
+    const abort = new AbortController();
+    const handle = await manager.spawn({ task: "HANG_WITH_PROGRESS", transport: "process" }, abort.signal);
+    const runDirectory = manager.runDirectory(handle.id)!;
+    await vi.waitFor(
+      () => expect((manager.status(handle.id) as AgentRunRecord).turns).toBe(3),
+      { timeout: 10_000 },
+    );
+    abort.abort();                                             // the actor was stopped: detached
+    manager.abandon(handle.id);                                // and its run given up
+    const worker = Number(handle.sessionId);
+    process.kill(worker, "SIGKILL");
+    const result = await Promise.race([
+      manager.wait(handle.id),
+      new Promise<"hung">((resolve) => setTimeout(resolve, 15_000, "hung")),
+    ]);
+    expect(result).not.toBe("hung");
+    expect((result as AgentRunResult).status).toBe("failed");
+    expect((result as AgentRunResult).error).toContain("Agent transport exited without a result");
+    expect(fs.existsSync(path.join(runDirectory, "relaunches.jsonl"))).toBe(false);
+  },
+  30_000);
+
+  // Review round 2 (security S3) on pi-fabric#160: an abandonment that lands while recovery is
+  // already under way (after the backoff, or while the new worker launches) still stops it.
+  it.each(["after the backoff", "during the relaunch"] as const)(
+    "never keeps a relaunched worker for a run abandoned %s",
+    async (when) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+      roots.push(root);
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+      });
+      managers.push(manager);
+      let id = "";
+      const launch = ProcessTransport.prototype.launch;
+      const launched: Array<{ stop(): Promise<void>; isAlive(): Promise<boolean> }> = [];
+      const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+        const handle = await launch.call(this, request);
+        launched.push(handle);
+        if (launched.length === 1 && when === "after the backoff") {
+          // #relaunch stops the dead worker's transport first, after the backoff.
+          const stop = handle.stop;
+          handle.stop = async () => { manager.abandon(id); return stop(); };
+        }
+        if (launched.length === 2 && when === "during the relaunch") manager.abandon(id);
+        return handle;
+      });
+      try {
+        const handle = await manager.spawn({ task: "HANG_WITH_PROGRESS", transport: "process" });
+        id = handle.id;
+        await vi.waitFor(() => expect((manager.status(id) as AgentRunRecord).turns).toBe(3), { timeout: 10_000 });
+        process.kill(Number(handle.sessionId), "SIGKILL");
+        const result = await Promise.race([
+          manager.wait(id),
+          new Promise<"hung">((resolve) => setTimeout(resolve, 20_000, "hung")),
+        ]);
+        expect(result).not.toBe("hung");
+        expect((result as AgentRunResult).status).toBe("failed");
+        // The relaunched worker was signalled; it is gone within moments, not left running.
+        for (const transport of launched) {
+          await vi.waitFor(async () => expect(await transport.isAlive()).toBe(false), { timeout: 5_000 });
+        }
+        expect(launched.length).toBe(when === "after the backoff" ? 1 : 2);
+      } finally {
+        spy.mockRestore();
+      }
+    },
+    40_000,
+  );
+
+  // Review round 1 on pi-fabric#160: a caller that only stopped waiting still wants the run.
+  it("still resumes a detached run whose caller only stopped waiting when its worker dies", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+    });
+    managers.push(manager);
+    const abort = new AbortController();
+    const handle = await manager.spawn({ task: "HANG_WITH_PROGRESS", transport: "process" }, abort.signal);
+    const runDirectory = manager.runDirectory(handle.id)!;
+    await vi.waitFor(
+      () => expect((manager.status(handle.id) as AgentRunRecord).turns).toBe(3),
+      { timeout: 10_000 },
+    );
+    abort.abort();                                             // a canceled wait: detached, still wanted
+    process.kill(Number(handle.sessionId), "SIGKILL");
+    await vi.waitFor(
+      () => expect(fs.existsSync(path.join(runDirectory, "relaunches.jsonl"))).toBe(true),
+      { timeout: 15_000 },
+    );
+    expect(manager.status(handle.id).status).toBe("running");
+    await manager.stop(handle.id);
+  },
+  30_000);
+
   it("never resumes a run an operator stopped, and aborts only unused runs", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

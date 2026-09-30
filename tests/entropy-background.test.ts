@@ -93,8 +93,8 @@ const createHarness = () => {
       values.push(handler);
       handlers.set(event, values);
     }),
-    registerCommand: vi.fn((_name: string, definition: { handler: typeof command }) => {
-      command = definition.handler;
+    registerCommand: vi.fn((name: string, definition: { handler: typeof command }) => {
+      if (name === "fabric") command = definition.handler;
     }),
     registerMessageRenderer: vi.fn(),
     registerTool: vi.fn(),

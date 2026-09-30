@@ -64,6 +64,7 @@ const lazy = [
   "worker/event-projection.js",
   "worker/activation-window.js",
   "worker/reply-tool.js",
+  "guards/actor-bash-hook.js",
   "worker/options.js",
   "worker/recovery-watchdog.js",
   "worker/run-log.js",
@@ -130,7 +131,10 @@ const staticClosure = (roots) => {
 
 const startupFiles = staticClosure([join(dist, "index.js")]);
 const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLength(readFileSync(file)), 0);
-if (startupBytes > 1150 * 1024 || startupFiles.size > 44) {
+// 45 files: src/topology/participant-files.ts is eager (the directory and the dashboard) and also
+// imported by the lazy mesh bridge, so it is a shared chunk instead of part of index.js; the bytes
+// are the same (smarty-dev#2004).
+if (startupBytes > 1150 * 1024 || startupFiles.size > 45) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
 const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter"];
@@ -153,6 +157,12 @@ for (const forbidden of ["src/fabric-runtime-state.ts", "src/prewalk/handoff.ts"
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }
+}
+// smarty-dev#2184: the worker loads this hook into every Pi actor run, native-tool ones included;
+// it must stay one self-contained file that never pulls the Fabric graph.
+const actorBashHookFiles = staticClosure([join(dist, "guards/actor-bash-hook.js")]);
+if (actorBashHookFiles.size !== 1) {
+  throw new Error(`Actor bash hook pulls more than its timeout guard: ${[...actorBashHookFiles].join(", ")}`);
 }
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));
 const lazySource = [...lazyFiles].map((file) => readFileSync(file, "utf8")).join("\n");

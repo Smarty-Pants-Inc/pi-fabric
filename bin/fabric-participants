@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Fabric participant directory as JSON, read-only (smarty-knowledge-3#395); see docs/participants-cli.md.
+import { main } from "../dist/participants-cli.js";
+
+main(process.argv.slice(2)).then(
+  (code) => { process.exitCode = code; },
+  (error) => { process.stderr.write(`fabric-participants: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; },
+);

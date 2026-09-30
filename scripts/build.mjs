@@ -7,6 +7,7 @@ const primaryEntryPoints = [
   "src/memory.ts",
   "src/mesh.ts",
   "src/mesh-bridge.ts",
+  "src/participants-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/jev.ts",
@@ -102,7 +103,7 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // ponytail: typebox (agent-result schema checks) is their only host import
 // today; scripts/smoke-package-install.mjs fails if one gains another.
 const standalone = await build({
-  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts"],
+  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",
@@ -123,6 +124,22 @@ const standalone = await build({
           : { path: args.path, external: true });
     },
   }],
+});
+
+// smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
+// ones included. Built on its own, without splitting, so it shares no chunk with index.js.
+await build({
+  entryPoints: ["src/guards/actor-bash-hook.ts"],
+  outdir: "dist",
+  outbase: "src",
+  entryNames: "[dir]/[name]",
+  bundle: true,
+  packages: "external",
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  logLevel: "info",
 });
 
 // The records service runs as its own OS user from a root-owned copy of one file:

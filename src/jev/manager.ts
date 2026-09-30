@@ -15,7 +15,11 @@ interface Run {
   controller: AbortController;
   done: Promise<JevRunInfo>;
   observation: JevSubscription | undefined;
+  /** A terminal background result was returned by wait/status/stop (smarty-dev#2216). */
+  read?: boolean;
 }
+/** How long an unread background result holds a self-reload (smarty-dev#2216). */
+export const JEV_UNREAD_HOLD_MS = 10 * 60_000;
 export interface JevManagerOptions {
   registry: ActionRegistry;
   config: FabricConfig;
@@ -49,11 +53,16 @@ export class JevProgramManager {
     return run;
   }
   status(id: string, after = 0): JevRunInfo {
-    const info = this.#get(id).info;
+    const run = this.#get(id);
+    const info = run.info;
+    if (info.state !== "running") run.read = true;
     return structuredClone({ ...info, events: info.events.filter(e => e.sequence > after) });
   }
   async wait(id: string, signal?: AbortSignal): Promise<JevRunInfo> {
-    return structuredClone(await runAbortable(signal, () => this.#get(id).done));
+    const run = this.#get(id);
+    const info = await runAbortable(signal, () => run.done);
+    run.read = true;
+    return structuredClone(info);
   }
   /** Alias for wait. */
   join(id: string, signal?: AbortSignal): Promise<JevRunInfo> {
@@ -62,7 +71,9 @@ export class JevProgramManager {
   async stop(id: string): Promise<JevRunInfo> {
     const run = this.#get(id);
     if (run.info.state === "running") run.controller.abort(new Error("Jev run stopped"));
-    return structuredClone(await run.done);
+    const info = await run.done;
+    run.read = true;
+    return structuredClone(info);
   }
   advise(id: string, eventId: string, message: string) {
     if (typeof message !== "string" || !message.trim() || message.length > 2000 || typeof eventId !== "string" || eventId.length > 256)
@@ -262,6 +273,16 @@ export class JevProgramManager {
       if (this.#runs.size <= this.options.config.jev.maxRetainedRuns) break;
       if (run.info.state !== "running") this.#runs.delete(id);
     }
+  }
+  /**
+   * Runs starting or running: a reload cancels them (smarty-dev#2160). Also a terminal background
+   * run whose result nobody read yet, for JEV_UNREAD_HOLD_MS: close() drops it (smarty-dev#2216).
+   * ponytail: a bounded hold, not a carry across the reload like readStoppedRuns (#1602).
+   */
+  runningCount(now = Date.now()): number {
+    return this.#starting + [...this.#runs.values()].filter(r => r.info.state === "running"
+      // A cancelled run (stop, Escape, shutdown) has no result worth holding a reload for.
+      || (r.info.background && !r.read && r.info.state !== "cancelled" && now - (r.info.endedAt ?? now) < JEV_UNREAD_HOLD_MS)).length;
   }
   stopAll(): void {
     for (const run of this.#runs.values()) if (run.info.state === "running") run.controller.abort(new Error("Jev provider closed"));

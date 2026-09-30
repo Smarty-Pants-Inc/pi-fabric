@@ -56,9 +56,11 @@ export class ActorDirectory extends ActorManager {
     const actors = this.list();
     const exact = actors.find((actor) => actor.id === id);
     if (exact) return exact.scope === this.#defaultScope;
-    const matches = actors.filter((actor) => actor.id.startsWith(id) || actor.name === id);
+    let matches = actors.filter((actor) => actor.id.startsWith(id) || actor.name === id);
     if (matches.length === 0) throw new Error(`Unknown Fabric actor: ${id}`);
-    if (matches.length > 1) throw new Error(`Ambiguous Fabric actor: ${id}`);
+    // A same-name successor wins over a predecessor whose removal is pending (smarty-dev#2184).
+    if (matches.length > 1) matches = matches.filter((actor) => !actor.removal);
+    if (matches.length !== 1) throw new Error(`Ambiguous Fabric actor: ${id}`);
     return matches[0]!.scope === this.#defaultScope;
   }
 
@@ -75,10 +77,11 @@ export class ActorDirectory extends ActorManager {
       throw new Error(`Invalid Fabric actor storage scope: ${String(scope)}`);
     }
     const name = request.name.trim();
-    const sameName = this.list().filter((actor) => actor.name === name);
+    // A predecessor whose removal is pending finishes behind its run, not in this create's way.
+    const sameName = this.list().filter((actor) => actor.name === name && !actor.removal);
     const existing = sameName.find((actor) => actor.status !== "stopped");
     if (existing) throw new Error(`A Fabric actor named ${name} is already active (${existing.id})`);
-    for (const actor of sameName) await this.remove(actor.id);
+    for (const actor of sameName) await this.remove(actor.id, { wait: false });
     return scope === this.#defaultScope
       ? super.create(request, options)
       : this.#secondary.create(request, options);
@@ -125,7 +128,12 @@ export class ActorDirectory extends ActorManager {
   override dispatchObservedHostEvent(...args: Parameters<ActorManager["dispatchObservedHostEvent"]>): number { return super.dispatchObservedHostEvent(...args) + this.#secondary.dispatchObservedHostEvent(...args); }
   override stop(...args: Parameters<ActorManager["stop"]>): ReturnType<ActorManager["stop"]> { return this.#isPrimary(args[0]) ? super.stop(...args) : this.#secondary.stop(...args); }
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
+  /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
+  override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
   override haltAll(): { halted: number } { const first = super.haltAll(); const second = this.#secondary.haltAll(); return { halted: first.halted + second.halted }; }
+  override pendingRemovals(): ReturnType<ActorManager["pendingRemovals"]> { return [...super.pendingRemovals(), ...this.#secondary.pendingRemovals()]; }
+  override removalSettled(id: string): Promise<void> | undefined { return super.removalSettled(id) ?? this.#secondary.removalSettled(id); }
+  override async finishPendingRemovals(): Promise<void> { await super.finishPendingRemovals(); await this.#secondary.finishPendingRemovals(); }
   override remove(...args: Parameters<ActorManager["remove"]>): ReturnType<ActorManager["remove"]> { return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args); }
   override async close(): Promise<void> { await Promise.all([super.close(), this.#secondary.close()]); }
 }

@@ -161,7 +161,7 @@ const waitSchema = {
   type: "object",
   properties: {
     id: { type: "string" },
-    timeoutMs: { type: "number", minimum: 1_000, description: `Clamped to ${AGENT_WAIT_MAX_MS / 60_000} min: a foreground wait over the bash guard's limit blocks steers (smarty-dev#854)` },
+    timeoutMs: { type: "number", minimum: 1_000, description: `Clamped to ${AGENT_WAIT_MAX_MS / 60_000} min: a foreground wait over the bash guard's limit blocks steers (smarty-dev#854). In an interactive Main, clamped to 60 s, and the bound returns the live status with waitTimedOut: true (smarty-dev#2119)` },
   },
   required: ["id"],
   additionalProperties: false,
@@ -405,6 +405,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         transport: runProperties.transport,
         timeoutMs: runProperties.timeoutMs,
         nice: runProperties.nice,
+        bashTimeoutSeconds: { type: "integer", minimum: 0, description: "Default timeout in seconds for a bash call without one in this actor's runs (default 600); 0 = no default timeout." },
         extensions: runProperties.extensions,
         inferenceContext: { type: "string", enum: ["full-history", "activation"], description: "Inference-only activation window (Pi only); journals remain complete. Default full-history." },
         requires: {

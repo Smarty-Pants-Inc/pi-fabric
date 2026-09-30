@@ -6,6 +6,7 @@ import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import {
   abandonResidentRequest,
   RESIDENT_HOST_FORMAT,
+  residentHostStateNote,
   residentRoot,
   sleepUnlessAborted,
   type ResidentCommand,
@@ -33,10 +34,12 @@ export class ResidentActorClient {
   readonly #requestsPath: string;
   readonly #responsesPath: string;
   readonly #ownerPath: string;
+  readonly #residencyDir: string;
 
   constructor(meshRoot: string, rootId: string) {
     this.#rootId = rootId;
     const residencyDir = residentRoot(meshRoot, rootId);
+    this.#residencyDir = residencyDir;
     this.#requestsPath = path.join(residencyDir, "requests");
     this.#responsesPath = path.join(residencyDir, "responses");
     this.#ownerPath = path.join(residencyDir, "owner.json");
@@ -62,8 +65,8 @@ export class ResidentActorClient {
     return response.actor;
   }
 
-  async removeActor(id: string, signal?: AbortSignal): Promise<{ removed: true }> {
-    await this.#send({
+  async removeActor(id: string, signal?: AbortSignal): Promise<{ removed: true; pending?: string }> {
+    const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
       operation: "removeActor",
       requestId: randomUUID(),
@@ -71,7 +74,7 @@ export class ResidentActorClient {
       id,
       createdAt: Date.now(),
     }, signal);
-    return { removed: true };
+    return { removed: true, ...(response.pending ? { pending: response.pending } : {}) };
   }
 
   async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
@@ -92,7 +95,8 @@ export class ResidentActorClient {
         if (!owner?.pid) throw new Error("Root resident host exited during actor request");
         await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
       }
-      throw new Error("Timed out waiting for resident host actor response");
+      const note = residentHostStateNote(this.#residencyDir);
+      throw new Error(`Timed out waiting for resident host actor response (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
       abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
       throw error;

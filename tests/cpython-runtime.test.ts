@@ -24,7 +24,12 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 const python = childProcess.spawnSync("python3", ["-I", "-B", "-c", "import sys; print(sys.executable)"]);
 const hasPython = python.status === 0;
 const binary = hasPython ? python.stdout.toString().trim() : "python3";
-const options: FabricSandboxOptions = { timeoutMs: 5_000, memoryLimitBytes: 256 * 1024 * 1024 };
+// smarty-dev#883: the execution deadline also measures interpreter startup,
+// which a loaded runner can stretch past any small budget. Tests that do not
+// test the deadline therefore get a hang guard, and the tests that do run it
+// on a controlled clock.
+const HANG_GUARD_MS = 60_000;
+const options: FabricSandboxOptions = { timeoutMs: HANG_GUARD_MS, memoryLimitBytes: 256 * 1024 * 1024 };
 const roots: string[] = [];
 const temp = (): string => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cpython-runtime-"));
@@ -42,7 +47,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe.skipIf(!hasPython)("CPythonRuntime", () => {
+describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 }, () => {
   it("routes the records primitive through the same host bridge", async () => {
     expect(await run('return await records.read(after=3, limit=2)')).toMatchObject({
       terminationReason: "completed", value: { ref: "records.read", args: { after: 3, limit: 2 } },
@@ -148,19 +153,48 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
   });
 
   it("extends active deadlines at the host-call boundary", async () => {
-    const result = await run('return await tools.call(ref="slow.wait", args={})', async () => {
-      await new Promise((resolve) => setTimeout(resolve, 1100));
-      return "done";
-    }, { timeoutMs: 1000, minimumTimeoutMsForHostCall: () => 2000 });
-    expect(result).toMatchObject({ terminationReason: "completed", value: "done" });
+    // Controlled clock: startup takes no deadline time; the host call spends
+    // 1100 ms, past the original 1000 ms deadline but inside the 2000 ms floor.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const result = await run('return await tools.call(ref="slow.wait", args={})', async () => {
+        vi.advanceTimersByTime(1100);
+        return "done";
+      }, { timeoutMs: 1000, minimumTimeoutMsForHostCall: () => 2000 });
+      expect(result).toMatchObject({ terminationReason: "completed", value: "done" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("kills synchronous infinite loops and preserves pre-timeout logs", async () => {
-    // The wall deadline includes interpreter startup. Leave room for a cold
-    // process on busy CI before checking log preservation during termination.
-    const result = await run('print("started", flush=True)\nwhile True:\n    pass', echo, { timeoutMs: 1500 });
-    expect(result.terminationReason).toBe("timed_out");
-    expect(result.logs).toContain("started");
+    // smarty-dev#883: a wall deadline also measured interpreter startup, so a
+    // loaded runner timed out before the guest printed. The deadline runs on a
+    // controlled clock, advanced only once the guest has printed and entered its loop.
+    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    // Watch the guest's stdout from spawn on, so no early chunk is missed.
+    let started!: () => void;
+    const printed = new Promise<void>((resolve) => { started = resolve; });
+    vi.mocked(childProcess.spawn).mockImplementationOnce(((...args: Parameters<typeof actual.spawn>) => {
+      const child = actual.spawn(...args);
+      let output = "";
+      child.stdout?.on("data", (chunk: Buffer) => { output += chunk; if (output.includes("started")) started(); });
+      return child;
+    }) as typeof actual.spawn);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const pending = run('print("started", flush=True)\nwhile True:\n    pass', echo, { timeoutMs: 1500 });
+      // Once "started" arrives, the guest has returned from print and has no
+      // await point left before its loop. A run that ends first (a startup
+      // error) settles pending, so the race shows that error instead of hanging.
+      await Promise.race([printed, pending]);
+      vi.advanceTimersByTime(1500);
+      const result = await pending;
+      expect(result.terminationReason).toBe("timed_out");
+      expect(result.logs).toContain("started");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("aborts outstanding host calls and rejects pre-aborted invocations without spawn", async () => {
@@ -260,14 +294,98 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
     expect(writes).toEqual(["execute"]);
   });
 
-  it("bounds non-cooperative host calls after guest failure", async () => {
+  // Security review on #146: a broken pipe must end host authority at once,
+  // even when the child's "close" is held back (a descendant keeps stdout open).
+  it.skipIf(process.platform === "win32")("aborts issued host calls at a pipe error while the child's close is withheld", async () => {
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+        queueMicrotask(() => channel.push(`${JSON.stringify({ type: "call", id: 1, ref: "schema.status", args: {} })}\n`));
+      },
+    });
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(), stderr: new PassThrough(),
+      stdio: [null, null, null, channel], kill: vi.fn(),
+    });
+    vi.mocked(childProcess.spawn).mockReturnValue(child as unknown as ReturnType<typeof childProcess.spawn>);
+    const calls: string[] = [];
+    let abortedAtError: boolean | undefined;
     const started = Date.now();
+    const result = await run("return 1", (ref, _args, signal) => {
+      calls.push(ref);
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        if (calls.length === 1) queueMicrotask(() => {
+          channel.emit("error", new Error("read ECONNRESET"));
+          abortedAtError = signal?.aborted;
+          // A late guest frame after the break is not admitted.
+          channel.emit("data", Buffer.from(`${JSON.stringify({ type: "call", id: 2, ref: "memory.sessions", args: {} })}\n`));
+        });
+      });
+    }, { timeoutMs: 60_000 });
+    expect(abortedAtError).toBe(true);
+    expect(calls).toEqual(["schema.status"]);
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(result).toMatchObject({ terminationReason: "runtime_error" });
+    expect(result.error).toContain("CPython IPC failed: read ECONNRESET");
+    expect(result.error).toContain("did not report its exit");
+    expect(Date.now() - started).toBeLessThan(30_000);
+  });
+
+  // Astra round 2: the execution deadline may expire during the diagnosis wait;
+  // it must settle the recorded pipe failure, not replace it with a timeout.
+  it.skipIf(process.platform === "win32")("keeps the pipe failure when the deadline expires during its diagnosis", async () => {
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+        queueMicrotask(() => channel.push(`${JSON.stringify({ type: "call", id: 1, ref: "schema.status", args: {} })}\n`));
+      },
+    });
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(), stderr: new PassThrough(),
+      stdio: [null, null, null, channel], kill: vi.fn(),
+    });
+    vi.mocked(childProcess.spawn).mockReturnValue(child as unknown as ReturnType<typeof childProcess.spawn>);
+    let signalBroken!: () => void;
+    const broken = new Promise<void>((resolve) => { signalBroken = resolve; });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const pending = run("return 1", (_ref, _args, signal) => new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        // The pipe breaks with 500 ms left, less than the 2 s diagnosis bound.
+        queueMicrotask(() => {
+          vi.advanceTimersByTime(500);
+          channel.emit("error", new Error("read ECONNRESET"));
+          signalBroken();
+        });
+      }), { timeoutMs: 1000 });
+      await broken;
+      vi.advanceTimersByTime(3000);
+      const result = await pending;
+      expect(result).toMatchObject({ terminationReason: "runtime_error" });
+      expect(result.error).toContain("CPython IPC failed: read ECONNRESET");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds non-cooperative host calls after guest failure", async () => {
+    // smarty-dev#883: time from the sibling failure, not from before
+    // interpreter startup. Without the settle bound, the never-settling call
+    // would hold the run to its hang-guard deadline (timed_out).
+    let failedAt = 0;
     const result = await run('await asyncio.gather(schema.status(), memory.sessions())', async (ref) => {
       if (ref === "schema.status") return new Promise(() => undefined);
+      failedAt = Date.now();
       throw new Error("sibling failed");
     });
+    expect(result.terminationReason).toBe("runtime_error");
     expect(result.error).toContain("sibling failed");
-    expect(Date.now() - started).toBeLessThan(2000);
+    expect(Date.now() - failedAt).toBeLessThan(10_000);
   });
 
   it("rejects malformed/oversized IPC before calling the host", async () => {
@@ -302,6 +420,17 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  // smarty-dev#883: bwrap without user namespaces exits before it reads the
+  // execute frame; the reset pipe raced "close" and hid the sandbox diagnosis.
+  it.skipIf(process.platform === "win32")("reports a child that exits at startup, not the pipe reset it leaves", async () => {
+    const dying = path.join(temp(), "dying-python");
+    fs.writeFileSync(dying, "#!/bin/sh\necho 'bwrap: setting up uid map: Permission denied' >&2\nexit 1\n", { mode: 0o755 });
+    const result = await new CPythonRuntime(dying).execute(`return "${"x".repeat(256 * 1024)}"`, echo, options);
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toMatch(/process exited before returning a result \(1\)/);
+    expect(result.error).toContain("setting up uid map");
+  });
+
   it.each(['sys.version_info = (3, 9, 0)', 'sys.implementation.name = "pypy"'])("rejects unsupported interpreter identity before imports/RPC: %s", (override) => {
     const result = childProcess.spawnSync(binary, ["-I", "-B", "-c", `import sys\n${override}\nexec(${JSON.stringify(CPYTHON_CHILD_SOURCE)})`]);
     expect(result.status).toBe(1);
@@ -327,7 +456,7 @@ const linuxSandboxStarts = (() => {
 })();
 const usableSandbox = installedSandbox && (process.platform !== "linux" || linuxSandboxStarts);
 
-describe.skipIf(!hasPython || !supportedSandbox)("CPython OS sandbox", () => {
+describe.skipIf(!hasPython || !supportedSandbox)("CPython OS sandbox", { timeout: HANG_GUARD_MS + 30_000 }, () => {
   it.skipIf(process.platform !== "linux" || !usableSandbox)("starts the real Linux sandbox and carries the result over inherited IPC", async () => {
     const result = await new CPythonRuntime(binary, true).execute("return 6 * 7", echo, options);
     expect(result.terminationReason, `${result.error}\n${result.logs.join("\n")}`).toBe("completed");

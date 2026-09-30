@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { describeWaitBound } from "./wait-bound.js";
+import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +38,7 @@ import { removeTree } from "./rm.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
 import { ProcessTransport } from "./transports/process-transport.js";
+import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
 import type {
@@ -76,8 +78,9 @@ import {
   heartbeatRunRoot,
   markRunRootActive,
   markRunRootClosed,
+  claimTempRunSweep,
   removeEmptyRunRoot,
-  sweepTempRunRoots,
+  type TempRunSweepRequest,
 } from "../storage/retention.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 import { effectiveAgentNice, parseAgentNice } from "./priority.js";
@@ -104,8 +107,6 @@ const MAX_RETAINED_RUN_HANDLES = 1_000;
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
-// Synchronous walk: bound it on exit and on a live Main's event loop (smarty-dev#2010).
-const RETENTION_SWEEP_BUDGET_MS = 1_000;
 
 export const effectiveAgentTimeoutMs = (
   configuredTimeoutMs: number,
@@ -263,6 +264,12 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Set by an explicit stop — tool, dashboard, or session shutdown. A requested
    *  stop is terminal and must never be resumed behind the operator's back. */
   stopRequested: boolean;
+  /**
+   * Its owner gave it up (a stopped or removed actor): nobody wants its result, so a worker that
+   * dies is not relaunched and the run ends failed (smarty-dev#2184 item 8b). A caller that only
+   * stopped waiting does not set this: its detached run is still resumed (review on pi-fabric#160).
+   */
+  abandoned?: boolean;
   /** Monotonic progress maxima seen for this run across attempts. The worker's
    *  own terminal record keeps its counters, but a host-synthesized stop or
    *  transport-death record resets them to zero, so recovery reads this. */
@@ -547,6 +554,7 @@ export class AgentManager {
   readonly #managedTempRoot: boolean;
   readonly #retention: FabricRetentionConfig;
   readonly #workerPath: string;
+  readonly #sweepPath: string;
   readonly #fabricExtensionPath: string;
   readonly #piBinary: string;
   readonly #claudeBinary: string;
@@ -601,6 +609,8 @@ export class AgentManager {
     readonly config: FabricAgentConfig,
     options: {
       workerPath?: string;
+      /** The detached temp-root sweep entry (dist/storage/sweep-main.js). */
+      sweepPath?: string;
       fabricExtensionPath?: string;
       piBinary?: string;
       claudeBinary?: string;
@@ -635,6 +645,8 @@ export class AgentManager {
     this.#retention = options.retention ?? DEFAULT_FABRIC_CONFIG.retention;
     this.#workerPath =
       options.workerPath ?? fileURLToPath(new URL("../worker.js", import.meta.url));
+    this.#sweepPath =
+      options.sweepPath ?? fileURLToPath(new URL("../storage/sweep-main.js", import.meta.url));
     this.#fabricExtensionPath =
       options.fabricExtensionPath ?? fileURLToPath(new URL("../index.js", import.meta.url));
     this.#piBinary = resolvePiBinary(options.piBinary);
@@ -1011,6 +1023,7 @@ export class AgentManager {
           : []),
         ...(request.actorId ? ["--actor-id", request.actorId] : []),
         ...(request.actorName ? ["--actor-name", request.actorName] : []),
+        ...(request.bashTimeoutSeconds !== undefined ? ["--actor-bash-timeout", String(request.bashTimeoutSeconds)] : []),
         ...(request.capabilityRequirements
           ? ["--capability-requirements", JSON.stringify(request.capabilityRequirements)]
           : []),
@@ -1119,8 +1132,13 @@ export class AgentManager {
     }
   }
 
-  async run(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentRunResult> {
+  async run(
+    request: AgentRunRequest,
+    signal?: AbortSignal,
+    onSpawned?: (handle: AgentHandleInfo) => void,
+  ): Promise<AgentRunResult> {
     const handle = await this.spawn(request, signal);
+    onSpawned?.(handle);
     return this.wait(handle.id);
   }
 
@@ -1155,7 +1173,7 @@ export class AgentManager {
     const bound = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
         this.#detach(managed, "agents.wait reached its bound; the run continues");
-        reject(new Error(
+        reject(new AgentWaitBoundError(
           `agents.wait: ${managed.name} is still running after ${describeWaitBound(timeoutMs)}. It continues, and its result ` +
             "arrives as a completion message after this turn: end the turn now.",
         ));
@@ -1181,6 +1199,15 @@ export class AgentManager {
    * and keeps going to a real terminal state; a run that never started working is
    * still stopped, because releasing it loses nothing.
    */
+  /**
+   * Its owner no longer wants this run (an actor stopped or removed while the run finishes): it
+   * may end on its own, but a worker that dies is not relaunched (smarty-dev#2184 item 8b).
+   */
+  abandon(id: string): void {
+    const managed = this.#runs.get(id);
+    if (managed && !managed.settled) managed.abandoned = true;
+  }
+
   #handleCallerAbort(id: string): void {
     const managed = this.#runs.get(id);
     if (!managed || managed.settled || this.#closing) return;
@@ -1498,18 +1525,37 @@ export class AgentManager {
       }
     }
     if (this.#budgetOwned) clearOwnedBudgetEnv();
-    if (this.#managedTempRoot) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      try {
-        sweepTempRunRoots({
-          tempRoot: os.tmpdir(),
-          currentRoot: this.#runRoot,
-          orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
-          oneShotRunRetentionMs: this.#retention.oneShotRunMs,
-          minIntervalMs: RETENTION_SWEEP_INTERVAL_MS,
-          budgetMs: RETENTION_SWEEP_BUDGET_MS,
-        });
-      } catch {}
+    if (this.#managedTempRoot) await this.#startTempRunSweep();
+  }
+
+  /**
+   * Walking every retained run on the host is slow (about 60 runs/s at load 130 on Dev1), so it
+   * runs in a detached, niced process: neither this exit nor a live event loop waits for it, and
+   * one unbounded sweep per interval per host keeps up with creation (smarty-dev#2010).
+   */
+  async #startTempRunSweep(): Promise<void> {
+    const request: TempRunSweepRequest = {
+      tempRoot: os.tmpdir(),
+      currentRoot: this.#runRoot,
+      orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
+      oneShotRunRetentionMs: this.#retention.oneShotRunMs,
+    };
+    try {
+      // A Bun-compiled Pi's execPath is Pi itself: resolve a real node/bun (the override, then PATH)
+      // as every other detached launch does. Resolve before the claim, so a host that cannot run
+      // the sweep does not suppress the next attempt for a whole interval.
+      const [runtime, ...args] = await scriptSpawnArgs(this.#sweepPath, [JSON.stringify(request)]);
+      if (!claimTempRunSweep(os.tmpdir(), RETENTION_SWEEP_INTERVAL_MS)) return;
+      const child = spawn(runtime!, args, {
+        detached: true, stdio: "ignore", windowsHide: true,
+      });
+      child.on("error", () => undefined);
+      if (child.pid) {
+        try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
+      }
+      child.unref();
+    } catch {
+      // The next close or interval sweeps.
     }
   }
 
@@ -1524,15 +1570,7 @@ export class AgentManager {
   async #runRetentionSweep(now = Date.now()): Promise<void> {
     if (this.#managedTempRoot) {
       heartbeatRunRoot(this.#runRoot, now);
-      sweepTempRunRoots({
-        tempRoot: os.tmpdir(),
-        currentRoot: this.#runRoot,
-        orphanedTempRunRetentionMs: this.#retention.orphanedTempRunMs,
-        oneShotRunRetentionMs: this.#retention.oneShotRunMs,
-        now,
-        minIntervalMs: RETENTION_SWEEP_INTERVAL_MS,
-        budgetMs: RETENTION_SWEEP_BUDGET_MS,
-      });
+      await this.#startTempRunSweep();
     }
     const expired = [...this.#runs.values()].filter((managed) => {
       if (!managed.settled || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
@@ -1591,6 +1629,7 @@ export class AgentManager {
       managed.settled ||
       this.#closing ||
       managed.abortSignal?.aborted ||
+      managed.abandoned ||
       record.status !== "failed" ||
       !(
         (managed.runner === "pi" && retryablePiStartupError(record.error)) ||
@@ -1610,7 +1649,7 @@ export class AgentManager {
     if (Date.now() + retryDelayMs >= deadline) return false;
     await this.#waitForTransportExit(managed);
     await delay(retryDelayMs);
-    if (managed.settled || this.#closing || managed.abortSignal?.aborted) return false;
+    if (managed.settled || this.#closing || managed.abortSignal?.aborted || managed.abandoned) return false;
     managed.startupAttempts++;
     return this.#relaunch(managed, record);
   }
@@ -1633,6 +1672,7 @@ export class AgentManager {
       managed.settled ||
       this.#closing ||
       managed.stopRequested ||
+      managed.abandoned ||
       managed.resumeAttempts >= AGENT_RESUME_MAX_ATTEMPTS ||
       !this.#observedWork(managed) ||
       !recoverableStop(record)
@@ -1643,7 +1683,7 @@ export class AgentManager {
     if (Date.now() + retryDelayMs >= deadline) return false;
     await this.#waitForTransportExit(managed);
     await delay(retryDelayMs);
-    if (managed.settled || this.#closing || managed.stopRequested) return false;
+    if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
     managed.resumeAttempts += 1;
     const { turns, toolCalls, usage } = managed.observedProgress;
     return this.#relaunch(managed, record, {
@@ -1697,7 +1737,7 @@ export class AgentManager {
       const previousSession = managed.transport.sessionId;
       await managed.transport.stop().catch(() => undefined);
       await this.#waitForTransportExit(managed);
-      if (managed.settled || this.#closing || managed.stopRequested) return false;
+      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       // Relaunch only when the previous worker is gone for certain. A worker that did
       // not stop, or whose transport cannot say, fails the run instead of running twice.
       if (await managed.transport.isAlive().catch(() => true)) {
@@ -1725,15 +1765,15 @@ export class AgentManager {
       // the journal it landed in.
       this.#drainLifecycle(managed);
       fs.rmSync(managed.statusFile, { force: true });
-      if (managed.settled || this.#closing || managed.stopRequested) return false;
+      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
       this.#unregisteredTransports.delete(managed.transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
-      if (managed.settled || this.#closing || managed.stopRequested) {
-        // A stop landed while the relaunch was in flight. Release the child we
-        // just started so it cannot outlive the monitor and the stop path can
-        // publish its terminal record.
+      if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) {
+        // A stop (or an abandonment, #2184 8b) landed while the relaunch was in flight.
+        // Release the child we just started so it cannot outlive the monitor and the
+        // stop path can publish its terminal record.
         await managed.transport.stop().catch(() => undefined);
         return false;
       }

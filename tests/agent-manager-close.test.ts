@@ -15,7 +15,8 @@ const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManag
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   for (const key of ["PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, retainRuns, transport: "process", sessionExport: false }, {
-    workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), ...extra,
+    workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+    sweepPath: path.resolve("dist/storage/sweep-main.js"), ...extra,
   });
   managers.push(manager);
   const name = fs.readdirSync(tempRoot).find((name) => name.startsWith("pi-fabric-runs-"));
@@ -81,8 +82,31 @@ describe("AgentManager close storage", () => {
     managers.push(second);
     await new Promise((resolve) => setImmediate(resolve));
     expect(fs.existsSync(sentinel)).toBe(true);
+    const started = performance.now();
     await manager.close();
-    expect(fs.existsSync(sentinel)).toBe(false);
+    // smarty-dev#2010: close only starts the detached sweep; it never waits for the walk.
+    expect(performance.now() - started).toBeLessThan(5_000);
+    await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
+  });
+
+  it("starts the close sweep through a real JS runtime under a Bun-compiled Pi (smarty-dev#2010)", async () => {
+    const originalExecPath = process.execPath;
+    const originalOverride = process.env.PI_FABRIC_NODE_BINARY;
+    const { manager, tempRoot } = setup();
+    const sentinel = path.join(tempRoot, "pi-fabric-runs-bundled");
+    fs.mkdirSync(sentinel);
+    fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    // process.execPath is the Pi executable itself, which cannot run sweep-main.js.
+    process.execPath = "/usr/local/bin/pi";
+    process.env.PI_FABRIC_NODE_BINARY = originalExecPath;
+    try {
+      await manager.close();
+    } finally {
+      process.execPath = originalExecPath;
+      if (originalOverride === undefined) delete process.env.PI_FABRIC_NODE_BINARY;
+      else process.env.PI_FABRIC_NODE_BINARY = originalOverride;
+    }
+    await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
   });
 
   it("preserves explicit caller roots with retainRuns:true", async () => {

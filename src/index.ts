@@ -1,12 +1,14 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
-import { killsByPattern, PATTERN_KILL_REASON } from "./core/pattern-kill.js";
+import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
+import { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp } from "./core/pattern-kill.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  MessageUpdateEvent,
 } from "@earendil-works/pi-coding-agent";
 import { defaultCodePreviewSettings } from "./ui/code-preview.js";
 import {
@@ -109,7 +111,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
-import { readStoppedRuns } from "./agents/stopped-runs.js";
+import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
+import { installSelfReload, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -393,10 +396,17 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     haltOnEscapeUnsubscribe = installFabricEscapeHalt(context, {
       enabled: () => state.initialized && (state.config.mesh.enabled || state.config.jev.enabled) && state.config.ui.haltOnEscape,
       ownsInput: () => fabricUi.ownsInput,
-      halted: () => state.advisorsHalted,
+      // Called only for a recognized lone Escape: latch it even when nothing was left to halt.
+      halted: () => { escapeLatched = true; return state.advisorsHalted; },
       halt: () => state.haltAdvisors(),
     });
   };
+  // The user's Escape stop-the-world, held for the self-reload gate independently of the actor
+  // and Jev halts and of any settle outcome; only a non-extension input lifts it (pi-fabric#160).
+  let escapeLatched = false;
+  pi.on("input", (event) => {
+    if ((event as { source?: string }).source !== "extension") escapeLatched = false;
+  });
   const installShellHangKeys = (context: ExtensionContext): void => {
     uninstallShellHangKeys();
     shellHangKeysUnsubscribe = installFabricShellHangKeys(context, {
@@ -626,8 +636,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
   };
 
-  pi.on("session_start", async (_event, context) => {
+  pi.on("session_start", async (event, context) => {
+    fabricPrewarm = undefined;
     stopInboxWake();
+    // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
+    const reloadNotice = takeReloadStoppedNotice(context.sessionManager?.getSessionId?.() ?? "", event?.reason ?? "");
+    if (reloadNotice && context.hasUI) context.ui.notify(reloadNotice, "warning");
     inboxWake.context = context;
     inboxWake.armed = true;
     endEntropyLifecycle();
@@ -662,7 +676,22 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     applyFabricMode();
     // Results of task agents the last reload/shutdown stopped reach the spawner now (smarty-dev#1602).
     const stoppedUndelivered = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []).undelivered.length > 0;
-    if (stoppedUndelivered || state.shouldEagerlyActivate(context)) await state.ensure(context);
+    // A self-reload (smarty-dev#2160) re-arms the actors this Main hosts and reports on the mesh.
+    const selfReloaded = selfReload.sessionStart(event?.reason ?? "", context);
+    if (selfReloaded && context.hasUI) {
+      const notice = `Fabric reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
+      context.ui.notify(notice, "info");
+      // The TUI's own "Reloaded ..." status line replaces an info notice; the footer keeps it
+      // until the user's next input.
+      context.ui.setStatus(SELF_RELOAD_STATUS, notice);
+    }
+    if (stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+    if (selfReloaded) {
+      await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
+        ...selfReloaded,
+        sessionId: context.sessionManager.getSessionId(),
+      });
+    }
   });
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget
@@ -764,6 +793,22 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   };
 
 
+  // The first fabric_exec of a session paid Fabric's initialization and the TypeScript checker
+  // (5-10 s on a loaded host) after the model finished streaming it. Start both when the model
+  // starts streaming that call, the first sign of actual use (smarty-dev#2010).
+  let fabricPrewarm: Promise<void> | undefined;
+  const prewarmOnFabricExecStream = (event: MessageUpdateEvent, context: ExtensionContext): void => {
+    if (fabricPrewarm) return;
+    const update = event.assistantMessageEvent;
+    if (update.type !== "toolcall_start" && update.type !== "toolcall_delta") return;
+    const block = update.partial?.content?.[update.contentIndex];
+    if (block?.type !== "toolCall" || block.name !== "fabric_exec") return;
+    fabricPrewarm = (async () => {
+      await state.ensure(context);
+      await state.execution.prewarm(context);
+    })().catch(() => undefined);
+  };
+
   // Speculative PTC: follow fabric_exec argument streaming and pre-launch
   // literal-argument read calls so their latency hides behind generation.
   pi.on("message_start", () => {
@@ -771,6 +816,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("message_update", (event, context) => {
+    prewarmOnFabricExecStream(event, context);
     if (!state.initialized) return;
     state.speculationTap?.handleMessageUpdate(event, context);
   });
@@ -787,8 +833,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
     if (killsByPattern(command)) return { block: true, reason: PATTERN_KILL_REASON };
+    if (wipesTmp(command)) return { block: true, reason: TMP_WIPE_REASON };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
-    return reason ? { block: true, reason } : undefined;
+    if (reason) return { block: true, reason };
+    // smarty-dev#2184: judged on the caller's own timeout above, so the injected default never unblocks a wait.
+    const injected = actorBashTimeout(process.env, timeout);
+    if (injected !== undefined) (event.input as { timeout?: number }).timeout = injected;
+    return undefined;
   });
 
   // Pi 0.80.6 intentionally ignores `isError` returned by custom-tool
@@ -1140,6 +1191,19 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     suspendToolCapture,
     refreshCodePreviewSettings,
     refreshToolDisplay: () => toolDisplay.refresh(),
+  });
+
+  // Registered after Fabric's own agent_settled handler, so the inbox follow-up goes first.
+  const selfReload = installSelfReload(pi, {
+    busy: () => state.initialized
+      ? state.agents.runningCount() + state.actors.inFlightCount() + state.backgroundWorkCount()
+      : 0,
+    autoReloadConfigured: () => state.provisionalConfig().autoReload,
+    moduleUrl: import.meta.url,
+    publishHeld: data => { void state.publishOpsEvent(RELOAD_HELD_TOPIC, "fabric.reload_held", data); },
+    // Escape's stop-the-world halt of actors or Jev observers (mesh off too); the user's next
+    // input lifts it (review/astra on pi-fabric#158, #160).
+    halted: () => escapeLatched || state.escapeHalted,
   });
 }
 

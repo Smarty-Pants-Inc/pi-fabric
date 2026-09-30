@@ -21,6 +21,7 @@ import { buildActorContext } from "./actors/context.js";
 import { actorDeliveryNotice } from "./actors/delivery-policy.js";
 import { prepareFabricActorHostPayload } from "./actors/host-event-payload.js";
 import type { JevObservationHost } from "./jev/observation.js";
+import type { JevProgramManager } from "./jev/manager.js";
 import { resolveJevModelRoute } from "./jev/routes.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
 import { CapturedToolCatalog, type CapturedToolEntry } from "./capture/catalog.js";
@@ -127,7 +128,7 @@ import {
 import { participantProject, participantRole } from "./topology/project-identity.js";
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
-import { restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
+import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
 import { ResidencyClient } from "./residency/client.js";
@@ -195,6 +196,7 @@ export class FabricRuntimeState {
   #shellInbox: ShellEventInbox | undefined;
   #actors: ActorDirectory | undefined;
   #jevObservationHost: JevObservationHost | undefined;
+  #jevPrograms: JevProgramManager | undefined;
   #globalActors: GlobalActorRegistry | undefined;
   #rootInbox: RootInbox | undefined;
   #records: Promise<RecordsService> | undefined;
@@ -731,8 +733,10 @@ export class FabricRuntimeState {
         completionInbox.acknowledge(id);
         markStoppedDelivered(id);
       },
-      onStoppedAtClose: (results) =>
-        this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results }),
+      onStoppedAtClose: (results) => {
+        rememberStoppedAtClose(sessionId, results);
+        this.pi.appendEntry<StoppedAgentsEntryData>(STOPPED_AGENTS_ENTRY, { stopped: results });
+      },
     });
     // Runs a previous runtime of this session stopped at reload/shutdown (smarty-dev#1602):
     // wait/status answer from the record, and with notices on each result reaches the spawner once.
@@ -829,6 +833,9 @@ export class FabricRuntimeState {
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);
+    // A removal this Main accepted behind a run that its restart ended (a same-name create) is
+    // finished here, as a resident host does at start; ownership limits it to this Main's actors.
+    if (ownsPersistentActorRegistry) void this.#actors.finishPendingRemovals().catch(() => undefined);
     this.#registry.subscribeProviderChanges(() => {
       this.#actors?.retryCapabilityWaiters();
       this.#refreshRepairCatalog();
@@ -983,12 +990,14 @@ export class FabricRuntimeState {
           });
           // A program may pin jev.evaluate itself. Cancel at owner retirement,
           // not only at provider.close(), which waits for those pins to drain.
+          this.#jevPrograms = provider.manager;
           const stop = () => { observationHost?.close(); provider.manager.stopAll(); };
           component.signal.addEventListener("abort", stop, { once: true });
           component.defer(async () => {
             component.signal.removeEventListener("abort", stop);
             observationHost?.close();
             if (this.#jevObservationHost === observationHost) this.#jevObservationHost = undefined;
+            if (this.#jevPrograms === provider.manager) this.#jevPrograms = undefined;
             await provider.manager.close();
           }, { label: "jev-program-owner", kind: "transactional", resources: ["jev:programs"], ordering: "ordered" });
           return provider;
@@ -1286,6 +1295,15 @@ export class FabricRuntimeState {
     return (!this.#config?.mesh.enabled || Boolean(this.#actors?.halted)) && (!this.#jevObservationHost || this.#jevObservationHost.halted);
   }
 
+  /**
+   * Escape's stop-the-world halt is in force: actors or the Jev observation host are halted.
+   * Both latches outlive the cancelled runs and lift only on the user's next input, so the
+   * self-reload gate holds with the mesh off too (review/astra on pi-fabric#160).
+   */
+  get escapeHalted(): boolean {
+    return Boolean(this.#actors?.halted) || Boolean(this.#jevObservationHost?.halted);
+  }
+
   haltAdvisors(): number {
     const actors = this.#config?.mesh.enabled ? this.#actors?.haltAll().halted ?? 0 : 0;
     return actors + (this.#jevObservationHost?.halt() ?? 0);
@@ -1310,7 +1328,8 @@ export class FabricRuntimeState {
       this.#config.schema.mode === "enforce"
     ) return observed;
     const idle = context.isIdle();
-    if (!this.#actors.observeHostEvent(event, idle)) return observed;
+    const source = event === "input" && isPlainObject(payload) && typeof payload.source === "string" ? payload.source : undefined;
+    if (!this.#actors.observeHostEvent(event, idle, source)) return observed;
     const branch = context.sessionManager.getBranch();
     const { digest, transcript } = buildActorContext(
       branch as unknown[],
@@ -1455,6 +1474,9 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
+    // Stop the resident drainer (and await its drain) before the Main journal closes: a delivery
+    // must never reach a Main that can no longer journal it (review round 3 on pi-fabric#160).
+    await this.#residency?.close().catch(() => undefined);
     this.#mainAgent?.closeFollowUpDrain();
     this.#suppressResidentGuidanceSync = true;
     await this.#deactivateRepairs();
@@ -1512,6 +1534,22 @@ export class FabricRuntimeState {
     this.prewalkDrift.clear();
   }
 
+  /**
+   * Session-owned work a reload would cancel besides task agents and actor runs: live shell jobs
+   * (background, monitors, auto-detached) and running Jev programs, observers included (smarty-dev#2160).
+   * A finished shell job counts until its notice is sent and delivered; a background Jev run until
+   * its result is read (smarty-dev#2216).
+   */
+  backgroundWorkCount(): number {
+    return this.#shellJobs.unannounced() + (this.#shellInbox?.pendingCount() ?? 0) + (this.#jevPrograms?.runningCount() ?? 0);
+  }
+
+  /** Best-effort ops event on the mesh, e.g. ops.fabric.reloaded (smarty-dev#2160). */
+  publishOpsEvent(topic: string, kind: string, data: Record<string, unknown>): Promise<void> {
+    if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return Promise.resolve();
+    return this.#mesh.publish({ topic, kind, from: this.#identity, data }).then(() => undefined, () => undefined);
+  }
+
   // Publish a best-effort mesh event to the durable `fabric.compact` topic so
   // other roots, agents, and actors can observe compaction transitions.
   // Activity-only sessions (mesh disabled) silently skip this.
@@ -1556,6 +1594,9 @@ export class FabricRuntimeState {
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
+    // Stop the resident drainer (and await its drain) before the Main journal closes: a delivery
+    // must never reach a Main that can no longer journal it (review round 3 on pi-fabric#160).
+    await this.#residency?.close().catch(() => undefined);
     this.#mainAgent?.closeFollowUpDrain();
     await this.shellJobs.close();
     await this.#deactivateRepairs();

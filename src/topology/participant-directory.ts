@@ -438,7 +438,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // publish fails (for example a contended mesh lock at startup), keep
       // retrying so this host joins the mesh once the lock clears instead of
       // staying invisible until the next restart.
-      this.#timer = setInterval(() => void this.#backgroundRefresh.run(() => this.refresh()), this.#heartbeatMs);
+      this.#timer = setInterval(() => void this.#backgroundRefresh.run(() => this.refresh(), false), this.#heartbeatMs);
       this.#timer.unref();
     }
     if (initialError) throw initialError;
@@ -457,7 +457,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const run = (): void => {
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
-      void this.#backgroundRefresh.run(() => this.#runRefresh(false));
+      void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
     };
     const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
     if (wait <= 0) {
@@ -496,6 +496,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       const committed = await operation;
       if (!committed) return;
+      // An unchanged change-refresh proves nothing about the lock. Only a committed
+      // write/confirmWritable acquisition ends the background path's lock outage.
+      if (this.options.enabled) this.#backgroundRefresh.success();
       this.#refreshedAt = Date.now();
       this.#refreshError = undefined;
       if (full) this.#sweepDeadHosts();

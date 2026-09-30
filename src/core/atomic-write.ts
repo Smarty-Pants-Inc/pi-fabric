@@ -260,13 +260,15 @@ export class MeshBackgroundRetry {
     return transient;
   }
 
-  /** Polls retry unchanged state on a later tick after backoff; contains sync handlers too. */
-  async run(operation: () => unknown | Promise<unknown>): Promise<"done" | "retry" | "failed" | "skipped"> {
+  /** Polls retry unchanged state on a later tick after backoff; contains sync handlers too.
+   * Paths that may no-op can reset explicitly after a confirmed acquisition instead.
+   */
+  async run(operation: () => unknown | Promise<unknown>, resetOnSuccess = true): Promise<"done" | "retry" | "failed" | "skipped"> {
     if (this.#running || this.waitMs > 0) return "skipped";
     this.#running = true;
     try {
       await operation();
-      this.success();
+      if (resetOnSuccess) this.success();
       return "done";
     } catch (error) {
       return this.failure(error) ? "retry" : "failed";

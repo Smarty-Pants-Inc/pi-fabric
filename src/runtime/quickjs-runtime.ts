@@ -824,7 +824,15 @@ const disposeQuickJsContext = (context: any): void => {
   }
 };
 
-export type QuickJsSandboxOptions = FabricSandboxOptions;
+export type QuickJsSandboxOptions = FabricSandboxOptions & {
+  /**
+   * Opt-in setup allowance, separate from timeoutMs. Covers host/guest setup,
+   * transpilation and program compilation; timeoutMs starts just before the
+   * prepared program is invoked. Cannot replace a shared executionDeadline.
+   * Both phases remain clamped by maximumDeadlineAt, if supplied.
+   */
+  setupTimeoutMs?: number;
+};
 
 export class QuickJsRuntime {
   async execute(
@@ -864,6 +872,22 @@ export class QuickJsRuntime {
         error: "QuickJS timeout must be positive",
       };
     }
+    if (options.setupTimeoutMs !== undefined && (!Number.isFinite(options.setupTimeoutMs) || options.setupTimeoutMs < 1)) {
+      return {
+        value: undefined,
+        logs: [],
+        terminationReason: "runtime_error",
+        error: "QuickJS setup timeout must be positive",
+      };
+    }
+    if (options.setupTimeoutMs !== undefined && options.executionDeadline) {
+      return {
+        value: undefined,
+        logs: [],
+        terminationReason: "runtime_error",
+        error: "QuickJS separate setup budget cannot replace a shared execution deadline",
+      };
+    }
     if (options.maxLogChars !== undefined && (!Number.isSafeInteger(options.maxLogChars) || options.maxLogChars < 0)) {
       return {
         value: undefined,
@@ -889,7 +913,9 @@ export class QuickJsRuntime {
     const runtime = context.runtime;
     const jsonObject = context.getProp(context.global, "JSON");
     const jsonParse = context.getProp(jsonObject, "parse");
-    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
+    let executionDeadline = options.executionDeadline ?? new ExecutionDeadline(
+      options.setupTimeoutMs === undefined ? options : { ...options, timeoutMs: options.setupTimeoutMs },
+    );
     let interruptedByDeadline = false;
     // Timers cannot police an uninterrupted chain of already-resolved host
     // promises. Every boundary and the CPU interrupt use this same deadline.
@@ -1114,9 +1140,28 @@ export class QuickJsRuntime {
         : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
       const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
       const guestLineCount = guestBundle.code.split("\n").length;
-      const wrappedCode = `${guestBundle.code}\nPromise.race([__piFabricMain(), globalThis.__fabricExecutionGate])`;
+      const invokeCode = "Promise.race([__piFabricMain(), globalThis.__fabricExecutionGate])";
+      const wrappedCode = `${guestBundle.code}\n${invokeCode}`;
       cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
-      const evaluation = context.evalCode(wrappedCode, "pi-fabric-guest.js");
+      if (options.setupTimeoutMs !== undefined && deadlineReached()) throw executionDeadline.reason;
+      let evaluation = context.evalCode(
+        options.setupTimeoutMs === undefined ? wrappedCode : guestBundle.code,
+        "pi-fabric-guest.js",
+      );
+      if (options.setupTimeoutMs !== undefined && !evaluation.error) {
+        // Compile/declare the program under the setup bound before invoking it.
+        // Never reset an expired setup deadline (including an absolute ceiling).
+        evaluation.value.dispose();
+        if (deadlineReached()) throw executionDeadline.reason;
+        if (options.signal?.aborted) {
+          cancelled = true;
+          throw new Error("Execution cancelled");
+        }
+        executionDeadline.clear();
+        executionDeadline = new ExecutionDeadline(options);
+        cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
+        evaluation = context.evalCode(invokeCode, "pi-fabric-invoke.js");
+      }
       pumpJobs();
       if (evaluation.error) {
         const deadlineExceeded = interruptedByCpu || deadlineReached();

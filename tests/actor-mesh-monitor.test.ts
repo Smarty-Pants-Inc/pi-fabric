@@ -527,15 +527,19 @@ describe("ActorManager idle checkpoints", () => {
     const writes = vi.spyOn(fs, "renameSync");
     const initial = s.cursor();
     try {
+      let firstIgnored!: MeshEvent;
       for (let index = 0; index < 40; index++) {
-        await s.mesh.publish({ topic: index % 2 ? "fabric.control.noise" : "fleet.work.other", to: "actor:elsewhere", from: s.from });
+        const event = await s.mesh.publish({ topic: index % 2 ? "fabric.control.noise" : "fleet.work.other", to: "actor:elsewhere", from: s.from });
+        if (index === 0) firstIgnored = event;
         await s.poll();
       }
       // An empty seed is safe at sequence zero; the first real ignored event anchors
       // immediately, then the remaining unrelated burst stays batched.
       expect(initial.last).toEqual({ sequence: 0, id: "" });
       expect(writes.mock.calls.filter(([, target]) => String(target) === s.cursorPath)).toHaveLength(1);
-      expect(s.cursor().last?.sequence).toBe(1);
+      // Actor creation may have reserved an earlier sequence; assert the actual
+      // handed-on anchor rather than assuming this event is sequence one.
+      expect(s.cursor().last).toEqual({ sequence: firstIgnored.sequence, id: firstIgnored.id });
       const skipped = await s.mesh.publish({ topic: "fleet.work.wanted", kind: "skip", from: s.from });
       await s.poll();
       expect(s.actors.status(s.actor.id).filteredCount).toBe(1);

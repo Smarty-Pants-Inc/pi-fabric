@@ -65,6 +65,8 @@ export class AgentMessageRouter {
     if (this.participants.writeStalled?.()) return undefined;
     const known = this.participants.lastKnown?.(id);
     if (!known || known.participant.kind !== "root" || known.lapsedMs > LAPSED_ROOT_REPLY_WINDOW_MS) return undefined;
+    // Reload leases are a hard bound, not an ordinary heartbeat flap; an exit is never routable.
+    if (["reloading", "stopping"].includes(known.participant.status)) return undefined;
     // A mirrored lease lapses when the mesh bridge stops: nothing would carry the reply, so the
     // sender gets the lapse error at once instead of an acknowledgement timeout (smarty-dev#2004).
     if (known.participant.remoteHost) return undefined;
@@ -121,7 +123,7 @@ export class AgentMessageRouter {
   ): Promise<FabricAgentMessageResult> {
     id = this.#sessionTarget(id);
     const isMain = this.mainAgent.matches(id);
-    const remoteRoot = isMain ? undefined : this.participants.get(id) ?? this.#recentlyLapsedRoot(id);
+    const remoteRoot = isMain ? undefined : this.participants.get(id, undefined, { fresh: true }) ?? this.#recentlyLapsedRoot(id);
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.
     if (isMain || remoteRoot?.kind === "root") {
@@ -142,7 +144,7 @@ export class AgentMessageRouter {
           ...(data === undefined ? {} : { data }),
         });
       }
-      const participant = remoteRoot ?? this.participants.get(this.mainAgent.id) ??
+      const participant = remoteRoot ?? this.participants.get(this.mainAgent.id, undefined, { fresh: true }) ??
         this.#recentlyLapsedRoot(this.mainAgent.id);
       if (!participant) {
         throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");
@@ -163,7 +165,11 @@ export class AgentMessageRouter {
             : {}),
         },
         participant.ownerIdentityId,
-        { routedRemoteHost: participant.remoteHost ?? null },
+        {
+          routedRemoteHost: participant.remoteHost ?? null,
+          ...(participant.status === "reloading" && typeof participant.reloadUntil === "number"
+            ? { timeoutMs: Math.max(1, participant.reloadUntil - Date.now()) } : {}),
+        },
       );
     }
 
@@ -328,6 +334,7 @@ export class AgentMessageRouter {
         from,
         message,
         delivery: command.operation,
+        deliveryId: command.commandId,
         ...(typeof command.triggerTurn === "boolean"
           ? { triggerTurn: command.triggerTurn }
           : {}),

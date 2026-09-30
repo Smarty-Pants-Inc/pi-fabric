@@ -33,6 +33,8 @@ export interface FabricParticipantRecord {
   /** The checkout that owns the root's git common directory (smarty-dev#784). */
   project?: string;
   status: string;
+  /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
+  reloadUntil?: number;
   residency?: FabricParticipantResidency;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport | "host";

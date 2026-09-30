@@ -282,6 +282,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #stallS = 600;
   #suspended = false;
   #closed = false;
+  #reloading = false;
   #wake: ReturnType<typeof setInterval> | undefined;
   #operation: AbortSignal | undefined;
 
@@ -345,6 +346,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     return { queued: true, messageId, routed: "main" };
   }
 
+  /** No more Pi handoffs once reload starts; an already-admitted control command journals only. */
+  prepareReload(): void {
+    this.#reloading = true;
+    this.#stopWake();
+  }
+
   deliverAgent(request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
     const message = request.message.trim();
@@ -368,6 +375,15 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(deliveryId === undefined ? {} : { deliveryId }),
     };
     const triggerTurn = request.triggerTurn ?? true;
+    if (this.#reloading) {
+      if (!this.#journal) throw new Error("Main has no follow-up journal open; retry after reload");
+      item.deliverAs = request.delivery;
+      item.triggerTurn = triggerTurn;
+      this.#admit(item);
+      this.#held.push(item);
+      try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
+      return { queued: true, messageId: item.id, routed: "main", ...this.queueDepth(item.from.id) };
+    }
     let replaced: HeldAgentMessage | undefined;
     // Pi releases its own followUp queue only when Main has no more work, so a Main that
     // chains turns reads it an hour late (smarty-dev#1495). Fabric holds a triggering
@@ -745,6 +761,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#stallS = stallSeconds;
     this.#context = context;
     this.#closed = false;
+    this.#reloading = false;
     this.#journal = journal;
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);
@@ -864,12 +881,17 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #flushDue(): void {
-    if (!this.#held.length || this.#suspended) return;
+    if (!this.#held.length || this.#suspended || this.#reloading) return;
+    // A replayed reload-time steer/nextTurn keeps its own mode, even when Main is busy.
+    while (this.#held[0]?.deliverAs !== undefined) {
+      const first = this.#held[0]!;
+      if (!this.#handOver(1, first.deliverAs!, first.triggerTurn ?? true, false)) return;
+    }
     const now = Date.now();
     const age = this.#flushAll ? 0 : this.#flushMs;
     let due = 0;
     let bytes = 0;
-    while (due < this.#held.length && now - this.#held[due]!.sentAt >= age) {
+    while (due < this.#held.length && this.#held[due]!.deliverAs === undefined && now - this.#held[due]!.sentAt >= age) {
       bytes += itemBytes(this.#held[due]!);
       // A byte-bounded FIFO prefix per boundary; the rest waits for the next one.
       if (due > 0 && bytes > FOLLOW_UP_LIMITS.batchBytes) break;
@@ -881,11 +903,11 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   /** Send the first count held items as one message; they leave the queue only once it is sent. */
-  #handOver(count: number, deliverAs: FabricAgentMessageDelivery, triggerTurn: boolean, flushed: boolean): boolean {
+  #handOver(count: number, deliverAs: FabricMainAgentDelivery, triggerTurn: boolean, flushed: boolean): boolean {
     // smarty-dev#1826: an item that cannot be rendered fails every retry and, first in the queue,
     // holds every later followUp. It leaves the queue, with a report; the rest go. A failure of
     // Pi's queue itself keeps them all for the next boundary.
-    const delivery: FabricAgentMessageDelivery = flushed ? "followUp" : deliverAs;
+    const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
     for (let index = 0; index < Math.min(count, this.#held.length);) {
       const item = this.#held[index]!;
       try {
@@ -939,12 +961,19 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #release(triggerTurn: boolean): void {
+    if (this.#reloading) return;
     this.#stopWake();
     // In byte-bounded messages, oldest first; a failed send keeps the rest for a retry.
     while (this.#held.length) {
+      // Reload-time in-flight controls were never handed to Pi. Preserve their mode and policy.
+      const first = this.#held[0]!;
+      if (first.deliverAs !== undefined) {
+        if (!this.#handOver(1, first.deliverAs, first.triggerTurn ?? true, false)) return;
+        continue;
+      }
       let count = 0;
       let bytes = 0;
-      while (count < this.#held.length) {
+      while (count < this.#held.length && this.#held[count]!.deliverAs === undefined) {
         bytes += itemBytes(this.#held[count]!);
         if (count > 0 && bytes > FOLLOW_UP_LIMITS.batchBytes) break;
         count++;

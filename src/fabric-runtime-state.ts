@@ -1471,7 +1471,13 @@ export class FabricRuntimeState {
     await this.#componentLoader?.settle();
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(reason?: string): Promise<void> {
+    if (reason === "reload") {
+      // Stop admission synchronously, before the first await. In-flight handlers may only journal.
+      this.#mainAgent?.prepareReload();
+      this.#control?.pause();
+      await this.#participants?.quiesce("reload").catch(() => undefined);
+    }
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
@@ -1479,11 +1485,11 @@ export class FabricRuntimeState {
     // Stop the resident drainer (and await its drain) before the Main journal closes: a delivery
     // must never reach a Main that can no longer journal it (review round 3 on pi-fabric#160).
     await this.#residency?.close().catch(() => undefined);
-    this.#mainAgent?.closeFollowUpDrain();
+    if (reason !== "reload") this.#mainAgent?.closeFollowUpDrain();
     this.#suppressResidentGuidanceSync = true;
     await this.#deactivateRepairs();
     clearActiveCompiledSurface();
-    await this.#participants?.quiesce().catch(() => undefined);
+    if (reason !== "reload") await this.#participants?.quiesce().catch(() => undefined);
     this.#stopComponentWatch?.();
     this.#stopComponentWatch = undefined;
     await this.#componentControl?.close();
@@ -1495,6 +1501,9 @@ export class FabricRuntimeState {
     this.#sessionCapabilityLease = undefined;
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
+    // Actor shutdown starts before control drains (an in-flight ask may await an actor).
+    // Only now can admitted Main handlers no longer write the reload journal.
+    if (reason === "reload") this.#mainAgent?.closeFollowUpDrain();
     await this.#closeRecords();
     await this.#agents?.close();
     await this.shellJobs.close();

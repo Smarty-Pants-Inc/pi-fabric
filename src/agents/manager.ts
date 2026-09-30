@@ -786,9 +786,10 @@ export class AgentManager {
     return runtime;
   }
 
-  spawn(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+  /** authorize is host-only activation authority; unlike a guest deadline it survives queuing. */
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal);
+    const pending = this.#spawn(request, signal, authorize);
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -808,7 +809,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -884,11 +885,20 @@ export class AgentManager {
     const id = randomUUID().replaceAll("-", "");
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const callerSignal = signal;
+    const assertAuthorized = (): void => {
+      if (authorize && !authorize()) {
+        // Mark revocation before throwing so a queued receipt settles as stopped,
+        // not a launch failure, even if only the generation/state check changed.
+        this.#queued.get(id)?.abort.abort();
+        throw new Error("Agent activation no longer authorized");
+      }
+    };
     const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
       try {
         if (runner === "pi") model = await this.#prepareModel(model);
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
+        assertAuthorized();
       } catch (error) {
         release();
         throw error;
@@ -1077,6 +1087,9 @@ export class AgentManager {
         };
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
+        // Preparation/transport resolution may have yielded since admission. Check the
+        // current owner and activation generation at the final launch boundary too.
+        assertAuthorized();
         const transport = await this.#launchTransport(adapter, launch);
         const queued = this.#queued.get(id);
         const lifecycle = createAgentLifecycle<AgentRunResult>(release);
@@ -1108,7 +1121,7 @@ export class AgentManager {
           launch,
           startupAttempts: 1,
           ...lifecycle,
-          abortSignal: queued ? undefined : signal,
+          abortSignal: queued && !authorize ? undefined : signal,
           abortHandler: undefined,
           ...(model ? { model } : {}),
           ...(thinking ? { thinking } : {}),
@@ -1133,7 +1146,7 @@ export class AgentManager {
           },
           usageEmitted: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
         };
-        if (signal && !queued) {
+        if (signal && (!queued || authorize)) {
           managed.abortHandler = () => this.#handleCallerAbort(id);
           signal.addEventListener("abort", managed.abortHandler, { once: true });
         }
@@ -1170,17 +1183,19 @@ export class AgentManager {
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start);
+    }, request.task, start, authorize ? callerSignal : undefined);
   }
 
   #enqueue(
     info: AgentHandleInfo,
     task: string,
     start: (release: () => void, signal: AbortSignal) => Promise<AgentHandleInfo>,
+    ownerSignal?: AbortSignal,
   ): AgentHandleInfo {
     const abort = new AbortController();
-    // The receipt belongs to the session, never to the program that requested it.
-    const signal = AbortSignal.any([abort.signal, this.#closeAbort.signal]);
+    // Guest receipts belong to the session, not a program deadline. Host-owned
+    // actor activations retain their explicit stop/interrupt authority.
+    const signal = AbortSignal.any([abort.signal, this.#closeAbort.signal, ...(ownerSignal ? [ownerSignal] : [])]);
     let resolve!: (result: AgentRunResult) => void;
     const result = new Promise<AgentRunResult>((done) => { resolve = done; });
     const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false };
@@ -1237,8 +1252,9 @@ export class AgentManager {
     request: AgentRunRequest,
     signal?: AbortSignal,
     onSpawned?: (handle: AgentHandleInfo) => void,
+    authorize?: () => boolean,
   ): Promise<AgentRunResult> {
-    const handle = await this.spawn(request, signal);
+    const handle = await this.spawn(request, signal, authorize);
     onSpawned?.(handle);
     return this.wait(handle.id);
   }
@@ -1318,6 +1334,8 @@ export class AgentManager {
    * may end on its own, but a worker that dies is not relaunched (smarty-dev#2184 item 8b).
    */
   abandon(id: string): void {
+    // A queued activation has no worker to finish: revoke its permit request.
+    this.#queued.get(id)?.abort.abort();
     const managed = this.#runs.get(id);
     if (managed && !managed.settled) managed.abandoned = true;
   }

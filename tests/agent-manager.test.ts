@@ -155,6 +155,54 @@ describe("AgentManager", () => {
     expect((await manager.wait(queued.id)).status).toBe("completed");
   });
 
+  it("revokes a queued activation when its owner generation changes without aborting the signal", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const first = await manager.spawn({ task: "HANG", transport: "process" });
+      let generation = 1;
+      const owner = new AbortController();
+      const queued = await manager.spawn({ task: "stale generation", transport: "process" }, owner.signal, () => generation === 1);
+      generation++;
+      await manager.stop(first.id);
+      expect(await manager.wait(queued.id)).toMatchObject({ status: "stopped", error: "Agent activation no longer authorized" });
+      expect(owner.signal.aborted).toBe(false);
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect(manager.runningCount()).toBe(0);
+    } finally { launch.mockRestore(); }
+  });
+
+  it("checks owner revocation again after asynchronous transport preparation", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const preparing = new Promise<void>((resolve) => { ready = resolve; });
+    const available = vi.spyOn(ProcessTransport.prototype, "available").mockImplementation(async () => { ready(); await gate; return true; });
+    try {
+      let authorized = true;
+      const queued = await manager.spawn({ task: "revoked during preparation", transport: "process" }, undefined, () => authorized);
+      await manager.stop(first.id);
+      await preparing;
+      authorized = false;
+      release();
+      expect(await manager.wait(queued.id)).toMatchObject({ status: "stopped", error: "Agent activation no longer authorized" });
+      expect(launch).toHaveBeenCalledTimes(1);
+    } finally { release(); available.mockRestore(); launch.mockRestore(); }
+  });
+
   it("cancels an admitted queued run during model preparation without launching its worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

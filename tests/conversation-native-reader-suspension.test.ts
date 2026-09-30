@@ -35,6 +35,61 @@ afterEach(() => {
 });
 
 describe("native reader disk suspension", () => {
+  it.each(["relocation", "unread"] as const)("preserves poisoned evidence across a failed %s replacement transaction", (phase) => {
+    const file = path.join(workspace(), "session.jsonl");
+    const input = { id: "reader", status: "running", sessionFile: file };
+    fs.writeFileSync(file, jsonl([header, entry(0, 16)]));
+    const reader = new NativeConversationReader();
+    reader.read(input, false);
+    fs.writeFileSync(file, jsonl([header, { ...entry(0, 16), message: { ...entry(0, 16).message, content: "mutated" } }]));
+    reader.loadLatest(); // Contradictory interval permanently poisons the proof.
+    const newRecord = { ...entry(0, 16), message: { ...entry(0, 16).message, content: "new-generation" } };
+    const oldInode = fs.statSync(file).ino;
+    fs.writeFileSync(`${file}.new`, jsonl([header, newRecord, entry(1, 16)]));
+    fs.renameSync(`${file}.new`, file);
+    const inode = fs.statSync(file).ino;
+    expect(inode).not.toBe(oldInode);
+    const realRead = fs.readSync.bind(fs);
+    let injected = 0;
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+      const stack = new Error().stack ?? "";
+      const actualPhase = stack.includes("relocateBounds") ? "relocation"
+        : stack.includes("replaceWindowIfNeeded") && !stack.includes("readBackwardPage") ? "unread" : "other";
+      if (fs.fstatSync(args[0]).ino === inode && actualPhase === phase) {
+        injected++;
+        throw Object.assign(new Error("private payload EIO"), { code: "EIO" });
+      }
+      return realRead(...args);
+    }) as typeof fs.readSync);
+    const failed = reader.read({ ...input, status: "completed" }, true);
+    expect(injected).toBe(1);
+    expect(failed.messages).toEqual([]);
+    expect(failed.entries).toEqual([]);
+    expect(failed.unavailable?.sessionFile).toBe(true);
+    expect(failed.error).not.toContain("private");
+    reads.mockRestore();
+    const recovered = reader.read(input, false);
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(recovered.messages).toEqual([newRecord.message]);
+    expect(recovered.leafId).toBe("m0");
+    expect(recovered.hasNewer).toBe(true);
+    expect(reader.loadNewer()!.messages).toEqual([newRecord.message, entry(1, 16).message]);
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[0]!.value as string, "checkpoint");
+    for (const damage of ["missing", "corrupt"]) {
+      if (damage === "missing") fs.unlinkSync(checkpoint);
+      else fs.writeFileSync(checkpoint, "corrupt");
+      const rereads = vi.spyOn(fs, "readSync");
+      const unavailable = reader.read(input, false);
+      expect(unavailable.messages).toEqual([]);
+      expect(unavailable.error).toContain("Unable to restore reader history");
+      expect(rereads).not.toHaveBeenCalled();
+      rereads.mockRestore();
+    }
+    reader.clear();
+  });
+
   it.each(["session", "events"] as const)("bounds duplicate %s page verification across loadLatest and suspension", (kind) => {
     const file = path.join(workspace(), `${kind}.jsonl`);
     const record = (i: number) => kind === "session" ? entry(i, 16)

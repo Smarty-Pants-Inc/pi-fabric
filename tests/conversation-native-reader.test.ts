@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { compactTerminalRunLog } from "../src/worker/run-log.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NativeConversationReader,
   type NativeAgentMessage,
@@ -13,6 +13,7 @@ import {
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const directory of temporaryDirectories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -801,6 +802,180 @@ describe("native conversation reader — paging and rollover", () => {
     expect(third.messages.some((message) => message.role === "assistant")).toBe(true);
     expect(third.leafId).toBe("r2");
     expect(third.revision).toBeGreaterThan(second.revision);
+  });
+});
+
+describe("native conversation reader — replacement read I/O", () => {
+  const cases = [
+    ["session", "verification", "readPinned"], ["events", "verification", "loadOlder"],
+    ["session", "relocation", "loadNewer"], ["events", "relocation", "readPinned"],
+    ["session", "backward", "loadOlder"], ["events", "backward", "readPinned"],
+    ["session", "unread", "readFollow"], ["events", "unread", "loadNewer"],
+  ] as const;
+  it.each(cases)("fails closed and retries the same inode: %s %s via %s", (kind, phase, api) => {
+    const file = path.join(makeWorkspace(), `${kind}.jsonl`);
+    const records = (generation: string, count: number) => [
+      ...(kind === "session" ? [sessionHeader] : []),
+      ...Array.from({ length: count }, (_, i) => {
+        const message = kind === "session" ? { role: "user", content: `${generation}-${i}:` + "x".repeat(5000), timestamp: i }
+          : { role: "toolResult", toolCallId: `io-${i}`, toolName: "bash", content: [{ type: "text", text: `${generation}-${i}:` + "x".repeat(5000) }], details: { generation, i }, isError: false, timestamp: i };
+        return kind === "session" ? { ...entryBase(`io-${i}`, i ? `io-${i - 1}` : null), type: "message", message }
+          : { type: "message_end", message };
+      }),
+    ];
+    fs.writeFileSync(file, jsonl(records("old", 150)));
+    const input = source(kind === "session" ? { sessionFile: file } : { eventsFile: file });
+    const reader = new NativeConversationReader();
+    reader.read(input, false);
+    const before = reader.loadOlder()!;
+    expect(before.hasMore).toBe(true);
+    const oldInode = fs.statSync(file).ino;
+    const replacementRecords = records("new-generation", 152);
+    fs.writeFileSync(`${file}.new`, jsonl(replacementRecords));
+    fs.renameSync(`${file}.new`, file);
+    const newInode = fs.statSync(file).ino;
+    expect(newInode).not.toBe(oldInode);
+    const realRead = fs.readSync.bind(fs);
+    const trace: Array<{ phase: string; fd: number; position: number; length: number; failed: boolean }> = [];
+    let fail = true;
+    let faultPhase: string = phase;
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
+      const stack = new Error().stack ?? "";
+      const actualPhase = stack.includes("matchesLoadedPages") ? "verification" : stack.includes("relocateBounds") ? "relocation"
+        : stack.includes("readBackwardPage") ? "backward" : stack.includes("replaceWindowIfNeeded") ? "unread" : "ordinary";
+      const target = fs.fstatSync(fd).ino === newInode;
+      const failed = target && fail && actualPhase === faultPhase;
+      if (target) trace.push({ phase: actualPhase, fd, position, length, failed });
+      if (failed) throw Object.assign(new Error("EIO private payload must not appear " + "secret".repeat(100)), { code: "EIO" });
+      return realRead(fd, buffer, offset, length, position);
+    }) as typeof fs.readSync);
+    let failed: ReturnType<NativeConversationReader["read"]> | undefined;
+    expect(() => {
+      failed = api === "loadOlder" ? reader.loadOlder(1) : api === "loadNewer" ? reader.loadNewer()
+        : reader.read({ ...input, status: "completed" }, api === "readFollow");
+    }).not.toThrow();
+    expect(trace.filter((event) => event.failed).map((event) => event.phase)).toEqual([phase]);
+    expect(failed!.messages).toEqual([]);
+    expect(failed!.entries).toEqual([]);
+    expect(failed!.streaming).toEqual({ active: false, tools: [] });
+    expect(failed!.leafId).toBeNull();
+    expect(failed!.historyComplete).toBe(false);
+    expect(failed!.hasMore).toBe(before.hasMore);
+    expect(failed!.unavailable).toEqual(kind === "session" ? { sessionFile: true } : { eventsFile: true });
+    expect(failed!.error!.length).toBeLessThanOrEqual(201);
+    expect(failed!.error).not.toMatch(/secret|private payload/);
+    if (api.startsWith("read")) expect(failed!.status).toBe("completed");
+    // Pending replacements deliberately skip identity verification on retry.
+    // Fail relocation instead in that case; the original fault was verified above.
+    faultPhase = phase === "verification" ? "relocation" : phase;
+    // Keep the fault armed: a second transaction cannot use an advanced window.
+    const repeated = reader.read({ ...input, status: "completed" }, api === "loadNewer" || api === "readFollow");
+    expect(repeated.messages).toEqual([]);
+    expect(repeated.status).toBe("completed");
+    expect(repeated.unavailable).toBeDefined();
+    fail = false;
+    const follow = api === "loadNewer" || api === "readFollow";
+    const restored = reader.read(input, follow);
+    expect(fs.statSync(file).ino).toBe(newInode);
+    expect(restored.error).toBeUndefined();
+    expect(restored.unavailable).toBeUndefined();
+    expect(JSON.stringify(restored.messages)).not.toContain("old-");
+    const covered = restored.messages.filter((message) => message.timestamp < 150);
+    expect(covered.map((message) => message.timestamp)).toEqual(before.messages.map((message) => message.timestamp));
+    expect(covered).toEqual(replacementRecords.filter((record) => "message" in record && before.messages.some((message) => message.timestamp === (record.message as { timestamp: number }).timestamp)).map((record) => (record as { message: unknown }).message));
+    expect(restored.messages.at(-1)?.timestamp).toBe(follow ? 151 : 149);
+    if (kind === "session") expect(restored.leafId).toBe(follow ? "io-151" : "io-149");
+    expect(restored.hasNewer).toBe(!follow);
+    const newer = reader.loadNewer()!;
+    expect(newer.messages.filter((message) => message.timestamp >= 150)).toEqual(replacementRecords.slice(-2).map((record) => (record as { message: unknown }).message));
+    expect(reader.loadNewer()!.messages).toEqual(newer.messages);
+    expect(reader.loadOlder(3)!.messages).toEqual(replacementRecords.filter((record) => "message" in record).map((record) => (record as { message: unknown }).message));
+    expect(trace.some((event) => event.phase === "relocation" && !event.failed)).toBe(true);
+    for (const event of trace.filter((event) => event.failed)) expect(() => fs.fstatSync(event.fd)).toThrow();
+    if (process.env.TASK_OUT) fs.writeFileSync(path.join(process.env.TASK_OUT, `${kind}-${phase}-${api}-trace.json`), JSON.stringify({ kind, phase, api, newInode, reads: trace }, null, 2));
+    reads.mockRestore();
+    reader.clear();
+  });
+
+  it("discards applied replacement tool state on unread EIO and leaves canonical results pending on retry", () => {
+    const file = path.join(makeWorkspace(), "events.jsonl");
+    const result = (generation: string) => ({ content: [{ type: "text", text: generation }], details: { generation } });
+    const loaded = (generation: string) => [
+      { type: "queue_update", steering: [generation], followUp: [] },
+      { type: "tool_execution_start", toolCallId: "pending", toolName: "bash", args: { generation } },
+      { type: "tool_execution_end", toolCallId: "pending", toolName: "bash", result: result(generation), isError: false },
+    ];
+    fs.writeFileSync(file, jsonl(loaded("old")));
+    const reader = new NativeConversationReader();
+    const input = source({ eventsFile: file });
+    const before = reader.read(input, false);
+    expect(before.streaming.tools[0]?.result).toEqual(result("old"));
+    const canonical = { role: "toolResult", toolCallId: "pending", toolName: "bash", ...result("new"), isError: false, timestamp: 1 };
+    fs.writeFileSync(`${file}.new`, jsonl([...loaded("new"), { type: "message_end", message: canonical }]));
+    const oldInode = fs.statSync(file).ino;
+    fs.renameSync(`${file}.new`, file);
+    const inode = fs.statSync(file).ino;
+    expect(inode).not.toBe(oldInode);
+    const realRead = fs.readSync.bind(fs);
+    let injected = 0;
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+      const stack = new Error().stack ?? "";
+      if (fs.fstatSync(args[0]).ino === inode && stack.includes("replaceWindowIfNeeded") && stack.includes("readForwardPage") && !stack.includes("relocateBounds") && !stack.includes("matchesLoadedPages")) {
+        injected++;
+        throw Object.assign(new Error("private EIO"), { code: "EIO" });
+      }
+      return realRead(...args);
+    }) as typeof fs.readSync);
+    const failed = reader.read(input, true);
+    expect(injected).toBe(1);
+    expect(failed.messages).toEqual([]);
+    expect(failed.streaming).toEqual({ active: false, tools: [] });
+    expect(failed.pendingMessages).toBeUndefined();
+    expect(failed.unavailable?.eventsFile).toBe(true);
+    reads.mockRestore();
+    const recovered = reader.read(input, false);
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(recovered.error).toBeUndefined();
+    expect(recovered.messages).toEqual([]);
+    expect(recovered.hasNewer).toBe(true);
+    expect(recovered.pendingMessages).toEqual({ steering: ["new"], followUp: [] });
+    expect(recovered.streaming.tools).toHaveLength(1);
+    expect(recovered.streaming.tools[0]).toMatchObject({ status: "completed", args: { generation: "new" }, result: result("new") });
+    const newer = reader.loadNewer()!;
+    expect(newer.messages).toEqual([canonical]);
+    expect(newer.hasNewer).toBe(false);
+    expect(reader.loadNewer()!.messages).toEqual([canonical]);
+    reader.clear();
+  });
+
+  it("reports ordinary older-page EIO and loads the exact older page after recovery", () => {
+    const file = path.join(makeWorkspace(), "session.jsonl");
+    const records = [sessionHeader, ...Array.from({ length: 150 }, (_, i) => ({
+      ...entryBase(`older-${i}`, i ? `older-${i - 1}` : null), type: "message",
+      message: { role: "user", content: `older-${i}:` + "x".repeat(5000), timestamp: i },
+    }))];
+    fs.writeFileSync(file, jsonl(records));
+    const reader = new NativeConversationReader();
+    const input = source({ sessionFile: file });
+    const before = reader.read(input, false);
+    const realRead = fs.readSync.bind(fs);
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+      if ((new Error().stack ?? "").includes("readBackwardPage")) throw Object.assign(new Error("private EIO"), { code: "EIO" });
+      return realRead(...args);
+    }) as typeof fs.readSync);
+    let failed: ReturnType<NativeConversationReader["loadOlder"]>;
+    expect(() => { failed = reader.loadOlder(1); }).not.toThrow();
+    expect(failed!.messages).toEqual(before.messages);
+    expect(failed!.unavailable?.sessionFile).toBe(true);
+    expect(failed!.error).not.toContain("private");
+    reads.mockRestore();
+    const restored = reader.loadOlder(1)!;
+    expect(restored.unavailable).toBeUndefined();
+    expect(restored.leafId).toBe(before.leafId);
+    expect(restored.messages.slice(-before.messages.length)).toEqual(before.messages);
+    expect(restored.messages.length).toBeGreaterThan(before.messages.length);
+    expect(reader.loadOlder(3)!.messages).toHaveLength(150);
+    reader.clear();
   });
 });
 

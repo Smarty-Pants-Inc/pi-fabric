@@ -897,7 +897,16 @@ export class NativeConversationReader {
     try {
       if (this.#replaceWindowIfNeeded(kind, opened)) return true;
       if (!window.hasOlder || window.head <= 0) return false;
-      const page = readBackwardPage(opened.descriptor, window.head, OLDER_PAGE_BYTES, false);
+      let page: RecordPage;
+      try {
+        page = readBackwardPage(opened.descriptor, window.head, OLDER_PAGE_BYTES, false);
+      } catch {
+        // No replacement: previously loaded payload/bookmarks remain valid;
+        // this backward read failed before any new records were applied.
+        window.unavailable = true;
+        this.#setError("Unable to read older history");
+        return false;
+      }
       if (page.start >= window.head) return false;
       // Older records join the index without moving the authoritative leaf.
       this.#applyRecords(kind, page.records, false);
@@ -966,70 +975,91 @@ export class NativeConversationReader {
     const window = this.#windows.get(kind);
     if (!window || window.device === undefined ||
       (!window.replacementPending && window.device === device && window.inode === inode)) return false;
-    // Recreating an unchanged source is not compaction: the pinned tail must
-    // stay before unseen appends. Only reuse byte bookmarks after proving all
-    // loaded pages identical; changed payloads still take the reread path below.
-    if (!window.replacementPending && this.#matchesLoadedPages(kind, opened.descriptor, opened.size)) {
-      window.device = device;
-      window.inode = inode;
-      window.size = opened.size;
-      window.unavailable = false;
-      return false;
-    }
-    // Relocate logical coverage, not a count backwards from the new EOF:
-    // unread arrivals must not displace either loaded history or a pinned leaf.
-    const evidence = [...(this.#loadedPages.get(kind)?.values() ?? [])];
-    const first = evidence.reduce<typeof evidence[number] | undefined>((oldest, page) => !oldest || page.start < oldest.start ? page : oldest, undefined);
-    const last = evidence.reduce<typeof evidence[number] | undefined>((newest, page) => !newest || page.end > newest.end ? page : newest, undefined);
-    const bounds = first && last ? this.#relocateBounds(opened, first.start === 0 ? undefined : first.first, last.last) : undefined;
-    if (!bounds) {
-      // Missing/reused identities are not permission to guess at the new tail.
-      // Discard replaced payloads and leave evidence for a later retry.
+    // Only primitive bookmarks/evidence are retained across failure. Decoded
+    // payloads from the replaced generation must never be rolled back as truth.
+    const originalWindow = { ...window };
+    const originalPages = this.#loadedPages.get(kind);
+    const savedPages = originalPages && new Map([...originalPages].map(([key, page]) => [key, { ...page }]));
+    const originalRanges = this.#loadedRanges.get(kind);
+    const savedRanges = originalRanges?.map(([start, end]): [number, number] => [start, end]);
+    try {
+      // Recreating an unchanged source is not compaction: the pinned tail must
+      // stay before unseen appends. Only reuse byte bookmarks after proving all
+      // loaded pages identical; changed payloads still take the reread path below.
+      if (!window.replacementPending && this.#matchesLoadedPages(kind, opened.descriptor, opened.size)) {
+        window.device = device;
+        window.inode = inode;
+        window.size = opened.size;
+        window.unavailable = false;
+        return false;
+      }
+      // Relocate logical coverage, not a count backwards from the new EOF:
+      // unread arrivals must not displace either loaded history or a pinned leaf.
+      const evidence = [...(this.#loadedPages.get(kind)?.values() ?? [])];
+      const first = evidence.reduce<typeof evidence[number] | undefined>((oldest, page) => !oldest || page.start < oldest.start ? page : oldest, undefined);
+      const last = evidence.reduce<typeof evidence[number] | undefined>((newest, page) => !newest || page.end > newest.end ? page : newest, undefined);
+      const bounds = first && last ? this.#relocateBounds(opened, first.start === 0 ? undefined : first.first, last.last) : undefined;
+      if (!bounds) {
+        // Missing/reused identities are not permission to guess at the new tail.
+        // Discard replaced payloads and leave evidence for a later retry.
+        this.#clearFileState(kind);
+        window.unavailable = true;
+        window.replacementPending = true;
+        this.#setError("Replacement history boundaries are missing or ambiguous");
+        return true;
+      }
+      const pages: RecordPage[] = [];
+      let end = bounds.tail;
+      do {
+        const page = readBackwardPage(opened.descriptor, end, INITIAL_PAGE_BYTES, kind === "events");
+        pages.push(page);
+        if (page.start >= end) break;
+        end = page.start;
+      } while (end > bounds.head);
+      const invalid = this.#loadedPages.get(kind)?.has("invalid");
       this.#clearFileState(kind);
-      window.unavailable = true;
-      window.replacementPending = true;
-      this.#setError("Replacement history boundaries are missing or ambiguous");
+      this.#loadedPages.delete(kind);
+      this.#loadedRanges.delete(kind);
+      for (let index = 0; index < pages.length; index++) {
+        const page = pages[index]!;
+        this.#applyRecords(kind, page.records, index === 0);
+        if (index === 0 && invalid) {
+          // Relocation refreshes coverage, not the failed checkpoint proof.
+          this.#loadedPages.set(kind, new Map([["invalid", {
+            start: page.start, end: page.end, digest: null,
+            first: this.#recordBoundary(page.records[0] ?? ""),
+            last: this.#recordBoundary(page.records.at(-1) ?? ""),
+          }]]));
+        }
+        this.#rememberRange(kind, page);
+      }
+      this.#windows.set(kind, {
+        head: pages.at(-1)!.start, tail: bounds.tail, size: opened.size,
+        device, inode, hasOlder: pages.at(-1)!.start > 0,
+        loadedRecords: pages.reduce((count, page) => count + page.records.length, 0), unavailable: false,
+      });
+      if (this.#followed) {
+        const page = readForwardPage(opened.descriptor, bounds.tail, opened.size, GROWTH_PAGE_BYTES);
+        if (page.end > bounds.tail) {
+          this.#applyRecords(kind, page.records, true);
+          this.#rememberRange(kind, page);
+          this.#windows.get(kind)!.tail = page.end;
+        }
+      }
+      return true;
+    } catch {
+      // Verification, relocation, history reread and followed unread-tail IO
+      // form one transaction. Even after apply/clear, retry the ORIGINAL logical
+      // boundary on this same inode; never count backwards from a guessed EOF.
+      this.#clearFileState(kind);
+      if (savedPages) this.#loadedPages.set(kind, savedPages);
+      else this.#loadedPages.delete(kind);
+      if (savedRanges) this.#loadedRanges.set(kind, savedRanges);
+      else this.#loadedRanges.delete(kind);
+      this.#windows.set(kind, { ...originalWindow, unavailable: true, replacementPending: true });
+      this.#setError("Unable to read replacement history");
       return true;
     }
-    const pages: RecordPage[] = [];
-    let end = bounds.tail;
-    do {
-      const page = readBackwardPage(opened.descriptor, end, INITIAL_PAGE_BYTES, kind === "events");
-      pages.push(page);
-      if (page.start >= end) break;
-      end = page.start;
-    } while (end > bounds.head);
-    const invalid = this.#loadedPages.get(kind)?.has("invalid");
-    this.#clearFileState(kind);
-    this.#loadedPages.delete(kind);
-    this.#loadedRanges.delete(kind);
-    for (let index = 0; index < pages.length; index++) {
-      const page = pages[index]!;
-      this.#applyRecords(kind, page.records, index === 0);
-      if (index === 0 && invalid) {
-        // Relocation refreshes coverage, not the failed checkpoint proof.
-        this.#loadedPages.set(kind, new Map([["invalid", {
-          start: page.start, end: page.end, digest: null,
-          first: this.#recordBoundary(page.records[0] ?? ""),
-          last: this.#recordBoundary(page.records.at(-1) ?? ""),
-        }]]));
-      }
-      this.#rememberRange(kind, page);
-    }
-    this.#windows.set(kind, {
-      head: pages.at(-1)!.start, tail: bounds.tail, size: opened.size,
-      device, inode, hasOlder: pages.at(-1)!.start > 0,
-      loadedRecords: pages.reduce((count, page) => count + page.records.length, 0), unavailable: false,
-    });
-    if (this.#followed) {
-      const page = readForwardPage(opened.descriptor, bounds.tail, opened.size, GROWTH_PAGE_BYTES);
-      if (page.end > bounds.tail) {
-        this.#applyRecords(kind, page.records, true);
-        this.#rememberRange(kind, page);
-        this.#windows.get(kind)!.tail = page.end;
-      }
-    }
-    return true;
   }
 
   #recordBoundary(raw: string): string {

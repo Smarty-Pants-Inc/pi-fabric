@@ -8,6 +8,7 @@ import { processIdentityState, processStartIdentityState, readProcessStartIdenti
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { readHostLeases } from "../topology/host-leases.js";
 import type { ResidencyClient } from "./client.js";
+import { readRunProcessEvidence, assertRunProcessesSettled, type WorkerSettlementReceipt } from "../storage/worker-settlement.js";
 import { residentHostId, residentRoot, type ResidentHostConfig, type ResidentHostOwner } from "./protocol.js";
 
 const readRecord = <T>(file: string): T | undefined => {
@@ -54,10 +55,10 @@ const sameIdentity = (a: ProcessIdentity, b: ProcessIdentity): boolean =>
 // physical actor root; a temporary manager denies ALL runnable ownership and uses the normal
 // registry/removal implementation for the selected stopped deletion, including cleanup retries.
 const removalRegistry = async (client: ResidencyClient, manager: ActorManager, id: string): Promise<{
-  actor: FabricActorInfo; manager: ActorManager; temporary?: ActorManager;
+  actor: FabricActorInfo; manager: ActorManager; actorDir: string; temporary?: ActorManager;
 }> => {
   const known = manager.cleanupObligation(id) ?? manager.list().find((actor) => actor.id === id);
-  if (known) return { actor: known, manager };
+  if (known) return { actor: known, manager, actorDir: known.sessionFile ? path.dirname(known.sessionFile) : path.join(client.options.config.actorRoot, id) };
   if (!/^[a-f0-9]{32}$/.test(id)) throw new Error(`Unknown Fabric actor: ${id}`);
   const root = canonical(client.options.config.actorRoot);
   if (!root) throw new Error("Cannot verify the project actor registry root");
@@ -84,7 +85,7 @@ const removalRegistry = async (client: ResidencyClient, manager: ActorManager, i
   try {
     const actor = temporary.cleanupObligation(id) ?? temporary.list().find((actor) => actor.id === id);
     if (!actor) throw new Error(`Cannot verify predecessor actor ${id}`);
-    return { actor, manager: temporary, temporary };
+    return { actor, manager: temporary, actorDir: path.join(candidates[0]!, id), temporary };
   } catch (error) { await temporary.close(); throw error; }
 };
 
@@ -174,7 +175,7 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
           : "Cannot prove predecessor Main process is dead");
       }
     };
-    const recordedHost = (): ProcessIdentity | undefined => {
+    const recordedHost = (): (ProcessIdentity & { token: string }) | undefined => {
       const owner = readRecord<ResidentHostOwner>(path.join(dir, "owner.json"));
       const lock = readRecord<{ pid: number; token: string; processIdentity?: ProcessIdentity }>(path.join(dir, "host.lock"));
       if (!owner && !lock) return undefined; // a clean host shutdown removed both records
@@ -186,7 +187,7 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
             !validProcessIdentity(lock.processIdentity) || !sameIdentity(owner.processIdentity!, lock.processIdentity)))) {
         throw new Error("Resident host process identity mismatch (or missing recorded identity); no signal sent");
       }
-      return record.processIdentity;
+      return { ...record.processIdentity, token: record.token };
     };
     const assertHostStopped = (): void => {
       const recorded = recordedHost();
@@ -204,15 +205,37 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
     const retire = (): void => {
       writeJsonAtomic(path.join(dir, "retired.json"), { rootId: expectedRootId, by: manager.identity, mainIdentity }, { durable: true });
     };
+    const undoRetirement = (): void => {
+      // A refused, unaccepted stop must not retire a resumed Main. Do not erase
+      // another successor's marker if it replaced ours during the write.
+      const marker = readRecord<{ by?: { id?: string }; mainIdentity?: unknown }>(path.join(dir, "retired.json"));
+      if (marker?.by?.id === manager.identity.id && JSON.stringify(marker.mainIdentity) === JSON.stringify(mainIdentity)) {
+        fs.rmSync(path.join(dir, "retired.json"), { force: true });
+      }
+    };
     if (host) {
       const signal = (value: NodeJS.Signals): void => {
         assertRootDead();
         const current = recordedHost();
-        if (!current || !sameIdentity(current, host)) throw new Error("Resident host process identity mismatch; no signal sent");
+        if (!current || current.token !== host.token || !sameIdentity(current, host)) throw new Error("Resident host process identity mismatch; no signal sent");
         const state = processIdentityState(host);
         if (state !== "alive" && state !== "dead") throw new Error("Resident host process identity mismatch; no signal sent");
-        retire();
-        if (state === "dead") return;
+        try {
+          retire();
+          // The durable write/fsync may stall. Never signal from the observation made
+          // before it: revalidate the Main, lock token and complete kernel identity now.
+          assertRootDead();
+          const afterWrite = recordedHost();
+          if (afterWrite && (afterWrite.token !== host.token || !sameIdentity(afterWrite, host))) {
+            throw new Error("Resident host process identity mismatch; no signal sent");
+          }
+          const freshState = processIdentityState(host);
+          if (freshState === "dead") return;
+          if (!afterWrite || freshState !== "alive") throw new Error("Resident host process identity mismatch or unknown; no signal sent");
+        } catch (error) {
+          undoRetirement();
+          throw error;
+        }
         try { process.kill(host.pid, value); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       };
@@ -230,17 +253,58 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
       if (processIdentityState(host) !== "dead") throw new Error("Resident host process identity mismatch or failed to stop");
     } else {
       assertRootDead();
-      retire();
+      try {
+        retire();
+        assertRootDead();
+        if (recordedHost()) throw new Error("Resident host ownership changed; no signal sent");
+      } catch (error) { undoRetirement(); throw error; }
     }
     assertRootDead();
     assertHostStopped();
+    const assertWorkersSettled = (): void => {
+      const runRoot = path.join(dir, "runs");
+      let evidence;
+      if (fs.existsSync(runRoot)) evidence = readRunProcessEvidence(runRoot);
+      else {
+        const receipt = readRecord<WorkerSettlementReceipt>(path.join(dir, "workers-settled.json"));
+        if (!receipt || receipt.format !== 1 || receipt.rootId !== expectedRootId) {
+          throw new Error("Missing predecessor resident run settlement evidence");
+        }
+        evidence = receipt.runs;
+      }
+      assertRunProcessesSettled(evidence);
+      const actorRuns = path.join(selected.actorDir, "runs");
+      if (fs.existsSync(actorRuns)) {
+        const retained = readRunProcessEvidence(actorRuns);
+        assertRunProcessesSettled(retained);
+        evidence = [...evidence, ...retained];
+      }
+      // Read the actual disk row, not just this manager's projection (which may omit
+      // in-flight metadata), and include an already-revoked actor's cleanup debt.
+      const registry = readRecord<{ actors?: Array<{ id: string; status?: string; lastRunId?: string; inFlightRun?: { id?: string }; removal?: { runId?: string } }> }>(path.join(path.dirname(selected.actorDir), "actors.json"));
+      if (!registry || !Array.isArray(registry.actors)) throw new Error("Missing predecessor actor registry evidence");
+      const row = registry.actors.find(value => value.id === actor.id);
+      if (row?.status === "running" && !evidence.some(run => run.actorId === actor.id)) {
+        throw new Error("Missing running predecessor actor worker evidence");
+      }
+      const cleanup = readRecord<{ lastRunId?: string }>(path.join(path.dirname(selected.actorDir), `removal-${actor.id}.json`));
+      const required = [actor.lastRunId, actor.inFlightRun?.id, actor.removal?.runId,
+        row?.lastRunId, row?.inFlightRun?.id, row?.removal?.runId, cleanup?.lastRunId];
+      for (const runId of required) {
+        if (runId !== undefined && (typeof runId !== "string" || !evidence.some(run => run.id === runId))) {
+          throw new Error(`Missing predecessor actor run settlement evidence for ${runId}`);
+        }
+      }
+    };
+    try { assertWorkersSettled(); }
+    catch (error) { return { removed: false, pending: `Removal unaccepted: ${error instanceof Error ? error.message : String(error)}` }; }
     // A further rotation can recover this Main's accepted removal even if it never needed to
     // start a resident host of its own. Keep the same durable ownership evidence as a host launch.
     config.rootOwner = caller;
     writeJsonAtomic(path.join(config.residencyRoot, "config.json"), config, { durable: true });
     return await selected.manager.removeSuccessor(actor.id, expectedRootId, {
       presenceKey: `actors/${predecessor.sessionId}/${actor.id}`,
-      assertSafe: () => { assertRootDead(); assertHostStopped(); },
+      assertSafe: () => { assertRootDead(); assertHostStopped(); assertWorkersSettled(); },
     });
   } finally { await selected.temporary?.close(); }
 };

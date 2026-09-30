@@ -34,7 +34,7 @@ const kernelId = () => `${fs.readFileSync("/proc/sys/kernel/random/boot_id", "ut
 
 // Real disposable processes: every signal is fenced by the fixture's recorded start time.
 const child = async () => {
-  const proc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const proc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
   await new Promise<void>((resolve, reject) => { proc.once("spawn", resolve); proc.once("error", reject); });
   const pid = proc.pid!;
   const owned: Owned = { pid, started: startTime(pid), at: Date.now(), argv: [] };
@@ -92,7 +92,7 @@ const fixture = async (options: { liveMain?: boolean; project?: string; agentNam
     mesh: meshConfig, retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: "", fabricExtensionPath: "", piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   } as ResidentHostConfig;
   const oldDir = residentRoot(mesh.root, oldId);
-  fs.mkdirSync(oldDir, { recursive: true });
+  fs.mkdirSync(path.join(oldDir, "runs"), { recursive: true });
   fs.writeFileSync(path.join(oldDir, "config.json"), JSON.stringify({ ...config, rootId: oldId, sessionId: "predecessor", residencyRoot: oldDir, project: predecessor.project, role: predecessor.role, sessionActorRoot: options.sessionRegistry ? actorRoot : path.join(projectActorRoot, "predecessor"),
     rootOwner: options.noIdentity ? { ...predecessor, processIdentity: undefined } : predecessor }));
   const processIdentity = { ...host.identity, ...(options.mismatchHost ? { startTime: `${host.identity.startTime}-wrong` } : {}) };
@@ -124,6 +124,13 @@ const fixture = async (options: { liveMain?: boolean; project?: string; agentNam
   return { root, actorRoot, actor, oldId, oldDir, main, host, actors, agents, meshConfig, provider, residency, mesh, remove, predecessor, identity, realOwner };
 };
 
+const runEvidence = (root: string, id: string, worker: Awaited<ReturnType<typeof child>>["identity"], runner = worker) => {
+  const dir = path.join(root, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ id, status: "running", transport: "process" }));
+  fs.writeFileSync(path.join(dir, "worker-processes.jsonl"), JSON.stringify({ worker }) + "\n" + JSON.stringify({ worker, runner }) + "\n");
+  return dir;
+};
 describe.skipIf(process.platform !== "linux")("dead predecessor durable removal (#2386)", () => {
   it("does not load successor safety machinery on provider import, construction or idle", async () => {
     await fixture();
@@ -139,6 +146,114 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
     expect(record.processIdentity).toEqual({ pid: process.pid, startTime: startTime(process.pid), kernelId: kernelId() });
     expect(record.processIdentity).not.toHaveProperty("commandLine");
     await directory.close();
+  });
+  it("keeps removal unaccepted and files intact while a dead host's detached worker lives, then removes once", async () => {
+    const f = await fixture({ sessionRegistry: true });
+    await dead(f.host);
+    const worker = await child();
+    runEvidence(path.join(f.oldDir, "runs"), "orphan-run", worker.identity, worker.identity);
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const signal = vi.spyOn(process, "kill");
+    try {
+      expect(await f.remove()).toMatchObject({ removed: false, pending: expect.stringContaining("settlement not proven") });
+      expect(signal).not.toHaveBeenCalled();
+      expect(new ActorRegistryStore(f.actorRoot).records()[0]?.rootId).toBe(f.oldId);
+      expect(fs.existsSync(path.join(f.actorRoot, f.actor.id))).toBe(true);
+      expect(write).not.toHaveBeenCalled();
+      expect(f.mesh.get(`actor-removals/${f.actor.id}`)).toBeUndefined();
+    } finally { signal.mockRestore(); }
+    await dead(worker);
+    await expect(Promise.all([f.remove(), f.remove()])).resolves.toEqual([{ removed: true }, { removed: true }]);
+    expect(write.mock.calls.filter(([rows]) => !rows.some(row => row.id === f.actor.id))).toHaveLength(1);
+    expect(fs.existsSync(path.join(f.actorRoot, f.actor.id))).toBe(false);
+    expect(f.mesh.get(`actor-removals/${f.actor.id}`)?.updatedBy.id).toBe(f.identity.id);
+    write.mockRestore();
+  });
+  it("checks retained actor runs and recursively nested runners even when their parent process is dead", async () => {
+    const f = await fixture();
+    await dead(f.host);
+    const worker = await child();
+    const parent = runEvidence(path.join(f.actorRoot, f.actor.id, "runs"), "retained-parent", f.main.identity);
+    runEvidence(path.join(parent, "nested"), "nested-worker", worker.identity);
+    expect(await f.remove()).toMatchObject({ removed: false, pending: expect.stringContaining("nested-worker") });
+    expect(fs.existsSync(path.join(f.actorRoot, f.actor.id))).toBe(true);
+    await dead(worker);
+    await expect(f.remove()).resolves.toEqual({ removed: true });
+  });
+  it.each(["absent runs", "missing journal", "unresolved worker", "missing referenced run", "unknown kernel", "incomplete attempt"])("keeps %s settlement evidence pending without accepting cleanup", async kind => {
+    const f = await fixture();
+    await dead(f.host);
+    const runs = path.join(f.oldDir, "runs");
+    const dir = runEvidence(runs, "unknown-run", f.main.identity);
+    if (kind === "absent runs") fs.rmSync(runs, { recursive: true });
+    if (kind === "missing journal") fs.rmSync(path.join(dir, "worker-processes.jsonl"));
+    if (kind === "unresolved worker") fs.writeFileSync(path.join(dir, "unresolved-worker.json"), JSON.stringify({ runId: "unknown-run" }));
+    if (kind === "missing referenced run") {
+      const registry = new ActorRegistryStore(f.actorRoot);
+      await registry.withLock(() => registry.write(registry.records().map(row => ({ ...row, lastRunId: "missing-run" }))));
+    }
+    if (kind === "unknown kernel") runEvidence(runs, "unknown-run", { ...f.main.identity, kernelId: "00000000-0000-0000-0000-000000000000/pid:[123]" });
+    if (kind === "incomplete attempt") fs.appendFileSync(path.join(dir, "worker-processes.jsonl"), JSON.stringify({ worker: { ...f.main.identity, startTime: "1" } }) + "\n");
+    expect(await f.remove()).toMatchObject({ removed: false, pending: expect.stringContaining("Removal unaccepted") });
+    expect(new ActorRegistryStore(f.actorRoot).records()[0]?.rootId).toBe(f.oldId);
+    expect(fs.existsSync(path.join(f.actorRoot, f.actor.id))).toBe(true);
+    expect(f.mesh.get(`actor-removals/${f.actor.id}`)).toBeUndefined();
+  });
+  it("allows a recorded worker's PID reuse only after its kernel identity no longer matches, without signalling it", async () => {
+    const f = await fixture();
+    await dead(f.host);
+    const unrelated = await child();
+    runEvidence(path.join(f.oldDir, "runs"), "old-worker", { ...unrelated.identity, startTime: "1" });
+    const signal = vi.spyOn(process, "kill");
+    try { await expect(f.remove()).resolves.toEqual({ removed: true }); expect(signal).not.toHaveBeenCalled(); }
+    finally { signal.mockRestore(); }
+    expect(startTime(unrelated.identity.pid)).toBe(unrelated.identity.startTime);
+  });
+  it.each(["PID reuse", "command line", "lock token", "unknown process", "resumed Main"])("rechecks %s during durable marker I/O: refuses without signal and removes marker", async kind => {
+    const f = await fixture();
+    let markerWritten = false;
+    const rename = fs.renameSync;
+    const read = fs.readFileSync;
+    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      rename(source, target);
+      if (String(target) !== path.join(f.oldDir, "retired.json")) return;
+      markerWritten = true;
+      if (kind === "lock token") for (const name of ["owner.json", "host.lock"]) {
+        const file = path.join(f.oldDir, name);
+        const record = JSON.parse(read(file, "utf8"));
+        record.token = "resumed-owner-token";
+        fs.writeFileSync(file, JSON.stringify(record));
+      }
+      if (kind === "resumed Main") {
+        const file = path.join(f.oldDir, "config.json");
+        const config = JSON.parse(read(file, "utf8"));
+        config.rootOwner.processIdentity = f.residency.options.participants.self()!.processIdentity;
+        fs.writeFileSync(file, JSON.stringify(config));
+      }
+    });
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (markerWritten && String(file) === `/proc/${f.host.identity.pid}/stat`) {
+        if (kind === "unknown process") throw Object.assign(new Error("unreadable process"), { code: "EACCES" });
+        if (kind === "PID reuse") {
+          const stat = String(read(file, "utf8"));
+          const end = stat.lastIndexOf(")") + 2;
+          const fields = stat.slice(end).split(" ");
+          fields[19] = String(Number(f.host.identity.startTime) + 1);
+          return stat.slice(0, end) + fields.join(" ");
+        }
+      }
+      if (markerWritten && kind === "command line" && String(file) === `/proc/${f.host.identity.pid}/cmdline`) return "reused-process\0";
+      return (read as (...args: unknown[]) => unknown)(file, ...args);
+    }) as typeof fs.readFileSync);
+    const signal = vi.spyOn(process, "kill");
+    try {
+      await expect(f.remove()).rejects.toThrow(kind === "resumed Main" ? "owned by a live root" : "process identity mismatch");
+      expect(markerWritten).toBe(true);
+      expect(signal).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(f.oldDir, "retired.json"))).toBe(false);
+      expect(new ActorRegistryStore(f.actorRoot).records()[0]?.rootId).toBe(f.oldId);
+    } finally { signal.mockRestore(); readSpy.mockRestore(); renameSpy.mockRestore(); }
+    expect(startTime(f.host.identity.pid)).toBe(f.host.identity.startTime);
   });
   it("removes after Main rotation, stops the verified host, and records the successor", async () => {
     const f = await fixture();
@@ -313,6 +428,7 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
     const registry = new ActorRegistryStore(f.actorRoot);
     await registry.withLock(() => registry.write(registry.records().map((row) => ({ ...row,
       removal: { requestedAt: 42, runId: "predecessor-run", runStartedAt: 30 } })), { durable: true }));
+    runEvidence(path.join(f.oldDir, "runs"), "predecessor-run", f.main.identity, f.main.identity);
     const spawn = vi.spyOn(f.agents, "spawn");
     await expect(f.remove()).resolves.toEqual({ removed: true });
     expect(spawn).not.toHaveBeenCalled();

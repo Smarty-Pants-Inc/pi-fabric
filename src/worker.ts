@@ -13,6 +13,7 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { readProcessIdentity } from "./core/process-identity.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -284,6 +285,15 @@ const main = async (): Promise<void> => {
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
   writeRunRecord(options.statusFile, record);
+  // Append, never overwrite: retries have distinct workers/runners, and a dead host may
+  // leave any attempt detached. Publish the worker before launching its runner.
+  const workerIdentity = readProcessIdentity();
+  const processJournal = path.join(path.dirname(options.statusFile), "worker-processes.jsonl");
+  const recordProcesses = (runner?: unknown): void => {
+    fs.appendFileSync(processJournal, JSON.stringify({ worker: workerIdentity ?? null,
+      ...(runner === undefined ? {} : { runner }) }) + "\n", { encoding: "utf8", mode: 0o600 });
+  };
+  recordProcesses();
   const emitLifecycle = (
     event: string,
     data?: Record<string, unknown>,
@@ -483,6 +493,7 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  recordProcesses(child.pid ? readProcessIdentity(child.pid) ?? null : null);
   let stderr = "";
   let outputBuffer = "";
   // Veda emits a single JSON document on stdout (progress goes to stderr, and

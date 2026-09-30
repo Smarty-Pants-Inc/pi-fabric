@@ -82,6 +82,7 @@ import {
   removeEmptyRunRoot,
   type TempRunSweepRequest,
 } from "../storage/retention.js";
+import { hasUnsettledRecordedProcesses } from "../storage/worker-settlement.js";
 import { resolveSessionExportDir, sessionExportFileFor } from "./session-export.js";
 import { effectiveAgentNice, parseAgentNice } from "./priority.js";
 import {
@@ -540,7 +541,7 @@ const hostStoppedResult = (result: AgentRunResult, lastEventAt: number | undefin
 const runRootHasUnresolvedWorker = (root: string): boolean => {
   try {
     return fs.readdirSync(root, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && hasUnresolvedWorker(path.join(root, entry.name)));
+      .some((entry) => entry.isDirectory() && (hasUnresolvedWorker(path.join(root, entry.name)) || hasUnsettledRecordedProcesses(path.join(root, entry.name))));
   } catch {
     return false;
   }
@@ -1403,9 +1404,9 @@ export class AgentManager {
   async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
-    if (managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) {
+    if (managed.lostContact || hasUnresolvedWorker(managed.runDirectory) || hasUnsettledRecordedProcesses(managed.runDirectory)) {
       throw new Error(
-        `Cannot clean up agent ${id}: Fabric lost track of its worker (${managed.lostContact ?? "see its run directory"}), ` +
+        `Cannot clean up agent ${id}: Fabric lost track of its worker/runner (${managed.lostContact ?? "see its run directory"}), ` +
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
@@ -1529,7 +1530,7 @@ export class AgentManager {
     // Lost contact is not an exit: such a worker may still use its files.
     const alive = await Promise.all(transports.map((transport) =>
       transport.isAlive().then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
-    const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
+    const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory) || hasUnsettledRecordedProcesses(managed.runDirectory)) ||
       runRootHasUnresolvedWorker(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {

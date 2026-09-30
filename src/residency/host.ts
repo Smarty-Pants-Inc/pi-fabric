@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { readProcessIdentity, type ProcessStartIdentity } from "../core/process-identity.js";
 import { closeWithActors } from "../actors/close-order.js";
+import { readRunProcessEvidence, assertRunProcessesSettled, type RunProcessEvidence } from "../storage/worker-settlement.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -219,6 +220,9 @@ class ResidentHost {
       });
       return `${resolved.provider}/${resolved.id}`;
     };
+    // A previous clean-close receipt cannot cover work admitted by this host generation.
+    fs.rmSync(path.join(config.residencyRoot, "workers-settled.json"), { force: true });
+    fs.mkdirSync(path.join(config.residencyRoot, "runs"), { recursive: true, mode: 0o700 });
     this.agents = new AgentManager(config.cwd, config.agents, {
       workerPath: config.workerPath,
       fabricExtensionPath: config.fabricExtensionPath,
@@ -401,7 +405,18 @@ class ResidentHost {
     try {
       await closeWithActors(this.actors, () => this.control.close().catch(() => undefined));
     } finally {
+      // Preserve positive process evidence before close can delete the resident run tree.
+      // Incomplete/unresolved evidence must never produce a clean-close receipt.
+      let runs: RunProcessEvidence[] | undefined;
+      try { runs = readRunProcessEvidence(path.join(this.config.residencyRoot, "runs")); } catch { /* unknown */ }
       await this.agents.close();
+      if (runs) {
+        try {
+          assertRunProcessesSettled(runs);
+          writeJsonAtomic(path.join(this.config.residencyRoot, "workers-settled.json"),
+            { format: 1, rootId: this.config.rootId, runs }, { durable: true });
+        } catch { /* keep unknown settlement unaccepted by successors */ }
+      }
       await this.participants.close().catch(() => undefined);
       this.#releaseLock();
     }

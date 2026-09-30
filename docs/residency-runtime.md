@@ -84,8 +84,12 @@ Malformed/unreadable ownership or lease evidence fails closed.
 Before accepting removal, Fabric retires the predecessor Main's process identity
 and stops its host by the exact PID recorded in `owner.json`/`host.lock`, only
 after checking its kernel start time, complete command line, and ownership token.
-The retirement marker is written only after the final pre-signal Main liveness
-check passes. It sends SIGTERM, waits up to 30 seconds for normal host/worker
+The retirement marker is written only after the pre-signal Main liveness
+check passes. **After** its durable write, Fabric rechecks the Main owner/liveness,
+owner/lock token, and host PID/start time/command line immediately before signalling.
+Changed or unknown ownership refuses the stop without a signal and removes this
+attempt's marker; an already-dead host needs no signal. It sends SIGTERM, waits up
+to 30 seconds for normal host/worker
 shutdown, and **does not force-kill** an uncooperative host. A mismatched/reused
 PID is never signalled. The marker refuses a host whose configured
 `rootOwner.processIdentity` matches the retired `mainIdentity`; a launcher with
@@ -98,6 +102,18 @@ Pi session (`pi --session ...`) keeps the same root id but creates a new live
 Main process identity. `ResidencyClient.ensureHost` rewrites `rootOwner` with
 that live identity before launch, so its durable actor and agent operations
 work again; an old launcher carrying the dead Main's identity remains fenced.
+
+A dead resident host does **not** prove its detached activations stopped. Before
+acceptance, Fabric checks every predecessor resident run and the actor's retained
+run records, including every recorded launch attempt and nested worker/runner.
+Each recorded process must be kernel-proven dead or no longer match its recorded
+start time/command line. Missing, malformed, unresolved or unknown evidence returns
+`{ removed: false, pending: "Removal unaccepted: ..." }`; actor files and ownership
+remain intact. Fabric never signals these foreign workers. A later explicit remove
+can complete after they finish. A clean host close saves a durable settlement
+receipt before its run directory disappears; a new host invalidates that receipt
+before admitting work. Legacy runs without process evidence require explicit repair,
+not an inference from an expired lease or absent owner files.
 
 The registry lock rechecks the proof and accepts a stopped removal atomically.
 The normal `ActorManager.remove` transaction then handles pending removals,

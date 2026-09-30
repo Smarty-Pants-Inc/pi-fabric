@@ -122,9 +122,10 @@ describe("AgentManager close storage", () => {
   it("cancels queued admissions on close instead of launching after shutdown", async () => {
     const { manager, root } = setup(false);
     await manager.spawn({ task: "HANG", extensions: false });
-    const queued = manager.spawn({ task: "queued", extensions: false });
-    const rejected = expect(queued).rejects.toThrow("Operation aborted");
-    await Promise.all([rejected, manager.close()]);
+    const queued = await manager.spawn({ task: "queued", extensions: false });
+    expect(queued.status).toBe("queued");
+    await manager.close();
+    await expect(manager.wait(queued.id)).resolves.toMatchObject({ status: "stopped" });
     expect(fs.existsSync(root)).toBe(false);
   });
 

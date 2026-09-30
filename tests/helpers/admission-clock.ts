@@ -6,7 +6,7 @@ import { vi } from "vitest";
  * never the interpreter's startup time. The independent real guard bounds hangs.
  */
 export async function executeAfterAdmission<T>(
-  execute: (signal: AbortSignal) => Promise<T>,
+  execute: (signal: AbortSignal, startClock: () => void) => Promise<T>,
   admitted: () => boolean,
   onAdmitted?: () => void | Promise<void>,
 ): Promise<T> {
@@ -17,8 +17,17 @@ export async function executeAfterAdmission<T>(
   const guard = setTimeout(() => safety.abort(new Error("Guest did not settle within the 12-second admission hang guard")), 12_000);
   let execution: Promise<T> | undefined;
   let settled = false;
+  let clockStarted = false;
+  // Synchronous boundary probes may starve the observer below. They must start
+  // elapsed time inline, before entering their deliberately blocking work.
+  const startClock = () => {
+    if (clockStarted) return;
+    clockStarted = true;
+    const admittedAt = now();
+    clock.mockImplementation(() => startedAt + now() - admittedAt);
+  };
   try {
-    execution = execute(safety.signal);
+    execution = execute(safety.signal, startClock);
     const observed = execution.then(
       value => { settled = true; return value; },
       error => { settled = true; throw error; },
@@ -37,8 +46,7 @@ export async function executeAfterAdmission<T>(
         await Promise.race([observed, new Promise<void>(resolve => { timer = setTimeout(resolve, 10); })]);
       } finally { clearTimeout(timer); }
     }
-    const admittedAt = now();
-    clock.mockImplementation(() => startedAt + now() - admittedAt);
+    startClock();
     await onAdmitted?.();
     return await observed;
   } finally {

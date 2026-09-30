@@ -82,6 +82,11 @@ export class AgentMessageRouter {
       : id;
   }
 
+  /** Use the same exact session-UUID alias resolution as delivery when grouping lifecycle sources. */
+  isLocalMainTarget(id: string): boolean {
+    return this.mainAgent.local && this.mainAgent.matches(this.#sessionTarget(id));
+  }
+
   async routeMessage(
     id: string,
     message: string,

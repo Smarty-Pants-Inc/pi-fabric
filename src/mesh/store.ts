@@ -11,6 +11,8 @@ export interface MeshIdentity {
   name: string;
   kind: "main" | "actor" | "agent";
   sessionId?: string;
+  /** Set only by the admitting mesh bridge, after its sender/ownership checks. */
+  verified?: "bridge";
 }
 
 export interface MeshEvent {

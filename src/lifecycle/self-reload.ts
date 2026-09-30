@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { fabricHostIdentity, sendFabricUserMessage } from "../fabric-provenance.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -204,7 +205,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     const busy = deps.busy();
     if (busy > 0) noteHeld(context, target, busy);
     if (busy > 0 || context.hasPendingMessages()) return false;
-    pi.sendUserMessage(`/${SELF_RELOAD_COMMAND} auto`, { expandPromptTemplates: true });
+    sendFabricUserMessage(pi, `/${SELF_RELOAD_COMMAND} auto`, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp", { expandPromptTemplates: true });
     return true;
   };
 

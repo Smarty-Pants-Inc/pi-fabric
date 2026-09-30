@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resolveFabricIdentity } from "../main-agent.js";
+import { resolveFabricIdentity, sendFabricMessage } from "../fabric-provenance.js";
 
 export const HANDOFF_CONTINUATION_MESSAGE_TYPE = "pi-fabric-handoff-continuation";
 
@@ -38,9 +38,9 @@ export const queueHandoffFailureContinuation = (
     const details = { executorId: identity.id, status: "failed" };
     // Claim before queuing: a failed delivery must not create a retry loop.
     extension.appendEntry(HANDOFF_CONTINUATION_MESSAGE_TYPE, details);
-    extension.sendMessage(
+    sendFabricMessage(extension,
       { customType: HANDOFF_CONTINUATION_MESSAGE_TYPE, content: EXECUTOR_CONTINUATION_PROMPT, display: false, details },
-      { deliverAs: "followUp", triggerTurn: true },
+      { deliverAs: "followUp", triggerTurn: true }, identity, "followUp",
     );
     return true;
   } catch {

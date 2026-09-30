@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { fabricHostIdentity, sendFabricMessage } from "../fabric-provenance.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -81,14 +82,15 @@ const PREWALK_FAILURE_MESSAGE_TYPE = "pi-fabric-prewalk-failure";
 // fail or mask the handoff outcome itself.
 const queuePrewalkFollowUp = (
   extension: ExtensionAPI,
+  context: ExtensionContext,
   customType: string,
   content: string,
   details: Record<string, unknown>,
 ): void => {
   try {
-    extension.sendMessage(
+    sendFabricMessage(extension,
       { customType, content, display: false, details },
-      { deliverAs: "followUp", triggerTurn: true },
+      { deliverAs: "followUp", triggerTurn: true }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp",
     );
   } catch {
     // Swallow: a missed follow-up turn must not fail the handoff.
@@ -338,7 +340,7 @@ const runInPlacePrewalk = async (
       },
       timestamp: Date.now(),
     };
-    extension.sendMessage(continuationMessage, { triggerTurn: false });
+    sendFabricMessage(extension, continuationMessage, { triggerTurn: false }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor");
   } catch (error) {
     const restored = await setModelSafely(extension, returnModel);
     if (!restored) {
@@ -432,14 +434,14 @@ export const runFabricHandoffAtBoundary = async (
       // failed, stopped, or timed-out executor never ends the turn in silence.
       if (completed) {
         queuePrewalkFollowUp(
-          extension,
+          extension, context,
           PREWALK_CONTINUE_MESSAGE_TYPE,
           PREWALK_TRAJECTORY_VERIFY_PROMPT,
           { mode: "trajectory", model, trigger: pending.triggerRef },
         );
       } else {
         queuePrewalkFollowUp(
-          extension,
+          extension, context,
           PREWALK_FAILURE_MESSAGE_TYPE,
           PREWALK_TRAJECTORY_INCOMPLETE_PROMPT,
           {
@@ -453,7 +455,7 @@ export const runFabricHandoffAtBoundary = async (
       }
     }
     if (!continuing && pending.kind === "explicit") {
-      queueHandoffCompletion(extension, pending.args, result);
+      queueHandoffCompletion(extension, pending.args, result, () => fabricHostIdentity(context.sessionManager.getSessionId()));
     }
     context.ui.setStatus(
       "fabric-prewalk",
@@ -481,14 +483,14 @@ export const runFabricHandoffAtBoundary = async (
       // would only add a duplicate turn. Trajectory failures still end the
       // turn silently, so they queue the report-and-propose reply.
       queuePrewalkFollowUp(
-        extension,
+        extension, context,
         PREWALK_FAILURE_MESSAGE_TYPE,
         PREWALK_FAILURE_PROMPT,
         { mode: inPlace ? "in-place" : "trajectory", trigger: pending.triggerRef, error: message },
       );
     }
     if (!continuing && pending.kind === "explicit") {
-      queueHandoffCompletion(extension, pending.args, failure);
+      queueHandoffCompletion(extension, pending.args, failure, () => fabricHostIdentity(context.sessionManager.getSessionId()));
     }
     context.ui.setStatus("fabric-prewalk", continuing ? "handoff failed; executor continuing directly"
       : inPlace ? "in-place continuation failed" : "trajectory handoff failed");

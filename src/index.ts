@@ -1,5 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
+import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
+import { fabricHostIdentity, sendFabricMessage } from "./fabric-provenance.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp } from "./core/pattern-kill.js";
@@ -622,13 +624,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
-        pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+        deliverRootInbox(pi, inbox.events);
         return;
       }
       // Records: the same gate, re-checked after the read (F21).
       if (!idle()) return;
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
-      if (records && idle()) pi.sendMessage(records, { deliverAs: "followUp", triggerTurn: true });
+      if (records && idle()) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp");
     } catch {
       // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
     } finally {
@@ -785,10 +787,10 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // (smarty-dev#754). An aborted or failed run starts nothing: the batch waits for a turn.
     if (settledCompleted(event, context)) {
       const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
-      if (inbox?.events.length) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+      if (inbox?.events.length) deliverRootInbox(pi, inbox.events);
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
-      if (records) pi.sendMessage(records, { deliverAs: "followUp", triggerTurn: true });
+      if (records) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp");
     }
   };
 

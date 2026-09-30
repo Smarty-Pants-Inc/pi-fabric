@@ -3,6 +3,8 @@ import fs from "node:fs";
 import { writeFileAtomic } from "./core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
+import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
+export { resolveFabricIdentity, type FabricIdentityResolution } from "./fabric-provenance.js";
 
 const MAIN_AGENT_ALIAS = "main";
 export type FabricAgentMessageDelivery = "steer" | "followUp";
@@ -84,41 +86,9 @@ export interface FabricMainAgentTarget {
   // smarty-dev#2119: a capped Main wait returned; flush every held followUp at the next tool
   // boundary, whatever its age. Local Mains with a followUp drain only.
   flushHeldAtNextBoundary?(): void;
+  /** Local host capability, used to keep sender-specific lifecycle batches attributable. */
+  supportsProvenance?(): boolean;
 }
-
-export interface FabricIdentityResolution {
-  identity: MeshIdentity;
-  mainAgentId: string;
-}
-
-export const resolveFabricIdentity = (
-  sessionId: string,
-  environment: NodeJS.ProcessEnv = process.env,
-): FabricIdentityResolution => {
-  const actorId = environment.PI_FABRIC_ACTOR_ID?.trim();
-  const parentAgentId = environment.PI_FABRIC_PARENT_RUN?.trim();
-  const identity: MeshIdentity = actorId
-    ? {
-        id: actorId,
-        name: environment.PI_FABRIC_ACTOR_NAME?.trim() || actorId.slice(0, 8),
-        kind: "actor",
-        sessionId,
-      }
-    : parentAgentId
-      ? {
-          id: parentAgentId,
-          name: environment.PI_FABRIC_AGENT_NAME?.trim() || parentAgentId.slice(0, 8),
-          kind: "agent",
-          sessionId,
-        }
-      : { id: `session:${sessionId}`, name: "main", kind: "main", sessionId };
-  const inheritedMainAgentId = environment.PI_FABRIC_MAIN_AGENT_ID?.trim();
-  return {
-    identity,
-    mainAgentId:
-      inheritedMainAgentId || (identity.kind === "main" ? identity.id : `session:${sessionId}`),
-  };
-};
 
 const escapeXmlText = (value: string): string =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -174,6 +144,8 @@ export const followUpCoalesceKey = (data: unknown): string | undefined => {
 interface HeldAgentMessage {
   id: string;
   from: MeshIdentity;
+  /** Original verified admission, journalled before acknowledgement; never a Pi receipt stamp. */
+  provenance?: FabricTurnProvenance;
   message: string;
   /** The first send of a coalesced chain: it keeps the queue position and the flush wait. */
   sentAt: number;
@@ -255,6 +227,7 @@ const addDelivered = (ids: Set<string>, entry: SessionEntryLike | undefined): vo
 export class MainAgentController implements FabricMainAgentTarget {
   readonly startedAt = Date.now();
   readonly #held: HeldAgentMessage[] = [];
+  readonly #replayed = new Set<string>();
   // Handed to Pi, not yet in the session's entries. Kept in the journal until they are.
   readonly #sent: HeldAgentMessage[] = [];
   // Replayed handoffs of an earlier controller: in Pi's queue after a live reload, lost after a
@@ -336,12 +309,17 @@ export class MainAgentController implements FabricMainAgentTarget {
     return { ok: true };
   }
 
-  deliverUser(message: string, delivery: FabricAgentMessageDelivery): FabricAgentMessageResult {
+  supportsProvenance(): boolean { return fabricProvenanceSupported(this.pi); }
+
+  deliverUser(
+    message: string, delivery: FabricAgentMessageDelivery,
+    from: MeshIdentity = { id: this.id, name: "main", kind: "main" },
+  ): FabricAgentMessageResult {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
     const text = message.trim();
     if (!text) throw new Error("Main agent message must not be empty");
     const messageId = randomUUID();
-    this.pi.sendUserMessage(text, { deliverAs: delivery });
+    this.pi.sendUserMessage(text, fabricProvenanceOptions(this.pi, { deliverAs: delivery }, fabricTurnProvenance(from, delivery)));
     return { queued: true, messageId, routed: "main" };
   }
 
@@ -362,6 +340,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const item: HeldAgentMessage = {
       id: randomUUID(),
       from: sender,
+      provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery),
       message,
       sentAt: Date.now(),
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),
@@ -506,6 +485,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Remember that this item's delivery id and its superseded ids are done. */
   #consume(item: HeldAgentMessage): void {
+    this.#replayed.delete(item.id);
     const ids = [...(item.supersedes ?? []), ...(item.deliveryId === undefined ? [] : [item.deliveryId])];
     if (!ids.length) return;
     for (const id of ids) {
@@ -698,9 +678,14 @@ export class MainAgentController implements FabricMainAgentTarget {
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
           // followUp, as before policies were journalled.
-          const { deliverAs, triggerTurn, supersedes, ...rest } = item;
+          const { deliverAs, triggerTurn, supersedes, provenance, ...rest } = item;
+          const via = provenance?.via;
           items.push({
             ...rest, from: sender,
+            // Whitelist admission fields even for an older or malformed journal. No journal
+            // payload can supply keyboard/voice, a principal, or Pi's receipt stamps.
+            provenance: fabricTurnProvenance(sender, via === "steer" || via === "followUp" || via === "actor" || via === "replay"
+              ? via : deliverAs === "steer" ? "steer" : "followUp"),
             ...(Array.isArray(supersedes) ? { supersedes: supersedes.filter((id) => typeof id === "string") } : {}),
             ...(DIRECT_DELIVERIES.has(deliverAs) && typeof triggerTurn === "boolean" ? { deliverAs, triggerTurn } : {}),
           });
@@ -729,6 +714,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         continue;
       }
       last.delete(chainOf(item));                          // a duplicate id goes once
+      this.#replayed.add(item.id);
       (item.handed ? this.#unverified : this.#held).push(item);
     }
     this.#trySave();
@@ -876,8 +862,15 @@ export class MainAgentController implements FabricMainAgentTarget {
       due++;
     }
     if (!due) return;
-    // One message, queued behind any steer already in Pi's queue: it never overtakes one.
-    this.#handOver(due, "steer", true, true);
+    // Each sender-homogeneous prefix is queued behind any steer already in Pi's queue.
+    // Keep the whole eligible FIFO batch at this boundary, even when capable hosts split it.
+    while (due > 0) {
+      const before = this.#held.length;
+      if (!this.#handOver(due, "steer", true, true)) return;
+      const removed = before - this.#held.length;
+      if (removed <= 0) return;
+      due -= removed;
+    }
   }
 
   /** Send the first count held items as one message; they leave the queue only once it is sent. */
@@ -902,6 +895,13 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
     count = Math.min(count, this.#held.length);
     if (count <= 0) { this.#trySave(); return true; }
+    // A turn has one sender. Keep legacy batching unchanged, and hand over only a homogeneous
+    // FIFO prefix on capable hosts. Each successful prefix is journalled before the next send.
+    if (this.supportsProvenance()) {
+      const key = JSON.stringify(this.#provenance(this.#held[0]!, delivery));
+      const different = this.#held.slice(0, count).findIndex(item => JSON.stringify(this.#provenance(item, delivery)) !== key);
+      if (different > 0) count = different;
+    }
     const batch = this.#held.slice(0, count);
     try {
       this.#send(batch, deliverAs, triggerTurn, flushed);
@@ -953,6 +953,13 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
   }
 
+  #provenance(item: HeldAgentMessage, delivery: FabricMainAgentDelivery): FabricTurnProvenance {
+    // Rebuild the whitelisted shape from the original envelope, including for old journals.
+    // A replay not held by Pi is its first receipt. Already recorded/queued entries are deduped.
+    const admitted = item.provenance ?? fabricTurnProvenance(item.from, delivery === "nextTurn" ? "actor" : delivery);
+    return { ...admitted, sender: { ...admitted.sender }, via: this.#replayed.has(item.id) ? "replay" : admitted.via };
+  }
+
   #send(
     items: HeldAgentMessage[],
     deliverAs: FabricMainAgentDelivery,
@@ -993,7 +1000,7 @@ export class MainAgentController implements FabricMainAgentTarget {
           ...(flushed ? { flushed: true } : {}),
         },
       },
-      { deliverAs, triggerTurn },
+      fabricProvenanceOptions(this.pi, { deliverAs, triggerTurn }, this.#provenance(first, delivery)),
     );
   }
 }

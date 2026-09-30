@@ -107,6 +107,8 @@ import {
   type FabricMainAgentInfo,
 } from "./main-agent.js";
 import { followUpDrainSupported } from "./host-compatibility.js";
+import { deliverActorToMain } from "./actors/main-delivery.js";
+import { sendFabricMessage } from "./fabric-provenance.js";
 import { AgentsProvider } from "./providers/agents-provider.js";
 import { CompactProvider } from "./providers/compact-provider.js";
 import { CacheProvider } from "./providers/cache-provider.js";
@@ -387,7 +389,7 @@ export class FabricRuntimeState {
       throw new Error("Pi Fabric has not initialized");
     }
     if (this.#mainAgent.matches(targetId) && this.#mainAgent.local) {
-      return this.#mainAgent.deliverUser(message, delivery);
+      return this.#mainAgent.deliverUser(message, delivery, this.#identity);
     }
     return this.#agentsProvider.routeMessage(targetId, message, undefined, delivery);
   }
@@ -777,29 +779,7 @@ export class FabricRuntimeState {
       this.#mesh,
       enforceSchema ? { ...this.#config.mesh, enabled: false } : this.#config.mesh,
       this.#agents,
-      ({ actor, message, delivery, triggerTurn }) => {
-        const text = message.text ?? "";
-        if (!text) return;
-        const deliveryNotice = actorDeliveryNotice(delivery, triggerTurn);
-        this.pi.sendMessage(
-          {
-            customType: "pi-fabric-actor",
-            content: [
-              `<fabric-actor name=${JSON.stringify(actor.name)} id=${JSON.stringify(actor.id)}>\n${escapeXmlText(text)}\n</fabric-actor>`,
-              deliveryNotice,
-            ]
-              .filter((line): line is string => Boolean(line))
-              .join("\n"),
-            display: true,
-            details: {
-              actor,
-              message,
-              delivery: { mode: delivery, triggerTurn, passive: Boolean(deliveryNotice) },
-            },
-          },
-          { deliverAs: delivery, triggerTurn },
-        );
-      },
+      request => deliverActorToMain(this.pi, identity, request),
       ownsPersistentActorRegistry
         ? {
             persistent: true,
@@ -969,12 +949,12 @@ export class FabricRuntimeState {
             content: "Jev supplies typed Choice, Noul, and Score judgments, not generated text. Prefer shell-first orchestration: granted pi.bash runs existing CLIs; tasks.wait/watch await bounded receipts/monitor batches without polling or inference. Use UI-only monitors to avoid Main wakeups. Browser/macOS tools need no Fabric bridge. Code owns commands; never execute a model answer as shell source. Omit jev.evaluate and set maxEvaluations:0 for deterministic programs (host auto approvals remain independent). Use jev.evaluate only for explicit authorized batched questions; jev.run/spawn for isolated TypeScript programs that may loop using input, program.sleep, program.emit, and exact requires capabilities. run/wait return terminal envelopes (join aliases wait for both agents and Jev); inspect state and result/error. Programs and detached tasks are session-owned, not restart-durable. jev.status/stop control programs; tasks.stop separately stops their detached tasks. Observation timeout/cancellation never cancels the task; keep task IDs and finite process deadlines. For Main-turn advisors, spawn with observe, await program.nextEvent without polling, and opt into bounded context fields. program.advise requires jev.advise and explicit delivery; default is record-only. Return the observer ID without waiting in Main; Escape/Main abort cancels observers. Use /login jev, TYPESAFE_API_KEY, /login openrouter, OPENROUTER_API_KEY, /login vercel-ai-gateway, AI_GATEWAY_API_KEY, or a trusted credentialCommand. Credentials stay host-side; status never retrieves a key. See docs/jev.md for schemas, budgets, and shell/CLI composition.",
           });
           const observationHost = identity.kind === "main" ? new JevObservationHost(context.sessionManager.getSessionId(), advice => {
-            this.pi.sendMessage({
+            sendFabricMessage(this.pi, {
               customType: "pi-fabric-jev",
               content: [`<fabric-jev name=${JSON.stringify(escapeXmlText(advice.name))} id=${JSON.stringify(advice.runId)}>\n${escapeXmlText(advice.message)}\n</fabric-jev>`, actorDeliveryNotice(advice.delivery, advice.triggerTurn)].filter(Boolean).join("\n"),
               display: true,
               details: { runId: advice.runId, eventId: advice.eventId, delivery: { mode: advice.delivery, triggerTurn: advice.triggerTurn } },
-            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn });
+            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn }, identity, "actor");
           }) : undefined;
           this.#jevObservationHost = observationHost;
           // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.

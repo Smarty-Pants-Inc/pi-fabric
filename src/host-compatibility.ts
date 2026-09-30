@@ -1,4 +1,6 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { MeshIdentity } from "./mesh/store.js";
 import path from "node:path";
 
 export const MINIMUM_PI_HOST_VERSION = "0.80.6";
@@ -90,3 +92,109 @@ export const FOLLOW_UP_DRAIN_MIN_PI_VERSION = "0.87.0";
  */
 export const followUpDrainSupported = (version: string | undefined = detectPiHostVersion()): boolean =>
   version === undefined || (compareVersions(version, FOLLOW_UP_DRAIN_MIN_PI_VERSION) ?? 1) >= 0;
+
+// Shared startup metadata belongs in this existing eager/lazy chunk, keeping the file-count budget.
+/** Admission metadata only. Pi owns turnId and receivedAt at first receipt. */
+export interface FabricTurnProvenance {
+  v: 1;
+  channel: "fabric";
+  sender: {
+    id: string;
+    kind: "main" | "actor" | "agent" | "remote";
+    name?: string;
+    verified: "mesh" | "bridge";
+  };
+  via: "steer" | "followUp" | "actor" | "replay";
+}
+
+export interface FabricIdentityResolution {
+  identity: MeshIdentity;
+  mainAgentId: string;
+}
+
+/** Identity queries never import Main's journal engine. */
+export const resolveFabricIdentity = (
+  sessionId: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): FabricIdentityResolution => {
+  const identity = fabricHostIdentity(sessionId, environment);
+  const inheritedMainAgentId = environment.PI_FABRIC_MAIN_AGENT_ID?.trim();
+  return {
+    identity,
+    mainAgentId: inheritedMainAgentId || (identity.kind === "main" ? identity.id : `session:${sessionId}`),
+  };
+};
+
+/** Explicit host capability: option acceptance cannot be inferred from a JS function's arity. */
+export const fabricProvenanceSupported = (pi: ExtensionAPI): boolean =>
+  (pi as ExtensionAPI & { supportsProvenance?: unknown }).supportsProvenance === true;
+
+// Survives extension generations in the same Pi process.
+const WARNING_KEY = Symbol.for("pi-fabric.turn-provenance.compatibility-warning.v1");
+
+/** Keep unsupported hosts' arguments unchanged. Never retry a send: it may have been received. */
+export const fabricProvenanceOptions = <Options extends object | undefined>(
+  pi: ExtensionAPI,
+  options: Options,
+  provenance: FabricTurnProvenance | (() => FabricTurnProvenance),
+): Options | (Options & { provenance: FabricTurnProvenance }) => {
+  if (fabricProvenanceSupported(pi)) {
+    return { ...options, provenance: typeof provenance === "function" ? provenance() : provenance } as Options & { provenance: FabricTurnProvenance };
+  }
+  const diagnostics = globalThis as typeof globalThis & { [key: symbol]: unknown };
+  if (diagnostics[WARNING_KEY] !== true) {
+    diagnostics[WARNING_KEY] = true;
+    console.warn("[pi-fabric] Pi does not advertise supportsProvenance; delivering without turn provenance (legacy behavior). Upgrade to a provenance-capable Pi host.");
+  }
+  return options;
+};
+
+/** Snapshot only the verified admission envelope, never message text or arbitrary payload data. */
+export const fabricTurnProvenance = (
+  from: MeshIdentity,
+  via: FabricTurnProvenance["via"],
+): FabricTurnProvenance => ({
+  v: 1,
+  channel: "fabric",
+  sender: {
+    id: from.id,
+    kind: from.kind,
+    ...(typeof from.name === "string" && from.name ? { name: from.name } : {}),
+    verified: from.verified === "bridge" ? "bridge" : "mesh",
+  },
+  via,
+});
+
+export const sendFabricMessage = (
+  pi: ExtensionAPI,
+  message: Parameters<ExtensionAPI["sendMessage"]>[0],
+  options: Parameters<ExtensionAPI["sendMessage"]>[1],
+  from: MeshIdentity | (() => MeshIdentity),
+  via: FabricTurnProvenance["via"] = "actor",
+): void => {
+  pi.sendMessage(message, fabricProvenanceOptions(pi, options, () => fabricTurnProvenance(typeof from === "function" ? from() : from, via)));
+};
+
+export const sendFabricUserMessage = (
+  pi: ExtensionAPI,
+  content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+  from: MeshIdentity | (() => MeshIdentity),
+  via: FabricTurnProvenance["via"],
+  options?: Parameters<ExtensionAPI["sendUserMessage"]>[1],
+): void => {
+  const deliveryOptions = fabricProvenanceOptions(pi, options, () => fabricTurnProvenance(typeof from === "function" ? from() : from, via));
+  if (deliveryOptions === undefined) pi.sendUserMessage(content);
+  else pi.sendUserMessage(content, deliveryOptions);
+};
+
+/** Fabric's own runtime identity for host-generated messages, with no human principal. */
+export const fabricHostIdentity = (
+  sessionId: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): MeshIdentity => {
+  const actorId = environment.PI_FABRIC_ACTOR_ID?.trim();
+  const agentId = environment.PI_FABRIC_PARENT_RUN?.trim();
+  if (actorId) return { id: actorId, name: environment.PI_FABRIC_ACTOR_NAME?.trim() || actorId.slice(0, 8), kind: "actor", sessionId };
+  if (agentId) return { id: agentId, name: environment.PI_FABRIC_AGENT_NAME?.trim() || agentId.slice(0, 8), kind: "agent", sessionId };
+  return { id: `session:${sessionId}`, name: "main", kind: "main", sessionId };
+};

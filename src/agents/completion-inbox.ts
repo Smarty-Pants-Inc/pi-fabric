@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRunResult } from "./types.js";
+import { fabricHostIdentity, sendFabricMessage } from "../fabric-provenance.js";
 
 export const AGENT_COMPLETION_MESSAGE_TYPE = "pi-fabric-agent-complete";
 const SUMMARY_CHARS = 4_000;
@@ -134,7 +135,7 @@ export class AgentCompletionInbox {
   }
 
   #flush(deliver: (message: CompletionMessage) => void = (message) =>
-    this.pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true })): void {
+    sendFabricMessage(this.pi, message, { deliverAs: "steer", triggerTurn: true }, () => fabricHostIdentity(this.#context.sessionManager.getSessionId()), "steer")): void {
     if (this.#closed || this.#suspended || this.#context.signal?.aborted || !this.#pending.size) return;
     const batch = [...this.#pending.values()].slice(0, 32);
     const perResult = Math.max(0, Math.min(SUMMARY_CHARS, Math.floor(BATCH_CHARS / batch.length) - 320));

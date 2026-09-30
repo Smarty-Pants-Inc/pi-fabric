@@ -228,10 +228,13 @@ export class HerdrTransport implements AgentTransportAdapter {
     await this.#claimSpawnSlot(request.signal);
     const label = runLabel(request);
     let paneId: string;
+    let dispatched = false;
     try {
-      paneId = await this.#applyLayout(workspaceId, request, label);
+      paneId = await this.#applyLayout(workspaceId, request, label, () => { dispatched = true; });
     } catch (error) {
-      if (!droppedCall(error)) throw error;
+      // Command preparation and connection/authority checks can fail before any
+      // layout.apply is sent. Only an attempted write can leave an unknown worker.
+      if (!dispatched || !droppedCall(error)) throw error;
       // Fail closed: layout.apply is not idempotent and a dropped reply leaves its outcome
       // unknown, so Fabric neither adopts a pane nor launches again (smarty-dev#347).
       // ponytail: a pane Herdr created anyway runs unowned; the label names it for cleanup.
@@ -299,7 +302,7 @@ export class HerdrTransport implements AgentTransportAdapter {
     };
   }
 
-  async #applyLayout(workspaceId: string, request: AgentTransportLaunch, label: string): Promise<string> {
+  async #applyLayout(workspaceId: string, request: AgentTransportLaunch, label: string, onDispatch: () => void): Promise<string> {
     const command = await scriptSpawnArgs(request.workerPath, request.workerArguments);
     assertTransportLaunchAllowed(request);
     const response = (await this.#request({
@@ -320,7 +323,7 @@ export class HerdrTransport implements AgentTransportAdapter {
           command,
         },
       },
-    }, request)) as HerdrLayoutApplyResponse;
+    }, request, onDispatch)) as HerdrLayoutApplyResponse;
     const paneId = response.result?.layout?.root?.pane_id;
     if (response.result?.type !== "layout_apply" || !paneId) {
       throw new HerdrApiError("Herdr layout.apply did not return a pane id", undefined);
@@ -382,7 +385,7 @@ export class HerdrTransport implements AgentTransportAdapter {
     }
   }
 
-  #request(request: { method: string; params: Record<string, unknown> }, authority?: AgentTransportLaunch): Promise<unknown> {
+  #request(request: { method: string; params: Record<string, unknown> }, authority?: AgentTransportLaunch, onDispatch?: () => void): Promise<unknown> {
     const socketPath = this.environment.HERDR_SOCKET_PATH;
     if (!socketPath) return Promise.reject(new Error("Herdr transport requires HERDR_SOCKET_PATH"));
     const payload = JSON.stringify({ id: `pi-fabric:${randomUUID()}`, ...request });
@@ -410,6 +413,9 @@ export class HerdrTransport implements AgentTransportAdapter {
         // host, not merely before opening the socket. No yield before write.
         try { assertTransportLaunchAllowed(authority); }
         catch (error) { finish(error as Error); return; }
+        // Record the dispatch attempt without yielding after the authority check.
+        // From here, a dropped response cannot prove that Herdr did not start it.
+        onDispatch?.();
         socket.write(`${payload}\n`);
       });
       socket.on("data", (chunk: string) => {

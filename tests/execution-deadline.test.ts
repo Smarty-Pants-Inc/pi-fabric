@@ -4,6 +4,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const memoryLimitBytes = 32 * 1024 * 1024;
 const boundMs = 100;
@@ -27,6 +28,7 @@ describe("execution deadline under microtask starvation", () => {
     let calls = 0;
     let lastCallAt = 0;
     let coldDispatch = true;
+    let admit = () => {};
     const descriptor = { name: main ? "wait" : "done", description: "immediate result", inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const };
     registry.register({
       name: main ? "agents" : "demo", description: "immediate provider",
@@ -38,6 +40,7 @@ describe("execution deadline under microtask starvation", () => {
         return descriptor;
       },
       async invoke() {
+        admit();
         calls++; lastCallAt = performance.now();
         // Each already-resolved call does modest synchronous work: too few guest
         // instructions for the periodic VM interrupt to rescue a starved timer.
@@ -65,13 +68,26 @@ describe("execution deadline under microtask starvation", () => {
     calls = 0; lastCallAt = 0;
     config.executor.timeoutMs = main ? 500 : boundMs;
     config.executor.mainMaxTimeoutMs = boundMs;
-    const began = performance.now();
+    let began = 0;
+    let admitted = false;
+    if (call.includes("tools.providers")) {
+      const providers = registry.providers.bind(registry);
+      vi.spyOn(registry, "providers").mockImplementation(ctx => { admit(); return providers(ctx); });
+    }
     try {
-      const result = await service.execute({
-        code: `const until = Date.now() + ${guestDurationMs}; while (Date.now() < until) { ${call} } return "escaped";`,
-        ...(main ? { requestedTimeoutMs: 86_400_000 } : {}),
-        context, signal: undefined, parentToolCallId: "starvation", onPartial() {},
-      });
+      const result = await executeAfterAdmission((signal, startClock) => {
+        admit = () => {
+          if (admitted) return;
+          admitted = true;
+          startClock();
+          began = performance.now();
+        };
+        return service.execute({
+          code: `const until = Date.now() + ${guestDurationMs}; while (Date.now() < until) { ${call} } return "escaped";`,
+          ...(main ? { requestedTimeoutMs: 86_400_000 } : {}),
+          context, signal, parentToolCallId: "starvation", onPartial() {},
+        });
+      }, () => admitted);
       expect(result.typeErrors).toBeUndefined();
       expect(result.success).toBe(false);
       expect(result.trace.outcome).toBe("timed_out");
@@ -90,9 +106,10 @@ describe("execution deadline under microtask starvation", () => {
     const registry = new ActionRegistry();
     const descriptor = { name: "done", description: "timer-starving host", inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const };
     let calls = 0;
+    let admit = () => {};
     registry.register({
       name: "demo", description: "busy provider", async list() { return [descriptor]; }, async describe() { return descriptor; },
-      async invoke() { calls++; busyUntil(Date.now() + boundMs + 50); return "late"; },
+      async invoke() { admit(); calls++; busyUntil(Date.now() + boundMs + 50); return "late"; },
     });
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.timeoutMs = main ? 500 : boundMs;
@@ -100,11 +117,15 @@ describe("execution deadline under microtask starvation", () => {
     const context = { cwd: process.cwd(), mode: main ? "rpc" : "print", sessionManager: { getSessionId: () => "late-host" } } as unknown as ExtensionContext;
     const service = new FabricExecutionService(registry, config);
     await service.prewarm(context);
+    let admitted = false;
     try {
-      const result = await service.execute({
-        code: 'try { await tools.call({ ref: "demo.done", args: {} }); } catch {} await tools.providers(); return "escaped";',
-        context, signal: undefined, parentToolCallId: "late-result", onPartial() {},
-      });
+      const result = await executeAfterAdmission((signal, startClock) => {
+        admit = () => { admitted = true; startClock(); };
+        return service.execute({
+          code: 'try { await tools.call({ ref: "demo.done", args: {} }); } catch {} await tools.providers(); return "escaped";',
+          context, signal, parentToolCallId: "late-result", onPartial() {},
+        });
+      }, () => admitted);
       expect(result.success).toBe(false);
       expect(result.trace.outcome).toBe("timed_out");
       expect(result.error).toMatch(main ? /MainExecutionCeilingError/ : /Execution timed out after 100ms/);
@@ -118,12 +139,16 @@ describe("execution deadline under microtask starvation", () => {
     const runtime = new QuickJsRuntime();
     await runtime.execute("return 1;", async () => undefined, { timeoutMs: 1_000, memoryLimitBytes });
     let calls = 0;
-    const began = performance.now();
-    const result = await runtime.execute(
+    let began = 0;
+    let admitted = false;
+    const result = await executeAfterAdmission((signal, startClock) => runtime.execute(
       `const until = Date.now() + ${guestDurationMs}; while (Date.now() < until) await tools.providers(); return "escaped";`,
-      async () => { calls++; busyUntil(Date.now() + 5); return []; },
-      { timeoutMs: boundMs, memoryLimitBytes },
-    );
+      async () => {
+        if (!admitted) { admitted = true; startClock(); began = performance.now(); }
+        calls++; busyUntil(Date.now() + 5); return [];
+      },
+      { timeoutMs: boundMs, memoryLimitBytes, signal },
+    ), () => admitted);
     expect(result.terminationReason).toBe("timed_out");
     expect(result.error).toBe("Execution timed out after 100ms");
     expect(result.value).toBeUndefined();
@@ -150,16 +175,20 @@ describe("execution deadline under microtask starvation", () => {
     const runtime = new QuickJsRuntime();
     await runtime.execute("return 1;", async () => undefined, { timeoutMs: 1_000, memoryLimitBytes });
     let calls = 0;
-    const began = performance.now();
-    const result = await runtime.execute(
+    let began = 0;
+    let admitted = false;
+    const result = await executeAfterAdmission((signal, startClock) => runtime.execute(
       "await tools.providers(); while (true) {}",
-      async () => { calls++; busyUntil(Date.now() + 30); return []; },
+      async () => {
+        admitted = true; startClock(); began = performance.now();
+        calls++; busyUntil(Date.now() + 30); return [];
+      },
       {
-        timeoutMs: 500, memoryLimitBytes,
+        timeoutMs: 500, memoryLimitBytes, signal,
         maximumDeadlineAt: Date.now() + boundMs,
         minimumTimeoutMsForHostCall: () => 5_000,
       },
-    );
+    ), () => admitted);
     expect(result.terminationReason).toBe("timed_out");
     expect(calls).toBe(1);
     expect(performance.now() - began).toBeLessThan(guestDurationMs - 100);

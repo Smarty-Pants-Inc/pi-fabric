@@ -1023,6 +1023,63 @@ describe("AgentsProvider runner support", () => {
     });
   });
 
+  it.each([
+    ["not-yet-mirrored", "FabricParticipantNotYetMirroredError", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED"],
+    ["non-interactive", "FabricParticipantNonInteractiveError", "FABRIC_PARTICIPANT_NON_INTERACTIVE"],
+    ["ambiguous", "FabricProjectAgentAmbiguousError", "FABRIC_PROJECT_AGENT_AMBIGUOUS"],
+    ["unresolved", "FabricProjectAgentUnresolvedError", "FABRIC_PROJECT_AGENT_UNRESOLVED"],
+  ])("#201 preserves %s error metadata through normal TypeScript Fabric execution", async (scenario, name, code) => {
+    const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-guest-error-"));
+    roots.push(lane);
+    const id = "session:11111111-1111-4111-8111-111111111111";
+    const base = { format: 1, id, rootId: id, ownerHostId: id, ownerIdentityId: id, kind: "root",
+      name: "main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
+      startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: true, stale: false,
+      role: "project-agent", project: projectOf(lane) } as FabricParticipantInfo;
+    const members = scenario === "non-interactive" ? [{ ...base, interactive: false }]
+      : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
+    const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];
+    const { provider } = setup(peers, members, undefined, { cwd: lane });
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.kernel = "typescript";
+    config.executor.runtime = "quickjs";
+    const service = new FabricExecutionService(registry, config);
+    const call = scenario === "ambiguous" || scenario === "unresolved" ? "agents.projectAgent()"
+      : `agents.followUp({ id: ${JSON.stringify(id)}, message: "hello" })`;
+    try {
+      const result = await service.execute({
+        code: `try { await ${call}; return { unexpected: true }; }
+          catch (error) { const failure = error as Error & { code?: string; retryable?: boolean };
+            return { isError: error instanceof Error, name: failure.name, code: failure.code, retryable: failure.retryable }; }`,
+        context: { ...context.extensionContext, cwd: lane, mode: "rpc" } as ExtensionContext,
+        signal: undefined, parentToolCallId: "guest-error-contract", onPartial() {},
+      });
+      expect(result.success, result.error).toBe(true);
+      expect(result.value).toEqual({ isError: true, name, code,
+        ...(scenario === "not-yet-mirrored" ? { retryable: true } : {}) });
+    } finally {
+      await registry.close();
+    }
+  });
+
+  it("#201 never exposes a sensitive marker through projectAgent provider construction or invocation", async () => {
+    const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-marker-error-"));
+    roots.push(lane);
+    fs.mkdirSync(path.join(lane, ".local"));
+    const secret = "ghp_sensitive_provider_marker_secret";
+    fs.writeFileSync(path.join(lane, ".local", "lead"), secret);
+    const lookup = async () => {
+      const { provider } = setup([], [], undefined, { cwd: lane });
+      return provider.invoke("projectAgent", {}, { ...context, cwd: lane });
+    };
+    await expect(lookup()).rejects.toMatchObject({
+      name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID",
+      message: "Invalid project lead launch metadata: expected a regular, bounded marker containing session:<UUID>.",
+    });
+  });
+
   it("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch", async () => {
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-moved-lane-"));
     roots.push(lane);
@@ -1030,11 +1087,11 @@ describe("AgentsProvider runner support", () => {
     git("init", "-q");
     git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
     fs.mkdirSync(path.join(lane, ".local"));
-    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:launch-lead\n");
+    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111\n");
     const base = { format: 1, kind: "root", name: "main", status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp", "fabric"], startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false,
       stale: false, role: "project-agent", repository: "github.com/smarty-pants-inc/pi-fabric", project: "/remote/repo", cwd: "/remote/repo" };
-    const lead = { ...base, id: "session:launch-lead", rootId: "session:launch-lead", ownerHostId: "remote", ownerIdentityId: "remote", remoteHost: "forge" } as FabricParticipantInfo;
+    const lead = { ...base, id: "session:11111111-1111-4111-8111-111111111111", rootId: "session:11111111-1111-4111-8111-111111111111", ownerHostId: "remote", ownerIdentityId: "remote", remoteHost: "forge" } as FabricParticipantInfo;
     const other = { ...base, id: "session:newer", rootId: "session:newer", ownerHostId: "other", ownerIdentityId: "other", startedAt: 99 } as FabricParticipantInfo;
     const { provider } = setup([], [other, lead], undefined, { cwd: lane });
     fs.writeFileSync(path.join(lane, ".local", "lead"), "session:newer\n"); // must not change launch identity

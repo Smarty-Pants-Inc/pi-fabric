@@ -77,29 +77,51 @@ export const participantProject = (cwd: string, env: NodeJS.ProcessEnv = process
   return projectOf(explicit ? path.resolve(explicit) : cwd);
 };
 
-/** One repository identity across HTTPS, ssh:// and Git's user@host:path spelling. */
+/**
+ * One host[:port]/owner/name identity across HTTPS, ssh:// and user@host:path.
+ * Canonical identities (including dotless hosts) are already suffix-normalized: never strip
+ * another .git from their repository name. Explicit ports and every path component survive.
+ * Parse without URL, which silently removes dot segments, default ports and backslashes.
+ * A numeric host:port/path spelling is canonical; scp paths with numeric owners use user@host:.
+ */
 export const normalizeOrigin = (origin: string): string | undefined => {
-  let value = origin.trim().replace(/^git\+/, "");
-  if (!value) return undefined;
-  if (/^[^/\s:]+\.[^/\s:]+\/.+$/.test(value)) value = `https://${value}`;
-  if (!value.includes("://")) {
-    const scp = /^(?:[^/@:]+@)?([^/:]+):(.+)$/.exec(value);
-    if (!scp) return undefined;
-    value = `ssh://${scp[1]}/${scp[2]}`;
+  const value = origin.trim().replace(/^git\+(?=[a-z]+:\/\/)/i, "");
+  if (!value || /[\s\\?#]/.test(value)) return undefined;
+  const hostPattern = /^(\[[0-9a-f:.]+\]|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::([0-9]+))?$/i;
+  let authority: string;
+  let repo: string;
+  let canonicalIdentity = false;
+  const url = /^([a-z]+):\/\/([^/]+)\/(.+)$/i.exec(value);
+  if (url) {
+    if (!["https", "http", "ssh", "git"].includes(url[1]!.toLowerCase())) return undefined;
+    // Authentication is not part of repository identity. Do not remove anything from the path.
+    authority = url[2]!;
+    if (authority.includes("@")) {
+      if (authority.indexOf("@") !== authority.lastIndexOf("@")) return undefined;
+      authority = authority.slice(authority.indexOf("@") + 1);
+    }
+    repo = url[3]!;
+  } else {
+    const slash = value.indexOf("/");
+    const prefix = value.slice(0, slash);
+    if (slash > 0 && hostPattern.test(prefix)) {
+      authority = prefix;
+      repo = value.slice(slash + 1);
+      canonicalIdentity = true;
+    } else {
+      const scp = /^(?:[^/@:\s]+@)?(\[[0-9a-f:.]+\]|[^/:@\s]+):(.+)$/i.exec(value);
+      if (!scp) return undefined;
+      authority = scp[1]!;
+      repo = scp[2]!;
+    }
   }
-  try {
-    const url = new URL(value);
-    if (!["https:", "http:", "ssh:", "git:"].includes(url.protocol) || !url.hostname) return undefined;
-    const host = url.hostname.toLowerCase();
-    const defaultPort = url.protocol === "ssh:" ? "22" : url.protocol === "git:" ? "9418" : "";
-    const port = url.port && url.port !== defaultPort ? `:${url.port}` : "";
-    let repo = url.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
-    if (!repo) return undefined;
-    if (host === "github.com") repo = repo.toLowerCase();
-    return `${host}${port}/${repo}`;
-  } catch {
-    return undefined;
-  }
+  const host = hostPattern.exec(authority);
+  if (!host || (host[2] !== undefined && (Number(host[2]) < 1 || Number(host[2]) > 65535))) return undefined;
+  const segments = repo.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) return undefined;
+  if (!canonicalIdentity) repo = repo.replace(/\.git$/i, "");
+  if (repo.split("/").some((segment) => !segment || segment === "." || segment === "..")) return undefined;
+  return `${authority.toLowerCase()}/${repo.toLowerCase()}`;
 };
 
 const repositories = new Map<string, string | undefined>();
@@ -118,16 +140,57 @@ export const repositoryOf = (cwd: string): string | undefined => {
   return repository;
 };
 
+export class FabricProjectLeadInvalidError extends Error {
+  override readonly name = "FabricProjectLeadInvalidError";
+  readonly code = "FABRIC_PROJECT_LEAD_INVALID";
+  constructor() {
+    // Never include file contents, an environment value, or an underlying filesystem error.
+    super("Invalid project lead launch metadata: expected a regular, bounded marker containing session:<UUID>.");
+  }
+}
+
+const MAX_LEAD_MARKER_BYTES = 128;
+const LEAD_SESSION_ID = /^session:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const validatedLead = (value: string): string => {
+  const id = value.trim();
+  if (value.length > MAX_LEAD_MARKER_BYTES || !LEAD_SESSION_ID.test(id)) throw new FabricProjectLeadInvalidError();
+  return id;
+};
+
 /** Launch metadata written by smarty-lane-move, or supplied explicitly by its launcher. */
 export const recordedProjectLead = (cwd: string, env: NodeJS.ProcessEnv = process.env): string | undefined => {
   const explicit = env.SMARTY_LEAD_SESSION?.trim();
-  if (explicit) return explicit;
+  if (explicit) return validatedLead(explicit);
   for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
+    const local = path.join(dir, ".local");
+    const marker = path.join(local, "lead");
+    let fd: number | undefined;
     try {
-      const id = fs.readFileSync(path.join(dir, ".local", "lead"), "utf8").trim();
-      if (id) return id;
-    } catch {
-      // Most sessions have no launch lead marker.
+      // Refuse both leaf and .local symlinks. O_NOFOLLOW also closes the leaf check/open race
+      // on platforms that support it; fstat verifies the opened file, not just the earlier path.
+      const directory = fs.lstatSync(local);
+      if (!directory.isDirectory() || directory.isSymbolicLink()) throw new FabricProjectLeadInvalidError();
+      const before = fs.lstatSync(marker);
+      if (!before.isFile() || before.isSymbolicLink()) throw new FabricProjectLeadInvalidError();
+      fd = fs.openSync(marker, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.size > MAX_LEAD_MARKER_BYTES || opened.dev !== before.dev || opened.ino !== before.ino) {
+        throw new FabricProjectLeadInvalidError();
+      }
+      const afterDirectory = fs.lstatSync(local);
+      if (!afterDirectory.isDirectory() || afterDirectory.dev !== directory.dev || afterDirectory.ino !== directory.ino) {
+        throw new FabricProjectLeadInvalidError();
+      }
+      // One extra byte detects growth after fstat; never read an unbounded file or special device.
+      const bytes = Buffer.alloc(MAX_LEAD_MARKER_BYTES + 1);
+      const count = fs.readSync(fd, bytes, 0, bytes.length, 0);
+      if (count > MAX_LEAD_MARKER_BYTES) throw new FabricProjectLeadInvalidError();
+      return validatedLead(bytes.subarray(0, count).toString("utf8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new FabricProjectLeadInvalidError();
+      // Most sessions have no launch lead marker; an invalid one must not fall back to election.
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
     }
     if (fs.existsSync(path.join(dir, ".git")) || path.dirname(dir) === dir) return undefined;
   }
@@ -180,6 +243,9 @@ export const resolveProjectAgent = <T extends ProjectRoot>(
   options: { repository?: string; leadId?: string } = {},
 ): T => {
   const repository = options.repository ? normalizeOrigin(options.repository) : undefined;
+  if (options.repository !== undefined && !repository) {
+    throw new FabricProjectAgentUnresolvedError(`No live project agent for ${project}: invalid repository identity.`);
+  }
   const eligible = (root: T): boolean => root.interactive !== false &&
     (!root.capabilities || (root.capabilities.includes("steer") && root.capabilities.includes("followUp")));
   const sameProject = (root: T): boolean => {

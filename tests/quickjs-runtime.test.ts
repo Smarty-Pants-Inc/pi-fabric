@@ -143,6 +143,39 @@ describe("QuickJsRuntime", () => {
   });
 
 
+  it("#201 carries only allowlisted Fabric error metadata into the guest", async () => {
+    const result = await new QuickJsRuntime().execute(
+      `try { await agents.followUp({ id: "session:test", message: "hello" }); }
+       catch (error) { return { name: error.name, code: error.code, retryable: error.retryable,
+         secret: error.secret, cause: error.cause, keys: Object.keys(error).sort() }; }`,
+      async () => {
+        const error = new Error("safe message");
+        Object.assign(error, { name: "FabricParticipantNotYetMirroredError",
+          code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true,
+          secret: "host-secret", cause: { secret: "nested-host-secret" } });
+        throw error;
+      }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "FabricParticipantNotYetMirroredError",
+      code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true, keys: ["code", "message", "name", "retryable"] });
+  });
+
+  it("#201 does not export arbitrary names, codes, or accessors as Fabric error metadata", async () => {
+    const result = await new QuickJsRuntime().execute(
+      `try { await agents.followUp({ id: "session:test", message: "hello" }); }
+       catch (error) { return { name: error.name, keys: Object.keys(error) }; }`,
+      async () => {
+        const error = new Error("safe message");
+        Object.assign(error, { name: "HostSecretError", code: "HOST_SECRET", secret: "host-secret" });
+        Object.defineProperty(error, "retryable", { get() { throw new Error("accessor must not run"); } });
+        throw error;
+      }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "Error", keys: ["message"] });
+  });
+
   it("runs parallel host calls and returns structured data", async () => {
     const hostCall = vi.fn(async (ref: string, args: Record<string, unknown>) => ({
       ref,

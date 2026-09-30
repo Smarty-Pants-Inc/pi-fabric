@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { deliveryRoot, normalizeOrigin, participantProject, participantRole, projectOf, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../src/topology/project-identity.js";
 
 const roots: string[] = [];
@@ -76,13 +76,13 @@ describe("project identity", () => {
 
   it("normalizes HTTPS, SSH and scp origins without user credentials or .git suffixes", () => {
     const expected = "github.com/smarty-pants-inc/pi-fabric";
-    for (const origin of ["https://GitHub.com/Smarty-Pants-Inc/pi-fabric.git/", "git@github.com:Smarty-Pants-Inc/pi-fabric.git",
-      "ssh://git@github.com:22/Smarty-Pants-Inc/pi-fabric.git", `git+https://${expected}`, expected]) {
+    for (const origin of ["https://GitHub.com/Smarty-Pants-Inc/pi-fabric.git", "git@github.com:Smarty-Pants-Inc/pi-fabric.git",
+      "ssh://git@github.com/Smarty-Pants-Inc/pi-fabric.git", `git+https://${expected}`, expected]) {
       expect(normalizeOrigin(origin)).toBe(expected);
     }
-    expect(normalizeOrigin("https://example.org/Team/Repo.git")).toBe("example.org/Team/Repo");
-    expect(normalizeOrigin("ssh://git@example.org:2222/Team/Repo.git")).toBe("example.org:2222/Team/Repo");
-    expect(normalizeOrigin("https://example.org:22/Team/Repo.git")).toBe("example.org:22/Team/Repo");
+    expect(normalizeOrigin("https://example.org/Team/Repo.git")).toBe("example.org/team/repo");
+    expect(normalizeOrigin("ssh://git@example.org:2222/Team/Repo.git")).toBe("example.org:2222/team/repo");
+    expect(normalizeOrigin("https://example.org:22/Team/Repo.git")).toBe("example.org:22/team/repo");
     expect(normalizeOrigin("")).toBeUndefined();
   });
 
@@ -100,9 +100,112 @@ describe("project identity", () => {
     expect(repositoryOf(path.join(base, "wt"))).toBe(repositoryOf(lead));
     fs.mkdirSync(path.join(lane, ".local"));
     fs.mkdirSync(path.join(lane, "sub"));
-    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:launch-lead\n");
-    expect(recordedProjectLead(path.join(lane, "sub"), {})).toBe("session:launch-lead");
-    expect(recordedProjectLead(lane, { SMARTY_LEAD_SESSION: "session:explicit" })).toBe("session:explicit");
+    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111\n");
+    expect(recordedProjectLead(path.join(lane, "sub"), {})).toBe("session:11111111-1111-4111-8111-111111111111");
+    expect(recordedProjectLead(lane, { SMARTY_LEAD_SESSION: "session:22222222-2222-4222-8222-222222222222" }))
+      .toBe("session:22222222-2222-4222-8222-222222222222");
+  });
+
+  const markerLane = () => {
+    const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-marker-"));
+    roots.push(lane);
+    fs.mkdirSync(path.join(lane, ".local"));
+    return lane;
+  };
+
+  it.each(["ghp_sensitive_marker_secret", "session:not-a-uuid"])("#201 rejects invalid sensitive launch-marker contents without echoing them: %s", (contents) => {
+    const lane = markerLane();
+    fs.writeFileSync(path.join(lane, ".local", "lead"), contents);
+    expect(() => recordedProjectLead(lane, {})).toThrow(expect.objectContaining({
+      name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID",
+      message: "Invalid project lead launch metadata: expected a regular, bounded marker containing session:<UUID>.",
+    }));
+  });
+
+  it("#201 bounds marker reads even when a large file begins with a valid id", () => {
+    const lane = markerLane();
+    fs.writeFileSync(path.join(lane, ".local", "lead"), `session:11111111-1111-4111-8111-111111111111${" ".repeat(4096)}`);
+    const read = vi.spyOn(fs, "readSync");
+    try {
+      expect(() => recordedProjectLead(lane, {})).toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_LEAD_INVALID" }));
+      expect(read).not.toHaveBeenCalled(); // reject by fstat before reading an oversized file
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it.each(["ghp_sensitive_env_secret", "session:fake"])("#201 validates explicit launch metadata without echoing it: %s", (value) => {
+    expect(() => recordedProjectLead(os.tmpdir(), { SMARTY_LEAD_SESSION: value }))
+      .toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_LEAD_INVALID" }));
+  });
+
+  it.skipIf(process.platform === "win32")("#201 refuses marker and .local symlinks without opening their targets", () => {
+    const lane = markerLane();
+    const secret = path.join(lane, "host-secret");
+    fs.writeFileSync(secret, "ghp_sensitive_symlink_secret");
+    fs.symlinkSync(secret, path.join(lane, ".local", "lead"));
+    const open = vi.spyOn(fs, "openSync");
+    try {
+      expect(() => recordedProjectLead(lane, {})).toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_LEAD_INVALID" }));
+      expect(open).not.toHaveBeenCalled();
+      fs.rmSync(path.join(lane, ".local"), { recursive: true });
+      fs.mkdirSync(path.join(lane, "outside"));
+      fs.writeFileSync(path.join(lane, "outside", "lead"), "session:11111111-1111-4111-8111-111111111111");
+      fs.symlinkSync(path.join(lane, "outside"), path.join(lane, ".local"));
+      expect(() => recordedProjectLead(lane, {})).toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_LEAD_INVALID" }));
+      expect(open).not.toHaveBeenCalled();
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it.each([
+    ["ssh://git@code.example.net:2222/team/app.git", "code.example.net:2222/team/app"],
+    ["ssh://git@forge/team/app.git", "forge/team/app"],
+    ["ssh://git@forge:2222/team/app.git", "forge:2222/team/app"],
+    ["https://CODE.example.net/Team/App.git", "code.example.net/team/app"],
+    ["https://code.example.net/team/app.git.git", "code.example.net/team/app.git"],
+  ])("#201 origin normalization is idempotent for %s", (origin, expected) => {
+    const identity = normalizeOrigin(origin);
+    expect(identity).toBe(expected);
+    expect(normalizeOrigin(identity!)).toBe(identity);
+  });
+
+  it.each([
+    ["ssh://git@code.example.net:2222/team/app.git", "https://code.example.net/2222/team/app.git"],
+    ["ssh://git@code.example.net:2222/team/app.git", "git@code.example.net:2222/team/app.git"],
+    ["ssh://git@code.example.net:22/team/app.git", "https://code.example.net/team/app.git"],
+    ["https://code.example.net:443/team/app.git", "https://code.example.net/team/app.git"],
+    ["https://code.example.net/team/app.git", "https://other.example.net/team/app.git"],
+    ["https://code.example.net/team/app.git", "https://code.example.net/other/app.git"],
+    ["https://code.example.net/team/app.git", "https://code.example.net/team/other.git"],
+    ["https://code.example.net/team/app.git", "https://code.example.net/team/app.git.git"],
+  ])("#201 rejects cross-repository recorded leads: %s versus %s", (origin, foreignOrigin) => {
+    const repository = normalizeOrigin(origin)!;
+    const foreignRepository = normalizeOrigin(foreignOrigin)!;
+    expect(repository).not.toBe(foreignRepository);
+    const lead = { id: "session:lead", startedAt: 1, repository: foreignRepository, remoteHost: "forge" };
+    expect(() => resolveProjectAgent([lead], path.resolve("/lane"), { repository, leadId: lead.id }))
+      .toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" }));
+  });
+
+  it.each([
+    "https://code.example.net/team/../app.git", "https://code.example.net/team/./app.git",
+    "https://code.example.net//team/app.git", "https://code.example.net/team/app.git/",
+    "https://code.example.net/team/app.git?other", "https://code.example.net/team/app.git#other",
+    "https://code.example.net/team\\app.git",
+  ])("#201 rejects syntax whose lossy URL normalization could alias a repository: %s", (origin) => {
+    expect(normalizeOrigin(origin)).toBeUndefined();
+    const project = path.resolve("/lane");
+    const lead = { id: "session:lead", startedAt: 1, project, role: "project-agent" };
+    expect(() => resolveProjectAgent([lead], project, { repository: origin, leadId: lead.id }))
+      .toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" }));
+  });
+
+  it("#201 resolves a dotless-host mirror using the already published repository identity", () => {
+    const repository = normalizeOrigin("ssh://git@forge/team/app.git")!;
+    const lead = { id: "session:lead", startedAt: 1, repository, remoteHost: "forge" };
+    expect(resolveProjectAgent([lead], path.resolve("/lane"), { repository, leadId: lead.id })).toBe(lead);
   });
 
   it("never elects a non-interactive auditor or a recorded lead from a different repository", () => {

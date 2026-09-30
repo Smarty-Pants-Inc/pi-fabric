@@ -67,16 +67,10 @@ export const sessionHoldsRecords = (entries: readonly unknown[], ids: readonly s
   return false;
 };
 
-/** A receipt snapshot of recent entries; async inbox reads must not retain the history. */
-export const recordsInboxSession = (entries: readonly unknown[]): RecordsInboxSession => {
-  const batches: Set<string>[] = [];
-  for (let index = entries.length - 1; index >= Math.max(0, entries.length - 500); index--) {
-    const entry = entries[index] as { type?: string; customType?: string; details?: { ids?: unknown } } | undefined;
-    if (entry?.type !== "custom_message" || entry.customType !== RECORDS_INBOX_CUSTOM_TYPE || !Array.isArray(entry.details?.ids)) continue;
-    batches.push(new Set(entry.details.ids.filter((id): id is string => typeof id === "string")));
-  }
-  return { holdsBatch: (ids) => batches.some((held) => ids.every((id) => held.has(id))) };
-};
+/** The records inbox's view of a session's recent entries. */
+export const recordsInboxSession = (entries: readonly unknown[]): RecordsInboxSession => ({
+  holdsBatch: (ids) => sessionHoldsRecords(entries, ids),
+});
 
 const escapeXml = (value: string): string => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 

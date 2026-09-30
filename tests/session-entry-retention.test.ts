@@ -2,7 +2,6 @@ import { setImmediate } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 import { restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "../src/agents/stopped-runs.js";
 import type { AgentRunResult } from "../src/agents/types.js";
-import { recordsInboxSession, RECORDS_INBOX_CUSTOM_TYPE } from "../src/records/inbox.js";
 import { rootInboxSession, ROOT_INBOX_CUSTOM_TYPE } from "../src/topology/root-inbox.js";
 
 // About 50 MiB of distinct heap payload, not repeated strings/ropes. Each fixture
@@ -42,17 +41,17 @@ const deliveryFixture = (notifyOnComplete: boolean) => {
   };
 };
 
-const inboxFixture = (kind: "root" | "records") => {
+const inboxFixture = () => {
   const entries = largeHistory();
   const ids = ["a", "b"];
   entries.push({
-    type: "custom_message", customType: kind === "root" ? ROOT_INBOX_CUSTOM_TYPE : RECORDS_INBOX_CUSTOM_TYPE,
+    type: "custom_message", customType: ROOT_INBOX_CUSTOM_TYPE,
     details: { ids },
   });
   const carried = { from: { id: "peer" }, data: { key: " work " } };
   entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: { items: [carried] } });
-  const rootSession = kind === "root" ? rootInboxSession(entries) : undefined;
-  const session = rootSession ?? recordsInboxSession(entries);
+  const rootSession = rootInboxSession(entries);
+  const session = rootSession;
   return { session, holdsSteer: rootSession?.holdsSteer, references: [new WeakRef(entries), new WeakRef(entries[0] as object), new WeakRef(ids), new WeakRef(carried)] };
 };
 
@@ -70,8 +69,8 @@ describe("session-entry consumers release canonical history (smarty-dev#2177)", 
     expect(fixture.appended).toEqual([{ delivered: ["pending"] }]);
   });
 
-  it.each(["root", "records"] as const)("collects history while the %s inbox view stays usable", async (kind) => {
-    const { session, holdsSteer, references } = inboxFixture(kind);
+  it.each(["root"] as const)("collects history while the %s inbox view stays usable", async () => {
+    const { session, holdsSteer, references } = inboxFixture();
     expect(await collected(references)).toBe(true);
     expect(session.holdsBatch(["a", "b"])).toBe(true);
     expect(session.holdsBatch(["missing"])).toBe(false);
@@ -82,16 +81,16 @@ describe("session-entry consumers release canonical history (smarty-dev#2177)", 
     }
   });
 
-  it.each(["root", "records"] as const)("preserves single-batch and lookback boundaries in the %s view", (kind) => {
-    const customType = kind === "root" ? ROOT_INBOX_CUSTOM_TYPE : RECORDS_INBOX_CUSTOM_TYPE;
+  it.each(["root"] as const)("preserves single-batch and lookback boundaries in the %s view", () => {
+    const customType = ROOT_INBOX_CUSTOM_TYPE;
     const batch = (ids: string[]) => ({ type: "custom_message", customType, details: { ids } });
     const entries = [batch(["old"]), ...Array<unknown>(500).fill({ type: "message" }), batch(["a"]), batch(["b"])];
-    const session = kind === "root" ? rootInboxSession(entries) : recordsInboxSession(entries);
+    const session = rootInboxSession(entries);
     expect(session.holdsBatch(["old"])).toBe(false);
     expect(session.holdsBatch(["a"])).toBe(true);
     expect(session.holdsBatch(["b"])).toBe(true);
     expect(session.holdsBatch(["a", "b"])).toBe(false);
     expect(session.holdsBatch([])).toBe(true);
-    expect((kind === "root" ? rootInboxSession([]) : recordsInboxSession([])).holdsBatch([])).toBe(false);
+    expect(rootInboxSession([]).holdsBatch([])).toBe(false);
   });
 });

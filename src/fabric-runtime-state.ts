@@ -674,11 +674,12 @@ export class FabricRuntimeState {
       }
       return { key: `${resolved.provider}/${resolved.id}`, model };
     };
-    const completionInbox = new AgentCompletionInbox(this.pi, context);
-    this.#completionInbox = completionInbox;
     const actorSpawner = identity.kind === "actor" ? resolveAgentSpawner(identity.id, mainAgentId) : undefined;
     const actorSessionFile = process.env.PI_FABRIC_ACTOR_SESSION_FILE?.trim() || context.sessionManager.getSessionFile?.();
     const actorChildStore = actorSpawner && actorSessionFile ? new ActorChildCompletionStore(actorSessionFile) : undefined;
+    const completionInbox = new AgentCompletionInbox(this.pi, context,
+      actorChildStore ? (ids) => actorChildStore.consumeLiveBatch(ids) : undefined);
+    this.#completionInbox = completionInbox;
     let markStoppedDelivered = (_id: string): void => {};
     this.#agents = new AgentManager(context.cwd, agentConfig, {
       fullCodeMode: this.#config.fullCodeMode,
@@ -742,7 +743,17 @@ export class FabricRuntimeState {
       onBackgroundComplete: (result) => {
         completionInbox.enqueue(result,
           actorChildStore ? () => actorChildStore.acknowledge(result.id) : undefined,
-          actorChildStore ? () => actorChildStore.consume(result.id) : undefined);
+          actorChildStore ? () => actorChildStore.prepareLive(result.id) : undefined);
+      },
+      onBeforeResultReturned: (id) => {
+        // ponytail: commit BEFORE returning to the actor program, not in the
+        // deferred post-delivery callback. Retry a transient receipt failure once;
+        // persistent failure rejects the observation, making returned-but-unrecorded impossible.
+        if (actorChildStore) {
+          try { actorChildStore.consume(id, { handoff: true }); } catch {
+            actorChildStore.consume(id, { handoff: true });
+          }
+        }
       },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);

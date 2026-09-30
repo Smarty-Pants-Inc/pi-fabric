@@ -10,12 +10,12 @@ export interface ActorChildCompletion {
   result: ActorChildResult;
 }
 const ID = /^[a-f0-9]{32}$/;
-const STORED_FILE = /^([a-f0-9]{32})(?:\.result\.json|\.json|\.receipt)$/;
+const STORED_FILE = /^([a-f0-9]{32})(?:\.result\.json|\.json|\.receipt|\.live-receipt)$/;
 
 /**
  * Write-ahead inbox shared by an actor activation and its authoritative owner.
  * Only unread outcomes retain a full result. A handoff receipt transfers ownership
- * to the serial mailbox; that result lives until the mailbox activation finishes.
+ * to the serial mailbox; that result lives until an activation consumes its context.
  */
 export class ActorChildCompletionStore {
   readonly directory: string;
@@ -57,17 +57,37 @@ export class ActorChildCompletionStore {
     if (!options.handoff) this.releaseResult(id);
   }
 
-  /** A foreground result was returned in this activation: leave no archive. */
+  /** Preparation checks recoverability, but must not claim or remove an outcome. */
+  prepareLive(id: string): void {
+    fs.accessSync(this.resultFile(id), fs.constants.R_OK);
+  }
+
+  /** One atomic claim for the entire prepared batch, immediately before sending. */
+  consumeLiveBatch(ids: string[]): void {
+    if (ids.some((id) => !ID.test(id))) throw new Error("Invalid actor child completion id");
+    const batchId = ids[0];
+    if (!batchId) return;
+    // Staged receipts are unread until the batch marker commits. No shared mutable
+    // ledger: owner pruning and a new activation cannot overwrite another batch.
+    for (const id of ids) {
+      if (!this.received(id)) writeJsonAtomic(this.#receipt(id), { id, batchId, acknowledgedAt: Date.now() }, { durable: true });
+    }
+    writeJsonAtomic(this.#batchReceipt(batchId), { ids }, { durable: true });
+  }
+
+  #batchReceipt(id: string): string { return path.join(this.directory, `${id}.live-receipt`); }
+
+  /** A foreground result was durably consumed: cleanup cannot undo its receipt. */
   discard(id: string): void {
     if (!ID.test(id)) return;
+    this.consume(id, { handoff: true });
     // status.json may become terminal before the manager receives its settle event.
     this.#consumed.add(id);
-    // A failed unlink must not resurrect the envelope after the result returns.
-    if (fs.existsSync(this.#file(id))) this.consume(id);
-    fs.rmSync(this.#file(id), { force: true });
-    this.releaseResult(id);
-    fs.rmSync(this.#receipt(id), { force: true });
-    this.#checked.delete(id);
+    try {
+      fs.rmSync(this.#file(id), { force: true });
+      this.releaseResult(id);
+      this.#checked.delete(id);
+    } catch { /* Receipt is durable; the owner/retention sweep can retry cleanup. */ }
   }
 
   releaseResult(id: string): void {
@@ -158,7 +178,15 @@ export class ActorChildCompletionStore {
     return path.join(this.directory, `${id}.result.json`);
   }
 
-  received(id: string): boolean { return ID.test(id) && fs.existsSync(this.#receipt(id)); }
+  received(id: string): boolean {
+    if (!ID.test(id)) return false;
+    let receipt: { batchId?: string };
+    try { receipt = JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error; // Unreadable consumption evidence is not evidence of non-consumption.
+    }
+    return !receipt.batchId || (ID.test(receipt.batchId) && fs.existsSync(this.#batchReceipt(receipt.batchId)));
+  }
   #file(id: string): string { return path.join(this.directory, `${id}.json`); }
   #receipt(id: string): string { return path.join(this.directory, `${id}.receipt`); }
 }

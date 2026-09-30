@@ -749,6 +749,7 @@ export class AgentsProvider implements FabricProvider {
           const result = this.manager.status(id);
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
           if (terminalAgentStatuses.has(result.status)) {
+            this.manager.prepareForeground(id);
             if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
             else this.manager.markForeground(id);
           }

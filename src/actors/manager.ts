@@ -2112,16 +2112,18 @@ export class ActorManager {
         const beforeRun = await this.#validity(actor, item);
         if (!beforeRun.valid) {
           this.#recordStale(actor, item, beforeRun.reason);
-          this.#finishInFlight(actor.id, item);
+          const retained = this.#finishInFlight(actor.id, item, false);
           delete actor.abortController;
           actor.status = actor.queue.length > 0 ? "queued" : "idle";
           actor.updatedAt = Date.now();
           await this.#publishPresence(actor);
+          if (retained) break;
           continue;
         }
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
+        let handoffConsumed = false;
         // A run ended by a stop (agents.stop, a signal) is interrupted, not failing.
         let runStopped = false;
         let capabilityLease: FabricCapabilityViewLease | undefined;
@@ -2166,6 +2168,8 @@ export class ActorManager {
             },
           );
           runId = result.id;
+          // Error-only turns and a spawned handle do not prove inference consumed context.
+          handoffConsumed = result.inferenceStarted ?? (result.status === "completed" || result.toolCalls > 0);
           // Captured before any check that can throw: a completed run is never parked and
           // rerun, whatever happens to ownership afterwards.
           runCompleted = result.status === "completed";
@@ -2321,8 +2325,11 @@ export class ActorManager {
           delete actor.inFlightRun;
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
-          this.#finishInFlight(actor.id, item);
+          const retained = this.#finishInFlight(actor.id, item, handoffConsumed);
+          if (retained && actor.status !== "stopped") actor.status = "queued";
           if (this.#canManage(actor.id)) await this.#publishPresence(actor);
+          // No hot retry: the next external activation (or owner restart) retries the unread handoff.
+          if (retained) break;
         }
       }
     } finally {
@@ -3240,14 +3247,20 @@ export class ActorManager {
     return true;
   }
 
-  #finishInFlight(actorId: string, item: ActorQueueItem): void {
+  #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean): boolean {
     if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
     const actor = this.#actors.get(actorId);
     const stillPending = actor && [...actor.queue, ...(this.#overflow.get(actorId) ?? []),
       ...(this.#parked.get(actorId) ?? [])].some((pending) => pending.id === item.id);
-    if (this.#persistQueue(actorId) && actor && item.source === "child-completion" && !stillPending) {
+    const retained = !!actor && item.source === "child-completion" && !consumed && !stillPending;
+    // ponytail: a failed-before-inference activation has not consumed the handoff.
+    // Keep its deterministic mailbox item AND full result for the next activation.
+    if (retained) actor.queue.unshift(item);
+    if (this.#persistQueue(actorId, item.source === "child-completion") && actor &&
+        item.source === "child-completion" && consumed && !stillPending) {
       try { this.#childCompletionStore(actor).releaseResult(item.id); } catch { /* The retention sweep retries cleanup. */ }
     }
+    return retained;
   }
 
   #readQueue(file: string): unknown {

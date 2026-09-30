@@ -994,7 +994,10 @@ const main = async (): Promise<void> => {
     if (event.type === "message_update" && !terminalStatus) {
       const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
       if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
-          typeof delta.delta === "string" && delta.delta.length > 0) recoveryWatchdog.progress();
+          typeof delta.delta === "string" && delta.delta.length > 0) {
+        if (!record.inferenceStarted) { record.inferenceStarted = true; update(); }
+        recoveryWatchdog.progress();
+      }
     }
     if (event.type === "agent_start") {
       emitLifecycle("pi.agent_start");
@@ -1036,6 +1039,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_start") {
+      record.inferenceStarted = true;
       record.toolCalls++;
       if (typeof event.toolName === "string") {
         record.currentTool = event.toolName;
@@ -1081,6 +1085,9 @@ const main = async (): Promise<void> => {
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
       const text = extractText(messageRecord);
+      if (text || (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted")) {
+        record.inferenceStarted = true;
+      }
       if (text) {
         record.text = latestRunText(text);
         process.stdout.write(`\n${text}\n`);

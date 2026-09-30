@@ -150,6 +150,8 @@ export interface AgentRunRecord {
   finishedAt?: number;
   currentTool?: string;
   turns: number;
+  /** Actual model output/tool execution, not worker startup or an error-only turn. */
+  inferenceStarted?: boolean;
   toolCalls: number;
   text: string;
   /** How a structured reply arrived: its fabric_reply tool call (smarty-dev#967). */

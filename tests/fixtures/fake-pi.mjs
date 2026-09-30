@@ -107,6 +107,12 @@ switch (behavior) {
       setInterval(() => {}, 60_000);
     }
     break;
+  case "error-only-turn":
+    terminated();
+    emit({ type: "turn_end", turnIndex: 0, toolResults: [] });
+    emit({ type: "agent_end", willRetry: false });
+    emit({ type: "agent_settled" });
+    break;
   case "terminated-restart-exit":
     terminated();
     emit({ type: "agent_start" });

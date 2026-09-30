@@ -43,6 +43,7 @@ export const createRunningRecord = (
   startedAt,
   updatedAt: startedAt,
   turns: options.carryOver?.turns ?? 0,
+  ...(options.runner === "pi" ? { inferenceStarted: false } : {}),
   toolCalls: options.carryOver?.toolCalls ?? 0,
   text: "",
   usage: options.carryOver?.usage ?? emptyUsage(),

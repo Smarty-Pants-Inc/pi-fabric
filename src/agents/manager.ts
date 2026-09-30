@@ -577,6 +577,7 @@ export class AgentManager {
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onResultConsumed: ((id: string) => void) | undefined;
+  readonly #onBeforeResultReturned: ((id: string) => void) | undefined;
   readonly #onStoppedAtClose: ((results: AgentRunResult[]) => void) | undefined;
   readonly #onSettled: ((result: AgentRunResult) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
@@ -633,6 +634,8 @@ export class AgentManager {
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onResultConsumed?: (id: string) => void;
+      /** Fail-closed durable fence before a foreground value reaches its caller. */
+      onBeforeResultReturned?: (id: string) => void;
       onStoppedAtClose?: (results: AgentRunResult[]) => void;
       /** Every terminal result, foreground or background, before its run directory can be removed. */
       onSettled?: (result: AgentRunResult) => void;
@@ -661,6 +664,7 @@ export class AgentManager {
       options.vedaBinary ?? process.env.PI_FABRIC_VEDA_BINARY ?? config.veda.binary;
     this.#onBackgroundComplete = options.onBackgroundComplete;
     this.#onResultConsumed = options.onResultConsumed;
+    this.#onBeforeResultReturned = options.onBeforeResultReturned;
     this.#onStoppedAtClose = options.onStoppedAtClose;
     this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
@@ -1165,6 +1169,7 @@ export class AgentManager {
   async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void } = {}): Promise<AgentRunResult> {
     const previous = this.#previousRun(id);
     if (previous) {
+      this.prepareForeground(id);
       if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id));
       else this.#onResultConsumed?.(id);
       return previous;
@@ -1172,6 +1177,7 @@ export class AgentManager {
     const managed = this.#requireRun(id);
     if (!options.deferConsumption) managed.background = false;
     const consumed = (): void => {
+      this.prepareForeground(id);
       if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id), () => this.detachSignal(id));
       else this.#onResultConsumed?.(id);
     };
@@ -1221,7 +1227,12 @@ export class AgentManager {
     });
   }
 
+  prepareForeground(id: string): void {
+    this.#onBeforeResultReturned?.(id);
+  }
+
   markForeground(id: string): void {
+    this.prepareForeground(id);
     if (!this.#previousRun(id)) this.#requireRun(id).background = false;
     this.#onResultConsumed?.(id);
   }

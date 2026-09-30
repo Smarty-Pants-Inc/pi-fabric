@@ -284,6 +284,7 @@ interface FabricAgentResult extends FabricAgentHandle {
   startedAt: number;
   finishedAt?: number;
   turns: number;
+  inferenceStarted?: boolean;
   toolCalls: number;
   text: string;
   value?: unknown;

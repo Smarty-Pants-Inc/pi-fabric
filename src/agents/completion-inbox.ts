@@ -25,7 +25,7 @@ export class AgentCompletionInbox {
   #suspended = false;
   #closed = false;
 
-  constructor(readonly pi: ExtensionAPI, context: ExtensionContext) {
+  constructor(readonly pi: ExtensionAPI, context: ExtensionContext, readonly commitBatch?: (ids: string[]) => void) {
     this.#context = context;
     const subscribe = (event: string, handler: (...handlerArgs: any[]) => unknown): void => {
       if (typeof pi.on !== "function") return;
@@ -153,8 +153,12 @@ export class AgentCompletionInbox {
         return `Agent ${oneLine(result.name).slice(0, 80)} (${result.id}) ${result.status} after ${seconds}s:\n${clip(summary || "no result", perResult)}`;
       }),
     ].join("\n\n");
-    // Claim durable actor consumption before attempting a live send.
-    try { for (const { prepare } of batch) prepare?.(); } catch { this.#schedule(); return; }
+    // Preparation is non-consuming. Only a fully prepared batch gets one atomic
+    // durable claim, so a later preparation failure leaves every outcome unread.
+    try {
+      for (const { prepare } of batch) prepare?.();
+      this.commitBatch?.(batch.map(({ result }) => result.id));
+    } catch { this.#schedule(); return; }
     try { deliver({
       customType: AGENT_COMPLETION_MESSAGE_TYPE,
       content,

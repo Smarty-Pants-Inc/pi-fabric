@@ -25,13 +25,13 @@ const setup = () => {
 };
 
 describe("actor child completion handoff storage", () => {
-  it.each([true, false])("removes every file when a foreground result is consumed (notify=%s)", (notify) => {
+  it.each([true, false])("removes the archive but retains durable foreground consumption evidence (notify=%s)", (notify) => {
     const h = setup();
     const result = h.result();
     h.store.enqueue(result, h.spawner, notify);
     expect(fs.existsSync(h.store.resultFile(result.id))).toBe(true);
     h.store.discard(result.id);
-    expect(fs.readdirSync(h.store.directory)).toEqual([]);
+    expect(fs.readdirSync(h.store.directory)).toEqual([`${result.id}.receipt`]);
   });
 
   it("does not archive a terminal status consumed before the settle event arrives", () => {
@@ -39,7 +39,7 @@ describe("actor child completion handoff storage", () => {
     const result = h.result();
     h.store.discard(result.id);
     h.store.enqueue(result, h.spawner);
-    expect(fs.existsSync(h.store.directory)).toBe(false);
+    expect(fs.readdirSync(h.store.directory)).toEqual([`${result.id}.receipt`]);
   });
 
   it("retains an unread full outcome through handoff, then deletes it on consumption", () => {
@@ -63,6 +63,46 @@ describe("actor child completion handoff storage", () => {
     expect(fs.existsSync(h.store.resultFile(result.id))).toBe(false);
     expect(h.store.pending()).toEqual([]);
     expect(fs.readdirSync(h.store.directory)).toEqual([`${result.id}.receipt`]);
+  });
+
+  it("claims a live batch atomically without deleting its full outcomes before delivery", () => {
+    const h = setup();
+    const a = h.result();
+    const b = h.result("c".repeat(32));
+    for (const result of [a, b]) { h.store.enqueue(result, h.spawner); h.store.prepareLive(result.id); }
+    h.store.consumeLiveBatch([a.id, b.id]);
+    const restarted = new ActorChildCompletionStore(h.sessionFile);
+    for (const result of [a, b]) {
+      expect(restarted.received(result.id)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(restarted.resultFile(result.id), "utf8"))).toMatchObject(result);
+      restarted.acknowledge(result.id);
+      expect(fs.existsSync(restarted.resultFile(result.id))).toBe(false);
+    }
+    restarted.prune(1, Date.now() + 10);
+    expect(fs.readdirSync(restarted.directory)).toEqual([]);
+  });
+
+  it("a second staged receipt failure leaves the entire unsent live batch recoverable after restart", () => {
+    const h = setup();
+    const a = h.result();
+    const b = h.result("c".repeat(32));
+    for (const result of [a, b]) h.store.enqueue(result, h.spawner);
+    const rename = fs.renameSync;
+    const failed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === path.join(h.store.directory, `${b.id}.receipt`)) throw new Error("second staged receipt failed");
+      rename(from, to);
+    });
+    expect(() => h.store.consumeLiveBatch([a.id, b.id])).toThrow("second staged receipt failed");
+    failed.mockRestore();
+    const restarted = new ActorChildCompletionStore(h.sessionFile);
+    expect(restarted.pending()).toHaveLength(2);
+    for (const result of [a, b]) {
+      expect(restarted.received(result.id)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(restarted.resultFile(result.id), "utf8"))).toMatchObject(result);
+    }
+    restarted.consumeLiveBatch([a.id, b.id]);
+    expect(restarted.pending()).toEqual([]);
+    for (const result of [a, b]) restarted.acknowledge(result.id);
   });
 
   it("does not read the session for in-flight envelopes across 100 polls", () => {

@@ -23,7 +23,7 @@ import {
   readFabricExecutionRenderDetails,
 } from "./audit/index.js";
 import { DEFAULT_FABRIC_CONFIG } from "./config.js";
-import { hostGlobalsGuidance } from "./core/system-guidance.js";
+import { PAYLOADS_LITERAL_GUIDANCE, hostGlobalsGuidance } from "./core/system-guidance.js";
 import type { FabricState } from "./fabric-state.js";
 import { formatFailureProgress } from "./failure-progress.js";
 import {
@@ -151,8 +151,8 @@ const orchestrationGuidelines = (python: boolean): string[] => [
   "For coding tasks, keep an acceptance ledger: turn the request into concrete checks, trace the relevant execution path before editing, implement end to end, then run targeted tests and direct behavioral probes. Mechanically confirm requested public symbols, registrations, and configuration entries. Use the smallest checks that cover the ledger, escalating only for failures or cross-cutting risk; inspect failures and iterate instead of rerunning unchanged passing checks. A build alone is not completion.",
   "Amortize round trips without inflating context: batch only independent, bounded work in one program, and keep a step sequential when its output decides the next one. Filter or summarize large results inside the program and return decisions and evidence, not raw data.",
   python
-    ? "Pass multiline or quote-heavy text through top-level `payloads`; read it as `π.key` or `payloads['key']`, with exactly the keys supplied."
-    : "Pass multiline or quote-heavy text through top-level `payloads`; each `π.key` must exactly match a key there.",
+    ? "Pass multiline or quote-heavy text through top-level `payloads`; read it as `π.key` or `payloads['key']`, with exactly the keys supplied; " + PAYLOADS_LITERAL_GUIDANCE + "."
+    : "Pass multiline or quote-heavy text through top-level `payloads`; each `π.key` must exactly match a key there; " + PAYLOADS_LITERAL_GUIDANCE + ".",
   executionDisplayGuidance,
 ];
 
@@ -231,7 +231,7 @@ export const createFabricExecTool = (
       payloads: Type.Optional(
         Type.Record(Type.String(), Type.String(), {
           description:
-            "Named payloads exposed under the same exact name as π.key (for example, payloads.contract becomes π.contract). Never reference a π key absent from this map. Useful for content that is awkward to quote inside code. Prefer an object of string values; a JSON-object string is parsed.",
+            "Named payloads exposed under the same exact name as π.key (for example, payloads.contract becomes π.contract). Never reference a π key absent from this map. Useful for content that is awkward to quote inside code. Prefer an object of string values; a JSON-object string is parsed. " + PAYLOADS_LITERAL_GUIDANCE + " (a bare `__TOKEN__`, `@/path` or `file://` value is rejected).",
         }),
       ),
       resultFormat: Type.Optional(Type.Union(RESULT_FORMATS.map((value) => Type.Literal(value)))),
@@ -313,7 +313,7 @@ export const createFabricExecTool = (
         : renderFabricWriteArgumentPreview(
             {
               bindings: rendererState.fabricWriteBindings ?? [],
-              strings: resolveFabricExecPayloads(params),
+              strings: resolveFabricExecPayloads(params, { validate: false }),
               expanded: context.expanded,
               cwd: context.cwd,
               settings: codePreviewSettings,
@@ -865,6 +865,8 @@ export const createFabricExecTool = (
       // keep the same coercion here for direct internal invocations.
       const joined = Array.isArray(params.code) ? params.code.join("\n") : params.code;
       const code = state.config.executor.kernel === "python" ? joined : repairFabricGuestCode(joined);
+      // Shared payload validation (smarty-dev#2340) rejects before any runtime.
+      const strings = resolveFabricExecPayloads(params);
       const repeat = repeatGuard.observe(code);
       if (repeat.blocked) {
         return {
@@ -874,7 +876,6 @@ export const createFabricExecTool = (
         };
       }
       const runDisplay = normalizeRunDisplay(params.display);
-      const strings = resolveFabricExecPayloads(params);
       const tokenBudget = "tokenBudget" in params && typeof params.tokenBudget === "number"
         ? params.tokenBudget : undefined;
       const result = await state.execution.execute({

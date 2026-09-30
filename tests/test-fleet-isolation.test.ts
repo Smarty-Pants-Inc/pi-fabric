@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { expect, test, vi } from "vitest";
 
@@ -25,7 +26,8 @@ const sentinel = process.env.FLEET_ISOLATION_SENTINEL;
 const entry = process.env.FLEET_ISOLATION_ENTRY;
 const baseline = fs.readFileSync(path.join(sentinel, "agent", "fabric.json"), "utf8");
 const module = await import(pathToFileURL(entry).href);
-const keys = ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT", "PI_FABRIC_PROJECT",
+// These selectors grant WRITE locations; semantic project attribution is deliberately absent.
+const keys = ["PI_FABRIC_MESH_ROOT", "PI_FABRIC_PROJECT_ROOT",
   "PI_FABRIC_RUN_ROOT", "PI_FABRIC_AGENT_DIR", "PI_CODING_AGENT_DIR", "MCPORTER_CONFIG"];
 const contained = (root, target) => {
   const relative = path.relative(root, target);
@@ -38,6 +40,7 @@ const assertIsolated = () => {
     assert(process.env[key], key + " must be explicitly isolated, not defaulted");
     assert(contained(root, process.env[key]), key + " inherited a fleet path");
   }
+  assert.equal(process.env.PI_FABRIC_PROJECT, undefined, "inherited semantic project must be scrubbed, not replaced");
   const safe = new Set(keys.filter(key => key.startsWith("PI_FABRIC_")));
   assert.deepEqual(Object.keys(process.env).filter(key => key.startsWith("PI_FABRIC_") && !safe.has(key)), []);
   for (const key of ["SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID"])
@@ -66,7 +69,7 @@ const root = assertIsolated();
 assertChildSnapshot();
 const { resolveAgentDir } = await import(pathToFileURL(path.join(repo, "src/core/agent-dir.ts")).href);
 const { resolveFabricIdentity } = await import(pathToFileURL(path.join(repo, "src/main-agent.ts")).href);
-const { participantRole, participantProject } = await import(pathToFileURL(path.join(repo, "src/topology/project-identity.ts")).href);
+const { participantRole, participantProject, projectOf, resolveProjectAgent } = await import(pathToFileURL(path.join(repo, "src/topology/project-identity.ts")).href);
 const { ResidentActorClient } = await import(pathToFileURL(path.join(repo, "src/residency/actor-client.ts")).href);
 const { loadFabricConfig, saveFabricConfig } = await import(pathToFileURL(path.join(repo, "src/config.ts")).href);
 const { resolveSessionExportDir } = await import(pathToFileURL(path.join(repo, "src/agents/session-export.ts")).href);
@@ -74,16 +77,55 @@ assert.equal(resolveAgentDir(), process.env.PI_CODING_AGENT_DIR);
 assert.equal(resolveFabricIdentity("isolated-test").mainAgentId, "session:isolated-test");
 assert.equal(resolveFabricIdentity("isolated-test").identity.kind, "main");
 assert.equal(participantRole(), undefined);
-assert.equal(participantProject(repo), process.env.PI_FABRIC_PROJECT_ROOT);
+assert.equal(participantProject(repo), projectOf(repo));
+const { MeshStore } = await import(pathToFileURL(path.join(repo, "src/mesh/store.ts")).href);
+const { ParticipantDirectory } = await import(pathToFileURL(path.join(repo, "src/topology/participant-directory.ts")).href);
+const identity = { id: "session:isolated-test", name: "main", kind: "main", sessionId: "isolated-test" };
+const directory = new ParticipantDirectory(new MeshStore(process.env.PI_FABRIC_MESH_ROOT, 65536, 1000), {
+  enabled: false, hostId: identity.id, rootId: identity.id, identity,
+});
+const main = { id: identity.id, cwd: repo, status: "idle", startedAt: 1, updatedAt: 2, pendingMessages: false };
+assert.equal(directory.root(main).role, undefined);
+assert.equal(directory.root(main).project, projectOf(repo));
+// Native role and semantic project overrides set AFTER the boundary must still work.
+process.env.SMARTY_ROLE = "project-agent@test";
+assert.equal(participantRole(), "project-agent");
+const native = directory.root(main);
+assert.equal(native.role, "project-agent");
+assert.equal(native.project, projectOf(repo));
+const mirror = { ...native, id: "session:mirror", startedAt: 99, remoteHost: "forge" };
+assert.equal(resolveProjectAgent([native, mirror], participantProject(repo)).id, identity.id);
+assert.throws(() => resolveProjectAgent([mirror], participantProject(repo)), /No live project agent/);
+process.env.PI_FABRIC_PROJECT = process.env.PI_FABRIC_PROJECT_ROOT;
+assert.equal(participantProject(repo), projectOf(process.env.PI_FABRIC_PROJECT_ROOT));
+assert.equal(directory.root(main).project, projectOf(process.env.PI_FABRIC_PROJECT_ROOT));
+process.env.PI_FABRIC_ROLE = "worktree-agent";
+assert.equal(participantRole(), "worktree-agent");
+delete process.env.PI_FABRIC_ROLE;
+delete process.env.PI_FABRIC_PROJECT;
+delete process.env.SMARTY_ROLE;
+assert.equal(participantRole(), undefined);
+assert.equal(participantProject(repo), projectOf(repo));
+assertIsolated();
+assertChildSnapshot();
 assert.equal(ResidentActorClient.fromEnv(), undefined);
 assert.deepEqual(JSON.parse(fs.readFileSync(process.env.MCPORTER_CONFIG, "utf8")), { mcpServers: {}, imports: [] });
 process.env.PI_FABRIC_MAIN_AGENT_ID = "explicit-test-main";
 assert.equal(resolveFabricIdentity("isolated-test").mainAgentId, "explicit-test-main");
 delete process.env.PI_FABRIC_MAIN_AGENT_ID;
 const location = { cwd: process.env.PI_FABRIC_PROJECT_ROOT, agentDir: resolveAgentDir(), projectTrusted: true };
+// Config APIs write to their supplied cwd, NOT semantic projectOf(repo): keep it private.
 // Real migration and save paths: all containment assertions precede these writes.
-fs.writeFileSync(path.join(location.agentDir, "fabric.json"), "{}");
+fs.mkdirSync(path.join(location.cwd, ".pi"), { recursive: true });
+const configPaths = [path.join(location.agentDir, "fabric.json"), path.join(location.cwd, ".pi", "fabric.json")];
+for (const configPath of configPaths) {
+  assert(contained(root, configPath), "migration target escaped the owned root");
+  fs.writeFileSync(configPath, "{}");
+}
 loadFabricConfig(location);
+for (const configPath of configPaths) {
+  assert(JSON.parse(fs.readFileSync(configPath, "utf8")).configVersion > 0, "real legacy configuration was not migrated");
+}
 for (const scope of ["global", "project"]) {
   const saved = saveFabricConfig({ ...location, scope }, { mesh: { enabled: false } });
   assert(contained(root, saved.path), "configuration escaped the owned root");
@@ -99,8 +141,7 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 test.each(["vitest.config.ts", "tests/fleet-isolation-setup.ts"])(
   "%s fences inherited fleet paths before real source initialization and config writes",
   (entry) => {
-    fs.mkdirSync(path.join(repo, ".local"), { recursive: true });
-    const sentinel = fs.mkdtempSync(path.join(repo, ".local", "fleet-isolation-sentinel-"));
+    const sentinel = fs.mkdtempSync(path.join(tmpdir(), "fleet-isolation-sentinel-"));
     try {
       fs.mkdirSync(path.join(sentinel, "agent"));
       fs.writeFileSync(path.join(sentinel, "agent", "fabric.json"), '{"sentinel":"unchanged"}\n');
@@ -138,6 +179,13 @@ test("explicit behavior stubs still override the safe defaults", async () => {
   try {
     const { resolveFabricIdentity } = await import("../src/main-agent.js");
     expect(resolveFabricIdentity("test").mainAgentId).toBe("explicit-test-main");
+    const { participantRole, participantProject, projectOf } = await import("../src/topology/project-identity.js");
+    vi.stubEnv("SMARTY_ROLE", "project-agent@test");
+    expect(participantRole()).toBe("project-agent");
+    vi.stubEnv("PI_FABRIC_PROJECT", process.env.PI_FABRIC_PROJECT_ROOT!);
+    expect(participantProject(repo)).toBe(projectOf(process.env.PI_FABRIC_PROJECT_ROOT!));
+    vi.stubEnv("PI_FABRIC_ROLE", "worktree-agent");
+    expect(participantRole()).toBe("worktree-agent");
   } finally {
     vi.unstubAllEnvs();
   }

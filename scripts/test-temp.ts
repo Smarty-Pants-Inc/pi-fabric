@@ -63,8 +63,9 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
   owner[fleetRootsKey]!.add(root);
   const environment = {
     PI_FABRIC_MESH_ROOT: join(root, "mesh"),
+    // Writable project state is private; PI_FABRIC_PROJECT is attribution only.
+    // Leave it scrubbed so participantProject(cwd) keeps the fixture's real project.
     PI_FABRIC_PROJECT_ROOT: join(root, "project"),
-    PI_FABRIC_PROJECT: join(root, "project"),
     PI_FABRIC_RUN_ROOT: join(root, "runs"),
     PI_FABRIC_AGENT_DIR: join(root, "exports"),
     PI_CODING_AGENT_DIR: join(root, "agent"),

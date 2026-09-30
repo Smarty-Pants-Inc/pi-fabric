@@ -25,7 +25,7 @@ Every unrelated malformed sender in the raw suffix is recorded, not filtered awa
 
 All other envelope checks (ID/topic/kind/sequence/time/to/text), command schema validation, all-topic raw sequence monotonicity and duplicate-ID rejection, full raw/Store command equality, publication/replay/cancellation checks, stable-file checks and bounds remain fail-closed.
 
-Owner recipe (not executed for this source-only disposition): `node compute-probes/first-send-validator-probe.mjs`; after the owner supplies the compiled Store, `PROOF_MESH_ENTRY="$PWD/dist/mesh.js" node compute-probes/first-send-validator-probe.mjs`. These extract the real production predicates and exercise fixture logs; neither is installed real-host acceptance.
+The inert validation probes are retained in the proof packet linked on #2045, not shipped in this checkout. To replay them, use a lane-owned scratch tree: copy the packet's `proof/` directory to `<scratch>/proof/` and `checks/compute-probes/` to `<scratch>/compute-probes/`. Create `<scratch>/tmp/`, set `TMPDIR` to its absolute path and `PROOF_MESH_ENTRY` to the absolute built or installed `dist/mesh.js`, then run `node <scratch>/compute-probes/first-send-validator-probe.mjs`. The sibling directory layout preserves the probes' source-relative paths. This checks production predicates and fixture logs; it is not an installed real-host acceptance run.
 
 A run on ryzen2 is supplemental evidence for the mission's second host. It does **not** satisfy #2045's explicit Dev1↔Forge acceptance requirement. Report the tested host and installed version without renaming a host to make an assertion pass.
 

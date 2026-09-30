@@ -65,7 +65,7 @@ export class ResidentActorClient {
     return response.actor;
   }
 
-  async removeActor(id: string, signal?: AbortSignal): Promise<{ removed: true; pending?: string }> {
+  async removeActor(id: string, signal?: AbortSignal): Promise<{ removed: true; pending?: string; cleaned?: boolean }> {
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
       operation: "removeActor",
@@ -74,7 +74,8 @@ export class ResidentActorClient {
       id,
       createdAt: Date.now(),
     }, signal);
-    return { removed: true, ...(response.pending ? { pending: response.pending } : {}) };
+    return { removed: true, ...(response.pending === undefined ? {} : { pending: response.pending }),
+      ...(response.cleaned === undefined ? {} : { cleaned: response.cleaned }) };
   }
 
   async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {

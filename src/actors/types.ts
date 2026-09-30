@@ -309,6 +309,17 @@ export interface FabricActorInfo {
   logDir?: string;
 }
 
+/**
+ * Provider read view: a non-owned actor's execution state comes only from its live owner.
+ * Unknown means no fresh owner state; omitted counts are unavailable, not zero.
+ * FabricActorStatus stays closed for ManagedActor execution and registry snapshots.
+ */
+export type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "messages"> & {
+  status: FabricActorStatus | "unknown";
+  queued?: number;
+  messages?: number;
+};
+
 export interface FabricActorLog {
   actorId: string;
   actorName: string;

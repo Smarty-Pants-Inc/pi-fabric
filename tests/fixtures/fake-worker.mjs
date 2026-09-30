@@ -155,7 +155,19 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   };
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
   fs.writeFileSync(statusFile, JSON.stringify(running));
-  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  // Opt-in gate carried in the actor task's JSON payload; existing LIVE markers
+  // still finish after 1.5 s. A missing release fails rather than hanging forever.
+  const releaseMatch = task.match(/"fakeWorkerReleasePath":\s*("(?:\\.|[^"\\])*")/);
+  if (releaseMatch) {
+    const releasePath = JSON.parse(releaseMatch[1]);
+    const deadline = Date.now() + 30_000;
+    while (!fs.existsSync(releasePath)) {
+      if (Date.now() >= deadline) throw new Error("Timed out waiting for fake worker release");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  } else {
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+  }
   const finishedAt = Date.now();
   fs.writeFileSync(
     statusFile,

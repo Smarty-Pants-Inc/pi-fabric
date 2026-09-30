@@ -9,6 +9,7 @@ import type {
   FabricActorDelivery,
   FabricActorHostEvent,
   FabricActorInfo,
+  FabricActorReadInfo,
   FabricActorMessage,
   FabricActorRequest,
   FabricActorRunBinding,
@@ -1116,7 +1117,7 @@ export class AgentsProvider implements FabricProvider {
         return result;
       }
       case "actorStatus":
-        return this.actorManager.status(String(args.id));
+        return this.#actorWithLiveState(this.actorManager.status(String(args.id)));
       case "instructions": {
         const actor = this.actorManager.status(String(args.id));
         const { instructions } = this.actorManager.definition(actor.id);
@@ -1408,36 +1409,42 @@ export class AgentsProvider implements FabricProvider {
     return actor;
   }
 
-  /**
-   * Actors, with the owner's live state for those another host runs: the registry says only
-   * idle or stopped, so a stopped actor still ending a run looked finished (smarty-dev#2184 item 8).
-   */
-  #actorsWithLiveState(): FabricActorInfo[] {
-    return this.actorManager.list().map((actor) => {
-      if (this.actorManager.owns(actor.id)) return actor;
-      const live = this.participants.get(actor.id);
-      if (!live || live.stale || live.kind !== "actor") return actor;
-      const now = Date.now();
-      const removal = live.actorRemoval ?? actor.removal;
-      const run = live.actorRun;
-      const runId = removal?.runId ?? run?.id;
-      const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
-      return {
-        ...actor,
-        status: live.status as FabricActorInfo["status"],
-        ...(run ? { inFlightRun: { ...run, ageS: Math.max(0, Math.round((now - run.startedAt) / 1_000)) } } : {}),
-        ...(removal
-          ? {
-              removal: {
-                ...removal,
-                state: runId
-                  ? `removal of ${actor.name} (${actor.id}) is pending behind its in-flight run ${runId} (${runAge})`
-                  : `removal of ${actor.name} (${actor.id}) is pending (${runAge})`,
-              },
-            }
-          : {}),
-      };
-    });
+  #actorsWithLiveState(): FabricActorReadInfo[] {
+    return this.actorManager.list().map((actor) => this.#actorWithLiveState(actor));
+  }
+
+  /** Registry definitions/bindings are useful; non-owned execution snapshots are not (#2726). */
+  #actorWithLiveState(actor: FabricActorInfo): FabricActorReadInfo {
+    if (this.actorManager.owns(actor.id)) return actor;
+    const live = this.participants.get(actor.id, undefined, { fresh: true });
+    // Strip passive counts and runs even when an older owner omits its live counters.
+    // In particular, an idle owner without actorRun must clear a registry's stale run.
+    const { queued: _queued, messages: _messages, inFlightRun: _run, ...definition } = actor;
+    if (!live || live.stale || live.kind !== "actor") return { ...definition, status: "unknown" };
+    const now = Date.now();
+    const removal = live.actorRemoval ?? actor.removal;
+    const run = live.actorRun;
+    const runId = removal?.runId ?? run?.id;
+    const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
+    const status = live.status === "idle" || live.status === "queued" ||
+      live.status === "running" || live.status === "stopped" ? live.status : "unknown";
+    return {
+      ...definition,
+      status,
+      ...(live.actorQueued !== undefined ? { queued: live.actorQueued } : {}),
+      ...(live.actorMessages !== undefined ? { messages: live.actorMessages } : {}),
+      ...(run ? { inFlightRun: { ...run, ageS: Math.max(0, Math.round((now - run.startedAt) / 1_000)) } } : {}),
+      ...(removal
+        ? {
+            removal: {
+              ...removal,
+              state: runId
+                ? `removal of ${actor.name} (${actor.id}) is pending behind its in-flight run ${runId} (${runAge})`
+                : `removal of ${actor.name} (${actor.id}) is pending (${runAge})`,
+            },
+          }
+        : {}),
+    };
   }
 
   #residentActorClient(): ResidentActorClient {

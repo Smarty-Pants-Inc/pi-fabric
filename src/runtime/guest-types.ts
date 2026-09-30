@@ -739,11 +739,22 @@ interface FabricActorInfo {
   messages: number;
   createdAt: number;
   updatedAt: number;
+  /** Last settled run, not the run currently in flight. */
   lastRunId?: string;
+  /** Present only when the current execution owner reports an in-flight run. */
+  inFlightRun?: { id: string; startedAt: number; ageS: number };
+  /** Removal pending behind an in-flight run; state includes a useful progress note. */
+  removal?: { requestedAt: number; runId?: string; runStartedAt?: number; state: string };
   lastError?: string;
   sessionFile?: string;
   logDir?: string;
 }
+/** Live read view: unknown owner state is not idle; omitted counts are unavailable, not zero. */
+type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "messages"> & {
+  status: FabricActorInfo["status"] | "unknown";
+  queued?: number;
+  messages?: number;
+};
 interface FabricModelSwitchRequest {
   /** provider/id, a models.aliases name, or a search term; resolution tries aliases first, then exact matches, then the closest fuzzy match (recency from pi-model-sort breaks ties) against authenticated models. */
   model: string;
@@ -876,7 +887,7 @@ interface FabricAgentsApi {
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
-  actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorInfo>;
+  actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorReadInfo>;
   /** Read a live actor's instruction text and its sha256 digest. Writes nothing. */
   instructions(args: FabricAgentTargetArgs): Promise<{
     id: string;
@@ -885,7 +896,7 @@ interface FabricAgentsApi {
     instructionsDigest: string;
     instructionsLength: number;
   }>;
-  actors(args?: { scope?: "project" }): Promise<FabricActorInfo[]>;
+  actors(args?: { scope?: "project" }): Promise<FabricActorReadInfo[]>;
   /** Project-independent templates in the global registry. */
   actors(args: { scope: "global" }): Promise<FabricActorTemplate[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;

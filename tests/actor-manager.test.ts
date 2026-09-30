@@ -1208,6 +1208,58 @@ describe("ActorManager across a session reload", () => {
 });
 
 describe("ActorManager", () => {
+  it.each([false, true])("keeps an in-flight actor running while its queue grows (persistent owner: %s)", async (persistent) => {
+    const { actors, agents } = setup(persistent);
+    const run = agents.run.bind(agents);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const running = vi.spyOn(agents, "run").mockImplementation(async (request, signal, onSpawned) => {
+      const result = await run(request, signal, onSpawned);
+      await gate;
+      return result;
+    });
+    const actor = await actors.create({ name: "busy", instructions: "Work.", responseMode: "text" });
+    try {
+      actors.tell(actor.id, "first");
+      await waitFor(() => actors.status(actor.id).inFlightRun !== undefined);
+      const inFlightRun = actors.status(actor.id).inFlightRun!;
+      expect(actors.status(actor.id)).toMatchObject({ status: "running", queued: 0 });
+
+      actors.tell(actor.id, "second");
+      actors.tell(actor.id, "third");
+      const queued = actors.status(actor.id);
+      expect(queued).toMatchObject({ status: "running", queued: 2 });
+      expect(queued.inFlightRun).toMatchObject({ id: inFlightRun.id, startedAt: inFlightRun.startedAt });
+      expect(running).toHaveBeenCalledTimes(1);
+
+      release();
+      await waitFor(() => actors.status(actor.id).status === "idle", 10_000);
+      expect(actors.status(actor.id)).toMatchObject({ status: "idle", queued: 0 });
+      expect(actors.status(actor.id).inFlightRun).toBeUndefined();
+      expect(running).toHaveBeenCalledTimes(3);
+      expect(actors.messages(actor.id).filter((message) => message.direction === "out" && !message.error)).toHaveLength(3);
+    } finally {
+      release();
+    }
+  });
+
+  it.each([false, true])("does not requeue a stopped in-flight actor (persistent owner: %s)", async (persistent) => {
+    const { actors } = setup(persistent);
+    const actor = await actors.create({ name: "stopped-busy", instructions: "Work.", events: ["agent_settled"], responseMode: "text" });
+    actors.tell(actor.id, "HANG first");
+    await waitFor(() => actors.status(actor.id).inFlightRun !== undefined);
+    actors.tell(actor.id, "waiting");
+    expect(actors.status(actor.id)).toMatchObject({ status: "running", queued: 1 });
+
+    await actors.stop(actor.id);
+    expect(actors.status(actor.id)).toMatchObject({ status: "stopped", queued: 0 });
+    expect(() => actors.tell(actor.id, "later")).toThrow("is stopped");
+    expect(() => actors.ask(actor.id, "later")).toThrow("is stopped");
+    expect(actors.dispatchHostEvent("agent_settled", {})).toBe(0);
+    await waitFor(() => actors.status(actor.id).inFlightRun === undefined, 10_000);
+    expect(actors.status(actor.id)).toMatchObject({ status: "stopped", queued: 0 });
+  });
+
   it("updates inference context on the same identity, preserves policy/history, and restores it", async () => {
     const s = setup(true);
     const actor = await s.actors.create({

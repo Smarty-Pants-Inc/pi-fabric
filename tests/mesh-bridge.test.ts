@@ -77,6 +77,8 @@ interface SetupOptions {
   /** Wrap the hub's view of the remote (to hold or fail its calls). */
   wrapRemote?: (remote: RemoteBridgeSide) => BridgeSide;
   local?: (hub: MeshStore, remoteName: string) => StoreBridgeSide;
+  agent?: (far: MeshStore) => StoreBridgeSide;
+  pollMs?: number;
 }
 
 const setup = (cursorPath?: string, options: SetupOptions = {}) => {
@@ -92,7 +94,7 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
   toGate.on("data", (chunk) => {
     if (!gate.silent) toAgent.write(chunk);
   });
-  void serveBridgeAgent(new StoreBridgeSide(far, "dev1"), toAgent, fromAgent);
+  void serveBridgeAgent(options.agent?.(far) ?? new StoreBridgeSide(far, "dev1"), toAgent, fromAgent);
   let replies: NodeJS.ReadableStream & import("node:stream").Readable = fromAgent;
   if (options.realPipe) {
     const relay = spawn(process.execPath, ["-e", "process.stdin.pipe(process.stdout)"], { stdio: ["pipe", "pipe", "inherit"] });
@@ -109,6 +111,7 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
     remote: options.wrapRemote?.(remote) ?? remote,
     cursorPath: cursorPath ?? path.join(scratch(), "cursor.json"),
     presenceMs: 0,
+    ...(options.pollMs ? { pollMs: options.pollMs } : {}),
     ...(options.stopMs ? { stopMs: options.stopMs } : {}),
     log: (message) => logs.push(message),
   });
@@ -122,7 +125,194 @@ const command = (targetId: string, replyTo: string) => ({
 
 const on = (store: MeshStore, topic: string): MeshEvent[] => store.read({ after: 0, limit: 100 }).filter((e) => e.topic === topic);
 
+const lockTimeout = (): Error => Object.assign(new Error("mesh busy"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+
+const waitFor = async (check: () => boolean): Promise<void> => {
+  const until = Date.now() + 3_000;
+  while (!check() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(check()).toBe(true);
+};
+
 describe("mesh bridge", () => {
+  it.each(["local", "remote"] as const)("retries one typed %s mesh timeout at startup, presence and forward without loss or duplicates", async (where) => {
+    for (const op of ["bridgedIds", "mirror", "publish"] as const) {
+      let side!: StoreBridgeSide;
+      const wrap = (store: MeshStore, peer: string): StoreBridgeSide => (side = new StoreBridgeSide(store, peer));
+      const { hub, far, bridge, logs } = setup(undefined, {
+        pollMs: 5, stopMs: 100,
+        ...(where === "local" ? { local: wrap } : { agent: (store: MeshStore) => wrap(store, "dev1") }),
+      });
+      const lane = await addRoot(hub, "lane");
+      const forge = await addRoot(far, "forge-main");
+      await bridge.start();
+      const original = side[op].bind(side) as (...args: unknown[]) => Promise<unknown>;
+      let calls = 0;
+      const failAt = op === "publish" ? 2 : 1; // A committed prefix must not replay after retry.
+      const times: number[] = [];
+      Object.assign(side, { [op]: async (...args: unknown[]) => {
+        times.push(Date.now());
+        if (++calls === failAt) throw lockTimeout();
+        return original(...args);
+      } });
+      // The startup cursor is already durable: backlog arriving during the retry is retained.
+      const source = where === "local" ? far : hub;
+      const target = where === "local" ? hub : far;
+      const from = where === "local" ? forge.identity : lane.identity;
+      const to = where === "local" ? lane.identity.id : forge.identity.id;
+      const sent = [
+        await source.publish({ topic: "fleet.work.retry.1", kind: "ask", from, to, text: "one" }),
+        await source.publish({ topic: "fleet.work.retry.1", kind: "ask", from, to, text: "two" }),
+      ];
+      let failure: unknown;
+      const running = bridge.run().catch((error: unknown) => { failure = error; });
+      try {
+        await waitFor(() => on(target, "fleet.work.retry.1").length === 2);
+        await waitFor(() => calls >= 2);
+        expect(times[failAt]! - times[failAt - 1]!).toBeGreaterThanOrEqual(80);
+        expect(on(target, "fleet.work.retry.1").map((event) => event.text)).toEqual(["one", "two"]);
+        expect(on(target, "fleet.work.retry.1").map((event) => (event.data as { bridge: { id: string } }).bridge.id))
+          .toEqual(sent.map((event) => event.id));
+        expect(logs.filter((line) => line.includes("retrying"))).toHaveLength(1);
+        expect(logs.some((line) => /dropped|refused/.test(line))).toBe(false);
+        expect(failure).toBeUndefined();
+      } finally {
+        await bridge.stop();
+        await running;
+      }
+    }
+  });
+
+  it.each(["local", "remote"] as const)("releases new seen IDs only after successful %s checkpoints", async (where) => {
+    const cursorPath = path.join(scratch(), "cursor.json");
+    const { hub, far, bridge } = setup(cursorPath);
+    const lane = await addRoot(hub, "lane");
+    const forge = await addRoot(far, "forge-main");
+    await bridge.start();
+    const source = where === "local" ? far : hub;
+    const target = where === "local" ? hub : far;
+    const from = where === "local" ? forge.identity : lane.identity;
+    const to = where === "local" ? lane.identity.id : forge.identity.id;
+    const sent: MeshEvent[] = [];
+    for (let index = 0; index < 12; index++) {
+      sent.push(await source.publish({ topic: "fleet.work.seen.1", kind: "ask", from, to, text: String(index) }));
+    }
+    const known = new Set(sent.map((event) => event.id));
+    const observed = new Set<Set<string>>();
+    const add = Set.prototype.add;
+    Set.prototype.add = function (id) {
+      if (known.has(id)) add.call(observed, this);
+      return add.call(this, id);
+    };
+    try {
+      expect(await bridge.step()).toMatchObject({ [where === "local" ? "toLocal" : "toRemote"]: sent.length, dropped: 0 });
+      expect(observed.size).toBe(1);
+      for (const seen of observed) expect(sent.filter((event) => seen.has(event.id))).toEqual([]);
+      const saved = JSON.parse(fs.readFileSync(cursorPath, "utf8"));
+      expect(saved[where === "local" ? "toLocal" : "toRemote"].after).toBe(sent.at(-1)!.sequence);
+      expect(on(target, "fleet.work.seen.1").map((event) => (event.data as { bridge: { id: string } }).bridge.id))
+        .toEqual(sent.map((event) => event.id));
+    } finally {
+      Set.prototype.add = add;
+    }
+  });
+
+  it.each(["local", "remote"] as const)("retains an uncheckpointed ID on a failed %s save", async (where) => {
+    const cursorDir = scratch();
+    const cursorPath = path.join(cursorDir, "cursor.json");
+    let side!: StoreBridgeSide;
+    const wrap = (store: MeshStore, peer: string): StoreBridgeSide => (side = new StoreBridgeSide(store, peer));
+    const { hub, far, bridge } = setup(cursorPath, where === "local"
+      ? { local: wrap } : { agent: (store) => wrap(store, "dev1") });
+    const lane = await addRoot(hub, "lane");
+    const forge = await addRoot(far, "forge-main");
+    await bridge.start();
+    const source = where === "local" ? far : hub;
+    const sent = await source.publish({ topic: "fleet.work.seen.1", kind: "ask",
+      from: where === "local" ? forge.identity : lane.identity,
+      to: where === "local" ? lane.identity.id : forge.identity.id });
+    const observed = new Set<Set<string>>();
+    const add = Set.prototype.add;
+    Set.prototype.add = function (id) {
+      if (id === sent.id) add.call(observed, this);
+      return add.call(this, id);
+    };
+    const publish = side.publish.bind(side);
+    const backup = path.join(scratch(), "saved");
+    side.publish = async (...args) => {
+      const result = await publish(...args);
+      fs.renameSync(cursorDir, backup);
+      fs.writeFileSync(cursorDir, "blocks checkpoint mkdir");
+      return result;
+    };
+    try {
+      await expect(bridge.step()).rejects.toThrow(/EEXIST|ENOTDIR|not a directory/i);
+      expect(observed.size).toBe(1);
+      for (const seen of observed) expect(seen.has(sent.id)).toBe(true);
+      const saved = JSON.parse(fs.readFileSync(path.join(backup, "cursor.json"), "utf8"));
+      expect(saved[where === "local" ? "toLocal" : "toRemote"].after).toBeLessThan(sent.sequence);
+    } finally {
+      Set.prototype.add = add;
+      side.publish = publish;
+      if (fs.existsSync(backup)) {
+        fs.rmSync(cursorDir, { force: true });
+        fs.renameSync(backup, cursorDir);
+      }
+    }
+  });
+
+  it("wakes a capped lock backoff on stop and makes no further pass", async () => {
+    let calls = 0;
+    const { bridge, logs } = setup(undefined, {
+      stopMs: 100,
+      local: (store, peer) => {
+        const side = new StoreBridgeSide(store, peer);
+        side.latestSequence = async () => { calls++; throw lockTimeout(); };
+        return side;
+      },
+    });
+    const running = bridge.run();
+    await waitFor(() => logs.some((line) => line.includes("retrying in 800 ms")));
+    const before = calls;
+    const started = Date.now();
+    await bridge.stop();
+    await running;
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(calls).toBe(before);
+  });
+
+  it.each([new Error("Timed out waiting for the Fabric mesh lock"), Object.assign(new Error("unauthorized"), { code: "DENIED" })])(
+    "fails unknown/security errors rather than retrying: %s", async (error) => {
+      const { bridge, logs } = setup(undefined, {
+        local: (store, peer) => {
+          const side = new StoreBridgeSide(store, peer);
+          side.latestSequence = async () => { throw error; };
+          return side;
+        },
+      });
+      await expect(bridge.run()).rejects.toBe(error);
+      await bridge.stop();
+      expect(logs.some((line) => line.includes("retrying"))).toBe(false);
+    },
+  );
+
+  it("fails transport death after a remote lock timeout, without retrying a closed transport", async () => {
+    let side!: StoreBridgeSide;
+    const { bridge, remote, logs } = setup(undefined, {
+      stopMs: 100,
+      agent: (store) => {
+        side = new StoreBridgeSide(store, "dev1");
+        side.latestSequence = async () => { throw lockTimeout(); };
+        return side;
+      },
+    });
+    const running = bridge.run();
+    const failed = expect(running).rejects.toThrow("transport died");
+    await waitFor(() => logs.some((line) => line.includes("retrying")));
+    remote.close(new Error("transport died"));
+    await failed;
+    await bridge.stop();
+    expect(logs.filter((line) => line.includes("retrying"))).toHaveLength(1);
+  });
   it("mirrors each side's live roots into the other, marked remoteHost, and withdraws them on stop", async () => {
     const { hub, far, bridge } = setup();
     const lane = await addRoot(hub, "lane");
@@ -250,7 +440,7 @@ describe("mesh bridge", () => {
     const forgeRoot = await addRoot(first.far, "forge-main");
     await first.bridge.start();
     const before = fs.readFileSync(cursorPath, "utf8");
-    await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
+    const recovered = await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
     expect(await first.bridge.step()).toMatchObject({ toRemote: 1 });
     // A crash after the publish, before the cursor save: the cursor file is the older one.
     fs.writeFileSync(cursorPath, before);
@@ -263,11 +453,26 @@ describe("mesh bridge", () => {
       localName: "dev1", remoteName: "forge", presenceMs: 0, cursorPath,
       local: new StoreBridgeSide(first.hub, "forge"), remote: new RemoteBridgeSide(fromAgent, toAgent),
     });
-    await second.start();
-    expect(await second.step()).toMatchObject({ toRemote: 0 });
-    expect(on(first.far, "fabric.control.command")).toHaveLength(1);
-    await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
-    expect(await second.step()).toMatchObject({ toRemote: 1 });
+    let recoverySeen: Set<string> | undefined;
+    const add = Set.prototype.add;
+    Set.prototype.add = function (id) {
+      if (id === recovered.id) recoverySeen = this;
+      return add.call(this, id);
+    };
+    try {
+      await second.start();
+      expect(recoverySeen?.has(recovered.id)).toBe(true);
+      expect(await second.step()).toMatchObject({ toRemote: 0 });
+      expect(on(first.far, "fabric.control.command")).toHaveLength(1);
+      const fresh = await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
+      expect(await second.step()).toMatchObject({ toRemote: 1 });
+      expect(recoverySeen?.has(recovered.id)).toBe(true); // No blanket recovery-set clear.
+      expect(recoverySeen?.has(fresh.id)).toBe(false);
+      expect(on(first.far, "fabric.control.command").map((event) => (event.data as { bridge: { id: string } }).bridge.id))
+        .toEqual([recovered.id, fresh.id]);
+    } finally {
+      Set.prototype.add = add;
+    }
   });
 
   it("the agent refuses writes off the allow-list, and stamps its pinned peer name", async () => {

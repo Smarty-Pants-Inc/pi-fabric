@@ -70,6 +70,23 @@ describe("prewalk prompt isolation", () => {
     expect(guidelines).toContain("deterministic compaction");
   });
 
+  it.each([true, false])("folds Main limits into six bounded guidelines (fullCodeMode=%s)", fullCodeMode => {
+    const state = { bootstrapped: true, config: normalizeFabricConfig({ fullCodeMode }) } as FabricState;
+    const allGuidelines = createFabricExecTool(
+      state, defaultCodePreviewSettings(), new Map(), (tool) => tool,
+    ).promptGuidelines ?? [];
+    expect(allGuidelines.at(-1)).toBe(hostGlobalsGuidance(fullCodeMode));
+    const visibleGuidelines = allGuidelines.slice(0, -1);
+    expect(visibleGuidelines).toHaveLength(6);
+    expect(visibleGuidelines.reduce((total, line) => total + line.length, 0)).toBeLessThanOrEqual(2_200);
+    const guidance = visibleGuidelines.join("\n");
+    expect(guidance).toContain("Main");
+    expect(guidance).toContain("10 min");
+    expect(guidance).toContain("agents.run/wait");
+    expect(guidance).toContain("60 s");
+    expect(guidance).toContain("spawned agents keep running");
+  });
+
   it("runs handoff from finalized outer message_end without aborting nested calls", () => {
     const extensionSource = fs.readFileSync(
       path.join(process.cwd(), "src", "index.ts"),

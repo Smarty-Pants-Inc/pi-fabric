@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# smarty-dev#2045 lane C, step 1: the mesh bridge over REAL ssh on one host (loopback), with no global
+# configuration change. Everything lives in one lane-local `mktemp -d`: a private sshd on a free high port
+# (its own HostKey, AuthorizedKeysFile and forced command), the bridge's dedicated key, a private
+# known_hosts. ~/.ssh and the system sshd are never read or written.
+#
+# usage: proof/loopback-ssh-bridge.sh FABRIC_CHECKOUT [EVIDENCE_DIR]
+#   FABRIC_CHECKOUT  a built pi-fabric checkout with bin/mesh-bridge (pi-fabric#135) and #132; the
+#                    bridge and both Pis run this one artifact. Run `bun run build` there first.
+#   EVIDENCE_DIR     copied there at the end (default: kept in the scratch dir)
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+bridge_checkout=$(cd "$1" && pwd)
+evidence=${2:-}
+bridge_bin=$bridge_checkout/bin/mesh-bridge
+[[ -f $bridge_checkout/dist/index.js && -f $bridge_checkout/dist/mesh-bridge.js ]] || { echo "build $bridge_checkout first" >&2; exit 2; }
+
+mkdir -p "$here/.local"
+T=$(mktemp -d "$here/.local/mesh-bridge-loopback-XXXXXX")
+chmod 700 "$T"
+sshd_pid= sshd_start=
+cleanup() {
+  [[ -n $sshd_pid && -n $sshd_start ]] || return 0
+  # The driver can already have reaped this listener. Never signal a reused PID.
+  python3 - "$sshd_pid" "$sshd_start" <<'PY'
+import os, signal, sys
+pid, start = int(sys.argv[1]), sys.argv[2]
+fd = None
+try:
+    fd = os.pidfd_open(pid)
+    fields = open(f'/proc/{pid}/stat').read().rsplit(') ', 1)[1].split()
+    if fields[19] == start and fields[0] != 'Z':
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+except ProcessLookupError:
+    pass
+except FileNotFoundError:
+    pass
+finally:
+    if fd is not None:
+        os.close(fd)
+PY
+}
+trap cleanup EXIT
+mkdir -p "$T/run/forge"
+node=$(command -v node)
+forge_mesh=$T/run/forge/mesh
+
+ssh-keygen -q -t ed25519 -N '' -f "$T/host_key" -C mesh-bridge-loopback-host
+ssh-keygen -q -t ed25519 -N '' -f "$T/bridge_key" -C mesh-bridge@dev1
+# The forced command: the key can run only the bridge agent on the forge mesh, pinned to peer dev1.
+printf 'command="%s %s agent --mesh %s --peer dev1",restrict %s\n' "$node" "$bridge_bin" "$forge_mesh" "$(cat "$T/bridge_key.pub")" > "$T/authorized_keys"
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+cat > "$T/sshd_config" <<EOF
+Port $port
+ListenAddress 127.0.0.1
+HostKey $T/host_key
+PidFile $T/sshd.pid
+AuthorizedKeysFile $T/authorized_keys
+AllowUsers $(id -un)
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+PermitRootLogin no
+# The lane checkout can be group-writable; the private scratch directory itself is 0700.
+StrictModes no
+LogLevel VERBOSE
+EOF
+/usr/sbin/sshd -t -f "$T/sshd_config"
+/usr/sbin/sshd -D -e -f "$T/sshd_config" 2> "$T/sshd.log" &
+sshd_pid=$!
+sshd_start=$(python3 - "$sshd_pid" <<'PY'
+import sys
+print(open(f'/proc/{sys.argv[1]}/stat').read().rsplit(') ', 1)[1].split()[19])
+PY
+)
+
+printf '[127.0.0.1]:%s %s\n' "$port" "$(cut -d' ' -f1,2 "$T/host_key.pub")" > "$T/known_hosts"
+for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
+
+# The forced command wins: asking for another command still runs only the agent (it answers no shell).
+{ echo "== forced command check: ssh 127.0.0.1 id (a shell would print the user id line)"
+  timeout 5 ssh -F /dev/null -T -o BatchMode=yes -o IdentitiesOnly=yes -i "$T/bridge_key" -p "$port" \
+    -o UserKnownHostsFile="$T/known_hosts" -o StrictHostKeyChecking=yes 127.0.0.1 id </dev/null 2>&1 || echo "exit=$?"
+  grep 'Starting session' "$T/sshd.log" || true
+} > "$T/run/forced-command-check.txt"
+if grep -q '^uid=' "$T/run/forced-command-check.txt"; then echo "forced command NOT enforced" >&2; exit 1; fi
+
+set +e
+# The driver is plain JavaScript; use the same Node runtime as the bridge and Pi.
+nice -n 19 "$node" "$here/proof/loopback-ssh-bridge.mjs" "$T/run" "$bridge_checkout/dist/index.js" "$bridge_bin" 127.0.0.1 "$T/bridge_key" "$port" "$T/known_hosts" \
+  2>&1 | tee "$T/run/driver.log"
+statuses=("${PIPESTATUS[@]}")
+set -e
+status=${statuses[0]}
+[[ $status -ne 0 ]] || status=${statuses[1]}
+cleanup; sshd_pid=
+cp "$T/sshd.log" "$T/sshd_config" "$T/authorized_keys" "$T/known_hosts" "$T/run/"
+if [[ -n $evidence ]]; then
+  mkdir -p "$evidence"
+  (cd "$T/run" && cp -r results.json driver.log bridge.log sshd.log sshd_config authorized_keys known_hosts forced-command-check.txt "$evidence/")
+  for s in dev1 forge; do cp "$T/run/$s/rpc-stdout.jsonl" "$evidence/$s-rpc-stdout.jsonl"; cp "$T/run/$s/rpc-stderr.log" "$evidence/$s-rpc-stderr.log"; done
+  echo "evidence: $evidence"
+  rm -rf "$T"
+else
+  echo "scratch: $T (delete with: rm -rf $T)"
+fi
+exit "$status"

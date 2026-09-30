@@ -166,6 +166,7 @@ interface ToolCorrelation {
   starts: number;
   lastStart: number;
   canonicals: number;
+  otherCompletions: number;
   canonicalOffset: number;
   canonicalBytes: number;
 }
@@ -177,7 +178,7 @@ const hasEquivalentCanonical = (
   const result = end.result;
   if (!isRecord(result) || !Array.isArray(result.content) || typeof end.toolCallId !== "string" ||
     Object.hasOwn(end, "resultMetadata") || !correlation || correlation.ends !== 1 ||
-    correlation.starts > 1 || correlation.canonicals !== 1 ||
+    correlation.starts > 1 || correlation.canonicals !== 1 || correlation.otherCompletions !== 0 ||
     correlation.lastStart > offset || correlation.canonicalOffset <= offset) return false;
   checkWork();
   const bytes = Buffer.allocUnsafe(correlation.canonicalBytes);
@@ -248,7 +249,7 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       let entry = index.get(id);
       if (!entry) {
         if (index.size >= MAX_TERMINAL_LOG_RECORDS) skip(`MAX_TERMINAL_LOG_RECORDS=${MAX_TERMINAL_LOG_RECORDS} correlation entries`);
-        entry = { ends: 0, starts: 0, lastStart: -1, canonicals: 0, canonicalOffset: -1, canonicalBytes: 0 };
+        entry = { ends: 0, starts: 0, lastStart: -1, canonicals: 0, otherCompletions: 0, canonicalOffset: -1, canonicalBytes: 0 };
         index.set(id, entry);
       }
       return entry;
@@ -275,6 +276,17 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
         for (const part of message.content) {
           if (isRecord(part) && part.type === (event.type === "message" ? "toolCall" : "tool_use") &&
             typeof part.id === "string") correlation(part.id).lastStart = record.offset;
+        }
+      }
+      // Other receiver-recognized completions can finish a prior same-ID call.
+      // Count ambiguity only: message_end remains the sole canonical evidence.
+      if (event.type === "message" && isRecord(message) && message.role === "toolResult" &&
+        typeof message.toolCallId === "string") correlation(message.toolCallId).otherCompletions++;
+      if (event.type === "user" && isRecord(message) && Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (isRecord(part) && part.type === "tool_result" && typeof part.tool_use_id === "string") {
+            correlation(part.tool_use_id).otherCompletions++;
+          }
         }
       }
       if (event.type === "message_end" && isRecord(message) && message.role === "toolResult" &&

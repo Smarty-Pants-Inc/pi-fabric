@@ -305,7 +305,8 @@ describe("worker run log", () => {
       if (bound === "elapsed") expect(writeSpy).toHaveBeenCalled();
     } finally { writeSpy.mockRestore(); clock.mockRestore(); }
     expect(fs.statSync(file).ino).toBe(inode);
-    expect(fs.readFileSync(file)).toEqual(original);
+    // Avoid deep-equality enumeration of every byte in the 64 MiB bound fixture.
+    expect(fs.readFileSync(file).equals(original)).toBe(true);
     expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
   });
   it("keeps the full live end through crash/abort before canonical and refuses nonterminal compaction", () => {

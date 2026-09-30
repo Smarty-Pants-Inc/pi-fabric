@@ -1,6 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
+import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
@@ -110,7 +111,7 @@ import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
 import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
-import { installSelfReload, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
+import { installSelfReload, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -394,10 +395,17 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     haltOnEscapeUnsubscribe = installFabricEscapeHalt(context, {
       enabled: () => state.initialized && (state.config.mesh.enabled || state.config.jev.enabled) && state.config.ui.haltOnEscape,
       ownsInput: () => fabricUi.ownsInput,
-      halted: () => state.advisorsHalted,
+      // Called only for a recognized lone Escape: latch it even when nothing was left to halt.
+      halted: () => { escapeLatched = true; return state.advisorsHalted; },
       halt: () => state.haltAdvisors(),
     });
   };
+  // The user's Escape stop-the-world, held for the self-reload gate independently of the actor
+  // and Jev halts and of any settle outcome; only a non-extension input lifts it (pi-fabric#160).
+  let escapeLatched = false;
+  pi.on("input", (event) => {
+    if ((event as { source?: string }).source !== "extension") escapeLatched = false;
+  });
   const installShellHangKeys = (context: ExtensionContext): void => {
     uninstallShellHangKeys();
     shellHangKeysUnsubscribe = installFabricShellHangKeys(context, {
@@ -833,7 +841,11 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (guard.blocked) return { block: true, reason: PATTERN_KILL_REASON };
     if (guard.wipe) return { block: true, reason: TMP_WIPE_REASON };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
-    return reason ? { block: true, reason } : undefined;
+    if (reason) return { block: true, reason };
+    // smarty-dev#2184: judged on the caller's own timeout above, so the injected default never unblocks a wait.
+    const injected = actorBashTimeout(process.env, timeout);
+    if (injected !== undefined) (event.input as { timeout?: number }).timeout = injected;
+    return undefined;
   });
 
   // Pi 0.80.6 intentionally ignores `isError` returned by custom-tool
@@ -1194,6 +1206,10 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       : 0,
     autoReloadConfigured: () => state.provisionalConfig().autoReload,
     moduleUrl: import.meta.url,
+    publishHeld: data => { void state.publishOpsEvent(RELOAD_HELD_TOPIC, "fabric.reload_held", data); },
+    // Escape's stop-the-world halt of actors or Jev observers (mesh off too); the user's next
+    // input lifts it (review/astra on pi-fabric#158, #160).
+    halted: () => escapeLatched || state.escapeHalted,
   });
 }
 

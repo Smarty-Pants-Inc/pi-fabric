@@ -65,6 +65,7 @@ const lazy = [
   "worker/event-projection.js",
   "worker/activation-window.js",
   "worker/reply-tool.js",
+  "guards/actor-bash-hook.js",
   "worker/options.js",
   "worker/recovery-watchdog.js",
   "worker/run-log.js",
@@ -157,6 +158,12 @@ for (const forbidden of ["src/core/pattern-kill.ts", "src/fabric-runtime-state.t
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }
+}
+// smarty-dev#2184: the worker loads this hook into every Pi actor run, native-tool ones included;
+// it must stay one self-contained file that never pulls the Fabric graph.
+const actorBashHookFiles = staticClosure([join(dist, "guards/actor-bash-hook.js")]);
+if (actorBashHookFiles.size !== 1) {
+  throw new Error(`Actor bash hook pulls more than its timeout guard: ${[...actorBashHookFiles].join(", ")}`);
 }
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));
 const lazySource = [...lazyFiles].map((file) => readFileSync(file, "utf8")).join("\n");

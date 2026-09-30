@@ -127,6 +127,22 @@ const standalone = await build({
   }],
 });
 
+// smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
+// ones included. Built on its own, without splitting, so it shares no chunk with index.js.
+await build({
+  entryPoints: ["src/guards/actor-bash-hook.ts"],
+  outdir: "dist",
+  outbase: "src",
+  entryNames: "[dir]/[name]",
+  bundle: true,
+  packages: "external",
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  logLevel: "info",
+});
+
 // The records service runs as its own OS user from a root-owned copy of one file:
 // inline every package (pg included) so no module resolves outside that copy.
 await build({

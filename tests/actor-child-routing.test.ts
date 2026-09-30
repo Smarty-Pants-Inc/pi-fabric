@@ -20,7 +20,11 @@ afterEach(async () => {
   for (const close of cleanups.splice(0).reverse()) await close();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  // Windows can briefly retain an exited worker's cwd after close. Keep teardown
+  // bounded, but retry EBUSY/EPERM/ENOTEMPTY rather than failing passed assertions.
+  for (const root of roots.splice(0)) {
+    await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 });
 
 // Real provider -> AgentManager -> process worker, with the environment an actor's

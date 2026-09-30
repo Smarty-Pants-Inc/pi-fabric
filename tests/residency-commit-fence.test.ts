@@ -461,15 +461,18 @@ const requestArgs = (state: Awaited<ReturnType<typeof harness>>, operation: "spa
 
 const engines = ["quickjs", "cpython", "monty", "node", "bun"] as const;
 type ReceiptEngine = typeof engines[number];
-const publicExecution = (state: Awaited<ReturnType<typeof harness>>, main: ReturnType<typeof mainProvider>, engine: ReceiptEngine, timeoutMs = 1_500) => {
+const publicExecution = (state: Awaited<ReturnType<typeof harness>>, main: ReturnType<typeof mainProvider>, engine: ReceiptEngine, timeoutMs = 1_500, interactiveMain = false) => {
   const python = engine === "cpython" || engine === "monty";
   const config = normalizeFabricConfig({
     fullCodeMode: true, executor: { kernel: python ? "python" : "typescript", pythonRuntime: python ? engine : "monty",
       runtime: engine === "node" ? "node-process" : engine === "bun" ? "bun-process" : "quickjs", timeoutMs, memoryLimitBytes: 256 * 1024 * 1024 },
     agents: { timeoutMs },
   });
+  // Unit-scale Main budgets bypass the production minimum without weakening it.
+  if (interactiveMain) config.executor.mainMaxTimeoutMs = timeoutMs;
   const service = new FabricExecutionService(main.registry, config);
   const context = { ...main.context.extensionContext, cwd: state.root, hasUI: false,
+    ...(interactiveMain ? { mode: "rpc" } : {}),
     sessionManager: { getSessionId: () => "round2", getSessionFile: () => undefined },
   } as unknown as FabricInvocationContext["extensionContext"];
   let sequence = 0;
@@ -671,6 +674,36 @@ describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_0
 });
 
 describe("round 2 public execution receipt contract", { timeout: 25_000 }, () => {
+  for (const engine of engines) {
+    it(`${engine} public Main ceiling retains committed resident receipts through normalized provider signals`, async () => {
+      const state = await harness(false, undefined, 10_000);
+      const main = mainProvider(state);
+      const controller = new AbortController();
+      const original = ActorDirectory.prototype.create;
+      vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+        const actor = await original.apply(this, args);
+        state.entered.resolve(); await state.release.promise; return actor;
+      });
+      try {
+        const run = publicExecution(state, main, engine, 1_500, true);
+        const outcome = run(`return ${publicCall(engine, "create", requestArgs(state, "create"))}`, controller.signal);
+        await state.entered.promise;
+        const result = await outcome;
+        expect(result.success).toBe(false);
+        expect(result.trace.outcome).toBe("timed_out");
+        expect(result.error).toContain("MainExecutionCeilingError");
+        const decisions = decisionsFor(state);
+        expect(decisions).toHaveLength(1);
+        assertReceipts(result.error, decisions);
+        expect(result.residentOutcomes).toEqual([expect.objectContaining({
+          requestId: decisions[0].requestId, id: decisions[0].id, state: "committed",
+        })]);
+        state.release.resolve();
+        await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
+      } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+    });
+  }
   for (const engine of engines) for (const operation of ["spawn", "create"] as const) {
     it(`${engine} normal durable ${operation} returns its handle without false uncertainty`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);

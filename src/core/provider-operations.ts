@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { throwIfAborted, settleWithin, shareCancellationEffects } from "../async-settlement.js";
+import { throwIfAborted, throwIfExecutionExpired, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { providerTake, providerRevoke, type ProviderTicket, type StateText } from "../verified/generated/provider-kernel.js";
 import type { FabricInvocationContext, FabricScopedProviderResult } from "../protocol.js";
 import type { FabricProviderBinding, FabricProviderBindings } from "./provider-bindings.js";
@@ -74,9 +74,17 @@ export class ProviderOperations {
         if (target.slice(0, separator) !== binding.name || action !== input.action) {
           throw new Error("Provider descriptor changed the requested action");
         }
-        if (mode === "replay") return replay;
-        if (mode !== "acquire") return binding.provider.invoke(action, args, context);
-        const acquired = await binding.provider.acquire!(action, args, context);
+        // Preparation, descriptor observation and plan decoding may be synchronous.
+        // The timer's signal alone cannot prevent new effects after their overrun.
+        if (mode === "replay") { throwIfExecutionExpired(context); return replay; }
+        if (mode !== "acquire") {
+          const invoke = binding.provider.invoke;
+          throwIfExecutionExpired(context);
+          return invoke.call(binding.provider, action, args, context);
+        }
+        const acquire = binding.provider.acquire!;
+        throwIfExecutionExpired(context);
+        const acquired = await acquire.call(binding.provider, action, args, context);
         let cleanup: () => void | Promise<void>;
         try {
           const callback = acquired?.dispose;
@@ -111,7 +119,9 @@ export class ProviderOperations {
             throwIfAborted(context.signal);
             throw new Error("Fabric provider authority revoked during acquisition");
           }
-          return { value: acquired.value, dispose } satisfies FabricScopedProviderResult;
+          const value = acquired.value;
+          throwIfExecutionExpired(context);
+          return { value, dispose } satisfies FabricScopedProviderResult;
         } catch (error) {
           await dispose();
           throw error;

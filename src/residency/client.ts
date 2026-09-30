@@ -366,12 +366,13 @@ export class ResidencyClient {
     this.options.onResultConsumed?.(id);
   }
 
-  async waitAgent(id: string, signal?: AbortSignal): Promise<AgentRunResult> {
+  async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult> {
     while (true) {
       if (signal?.aborted) throw new Error(`Waiting for durable Fabric agent ${id} was aborted`);
       const status = this.statusAgent(id);
       if (terminal(status.status) && "startedAt" in status) {
-        this.acknowledgeCompletion(id);
+        if (deferConsumption) deferConsumption(() => this.acknowledgeCompletion(id));
+        else this.acknowledgeCompletion(id);
         return status as AgentRunResult;
       }
       await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);

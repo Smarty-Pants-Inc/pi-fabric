@@ -51,6 +51,8 @@ it.each([[true, false], [false, false], [true, true]])("resolves handoff setting
     await runtime.shutdown();
     settingsSpy.mockRestore();
     vi.unstubAllEnvs();
-    fs.rmSync(cwd, { recursive: true, force: true });
+    // Windows can briefly retain a terminated worker's cwd handle. Await bounded
+    // EBUSY/EPERM retries instead of turning successful assertions into a flake.
+    await fs.promises.rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

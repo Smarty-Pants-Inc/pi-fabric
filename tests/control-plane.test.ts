@@ -11,6 +11,7 @@ import {
 } from "../src/mesh/store.js";
 import { CONTROL_CLAIMS_POLICY_KEY, FabricControlPlane, type FabricControlCommand, type FabricControlPlaneOptions } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import { removeHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -51,6 +52,47 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  it.each(["Escape", "ordinary timeout", "forged ceiling", "cloned ceiling", "ceiling without policy"])("still cancels the owner for %s, never from guest ceiling text", async cause => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-ceiling-")); roots.push(root);
+    const owner = plane(path.join(root, "mesh"), "session:owner0000");
+    const sender = plane(path.join(root, "mesh"), "session:sender000");
+    const aborted = vi.fn();
+    let entered = false;
+    owner.start((_command, _from, signal) => new Promise(resolve => {
+      entered = true;
+      signal!.addEventListener("abort", () => { aborted(); resolve({ accepted: false, error: "owner cancelled" }); }, { once: true });
+    }));
+    sender.start(() => ({ accepted: false }));
+    const controller = new AbortController();
+    const observation = sender.requestResult("session:owner0000", "actor:target", "ask", { message: "accepted" }, "session:owner0000", { signal: controller.signal, timeoutMs: 5_000, detachOnMainCeiling: cause !== "ceiling without policy" }).catch(error => error);
+    await vi.waitFor(() => expect(entered).toBe(true));
+    const genuine = createMainExecutionCeilingError(700);
+    const reason = cause === "ceiling without policy" ? genuine : cause === "cloned ceiling" ? structuredClone(genuine) : cause === "forged ceiling" ? Object.assign(new Error(genuine.message), { name: "MainExecutionCeilingError" }) : new Error(cause);
+    controller.abort(reason);
+    expect(await observation).toMatchObject({ message: expect.stringContaining("Remote Fabric request cancelled") });
+    await vi.waitFor(() => expect(aborted).toHaveBeenCalledOnce());
+    expect(sender.mesh.read({ topic: "fabric.control.command", limit: 20 }).filter(event => event.kind === "cancel")).toHaveLength(1);
+  });
+
+  it("retains the remote owner's independent ASK deadline after Main stops observing", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-owner-deadline-")); roots.push(root);
+    const owner = plane(path.join(root, "mesh"), "session:owner0000");
+    const sender = plane(path.join(root, "mesh"), "session:sender000");
+    const aborted = vi.fn(); let entered = false;
+    owner.start((_command, _from, signal) => new Promise(resolve => {
+      entered = true;
+      signal!.addEventListener("abort", () => { aborted(); resolve({ accepted: false, error: "owner budget" }); }, { once: true });
+    }));
+    sender.start(() => ({ accepted: false }));
+    const controller = new AbortController();
+    const observation = sender.requestResult("session:owner0000", "actor:target", "ask", { message: "accepted" }, "session:owner0000", { signal: controller.signal, timeoutMs: 500, detachOnMainCeiling: true }).catch(error => error);
+    await vi.waitFor(() => expect(entered).toBe(true));
+    const ceiling = createMainExecutionCeilingError(100); controller.abort(ceiling);
+    expect(await observation).toBe(ceiling);
+    expect(aborted).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(aborted).toHaveBeenCalledOnce(), { timeout: 2_000 });
+    expect(sender.mesh.read({ topic: "fabric.control.command", limit: 20 }).filter(event => event.kind === "cancel")).toHaveLength(0);
+  });
   describe("pending mirrored owners", () => {
     const setup = async (timeoutMs = 1_000) => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-mirror-"));

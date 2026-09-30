@@ -80,8 +80,51 @@ const abortError = (signal: AbortSignal): Error => {
     : new Error(typeof reason === "string" && reason ? reason : "Operation aborted"));
 };
 
+// Identity, not text/name/prototype: guest exceptions can reproduce every public field.
+const mainCeilingReasons = new WeakSet<Error>();
+
+export const createMainExecutionCeilingError = (timeoutMs: number): Error => {
+  const reason = new Error(`MainExecutionCeilingError: Main ceiling hit after ${timeoutMs}ms ` +
+    "(executor.mainMaxTimeoutMs). Spawned agents keep running detached and report results as completion messages; check agents.status/list.");
+  mainCeilingReasons.add(reason);
+  return reason;
+};
+
+export const isMainExecutionCeilingError = (reason: unknown): reason is Error =>
+  reason instanceof Error && mainCeilingReasons.has(reason);
+
+/** The fixed Main watchdog's host-only reason; ordinary cancellation stays unchanged. */
+export const mainExecutionCeilingAbortReason = (signal: AbortSignal | undefined): Error | undefined => {
+  const reason: unknown = signal?.reason;
+  return signal?.aborted && isMainExecutionCeilingError(reason) ? reason : undefined;
+};
+
+/** Preserve launch cancellation except for the genuine Main observation ceiling. */
+export const withoutMainExecutionCeiling = (signal: AbortSignal | undefined): AbortSignal | undefined => {
+  if (!signal) return undefined;
+  const controller = new AbortController();
+  const forward = (): void => {
+    if (!mainExecutionCeilingAbortReason(signal)) controller.abort(signal.reason);
+  };
+  if (signal.aborted) forward();
+  else signal.addEventListener("abort", forward, { once: true });
+  return controller.signal;
+};
+
 export const throwIfAborted = (signal: AbortSignal | undefined): void => {
   if (signal?.aborted) throw abortError(signal);
+};
+
+/** Timers cannot observe synchronous preparation/serialization overruns. */
+export const throwIfExecutionExpired = (context: {
+  signal: AbortSignal | undefined;
+  checkExecutionBudget?: () => void;
+}): void => {
+  // A shorter timeout or Escape remains the first cause even if cleanup later
+  // crosses Main's wall deadline. Only live work can spend the Main budget.
+  throwIfAborted(context.signal);
+  context.checkExecutionBudget?.();
+  throwIfAborted(context.signal);
 };
 
 const raceWithAbort = <T>(

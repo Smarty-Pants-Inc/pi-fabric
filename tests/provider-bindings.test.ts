@@ -260,6 +260,45 @@ describe("provider binding generations", () => {
     await registry.close();
   });
 
+  it.each(["preparation", "descriptor observation"] as const)("checks the host budget before scoped acquisition after %s", async stage => {
+    const registry = new ActionRegistry();
+    let expired = false;
+    let prepared = false;
+    const acquire = vi.fn(async () => ({ value: "lease", dispose: async () => {} }));
+    const descriptor = { name: "open", description: "Budgeted lease", risk: "execute" as const,
+      effect: { kind: "scoped" as const, resources: ["lease:key"], ordering: "ordered" as const },
+      inputSchema: { type: "object", additionalProperties: false } };
+    registry.register({ name: "lease", description: "Budgeted lease", async list() { return [descriptor]; },
+      async describe() { if (prepared && stage === "descriptor observation") expired = true; return descriptor; },
+      async prepareArguments(_name, args) { prepared = true; if (stage === "preparation") expired = true; return args; },
+      async invoke() { throw new Error("use acquire"); }, acquire,
+    });
+    try {
+      await expect(registry.acquireScoped("lease.open", {}, { ...context,
+        checkExecutionBudget() { if (expired) throw new Error("absolute budget expired"); },
+      })).rejects.toThrow("absolute budget expired");
+      expect(acquire).not.toHaveBeenCalled();
+    } finally { await registry.close(); }
+  });
+
+  it("disposes an admitted scoped effect exactly once rather than publishing its late value", async () => {
+    const registry = new ActionRegistry();
+    let expired = false;
+    const dispose = vi.fn(async () => {});
+    const descriptor = { name: "open", description: "Late lease", risk: "execute" as const,
+      effect: { kind: "scoped" as const, resources: ["lease:key"], ordering: "ordered" as const },
+      inputSchema: { type: "object", additionalProperties: false } };
+    registry.register({ name: "lease", description: "Late lease", async list() { return [descriptor]; }, async describe() { return descriptor; },
+      async invoke() { throw new Error("use acquire"); }, async acquire() { expired = true; return { value: "late lease", dispose }; },
+    });
+    try {
+      await expect(registry.acquireScoped("lease.open", {}, { ...context,
+        checkExecutionBudget() { if (expired) throw new Error("absolute budget expired"); },
+      })).rejects.toThrow("absolute budget expired");
+      expect(dispose).toHaveBeenCalledOnce();
+    } finally { await registry.close(); }
+  });
+
   it("acquires scoped actions with schema checks and a single-shot disposer", async () => {
     const registry = new ActionRegistry();
     const dispose = vi.fn(async () => {});

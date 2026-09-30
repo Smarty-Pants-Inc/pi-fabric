@@ -718,10 +718,20 @@ return "unreachable";
     const registry = new ActionRegistry();
     const descriptor = { name: "slow", description: "slow call", inputSchema: { type: "object", additionalProperties: true }, risk: "read" as const };
     let escape: AbortController | undefined;
+    const escapeEvents: string[] = [];
     registry.register({
       name: "demo", description: "demo", async list() { return [descriptor]; }, async describe() { return descriptor; },
       async invoke(_name, _args, context) {
-        if (escape) { escape.abort(); return; }
+        if (escape) {
+          escapeEvents.push("provider-entered");
+          expect(context.signal?.aborted).toBe(false);
+          escape.abort();
+          escapeEvents.push("escape-aborted");
+          // Cross both deadlines after Escape, without running their timers:
+          // an already-recorded cancellation must remain an abort at settlement.
+          vi.setSystemTime(Date.now() + 1_000);
+          return;
+        }
         return new Promise((resolve, reject) => {
           const timer = setTimeout(resolve, 500);
           context.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(context.signal?.reason); }, { once: true });
@@ -746,10 +756,16 @@ return "unreachable";
       expect(short.trace.outcome).toBe("timed_out");
       expect(short.error).not.toContain("Main ceiling hit");
       escape = new AbortController();
+      // Keep the real clock for the CPU/short-timeout checks above. Freeze it
+      // only through provider admission here: on a loaded runner, the inherited
+      // 20ms deadline could otherwise expire before invoke can press Escape.
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
       const cancelled = await service.execute({ ...options, code: 'return tools.call({ ref: "demo.slow", args: {} });', signal: escape.signal });
+      escapeEvents.push("settled");
+      expect(escapeEvents).toEqual(["provider-entered", "escape-aborted", "settled"]);
       expect(cancelled.trace.outcome).toBe("aborted");
       expect(cancelled.error).not.toContain("Main ceiling hit");
-    } finally { vi.unstubAllEnvs(); }
+    } finally { vi.useRealTimers(); vi.unstubAllEnvs(); }
   });
 
   it.each([

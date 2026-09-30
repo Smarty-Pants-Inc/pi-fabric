@@ -77,6 +77,9 @@ function readDouble(text: string, index: number, word: Expansion, budget: GuardB
     const c = text[index]!;
     if (c === "\\") {
       budget.spend(2);
+      // A live continuation contributes no bytes; single quotes and quoted
+      // heredoc DATA never pass through this double-quoted reader.
+      if (text[index + 1] === "\n") { index += 2; continue; }
       // This reader does not model every double-quoted escape. In particular Bash
       // preserves \n in a printf format; losing its slash must never prove safe bytes.
       const unproved = !/[$`"\\\n]/.test(text[index + 1] ?? "");
@@ -85,6 +88,8 @@ function readDouble(text: string, index: number, word: Expansion, budget: GuardB
       // text must not acquire different format bytes when this Word is reparsed.
       word.text = (word.text ?? "") + (unproved ? "\\" : "") + (text[index + 1] ?? ""); index += 2; continue;
     }
+    // Arithmetic expansion writes parent cells; it is not a child capture.
+    if (c === "$" && text.startsWith("$((", index)) throw new ShellStateRefused();
     if ((c === "$" && text[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(text, start, "`", "`", budget) : readBalanced(text, start, "(", ")", budget);
@@ -120,6 +125,7 @@ function expandHeredoc(body: string, budget: GuardBudget): Expansion & { text: s
     const c = body[index]!;
     // In a heredoc a backslash escapes only $, ` and \: the reader gets `\$(…)` as `$(…)`.
     if (c === "\\") { expansion.text += /[$`\\]/.test(body[index + 1] ?? "") ? body[index + 1] : body.slice(index, index + 2); index += 2; continue; }
+    if (c === "$" && body.startsWith("$((", index)) throw new ShellStateRefused();
     if ((c === "$" && body[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(body, start, "`", "`", budget) : readBalanced(body, start, "(", ")", budget);
@@ -141,8 +147,8 @@ function expandHeredoc(body: string, budget: GuardBudget): Expansion & { text: s
 
 function tokenize(source: string, budget: GuardBudget): Token[] {
   budget.spend(12 * source.length + 1);
-  // As in comment-cut (#104): a backslash-newline continues the line.
-  const text = source.replace(/\\\r?\n/g, " ");
+  // Continuations are lexical, not a source rewrite: quoted DATA keeps its bytes.
+  const text = source;
   const tokens: Token[] = [];
   const pending: Array<{ delimiter: string; strip: boolean; token: { heredoc: { body: string; quoted: boolean } } }> = [];
   let index = 0;
@@ -165,19 +171,38 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
   while (index < text.length) {
     budget.spend((word?.text.length ?? 0) + 1);
     const c = text[index]!;
+    // Outside quotes, remove both continuation bytes without ending the word
+    // or changing lexical assignment membership. Escaped slashes are read below.
+    if (c === "\\" && text[index + 1] === "\n") {
+      let end = index + 2;
+      while (text[end] === "\\" && text[end + 1] === "\n") { budget.spend(); end += 2; }
+      // Operators were already emitted. A continuation joining their fragments
+      // needs retokenization; decline instead of inventing an execution boundary.
+      if (/[;&|()<>]/.test(text[index - 1] ?? "") && /[;&|()<>]/.test(text[end] ?? "")) throw new ShellStateRefused();
+      index = end; continue;
+    }
+    // Unsupported arithmetic must refuse before group/substitution admission.
+    if ((c === "(" && text.startsWith("((", index)) || (c === "$" && text.startsWith("$((", index))) throw new ShellStateRefused();
     if (c === " " || c === "\t" || c === "\r") { endWord(); index += 1; continue; }
     if (c === "\n") {
       endWord();
       index += 1;
       for (const heredoc of pending.splice(0)) {
         const lines: string[] = [];
+        let closed = false;
         while (index < text.length) {
           const end = text.indexOf("\n", index);
-          const line = text.slice(index, end < 0 ? text.length : end);
+          const rawLine = text.slice(index, end < 0 ? text.length : end);
           index = end < 0 ? text.length : end + 1;
-          if ((heredoc.strip ? line.replace(/^\t+/, "") : line).trim() === heredoc.delimiter) break;
+          // Unquoted continued heredoc lines affect delimiter recognition too.
+          // Decline that unsupported boundary rather than attest physical lines.
+          if (!heredoc.token.heredoc.quoted && rawLine.endsWith("\\") && end >= 0) throw new ShellStateRefused();
+          const line = heredoc.strip ? rawLine.replace(/^\t+/, "") : rawLine;
+          if (line === heredoc.delimiter) { closed = true; break; }
+          // <<- strips body tabs as well, before any receiver/capture byte grant.
           lines.push(line);
         }
+        if (!closed) throw new ShellStateRefused();
         heredoc.token.heredoc.body = lines.join("\n");
       }
       // A newline after `|`, `&&` or `||` continues the same list (as comment-cut reads `|`-newline).
@@ -185,7 +210,14 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       if (!(last && "op" in last && ["|", "|&", "&&", "||", ";", "\n"].includes(last.op))) tokens.push({ op: "\n" });
       continue;
     }
-    if (c === "#" && !word) { while (index < text.length && text[index] !== "\n") index += 1; continue; }
+    if (c === "#" && !word) {
+      while (index < text.length && text[index] !== "\n") {
+        // Do not infer comment boundaries through an unsupported continuation.
+        if (text[index] === "\\" && text[index + 1] === "\n") throw new ShellStateRefused();
+        index += 1;
+      }
+      continue;
+    }
     if (c === "<" && text[index + 1] === "<" && text[index + 2] !== "<") {
       endWord();
       const strip = text[index + 2] === "-";
@@ -193,6 +225,8 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       while (text[index] === " " || text[index] === "\t") index += 1;
       let raw = "";
       while (index < text.length && !/[\s;&|()<>]/.test(text[index]!)) raw += text[index++];
+      // The small delimiter reader cannot prove split/partial quoted spellings.
+      if (!raw || raw.endsWith("\\") || (raw.match(/'/g)?.length ?? 0) % 2 || (raw.match(/"/g)?.length ?? 0) % 2) throw new ShellStateRefused();
       const token = { heredoc: { body: "", quoted: /['"\\]/.test(raw) } };
       tokens.push(token);
       pending.push({ delimiter: raw.replace(/['"\\]/g, ""), strip, token });
@@ -272,6 +306,9 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
         !(text[end] === "$" && (text[end + 1] === "(" || text[end + 1] === "'"))) end += 1;
       budget.spend(end - index + 1);
       const fragment = text.slice(index, end);
+      // No tilde interpreter: only lexer-live candidate bytes refuse. Quoted or
+      // escaped tildes never enter this branch, including truly literal values.
+      if (/[=:]~/.test(fragment) || (fragment.startsWith("~") && (!w.text || /[=:]$/.test(w.text)))) throw new ShellStateRefused();
       if (w.assignment !== false && !w.text.includes("=") && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(w.text + fragment)) w.assignment = true;
       if (fragment.includes("$")) w.dynamic = true;
       w.text += fragment;
@@ -282,6 +319,7 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
     w.pattern += bare ? added : mask(added).replaceAll("$", kind);
   }
   endWord();
+  if (pending.length) throw new ShellStateRefused();
   return tokens;
 }
 
@@ -604,7 +642,7 @@ function checkParameterSyntax(pattern: string, budget: GuardBudget): void {
   budget.spend(4 * pattern.length + 1);
   if (/[$\u0002]\{/.test(pattern.replace(REFERENCE, ""))) throw new ShellStateRefused();
 }
-const SHELL_STATE_BUILTINS = new Set(["declare", "typeset", "export", "read", "mapfile", "readarray", "eval", "source", ".", "local", "let", "getopts", "trap", "enable", "alias", "unalias", "shopt", "function", "unset", "shift", "hash", "bind"]);
+const SHELL_STATE_BUILTINS = new Set(["declare", "typeset", "export", "read", "mapfile", "readarray", "eval", "source", ".", "local", "let", "getopts", "trap", "enable", "alias", "unalias", "shopt", "function", "select", "unset", "shift", "hash", "bind"]);
 
 /** Admit syntax, never a remembered whole-command fixture or inferred execution. */
 function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Context, budget: GuardBudget,

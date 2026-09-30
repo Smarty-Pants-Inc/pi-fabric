@@ -21,8 +21,15 @@ const round5IntentionalState = new Set<string>([
   "dirs=(/tmp/tmp.AbC123); dirs+=(/tmp/tmp.AbC123/*.json); rm -rf \"${dirs[@]}\"",
   "D=$(mktemp -d); dirs=(/tmp/tmp.AbC123/*.json); dirs+=(\"$D\"); rm -rf \"${dirs[@]}\""
 ]);
+// R7 owner precision cut: live tilde expansion is unmodeled. Keep the exact old
+// IDs/commands, but refuse these three old allowances before granting path bytes.
+const round7IntentionalState = new Set<string>([
+  "cd /tmp && cd ~/w && rm -rf tmp.*",
+  "rm -rf ~/.cache/wt-*",
+  "cd ~/w && sh -c 'cd /tmp' && rm -rf tmp.*",
+]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
-  const intentional = round5IntentionalState.has(command);
+  const intentional = round5IntentionalState.has(command) || round7IntentionalState.has(command);
   const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
   if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);
   if (intentional || (originallyRefused && result.shellState === true)) {

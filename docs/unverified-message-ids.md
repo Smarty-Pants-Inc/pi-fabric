@@ -111,7 +111,7 @@ routing branches, hosted child/peer ports and actual local durable mesh writes.
 no-ID sends and first use. Guest types expose the optional receipt notice.
 
 Run `bun scripts/benchmark-message-identifiers.ts` for first-use, no-ID, nine-ID
-and 128-ID measurements over 10 KiB messages / 2 MiB history. Timings are measured
-rather than flaky CI limits. Build artifacts keep the checker outside the exact
+and 128-ID measurements over 10 KiB messages / 2 MiB history. The benchmark reports
+timings; CI does not enforce time limits, which would flake. Build artifacts keep the checker outside the exact
 startup closure and preserve the existing budgets; compare startup with fresh,
 host-preloaded processes using `bun run benchmark:startup BASE FIX`.

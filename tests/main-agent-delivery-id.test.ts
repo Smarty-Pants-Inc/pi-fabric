@@ -13,7 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MainAgentController } from "../src/main-agent.js";
+import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
 
 // Review round 2 on pi-fabric#160 (finding 1, security S1): Pi's sendMessage returns void and may
 // only queue the message (streaming, prompt preflight, a settle), or fail asynchronously. A
@@ -67,6 +67,47 @@ const journalPath = () => {
   roots.push(dir);
   return path.join(dir, "main-followups", "root.json");
 };
+
+describe("#169 round 3 receiver receipt durability", () => {
+  it("keeps the journal until the session receipt file can be synced", () => {
+    const journal = journalPath();
+    const file = path.join(path.dirname(journal), "session.jsonl");
+    const first = fakePi();
+    const context = busy([], true);
+    context.sessionManager.getSessionFile = () => file;
+    const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 60_000, journal);
+    main.deliverAgent({ from: actor, message: "reply", delivery: "steer", deliveryId: "sync-receipt" });
+    fs.writeFileSync(file, `${JSON.stringify(persisted(first.sent[0]!))}\n`);
+    const sync = fs.fsyncSync.bind(fs);
+    let failed = false;
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      failed = true;
+      throw new Error("session barrier unavailable");
+    });
+    try {
+      first.emit("agent_settled", { outcome: "completed" }, context);
+      expect(failed).toBe(true);
+      expect(fs.readFileSync(journal, "utf8")).toContain("sync-receipt");
+    } finally { synced.mockRestore(); }
+    const events: string[] = [];
+    const open = fs.openSync.bind(fs);
+    const descriptors = new Map<number, string>();
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => {
+      const fd = open(target, flags, mode); descriptors.set(fd, String(target)); return fd;
+    });
+    const syncOrder = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      events.push(descriptors.get(fd) === file ? "session" : fs.fstatSync(fd).isDirectory() ? "directory" : "consumed");
+      sync(fd);
+    });
+    try {
+      first.emit("agent_settled", { outcome: "completed" }, context);
+      expect(events).toEqual(process.platform === "win32" ? ["session", "consumed"] : ["session", "consumed", "directory"]);
+      expect(fs.existsSync(journal)).toBe(false);
+      expect(fs.readFileSync(`${journal}.delivered`, "utf8")).toContain("sync-receipt");
+    } finally { syncOrder.mockRestore(); opened.mockRestore(); main.closeFollowUpDrain(); }
+  });
+});
 
 describe("Main admits a delivery id durably, once", () => {
   for (const [label, delivery, triggerTurn] of [["a steer", "steer", true], ["a non-triggering followUp", "followUp", false]] as const) {
@@ -173,6 +214,144 @@ describe("Main admits a delivery id durably, once", () => {
     expect(second.sent.map((sent) => sent.message.details.deliveryId)).toEqual(["rec-B"]);
   });
 
+  // smarty-dev#2339 F2: a failed mesh delete can outlive the bounded consumed-id history.
+  it.each([2, 3])("keeps a %i-member replacement chain across tombstone eviction and restart", (length) => {
+    // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+    try {
+      const journal = journalPath();
+      const entries: unknown[] = [];
+      const first = fakePi();
+      const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+      main.attachFollowUpDrain(busy(entries), 1_000_000_000, journal);
+      const chain = ["rec-A", "rec-B", "rec-C"].slice(0, length);
+      for (const id of chain) main.deliverAgent(coalesced(id, `state ${id}`));
+      // Retain A's mesh record; confirm enough unrelated messages to evict all replaced ids.
+      for (let index = 0; index <= 2000; index++) {
+        main.deliverAgent({ from: actor, message: `m${index}`, delivery: "steer", deliveryId: `other-${index}` });
+        entries.push(persisted(first.sent.at(-1)!));
+        if (index % 100 === 0 || index === 2000) first.emit("turn_end", boundary([]), busy(entries));
+      }
+      const consumed = JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")) as { ids: string[] };
+      expect(consumed.ids).toHaveLength(2000);
+      for (const id of chain) expect(consumed.ids).not.toContain(id);
+      const held = JSON.parse(fs.readFileSync(journal, "utf8")) as { items: Array<{ deliveryId: string }> };
+      expect(held.items.map((item) => item.deliveryId)).toEqual([chain.at(-1)]);
+      expect(entries.some((entry) => JSON.stringify(entry).includes("rec-A"))).toBe(false);
+      // Abrupt restart, then the retained mesh record redrains before the newer item is released.
+      const second = fakePi();
+      const restarted = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
+      restarted.attachFollowUpDrain(busy(entries), 1_000_000_000, journal);
+      for (const id of chain.slice(0, -1)) {
+        expect(restarted.deliverAgent(coalesced(id, `stale ${id}`))).toMatchObject({ duplicate: true });
+      }
+      expect(restarted.queueDepth().pendingFollowUps).toBe(1);
+      second.emit("agent_before_settle", boundary([]), busy(entries));
+      expect(second.sent.map((sent) => sent.message.details.deliveryId)).toEqual([chain.at(-1)]);
+      entries.push(persisted(second.sent[0]!));
+      second.emit("agent_settled", { outcome: "completed" }, busy(entries, true));
+      expect(fs.existsSync(journal)).toBe(false);
+      const confirmed = JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")) as { ids: string[] };
+      expect(confirmed.ids.slice(-length)).toEqual(chain);
+      // The consumed carrier leaves its whole chain in the durable receipt, even without entries.
+      const third = fakePi();
+      const confirmedRestart = new MainAgentController(third.pi, "session:root", true, "/tmp/project", "root");
+      confirmedRestart.attachFollowUpDrain(busy([]), 60_000, journal);
+      for (const id of chain) expect(confirmedRestart.deliverAgent(coalesced(id, "stale"))).toMatchObject({ duplicate: true });
+      expect(third.sent).toHaveLength(0);
+      // Session receipts also remember the chain when the bounded sidecar no longer does.
+      fs.rmSync(`${journal}.delivered`);
+      const fourth = fakePi();
+      const sessionRestart = new MainAgentController(fourth.pi, "session:root", true, "/tmp/project", "root");
+      sessionRestart.attachFollowUpDrain(busy(entries), 60_000, journal);
+      for (const id of chain) expect(sessionRestart.deliverAgent(coalesced(id, "stale"))).toMatchObject({ duplicate: true });
+      expect(fourth.sent).toHaveLength(0);
+    } finally { synced.mockRestore(); }
+  });
+
+  it("#169 round 1 bounds a 5000-replacement burst without losing F2 tombstones across restart and release reload", { timeout: 30_000 }, async () => {
+    // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+    try {
+      const journal = journalPath();
+      const entries: unknown[] = [];
+      const first = fakePi();
+      const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+      main.attachFollowUpDrain(busy(entries), 1_000_000_000, journal);
+      let accepted = 0;
+      let refused = 0;
+      let beforeRefusal = "";
+      for (let index = 0; index < 5000; index++) {
+        try { main.deliverAgent(coalesced(`burst-${index}`, "tiny")); accepted++; }
+        catch (error) {
+          expect(String(error)).toMatch(/queue is full/);
+          refused++;
+          const saved = fs.readFileSync(journal, "utf8");
+          if (!beforeRefusal) beforeRefusal = saved;
+          expect(saved).toBe(beforeRefusal); // Refusal never truncates or replaces the prior carrier.
+        }
+      }
+      expect(refused).toBeGreaterThan(0);
+      expect(accepted).toBeLessThanOrEqual(FOLLOW_UP_LIMITS.ancestryIds + 1);
+      const saved = JSON.parse(fs.readFileSync(journal, "utf8"));
+      expect(saved.items).toHaveLength(1);
+      expect(saved.items[0].supersedes).toHaveLength(accepted - 1);
+      expect(Buffer.byteLength(JSON.stringify(saved))).toBeLessThan(FOLLOW_UP_LIMITS.senderBytes);
+      // Evict A from the bounded sidecar while its source may still be redrained.
+      for (let index = 0; index <= 2000; index++) {
+        main.deliverAgent({ from: actor, message: "unrelated", delivery: "steer", deliveryId: `unrelated-${index}` });
+        entries.push(persisted(first.sent.at(-1)!));
+        if (index % 100 === 0 || index === 2000) first.emit("turn_end", boundary([]), busy(entries));
+      }
+      expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).ids).not.toContain("burst-0");
+      const second = fakePi();
+      const restarted = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
+      restarted.attachFollowUpDrain(busy(entries), 1_000_000_000, journal);
+      expect(restarted.deliverAgent(coalesced("burst-0", "stale"))).toMatchObject({ duplicate: true });
+      expect(() => restarted.deliverAgent(coalesced("refused-source", "tiny"))).toThrow(/queue is full/);
+      restarted.closeFollowUpDrain();
+      vi.resetModules();
+      const { MainAgentController: Reloaded } = await import("../src/main-agent.js");
+      const third = fakePi();
+      const reloaded = new Reloaded(third.pi, "session:root", true, "/tmp/project", "root");
+      reloaded.attachFollowUpDrain(busy(entries), 1_000_000_000, journal);
+      expect(reloaded.deliverAgent(coalesced("burst-0", "stale"))).toMatchObject({ duplicate: true });
+      third.emit("agent_before_settle", boundary([]), busy(entries));
+      expect(third.sent).toHaveLength(1);
+      expect(third.sent[0]!.message.details.deliveryId).toBe(`burst-${accepted - 1}`);
+      expect(third.sent[0]!.message.details.supersedes).toHaveLength(accepted - 1);
+      entries.push(persisted(third.sent[0]!));
+      third.emit("agent_settled", { outcome: "completed" }, busy(entries, true));
+      fs.rmSync(`${journal}.delivered`);
+      reloaded.closeFollowUpDrain();
+      const fourth = fakePi();
+      const receiptRestart = new Reloaded(fourth.pi, "session:root", true, "/tmp/project", "root");
+      receiptRestart.attachFollowUpDrain(busy(entries), 1_000_000_000, journal);
+      expect(receiptRestart.deliverAgent(coalesced("burst-0", "stale"))).toMatchObject({ duplicate: true });
+      expect(fourth.sent).toHaveLength(0);
+    } finally { synced.mockRestore(); }
+  });
+
+  it.each(["sender", "total"] as const)("#169 round 1 charges ancestry bytes to the %s quota before admission", (quota) => {
+    const journal = journalPath();
+    const first = fakePi();
+    const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(busy([]), 1_000_000_000, journal);
+    const request = (sender: string, id: string) => ({ ...coalesced(id, "tiny"), from: { ...actor, id: sender } });
+    // Each carrier holds ~240 KiB of delivery-id ancestry, still fewer than 1024 ids.
+    for (let sender = 0; sender < (quota === "total" ? 4 : 1); sender++) {
+      for (let generation = 0; generation <= 12; generation++) {
+        main.deliverAgent(request(`sender-${sender}`, `${sender}:${generation}:` + "x".repeat(18_000)));
+      }
+    }
+    const before = fs.readFileSync(journal, "utf8");
+    if (quota === "sender") {
+      expect(() => main.deliverAgent(request("sender-0", "oversized-ancestry:" + "x".repeat(30_000)))).toThrow(/per sender/);
+    } else {
+      expect(() => main.deliverAgent(request("sender-4", "over-total:" + "x".repeat(120_000)))).toThrow(/in total/);
+    }
+    expect(fs.readFileSync(journal, "utf8")).toBe(before);
+  });
   it("rolls a replacement back when its journal write fails, and the replaced id stays admissible", () => {
     const journal = journalPath();
     const first = fakePi();
@@ -212,25 +391,29 @@ describe("Main admits a delivery id durably, once", () => {
   });
 
   it("refuses a consumed id from its persisted set, even without the session entries, and keeps the last 2000", () => {
-    const journal = journalPath();
-    const entries: unknown[] = [];
-    const first = fakePi();
-    const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
-    main.attachFollowUpDrain(busy(entries), 60_000, journal);
-    for (let index = 0; index <= 2000; index++) {
-      main.deliverAgent({ from: actor, message: `m${index}`, delivery: "steer", deliveryId: `rec-${index}` });
-      entries.push(persisted(first.sent.at(-1)!));                              // Pi appended it
-      if (index % 100 === 0 || index === 2000) first.emit("turn_end", boundary([]), busy(entries));
-    }
-    expect(fs.existsSync(journal)).toBe(false);
-    const ids = (JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")) as { ids: string[] }).ids;
-    expect(ids).toHaveLength(2000);
-    expect(ids[0]).toBe("rec-1");
-    const second = fakePi();
-    const fresh = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
-    fresh.attachFollowUpDrain(busy([]), 60_000, journal);                        // no session entries at all
-    expect(fresh.deliverAgent({ from: actor, message: "m2000", delivery: "steer", deliveryId: "rec-2000" })).toMatchObject({ duplicate: true });
-    expect(second.sent).toHaveLength(0);
+    // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+    try {
+      const journal = journalPath();
+      const entries: unknown[] = [];
+      const first = fakePi();
+      const main = new MainAgentController(first.pi, "session:root", true, "/tmp/project", "root");
+      main.attachFollowUpDrain(busy(entries), 60_000, journal);
+      for (let index = 0; index <= 2000; index++) {
+        main.deliverAgent({ from: actor, message: `m${index}`, delivery: "steer", deliveryId: `rec-${index}` });
+        entries.push(persisted(first.sent.at(-1)!));                              // Pi appended it
+        if (index % 100 === 0 || index === 2000) first.emit("turn_end", boundary([]), busy(entries));
+      }
+      expect(fs.existsSync(journal)).toBe(false);
+      const ids = (JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")) as { ids: string[] }).ids;
+      expect(ids).toHaveLength(2000);
+      expect(ids[0]).toBe("rec-1");
+      const second = fakePi();
+      const fresh = new MainAgentController(second.pi, "session:root", true, "/tmp/project", "root");
+      fresh.attachFollowUpDrain(busy([]), 60_000, journal);                        // no session entries at all
+      expect(fresh.deliverAgent({ from: actor, message: "m2000", delivery: "steer", deliveryId: "rec-2000" })).toMatchObject({ duplicate: true });
+      expect(second.sent).toHaveLength(0);
+    } finally { synced.mockRestore(); }
   });
 });
 

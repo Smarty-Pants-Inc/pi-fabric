@@ -7,6 +7,8 @@ export interface AtomicWriteOptions {
   // parent directory (default 0o700).
   mode?: number;
   dirMode?: number;
+  // Opt in to stable-storage ordering: sync the file before rename and its parent after.
+  durable?: boolean;
   // Windows transiently rejects rename() with EPERM/EACCES/EEXIST/EBUSY while
   // an antivirus scan, indexer, or sibling reader probes the destination —
   // milliseconds of contention, not a policy failure. Retry a bounded number
@@ -79,17 +81,54 @@ export const writeFileAtomic = (
   contents: string,
   options?: AtomicWriteOptions,
 ): void => {
-  fs.mkdirSync(path.dirname(filePath), {
+  const directory = path.dirname(filePath);
+  const missing: string[] = [];
+  let existingParent = path.resolve(directory);
+  if (options?.durable && process.platform !== "win32") {
+    // Record the missing chain before mkdir: syncing only the leaf cannot persist
+    // its ancestors' entries, including the topmost new directory's link.
+    for (;;) {
+      try { fs.statSync(existingParent); break; } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
+        missing.unshift(existingParent);
+        existingParent = path.dirname(existingParent);
+      }
+    }
+  }
+  fs.mkdirSync(directory, {
     recursive: true,
     mode: options?.dirMode ?? 0o700,
   });
+  if (missing.length > 0) {
+    // Fail closed before the file barriers. Sync new components top down, then
+    // their pre-existing containing directory so the entire chain is linked.
+    for (const created of [...missing, existingParent]) {
+      const fd = fs.openSync(created, fs.constants.O_RDONLY);
+      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    }
+  }
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(temporary, contents, {
-      encoding: "utf8",
-      mode: options?.mode ?? 0o600,
-    });
+    if (options?.durable) {
+      const fd = fs.openSync(temporary, "w", options.mode ?? 0o600);
+      try {
+        fs.writeFileSync(fd, contents, { encoding: "utf8" });
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      fs.writeFileSync(temporary, contents, {
+        encoding: "utf8",
+        mode: options?.mode ?? 0o600,
+      });
+    }
     renameAtomic(temporary, filePath, options);
+    // ponytail: Windows cannot open directories for fsync; only this barrier is skipped.
+    if (options?.durable && process.platform !== "win32") {
+      const fd = fs.openSync(path.dirname(filePath), fs.constants.O_RDONLY);
+      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    }
   } finally {
     // No-op right after a successful rename; removes the temp on failure.
     fs.rmSync(temporary, { force: true });
@@ -120,7 +159,7 @@ const asyncSleep = (ms: number): Promise<void> =>
 const renameAtomicAsync = async (
   source: string,
   target: string,
-  options?: AtomicWriteOptions,
+  options?: Omit<AtomicWriteOptions, 'durable'>,
 ): Promise<void> => {
   const attempts = Math.max(1, options?.renameRetries ?? 8);
   const delay = options?.renameRetryDelayMs ?? 25;
@@ -141,7 +180,7 @@ const renameAtomicAsync = async (
 const writeFileAtomicAsync = async (
   filePath: string,
   contents: string,
-  options?: AtomicWriteOptions,
+  options?: Omit<AtomicWriteOptions, 'durable'>,
 ): Promise<void> => {
   await fs.promises.mkdir(path.dirname(filePath), {
     recursive: true,
@@ -162,7 +201,7 @@ const writeFileAtomicAsync = async (
 export const writeJsonAtomicAsync = async (
   filePath: string,
   value: unknown,
-  options?: AtomicJsonOptions,
+  options?: Omit<AtomicJsonOptions, 'durable'>,
 ): Promise<void> => {
   const space = options?.space;
   const serialized =

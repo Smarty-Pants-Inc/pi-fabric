@@ -17,6 +17,15 @@ const hasBun = (() => {
 })();
 
 describe("NodeProcessRuntime", () => {
+  it("rejects unencodable host results without committing their observation", async () => {
+    let delivered = 0;
+    const result = await new NodeProcessRuntime().execute("return tools.providers();", async () => ({ value: 1n }), {
+      ...options, onHostResultDelivered() { delivered++; },
+    });
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toMatch(/BigInt|serialize/i);
+    expect(delivered).toBe(0);
+  });
   it("routes the records primitive through the shared guest setup", async () => {
     const result = await new NodeProcessRuntime().execute('return records.read({after:3});',
       async (ref, args) => ({ref, args}), options);

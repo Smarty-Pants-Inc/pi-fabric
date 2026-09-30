@@ -373,12 +373,13 @@ export class ResidencyClient {
     this.options.onResultConsumed?.(id);
   }
 
-  async waitAgent(id: string, signal?: AbortSignal): Promise<AgentRunResult> {
+  async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult> {
     while (true) {
       if (signal?.aborted) throw new Error(`Waiting for durable Fabric agent ${id} was aborted`);
       const status = this.statusAgent(id);
       if (terminal(status.status) && "startedAt" in status) {
-        this.acknowledgeCompletion(id);
+        if (deferConsumption) deferConsumption(() => this.acknowledgeCompletion(id));
+        else this.acknowledgeCompletion(id);
         return status as AgentRunResult;
       }
       await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
@@ -402,7 +403,7 @@ export class ResidencyClient {
     };
   }
 
-  async removeActor(id: string): Promise<{ removed: boolean; pending?: string }> {
+  async removeActor(id: string): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }> {
     await this.ensureHost();
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
@@ -412,7 +413,8 @@ export class ResidencyClient {
       id,
       createdAt: Date.now(),
     });
-    return { removed: true, ...(response.pending ? { pending: response.pending } : {}) };
+    return { removed: true, ...(response.pending === undefined ? {} : { pending: response.pending }),
+      ...(response.cleaned === undefined ? {} : { cleaned: response.cleaned }) };
   }
 
   /** Pending removals and a long request on the host, for error messages (smarty-dev#2184). */
@@ -654,7 +656,9 @@ export class ResidencyClient {
     this.#drainingDeliveries = true;
     try {
       const entries = this.options.mesh.listAll(this.#deliveryPrefix);
-      for (const entry of entries) await this.#deliver(entry);
+      for (const entry of entries) {
+        try { await this.#deliver(entry); } catch { /* Retain this source for retry; other senders and steers still drain. */ }
+      }
     } finally {
       this.#drainingDeliveries = false;
     }

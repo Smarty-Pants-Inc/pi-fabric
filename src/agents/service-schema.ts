@@ -55,7 +55,9 @@ export function agentServiceDescriptors(capabilities: AgentServiceCapabilities =
   return descriptors;
 }
 
-const descriptors = agentServiceDescriptors({steer: true, compact: true, resume: true});
+// Validation knows every supported action; each bound provider independently
+// gates admission with its authenticated client's capability descriptor set.
+const descriptors = agentServiceDescriptors({steer: true, followUp: true, compact: true, resume: true, topology: true});
 const normalize = actionArgNormalizer(() => descriptors);
 export function agentServiceArgs(action: AgentServiceAction, input: Record<string, unknown>): Record<string, unknown> {
   const descriptor = descriptors.find((entry) => entry.name === action);

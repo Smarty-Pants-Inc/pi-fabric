@@ -71,6 +71,14 @@ root step, what a rerun does, the success line and the rollback. Archiving is of
 writes, and step 9 prints its size. PostgreSQL comes only from the distro package path, and its binaries and
 every ancestor directory must be root-owned and not group- or world-writable before anything there is run.
 
+The service's privileged `ExecStartPre=+/usr/bin/install -d -m 2750` creates or repairs its socket
+directory with owner `<org>-records` and the org user's primary group on every start, including after
+`/run` is wiped at reboot. It deliberately does not use `RuntimeDirectory=` for this directory:
+systemd reapplies that setting's mode and the service's own group before each command. The service
+removes a stale socket before listening, but refuses a live listener. Installer step 9 connects as the
+org user (5 s timeout); permission denied or any other connection failure prevents the success line.
+Rollback still stops the units, removes their files, and removes both socket directories.
+
 ## Configuration
 
 Fabric (`.pi/fabric.json`) names only the socket:

@@ -93,6 +93,7 @@ import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
 import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
+import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
 
@@ -1210,9 +1211,15 @@ export class AgentsProvider implements FabricProvider {
       case "setInstructions": {
         const id = String(args.id);
         const instructions = String(args.instructions);
-        if (args.scope === "global") {
-          return this.globalActors.update(id, { instructions });
+        const global = args.scope === "global";
+        // smarty-dev#2340: refuse a >80% shrink unless the caller opts into replace: true.
+        const current = global ? this.globalActors.resolve(id)?.instructions : this.actorManager.instructions(id);
+        if (args.replace !== true && current !== undefined && instructions.length * 5 < current.length) {
+          throw new Error(
+            `Refusing setInstructions: new instructions (${instructions.length} chars) are more than 80% shorter than the current ${current.length} chars; pass replace: true to replace them`,
+          );
         }
+        if (global) return this.globalActors.update(id, { instructions });
         return this.actorManager.setInstructions(id, instructions);
       }
       case "import": {
@@ -1298,7 +1305,13 @@ export class AgentsProvider implements FabricProvider {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
-    return this.#router.routeMessage(id, message, data, kind, context, options);
+    // Host-authored lifecycle routing has no sender invocation/history. Check
+    // only model sends, before *all* local/actor/remote routing branches.
+    if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
+    const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
+    const result = await deliverWithMessageNotice(message, checked,
+      text => this.#router.routeMessage(id, text, data, kind, context, options));
+    return checked.notice ? { ...result, notice: checked.notice } : result;
   }
 
   /** Flush pending coalesced lifecycle deliveries; used by tests and shutdown. */
@@ -1502,6 +1515,7 @@ export class AgentsProvider implements FabricProvider {
       "stop",
       {},
       participant.ownerIdentityId,
+      { routedRemoteHost: participant.remoteHost ?? null },
     );
     if (this.residency?.hasAgent(id)) this.residency.acknowledgeCompletion(id);
     return result;

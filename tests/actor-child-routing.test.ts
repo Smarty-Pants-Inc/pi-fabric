@@ -117,7 +117,7 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true) 
   const spawn = (task = "private review sub-result") => runtime.registry.invoke("agents.spawn", {
     task, name: "review-subtask", transport: "process", model: "fixture/review",
   }, invocation) as Promise<AgentHandleInfo>;
-  return { actor, actorRunId, owner, runtime, invocation, rootDeliveries, sendMessage, boundary, spawn, endActivation, makeOwner };
+  return { actor, actorRunId, owner, ownerAgents, mesh, runtime, invocation, rootDeliveries, sendMessage, boundary, spawn, endActivation, makeOwner };
 };
 
 describe.each(["session", "durable"] as const)("%s actor process children", (residency) => {
@@ -153,6 +153,11 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     const child = await h.spawn("LARGE_RESULT");
     const store = new ActorChildCompletionStore(h.actor.sessionFile!);
     await vi.waitFor(() => expect(store.pending()).toHaveLength(1), { timeout: 5000 });
+    let consumeHandoff!: () => void;
+    const handoff = new Promise<void>((resolve) => { consumeHandoff = resolve; });
+    cleanups.push(async () => { consumeHandoff(); });
+    const run = h.ownerAgents.run.bind(h.ownerAgents);
+    vi.spyOn(h.ownerAgents, "run").mockImplementationOnce(async (...args) => { await handoff; return run(...args); });
     await h.runtime.shutdown();
     h.endActivation();
     await vi.waitFor(() => expect(store.received(child.id)).toBe(true), { timeout: 5000 });
@@ -163,6 +168,9 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(saved.value).toEqual({ output: "x".repeat(100000) });
     expect(saved.spawner).toEqual({ id: h.actor.id, kind: "actor", runId: h.actorRunId });
     expect(store.pending()).toEqual([]);
+    consumeHandoff();
+    await vi.waitFor(() => expect(h.owner.status(h.actor.id).status).toBe("idle"), { timeout: 5000 });
+    expect(fs.existsSync(store.resultFile(child.id))).toBe(false);
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
@@ -254,8 +262,54 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(h.sendMessage).not.toHaveBeenCalled();
     await h.runtime.shutdown();
     h.endActivation();
-    expect(new ActorChildCompletionStore(h.actor.sessionFile!).pending()).toEqual([]);
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(store.pending()).toEqual([]);
+    expect(fs.readdirSync(store.directory)).toEqual([]);
     expect(h.rootDeliveries).not.toHaveBeenCalled();
+  });
+
+  it("terminal agents.status consumption deletes the full result and envelope", async () => {
+    const h = await setup(residency);
+    const child = await h.spawn("LARGE_RESULT");
+    await vi.waitFor(() => expect(h.runtime.agents.status(child.id).status).toBe("completed"), { timeout: 5000 });
+    const result = await h.runtime.registry.invoke("agents.status", { id: child.id }, { ...h.invocation, maxResultChars: 300000 }) as AgentRunResult;
+    expect(result).toMatchObject({ id: child.id, status: "completed" });
+    h.boundary();
+    await h.runtime.shutdown(); // Wait for any late settle event, not just terminal status.json.
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(fs.existsSync(store.directory) ? fs.readdirSync(store.directory) : []).toEqual([]);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("owner polls do not read the actor session while its spawning activation is in flight", async () => {
+    const h = await setup(residency);
+    const child = await h.spawn();
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    await vi.waitFor(() => expect(fs.existsSync(path.join(store.directory, `${child.id}.json`))).toBe(true), { timeout: 5000 });
+    const pending = vi.spyOn(ActorChildCompletionStore.prototype, "pending");
+    const read = vi.spyOn(fs, "readFileSync");
+    try {
+      for (let i = 0; i < 20; i++) {
+        const before = pending.mock.calls.length;
+        // Wake the filesystem watcher too: Unix reconciles on a slower idle timer.
+        await h.mesh.publish({ topic: "test.in-flight-poll", from: { id: "fixture", name: "fixture", kind: "main" }, text: "poll" });
+        await vi.waitFor(() => expect(pending.mock.calls.length).toBeGreaterThan(before), { timeout: 1000 });
+      }
+      expect(read.mock.calls.filter(([file]) => file === h.actor.sessionFile)).toHaveLength(0);
+      expect(h.owner.status(h.actor.id).inFlightRun?.id).toBe(h.actorRunId);
+    } finally { read.mockRestore(); pending.mockRestore(); }
+  });
+
+  it("a foreground cleanup failure does not turn a completed wait into an error", async () => {
+    const h = await setup(residency);
+    const child = await h.spawn();
+    const discard = vi.spyOn(ActorChildCompletionStore.prototype, "discard").mockImplementation(() => { throw new Error("cleanup I/O failure"); });
+    try {
+      const result = await h.runtime.registry.invoke("agents.wait", { id: child.id }, h.invocation) as AgentRunResult;
+      expect(result).toMatchObject({ id: child.id, status: "completed", text: "fake worker complete" });
+      h.boundary();
+      expect(h.sendMessage).not.toHaveBeenCalled();
+    } finally { discard.mockRestore(); }
   });
 
   it("keeps a stopped actor's unread completion stored instead of falling back to Main", async () => {
@@ -352,8 +406,8 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(h.rootDeliveries).not.toHaveBeenCalled();
   });
 
-  it("verifies the meanwhile mitigation: await agents.run in the same program", async () => {
-    const h = await setup(residency);
+  it.each([true, false])("synthetic mitigation: consumed foreground agents.run leaves no archive (notify=%s)", async (notify) => {
+    const h = await setup(residency, notify);
     const execution = await h.runtime.execution.execute({
       code: `return await agents.run({task:"private review sub-result",transport:"process",model:"fixture/review"});`,
       context: h.invocation.extensionContext, signal: undefined, parentToolCallId: "review-mitigation", onPartial() {},
@@ -361,6 +415,8 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     expect(execution.success, execution.error ?? JSON.stringify(execution.typeErrors)).toBe(true);
     const result = execution.value as AgentRunResult;
     expect(result).toMatchObject({ status: "completed", text: "fake worker complete" });
+    const store = new ActorChildCompletionStore(h.actor.sessionFile!);
+    expect(fs.readdirSync(store.directory)).toEqual([]);
     h.boundary();
     expect(h.sendMessage).not.toHaveBeenCalled();
     expect(h.rootDeliveries).not.toHaveBeenCalled();

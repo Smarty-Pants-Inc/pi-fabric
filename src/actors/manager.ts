@@ -339,6 +339,7 @@ export class ActorManager {
   readonly #relayParticipantSteering: boolean;
   readonly #deadSessionReap: boolean | { deadAfterMs: number };
   readonly #logs: ActorLogStore;
+  readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
   readonly #acquireCapabilityView:
     | ((
         requirements: readonly FabricCapabilityRequirement[],
@@ -1887,15 +1888,23 @@ export class ActorManager {
     fs.rmSync(this.#actorRoot, { recursive: true, force: true });
   }
 
+  #childCompletionStore(actor: ManagedActor): ActorChildCompletionStore {
+    let store = this.#childCompletionStores.get(actor.sessionFile);
+    if (!store) {
+      store = new ActorChildCompletionStore(actor.sessionFile);
+      this.#childCompletionStores.set(actor.sessionFile, store);
+    }
+    return store;
+  }
+
   // Once its spawning activation ends, an unread child result belongs to the
   // actor's next activation. Stopped/removed actors keep the spool; never reroute to Main.
   #reconcileChildCompletions(): void {
     if (!this.#persistent || this.#closing) return;
     for (const actor of this.#actors.values()) {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
-      const store = new ActorChildCompletionStore(actor.sessionFile);
-      for (const { spawner, result } of store.pending()) {
-        if (spawner.id !== actor.id || (spawner.runId && actor.inFlightRun?.id === spawner.runId)) continue;
+      const store = this.#childCompletionStore(actor);
+      for (const { spawner, result } of store.pending({ actorId: actor.id, ...(actor.inFlightRun ? { inFlightRunId: actor.inFlightRun.id } : {}) })) {
         try {
           const id = result.id;
           const existing = [this.#inFlight.get(actor.id), ...actor.queue,
@@ -1910,7 +1919,7 @@ export class ActorManager {
           // Queue write first, receipt second, drain last. A retry between the first
           // two finds the same deterministic item, including after an owner restart.
           if (this.#persistQueue(actor.id, true)) {
-            store.acknowledge(id);
+            store.acknowledge(id, { handoff: true });
             this.#ensureDrain(actor);
           }
         } catch { /* The actor-addressed file stays pending for the next owner poll. */ }
@@ -2077,7 +2086,7 @@ export class ActorManager {
         // the next poll retries the same queued id before opening this gate.
         const head = actor.queue[0];
         if (head?.source === "child-completion" &&
-          !new ActorChildCompletionStore(actor.sessionFile).received(head.id)) break;
+          !this.#childCompletionStore(actor).received(head.id)) break;
         const item = actor.queue.shift();
         this.#refill(actor);
         // A freed slot lets a catch-up that a full queue deferred continue at once.
@@ -2715,7 +2724,13 @@ export class ActorManager {
     if (this.#closing) return;
     this.#refreshOwnership();
     for (const actor of this.#actors.values()) {
-      if (this.#canManage(actor.id)) this.#logs.pruneRuns(actor, now);
+      if (this.#canManage(actor.id)) {
+        this.#logs.pruneRuns(actor, now);
+        const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
+          ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
+          .filter((item) => item?.source === "child-completion").map((item) => item!.id));
+        this.#childCompletionStore(actor).prune(this.#logs.retention.actorRunArchiveMs, now, keepIds);
+      }
     }
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
       void reapDeadSessionPresence(this.mesh, this.identity, {
@@ -3227,7 +3242,12 @@ export class ActorManager {
 
   #finishInFlight(actorId: string, item: ActorQueueItem): void {
     if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
-    this.#persistQueue(actorId);
+    const actor = this.#actors.get(actorId);
+    const stillPending = actor && [...actor.queue, ...(this.#overflow.get(actorId) ?? []),
+      ...(this.#parked.get(actorId) ?? [])].some((pending) => pending.id === item.id);
+    if (this.#persistQueue(actorId) && actor && item.source === "child-completion" && !stillPending) {
+      try { this.#childCompletionStore(actor).releaseResult(item.id); } catch { /* The retention sweep retries cleanup. */ }
+    }
   }
 
   #readQueue(file: string): unknown {

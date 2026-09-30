@@ -735,7 +735,7 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publish(event).catch(() => undefined);
       },
-      // Retention is independent of notification policy (including muted completed children).
+      // Spool until consumption or handoff, independently of notification policy.
       onSettled: (result) => {
         if (actorChildStore && actorSpawner) actorChildStore.enqueue(result, actorSpawner, agentConfig.notifyOnComplete);
       },
@@ -746,7 +746,7 @@ export class FabricRuntimeState {
       },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);
-        actorChildStore?.acknowledge(id);
+        try { actorChildStore?.discard(id); } catch { /* Cleanup must not turn a returned outcome into a wait failure. */ }
         markStoppedDelivered(id);
       },
       onStoppedAtClose: (results) => {

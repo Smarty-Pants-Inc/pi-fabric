@@ -2115,6 +2115,12 @@ export class ActorManager {
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
               void this.#publishPresence(actor).catch(() => undefined);
             },
+            // The controller identity is this activation's generation token. A
+            // permit may arrive after stop/remove/halt or after a newer drain.
+            () => !this.#closing && !abortController.signal.aborted &&
+              this.#runningActor(actor.id)?.abortController === abortController &&
+              actor.status !== "stopped" && this.#actors.has(actor.id) &&
+              this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id),
           );
           runId = result.id;
           // Captured before any check that can throw: a completed run is never parked and

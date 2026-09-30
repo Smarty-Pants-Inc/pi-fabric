@@ -123,6 +123,8 @@ export interface AgentRunRecord {
   name: string;
   task: string;
   status: AgentRunStatus;
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;
@@ -174,6 +176,8 @@ export interface AgentHandleInfo {
   id: string;
   name: string;
   status: AgentRunStatus;
+  /** One-based FIFO admission position; present only while queued. */
+  queuePosition?: number;
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;
@@ -271,8 +275,10 @@ export interface AgentTransportLaunch {
   cwd: string;
   workerPath: string;
   workerArguments: string[];
-  /** Aborted when the agent manager closes; a transport may stop waiting to launch. */
-  signal?: AbortSignal;
+  /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
+  signal?: AbortSignal | undefined;
+  /** Host activation generation check. Recheck after preparation, immediately before worker creation. */
+  authorize?: () => boolean;
 }
 
 export interface AgentTransportHandle {

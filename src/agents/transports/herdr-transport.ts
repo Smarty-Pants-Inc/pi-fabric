@@ -10,6 +10,7 @@ import type {
 } from "../types.js";
 import { EXTERNAL_TRANSPORT_LIVENESS_POLL_INTERVAL_MS } from "../constants.js";
 import { scriptSpawnArgs } from "./process-utils.js";
+import { assertTransportLaunchAllowed } from "./launch-authority.js";
 
 const REQUEST_TIMEOUT_MS = 3_000;
 const MAX_RESPONSE_BYTES = 1 * 1024 * 1024;
@@ -227,10 +228,13 @@ export class HerdrTransport implements AgentTransportAdapter {
     await this.#claimSpawnSlot(request.signal);
     const label = runLabel(request);
     let paneId: string;
+    let dispatched = false;
     try {
-      paneId = await this.#applyLayout(workspaceId, request, label);
+      paneId = await this.#applyLayout(workspaceId, request, label, () => { dispatched = true; });
     } catch (error) {
-      if (!droppedCall(error)) throw error;
+      // Command preparation and connection/authority checks can fail before any
+      // layout.apply is sent. Only an attempted write can leave an unknown worker.
+      if (!dispatched || !droppedCall(error)) throw error;
       // Fail closed: layout.apply is not idempotent and a dropped reply leaves its outcome
       // unknown, so Fabric neither adopts a pane nor launches again (smarty-dev#347).
       // ponytail: a pane Herdr created anyway runs unowned; the label names it for cleanup.
@@ -298,7 +302,9 @@ export class HerdrTransport implements AgentTransportAdapter {
     };
   }
 
-  async #applyLayout(workspaceId: string, request: AgentTransportLaunch, label: string): Promise<string> {
+  async #applyLayout(workspaceId: string, request: AgentTransportLaunch, label: string, onDispatch: () => void): Promise<string> {
+    const command = await scriptSpawnArgs(request.workerPath, request.workerArguments);
+    assertTransportLaunchAllowed(request);
     const response = (await this.#request({
       method: "layout.apply",
       params: {
@@ -314,10 +320,10 @@ export class HerdrTransport implements AgentTransportAdapter {
           ...(this.environment.PI_CODING_AGENT_DIR !== undefined
             ? { env: { PI_CODING_AGENT_DIR: this.environment.PI_CODING_AGENT_DIR } }
             : {}),
-          command: await scriptSpawnArgs(request.workerPath, request.workerArguments),
+          command,
         },
       },
-    })) as HerdrLayoutApplyResponse;
+    }, request, onDispatch)) as HerdrLayoutApplyResponse;
     const paneId = response.result?.layout?.root?.pane_id;
     if (response.result?.type !== "layout_apply" || !paneId) {
       throw new HerdrApiError("Herdr layout.apply did not return a pane id", undefined);
@@ -379,7 +385,7 @@ export class HerdrTransport implements AgentTransportAdapter {
     }
   }
 
-  #request(request: { method: string; params: Record<string, unknown> }): Promise<unknown> {
+  #request(request: { method: string; params: Record<string, unknown> }, authority?: AgentTransportLaunch, onDispatch?: () => void): Promise<unknown> {
     const socketPath = this.environment.HERDR_SOCKET_PATH;
     if (!socketPath) return Promise.reject(new Error("Herdr transport requires HERDR_SOCKET_PATH"));
     const payload = JSON.stringify({ id: `pi-fabric:${randomUUID()}`, ...request });
@@ -402,7 +408,16 @@ export class HerdrTransport implements AgentTransportAdapter {
       );
       timeout.unref?.();
       socket.setEncoding("utf8");
-      socket.on("connect", () => socket.write(`${payload}\n`));
+      socket.on("connect", () => {
+        // Connecting is asynchronous too: revoke before layout.apply leaves the
+        // host, not merely before opening the socket. No yield before write.
+        try { assertTransportLaunchAllowed(authority); }
+        catch (error) { finish(error as Error); return; }
+        // Record the dispatch attempt without yielding after the authority check.
+        // From here, a dropped response cannot prove that Herdr did not start it.
+        onDispatch?.();
+        socket.write(`${payload}\n`);
+      });
       socket.on("data", (chunk: string) => {
         const newline = chunk.indexOf("\n");
         const captured = newline < 0 ? chunk : chunk.slice(0, newline);

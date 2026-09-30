@@ -18,8 +18,28 @@ bridge_bin=$bridge_checkout/bin/mesh-bridge
 mkdir -p "$here/.local"
 T=$(mktemp -d "$here/.local/mesh-bridge-loopback-XXXXXX")
 chmod 700 "$T"
-sshd_pid=
-cleanup() { [[ -n $sshd_pid ]] && kill "$sshd_pid" 2>/dev/null || true; }
+sshd_pid= sshd_start=
+cleanup() {
+  [[ -n $sshd_pid && -n $sshd_start ]] || return 0
+  # The driver can already have reaped this listener. Never signal a reused PID.
+  python3 - "$sshd_pid" "$sshd_start" <<'PY'
+import os, signal, sys
+pid, start = int(sys.argv[1]), sys.argv[2]
+fd = None
+try:
+    fd = os.pidfd_open(pid)
+    fields = open(f'/proc/{pid}/stat').read().rsplit(') ', 1)[1].split()
+    if fields[19] == start and fields[0] != 'Z':
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+except ProcessLookupError:
+    pass
+except FileNotFoundError:
+    pass
+finally:
+    if fd is not None:
+        os.close(fd)
+PY
+}
 trap cleanup EXIT
 mkdir -p "$T/run/forge"
 node=$(command -v node)
@@ -49,6 +69,11 @@ EOF
 /usr/sbin/sshd -t -f "$T/sshd_config"
 /usr/sbin/sshd -D -e -f "$T/sshd_config" 2> "$T/sshd.log" &
 sshd_pid=$!
+sshd_start=$(python3 - "$sshd_pid" <<'PY'
+import sys
+print(open(f'/proc/{sys.argv[1]}/stat').read().rsplit(') ', 1)[1].split()[19])
+PY
+)
 
 printf '[127.0.0.1]:%s %s\n' "$port" "$(cut -d' ' -f1,2 "$T/host_key.pub")" > "$T/known_hosts"
 for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done

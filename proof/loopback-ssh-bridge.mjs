@@ -124,7 +124,44 @@ let MeshStore;
 const fleetAgent = process.env.PI_CODING_AGENT_DIR;
 const MODEL = process.env.PROOF_MODEL ?? "cliproxyapi/gpt-6.1-sol"; // smarty-dev#2236: Claude P0
 const log = (...a) => console.log(new Date().toISOString(), ...a);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const cleanupSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// BEGIN LOOPBACK CANCELLATION (extracted by the inert probe).
+const cancellation = () => {
+  let stopped;
+  const pending = new Set();
+  const gate = () => { if (stopped) throw stopped; };
+  const subscribe = (reject) => {
+    if (stopped) { reject(stopped); return () => {}; }
+    pending.add(reject); return () => pending.delete(reject);
+  };
+  const stop = (error) => {
+    if (stopped) return;
+    stopped = error;
+    for (const reject of [...pending]) reject(error);
+    pending.clear();
+  };
+  const wait = (operation) => {
+    gate();
+    return new Promise((resolve, reject) => {
+      const off = subscribe(reject);
+      Promise.resolve(operation).then((value) => { off(); try { gate(); resolve(value); } catch (error) { reject(error); } }, (error) => { off(); reject(error); });
+    });
+  };
+  return { gate, subscribe, stop, wait };
+};
+const installSignals = (host, fail) => {
+  for (const signal of ["SIGTERM", "SIGINT"]) host.on(signal, () => fail(new Error(`proof canceled by ${signal}`)));
+};
+// END LOOPBACK CANCELLATION
+const control = cancellation();
+const sleep = (ms) => {
+  control.gate();
+  return new Promise((resolve, reject) => {
+    let off = () => {};
+    const timer = setTimeout(() => { off(); resolve(); }, ms);
+    off = control.subscribe((error) => { clearTimeout(timer); off(); reject(error); });
+  });
+};
 const results = { status: "RUNNING", startedAt: new Date().toISOString(), fabricDist, bridgeBin, sshHost };
 const children = new Set();
 // BEGIN LOOPBACK LIFECYCLE (also extracted by the owner-only probe).
@@ -132,7 +169,7 @@ const processIdentity = (pid) => {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    return { pid: Number(pid), state: fields[0], group: Number(fields[2]), session: Number(fields[3]), tick: fields[19] };
+    return { pid: Number(pid), state: fields[0], parent: Number(fields[1]), group: Number(fields[2]), session: Number(fields[3]), tick: fields[19] };
   } catch (error) { if (error.code === "ENOENT" || error.code === "ESRCH") return undefined; throw error; }
 };
 const ownChild = (child, label, requireCleanExit) => {
@@ -145,11 +182,36 @@ const ownChild = (child, label, requireCleanExit) => {
   children.add(owner);
   return owner;
 };
+const ownSshd = () => {
+  const pid = Number(fs.readFileSync(path.join(scratch, "../sshd.pid"), "utf8").trim());
+  assert(Number.isSafeInteger(pid) && pid > 1, "invalid private sshd PID");
+  const identity = processIdentity(pid);
+  assert(identity, "private sshd missing");
+  // OpenSSH may rewrite argv into a single listener process title.
+  const args = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split(/[\0\s]+/);
+  assert(args.includes(path.resolve(scratch, "../sshd_config")), "not wrapper's private sshd");
+  assert(processIdentity(pid)?.tick === identity.tick, "private sshd identity changed");
+  const owner = { label: "private sshd/receiver", identity, tree: true, known: new Map([[pid, identity.tick]]) };
+  children.add(owner); return owner;
+};
 const ownedMembers = (owner) => {
   const leader = processIdentity(owner.identity.pid);
   assert(!leader || leader.tick === owner.identity.tick, `${owner.label}: owner PID reused`);
-  const members = fs.readdirSync("/proc").filter((name) => /^\d+$/.test(name)).map(processIdentity)
-    .filter((p) => p && p.group === owner.identity.group && p.session === owner.identity.session);
+  const all = fs.readdirSync("/proc").filter((name) => /^\d+$/.test(name)).map(processIdentity).filter(Boolean);
+  if (owner.tree) {
+    // SSH receiver sessions have separate groups: follow authenticated ancestry only.
+    const members = all.filter((p) => owner.known.get(p.pid) === p.tick);
+    for (let size = -1; size !== members.length;) {
+      size = members.length;
+      for (const p of all) if (!members.includes(p) && members.some((parent) => parent.pid === p.parent)) {
+        assert(BigInt(p.tick) >= BigInt(owner.identity.tick), "pre-existing sshd descendant");
+        if (owner.known.has(p.pid)) assert(owner.known.get(p.pid) === p.tick, "sshd descendant PID reused");
+        owner.known.set(p.pid, p.tick); members.push(p);
+      }
+    }
+    return members;
+  }
+  const members = all.filter((p) => p.group === owner.identity.group && p.session === owner.identity.session);
   for (const p of members) {
     assert(BigInt(p.tick) >= BigInt(owner.identity.tick), `${owner.label}: pre-existing group member`);
     assert(leader || owner.known.get(p.pid) === p.tick || members.some((m) => owner.known.get(m.pid) === m.tick), `${owner.label}: unauthenticated orphan group`);
@@ -163,14 +225,14 @@ const cleanupChild = async (owner, graceMs = 5_000, termMs = 3_000, killMs = 2_0
   const waitDead = async (ms) => {
     const until = Date.now() + ms;
     do {
-      if (ownedMembers(owner).length === 0 && owner.closed) return true;
-      await sleep(Math.min(50, Math.max(1, until - Date.now())));
+      if (ownedMembers(owner).length === 0 && (owner.tree || owner.closed)) return true;
+      await cleanupSleep(Math.min(50, Math.max(1, until - Date.now())));
     } while (Date.now() < until);
-    return ownedMembers(owner).length === 0 && owner.closed;
+    return ownedMembers(owner).length === 0 && (owner.tree || owner.closed);
   };
   try {
     ownedMembers(owner); // Capture descendants before EOF can reap the group leader.
-    if (!owner.child.stdin?.destroyed && !owner.child.stdin?.writableEnded) owner.child.stdin?.end();
+    if (owner.child?.stdin && !owner.child.stdin.destroyed && !owner.child.stdin.writableEnded) owner.child.stdin.end();
     let dead = await waitDead(graceMs);
     for (const [signal, ms] of [["SIGTERM", termMs], ["SIGKILL", killMs]]) {
       if (dead) break;
@@ -178,7 +240,7 @@ const cleanupChild = async (owner, graceMs = 5_000, termMs = 3_000, killMs = 2_0
       for (const member of members) {
         const current = processIdentity(member.pid);
         if (!current) continue;
-        assert(current.tick === member.tick && current.group === owner.identity.group && current.session === owner.identity.session, "cleanup identity changed");
+        assert(current.tick === member.tick && (owner.tree || (current.group === owner.identity.group && current.session === owner.identity.session)), "cleanup identity changed");
         try { process.kill(member.pid, signal); receipt.signals.push({ pid: member.pid, signal }); }
         catch (error) { if (error.code !== "ESRCH") throw error; }
       }
@@ -197,22 +259,26 @@ const finalStatus = (proofPassed, cleanup) => proofPassed && cleanup.length > 0 
 const rpcReady = (request) => request("get_state", 120_000);
 // END LOOPBACK LIFECYCLE
 const saveAfterKill = () => { if (results.bridgeKilledAt) fs.writeFileSync(path.join(scratch, "after-kill.json"), JSON.stringify(results, null, 2)); };
-let finishing;
+let finishing, ownershipMonitor;
 const finish = (error) => finishing ??= (async () => {
   if (error) results.failed = String(error?.stack ?? error);
+  control.stop(error ?? new Error("proof finishing"));
   results.cleanup = await Promise.all([...children].map((owner) => cleanupChild(owner)));
+  clearInterval(ownershipMonitor);
   results.status = finalStatus(results.proofPassed === true && !results.failed, results.cleanup);
   results.finishedAt = new Date().toISOString();
   save(); saveAfterKill();
   if (results.status === "FAIL") console.error("FAILED", results.failed, results.cleanup);
   process.exit(results.status === "PASS" ? 0 : 1);
 })();
-const fail = (error) => { results.failed = String(error?.stack ?? error); return finish(error); };
+const fail = (error) => { results.failed ??= String(error?.stack ?? error); control.stop(error); return finish(error); };
+installSignals(process, fail);
 process.on("unhandledRejection", fail);
 process.on("uncaughtException", fail);
 const save = () => fs.writeFileSync(path.join(scratch, "results.json"), JSON.stringify(results, null, 2));
 
 const side = (name) => {
+  control.gate();
   const root = path.join(scratch, name);
   const agentDir = path.join(root, "agent");
   const cwd = path.join(root, `${name}-work`);
@@ -227,6 +293,7 @@ const side = (name) => {
 };
 
 const startPi = (s) => {
+  control.gate();
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(PI_|HERDR|FABRIC|SMARTY_ROLE$)/.test(k)));
   env.PI_CODING_AGENT_DIR = s.agentDir;
   // ponytail: proof calls perform one explicit native provider operation, not
@@ -254,21 +321,25 @@ const startPi = (s) => {
     }
   });
   const request = (type, timeoutMs = 30_000) => new Promise((resolve, reject) => {
+    control.gate();
+    let completed = false, off = () => {};
     const id = randomUUID();
-    const done = (error, value) => { clearTimeout(timer); listeners.delete(on); child.off("close", dead); child.off("error", dead); error ? reject(error) : resolve(value); };
+    const done = (error, value) => { if (completed) return; completed = true; off(); clearTimeout(timer); listeners.delete(on); child.off("close", dead); child.off("error", dead); error ? reject(error) : resolve(value); };
     const dead = () => done(new Error(`${s.name}: child died during ${type}`));
     const on = (record) => { if (record.type === "response" && record.id === id) done(record.success === false ? new Error(record.error) : null, record.data); };
     const timer = setTimeout(() => done(new Error(`${s.name}: ${type} timed out`)), timeoutMs);
     listeners.add(on);
+    off = control.subscribe((error) => done(error));
     child.once("close", dead); child.once("error", dead);
     if (owner.closed || owner.error) return dead();
     child.stdin.write(JSON.stringify({ id, type }) + "\n", (error) => { if (error) done(error); });
   });
   const ready = rpcReady(request);
   const prompt = async (program, timeoutMs = 600_000) => {
-    await ready; // Explicit cold extension binding budget, not a fixed sleep/30s guess.
+    control.gate();
+    await control.wait(ready); // Explicit cold extension binding budget, not a fixed sleep/30s guess.
     const deadline = Date.now() + timeoutMs;
-    const remaining = () => { const ms = deadline - Date.now(); assert(ms > 0, `${s.name}: operation deadline`); return ms; };
+    const remaining = () => { control.gate(); const ms = deadline - Date.now(); assert(ms > 0, `${s.name}: operation deadline`); return ms; };
     await waitFor(`${s.name} idle`, async () => !(await request("get_state", Math.min(30_000, remaining()))).isStreaming, Math.min(60_000, remaining()));
     const token = randomUUID();
     const code = `const value = await (async () => { ${program}\n})(); return { proofToken: ${JSON.stringify(token)}, value };`;
@@ -278,8 +349,8 @@ const startPi = (s) => {
     results.toolExecutions.push({ side: s.name, code, token, records: evidence.records });
     return new Promise((resolve, reject) => {
       const id = randomUUID();
-      let completed = false;
-      const done = (error, value) => { if (completed) return; completed = true; clearTimeout(timer); listeners.delete(on); child.off("close", dead); child.off("error", dead); save(); error ? reject(error) : resolve(value); };
+      let completed = false, off = () => {};
+      const done = (error, value) => { if (completed) return; completed = true; off(); clearTimeout(timer); listeners.delete(on); child.off("close", dead); child.off("error", dead); save(); error ? reject(error) : resolve(value); };
       const dead = () => done(new Error(`${s.name}: child died during requested run`));
       const on = (record) => {
         try {
@@ -290,6 +361,7 @@ const startPi = (s) => {
       };
       const timer = setTimeout(() => done(new Error(`${s.name}: prompt/tool timed out`)), remaining());
       listeners.add(on);
+      off = control.subscribe((error) => done(error));
       child.once("close", dead); child.once("error", dead);
       if (owner.closed || owner.error) return dead();
       child.stdin.write(JSON.stringify({ id, type: "prompt", message }) + "\n", (error) => { if (error) done(error); });
@@ -297,6 +369,7 @@ const startPi = (s) => {
   };
   // The <fabric-agent-message ... delivery="..."> (or inbox) block that carried a needle into this session.
   const received = async (needle, customType, id, sender, delivery) => {
+    control.gate();
     const raw = fs.readFileSync(file, "utf8");
     const messages = (await request("get_messages"))?.messages ?? [];
     for (const message of messages) {
@@ -321,13 +394,18 @@ const roots = (s, mirrored) => s.store.listAll("topology/participants/", { fresh
   .map((e) => e.value).filter((v) => v?.kind === "root" && (mirrored ? v.remoteHost : !v.remoteHost));
 const waitFor = async (what, check, ms = 120_000) => {
   const until = Date.now() + ms;
-  while (Date.now() < until) { const v = await check(); if (v) return v; await sleep(250); }
+  while (Date.now() < until) { control.gate(); const v = await control.wait(check()); if (v) return v; await sleep(250); }
   throw new Error(`timed out waiting for ${what}`);
 };
-const run = (code) => code;
+const run = (code) => { control.gate(); return code; };
 
 try {
-({ MeshStore } = await import(path.join(path.dirname(fabricDist), "../src/mesh/store.ts")));
+control.gate();
+const sshdOwner = ownSshd();
+ownershipMonitor = setInterval(() => {
+  try { for (const owner of children) ownedMembers(owner); } catch (error) { fail(error); }
+}, 50);
+({ MeshStore } = await control.wait(import(path.join(path.dirname(fabricDist), "../src/mesh/store.ts"))));
 const A = side("dev1"), B = side("forge");
 const piA = startPi(A), piB = startPi(B);
 await Promise.all([piA.ready, piB.ready]);
@@ -341,6 +419,7 @@ log("roots", rootA.id, rootB.id);
 // The bridge: the hub side on dev1's mesh; the transport is the bridge's own ssh argv to the loopback
 // sshd, whose forced command runs `mesh-bridge agent --mesh <forge mesh> --peer dev1`.
 const bridgeLog = path.join(scratch, "bridge.log");
+control.gate();
 const bridge = spawn("node", [bridgeBin, "run", "--mesh", A.mesh, "--name", "dev1", "--remote", "forge",
   "--cursor", path.join(scratch, "bridge-cursor.json"), "--ssh", sshHost, "--ssh-key", sshKey, "--ssh-port", sshPort, "--ssh-known-hosts", knownHosts],
   { stdio: ["ignore", "inherit", fs.openSync(bridgeLog, "a")], detached: true });
@@ -372,15 +451,18 @@ await sleep(5_000);
 const pr = `LOOP-PRWAKE-${tag()}`, lane = `LOOP-LANEWAKE-${tag()}`, work = `LOOP-WORK-${tag()}`;
 const now = Date.now();
 // 3a. ops.owner pr.wake (factory-host:owner) addressed to the forge Main.
-const prWake = await A.store.publish({ topic: "ops.owner", kind: "pr.wake", from: { id: "factory-host:owner", name: "factory-owner", kind: "main" },
-  to: rootB.id, text: `${pr}: PR smarty-dev#2045 needs its owner`, data: { rootId: rootB.id, repo: "Smarty-Pants-Inc/smarty-dev", pr: 2045 } });
+control.gate();
+const prWake = await control.wait(A.store.publish({ topic: "ops.owner", kind: "pr.wake", from: { id: "factory-host:owner", name: "factory-owner", kind: "main" },
+  to: rootB.id, text: `${pr}: PR smarty-dev#2045 needs its owner`, data: { rootId: rootB.id, repo: "Smarty-Pants-Inc/smarty-dev", pr: 2045 } }));
 // 3b. The factory's lane wake: the followUp control command owner_wake publishes for a lane session.
-const laneWake = await A.store.publish({ topic: "fabric.control.command", kind: "followUp", from: { id: "factory-host:stuck-work", name: "factory-stuck-work", kind: "main" },
+control.gate();
+const laneWake = await control.wait(A.store.publish({ topic: "fabric.control.command", kind: "followUp", from: { id: "factory-host:stuck-work", name: "factory-stuck-work", kind: "main" },
   to: rootB.id, text: `${lane}: reply with just OK`, data: { version: 1, commandId: randomUUID().replaceAll("-", ""), targetId: rootB.id, operation: "followUp",
-    replyTo: "factory-host:stuck-work", message: `${lane}: reply with just OK`, data: { ref: "smarty-dev#2045" }, requestedAt: now, deadlineAt: now + 120_000 } });
+    replyTo: "factory-host:stuck-work", message: `${lane}: reply with just OK`, data: { ref: "smarty-dev#2045" }, requestedAt: now, deadlineAt: now + 120_000 } }));
 // 3c. A fleet.work event (the #754 shadow record / work inbox), kind p0, from the dev1 Main.
-const workEvent = await A.store.publish({ topic: "fleet.work.smarty-dev.2045", kind: "p0", from: { id: rootA.id, name: "main", kind: "main" },
-  to: rootB.id, text: `${work}: reply with just OK`, data: { ref: "smarty-dev#2045", key: work } });
+control.gate();
+const workEvent = await control.wait(A.store.publish({ topic: "fleet.work.smarty-dev.2045", kind: "p0", from: { id: rootA.id, name: "main", kind: "main" },
+  to: rootB.id, text: `${work}: reply with just OK`, data: { ref: "smarty-dev#2045", key: work } }));
 results.wakesPublished = { prWake: prWake.id, laneWake: laneWake.id, work: workEvent.id };
 const bridged = (id) => B.store.read({ after: 0, limit: 5_000 }).find((e) => e.data?.bridge?.id === id);
 const onForge = {
@@ -407,6 +489,8 @@ save();
 
 // 4. Kill the bridge (SIGKILL: no clean withdrawal). Both Mains then try to reach the other side,
 // once a second, and record every attempt with its duration until the named lapse error.
+control.gate();
+ownedMembers(sshdOwner);
 ownedMembers(bridgeOwner);
 assert(processIdentity(bridge.pid)?.tick === bridgeOwner.identity.tick, "bridge identity changed before kill");
 assert(bridge.kill("SIGKILL"), "bridge SIGKILL failed");

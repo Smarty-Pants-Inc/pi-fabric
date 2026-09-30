@@ -7,6 +7,7 @@ import { FabricExecutionService } from "../src/execution-service.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { TasksProvider } from "../src/providers/tasks-provider.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 const stores: FabricShellJobStore[] = [];
 const context = {} as FabricInvocationContext;
 afterEach(async () => { for (const store of stores.splice(0)) await store.close(); });
@@ -23,13 +24,15 @@ describe("tasks provider", () => {
     registry.register(provider);
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.mainMaxTimeoutMs = 50;
+    // Observe the actual waiter subscription, not merely provider dispatch.
+    const subscribed = vi.spyOn(store, "subscribe");
     try {
-      const result = await new FabricExecutionService(registry, config).execute({
+      const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
         code: `return tools.call({ ref: "tasks.wait", args: { id: ${JSON.stringify(job.id)}, timeoutMs: 300_000 } });`,
-        signal: AbortSignal.timeout(1_000), parentToolCallId: "main-task-ceiling",
+        signal, parentToolCallId: "main-task-ceiling",
         context: { cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
         onPartial() {},
-      });
+      }), () => subscribed.mock.calls.length > 0);
       expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
       expect(job.abort.signal.aborted).toBe(false);
       expect(job.info().status).toBe("spilled");

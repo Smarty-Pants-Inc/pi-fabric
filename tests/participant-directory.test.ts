@@ -6,7 +6,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -86,6 +87,203 @@ const createDirectory = (
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("ParticipantDirectory.mirroredControlOwner", () => {
+  const keyFor = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
+  const setup = async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mirror-owner-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const writer = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const reader = new MeshStore(meshRoot, 64 * 1024, 1_000, { readCacheMs: 60_000 });
+    const localIdentity: MeshIdentity = { id: "local-identity", name: "main", kind: "main" };
+    const identity: MeshIdentity = { id: "remote-identity", name: "main", kind: "main" };
+    const directory = new ParticipantDirectory(reader, {
+      enabled: true, hostId: "local-host", rootId: "local-root", identity: localIdentity,
+    });
+    const participant = {
+      ...rootRecord("remote-root", "remote-host", "remote-session"),
+      ownerIdentityId: identity.id, remoteHost: "forge",
+    };
+    const host = {
+      format: 1, id: "remote-host", rootId: participant.id, identity,
+      startedAt: 1, updatedAt: 2, expiresAt: Date.now() + 15_000, remoteHost: "forge",
+    };
+    const participantKey = keyFor("topology/participants/", participant.id);
+    const hostKey = keyFor("topology/hosts/", host.id);
+    const putParticipant = (patch: Record<string, unknown> = {}, author = identity) => writer.put({
+      key: participantKey, value: { ...participant, ...patch }, identity: author,
+    });
+    const putHost = (patch: Record<string, unknown> = {}, author = identity) => writer.put({
+      key: hostKey, value: { ...host, ...patch }, identity: author,
+    });
+    await putHost();
+    await putParticipant();
+    const read = () => directory.mirroredControlOwner(host.id, identity.id, participant.id);
+    return { meshRoot, writer, reader, directory, identity, participant, host, participantKey, hostKey, putParticipant, putHost, read };
+  };
+
+  it("exposes the exact public read port and retains fresh expiry knowledge from first send through lapse", async () => {
+    const { directory, reader, host, putHost, read } = await setup();
+    expect(typeof ParticipantDirectory.prototype.mirroredControlOwner).toBe("function");
+    const port: (host: string, identity: string | undefined, target: string) =>
+      { remoteHost: string; expiresAt: number } | undefined = directory.mirroredControlOwner.bind(directory);
+    expect(port(host.id, undefined, host.rootId)).toBeUndefined();
+    const publish = vi.spyOn(reader, "publish");
+    const put = vi.spyOn(reader, "put");
+    try {
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: host.expiresAt });
+      const renewed = host.expiresAt + 30_000;
+      await putHost({ expiresAt: renewed });
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: renewed });
+      const expired = Date.now() - 1_000;
+      await putHost({ expiresAt: expired });
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: expired });
+      expect(directory.get(host.rootId, Date.now(), { fresh: true })).toBeUndefined();
+      expect(publish).not.toHaveBeenCalled();
+      expect(put).not.toHaveBeenCalled();
+    } finally {
+      publish.mockRestore();
+      put.mockRestore();
+    }
+  });
+
+  it("uses later matching file expiry, and observes file renewals and removal", async () => {
+    const { meshRoot, host, read } = await setup();
+    const lease = {
+      id: host.id, rootId: host.rootId, identityId: host.identity.id,
+      updatedAt: Date.now(), expiresAt: host.expiresAt + 30_000,
+    };
+    const leaseFile = path.join(meshRoot, "host-leases",
+      createHash("sha256").update(host.id).digest("hex").slice(0, 32) + ".json");
+    const replaceLease = (expiresAt: number) => {
+      writeHostLease(meshRoot, { ...lease, updatedAt: Date.now(), expiresAt });
+    };
+    replaceLease(lease.expiresAt);
+    expect(read()).toEqual({ remoteHost: "forge", expiresAt: lease.expiresAt });
+    replaceLease(lease.expiresAt + 100_000);
+    expect(read()?.expiresAt).toBe(lease.expiresAt + 100_000);
+    replaceLease(host.expiresAt - 1);
+    expect(read()?.expiresAt).toBe(host.expiresAt);
+    // Removal must discard a cached lease that still outranks state, not merely a shorter one.
+    replaceLease(lease.expiresAt + 100_000);
+    expect(read()?.expiresAt).toBe(lease.expiresAt + 100_000);
+    removeHostLease(meshRoot, host.id);
+    expect(fs.existsSync(leaseFile)).toBe(false);
+    expect(read()?.expiresAt).toBe(host.expiresAt);
+  });
+
+  it.each(["rootId", "identityId"])("ignores a later file lease with mismatched %s", async (field) => {
+    const { meshRoot, host, read } = await setup();
+    writeHostLease(meshRoot, {
+      id: host.id, rootId: host.rootId, identityId: host.identity.id,
+      updatedAt: Date.now(), expiresAt: host.expiresAt + 30_000, [field]: "wrong",
+    });
+    expect(read()).toEqual({ remoteHost: "forge", expiresAt: host.expiresAt });
+  });
+
+  it("requires exact caller target, owner host and identity bindings", async () => {
+    const { directory, host } = await setup();
+    expect(directory.mirroredControlOwner(host.id, "wrong", host.rootId)).toBeUndefined();
+    expect(directory.mirroredControlOwner("wrong", host.identity.id, host.rootId)).toBeUndefined();
+    expect(directory.mirroredControlOwner(host.id, host.identity.id, "wrong")).toBeUndefined();
+    directory.options.enabled = false;
+    expect(directory.mirroredControlOwner(host.id, host.identity.id, host.rootId)).toBeUndefined();
+  });
+
+  it.each([
+    { rootId: "wrong" }, { ownerHostId: "wrong" }, { ownerIdentityId: "wrong" },
+    { remoteHost: "other" }, { remoteHost: undefined }, { remoteHost: "bad/name" },
+    { remoteHost: 42 }, { kind: "agent" }, { format: 2 }, { id: "wrong" },
+    { capabilities: ["unknown"] }, { role: 42 },
+  ])("rejects invalid or conflicting participant metadata %j", async (patch) => {
+    const { putParticipant, read } = await setup();
+    await putParticipant(patch);
+    expect(read()).toBeUndefined();
+  });
+
+  it.each([
+    { rootId: "wrong" }, { identity: { id: "wrong", name: "main", kind: "main" } },
+    { remoteHost: "other" }, { remoteHost: undefined }, { remoteHost: "bad/name" },
+    { remoteHost: 42 }, { expiresAt: "wrong" }, { expiresAt: null },
+    { format: 2 }, { id: "wrong" },
+  ])("rejects invalid, native or conflicting host metadata %j", async (patch) => {
+    const { putHost, read } = await setup();
+    await putHost(patch);
+    expect(read()).toBeUndefined();
+  });
+
+  it("rejects records whose entry author does not match the claimed owner", async () => {
+    const { identity, putParticipant, putHost, read } = await setup();
+    const stranger = { ...identity, id: "stranger" };
+    await putParticipant({}, stranger);
+    expect(read()).toBeUndefined();
+    await putParticipant();
+    await putHost({}, stranger);
+    expect(read()).toBeUndefined();
+  });
+
+  it("does not attribute a missing participant or host", async () => {
+    const { writer, participantKey, hostKey, putParticipant, read } = await setup();
+    await writer.delete({ key: participantKey });
+    expect(read()).toBeUndefined();
+    await putParticipant();
+    await writer.delete({ key: hostKey });
+    expect(read()).toBeUndefined();
+  });
+
+  it("keeps a native participant file ahead of a newer state mirror", async () => {
+    const { meshRoot, writer, participantKey, participant, putParticipant, read } = await setup();
+    const entry = writer.get(participantKey, { fresh: true })!;
+    writeParticipantFile(meshRoot, {
+      ...entry, updatedAt: 0, value: { ...participant, remoteHost: undefined },
+    });
+    await putParticipant();
+    expect(read()).toBeUndefined();
+  });
+
+  it.each(["id", "rootId", "identity"])("refuses collisions with a native host's %s without publishing", async (field) => {
+    const { writer, reader, host, read } = await setup();
+    const identity: MeshIdentity = { id: field === "identity" ? host.rootId : "native-identity", name: "main", kind: "main" };
+    const nativeId = field === "id" ? host.rootId : "native-host";
+    await writer.put({
+      key: keyFor("topology/hosts/", nativeId), identity,
+      value: {
+        ...host, id: nativeId, identity, remoteHost: undefined,
+        rootId: field === "rootId" ? host.rootId : "native-root",
+      },
+    });
+    const publish = vi.spyOn(reader, "publish");
+    try {
+      expect(read()).toBeUndefined();
+      expect(publish).not.toHaveBeenCalled();
+    } finally {
+      publish.mockRestore();
+    }
+  });
+
+  it.each(["root", "identity"])("refuses a mirror colliding with this directory's %s", async (field) => {
+    const { directory, participant, read } = await setup();
+    if (field === "root") directory.options.rootId = participant.id;
+    else directory.options.identity = { ...directory.options.identity, id: participant.id };
+    expect(read()).toBeUndefined();
+  });
+
+  it("refuses a mirrored owner claiming this directory's host id", async () => {
+    const { writer, identity, participant, host, putParticipant, read } = await setup();
+    await writer.put({
+      key: keyFor("topology/hosts/", "local-host"), identity,
+      value: { ...host, id: "local-host" },
+    });
+    await putParticipant({ ownerHostId: "local-host" });
+    const directory = new ParticipantDirectory(writer, {
+      enabled: true, hostId: "local-host", rootId: "local-root",
+      identity: { id: "local-identity", name: "main", kind: "main" },
+    });
+    expect(directory.mirroredControlOwner("local-host", identity.id, participant.id)).toBeUndefined();
+    expect(read()).toBeUndefined();
+  });
 });
 
 // smarty-dev#816: heartbeats were 78% of all writes under the one mesh lock, each a rewrite of

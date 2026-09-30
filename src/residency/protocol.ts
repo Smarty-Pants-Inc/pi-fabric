@@ -358,6 +358,7 @@ export interface ResidentCommandResponse {
   actor?: FabricActorInfo;
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
+  cleaned?: boolean;
   error?: string;
   completedAt: number;
 }

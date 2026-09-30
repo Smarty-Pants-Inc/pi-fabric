@@ -896,7 +896,7 @@ export class MeshBridge {
       }
       for (const event of page.events) {
         if (event.sequence <= cursor.after) continue;
-        const reason = this.#refusal(event, rules);
+        const reason = this.#refusal(event, rules, direction);
         if (reason) {
           if (reason !== "not addressed across") {
             dropped += 1;
@@ -919,6 +919,10 @@ export class MeshBridge {
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
               throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
             }
+            // Bind the command to its captured destination, never to whichever link now holds
+            // the canonical id. Check again at the last pre-transport seam after every await.
+            const destinationRefusal = this.#destinationRefusal(event, direction);
+            if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
             const published = await target.publish({
               topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
               ...(event.text !== undefined ? { text: event.text } : {}),
@@ -945,10 +949,25 @@ export class MeshBridge {
     return { forwarded, dropped };
   }
 
-  #refusal(event: MeshEvent, rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }): string | undefined {
+  #destinationRefusal(event: MeshEvent, direction: "toRemote" | "toLocal"): string | undefined {
+    // This is control-plane routing metadata, not a business field on work events or ACKs.
+    // Absence alone is legacy compatibility; an explicitly present undefined is malformed.
+    if (event.topic !== "fabric.control.command" || !isObject(event.data) ||
+        !Object.hasOwn(event.data, "destinationRemoteHost")) return undefined;
+    const destination = event.data.destinationRemoteHost;
+    if (destination === null) return "command destination is native and must not cross a bridge";
+    if (typeof destination !== "string") return "command destinationRemoteHost is not a string or null";
+    const intended = direction === "toRemote" ? this.options.remoteName : this.options.localName;
+    if (destination !== intended) return `command destination is not bound to bridge link ${intended}`;
+    return undefined;
+  }
+
+  #refusal(event: MeshEvent, rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }, direction: "toRemote" | "toLocal"): string | undefined {
     if (!isBridgedTopic(event) || hasBridgeField(event)) return "not allowed";
     if (!event.to || !rules.recipients.has(event.to)) return "not addressed across";
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";
+    const destinationRefusal = this.#destinationRefusal(event, direction);
+    if (destinationRefusal) return destinationRefusal;
     if (!isIdentity(event.from)) return "no sender identity";
     if (rules.reserved?.has(event.from.id)) return "sender claims a hub identity";
     if (rules.senders && !rules.senders.has(event.from.id)) return "sender is not a live participant of the remote";

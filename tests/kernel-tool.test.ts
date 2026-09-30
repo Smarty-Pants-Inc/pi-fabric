@@ -186,4 +186,47 @@ describe("exclusive kernel tool surface", () => {
       rmSync(agentDir, { recursive: true, force: true });
     }
   });
+
+  // smarty-dev#2340: every runtime (QuickJS, node process, Monty, CPython) receives
+  // payloads only through execute(), so the shared validation must reject before dispatch.
+  it.each([
+    ["typescript", "cpython", "quickjs"],
+    ["typescript", "cpython", "node-process"],
+    ["python", "monty", undefined],
+    ["python", "cpython", undefined],
+  ] as const)("rejects placeholder payloads before %s/%s/%s runtime execution", async (kernel, pythonRuntime, runtime) => {
+    const execute = vi.fn(async () => ({ success: true, output: "ran" }));
+    const state = {
+      bootstrapped: true,
+      config: normalizeFabricConfig({
+        executor: { kernel, pythonRuntime, ...(runtime ? { runtime } : {}) }, ui: { toolDisplay: "full" },
+      }),
+      ensure: vi.fn(async () => {}),
+      execution: { execute },
+    } as unknown as FabricState;
+    const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), (value) => value);
+    const literal = "payloads are literal: read the file with a native tool first and pass its content";
+    for (const args of [
+      { code: "return 1", payloads: { spec: "@/tmp/spec.md" } },
+      { code: "return 1", payloads: '{"spec":"__SPEC__"}' },
+      { code: "return 1", strings: { spec: "file:///tmp/spec.md" } },
+    ]) {
+      expect(() => tool.prepareArguments!(args)).toThrow(literal);
+      await expect(tool.execute("call", args as never, undefined, undefined, {} as never)).rejects.toThrow(/"spec".*payloads are literal/s);
+    }
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each(["typescript", "python"] as const)("tells %s programs that payloads are literal", (kernel) => {
+    for (const fullCodeMode of [true, false]) {
+      const line = "payloads are literal: read files with native tools first";
+      expect(defaultFabricExecutionGuidance(fullCodeMode, kernel, "monty")).toContain(line);
+      expect(defaultFabricExecutionGuidance(fullCodeMode, kernel, "cpython")).toContain(line);
+      const tool = toolFor(kernel, "cpython", { fullCodeMode });
+      // Full-code tool guidelines are budget-capped (prewalk-prompt); there the line
+      // rides the system-section default guidance and the payloads description.
+      if (!fullCodeMode) expect(tool.promptGuidelines!.join("\n")).toContain(line);
+      expect(tool.parameters.properties.payloads.description).toContain(line);
+    }
+  });
 });

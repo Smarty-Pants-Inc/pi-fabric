@@ -1,5 +1,6 @@
 import { FABRIC_ACTOR_HOST_EVENTS } from "../actors/types.js";
 import { AGENT_WAIT_MAX_MS } from "../agents/wait-bound.js";
+import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import {
   MAX_COMPACTION_INSTRUCTIONS_CHARS,
   MAX_PRESERVE_ITEM_CHARS,
@@ -405,7 +406,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         transport: runProperties.transport,
         timeoutMs: runProperties.timeoutMs,
         nice: runProperties.nice,
-        bashTimeoutSeconds: { type: "integer", minimum: 0, description: "Default timeout in seconds for a bash call without one in this actor's runs (default 600); 0 = no default timeout." },
+        bashTimeoutSeconds: { type: "integer", minimum: 0, maximum: MAX_ACTOR_BASH_TIMEOUT_S, description: "Default timeout in seconds for a bash call without one in this actor's runs (default 600, maximum 2147483); 0 = no default timeout." },
         extensions: runProperties.extensions,
         inferenceContext: { type: "string", enum: ["full-history", "activation"], description: "Inference-only activation window (Pi only); journals remain complete. Default full-history." },
         requires: {
@@ -771,13 +772,14 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "setInstructions",
     description:
-      'Replace an actor\'s default instruction (its persona / system-prompt body). Default scope "project" edits a live project actor; scope "global" edits a project-independent template. Takes effect on the actor\'s next queued message.',
+      'Replace an actor\'s default instruction (its persona / system-prompt body). Default scope "project" edits a live project actor; scope "global" edits a project-independent template. Takes effect on the actor\'s next queued message. A new body more than 80% shorter than the current one is refused unless replace is true.',
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         instructions: { type: "string" },
         scope: { type: "string", enum: ["project", "global"] },
+        replace: { type: "boolean" },
       },
       required: ["id", "instructions"],
       additionalProperties: false,

@@ -143,6 +143,14 @@ export class ActorDirectory extends ActorManager {
   override pendingRemovals(): ReturnType<ActorManager["pendingRemovals"]> { return [...super.pendingRemovals(), ...this.#secondary.pendingRemovals()]; }
   override removalSettled(id: string): Promise<void> | undefined { return super.removalSettled(id) ?? this.#secondary.removalSettled(id); }
   override async finishPendingRemovals(): Promise<void> { await super.finishPendingRemovals(); await this.#secondary.finishPendingRemovals(); }
-  override remove(...args: Parameters<ActorManager["remove"]>): ReturnType<ActorManager["remove"]> { return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args); }
+  override cleanupObligation(id: string): ReturnType<ActorManager["cleanupObligation"]> {
+    return super.cleanupObligation(id) ?? this.#secondary.cleanupObligation(id);
+  }
+  override remove(...args: Parameters<ActorManager["remove"]>): ReturnType<ActorManager["remove"]> {
+    // Cleanup obligations route only by exact id, never by name or prefix.
+    if (super.cleanupObligation(args[0])) return super.remove(...args);
+    if (this.#secondary.cleanupObligation(args[0])) return this.#secondary.remove(...args);
+    return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args);
+  }
   override async close(): Promise<void> { await Promise.all([super.close(), this.#secondary.close()]); }
 }

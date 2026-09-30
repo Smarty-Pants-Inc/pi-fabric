@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import path from "node:path";
+import { writeFileAtomic } from "./core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 
@@ -144,6 +144,8 @@ export const FOLLOW_UP_LIMITS = {
   senderBytes: 256 * 1024,
   totalItems: 200,
   totalBytes: 1024 * 1024,
+  /** Undeleted source ids travel with their carrier; never truncate them to admit a replacement. */
+  ancestryIds: 1024,
   /**
    * ponytail: a soft target for the raw text of one delivered message. A single item larger
    * than this still goes alone (the per-sender byte quota bounds it); headers and escaping add
@@ -186,6 +188,8 @@ interface HeldAgentMessage {
   data?: unknown;
   /** The sender's stable delivery id (FabricMainAgentDeliveryRequest.deliveryId). */
   deliveryId?: string;
+  /** Replaced delivery ids: retained with the live carrier even after consumed-id eviction. */
+  supersedes?: string[];
   /** Handed to Pi's queue; it may still be there after a reload. Unset while Fabric holds it. */
   handed?: true;
   /**
@@ -222,7 +226,9 @@ const agentMessageBlock = (item: HeldAgentMessage, delivery: FabricMainAgentDeli
 ].filter((line): line is string => Boolean(line)).join("\n");
 
 const itemBytes = (item: HeldAgentMessage): number =>
-  Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data)));
+  Buffer.byteLength(item.message) + (item.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.data))) +
+  (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
+  (item.supersedes === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.supersedes)));
 
 type SessionEntryLike = { id?: unknown; parentId?: unknown; type?: string; customType?: string; details?: { id?: unknown; items?: unknown } };
 
@@ -234,10 +240,13 @@ const deliveryKey = (deliveryId: string): string => `delivery:${deliveryId}`;
 const addDelivered = (ids: Set<string>, entry: SessionEntryLike | undefined): void => {
   if (entry?.type !== "custom_message" || entry.customType !== "pi-fabric-agent-message") return;
   // A delivered replacement's chain counts as delivered too: its earlier members never go.
-  for (const item of [entry.details, ...(Array.isArray(entry.details?.items) ? entry.details.items : [])] as Array<{ id?: unknown; chain?: unknown; deliveryId?: unknown } | undefined>) {
+  for (const item of [entry.details, ...(Array.isArray(entry.details?.items) ? entry.details.items : [])] as Array<{ id?: unknown; chain?: unknown; deliveryId?: unknown; supersedes?: unknown } | undefined>) {
     if (typeof item?.id === "string") ids.add(item.id);
     if (typeof item?.chain === "string") ids.add(item.chain);
     if (typeof item?.deliveryId === "string") ids.add(deliveryKey(item.deliveryId));
+    if (Array.isArray(item?.supersedes)) {
+      for (const id of item.supersedes) if (typeof id === "string") ids.add(deliveryKey(id));
+    }
   }
 };
 
@@ -370,18 +379,23 @@ export class MainAgentController implements FabricMainAgentTarget {
       const index = key === undefined ? -1 : this.#held.findIndex((held) =>
         held.from.id === item.from.id && followUpCoalesceKey(held.data) === key);
       replaced = index < 0 ? undefined : this.#held[index];
-      this.#admit(item, replaced);
       if (replaced) {
         item.sentAt = replaced.sentAt;
         item.replacedAt = Date.now();
         item.chain = replaced.chain ?? replaced.id;
         item.generation = (replaced.generation ?? 0) + 1;
         item.replaces = replaced.id;
-        this.#held[index] = item;
-      } else this.#held.push(item);
+        // smarty-dev#2339 F2: a failed mesh delete can outlive the last 2000 consumed ids.
+        // The replacement journals every superseded delivery id until the carrier is consumed.
+        item.supersedes = [...(replaced.supersedes ?? []), ...(replaced.deliveryId === undefined ? [] : [replaced.deliveryId])];
+      }
+      // Charge the proposed ancestry before mutating or acknowledging either carrier.
+      this.#admit(item, replaced);
+      if (replaced) this.#held[index] = item;
+      else this.#held.push(item);
       // The replaced id is recorded as consumed in the same save, before the return: its sender's
       // record, if kept, is then refused after a restart (Astra round 3 finding 4, pi-fabric#160).
-      const consumed = replaced?.deliveryId === undefined ? this.#consumed : new Set(this.#consumed);
+      const consumed = replaced ? new Set(this.#consumed) : this.#consumed;
       const consumedDirty = this.#consumedDirty;
       if (replaced) this.#consume(replaced);
       try {
@@ -391,8 +405,8 @@ export class MainAgentController implements FabricMainAgentTarget {
         else this.#held.pop();
         this.#consumed = consumed;
         this.#consumedDirty = consumedDirty;
-        // The consumed file may already hold the replaced id, which the journal still lists.
-        if (replaced?.deliveryId !== undefined) { this.#consumedDirty = true; this.#trySave(); }
+        // The consumed file may already hold the replaced chain, which the journal still lists.
+        if (replaced) { this.#consumedDirty = true; this.#trySave(); }
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
       if (this.#context!.isIdle()) this.#release(true);
@@ -470,6 +484,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       `Main's followUp queue is full (${what}); Main is busy and reads followUps only at its next tool boundary. ` +
         "Wait, or send a short steer.",
     );
+    if ((item.supersedes?.length ?? 0) > limits.ancestryIds) throw full("replacement ancestry limit");
     if (mine.length + 1 > limits.senderItems || mineBytes + bytes > limits.senderBytes) {
       throw full(`${mine.length} of yours, ${mineBytes} bytes; limit ${limits.senderItems} or ${limits.senderBytes} bytes per sender`);
     }
@@ -480,17 +495,21 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** The message id under which Main already admitted this delivery id, if it did. */
   #admitted(deliveryId: string): string | undefined {
-    const item = [...this.#unverified, ...this.#sent, ...this.#held].find((item) => item.deliveryId === deliveryId);
+    const item = [...this.#unverified, ...this.#sent, ...this.#held].find((item) =>
+      item.deliveryId === deliveryId || item.supersedes?.includes(deliveryId));
     if (item) return item.id;
     if (this.#consumed.has(deliveryId) || this.#refreshDelivered().has(deliveryKey(deliveryId))) return deliveryId;
     return undefined;
   }
 
-  /** Remember that this item's delivery id is done: delivered, or never to be delivered. */
+  /** Remember that this item's delivery id and its superseded ids are done. */
   #consume(item: HeldAgentMessage): void {
-    if (item.deliveryId === undefined) return;
-    this.#consumed.delete(item.deliveryId);
-    this.#consumed.add(item.deliveryId);
+    const ids = [...(item.supersedes ?? []), ...(item.deliveryId === undefined ? [] : [item.deliveryId])];
+    if (!ids.length) return;
+    for (const id of ids) {
+      this.#consumed.delete(id);
+      this.#consumed.add(id);
+    }
     while (this.#consumed.size > CONSUMED_DELIVERIES_MAX) this.#consumed.delete(this.#consumed.values().next().value!);
     this.#consumedDirty = true;
   }
@@ -505,18 +524,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (this.#consumedDirty) {
       // Before the journal: an item leaves the journal only once its id is recorded as consumed.
       const file = this.#consumedPath()!;
-      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      const temporary = `${file}.${process.pid}.tmp`;
-      fs.writeFileSync(temporary, JSON.stringify({ version: 1, ids: [...this.#consumed] }), { mode: 0o600 });
-      fs.renameSync(temporary, file);
+      writeFileAtomic(file, JSON.stringify({ version: 1, ids: [...this.#consumed] }), { durable: true });
       this.#consumedDirty = false;
     }
     const items = [...this.#unverified, ...this.#sent, ...this.#held];
     if (!items.length) { fs.rmSync(this.#journal, { force: true }); return; }
-    fs.mkdirSync(path.dirname(this.#journal), { recursive: true, mode: 0o700 });
-    const temporary = `${this.#journal}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify({ version: 1, items }), { mode: 0o600 });
-    fs.renameSync(temporary, this.#journal);
+    writeFileAtomic(this.#journal, JSON.stringify({ version: 1, items }), { durable: true });
   }
 
   #trySave(): void {
@@ -548,7 +561,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       for (let index = this.#scanned!; index < entries.length; index++) addDelivered(this.#delivered, entries[index] as SessionEntryLike);
       this.#scanned = entries.length;
     } catch {
-      // The set stays as it was; the next boundary scans again.
+      // A failed session barrier supplies no receipt: keep every journalled payload.
+      return new Set();
     }
     return this.#delivered;
   }
@@ -563,7 +577,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   #indexSessionFile(file: string): void {
     let fd: number;
     try {
-      fd = fs.openSync(file, "r");
+      // ponytail: Windows' FlushFileBuffers (fsyncSync) needs a writable handle; this code never writes through it.
+      fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       if (this.#source !== file) this.#restartIndex(file);    // not written yet: nothing persisted
@@ -571,6 +586,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
     try {
       const size = fs.fstatSync(fd).size;
+      // Reading a complete line is not a stable-storage receipt. Sync before indexing new
+      // bytes (including on restart); a failure leaves the index and journal untouched.
+      if (this.#source !== file || this.#scanned === undefined || size !== this.#scanned) fs.fsyncSync(fd);
       if (this.#source !== file || this.#scanned === undefined || size < this.#scanned) this.#restartIndex(file);
       const buffer = Buffer.allocUnsafe(1 << 20);
       let position = this.#scanned!;
@@ -678,9 +696,10 @@ export class MainAgentController implements FabricMainAgentTarget {
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
           // followUp, as before policies were journalled.
-          const { deliverAs, triggerTurn, ...rest } = item;
+          const { deliverAs, triggerTurn, supersedes, ...rest } = item;
           items.push({
             ...rest, from: sender,
+            ...(Array.isArray(supersedes) ? { supersedes: supersedes.filter((id) => typeof id === "string") } : {}),
             ...(DIRECT_DELIVERIES.has(deliverAs) && typeof triggerTurn === "boolean" ? { deliverAs, triggerTurn } : {}),
           });
         }
@@ -950,6 +969,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(item.chain === undefined ? {} : { chain: item.chain, generation: item.generation, replaces: item.replaces }),
       ...(item.data === undefined ? {} : { data: item.data }),
       ...(item.deliveryId === undefined ? {} : { deliveryId: item.deliveryId }),
+      ...(item.supersedes?.length ? { supersedes: item.supersedes } : {}),
     });
     const first = items[0]!;
     this.pi.sendMessage(

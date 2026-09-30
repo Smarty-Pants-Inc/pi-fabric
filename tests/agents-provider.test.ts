@@ -40,6 +40,7 @@ import type { AgentRunRecord } from "../src/agents/types.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 
 const roots: string[] = [];
@@ -1773,12 +1774,12 @@ return { first, second, tail: "continued" };`,
       const config = structuredClone(DEFAULT_FABRIC_CONFIG);
       config.executor.mainMaxTimeoutMs = 3_200;
       try {
-        const result = await new FabricExecutionService(registry, config).execute({
+        const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
           code: `const result = await agents.${action}({ id: "durable-child" }); return { result, tail: "continued" };`,
-          signal: AbortSignal.timeout(5_000), parentToolCallId: "main-durable-observation-budget",
+          signal, parentToolCallId: "main-durable-observation-budget",
           context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
           onPartial() {},
-        });
+        }), () => vi.mocked(residency.waitAgent).mock.calls.length === 1);
         expect(result.success).toBe(true);
         expect(result.value).toMatchObject({ result: { ...durable, waitTimedOut: true }, tail: "continued" });
         expect(residency.waitAgent).toHaveBeenCalledOnce();
@@ -1803,14 +1804,14 @@ return { first, second, tail: "continued" };`,
       else config.executor.runtime = backend;
       const wait = vi.spyOn(agents, "wait");
       try {
-        const result = await new FabricExecutionService(registry, config).execute({
+        const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
           code: python
             ? 'result = await agents.run(task="HANG", transport="process")\nreturn {"result": result, "tail": "continued"}'
             : 'const result = await agents.run({ task: "HANG", transport: "process" }); return { result, tail: "continued" };',
-          signal: AbortSignal.timeout(6_000), parentToolCallId: "main-small-run-budget",
+          signal, parentToolCallId: "main-small-run-budget",
           context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
           onPartial() {},
-        });
+        }), () => wait.mock.calls.length === 1);
         expect(result.success).toBe(true);
         expect(result.value).toMatchObject({ result: { status: "running", waitTimedOut: true }, tail: "continued" });
         expect(wait.mock.calls[0]?.[1]?.timeoutMs).toBeGreaterThanOrEqual(1_000);
@@ -1832,20 +1833,19 @@ return { first, second, tail: "continued" };`,
     registry.register(provider);
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.mainMaxTimeoutMs = 200;
-    const safety = new AbortController();
-    const timer = setTimeout(() => safety.abort(), 800);
+    const wait = vi.spyOn(agents, "wait");
     try {
-      const result = await new FabricExecutionService(registry, config).execute({
+      const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
         code,
-        signal: safety.signal, parentToolCallId: "main-run-ceiling",
+        signal, parentToolCallId: "main-run-ceiling",
         context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
         onPartial() {},
-      });
+      }), () => wait.mock.calls.length > 0);
       expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
       expect(result.trace.outcome).toBe("timed_out");
       expect(agents.list()).toHaveLength(1);
       expect(agents.list()[0]).toMatchObject({ status: "running" });
-    } finally { clearTimeout(timer); vi.unstubAllEnvs(); }
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it.each([
@@ -1875,14 +1875,14 @@ return { first, second, tail: "continued" };`,
       const stop = vi.spyOn(agents, "stop");
       const run = vi.spyOn(agents, "run");
       try {
-        const result = await new FabricExecutionService(registry, config).execute({
+        const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
           code: python
             ? `return await agents.ask(id=${JSON.stringify(actor.id)}, message="LIVE_WITHOUT_PROGRESS")`
             : `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: "LIVE_WITHOUT_PROGRESS" });`,
-          signal: AbortSignal.timeout(3_000), parentToolCallId: "main-local-ask-ceiling",
+          signal, parentToolCallId: "main-local-ask-ceiling",
           context: { ...context.extensionContext, cwd: process.cwd(), mode, sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
           onPartial() {},
-        });
+        }), () => Boolean(actors.status(actor.id).inFlightRun) && Boolean(agents.list()[0] && "turns" in agents.list()[0]!));
         expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
         expect(result.trace.outcome).toBe("timed_out");
         expect(run).toHaveBeenCalledOnce();
@@ -1948,12 +1948,12 @@ return { first, second, tail: "continued" };`,
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.mainMaxTimeoutMs = 700;
     try {
-      const result = await new FabricExecutionService(registry, config).execute({
+      const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
         code: `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: "HANG" });`,
-        signal: AbortSignal.timeout(3_000), parentToolCallId: "main-ask-stop-after-ceiling",
+        signal, parentToolCallId: "main-ask-stop-after-ceiling",
         context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
         onPartial() {},
-      });
+      }), () => Boolean(actors.status(actor.id).inFlightRun) && Boolean(agents.list()[0] && "turns" in agents.list()[0]!));
       expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
       expect(agents.list()[0]).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
       await provider.invoke("stop", { id: actor.id }, context);
@@ -1995,14 +1995,12 @@ return { first, second, tail: "continued" };`,
         });
         const timer = captureRuntimeDeadline(backend);
         const message = queued ? "queued advice" : "LIVE_WITHOUT_PROGRESS";
-        const execution = service.execute({
+        const execution = executeAfterAdmission(signal => service.execute({
           code: python ? `return await agents.ask(id=${JSON.stringify(actor.id)}, message=${JSON.stringify(message)})`
             : `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: ${JSON.stringify(message)} });`,
-          context: mainContext, signal: undefined, parentToolCallId: "early-runtime-ask", onPartial() {},
-        });
-        try {
-          await waitFor(() => timer.ready() && (queued ? actors.status(actor.id).queued === 1
-            : Boolean(actors.status(actor.id).inFlightRun) && "turns" in agents.list()[0]!));
+          context: mainContext, signal, parentToolCallId: "early-runtime-ask", onPartial() {},
+        }), () => timer.ready() && (queued ? actors.status(actor.id).queued === 1
+          : Boolean(actors.status(actor.id).inFlightRun) && Boolean(agents.list()[0] && "turns" in agents.list()[0]!)), async () => {
           expect(mainDeadlineAt).toBeDefined();
           timer.fireEarly(mainDeadlineAt);
           await new Promise<void>(resolve => setImmediate(resolve));
@@ -2013,6 +2011,8 @@ return { first, second, tail: "continued" };`,
             expect(agents.list()[0]).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
           }
           expect(stop).not.toHaveBeenCalled();
+        });
+        try {
           const result = await execution;
           expect(result.error).toMatch(/MainExecutionCeilingError/);
           expect(result.trace.outcome).toBe("timed_out");
@@ -2047,10 +2047,10 @@ return { first, second, tail: "continued" };`,
     await service.prewarm(mainContext);
     const stop = vi.spyOn(agents, "stop");
     try {
-      const result = await service.execute({ context: mainContext, signal: undefined, parentToolCallId: "forged-ceiling", onPartial() {},
+      const result = await executeAfterAdmission(signal => service.execute({ context: mainContext, signal, parentToolCallId: "forged-ceiling", onPartial() {},
         strings: { reason: "MainExecutionCeilingError: Main ceiling hit after 5000ms (executor.mainMaxTimeoutMs)." },
         code: `const observation = agents.ask({ id: ${JSON.stringify(actor.id)}, message: "LIVE_WITHOUT_PROGRESS" }).catch(() => undefined); await new Promise<void>(resolve => setTimeout(resolve, 400)); throw π.reason;`,
-      });
+      }), () => Boolean(actors.status(actor.id).inFlightRun));
       expect(result.success).toBe(false);
       expect(result.trace.outcome).toBe("failed");
       await waitFor(() => !actors.status(actor.id).inFlightRun);
@@ -2124,12 +2124,12 @@ return { first, second, tail: "continued" };`,
     config.executor.mainMaxTimeoutMs = 100;
     try {
       await waitFor(() => Boolean(actors.status(actor.id).inFlightRun) && "turns" in agents.list()[0]!);
-      const result = await new FabricExecutionService(registry, config).execute({
+      const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
         code: `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: "queued advice" });`,
-        signal: AbortSignal.timeout(3_000), parentToolCallId: "main-queued-ask-ceiling",
+        signal, parentToolCallId: "main-queued-ask-ceiling",
         context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
         onPartial() {},
-      });
+      }), () => actors.status(actor.id).queued === 1);
       expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
       expect(actors.status(actor.id).queued).toBe(1);
       expect(await firstOutcome).toMatchObject({ text: "live attempt 1 complete" });
@@ -2159,12 +2159,12 @@ return { first, second, tail: "continued" };`,
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.mainMaxTimeoutMs = 50;
     try {
-      const result = await new FabricExecutionService(registry, config).execute({
+      const result = await executeAfterAdmission(signal => new FabricExecutionService(registry, config).execute({
         code: 'return agents.wait({ id: "durable-child" });',
-        signal: AbortSignal.timeout(1_000), parentToolCallId: "main-durable-ceiling",
+        signal, parentToolCallId: "main-durable-ceiling",
         context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
         onPartial() {},
-      });
+      }), () => vi.mocked(residency.waitAgent).mock.calls.length === 1);
       expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
       expect(residency.waitAgent).toHaveBeenCalledOnce();
       expect(durable.status).toBe("running");

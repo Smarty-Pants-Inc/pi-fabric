@@ -6,15 +6,9 @@ import { NodeProcessRuntime } from "../src/runtime/node-process-runtime.js";
 import { MontyRuntime } from "../src/runtime/monty-runtime.js";
 import { CPythonRuntime } from "../src/runtime/cpython-runtime.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const runtimes = { quickjs: QuickJsRuntime, "node-process": NodeProcessRuntime, monty: MontyRuntime, cpython: CPythonRuntime } as const;
-const waitFor = async (check: () => boolean): Promise<void> => {
-  const until = Date.now() + 3_000;
-  while (!check()) {
-    if (Date.now() >= until) throw new Error("host call not admitted");
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-};
 
 describe("shared absolute deadline", () => {
   it("records clamp cause and never slides an expired budget", () => {
@@ -56,20 +50,20 @@ for (const [backend, Runtime] of Object.entries(runtimes)) {
       const timer = captureRuntimeDeadline(backend);
       let signal: AbortSignal | undefined;
       let release: (() => void) | undefined;
-      const result = new Runtime().execute(backend === "monty" || backend === "cpython"
+      const result = executeAfterAdmission(safety => new Runtime().execute(backend === "monty" || backend === "cpython"
         ? 'return await tools.call(ref="demo.hold", args={})' : 'return tools.call({ ref: "demo.hold", args: {} });',
         async (_ref, _args, hostSignal) => {
           signal = hostSignal;
           return new Promise<void>(resolve => { release = resolve; });
-        }, { timeoutMs: 5_000, maximumDeadlineAt, maximumDeadlineReason: reason, memoryLimitBytes: 128 * 1024 * 1024,
-          minimumTimeoutMsForHostCall: () => 900_000 });
-      try {
-        await waitFor(() => Boolean(signal) && timer.ready());
+        }, { timeoutMs: 5_000, signal: safety, maximumDeadlineAt, maximumDeadlineReason: reason, memoryLimitBytes: 128 * 1024 * 1024,
+          minimumTimeoutMsForHostCall: () => 900_000 }), () => Boolean(signal) && timer.ready(), () => {
         timer.fireEarly(maximumDeadlineAt);
         expect(signal!.aborted).toBe(false);
         timer.fireAt(maximumDeadlineAt);
         expect(mainExecutionCeilingAbortReason(signal)).toBe(reason);
         release!();
+      });
+      try {
         expect(await result).toMatchObject({ terminationReason: "timed_out", value: undefined, deadlineReason: reason });
         expect((await result).deadlineReason).toBe(reason);
       } finally { timer.restore(); release?.(); await result; }
@@ -82,13 +76,11 @@ for (const [backend, Runtime] of Object.entries(runtimes)) {
       const timer = captureRuntimeDeadline(backend);
       let signal: AbortSignal | undefined;
       let release: (() => void) | undefined;
-      const result = new Runtime().execute(backend === "monty" || backend === "cpython"
+      const result = executeAfterAdmission(safety => new Runtime().execute(backend === "monty" || backend === "cpython"
         ? 'return await tools.call(ref="demo.hold", args={})' : 'return tools.call({ ref: "demo.hold", args: {} });',
         async (_ref, _args, hostSignal) => { signal = hostSignal; return new Promise<void>(resolve => { release = resolve; }); },
-        { timeoutMs: 2_000, executionDeadline, maximumDeadlineAt, maximumDeadlineReason: reason,
-          memoryLimitBytes: 128 * 1024 * 1024, minimumTimeoutMsForHostCall: () => 900_000 });
-      try {
-        await waitFor(() => Boolean(signal) && timer.ready());
+        { timeoutMs: 2_000, signal: safety, executionDeadline, maximumDeadlineAt, maximumDeadlineReason: reason,
+          memoryLimitBytes: 128 * 1024 * 1024, minimumTimeoutMsForHostCall: () => 900_000 }), () => Boolean(signal) && timer.ready(), () => {
         expect(executionDeadline.at).toBe(maximumDeadlineAt);
         timer.fireEarly(maximumDeadlineAt);
         expect(signal!.aborted).toBe(false);
@@ -96,6 +88,8 @@ for (const [backend, Runtime] of Object.entries(runtimes)) {
         expect(executionDeadline.reason).toBe(reason);
         expect(mainExecutionCeilingAbortReason(signal)).toBe(reason);
         release!();
+      });
+      try {
         expect((await result).deadlineReason).toBe(reason);
       } finally { timer.restore(); release?.(); await result; }
     });
@@ -105,16 +99,16 @@ for (const [backend, Runtime] of Object.entries(runtimes)) {
       const timer = captureRuntimeDeadline(backend);
       let signal: AbortSignal | undefined;
       let release: (() => void) | undefined;
-      const result = new Runtime().execute(backend === "monty" || backend === "cpython"
+      const result = executeAfterAdmission(safety => new Runtime().execute(backend === "monty" || backend === "cpython"
         ? 'return await tools.call(ref="demo.hold", args={})' : 'return tools.call({ ref: "demo.hold", args: {} });',
         async (_ref, _args, hostSignal) => { signal = hostSignal; return new Promise<void>(resolve => { release = resolve; }); },
-        { timeoutMs: 2_000, maximumDeadlineAt, maximumDeadlineReason: createMainExecutionCeilingError(5_000), memoryLimitBytes: 128 * 1024 * 1024 });
-      try {
-        await waitFor(() => Boolean(signal) && timer.ready());
+        { timeoutMs: 2_000, signal: safety, maximumDeadlineAt, maximumDeadlineReason: createMainExecutionCeilingError(5_000), memoryLimitBytes: 128 * 1024 * 1024 }), () => Boolean(signal) && timer.ready(), () => {
         timer.fireAt(maximumDeadlineAt + 1);
         expect(signal!.aborted).toBe(true);
         expect(mainExecutionCeilingAbortReason(signal)).toBeUndefined();
         release!();
+      });
+      try {
         expect(await result).toMatchObject({ terminationReason: "timed_out", value: undefined });
         expect((await result).deadlineReason).toBeUndefined();
         expect((await result).error).not.toContain("Main ceiling");

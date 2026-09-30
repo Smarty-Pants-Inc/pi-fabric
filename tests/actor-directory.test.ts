@@ -14,7 +14,7 @@ const agents: AgentManager[] = [];
 const open = (
   root: string,
   sessionId: string,
-  options: { persistent?: boolean; meshCursorPath?: string } = {},
+  options: { persistent?: boolean; meshCursorPath?: string; canManageActor?: (id: string) => boolean | undefined } = {},
 ) => {
   const identity: MeshIdentity = {
     id: `session:${sessionId}`,
@@ -42,6 +42,8 @@ const open = (
     {
       persistent: options.persistent ?? true,
       rootId: identity.id,
+      removalRetryMs: 1,
+      ...(options.canManageActor ? { canManageActor: options.canManageActor } : {}),
       ...(options.meshCursorPath ? { meshCursorPath: options.meshCursorPath } : {}),
     },
   ], actorRoots, "project");
@@ -56,6 +58,89 @@ afterEach(async () => {
 });
 
 describe("ActorDirectory", () => {
+  it("#169 round 2 permits public same-name create while a waiting removal is behind a live run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-wait-"));
+    roots.push(root);
+    const { directory, manager } = open(root, "alpha");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const runId = "d".repeat(32);
+    vi.spyOn(manager, "run").mockImplementation(async (_request, _signal, onSpawned) => {
+      onSpawned?.({ id: runId } as never);
+      await gate;
+      return { id: runId, status: "stopped", text: "", usage: {} } as never;
+    });
+    const actor = await directory.create({ name: "replacement", instructions: "Work." });
+    directory.tell(actor.id, "go");
+    await vi.waitFor(() => expect(directory.status(actor.id).inFlightRun?.id).toBe(runId));
+    let removed = false;
+    const waiting = directory.remove(actor.id).then(() => { removed = true; });
+    await vi.waitFor(() => expect(directory.status(actor.id).status).toBe("stopped"));
+    const creating = directory.create({ name: "replacement", instructions: "Successor." });
+    try {
+      const result = await Promise.race([creating, new Promise<"blocked">((resolve) => setTimeout(resolve, 300, "blocked"))]);
+      expect(result).not.toBe("blocked");
+      expect(removed).toBe(false);
+      expect(directory.status("replacement").id).not.toBe(actor.id);
+      release();
+      await waiting;
+      expect(directory.list()).toHaveLength(1);
+    } finally { release(); await Promise.allSettled([waiting, creating]); }
+  });
+
+  it.each(["project", "session"] as const)("#169 round 1 retries an exact %s cleanup-only id after exhausted retries and reports it without reviving it", async (scope) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-cleanup-"));
+    roots.push(root);
+    const { directory, actorRoots, manager } = open(root, "alpha");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const runId = "b".repeat(32);
+    vi.spyOn(manager, "run").mockImplementation(async (_request, _signal, onSpawned) => {
+      onSpawned?.({ id: runId } as never);
+      await gate;
+      return { id: runId, status: "stopped", text: "", usage: {} } as never;
+    });
+    const actor = await directory.create({ scope, name: "reviewer", instructions: "Work." });
+    directory.tell(actor.id, "go");
+    await vi.waitFor(() => expect(directory.status(actor.id).inFlightRun?.id).toBe(runId));
+    const dir = path.join(actorRoots[scope], actor.id);
+    const marker = path.join(actorRoots[scope], `removal-${actor.id}.json`);
+    const rm = fs.rmSync.bind(fs);
+    let failures = 0;
+    const fail = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (target === dir) { failures++; throw new Error("persistent cleanup failure"); }
+      return rm(target, options);
+    });
+    try {
+      await directory.remove(actor.id, { wait: false });
+      release();
+      await directory.removalSettled(actor.id);
+      expect(failures).toBeGreaterThanOrEqual(6);
+      expect(directory.pendingRemovals()).toEqual([expect.objectContaining({ id: actor.id, state: expect.stringContaining("cleanup failed") })]);
+      expect(directory.list()).toContainEqual(expect.objectContaining({ id: actor.id, scope, status: "stopped", removal: expect.any(Object) }));
+      expect(() => directory.status(actor.id)).toThrow(/Unknown Fabric actor/);
+      expect(() => directory.tell(actor.id, "must not run")).toThrow();
+      expect(directory.listOwned()).toEqual([]);
+      const successor = await directory.create({ scope, name: "reviewer", instructions: "Successor." });
+      fs.writeFileSync(successor.sessionFile!, "successor\n");
+      expect(() => directory.status("reviewer")).not.toThrow();
+      await expect(directory.remove(actor.id.slice(0, 12))).rejects.toThrow();
+      // Foreign ownership opinions still deny cleanup of the exact id.
+      const foreign = open(root, "alpha", { canManageActor: () => false }).directory;
+      await foreign.finishPendingRemovals();
+      expect(foreign.owns(actor.id)).toBe(false);
+      await expect(foreign.remove(actor.id)).rejects.toThrow(/owning host/);
+      expect(fs.existsSync(marker)).toBe(true);
+      fail.mockRestore();
+      await expect(directory.remove(actor.id)).resolves.toEqual({ removed: true });
+      expect(directory.pendingRemovals()).toEqual([]);
+      expect(fs.existsSync(dir)).toBe(false);
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(directory.status("reviewer").id).toBe(successor.id);
+      expect(fs.readFileSync(successor.sessionFile!, "utf8")).toBe("successor\n");
+    } finally { release(); fail.mockRestore(); }
+  });
+
   it("runs project and session actor registries concurrently", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-directory-"));
     roots.push(root);

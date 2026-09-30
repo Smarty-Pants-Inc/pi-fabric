@@ -7,7 +7,8 @@ import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { actorBashTimeout, DEFAULT_ACTOR_BASH_TIMEOUT_S } from "../src/guards/actor-bash-timeout.js";
+import { actorBashTimeout, DEFAULT_ACTOR_BASH_TIMEOUT_S, MAX_ACTOR_BASH_TIMEOUT_S } from "../src/guards/actor-bash-timeout.js";
+import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { parseBashTimeoutSeconds } from "../src/actors/manager.js";
 import { foregroundWaitRefusal } from "../src/guards/foreground-wait.js";
 import piFabric from "../src/index.js";
@@ -31,6 +32,23 @@ describe("actor bash timeout (smarty-dev#2184)", () => {
     expect(actorBashTimeout({ ...actor, PI_FABRIC_ACTOR_BASH_TIMEOUT_S: "45" }, undefined)).toBe(45);
     expect(actorBashTimeout({ ...actor, PI_FABRIC_ACTOR_BASH_TIMEOUT_S: "0" }, undefined)).toBeUndefined();
     expect(actorBashTimeout({ ...actor, PI_FABRIC_ACTOR_BASH_TIMEOUT_S: "junk" }, undefined)).toBe(600);
+  });
+
+  it("smarty-dev#2339 F3: bounds the override to Pi's whole-second timer limit", () => {
+    expect(parseBashTimeoutSeconds(2_147_483)).toBe(2_147_483);
+    expect(() => parseBashTimeoutSeconds(2_147_484)).toThrow(/at most 2147483/);
+    expect(actorBashTimeout({ ...actor, PI_FABRIC_ACTOR_BASH_TIMEOUT_S: "2147483" }, undefined)).toBe(2_147_483);
+    for (const raw of ["2147484", "1e20", "Infinity"]) {
+      expect(actorBashTimeout({ ...actor, PI_FABRIC_ACTOR_BASH_TIMEOUT_S: raw }, undefined)).toBe(DEFAULT_ACTOR_BASH_TIMEOUT_S);
+    }
+    expect(parseBashTimeoutSeconds(0)).toBe(0);
+    expect(actorBashTimeout({ ...actor, PI_FABRIC_ACTOR_BASH_TIMEOUT_S: "0" }, undefined)).toBeUndefined();
+    expect(MAX_ACTOR_BASH_TIMEOUT_S).toBe(2_147_483);
+  });
+
+  it("smarty-dev#2339 F3: advertises the creation schema's maximum", () => {
+    const create = AGENTS_ACTION_DESCRIPTORS.find((action) => action.name === "create")!;
+    expect(create.inputSchema).toMatchObject({ properties: { bashTimeoutSeconds: { type: "integer", minimum: 0, maximum: 2_147_483 } } });
   });
 
   it("validates bashTimeoutSeconds", () => {
@@ -83,6 +101,26 @@ describe("actor bashTimeoutSeconds plumbing (smarty-dev#2184)", () => {
     expect(again.bashTimeoutSeconds).toBe(42);
   });
 
+  it("smarty-dev#2339 F3: rejects creation above the maximum, accepts the maximum and zero", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-bash-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    closers.push(() => agents.close());
+    const actors = new ActorManager("test", { id: "session:test", name: "main", kind: "main", sessionId: "test" }, mesh, DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, { actorRoot: path.join(root, "actors") });
+    closers.unshift(() => actors.close());
+    await expect(actors.create({ name: "too-large", instructions: "x", bashTimeoutSeconds: 2_147_484 })).rejects.toThrow(/bashTimeoutSeconds.*at most 2147483/);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    for (const seconds of [2_147_483, 0]) {
+      const created = await actors.create({ name: `valid-${seconds}`, instructions: "x", extensions: false, tools: [], transport: "process", bashTimeoutSeconds: seconds });
+      await actors.ask(created.id, "probe");
+      const options = parseWorkerOptions(["node", "worker.js", ...launch.mock.calls.at(-1)![0].workerArguments]);
+      expect(options.bashTimeoutSeconds).toBe(seconds);
+    }
+  });
+
   it("rejects an invalid bashTimeoutSeconds at create", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-bash-"));
     roots.push(root);
@@ -126,6 +164,16 @@ describe("Fabric bash tool_call hook in an actor run (smarty-dev#2184)", () => {
     expect((await bashCall({ command: "ls" })).input.timeout).toBe(600);
     expect((await bashCall({ command: "ls", timeout: 5 })).input.timeout).toBe(5);
     expect((await bashCall({ command: "while true; do sleep 5; done" })).blocked).toBe(true);
+    vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", "0");
+    expect((await bashCall({ command: "ls" })).input.timeout).toBeUndefined();
+  });
+
+  it("smarty-dev#2339 F3: injects the maximum and falls back for an oversized override", async () => {
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "actor:a");
+    vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", "2147483");
+    expect((await bashCall({ command: "ls" })).input.timeout).toBe(2_147_483);
+    vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", "2147484");
+    expect((await bashCall({ command: "ls" })).input.timeout).toBe(600);
     vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", "0");
     expect((await bashCall({ command: "ls" })).input.timeout).toBeUndefined();
   });
@@ -208,5 +256,59 @@ describe("timeout-only actor bash hook (smarty-dev#2184)", () => {
     expect(actor.argv[actor.argv.indexOf("--tools") + 1]).toBe("bash"); // tools are not widened
     expect(actor.timeout).toBe("2");
     expect((await surface()).argv).not.toContain(hook);
+  });
+});
+
+// smarty-dev#2339 F4: actor B's unset override must not inherit actor A's timeout.
+describe("nested actor bash timeout isolation (smarty-dev#2339 F4)", () => {
+  const roots: string[] = [];
+  const closers: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    for (const close of closers.splice(0)) await close();
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(["0", "2"])("clears parent timeout %s in the real worker and keeps the child's own 7 s override", { timeout: 20_000 }, async (inherited) => {
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "actor:parent");
+    vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", inherited);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-nested-actor-bash-"));
+    roots.push(root);
+    const fakePi = path.join(root, "fake-pi.mjs");
+    fs.writeFileSync(fakePi, [
+      "#!/usr/bin/env node",
+      "import readline from 'node:readline';",
+      "const send = (event) => process.stdout.write(JSON.stringify(event) + '\\n');",
+      "const text = JSON.stringify({ actorId: process.env.PI_FABRIC_ACTOR_ID, timeout: process.env.PI_FABRIC_ACTOR_BASH_TIMEOUT_S });",
+      "const message = { role: 'assistant', content: [{ type: 'text', text }], provider: 'fake', model: 'fake', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: 'stop' };",
+      "let started = false;",
+      "readline.createInterface({ input: process.stdin }).on('line', (line) => {",
+      "  if (started || !line.trim()) return; started = true;",
+      "  send({ type: 'response', command: 'prompt', success: true }); send({ type: 'agent_start' });",
+      "  send({ type: 'message_end', message }); send({ type: 'turn_end', message, toolResults: [] });",
+      "  send({ type: 'agent_end', messages: [message], willRetry: false }); send({ type: 'agent_settled' });",
+      "});",
+      "process.stdin.on('end', () => setTimeout(() => process.exit(0), 5));",
+    ].join("\n"), { mode: 0o755 });
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("src/worker.ts"), piBinary: fakePi, runRoot: path.join(root, "runs"),
+    });
+    closers.push(() => agents.close());
+    const surface = async (bashTimeoutSeconds?: number) => {
+      const result = await agents.run({
+        task: "report", transport: "process", runner: "pi", extensions: false, tools: ["bash"], timeoutMs: 10_000,
+        actorId: "actor:child",
+        ...(bashTimeoutSeconds === undefined ? {} : { bashTimeoutSeconds }),
+      });
+      expect(result.status).toBe("completed");
+      return JSON.parse(result.text) as { actorId: string; timeout?: string };
+    };
+    const defaults = await surface();
+    expect(defaults.actorId).toBe("actor:child");
+    expect(defaults).not.toHaveProperty("timeout");
+    expect(actorBashTimeout({ PI_FABRIC_ACTOR_ID: defaults.actorId, PI_FABRIC_ACTOR_BASH_TIMEOUT_S: defaults.timeout }, undefined)).toBe(600);
+    const override = await surface(7);
+    expect(override.timeout).toBe("7");
+    expect(actorBashTimeout({ PI_FABRIC_ACTOR_ID: override.actorId, PI_FABRIC_ACTOR_BASH_TIMEOUT_S: override.timeout }, undefined)).toBe(7);
   });
 });

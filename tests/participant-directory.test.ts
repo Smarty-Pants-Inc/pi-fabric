@@ -658,13 +658,15 @@ describe("ParticipantDirectory", () => {
       kind: "agent",
       sessionId: "recursive-session",
     };
+    // This tests live ownership and lineage, not expiry: keep all owners live across slow CI.
+    const lease = { heartbeatMs: 60_000, leaseMs: 120_000 };
     const alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [
       rootRecord(alphaIdentity.id, alphaIdentity.id, "alpha"),
       agentRecord("agent:alpha-child", alphaIdentity.id, alphaIdentity.id, alphaIdentity.id),
-    ]);
+    ], lease);
     const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [
       rootRecord(betaIdentity.id, betaIdentity.id, "beta"),
-    ]);
+    ], lease);
     const recursive = createDirectory(meshRoot, recursiveIdentity, alphaIdentity.id, () => [
       agentRecord(
         "agent:grandchild",
@@ -672,7 +674,7 @@ describe("ParticipantDirectory", () => {
         "runtime:recursive-session",
         recursiveIdentity.id,
       ),
-    ]);
+    ], lease);
 
     await alpha.start();
     await beta.start();

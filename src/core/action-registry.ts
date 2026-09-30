@@ -17,7 +17,7 @@ import {
   previewArgs,
   previewResult,
 } from "./action-result.js";
-import { runAbortable, settleWithin, throwIfAborted } from "../async-settlement.js";
+import { runAbortable, settleWithin, shareCancellationEffects, throwIfAborted } from "../async-settlement.js";
 import type {
   FabricCapabilityRequirement,
   FabricComponentProviderLease,
@@ -1535,11 +1535,11 @@ export class ActionRegistry {
     const view = context.capabilityView ? this.#requireView(context.capabilityView) : undefined;
     throwIfAborted(context.signal);
     if (this.#shutdown.signal.aborted) throw new FabricResolutionError("Fabric registry is closed");
-    return { ...context, signal: AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]) };
+    return { ...context, signal: shareCancellationEffects(AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]), context.signal) };
   }
 
   #bindingContext<T extends FabricInvocationContext>(binding: FabricProviderBinding, context: T): T {
-    return { ...context, signal: AbortSignal.any([this.#providerBindings.signal(binding.id), ...(context.signal ? [context.signal] : [])]) };
+    return { ...context, signal: shareCancellationEffects(AbortSignal.any([this.#providerBindings.signal(binding.id), ...(context.signal ? [context.signal] : [])]), context.signal) };
   }
 
   async #preparePlanned(binding: FabricProviderBinding, actionName: string, authority: { ref: string; descriptor: string }, mode: ProviderOperation["mode"], args: Record<string, unknown>, context: FabricInvocationContext, replayValue?: unknown, adopt?: ProviderOperation["adopt"]): Promise<(signal?: AbortSignal) => Promise<unknown>> {

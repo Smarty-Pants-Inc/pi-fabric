@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +21,8 @@ import {
   abandonResidentRequest,
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
+  registerResidentCancellation,
+  commitResidentRequest,
   RESIDENT_HOST_FORMAT,
   isResidentHostId,
   residentDeliveryPrefix,
@@ -410,10 +413,11 @@ export class ResidencyClient {
     return residentHostStateNote(this.options.config.residencyRoot);
   }
 
-  async cleanupAgent(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
+  async cleanupAgent(id: string, deleteBranch = false, signal?: AbortSignal): Promise<{ cleaned: boolean }> {
+    throwIfAborted(signal);
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
-    if (!this.#liveOwner()) return this.#cleanupTerminalFiles(metadata, deleteBranch);
+    if (!this.#liveOwner()) return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
     let response: ResidentCommandResponse;
     try {
       response = await this.#command({
@@ -424,10 +428,10 @@ export class ResidencyClient {
         id,
         deleteBranch,
         createdAt: Date.now(),
-      });
+      }, signal);
     } catch (error) {
       if (!(error instanceof ResidentOutcomeUnknownError) && error instanceof Error && /Unknown Fabric agent/.test(error.message)) {
-        return this.#cleanupTerminalFiles(metadata, deleteBranch);
+        return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
       }
       throw error;
     }
@@ -439,7 +443,9 @@ export class ResidencyClient {
   async #cleanupTerminalFiles(
     metadata: ResidentAgentMetadata,
     deleteBranch: boolean,
+    signal?: AbortSignal,
   ): Promise<{ cleaned: boolean }> {
+    throwIfAborted(signal);
     const status = this.statusAgent(metadata.id);
     if (!("startedAt" in status) || !terminal(status.status)) {
       throw new Error(`Cannot clean up running durable Fabric agent ${metadata.id}`);
@@ -450,35 +456,60 @@ export class ResidencyClient {
         `(see ${metadata.runDirectory}). Check the worker, then remove its files by hand.`,
       );
     }
-    if (metadata.handle.worktree) {
-      const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
-      const worktree = await registeredWorktree(gitRoot, metadata.handle.worktree);
-      await executeFile(
-        "git",
-        ["worktree", "remove", "--force", worktree],
-        { cwd: gitRoot, timeoutMs: 60_000 },
-      );
-      if (deleteBranch && metadata.handle.branch) {
+    const command: ResidentCommand = { format: RESIDENT_HOST_FORMAT, operation: "cleanup", requestId: randomUUID(),
+      rootId: this.options.config.rootId, id: metadata.id, deleteBranch, createdAt: Date.now() };
+    let commitAttempted = false;
+    const commit = (): void => {
+      throwIfAborted(signal);
+      registerResidentCancellation(signal, this.options.config.residencyRoot, command);
+      commitAttempted = true;
+      commitResidentRequest(this.options.config.residencyRoot, command, metadata.id, this.hostId);
+    };
+    try {
+      if (metadata.handle.worktree) {
+        const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
+        const worktree = await registeredWorktree(gitRoot, metadata.handle.worktree);
+        commit();
         await executeFile(
           "git",
-          ["branch", "-D", metadata.handle.branch],
-          { cwd: gitRoot, timeoutMs: 30_000 },
+          ["worktree", "remove", "--force", worktree],
+          { cwd: gitRoot, timeoutMs: 60_000 },
         );
+        if (deleteBranch && metadata.handle.branch) {
+          throwIfAborted(signal);
+          await executeFile(
+            "git",
+            ["branch", "-D", metadata.handle.branch],
+            { cwd: gitRoot, timeoutMs: 30_000 },
+          );
+        }
+      } else if (deleteBranch) {
+        throw new Error(`Durable Fabric agent ${metadata.id} has no worktree branch to delete`);
+      } else {
+        commit();
       }
-    } else if (deleteBranch) {
-      throw new Error(`Durable Fabric agent ${metadata.id} has no worktree branch to delete`);
+      throwIfAborted(signal);
+      fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
+      fs.rmSync(this.#metadataPath(metadata.id), { force: true });
+      fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
+      this.options.onResultConsumed?.(metadata.id);
+      return { cleaned: true };
+    } catch (error) {
+      if (!commitAttempted) throw error;
+      let decision;
+      try { decision = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unknown fence */ }
+      if (decision?.state === "abandoned") throw error;
+      // Partial cleanup or an unreadable fence is not a proved rejection either.
+      throw new ResidentOutcomeUnknownError(command, decision, error);
     }
-    fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
-    fs.rmSync(this.#metadataPath(metadata.id), { force: true });
-    fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
-    this.options.onResultConsumed?.(metadata.id);
-    return { cleaned: true };
   }
 
   async #command(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
     if (this.#liveOwner()?.requestFence !== 1) {
       throw new Error("Fabric resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }
+    throwIfAborted(signal);
+    registerResidentCancellation(signal, this.options.config.residencyRoot, command);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
     try {
       atomicWrite(path.join(this.#requestsPath, `${command.requestId}.json`), command);

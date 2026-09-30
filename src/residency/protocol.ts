@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { registerCancellationEffect } from "../async-settlement.js";
 import { readFileRetrying } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -153,6 +154,29 @@ export class ResidentOutcomeUnknownError extends Error {
     this.ownerHostId = decision?.ownerHostId;
   }
 }
+
+/** Install before request publication; outer abort races can now settle the same fence. */
+export const registerResidentCancellation = (
+  signal: AbortSignal | undefined,
+  residencyRoot: string,
+  command: ResidentCommand,
+): void => {
+  // A committed receipt is immutable. Reuse its first error instead of nesting
+  // already-formatted uncertainty again at each enclosing cancellation gate.
+  let committedOutcome: ResidentOutcomeUnknownError | undefined;
+  registerCancellationEffect(signal, (reason) => {
+    if (committedOutcome) return committedOutcome;
+    let decision: ResidentRequestDecision | undefined;
+    try {
+      decision = abandonResidentRequest(path.join(residencyRoot, "requests"), path.join(residencyRoot, "responses"), command.requestId);
+    } catch (error) {
+      try { decision = readResidentRequestDecision(residencyRoot, command.requestId); } catch { /* unreadable fence */ }
+      return new ResidentOutcomeUnknownError(command, decision, error);
+    }
+    if (decision.state === "committed") return committedOutcome = new ResidentOutcomeUnknownError(command, decision, reason);
+    return undefined;
+  });
+};
 
 /** A short age such as "42s", "3m12s" or "1h05m". */
 export const formatAge = (ms: number): string => {

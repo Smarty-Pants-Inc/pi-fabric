@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { formatAge } from "../residency/protocol.js";
-import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
+import { ActorManager, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
@@ -960,7 +960,7 @@ export class AgentsProvider implements FabricProvider {
       case "cleanup": {
         const id = String(args.id);
         return this.residency?.hasAgent(id)
-          ? this.residency.cleanupAgent(id, args.deleteBranch === true)
+          ? this.residency.cleanupAgent(id, args.deleteBranch === true, context.signal)
           : this.manager.cleanup(id, args.deleteBranch === true);
       }
       case "create": {
@@ -1343,18 +1343,12 @@ export class AgentsProvider implements FabricProvider {
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
     };
     if (request.residency !== "durable") return this.actorManager.create(request);
-    if (!this.residency) return this.#residentActorClient().createActor(request, signal);
-
-    await this.residency.ensureHost();
-    let actor: FabricActorInfo;
-    try {
-      actor = await this.actorManager.create(request);
-    } catch (error) {
-      if (!(error instanceof ActorRegistryOwnershipError)) throw error;
-      return this.residency.createActor(request, signal);
-    }
-    await this.#activateDurableActor(actor);
-    return actor;
+    // Even the first actor in an empty registry must use the authoritative
+    // host's capability check and request fence. A local-create/cede path can
+    // publish after cancellation with neither a decision nor a known-ID receipt.
+    return this.residency
+      ? this.residency.createActor(request, signal)
+      : this.#residentActorClient().createActor(request, signal);
   }
 
   /**
@@ -1404,23 +1398,6 @@ export class AgentsProvider implements FabricProvider {
       );
     }
     return this.residency;
-  }
-
-  async #activateDurableActor(actor: FabricActorInfo): Promise<void> {
-    const residency = this.#resident();
-    await this.actorManager.cede(actor.id);
-    await this.participants.refresh();
-    try {
-      await residency.ensureActor(actor.id);
-    } catch (error) {
-      try {
-        await residency.removeActor(actor.id);
-      } catch {
-        this.actorManager.reclaim(actor.id);
-      }
-      await this.participants.refresh().catch(() => undefined);
-      throw error;
-    }
   }
 
   #listAgents(scopeValue: unknown): Array<AgentRunRecord | AgentHandleInfo | ReturnType<FabricParticipantSource["self"]>> {

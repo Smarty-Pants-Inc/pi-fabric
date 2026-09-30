@@ -1144,6 +1144,16 @@ export class AgentManager {
     return this.wait(handle.id);
   }
 
+  /** Side-effect-free settlement join for preparation before a durable mutation fence. */
+  async join(id: string): Promise<void> {
+    if (this.#previousRun(id)) return;
+    const managed = this.#requireRun(id);
+    if (!managed.settled) {
+      if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
+      await managed.result;
+    }
+  }
+
   /**
    * Waits for a run's result and consumes it. With timeoutMs, a run still going at the bound is
    * detached instead (smarty-dev#854): it continues, nothing is consumed, and its result arrives

@@ -1,7 +1,47 @@
+// Cancellation is not a safe rejection once a durable mutation may have committed.
+// Effects are shared only along one invocation's signal lineage, never with a
+// registry/provider shutdown signal (which is shared by unrelated invocations).
+// Keep receipts until that signal is collected: a guest may receive a successful
+// host result, then be interrupted before it can return the ID to its caller.
+type CancellationEffect = (reason: Error) => Error | undefined;
+const cancellationEffects = new WeakMap<AbortSignal, Set<CancellationEffect>>();
+const effectsFor = (signal: AbortSignal): Set<CancellationEffect> => {
+  let effects = cancellationEffects.get(signal);
+  if (!effects) cancellationEffects.set(signal, effects = new Set());
+  return effects;
+};
+
+export const shareCancellationEffects = (signal: AbortSignal, parent?: AbortSignal): AbortSignal => {
+  if (parent) cancellationEffects.set(signal, effectsFor(parent));
+  return signal;
+};
+
+/** The callback must synchronously fence cancellation, not wait for a remote host. */
+export const registerCancellationEffect = (signal: AbortSignal | undefined, effect: CancellationEffect): void => {
+  if (signal) effectsFor(signal).add(effect);
+};
+
+/** Settle every effect BEFORE presenting cancellation, even if the guest cannot resume. */
+export const cancellationError = (signal: AbortSignal | undefined, reason: Error): Error => {
+  const errors: Error[] = [];
+  for (const effect of signal ? cancellationEffects.get(signal) ?? [] : []) {
+    try {
+      const error = effect(reason);
+      if (error) errors.push(error);
+    } catch (error) {
+      // A failed settlement must never look like a proved, safe rejection.
+      errors.push(new Error(`Cancellation outcome unknown; do not retry or reassign. ${String(error)}`, { cause: error }));
+    }
+  }
+  if (errors.length === 0) return reason;
+  if (errors.length === 1) return errors[0]!;
+  return new AggregateError(errors, errors.map((error) => error.message).join("\n"), { cause: reason });
+};
+
 const abortError = (signal: AbortSignal): Error => {
   const reason = signal.reason;
-  if (reason instanceof Error) return reason;
-  return new Error(typeof reason === "string" && reason ? reason : "Operation aborted");
+  return cancellationError(signal, reason instanceof Error ? reason
+    : new Error(typeof reason === "string" && reason ? reason : "Operation aborted"));
 };
 
 export const throwIfAborted = (signal: AbortSignal | undefined): void => {

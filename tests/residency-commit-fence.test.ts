@@ -8,6 +8,9 @@ import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { FabricControlPlane } from "../src/topology/control-plane.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -38,7 +41,7 @@ const entries = (root: string, directory: string) => names(path.join(root, direc
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 /** No fake host/response: real pickup, managers, model refresh, worker launch and ownership. */
-const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig) => void) => {
+const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig) => void, commandTimeoutMs = 500) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-commit-fence-"));
   const meshRoot = path.join(root, "mesh");
   const rootId = `session:fence:${path.basename(root)}`;
@@ -78,7 +81,7 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
   const host = runResidentHostFromConfigPath(configPath, shutdown.signal, registry);
   await waitFor(() => fs.existsSync(path.join(residencyRoot, "owner.json")));
   const client = new ResidencyClient({
-    config, mesh, participants, commandTimeoutMs: 500,
+    config, mesh, participants, commandTimeoutMs,
     mainAgent: { id: rootId, local: true, matches: (id) => id === rootId, info: () => { throw new Error("unused"); },
       deliverAgent: () => ({ queued: true, messageId: "unused", routed: "main" }) },
   });
@@ -201,11 +204,11 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
 
   it("cleanup that times out behind a real wait is fenced before file/worktree mutation", { timeout: 10_000 }, async () => {
     const state = await harness(false);
-    const original = AgentManager.prototype.wait;
+    const original = AgentManager.prototype.join;
     const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
     try {
       const handle = await state.client.spawnAgent({ task: "settle before cleanup", model: state.model });
-      vi.spyOn(AgentManager.prototype, "wait").mockImplementation(async function (this: AgentManager, ...args) {
+      vi.spyOn(AgentManager.prototype, "join").mockImplementation(async function (this: AgentManager, ...args) {
         const result = await original.apply(this, args);
         state.entered.resolve(); await state.release.promise;
         return result;
@@ -371,7 +374,7 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
       { enabled: false, pollMs: 20, maxReadEvents: 100 }, async () => {});
     const provider = new AgentsProvider(localAgents, localActors, new GlobalActorRegistry(state.root, 64 * 1024),
       state.client.options.mainAgent, state.participants, undefined, lifecycle, undefined,
-      operation === "spawn" ? state.client : undefined, false);
+      state.client, false);
     const controller = new AbortController();
     const context: FabricInvocationContext = {
       cwd: state.root, signal: controller.signal, parentToolCallId: "fence", nestedToolCallId: "fence-nested",
@@ -400,5 +403,300 @@ describe("resident commit vs abandonment: real client -> pickup -> preparation -
       await provider.close(); await localActors.close(); await localAgents.close(); await lifecycle.close();
       await state.close();
     }
+  });
+});
+
+const mainProvider = (state: Awaited<ReturnType<typeof harness>>) => {
+  const manager = new AgentManager(state.root, state.config.agents, { runRoot: path.join(state.root, "local-runs") });
+  const identity = { id: state.config.rootId, name: "main", kind: "main" as const };
+  const actors = new ActorDirectory(["caller", identity, state.client.options.mesh, state.config.mesh, manager, () => {}, {
+    persistent: true, rootId: state.config.rootId, claimResidency: "session",
+    canManageActor: (id) => {
+      const participant = state.participants.get(id);
+      return participant ? participant.ownerHostId === state.config.rootId : undefined;
+    },
+    resolvePiModel: async (model) => {
+      if (model === "test/slow") { state.entered.resolve(); await state.release.promise; }
+      return model;
+    },
+  }], { project: state.config.actorRoot, session: state.config.sessionActorRoot! }, "project");
+  const control = new FabricControlPlane(state.client.options.mesh, identity, {
+    enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 3_000,
+  });
+  control.start(() => ({ accepted: false }));
+  const lifecycle = new LifecycleBroker(state.client.options.mesh, identity, state.participants,
+    { enabled: false, pollMs: 20, maxReadEvents: 100 }, async () => {});
+  const global = new GlobalActorRegistry(state.root, 64 * 1024);
+  const provider = new AgentsProvider(manager, actors, global, state.client.options.mainAgent,
+    state.participants, control, lifecycle, undefined, state.client, false);
+  const registry = new ActionRegistry();
+  registry.register(provider);
+  const context: FabricInvocationContext = {
+    cwd: state.root, signal: undefined, parentToolCallId: "round1", nestedToolCallId: "round1-nested", update() {},
+    extensionContext: { modelRegistry: { getAvailable: () => [{ provider: "test", id: "slow" }, { provider: "test", id: "visible" }] } } as unknown as FabricInvocationContext["extensionContext"],
+  };
+  return { provider, registry, actors, global, context,
+    invoke: (ref: string, args: Record<string, unknown>, signal?: AbortSignal) => registry.invoke(ref, args,
+      { ...context, signal, audits: [], maxResultChars: 100_000, approve: async () => {} }),
+    close: async () => { await registry.close(); await control.close(); await actors.close(); await manager.close(); await lifecycle.close(); },
+  };
+};
+
+const requestArgs = (state: Awaited<ReturnType<typeof harness>>, operation: "spawn" | "create") => ({
+  residency: "durable", model: state.model,
+  ...(operation === "spawn" ? { task: "round1 never silently reassign" } : { name: "round1", instructions: "round1 never silently reassign" }),
+});
+
+describe("round 1 public cancellation contract", () => {
+  it("QuickJS teardown surfaces a committed unawaited resident call instead of successful guest output", async () => {
+    const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+    const original = ActorDirectory.prototype.create;
+    vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+      const actor = await original.apply(this, args); state.entered.resolve(); await state.release.promise; return actor;
+    });
+    try {
+      const outcome = new QuickJsRuntime().execute('void agents.create(JSON.parse(π.args)); await new Promise(resolve => setTimeout(resolve, 500)); return "guest ended";',
+        (ref, args, signal) => main.invoke(ref, args, signal), {
+          timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024, strings: { args: JSON.stringify(requestArgs(state, "create")) },
+        });
+      await state.entered.promise;
+      const result = await outcome;
+      expect(result.terminationReason).toBe("runtime_error"); expect(result.value).toBeUndefined();
+      const file = entries(state.residencyRoot, "decisions")[0]!;
+      const decision = JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", file), "utf8"));
+      expect(result.error).toContain("ResidentOutcomeUnknownError");
+      expect(result.error).toContain(decision.requestId); expect(result.error).toContain(decision.id);
+      state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
+    } finally { state.release.resolve(); await main.close(); await state.close(); }
+  });
+
+  it("QuickJS outer cancellation preserves all committed IDs, including an earlier successful call", async () => {
+    const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+    const controller = new AbortController(); const original = ActorDirectory.prototype.create; let created = 0;
+    vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+      const actor = await original.apply(this, args);
+      if (++created === 2) { state.entered.resolve(); await state.release.promise; }
+      return actor;
+    });
+    try {
+      const outcome = new QuickJsRuntime().execute('const args = JSON.parse(π.args); await agents.create({...args, name:"receipt-one"}); return await agents.create({...args, name:"receipt-two"});',
+        (ref, args, signal) => main.invoke(ref, args, signal), {
+          timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024, signal: controller.signal,
+          strings: { args: JSON.stringify(requestArgs(state, "create")) },
+        });
+      await state.entered.promise; controller.abort(); const result = await outcome;
+      expect(result.terminationReason).toBe("aborted"); expect(result.error).toContain("ResidentOutcomeUnknownError");
+      const decisions = entries(state.residencyRoot, "decisions").map(file => JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", file), "utf8")));
+      expect(decisions).toHaveLength(2);
+      for (const decision of decisions) {
+        expect(decision.state).toBe("committed"); expect(result.error).toContain(decision.requestId); expect(result.error).toContain(decision.id);
+      }
+      state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      expect(created).toBe(2); expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(2);
+    } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+  });
+
+  it("Main publication failure preserves committed actor uncertainty without compensation or reclaim", async () => {
+    const state = await harness(false, undefined, 10_000);
+    const main = mainProvider(state);
+    const cede = vi.spyOn(main.actors, "cede");
+    const reclaim = vi.spyOn(main.actors, "reclaim");
+    const remove = vi.spyOn(state.client, "removeActor");
+    const original = ActorDirectory.prototype.create;
+    const publicationFailure = new Error("injected publication failure after resident commit");
+    vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+      const actor = await original.apply(this, args);
+      if (this !== main.actors) throw publicationFailure;
+      return actor;
+    });
+    try {
+      const error = await main.invoke("agents.create", requestArgs(state, "create")).catch((error: Error) => error);
+      expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", operation: "createActor" });
+      expect((error as Error).message).toContain(publicationFailure.message);
+      const decisions = entries(state.residencyRoot, "decisions");
+      expect(decisions).toHaveLength(1);
+      const decision = JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", decisions[0]!), "utf8"));
+      expect(decision).toMatchObject({ state: "committed", id: (error as { id: string }).id });
+      expect((error as Error).message).toContain(decision.requestId);
+      expect((error as Error).message).toContain(decision.id);
+      expect(cede).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled(); expect(reclaim).not.toHaveBeenCalled();
+      await waitFor(() => state.participants.get(decision.id)?.ownerHostId === residentHostId(state.config.rootId));
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
+      expect(await main.invoke("agents.actorStatus", { id: decision.id })).toMatchObject({ id: decision.id });
+      await main.invoke("agents.stop", { id: decision.id });
+    } finally { await main.close(); await state.close(); }
+  });
+
+  it("abandoned public cleanup preserves real worker background completion exactly once", { timeout: 15_000 }, async () => {
+    const state = await harness(false, undefined, 10_000);
+    const main = mainProvider(state);
+    const controller = new AbortController();
+    const delivered = vi.spyOn(state.client.options.mainAgent, "deliverAgent");
+    const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
+    state.client.start();
+    try {
+      const handle = await state.client.spawnAgent({ task: "LIVE_WITH_PROGRESS cleanup notification", model: state.model });
+      const outcome = main.invoke("agents.cleanup", { id: handle.id }, controller.signal).catch((error: Error) => error);
+      await waitFor(() => entries(state.residencyRoot, "processing").length > 0);
+      const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
+      controller.abort(); expect(await outcome).toBeInstanceOf(Error);
+      expect(JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", `${requestId}.json`), "utf8")))
+        .toMatchObject({ state: "abandoned" });
+      await waitFor(() => state.client.settledAgent(handle.id) !== undefined);
+      await waitFor(() => delivered.mock.calls.some(([delivery]) => (delivery.data as { id?: string })?.id === handle.id));
+      await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      await delay(100);
+      expect(delivered.mock.calls.filter(([delivery]) => (delivery.data as { id?: string })?.id === handle.id)).toHaveLength(1);
+      expect(cleanup).not.toHaveBeenCalled(); expect(state.client.hasAgent(handle.id)).toBe(true);
+    } finally { controller.abort(); await main.close(); await state.close(); }
+  });
+
+  it("durable host still validates capability requirements before its fence", async () => {
+    const state = await harness(false);
+    const main = mainProvider(state);
+    try {
+      await expect(main.invoke("agents.create", { ...requestArgs(state, "create"), requires: ["memory.get"] }))
+        .rejects.toThrow("cannot commit actor capability requirements");
+      expect(entries(state.residencyRoot, "decisions").map((file) => JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", file), "utf8"))))
+        .not.toContainEqual(expect.objectContaining({ state: "committed" }));
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
+    } finally { await main.close(); await state.close(); }
+  });
+  it("Main cancellation during empty-registry preparation cannot publish a late actor after rejection", async () => {
+    const state = await harness(true, undefined, 10_000); const main = mainProvider(state);
+    const controller = new AbortController();
+    try {
+      const outcome = main.invoke("agents.create", requestArgs(state, "create"), controller.signal).catch((error: Error) => error);
+      await state.entered.promise; controller.abort(); expect(await outcome).toBeInstanceOf(Error);
+      state.release.resolve(); await delay(200);
+      await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
+      expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toEqual([]);
+      expect(entries(state.residencyRoot, "decisions")).toHaveLength(1);
+      expect(entries(state.residencyRoot, "agents")).toEqual([]);
+    } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+  });
+  it("Main empty-registry create is exclusively fenced before preparation; import uses the same path", async () => {
+    const state = await harness(true, undefined, 10_000);
+    const main = mainProvider(state);
+    const localCreate = vi.spyOn(main.actors, "create");
+    const controller = new AbortController();
+    try {
+      let finished = false;
+      const outcome = main.invoke("agents.create", requestArgs(state, "create"), controller.signal)
+        .catch((error: Error) => error).finally(() => { finished = true; });
+      await waitFor(() => finished || entries(state.residencyRoot, "processing").length > 0);
+      expect(localCreate).not.toHaveBeenCalled();
+      await state.entered.promise;
+      controller.abort();
+      expect((await outcome as Error).message).toMatch(/abort/i);
+      const requestId = entries(state.residencyRoot, "decisions")[0]!;
+      expect(JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", requestId), "utf8"))).toMatchObject({ state: "abandoned" });
+      state.release.resolve();
+      await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
+      expect(entries(state.residencyRoot, "agents")).toEqual([]);
+      const template = main.global.create({ name: "import-round1", instructions: "no local durable import", model: "test/visible", residency: "durable" });
+      const imported = await main.invoke("agents.import", { id: template.id });
+      expect(imported).toMatchObject({ residency: "durable" });
+      expect(localCreate).not.toHaveBeenCalled();
+    } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+  });
+
+  it("Main empty-registry create refuses a legacy host before any local or remote mutation", async () => {
+    const state = await harness(false);
+    const main = mainProvider(state);
+    const localCreate = vi.spyOn(main.actors, "create");
+    try {
+      const ownerPath = path.join(state.residencyRoot, "owner.json");
+      const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+      delete owner.requestFence; fs.writeFileSync(ownerPath, JSON.stringify(owner));
+      await expect(main.invoke("agents.create", requestArgs(state, "create"))).rejects.toThrow(/lacks the abandonment fence.*No request was dispatched/);
+      expect(localCreate).not.toHaveBeenCalled();
+      expect(entries(state.residencyRoot, "decisions")).toEqual([]);
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
+    } finally { await main.close(); await state.close(); }
+  });
+
+  for (const operation of ["spawn", "create"] as const) for (const ending of ["abort", "deadline"] as const) for (const before of [true, false]) {
+    it(`QuickJS -> registry -> Main ${operation} ${ending} ${before ? "before" : "after"} commit retains the fence outcome`, { timeout: 20_000 }, async () => {
+      const state = await harness(before, undefined, 10_000);
+      const main = mainProvider(state);
+      const controller = new AbortController();
+      let knownId = "";
+      let creations = 0;
+      if (!before) {
+        if (operation === "spawn") {
+          const original = AgentManager.prototype.spawn;
+          vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(async function (this: AgentManager, ...args) {
+            const handle = await original.apply(this, args); knownId = handle.id; creations++;
+            state.entered.resolve(); await state.release.promise; return handle;
+          });
+        } else {
+          const original = ActorDirectory.prototype.create;
+          vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+            const actor = await original.apply(this, args); knownId = actor.id; creations++;
+            state.entered.resolve(); await state.release.promise; return actor;
+          });
+        }
+      }
+      try {
+        const outcome = new QuickJsRuntime().execute(`return await agents.${operation}(JSON.parse(π.args));`,
+          (ref, args, signal) => main.invoke(ref, args, signal), {
+            timeoutMs: 1_000, memoryLimitBytes: 32 * 1024 * 1024, signal: controller.signal,
+            strings: { args: JSON.stringify(requestArgs(state, operation)) },
+          });
+        // π values are strings: use JSON.parse explicitly, as in public programs.
+        await state.entered.promise;
+        const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
+        if (ending === "abort") controller.abort();
+        const result = await outcome;
+        expect(result.terminationReason).toBe(ending === "abort" ? "aborted" : "timed_out");
+        const decision = JSON.parse(fs.readFileSync(path.join(state.residencyRoot, "decisions", `${requestId}.json`), "utf8"));
+        expect(decision.state).toBe(before ? "abandoned" : "committed");
+        if (!before) {
+          expect(result.error).toContain("ResidentOutcomeUnknownError");
+          expect(result.error).toContain(requestId); expect(result.error).toContain(knownId);
+          expect(result.error).toContain("Do not retry or reassign"); expect(result.error).toContain("agents.stop");
+        }
+        state.release.resolve();
+        await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+        if (before) {
+          expect(creations).toBe(0); expect(names(path.join(state.residencyRoot, "runs"))).toEqual([]);
+          expect(entries(state.residencyRoot, "agents")).toEqual([]);
+          expect(new ActorRegistryStore(state.config.actorRoot).records()).toEqual([]);
+        } else {
+          expect(creations).toBe(1);
+          await waitFor(() => state.participants.get(knownId)?.ownerHostId === residentHostId(state.config.rootId));
+          expect(state.participants.list({ scope: "lineage" }).filter((p) => p.id === knownId)).toHaveLength(1);
+          expect(await main.invoke(operation === "spawn" ? "agents.status" : "agents.actorStatus", { id: knownId })).toMatchObject({ id: knownId });
+          await main.invoke("agents.stop", { id: knownId });
+        }
+      } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
+    });
+  }
+
+  it("registry public cleanup abort fences a real host wait before destructive mutation", async () => {
+    const state = await harness(false, undefined, 10_000);
+    const main = mainProvider(state);
+    const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
+    const original = AgentManager.prototype.join;
+    const controller = new AbortController();
+    try {
+      const handle = await state.client.spawnAgent({ task: "cleanup round1", model: state.model });
+      vi.spyOn(AgentManager.prototype, "join").mockImplementation(async function (this: AgentManager, ...args) {
+        const result = await original.apply(this, args); state.entered.resolve(); await state.release.promise; return result;
+      });
+      const outcome = main.invoke("agents.cleanup", { id: handle.id }, controller.signal).catch((error: Error) => error);
+      await state.entered.promise; controller.abort();
+      expect(await outcome).toBeInstanceOf(Error);
+      const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
+      const decisionPath = path.join(state.residencyRoot, "decisions", `${requestId}.json`);
+      expect(fs.existsSync(decisionPath)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(decisionPath, "utf8"))).toMatchObject({ state: "abandoned" });
+      state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
+      expect(cleanup).not.toHaveBeenCalled(); expect(state.client.hasAgent(handle.id)).toBe(true);
+    } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
   });
 });

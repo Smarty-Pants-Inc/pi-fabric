@@ -46,6 +46,13 @@ const COMPLETION_MAX_CHARS = 8_000;
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Test-only native-process proof seam. Unset/invalid values are inert; never a startup hook. */
+const testResidentRequestDelay = async (stage: "before_commit" | "after_commit"): Promise<void> => {
+  if (process.env.PI_FABRIC_TEST_RESIDENT_DELAY_STAGE !== stage) return;
+  const ms = Number(process.env.PI_FABRIC_TEST_RESIDENT_DELAY_MS);
+  if (Number.isInteger(ms) && ms > 0 && ms <= 10_000) await delay(ms);
+};
+
 const atomicWrite = (filePath: string, value: unknown): void => {
   writeJsonAtomic(filePath, value, { space: 2 });
 };
@@ -625,6 +632,7 @@ class ResidentHost {
       if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
         throw new Error(`Fabric residency request ${requestId} was abandoned before commit`);
       }
+      await testResidentRequestDelay("before_commit");
       const commit = (id: string): void => commitResidentRequest(this.config.residencyRoot, command, id, this.hostId);
       if (command.operation === "spawn") {
         if (
@@ -673,7 +681,9 @@ class ResidentHost {
           completedAt: Date.now(),
         };
       } else if (command.operation === "cleanup") {
-        await this.agents.wait(command.id);
+        // Joining is preparation, not foregrounding or consumption: abandonment
+        // must preserve the background completion notification as well as files.
+        await this.agents.join(command.id);
         commit(command.id);
         await this.agents.cleanup(command.id, command.deleteBranch);
         fs.rmSync(path.join(this.#agentsPath, `${command.id}.json`), { force: true });
@@ -730,6 +740,7 @@ class ResidentHost {
         completedAt: Date.now(),
       };
     }
+    if (response.ok) await testResidentRequestDelay("after_commit");
     const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
     atomicWrite(responsePath, response);
     // An abandoned caller already left; clean late responses as well as processing files.

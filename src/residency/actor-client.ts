@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -7,6 +8,7 @@ import {
   abandonResidentRequest,
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
+  registerResidentCancellation,
   RESIDENT_HOST_FORMAT,
   residentHostStateNote,
   residentRoot,
@@ -84,6 +86,8 @@ export class ResidentActorClient {
     if (readJson<ResidentHostOwner>(this.#ownerPath)?.requestFence !== 1) {
       throw new Error("Root resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }
+    throwIfAborted(signal);
+    registerResidentCancellation(signal, this.#residencyDir, command);
     fs.mkdirSync(this.#requestsPath, { recursive: true });
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
     try {

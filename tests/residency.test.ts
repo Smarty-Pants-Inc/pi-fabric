@@ -609,6 +609,40 @@ describe("durable completion receipts", () => {
     });
   });
 
+  it("offline cleanup respects a pre-aborted public invocation before any deletion", async () => {
+    const state = await rootHarness("offline-cleanup-abort");
+    const seeded = await seedCompletion(state, "completed");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const controller = new AbortController(); controller.abort(new Error("owned cleanup cancellation"));
+    try {
+      await expect(client.cleanupAgent(seeded.id, false, controller.signal)).rejects.toThrow("owned cleanup cancellation");
+      expect(fs.existsSync(seeded.runDirectory)).toBe(true); expect(fs.existsSync(seeded.metadataPath)).toBe(true);
+      expect(fs.existsSync(path.join(state.config.residencyRoot, "decisions"))).toBe(false);
+    } finally { await client.close(); await state.participants.close(); }
+  });
+
+  it("offline cleanup filesystem failure after its fence retains known-ID uncertainty", async () => {
+    const state = await rootHarness("offline-cleanup-failure");
+    const seeded = await seedCompletion(state, "completed");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const original = fs.rmSync;
+    const failure = new Error("injected cleanup filesystem failure");
+    const remove = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) === seeded.runDirectory) throw failure;
+      return original(target, options);
+    });
+    try {
+      const error = await client.cleanupAgent(seeded.id).catch((error: Error) => error);
+      expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", id: seeded.id, operation: "cleanup", cause: failure });
+      expect((error as Error).message).toContain("Do not retry or reassign");
+      expect(fs.existsSync(seeded.metadataPath)).toBe(true);
+      const decisions = fs.readdirSync(path.join(state.config.residencyRoot, "decisions"));
+      expect(decisions).toHaveLength(1);
+      expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "decisions", decisions[0]!), "utf8")))
+        .toMatchObject({ state: "committed", id: seeded.id });
+    } finally { remove.mockRestore(); await client.close(); await state.participants.close(); }
+  });
+
   // review/astra on 3257dba, D1: the durable fallback cleanup keeps a possibly live worker's files.
   it("refuses the fallback cleanup of a durable run marked with an unresolved worker", async () => {
     const state = await rootHarness("unresolved-cleanup");
@@ -1586,6 +1620,19 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(fs.existsSync(runDirectory)).toBe(true);
 
       fs.writeFileSync(metadataPath, JSON.stringify({ ...metadata, worktreeGitRoot: source }));
+      const controller = new AbortController();
+      const originalRealpath = fs.realpathSync.native;
+      const validate = vi.spyOn(fs.realpathSync, "native").mockImplementation((...args) => {
+        const resolved = originalRealpath(...args);
+        controller.abort(new Error("cleanup aborted during worktree validation"));
+        return resolved;
+      });
+      try {
+        await expect(client.cleanupAgent(id, true, controller.signal)).rejects.toThrow("cleanup aborted during worktree validation");
+      } finally { validate.mockRestore(); }
+      expect(worktreeBranches(source)).toContain(branch);
+      expect(git(source, "branch", "--list", branch)).toContain(branch);
+      expect(fs.existsSync(runDirectory)).toBe(true); expect(fs.existsSync(metadataPath)).toBe(true);
       await expect(client.cleanupAgent(id, true)).resolves.toEqual({ cleaned: true });
       expect(worktreeBranches(source)).not.toContain(branch);
       expect(git(source, "branch", "--list", branch)).toBe("");

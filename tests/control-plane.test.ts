@@ -8,7 +8,7 @@ import {
   type MeshIdentity,
   type MeshStoreOptions,
 } from "../src/mesh/store.js";
-import { CONTROL_CLAIMS_POLICY_KEY, FabricControlPlane, type FabricControlPlaneOptions } from "../src/topology/control-plane.js";
+import { CONTROL_CLAIMS_POLICY_KEY, FabricControlPlane, type FabricControlCommand, type FabricControlPlaneOptions } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { removeHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -80,6 +80,8 @@ describe("FabricControlPlane", () => {
       const once = async (cancels: number) => {
         await vi.waitFor(() => expect(events().filter((event) => event.kind === "cancel")).toHaveLength(cancels));
         expect(events().filter((event) => event.kind !== "cancel")).toHaveLength(1);
+        expect(events().map((event) => (event.data as FabricControlCommand).destinationRemoteHost))
+          .toEqual(Array(events().length).fill("forge"));
       };
       return { sender, readMirroredOwner, command, ack, once, setLease: (value: typeof lease) => { lease = value; } };
     };
@@ -223,6 +225,94 @@ describe("FabricControlPlane", () => {
       await f.once(1);
     });
 
+    it.each(["forge", null] as const)("freezes cancellation destination %s while publication is blocked and ownership changes", async (routedRemoteHost) => {
+      const f = await setup();
+      if (routedRemoteHost === null) f.setLease(undefined);
+      const controller = new AbortController();
+      const publish = f.sender.mesh.publish.bind(f.sender.mesh);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      vi.spyOn(f.sender.mesh, "publish").mockImplementation(async (input) => {
+        if (input.topic === "fabric.control.command" && input.kind === "ask") await gate;
+        return publish(input);
+      });
+      const outcome = settle(f.sender.requestResult("host:owner", "agent:target", "ask",
+        { message: "private", data: { destinationRemoteHost: "ryzen2" } }, "identity:owner",
+        { signal: controller.signal, routedRemoteHost }));
+      try {
+        f.setLease({ remoteHost: "ryzen2", expiresAt: Date.now() + 60_000 });
+        controller.abort();
+        expect((await outcome).error?.message).toContain("cancelled");
+      } finally {
+        release();
+      }
+      const commands = () => f.sender.mesh.read({ topic: "fabric.control.command", limit: 100 });
+      await vi.waitFor(() => expect(commands()).toHaveLength(2));
+      expect(commands().map((event) => event.kind)).toEqual(["ask", "cancel"]);
+      expect(commands().map((event) => (event.data as FabricControlCommand).destinationRemoteHost))
+        .toEqual([routedRemoteHost, routedRemoteHost]);
+      expect((commands()[1]!.data as FabricControlCommand).cancelCommandId)
+        .toBe((commands()[0]!.data as FabricControlCommand).commandId);
+    });
+
+    it("refuses a known native routing snapshot when fresh admission finds a mirror", async () => {
+      const f = await setup();
+      const publish = vi.spyOn(f.sender.mesh, "publish");
+      await expect(f.sender.request("host:owner", "agent:target", "steer", {}, "identity:owner",
+        { routedRemoteHost: null })).rejects.toThrow("Fabric native routing is unavailable for agent:target; the routed owner changed; this attempt was not published.");
+      expect(publish).not.toHaveBeenCalled();
+    });
+
+    it("never retries a known native send into a newly mirrored owner", async () => {
+      const f = await setup();
+      f.setLease(undefined);
+      const outcome = settle(f.sender.request("host:owner", "agent:target", "followUp", {}, "identity:owner",
+        { routedRemoteHost: null }));
+      const { commandId } = await f.command();
+      f.setLease({ remoteHost: "ryzen2", expiresAt: Date.now() + 60_000 });
+      await f.sender.mesh.publish({ topic: "fabric.control.ack", kind: "rejected",
+        from: identity("identity:owner"), to: "host:sender", data: {
+          version: 1, commandId, targetId: "agent:target", accepted: false,
+          error: "native notRun", notRun: true,
+        } });
+      expect((await outcome).error?.message).toContain("Fabric native routing is unavailable");
+      const commands = f.sender.mesh.read({ topic: "fabric.control.command", limit: 100 });
+      expect(commands).toHaveLength(1);
+      expect(commands[0]!.data).toMatchObject({ destinationRemoteHost: null });
+    });
+
+    it("binds known native commands and ignores foreign stamped notRun after mirror takeover", async () => {
+      const f = await setup();
+      f.setLease(undefined);
+      let settled = false;
+      const outcome = f.sender.request("host:owner", "agent:target", "followUp", {}, "identity:owner",
+        { routedRemoteHost: null }).finally(() => { settled = true; });
+      const { commandId } = await f.command();
+      f.setLease({ remoteHost: "ryzen2", expiresAt: Date.now() + 60_000 });
+      await f.sender.mesh.put({
+        key: "topology/hosts/" + createHash("sha256").update("host:owner").digest("hex"),
+        identity: identity("host:owner"), value: { id: "host:owner", remoteHost: "ryzen2" },
+      });
+      const tail = vi.spyOn(f.sender.mesh, "tail");
+      await f.sender.mesh.publish({ topic: "fabric.control.ack", kind: "rejected",
+        from: identity("identity:owner"), to: "host:sender", data: {
+          version: 1, commandId, targetId: "agent:target", accepted: false,
+          error: "foreign notRun", notRun: true, bridge: { from: "ryzen2" },
+        } });
+      await vi.waitFor(() => expect(tail.mock.results.some((result) => result.type === "return" &&
+        result.value.events.some((event) => event.topic === "fabric.control.ack"))).toBe(true));
+      tail.mockRestore();
+      expect(settled).toBe(false);
+      await f.sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted",
+        from: identity("identity:owner"), to: "host:sender", data: {
+          version: 1, commandId, targetId: "agent:target", accepted: true, messageId: "native",
+        } });
+      await expect(outcome).resolves.toMatchObject({ messageId: "native" });
+      const events = f.sender.mesh.read({ topic: "fabric.control.command", limit: 100 });
+      expect(events).toHaveLength(1);
+      expect(events[0]!.data).toMatchObject({ destinationRemoteHost: null });
+    });
+
     it("does not start a watchdog or alter native ACKs when the read port returns no mirror", async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-native-"));
       roots.push(root);
@@ -235,6 +325,26 @@ describe("FabricControlPlane", () => {
         .resolves.toMatchObject({ acknowledged: true, messageId: "native" });
       await new Promise((resolve) => setTimeout(resolve, 60));
       expect(readMirroredOwner).toHaveBeenCalledTimes(1);
+      expect(sender.mesh.read({ topic: "fabric.control.command", limit: 10 })[0]!.data)
+        .toMatchObject({ destinationRemoteHost: null });
+    });
+
+    it("keeps legacy no-port commands unbound but refuses an unrevalidated explicit mirror", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-legacy-route-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const sender = plane(meshRoot, "host:sender");
+      const owner = plane(meshRoot, "host:owner");
+      sender.start(() => ({ accepted: false }));
+      owner.start(() => ({ accepted: true }));
+      await expect(sender.request("host:owner", "agent:target", "steer"))
+        .resolves.toMatchObject({ acknowledged: true });
+      expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })[0]!.data)
+        .not.toHaveProperty("destinationRemoteHost");
+      const publish = vi.spyOn(sender.mesh, "publish");
+      await expect(sender.request("host:owner", "agent:target", "steer", {}, "host:owner",
+        { routedRemoteHost: "forge" })).rejects.toThrow("Fabric mesh bridge routing to remote host forge is unavailable");
+      expect(publish).not.toHaveBeenCalled();
     });
 
     it("never adopts an unvalidated replacement link label", async () => {
@@ -286,7 +396,7 @@ describe("FabricControlPlane", () => {
         ] });
         removeHostLease(meshRoot, ownerId);
       };
-      const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000), {
+      const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000, { readCacheMs: 2_000 }), {
         enabled: true, hostId: "host:sender", rootId: "host:sender", identity: identity("host:sender"),
       });
       const readMirroredOwner = vi.fn((host: string, ownerIdentity: string | undefined, target: string) =>
@@ -294,7 +404,7 @@ describe("FabricControlPlane", () => {
       await advertise("forge");
       expect(readMirroredOwner(ownerId, ownerId, ownerId)).toEqual({ remoteHost: "forge", expiresAt });
       readMirroredOwner.mockClear();
-      const sender = plane(meshRoot, "host:sender", {}, { readMirroredOwner });
+      const sender = plane(meshRoot, "host:sender", { readCacheMs: 2_000 }, { readMirroredOwner });
       sender.start(() => ({ accepted: false }));
       const commands = () => writer.read({ topic: "fabric.control.command", limit: 100 });
       const command = async () => {
@@ -339,6 +449,35 @@ describe("FabricControlPlane", () => {
       await f.ack(commandId, "forge");
       await expect(outcome).resolves.toMatchObject({ acknowledged: true, messageId: "original-forge" });
       expect(f.commands().filter((event) => event.kind !== "cancel")).toHaveLength(1);
+    });
+
+    it.each([undefined, "forge"] as const)("does not adopt a replacement on bounded retry with routing snapshot %s", async (routedRemoteHost) => {
+      const f = await setup();
+      const outcome = f.sender.request(f.ownerId, f.ownerId, "followUp", {}, f.ownerId,
+        routedRemoteHost === undefined ? {} : { routedRemoteHost }).then(() => undefined, (error: Error) => error);
+      const { commandId } = await f.command();
+      await f.withdraw();
+      await f.advertise("ryzen2");
+      // Even a valid ORIGINAL rejection only authorizes retry to the original link.
+      await f.ack(commandId, "forge", false);
+      const error = await outcome;
+      expect(error?.message).toBe("Fabric mesh bridge routing to remote host forge is unavailable for X; the routed owner could not be revalidated; this attempt was not published.");
+      expect(error).not.toHaveProperty("notRun");
+      expect(f.commands()).toHaveLength(1);
+      expect(f.commands()[0]!.data).toMatchObject({ destinationRemoteHost: "forge" });
+    });
+
+    it("keeps the original destination on a healthy mirrored notRun retry", async () => {
+      const f = await setup();
+      const outcome = f.sender.request(f.ownerId, f.ownerId, "followUp");
+      const { commandId } = await f.command();
+      await f.ack(commandId, "forge", false);
+      await vi.waitFor(() => expect(f.commands()).toHaveLength(2));
+      const retry = f.commands().find((event) => (event.data as FabricControlCommand).commandId !== commandId)!;
+      expect(f.commands().map((event) => (event.data as FabricControlCommand).destinationRemoteHost))
+        .toEqual(["forge", "forge"]);
+      await f.ack((retry.data as FabricControlCommand).commandId, "forge");
+      await expect(outcome).resolves.toMatchObject({ acknowledged: true });
     });
 
     it("accepts the original Forge ACK committed before withdrawal but consumed after it", async () => {

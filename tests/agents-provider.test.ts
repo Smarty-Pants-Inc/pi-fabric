@@ -1727,6 +1727,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/session", thinking: "low" },
       }),
       "identity:owner",
+      { routedRemoteHost: null },
     );
   });
 
@@ -1742,8 +1743,10 @@ describe("AgentsProvider shared actor definitions", () => {
     const { provider } = setup([], [child], { request } as unknown as FabricControlPlane);
     for (const kind of ["steer", "followUp"] as const) {
       await expect(provider.routeMessage(child.id, `correct it (${kind})`, { key: "k" }, kind)).resolves.toMatchObject({ acknowledged: true });
-      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId);
+      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId, { routedRemoteHost: null });
     }
+    await expect(provider.stopParticipant(child.id)).resolves.toMatchObject({ acknowledged: true });
+    expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, "stop", {}, child.ownerIdentityId, { routedRemoteHost: null });
     const unsteerable = setup([], [{ ...child, capabilities: ["stop"] }], { request } as unknown as FabricControlPlane).provider;
     await expect(unsteerable.routeMessage(child.id, "no", undefined, "steer")).rejects.toThrow("does not support steer");
   });
@@ -1812,6 +1815,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "followUp",
       expect.objectContaining({ message: "queue" }),
       "identity:resident",
+      { routedRemoteHost: null },
     );
   });
 

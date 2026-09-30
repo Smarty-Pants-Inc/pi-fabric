@@ -37,6 +37,8 @@ export interface FabricControlCommand {
   targetId: string;
   operation: FabricControlOperation;
   replyTo: string;
+  /** Validated destination link; null binds native delivery, absent is legacy. */
+  destinationRemoteHost?: string | null;
   message?: string;
   data?: unknown;
   triggerTurn?: boolean;
@@ -131,6 +133,8 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
     typeof data.replyTo !== "string" ||
     typeof data.requestedAt !== "number" ||
     (data.deadlineAt !== undefined && typeof data.deadlineAt !== "number") ||
+    (data.destinationRemoteHost !== undefined && data.destinationRemoteHost !== null &&
+      typeof data.destinationRemoteHost !== "string") ||
     (data.operation === "cancel" && typeof data.cancelCommandId !== "string") ||
     (data.binding !== undefined &&
       (!isObject(data.binding) ||
@@ -189,6 +193,8 @@ export interface FabricControlInput {
 }
 
 export interface FabricControlRequestOptions {
+  /** Snapshot from the validated participant, never from message/data. */
+  routedRemoteHost?: string | null;
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -202,6 +208,7 @@ interface PendingControlRequest {
   ownerIdentityId: string;
   targetId: string;
   commandPublished: boolean;
+  readonly destinationRemoteHost?: string | null;
   cancellationRequested?: boolean;
   cancellationPublished?: boolean;
   mirroredOwner?: { remoteHost: string; expiresAt: number };
@@ -274,14 +281,19 @@ export class FabricControlPlane {
     operation: FabricControlOperation,
     input: FabricControlInput = {},
     ownerIdentityId = ownerHostId,
+    options: FabricControlRequestOptions = {},
   ): Promise<FabricControlResult> {
+    // Shared across the bounded retry: first admission may discover a mirror even
+    // for an older caller that supplied no routing snapshot.
+    const destination = { remoteHost: options.routedRemoteHost };
     const send = () => this.#requestAcceptance(
       ownerHostId,
       targetId,
       operation,
       input,
       ownerIdentityId,
-      { timeoutMs: this.#ackTimeoutMs },
+      { ...options, timeoutMs: options.timeoutMs ?? this.#ackTimeoutMs },
+      destination,
     );
     let sent;
     try {
@@ -340,6 +352,7 @@ export class FabricControlPlane {
     input: FabricControlInput,
     ownerIdentityId: string,
     options: FabricControlRequestOptions,
+    destination = { remoteHost: options.routedRemoteHost },
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
     if (!this.options.enabled) {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
@@ -352,7 +365,27 @@ export class FabricControlPlane {
     );
     const commandId = randomUUID();
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
-    const mirroredOwner = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, targetId);
+    let mirroredOwner: PendingControlRequest["mirroredOwner"];
+    const unavailable = (host: string): Error => new Error(
+      `Fabric mesh bridge routing to remote host ${host} is unavailable for ${targetId}; ` +
+        "the routed owner could not be revalidated; this attempt was not published.",
+    );
+    try {
+      mirroredOwner = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, targetId);
+    } catch (error) {
+      if (typeof destination.remoteHost === "string") throw unavailable(destination.remoteHost);
+      throw error;
+    }
+    if (typeof destination.remoteHost === "string" && mirroredOwner?.remoteHost !== destination.remoteHost) {
+      throw unavailable(destination.remoteHost);
+    }
+    if (destination.remoteHost === null && mirroredOwner) {
+      throw new Error(`Fabric native routing is unavailable for ${targetId}; the routed owner changed; this attempt was not published.`);
+    }
+    if (destination.remoteHost === undefined) {
+      destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
+    }
+    const destinationRemoteHost = destination.remoteHost;
     let pendingRequest: PendingControlRequest;
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
       const pending: PendingControlRequest = {
@@ -362,6 +395,7 @@ export class FabricControlPlane {
         ownerIdentityId,
         targetId,
         commandPublished: false,
+        ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
         ...(mirroredOwner ? { mirroredOwner: { ...mirroredOwner } } : {}),
       };
       pendingRequest = pending;
@@ -398,6 +432,7 @@ export class FabricControlPlane {
           targetId,
           operation,
           replyTo: this.options.hostId,
+          ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
           ...(input.message !== undefined ? { message: input.message } : {}),
           ...(input.data !== undefined ? { data: input.data } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
@@ -514,6 +549,8 @@ export class FabricControlPlane {
         operation: "cancel",
         cancelCommandId: commandId,
         replyTo: this.options.hostId,
+        ...(pending.destinationRemoteHost !== undefined
+          ? { destinationRemoteHost: pending.destinationRemoteHost } : {}),
         requestedAt,
         deadlineAt: requestedAt + this.#ackTimeoutMs,
       } satisfies FabricControlCommand,
@@ -586,10 +623,13 @@ export class FabricControlPlane {
       event.data.targetId !== pending.targetId ||
       event.from.id !== pending.ownerIdentityId ||
       // A validated mirror's answer authority survives record withdrawal/replacement.
-      // Only requests without that capture use the legacy/native metadata selector.
+      // Known native requests require an unstamped ACK, regardless of later metadata.
+      // Only unbound legacy requests use the mutable metadata selector.
       !(pending.mirroredOwner
         ? isObject(event.data.bridge) && event.data.bridge.from === pending.mirroredOwner.remoteHost
-        : this.#bridgeMatches(pending.ownerHostId, event.data))
+        : pending.destinationRemoteHost === null
+          ? !Object.prototype.hasOwnProperty.call(event.data, "bridge")
+          : this.#bridgeMatches(pending.ownerHostId, event.data))
     ) {
       return;
     }

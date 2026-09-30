@@ -516,6 +516,7 @@ class ResidentHost {
       subscription.delivery,
       { message, data: event, triggerTurn: subscription.triggerTurn },
       target.ownerIdentityId,
+      { routedRemoteHost: target.remoteHost ?? null },
     );
   }
 

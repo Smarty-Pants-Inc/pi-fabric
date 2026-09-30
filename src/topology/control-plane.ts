@@ -262,6 +262,7 @@ export class FabricControlPlane {
       path.join(mesh.root, "control-seen", createHash("sha256").update(options.hostId).digest("hex").slice(0, 32)),
       mesh.maxEventBytes,
       mesh.maxReadEvents,
+      { lockProtocol: mesh.lockProtocol },
     );
     // Replay the retained log from its current generation. Durable claims
     // recover unclaimed commands and make interrupted outcomes explicit without re-execution.

@@ -2217,13 +2217,49 @@ describe("AgentsProvider global actors", () => {
   it("edits instructions for project and global scopes", async () => {
     const { provider, actors, globalActors } = setup();
     const actor = (await provider.invoke("create", createRequest, context)) as { id: string };
-    await provider.invoke("setInstructions", { id: actor.id, instructions: "Be brief." }, context);
+    await provider.invoke("setInstructions", { id: actor.id, instructions: "Be brief.", replace: true }, context);
     expect(actors.instructions(actor.id)).toBe("Be brief.");
 
     await provider.invoke("create", { ...createRequest, name: "templar", scope: "global" }, context);
     const globalId = globalActors.resolve("templar")!.id;
-    await provider.invoke("setInstructions", { id: globalId, instructions: "Template brief.", scope: "global" }, context);
+    await provider.invoke("setInstructions", { id: globalId, instructions: "Template brief.", scope: "global", replace: true }, context);
     expect(globalActors.resolve("templar")!.instructions).toBe("Template brief.");
+  });
+
+  // smarty-dev#2340: a >80% shrink is refused unless replace: true.
+  it("guards setInstructions against a >80% shrink in project and global scopes", async () => {
+    const { provider, actors, globalActors } = setup();
+    const long = "x".repeat(100);
+    const actor = (await provider.invoke("create", createRequest, context)) as { id: string };
+    await provider.invoke("create", { ...createRequest, name: "templar", scope: "global" }, context);
+    const globalId = globalActors.resolve("templar")!.id;
+    const read = {
+      project: () => actors.instructions(actor.id),
+      global: () => globalActors.resolve("templar")!.instructions,
+    };
+    for (const scope of ["project", "global"] as const) {
+      const id = scope === "global" ? globalId : actor.id;
+      const set = (instructions: string, extra: Record<string, unknown> = {}) =>
+        provider.invoke("setInstructions", { id, instructions, scope, ...extra }, context);
+      await set(long, { replace: true });
+      expect(read[scope]()).toBe(long);
+      // Refused: 19 chars is more than 80% shorter than 100.
+      const error = await set("y".repeat(19)).then(() => undefined, (e: Error) => e);
+      expect(error?.message).toMatch(/19/);
+      expect(error?.message).toMatch(/100/);
+      expect(error?.message).toMatch(/replace: true/);
+      expect(read[scope]()).toBe(long);
+      // Exact 80% boundary (20 of 100) is allowed.
+      await set("z".repeat(20));
+      expect(read[scope]()).toBe("z".repeat(20));
+      // Normal edit allowed.
+      await set("z".repeat(18) + "ab");
+      expect(read[scope]()).toBe("z".repeat(18) + "ab");
+      // Explicit replace allows a large shrink.
+      await set(long, { replace: true });
+      await set("tiny", { replace: true });
+      expect(read[scope]()).toBe("tiny");
+    }
   });
 
   it("removes a global template via scoped remove", async () => {

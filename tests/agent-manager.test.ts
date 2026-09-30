@@ -420,6 +420,50 @@ describe("AgentManager", () => {
     expect(await manager.wait(queued.id)).toMatchObject({ status: "completed" });
   });
 
+  it.each([false, true])("detaches an aborted queued wait without consuming and delivers completion exactly once (deferred: %s)", async (deferred) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-wait-"));
+    roots.push(root);
+    const complete = vi.fn();
+    const consumed = vi.fn();
+    const deferConsumption = vi.fn();
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      onBackgroundComplete: complete, onResultConsumed: consumed,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "HANG", transport: "process" });
+    const queued = await manager.spawn({ task: "LIVE_WITH_PROGRESS", transport: "process" });
+    expect(queued.status).toBe("queued");
+    const controller = new AbortController();
+    const wait = manager.wait(queued.id, {
+      signal: controller.signal,
+      ...(deferred ? { deferConsumption } : {}),
+    });
+    let timer: NodeJS.Timeout | undefined;
+    const observation = Promise.race([wait, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("queued observation remained blocked")), 100);
+    })]);
+    controller.abort(new Error("Main stopped waiting for queued run"));
+    try {
+      await expect(observation).rejects.toThrow("Main stopped waiting for queued run");
+    } finally {
+      clearTimeout(timer);
+    }
+    expect(manager.status(queued.id).status).toBe("queued");
+    expect(consumed.mock.calls.filter(([id]) => id === queued.id)).toHaveLength(0);
+    expect(deferConsumption).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+    await manager.stop(first.id);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledWith(expect.objectContaining({
+      id: queued.id, status: "completed", text: expect.stringMatching(/^live attempt \d+ complete$/),
+    })), { timeout: 10_000 });
+    expect(consumed.mock.calls.filter(([id]) => id === queued.id)).toHaveLength(0);
+    expect(deferConsumption).not.toHaveBeenCalled();
+    expect(await manager.wait(queued.id)).toMatchObject({ status: "completed" });
+    expect(consumed.mock.calls.filter(([id]) => id === queued.id)).toHaveLength(1);
+    expect(complete.mock.calls.filter(([result]) => result.id === queued.id)).toHaveLength(1);
+  });
+
   it("runs a worker through the direct process transport", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1877,6 +1921,32 @@ describe("AgentManager", () => {
     expect(manager.status(handle.id).status).toBe("running");
     await expect(completion).resolves.toMatch(/^live attempt \d+ complete$/);
   }, 15_000);
+
+  it.each([false, true])("cancels only a Main wait observation and preserves completion (already aborted: %s)", async alreadyAborted => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-wait-"));
+    roots.push(root);
+    const consumed = vi.fn();
+    let resolveCompletion!: (text: string) => void;
+    const completion = new Promise<string>(resolve => { resolveCompletion = resolve; });
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      onBackgroundComplete: result => resolveCompletion(result.text),
+      onResultConsumed: consumed,
+    });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "LIVE_WITH_PROGRESS", transport: "process" });
+    const controller = new AbortController();
+    if (alreadyAborted) controller.abort(new Error("Main ceiling hit"));
+    const wait = manager.wait(handle.id, { timeoutMs: 60_000, signal: controller.signal });
+    if (!alreadyAborted) controller.abort(new Error("Main ceiling hit"));
+    // A bounded assertion lets the regression fail promptly on the unfixed base.
+    const observation = Promise.race([wait, new Promise((_, reject) => setTimeout(() => reject(new Error("observation remained blocked")), 100))]);
+    await expect(observation).rejects.toThrow("Main ceiling hit");
+    expect(manager.status(handle.id).status).toBe("running");
+    expect(consumed).not.toHaveBeenCalled();
+    await expect(completion).resolves.toMatch(/^live attempt \d+ complete$/);
+    expect(consumed).not.toHaveBeenCalled();
+  });
 
   it("surfaces the run-log tail when a worker exits without a terminal result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));

@@ -161,7 +161,11 @@ const withKeyLock = async <T>(mesh: ParticipantFileMesh, file: string, operation
   try {
     return operation();
   } finally {
-    fs.rmSync(lock, { recursive: true, force: true });      // only its holder removes a live lock
+    // Unlinking the owner before rmdir leaves an empty canonical directory that a successor
+    // can replace on POSIX. Detach our whole lock first; recursive cleanup touches only it.
+    const tombstone = `${lock}.${randomUUID()}.dead`;
+    fs.renameSync(lock, tombstone);
+    fs.rmSync(tombstone, { recursive: true, force: true });
   }
 };
 

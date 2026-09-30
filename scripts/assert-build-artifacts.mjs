@@ -31,6 +31,7 @@ const stable = [
 ];
 const lazy = [
   "core/pattern-kill.js",
+  "lifecycle/reload-target-profile.js",
   "coordination/unverified-ids.js",
   "agents/claude-cli.js",
   "agents/compact-control.js",

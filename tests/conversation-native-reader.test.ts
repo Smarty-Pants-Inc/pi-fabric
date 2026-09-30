@@ -476,6 +476,67 @@ describe("native conversation reader — paging and rollover", () => {
     expect(JSON.stringify(transcript.messages.at(-1))).toContain("message 499");
   });
 
+  it.each([false, true])("reloads replacement coverage without old payload ghosts (follow=%s)", (follow) => {
+    const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
+    temporaryDirectories.push(directory);
+    const file = path.join(directory, "events.jsonl");
+    const records = (prefix: string, padding: number) => Array.from({ length: 180 }, (_, index) => ({
+      type: "message_end",
+      message: { role: "user", content: `${prefix}${index}:${"x".repeat(padding)}`, timestamp: index },
+    }));
+    for (const padding of [3900, 4000, 4100]) {
+      fs.writeFileSync(file, jsonl(records("old", 4000)));
+      const reader = new NativeConversationReader();
+      const input = source({ eventsFile: file });
+      const initial = reader.read(input, follow);
+      const before = reader.loadOlder()!;
+      expect(before.messages.length).toBeGreaterThan(initial.messages.length);
+      const replacement = `${file}.new`;
+      fs.writeFileSync(replacement, jsonl(records("new", padding)));
+      fs.renameSync(replacement, file);
+      const after = reader.read(input, follow);
+      expect(after.messages.length).toBeGreaterThanOrEqual(before.messages.length);
+      expect(after.messages.every((message) => message.role === "user" &&
+        typeof message.content === "string" && message.content.startsWith("new"))).toBe(true);
+      expect(JSON.stringify(after.messages)).not.toContain("old");
+      expect(after.hasNewer).toBe(false);
+      reader.clear();
+    }
+  });
+
+  it.each([false, true])("preserves loaded session pages but drops old run coverage on rollover (follow=%s)", (follow) => {
+    const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
+    temporaryDirectories.push(directory);
+    const session = writeSession(directory, [sessionHeader, ...Array.from({ length: 160 }, (_, index) => ({
+      ...entryBase(`s${index}`, index ? `s${index - 1}` : null),
+      type: "message", message: { role: "user", content: `session-${index}:${"s".repeat(4000)}`, timestamp: index },
+    }))]);
+    const events = path.join(directory, "run-one.jsonl");
+    fs.writeFileSync(events, jsonl(Array.from({ length: 160 }, (_, index) => ({
+      type: "message_end", message: { role: "user", content: `old-run-${index}:${"x".repeat(4000)}`, timestamp: 1000 + index },
+    }))));
+    const reader = new NativeConversationReader();
+    const input = source({ sessionFile: session, eventsFile: events });
+    reader.read(input, follow);
+    const before = reader.loadOlder(2)!;
+    const sessionMessages = before.messages.filter((message) => message.timestamp < 1000);
+    expect(sessionMessages).toHaveLength(160);
+    fs.writeFileSync(`${events}.new`, jsonl(Array.from({ length: 160 }, (_, index) => ({
+      type: "message_end", message: { role: "user", content: `replacement-${index}:${"x".repeat(4000)}`, timestamp: 1000 + index },
+    }))));
+    fs.renameSync(`${events}.new`, events);
+    const replaced = reader.read(input, follow);
+    expect(replaced.messages.filter((message) => message.timestamp < 1000)).toEqual(sessionMessages);
+    expect(JSON.stringify(replaced.messages)).not.toContain("old-run");
+    const next = path.join(directory, "run-two.jsonl");
+    const nextMessage = { role: "user", content: "next-run", timestamp: 9999 };
+    fs.writeFileSync(next, jsonl([{ type: "message_end", message: nextMessage }]));
+    const rolled = reader.read({ ...input, eventsFile: next }, follow);
+    expect(rolled.messages).toEqual([...sessionMessages, nextMessage]);
+    expect(rolled.hasMore).toBe(false);
+    reader.clear();
+  });
+
   it("loads giant single records whole without clipping fields", () => {
     const directory = makeWorkspace();
     const huge = "y".repeat(1024 * 1024);

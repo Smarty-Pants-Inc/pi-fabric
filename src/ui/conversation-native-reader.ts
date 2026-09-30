@@ -337,6 +337,8 @@ interface FileWindow {
   /** Size observed at the last read; tail === size means followed to EOF. */
   size: number;
   hasOlder: boolean;
+  /** Whole records loaded, independent of byte offsets or replay pruning. */
+  loadedRecords?: number;
   /** Set when the file exists but could not be read. */
   unavailable: boolean;
 }
@@ -793,6 +795,7 @@ export class NativeConversationReader {
         device: opened.device,
         inode: opened.inode,
         hasOlder: page.start > 0,
+        loadedRecords: page.records.length,
         unavailable: false,
       });
     } catch (error) {
@@ -828,6 +831,7 @@ export class NativeConversationReader {
       this.#applyRecords(kind, page.records, false);
       this.#rememberRange(kind, page);
       window.head = page.start;
+      window.loadedRecords = (window.loadedRecords ?? 0) + page.records.length;
       window.hasOlder = page.start > 0;
       window.unavailable = false;
       return true;
@@ -858,6 +862,7 @@ export class NativeConversationReader {
       this.#applyRecords(kind, page.records, true);
       this.#rememberRange(kind, page);
       window.tail = Math.max(window.tail, page.end);
+      window.loadedRecords = (window.loadedRecords ?? 0) + page.records.length;
       return true;
     } finally {
       closeQuietly(opened.descriptor);
@@ -868,8 +873,17 @@ export class NativeConversationReader {
     const window = this.#windows.get(kind);
     if (!window || window.device === undefined ||
       (window.device === device && window.inode === inode)) return false;
+    const loadedRecords = window.loadedRecords ?? 0;
     if (kind === "events") this.#resetEventsState();
     else this.#resetPaths(this.#sourceId, this.#status, this.#sessionFile, this.#eventsFile);
+    // Terminal compaction preserves record order/count, not byte offsets. A
+    // smaller tail page must not discard history the user already loaded.
+    // Re-read coverage from the new inode; never keep old parsed payloads, as
+    // an arbitrary replacement may contain entirely different records.
+    const filePath = kind === "events" ? this.#eventsFile : this.#sessionFile;
+    while (filePath && (this.#windows.get(kind)?.loadedRecords ?? 0) < loadedRecords) {
+      if (!this.#loadOlderFile(kind, filePath)) break;
+    }
     return true;
   }
 

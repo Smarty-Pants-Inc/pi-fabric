@@ -246,6 +246,51 @@ describe("worker run log", () => {
     } finally { fs.closeSync(fd); }
   });
 
+  it.each([false, true])("retains loaded older native pages after large terminal replacement (follow=%s)", (follow) => {
+    const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
+    directories.push(directory);
+    const file = path.join(directory, "events.jsonl");
+    const events = Array.from({ length: 160 }, (_, index) => {
+      const content = [{ type: "text", text: `body-${index}:${"x".repeat(4000)}` }];
+      const toolCallId = `call-${index}`;
+      return [
+        { type: "tool_execution_start", toolCallId, toolName: "bash", args: {} },
+        { type: "tool_execution_end", toolCallId, toolName: "bash", result: { content }, isError: false },
+        { type: "message_end", message: { role: "toolResult", toolCallId, toolName: "bash", content, isError: false, timestamp: index + 1 } },
+      ];
+    }).flat();
+    const text = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+    fs.writeFileSync(file, text);
+    const source = { id: "loaded", status: "completed", eventsFile: file };
+    const reader = new NativeConversationReader();
+    const initial = reader.read(source, follow);
+    const before = reader.loadOlder(2)!;
+    expect(before.messages.length).toBeGreaterThan(initial.messages.length);
+    expect(before.hasMore).toBe(true);
+    const inode = fs.statSync(file).ino;
+    const descriptor = fs.openSync(file, "r");
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.compacted).toBe(160);
+      expect(outcome.afterBytes).toBeGreaterThan(256 * 1024);
+      expect(fs.statSync(file).ino).not.toBe(inode);
+      expect(fs.readFileSync(descriptor, "utf8")).toBe(text);
+      const compacted = fs.readFileSync(file, "utf8");
+      const types = (value: string) => value.trimEnd().split("\n").map((line) => JSON.parse(line).type);
+      expect(types(compacted)).toEqual(types(text));
+      const after = reader.read(source, follow);
+      expect(after.messages.length).toBeGreaterThanOrEqual(before.messages.length);
+      expect(after.messages.slice(-before.messages.length)).toEqual(before.messages);
+      expect(after.hasMore).toBe(true);
+      expect(after.hasNewer).toBe(false);
+      expect(after.revision).toBeGreaterThan(before.revision);
+    } finally {
+      fs.closeSync(descriptor);
+      reader.clear();
+    }
+  });
+
   it.each([false, true])("retains the only accepted result when canonical envelopes exceed the unchanged cap (isError=%s)", (isError) => {
     // Success is the exact review sequence: end4194304 / canonical4194344.
     const { events, end } = capEvents("x".repeat(4194157 + Number(isError)), isError);

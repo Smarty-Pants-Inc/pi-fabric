@@ -137,7 +137,7 @@ describe("worker run log", () => {
 
   it.each(["content", "details", "isError", "toolName", "partial", "duplicate", "reused"])("preserves full ends with unavailable/different/ambiguous canonical (%s)", (difference) => {
     const { events, end } = capEvents("main-kept result", false, { opaque: { elided: true }, terminate: true });
-    const message = { ...(events[3]!.message as Record<string, unknown>) };
+    const message = { ...((events[3]! as Record<string, unknown>).message as Record<string, unknown>) };
     if (difference === "content") message.content = [{ type: "text", text: "different" }];
     if (difference === "details") message.details = { changed: true };
     if (difference === "isError") message.isError = true;

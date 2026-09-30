@@ -607,7 +607,7 @@ class ResidentHost {
       // An idle durable subscription is not in-flight work. Keep its registry and parked
       // queue on disk, finish live runs, then release ownership for the reloaded Main.
       const running = this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
-        this.actors.listOwned().some(actor => actor.status === "running");
+        this.actors.inFlightCount() > 0;
       if (!running) this.onIdle();
       return;
     }

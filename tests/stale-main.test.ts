@@ -123,11 +123,25 @@ describe("stale Main task admission", () => {
     });
     managers.push(current);
     const resumedRun = vi.spyOn(current, "run");
+    // Force the Windows interleaving: recording an out message is not settlement.
+    let releasePublication!: () => void;
+    const publication = new Promise<void>(resolve => { releasePublication = resolve; });
+    const publish = mesh.publish.bind(mesh);
+    vi.spyOn(mesh, "publish").mockImplementation(async event => {
+      if (event.topic === "fabric.actor.output") await publication;
+      return publish(event);
+    });
     const resumed = new ActorManager("retry", identity, mesh, meshConfig, current, () => {}, options);
     actorManagers.push(resumed);
     await vi.waitFor(() => expect(resumed.messages(actor.id).some(message => message.direction === "out" && message.runId)).toBe(true));
+    expect(queueFile()).toBeDefined(); // held until mesh publication + cleanup finish
+    releasePublication();
+    await vi.waitFor(() => {
+      expect(queueFile()).toBeUndefined();
+      expect(resumed.status(actor.id).status).toBe("idle");
+    });
     expect(resumedRun).toHaveBeenCalledTimes(1);
-    expect(queueFile()).toBeUndefined();
+    expect(resumed.messages(actor.id).filter(message => message.direction === "out" && message.runId)).toHaveLength(1);
   });
 
   it("adds a notice, not a refusal, after the last critical release; reports once per active", async () => {

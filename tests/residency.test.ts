@@ -301,6 +301,38 @@ describe.skipIf(process.platform === "win32")("resident host start timeout", () 
 // Actual historical bytes are an opt-in input, not a copy of the candidate with a field deleted.
 // TEST_LEGACY_FABRIC_RELEASE=/absolute/older/release bunx vitest run tests/residency.test.ts -t 'release recovery'
 describe("resident host release recovery regressions", () => {
+  it("does not retire while queued public status hides an active actor drain", async () => {
+    const state = await rootHarness("queued-active-drain");
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    const configPath = path.join(state.config.residencyRoot, "config.json");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify(state.config));
+    // Publication can say queued, and the worker completed, while retention/queue cleanup
+    // still awaits. The live drain, not either public status, fences shutdown.
+    const owned = vi.spyOn(ActorManager.prototype, "listOwned").mockReturnValue([
+      { status: "queued", residency: "durable" },
+    ] as ReturnType<ActorManager["listOwned"]>);
+    const agents = vi.spyOn(AgentManager.prototype, "listForUi").mockReturnValue([]);
+    const drain = vi.spyOn(ActorManager.prototype, "inFlightCount").mockReturnValue(1);
+    const controller = new AbortController();
+    const host = runResidentHostFromConfigPath(configPath, controller.signal);
+    try {
+      await waitFor(() => fs.existsSync(ownerPath));
+      const checked = agents.mock.calls.length;
+      fs.writeFileSync(configPath, JSON.stringify({ ...state.config, fabricExtensionPath: "replacement" }));
+      await waitFor(() => agents.mock.calls.length > checked);
+      expect(drain).toHaveBeenCalled();
+      expect(fs.existsSync(ownerPath)).toBe(true);
+      drain.mockReturnValue(0);
+      await host;
+      expect(fs.existsSync(ownerPath)).toBe(false);
+    } finally {
+      controller.abort(); await host;
+      owned.mockRestore(); agents.mockRestore(); drain.mockRestore();
+      await state.participants.close();
+    }
+  });
+
   it("refuses a provenance-less live owner when idle cannot be proved", async () => {
     const state = await rootHarness("legacy-unknown");
     fs.mkdirSync(state.config.residencyRoot, { recursive: true });

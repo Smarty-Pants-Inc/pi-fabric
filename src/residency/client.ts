@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { authenticateLegacyOwner, legacyProcessStopped, signalLegacyOwner } from "./legacy-retirement.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -226,7 +227,7 @@ export class ResidencyClient {
       const deadline = Date.now() + startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
       do {
         if (this.#closed) throw new Error("Fabric residency client is closed");
-        if (!existing.fabricExtensionPath) this.#retireLegacyOwner(existing);
+        if (!existing.fabricExtensionPath) await this.#retireLegacyOwner(existing);
         if (Date.now() >= deadline) throw new Error("Fabric resident host is draining for release reload; retry after its running work finishes");
         await delay(STATUS_POLL_MS);
         existing = this.#liveOwner();
@@ -295,40 +296,73 @@ export class ResidencyClient {
     }
   }
 
-  #retireLegacyOwner(owner: ResidentHostOwner): void {
+  async #retireLegacyOwner(owner: ResidentHostOwner): Promise<void> {
     if (this.#retiringLegacyToken === owner.token) return;
-    // A legacy host has no release-drain protocol. Refuse until fresh, complete state proves
-    // an idle boundary; SIGTERM during a run would cancel it. Unreadable/unknown state is busy.
+    const config = this.options.config;
+    const identity = authenticateLegacyOwner(config, owner);
+    if (!identity || legacyProcessStopped(identity)) return; // Never resume somebody else's stop.
+    const fencePath = path.join(config.residencyRoot, "retirement.lock");
+    const fenceToken = randomUUID();
+    let claimed = false, suspended = false, retired = false;
     try {
-      for (const directory of [this.#requestsPath, path.join(this.options.config.residencyRoot, "processing")]) {
+      // Serialize independent Main clients. An orphaned fence is unknown, not permission to kill.
+      const descriptor = fs.openSync(fencePath, "wx", 0o600);
+      claimed = true;
+      try { fs.writeFileSync(descriptor, JSON.stringify({ token: fenceToken, pid: process.pid })); }
+      finally { fs.closeSync(descriptor); }
+      if (!signalLegacyOwner(config, owner, identity, "SIGSTOP")) return;
+      suspended = true;
+      const deadline = Date.now() + 1000;
+      while (!legacyProcessStopped(identity)) {
+        if (Date.now() >= deadline) return;
+        await delay(10);
+      }
+      // SIGSTOP is the admission fence. Only now inspect authoritative state: participants
+      // can lag a running actor by a second. Busy means abandon this attempt and resume;
+      // the existing activation must finish, never be cancelled for a release reload.
+      for (const directory of [this.#requestsPath, path.join(config.residencyRoot, "processing")]) {
         if (fs.readdirSync(directory).some(entry => entry.endsWith(".json"))) return;
       }
       const participants = this.options.participants.list({ scope: "lineage", includeStale: true, fresh: true })
         .filter(participant => participant.ownerHostId === this.hostId);
       if (participants.some(participant => participant.stale || participant.actorRun ||
         participant.status === "running" || participant.status === "queued")) return;
-      const actorRoots = new Set([this.options.config.actorRoot,
-        this.options.config.sessionActorRoot ?? path.join(this.options.config.actorRoot, this.options.config.sessionId)]);
+      const actorRoots = new Set([config.actorRoot,
+        config.sessionActorRoot ?? path.join(config.actorRoot, config.sessionId)]);
+      const registeredActors = new Set<string>();
       for (const root of actorRoots) {
         const registryPath = path.join(root, "actors.json");
         if (!fs.existsSync(registryPath)) continue;
-        const registry = readJson<{ actors?: Array<{ id: string; rootId?: string; residency?: string; status?: string }> }>(registryPath);
+        const registry = readJson<{ actors?: Array<{ id: string; rootId?: string; residency?: string; status?: string; inFlightRun?: unknown }> }>(registryPath);
         if (!Array.isArray(registry?.actors)) return;
         for (const actor of registry.actors) {
-          if (actor.rootId !== this.options.config.rootId || actor.residency !== "durable") continue;
+          if (actor.rootId !== config.rootId || actor.residency !== "durable") continue;
+          registeredActors.add(actor.id);
+          if (!["idle", "stopped"].includes(actor.status ?? "") || actor.inFlightRun) return;
           const participant = participants.find(candidate => candidate.id === actor.id);
           if (!participant || !["idle", "stopped"].includes(participant.status)) return;
+          // Includes in-flight/overflow items even before the running registry write lands.
+          for (const entry of fs.readdirSync(path.join(root, actor.id)).filter(name => name.startsWith("queue-") && name.endsWith(".json"))) {
+            const queue = readJson<{ items?: unknown[] }>(path.join(root, actor.id, entry));
+            if (!Array.isArray(queue?.items) || queue.items.length) return;
+          }
         }
       }
+      if (participants.some(participant => participant.kind === "actor" && !registeredActors.has(participant.id))) return;
       for (const entry of fs.readdirSync(this.#agentsPath).filter(entry => entry.endsWith(".json"))) {
-        // A worker's terminal status alone can precede a resume/retry. Require host settlement.
         if (!this.settledAgent(entry.slice(0, -5))) return;
       }
-      const current = this.#liveOwner();
-      if (current?.pid !== owner.pid || current.token !== owner.token || current.fabricExtensionPath) return;
-      process.kill(owner.pid, "SIGTERM");
-      this.#retiringLegacyToken = owner.token;
-    } catch { /* No proof of idle: keep refusing and retrying, never kill unknown live work. */ }
+      // Do not resume an idle legacy host into a SIGTERM handler: mesh callbacks could win
+      // that race. Terminate WHILE fenced. No live/queued work exists; events arriving after
+      // the fence stay in the durable mesh and the replacement replays them exactly once.
+      if (!legacyProcessStopped(identity)) return;
+      retired = signalLegacyOwner(config, owner, identity, "SIGKILL");
+      if (retired) this.#retiringLegacyToken = owner.token;
+    } catch { /* Unknown state is busy. */ }
+    finally {
+      if (suspended && !retired) signalLegacyOwner(config, owner, identity, "SIGCONT");
+      if (claimed && readJson<{ token?: string }>(fencePath)?.token === fenceToken) fs.rmSync(fencePath, { force: true });
+    }
   }
 
   #refreshPiModels(): void {

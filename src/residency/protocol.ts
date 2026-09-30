@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { registerCancellationEffect } from "../async-settlement.js";
+import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
 import { readFileRetrying } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -137,7 +137,7 @@ export class ResidentOutcomeUnknownError extends Error {
   readonly operation: ResidentCommand["operation"];
   readonly ownerHostId: string | undefined;
 
-  constructor(command: ResidentCommand, decision: ResidentRequestDecision | undefined, cause: unknown) {
+  constructor(command: ResidentCommand, decision: ResidentRequestDecision | undefined, cause: unknown, signal?: AbortSignal) {
     const id = decision?.id ?? ("id" in command ? command.id : undefined);
     const kind = ["spawn", "foreground", "cleanup"].includes(command.operation) ? "agent" : "actor";
     // Guest runtimes may preserve only message, so the classification and IDs live there too.
@@ -161,6 +161,7 @@ export class ResidentOutcomeUnknownError extends Error {
       ...(id ? { id } : {}),
       ...(decision?.ownerHostId ? { ownerHostId: decision.ownerHostId } : {}),
     });
+    recordResidentOutcome(signal, this.residentOutcome);
   }
 }
 
@@ -180,9 +181,9 @@ export const registerResidentCancellation = (
       decision = abandonResidentRequest(path.join(residencyRoot, "requests"), path.join(residencyRoot, "responses"), command.requestId);
     } catch (error) {
       try { decision = readResidentRequestDecision(residencyRoot, command.requestId); } catch { /* unreadable fence */ }
-      return new ResidentOutcomeUnknownError(command, decision, error);
+      return new ResidentOutcomeUnknownError(command, decision, error, signal);
     }
-    if (decision.state === "committed") return committedOutcome = new ResidentOutcomeUnknownError(command, decision, reason);
+    if (decision.state === "committed") return committedOutcome = new ResidentOutcomeUnknownError(command, decision, reason, signal);
     return undefined;
   });
 };

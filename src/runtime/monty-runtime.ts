@@ -197,12 +197,12 @@ export class MontyRuntime implements FabricKernelRuntime {
       }
       workerPid = undefined;
       await settleWithin([...tasks, ...(feed ? [feed] : [])], 250);
-      if (result && interrupted) preserveCancellationOutcome(result, hostAbort.signal);
+      if (result) preserveCancellationOutcome(result, hostAbort.signal, interrupted);
     }
     for (const text of Object.values(partial)) if (text) logs.push(text);
     if (truncated) logs.push("[Pi Fabric log output truncated]");
     if (result!.terminationReason === "completed" && executionDeadline.reached) {
-      return executionDeadline.timeoutResult(logs);
+      return preserveCancellationOutcome(executionDeadline.timeoutResult(logs), hostAbort.signal, true);
     }
     return result!;
   }

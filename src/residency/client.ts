@@ -268,7 +268,7 @@ export class ResidencyClient {
       throw new ResidentOutcomeUnknownError({
         format: RESIDENT_HOST_FORMAT, operation: "createActor", requestId: response.requestId,
         rootId: this.options.config.rootId, request, createdAt: Date.now(),
-      }, { requestId: response.requestId, state: "committed", id: response.actor!.id, ownerHostId: this.hostId }, error);
+      }, { requestId: response.requestId, state: "committed", id: response.actor!.id, ownerHostId: this.hostId }, error, signal);
     });
     return response.actor;
   }
@@ -298,7 +298,7 @@ export class ResidencyClient {
       throw new ResidentOutcomeUnknownError({
         format: RESIDENT_HOST_FORMAT, operation: "spawn", requestId: response.requestId,
         rootId: this.options.config.rootId, request, createdAt: Date.now(),
-      }, { requestId: response.requestId, state: "committed", id: response.handle!.id, ownerHostId: this.hostId }, error);
+      }, { requestId: response.requestId, state: "committed", id: response.handle!.id, ownerHostId: this.hostId }, error, signal);
     });
     return response.handle;
   }
@@ -502,7 +502,7 @@ export class ResidencyClient {
       try { decision = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unknown fence */ }
       if (decision?.state === "abandoned") throw error;
       // Partial cleanup or an unreadable fence is not a proved rejection either.
-      throw new ResidentOutcomeUnknownError(command, decision, error);
+      throw new ResidentOutcomeUnknownError(command, decision, error, signal);
     }
   }
 
@@ -542,9 +542,9 @@ export class ResidencyClient {
         // No proven abandonment: never report a safe-to-retry rejection.
         let known;
         try { known = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unreadable fence */ }
-        throw new ResidentOutcomeUnknownError(command, known, fenceError);
+        throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);
       }
-      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error);
+      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
       throw error;
     }
   }

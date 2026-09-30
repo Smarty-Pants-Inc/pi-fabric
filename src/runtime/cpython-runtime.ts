@@ -182,7 +182,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         options.signal?.removeEventListener("abort", abort);
         const interrupted = result.terminationReason !== "completed" || hostAbort.signal.aborted || hostTasks.size > 0 || unawaitedHostCalls;
         if (!hostAbort.signal.aborted) hostAbort.abort(new Error(result.error ?? "CPython execution ended"));
-        if (interrupted) preserveCancellationOutcome(result, hostAbort.signal);
+        preserveCancellationOutcome(result, hostAbort.signal, interrupted);
         channel?.destroy();
         ipc?.server.close();
         child.stdout?.destroy();
@@ -203,7 +203,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         for (const text of partialLogs) if (text) logs.push(text);
         if (truncated) logs.push("[Pi Fabric log output truncated]");
         if (result.terminationReason === "completed" && executionDeadline.reached) {
-          result = executionDeadline.timeoutResult([]);
+          result = preserveCancellationOutcome(executionDeadline.timeoutResult([]), hostAbort.signal, true);
         }
         resolve({ ...result, logs });
       };

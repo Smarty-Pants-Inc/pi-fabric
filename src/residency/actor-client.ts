@@ -116,9 +116,9 @@ export class ResidentActorClient {
       } catch (fenceError) {
         let known;
         try { known = readResidentRequestDecision(this.#residencyDir, command.requestId); } catch { /* unreadable fence */ }
-        throw new ResidentOutcomeUnknownError(command, known, fenceError);
+        throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);
       }
-      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error);
+      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
       throw error;
     }
   }

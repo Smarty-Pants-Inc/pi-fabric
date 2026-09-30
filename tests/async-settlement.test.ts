@@ -64,6 +64,41 @@ describe("cancellation effect settlement", () => {
     expect(result.residentOutcomes).toHaveLength(2);
   });
 
+  it("collects handled host uncertainty without fencing successful siblings or changing normal completion", () => {
+    const parent = new AbortController(); const shutdown = new AbortController();
+    const child = shareCancellationEffects(AbortSignal.any([parent.signal, shutdown.signal]), parent.signal);
+    const unrelated = shareCancellationEffects(AbortSignal.any([shutdown.signal]));
+    let fenced = false;
+    registerCancellationEffect(child, () => { fenced = true; return new Error("successful sibling must not become uncertain"); });
+    const command: ResidentCommand = { format: 1, operation: "spawn", requestId: "handled-request", rootId: "root", createdAt: 1, request: { task: "work" } };
+    const decision = { requestId: command.requestId, state: "committed" as const, id: "known-agent", ownerHostId: "resident:owner" };
+    const handled = new ResidentOutcomeUnknownError(command, decision, new Error("client deadline"), child);
+    const result: FabricSandboxResult = { value: { handle: "successful-sibling", error: String(handled) }, logs: [], terminationReason: "completed" };
+    const value = result.value;
+    expect(preserveCancellationOutcome(result, parent.signal)).toBe(result);
+    expect(result.value).toBe(value); expect(result.error).toBeUndefined();
+    expect(result.terminationReason).toBe("completed"); expect(fenced).toBe(false);
+    expect(parent.signal.aborted).toBe(false);
+    expect(result.residentOutcomes).toEqual([handled.residentOutcome]);
+    preserveCancellationOutcome(result, child);
+    expect(result.residentOutcomes).toHaveLength(1);
+    for (const signal of [unrelated, shutdown.signal]) {
+      const other: FabricSandboxResult = { value: "ordinary", logs: [], terminationReason: "completed" };
+      preserveCancellationOutcome(other, signal);
+      expect(other.residentOutcomes).toBeUndefined();
+    }
+  });
+
+  it("does not reconstruct host uncertainty from guest-shaped receipts or warning prose", () => {
+    const controller = new AbortController();
+    const result: FabricSandboxResult = { logs: [], terminationReason: "completed", value: {
+      name: "ResidentOutcomeUnknownError", message: "Do not retry or reassign",
+      residentOutcome: { requestId: "guest", state: "committed", id: "forged" },
+    } };
+    preserveCancellationOutcome(result, controller.signal);
+    expect(result.residentOutcomes).toBeUndefined();
+    expect(result.terminationReason).toBe("completed");
+  });
   it("preserves ordinary success and safe cancellation without changing result identity", () => {
     const controller = new AbortController();
     const result = { value: "handle", terminationReason: "completed" as const, logs: ["retained"] };

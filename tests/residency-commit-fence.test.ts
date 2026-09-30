@@ -11,6 +11,10 @@ import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { CPythonRuntime } from "../src/runtime/cpython-runtime.js";
+import { MontyRuntime } from "../src/runtime/monty-runtime.js";
+import { NodeProcessRuntime } from "../src/runtime/node-process-runtime.js";
+import type { FabricHostCall, FabricSandboxOptions } from "../src/runtime/kernel.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -498,11 +502,15 @@ const assertReceipts = (error: string | undefined, decisions: ReturnType<typeof 
 // Capture the tool actually registered by src/index.ts, including execute's
 // real formatter and production shell decorator. Only unrelated session/bootstrap
 // hooks are stubbed; registry, runtime, provider, clients and mutations are real.
-const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, main: ReturnType<typeof mainProvider>, timeoutMs = 5_000) => {
+const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, main: ReturnType<typeof mainProvider>, timeoutMs = 5_000, engine: ReceiptEngine = "quickjs", mainTimeoutMs?: number) => {
+  const python = engine === "cpython" || engine === "monty";
   const config = normalizeFabricConfig({ fullCodeMode: true,
-    executor: { runtime: "quickjs", resultFormat: "json", timeoutMs, maxOutputChars: 50_000, memoryLimitBytes: 256 * 1024 * 1024 },
+    executor: { kernel: python ? "python" : "typescript", pythonRuntime: python ? engine : "monty",
+      runtime: engine === "node" ? "node-process" : engine === "bun" ? "bun-process" : "quickjs",
+      resultFormat: "json", timeoutMs, maxOutputChars: 50_000, memoryLimitBytes: 256 * 1024 * 1024 },
     agents: { timeoutMs },
   });
+  if (mainTimeoutMs !== undefined) config.executor.mainMaxTimeoutMs = mainTimeoutMs;
   const execution = new FabricExecutionService(main.registry, config);
   vi.spyOn(FabricState.prototype, "bootstrapped", "get").mockReturnValue(true);
   vi.spyOn(FabricState.prototype, "config", "get").mockReturnValue(config);
@@ -522,6 +530,7 @@ const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, m
   expect(tool.name).toBe("fabric_exec");
   const context = { ...main.context.extensionContext, cwd: state.root, hasUI: false,
     sessionManager: { getSessionId: () => "round4", getSessionFile: () => undefined },
+    ...(mainTimeoutMs !== undefined ? { mode: "rpc" } : {}),
   } as unknown as FabricInvocationContext["extensionContext"];
   let sequence = 0;
   return async (code: string, signal?: AbortSignal) => {
@@ -600,6 +609,227 @@ describe("round 4 registered fabric_exec committed-output priority", { timeout: 
   });
 });
 
+describe("round 6 registered fabric_exec handled resident uncertainty", { timeout: 25_000 }, () => {
+  it.each(engines)("%s collects handled client-deadline receipts on normal completion, delivers priority output and reconciles without duplicates", async (engine) => {
+    const state = await harness(false, undefined, 700); const main = mainProvider(state);
+    const original = ActorDirectory.prototype.create;
+    vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+      const actor = await original.apply(this, args);
+      // Real commitment wins, but the client's own exchange deadline expires
+      // while the executor still has time. No outer abort or terminal guest error.
+      if (actor.name.startsWith("handled-unknown")) await delay(1_000);
+      return actor;
+    });
+    const descriptor = { name: "drain", description: "Wait for resident publication", risk: "read" as const,
+      inputSchema: { type: "object", properties: {}, additionalProperties: false } };
+    main.registry.register({ name: "probe", description: "resident exchange synchronization",
+      async list() { return [descriptor]; }, async describe() { return descriptor; },
+      async invoke() { await waitFor(() => entries(state.residencyRoot, "processing").length === 0); return true; },
+    });
+    let artifactPath: string | undefined;
+    try {
+      const run = await registeredExecution(state, main, 10_000, engine);
+      const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
+      const python = engine === "cpython" || engine === "monty";
+      const calls = ["handled-success", "handled-unknown-one", "handled-unknown-two"].map(name =>
+        publicCall(engine, "create", { ...requestArgs(state, "create"), name }));
+      const code = python
+        ? `mapped = []\n${calls.map(call => `try:\n    handle = ${call}\n    mapped.append({"ok": True, "handle": handle})\nexcept Exception as error:\n    mapped.append({"ok": False, "error": str(error)})\nawait tools.call(ref="probe.drain", args={})`).join("\n")}\nprint("guest-logs-start" + "log line; " * 3000 + "guest-logs-end")\nreturn {"mapped": mapped, "supplement": "result-start" + "result detail! " * 2000 + "result-end"}`
+        : `const mapped = []; ${calls.map(call => `mapped.push(...(await Promise.allSettled([${call.replace(/^await /, "")}])).map(result => result.status === "fulfilled" ? {ok:true,handle:result.value} : {ok:false,error:String(result.reason)})); await tools.call({ref:"probe.drain",args:{}});`).join("\n")}
+          console.log("guest-logs-start" + "log line; ".repeat(3000) + "guest-logs-end");
+          return {mapped,supplement:"result-start" + "result detail! ".repeat(2000) + "result-end"};`;
+      const result = await run(code);
+      const collected = await executed.mock.results[0]!.value;
+      const text = visibleText(result);
+      artifactPath = /saved to: ([^\n]+)\]/.exec(text)?.[1];
+      const decisions = decisionsFor(state); expect(decisions).toHaveLength(3);
+      const mapped = collected.value.mapped;
+      expect(collected.success, collected.error).toBe(true);
+      expect(collected.trace.outcome).toBe("succeeded");
+      expect(result.isError).not.toBe(true);
+      expect(mapped).toEqual([expect.objectContaining({ ok: true, handle: expect.objectContaining({ id: expect.any(String) }) }),
+        expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") }),
+        expect.objectContaining({ ok: false, error: expect.stringContaining("ResidentOutcomeUnknownError") })]);
+      const successful = decisions.find(decision => decision.id === mapped[0].handle.id)!;
+      const uncertain = decisions.filter(decision => decision !== successful);
+      const reconciled = [];
+      for (const { id } of decisions) {
+        await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));
+        expect(state.participants.list({ scope: "lineage" }).filter(participant => participant.id === id)).toHaveLength(1);
+        const reconciliation = await run(python
+          ? `return {"status": await agents.actorStatus(id="${id}"), "stop": await agents.stop(id="${id}")}`
+          : `return {status:await agents.actorStatus({id:"${id}"}),stop:await agents.stop({id:"${id}"})};`);
+        expect(reconciliation.isError).not.toBe(true);
+        const record = JSON.parse(visibleText(reconciliation));
+        expect(record.status.id).toBe(id); expect(record.stop).toMatchObject({ queued: true, acknowledged: true });
+        await waitFor(() => state.participants.get(id)?.status === "stopped");
+        const stopped = await run(python ? `return await agents.actorStatus(id="${id}")` : `return await agents.actorStatus({id:"${id}"});`);
+        expect(JSON.parse(visibleText(stopped))).toMatchObject({ id, status: "stopped" });
+        reconciled.push(record);
+      }
+      expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(3);
+      if (process.env.FABRIC_RESIDENT_OUTPUT_EVIDENCE) {
+        const prefix = `${process.env.FABRIC_RESIDENT_OUTPUT_EVIDENCE}.handled-${engine}`;
+        fs.writeFileSync(`${prefix}.visible.txt`, text);
+        fs.writeFileSync(`${prefix}.json`, JSON.stringify({ visibleChars: text.length, success: collected.success,
+          receipts: collected.residentOutcomes, mapped, decisions, reconciled }, null, 2));
+        if (artifactPath) fs.copyFileSync(artifactPath, `${prefix}.full-output.txt`);
+      }
+      expect(collected.residentOutcomes).toHaveLength(2);
+      for (const decision of uncertain) expect(collected.residentOutcomes).toContainEqual(expect.objectContaining({
+        requestId: decision.requestId, id: decision.id, ownerHostId: decision.ownerHostId, state: "committed",
+      }));
+      expect(text.length).toBeLessThanOrEqual(50_000);
+      expect(text.startsWith("ResidentOutcomeUnknownError:")).toBe(true);
+      const firstLog = text.indexOf("Guest logs:"); expect(firstLog).toBeGreaterThan(0);
+      const priority = text.slice(0, firstLog);
+      assertReceipts(priority, uncertain);
+      expect(priority).toContain("Resident receipts (2)");
+      expect(priority).not.toContain(successful.id);
+      for (const decision of uncertain) for (const field of ["requestId", "id"]) {
+        expect(priority.split(decision[field])).toHaveLength(2);
+      }
+      expect(artifactPath).toBeDefined();
+      const full = fs.readFileSync(artifactPath!, "utf8");
+      expect(full).toContain("log line; ".repeat(3000)); expect(full).toContain("result detail! ".repeat(2000));
+    } finally {
+      if (artifactPath) fs.rmSync(path.dirname(artifactPath), { recursive: true, force: true });
+      await main.close(); await state.close();
+    }
+  });
+});
+describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 25_000 }, () => {
+  const runtimes = { quickjs: QuickJsRuntime, cpython: CPythonRuntime, monty: MontyRuntime, node: NodeProcessRuntime, bun: NodeProcessRuntime };
+  for (const engine of engines) for (const tail of ["runtime-return", "finalization"] as const) for (const ending of ["on-time", "Main", "ordinary"] as const) {
+    it(`${engine} ${ending} ${tail} preserves confirmed handles or committed receipts without reassignment`, async () => {
+      const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+      const startedAt = Date.now(); const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
+      let finalizedOutcome: string | undefined;
+      main.registry.register({ name: "finalization-probe", description: "hold normal invocation finalization",
+        async list() { return []; }, async describe() { return undefined; }, async invoke() { throw new Error("unused"); },
+        async invocationEnded(_id, outcome) {
+          finalizedOutcome = outcome;
+          if (tail === "finalization" && ending !== "on-time") { await delay(20); clock.mockReturnValue(startedAt + 60_000); }
+        },
+      });
+      try {
+        const run = await registeredExecution(state, main, 5_000, engine, ending === "Main" ? 5_000 : 10_000);
+        const execute = runtimes[engine].prototype.execute;
+        const guest = vi.spyOn(runtimes[engine].prototype, "execute").mockImplementation(async function (this: QuickJsRuntime | CPythonRuntime | MontyRuntime | NodeProcessRuntime, code: string, hostCall: FabricHostCall, options: FabricSandboxOptions) {
+          const completed = await execute.call(this, code, hostCall, options);
+          // Guest and real native runtime have completed with all calls settled;
+          // hold the remaining runtime->service publication boundary separately.
+          if (tail === "runtime-return" && ending !== "on-time") { await delay(20); clock.mockReturnValue(startedAt + 60_000); }
+          return completed;
+        });
+        const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
+        const result = await run(`return ${publicCall(engine, "create", requestArgs(state, "create"))}${engine === "cpython" || engine === "monty" ? "" : ";"}`);
+        clock.mockRestore();
+        const completed = await guest.mock.results[0]!.value;
+        const collected = await executed.mock.results[0]!.value;
+        const decisions = decisionsFor(state); expect(decisions).toHaveLength(1);
+        const decision = decisions[0]!; const text = visibleText(result);
+        expect(finalizedOutcome).toBe(tail === "runtime-return" && ending !== "on-time" ? "failed" : "succeeded");
+        expect(completed.terminationReason).toBe("completed");
+        expect(completed.value.id).toBe(decision.id);
+        expect(completed.residentOutcomes).toBeUndefined();
+        if (ending === "on-time") {
+          expect(collected.success).toBe(true); expect(result.isError).not.toBe(true);
+          expect(JSON.parse(text)).toMatchObject({ id: decision.id });
+          expect(collected.residentOutcomes).toBeUndefined(); expect(text).not.toContain("Do not retry or reassign");
+        } else {
+          expect(collected.success).toBe(false); expect(collected.value).toBeUndefined();
+          expect(collected.trace.outcome).toBe("timed_out"); expect(result.isError).toBe(true);
+          expect(collected.residentOutcomes).toEqual([expect.objectContaining({ requestId: decision.requestId,
+            id: decision.id, ownerHostId: decision.ownerHostId, state: "committed" })]);
+          expect(text.startsWith("ResidentOutcomeUnknownError:")).toBe(true);
+          assertReceipts(text, decisions); expect(text.length).toBeLessThanOrEqual(50_000);
+          expect(text).toContain(ending === "Main" ? "MainExecutionCeilingError" : "Execution timed out after 5000ms");
+          if (ending === "ordinary") expect(text).not.toContain("MainExecutionCeilingError");
+        }
+        // The caller reconciles the original writer, never launches a replacement.
+        const python = engine === "cpython" || engine === "monty";
+        const reconciled = await run(python
+          ? `return {"status": await agents.actorStatus(id="${decision.id}"), "stop": await agents.stop(id="${decision.id}")}`
+          : `return {status:await agents.actorStatus({id:"${decision.id}"}),stop:await agents.stop({id:"${decision.id}"})};`);
+        expect(reconciled.isError).not.toBe(true);
+        expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { acknowledged: true } });
+        await waitFor(() => state.participants.get(decision.id)?.status === "stopped");
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
+        if (process.env.FABRIC_RESIDENT_OUTPUT_EVIDENCE) {
+          const prefix = `${process.env.FABRIC_RESIDENT_OUTPUT_EVIDENCE}.${tail}-${engine}-${ending}`;
+          fs.writeFileSync(`${prefix}.visible.txt`, text);
+          fs.writeFileSync(`${prefix}.json`, JSON.stringify({ success: collected.success, receipts: collected.residentOutcomes,
+            guestCompleted: completed.terminationReason, finalizedOutcome, decisions, reconciliation: JSON.parse(visibleText(reconciled)) }, null, 2));
+        }
+      } finally { clock.mockRestore(); await main.close(); await state.close(); }
+    });
+  }
+
+  for (const engine of ["cpython", "monty"] as const) for (const ending of ["Main", "ordinary"] as const) {
+    it(`${engine} ${ending} native teardown after confirmed guest completion settles every committed receipt`, async () => {
+      const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+      const startedAt = Date.now(); const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
+      let crossed = false; const closed: Promise<void>[] = [];
+      const crossDeadline = () => { crossed = true; clock.mockReturnValue(startedAt + 60_000); };
+      if (engine === "cpython") {
+        const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+        vi.mocked(childProcess.spawn).mockImplementation(((...args: Parameters<typeof actual.spawn>) => {
+          const child = actual.spawn(...args);
+          if (Array.isArray(args[1]) && args[1].includes("-I")) {
+            closed.push(new Promise<void>(resolve => child.once("close", () => resolve())));
+            const kill = child.kill.bind(child);
+            vi.spyOn(child, "kill").mockImplementation(signal => {
+              // finish() has accepted the successful result and run its initial
+              // receipt pass; only process teardown now crosses the deadline.
+              const killed = kill(signal); crossDeadline(); return killed;
+            });
+          }
+          return child;
+        }) as typeof actual.spawn);
+      } else {
+        const native = await import("@pydantic/monty/node"); const create = native.Monty.create.bind(native.Monty);
+        vi.spyOn(native.Monty, "create").mockImplementation(async options => {
+          const pool = await create(options); const close = pool.close.bind(pool);
+          vi.spyOn(pool, "close").mockImplementation(async () => { await close(); crossDeadline(); });
+          return pool;
+        });
+      }
+      try {
+        const run = await registeredExecution(state, main, 5_000, engine, ending === "Main" ? 5_000 : 10_000);
+        const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
+        const result = await run(`handle = ${publicCall(engine, "create", requestArgs(state, "create"))}\nprint("guest completed with " + handle["id"])\nreturn handle`);
+        clock.mockRestore();
+        await Promise.all(closed);
+        const collected = await executed.mock.results[0]!.value;
+        const decisions = decisionsFor(state); expect(decisions).toHaveLength(1);
+        const decision = decisions[0]!; const text = visibleText(result);
+        expect(crossed).toBe(true); expect(collected.logs.join("\n")).toContain(`guest completed with ${decision.id}`);
+        expect(collected.success).toBe(false); expect(collected.value).toBeUndefined();
+        expect(collected.trace.outcome).toBe("timed_out"); expect(result.isError).toBe(true);
+        expect(collected.residentOutcomes).toEqual([expect.objectContaining({ requestId: decision.requestId,
+          id: decision.id, ownerHostId: decision.ownerHostId, state: "committed" })]);
+        expect(text.startsWith("ResidentOutcomeUnknownError:")).toBe(true); assertReceipts(text, decisions);
+        expect(text).toContain(ending === "Main" ? "MainExecutionCeilingError" : "Execution timed out after 5000ms");
+        if (ending === "ordinary") expect(text).not.toContain("MainExecutionCeilingError");
+        // Stop injecting the crossed clock into later reconciliation invocations.
+        vi.restoreAllMocks(); vi.mocked(childProcess.spawn).mockReset();
+        const reconcile = await registeredExecution(state, main, 5_000, engine);
+        const reconciled = await reconcile(`return {"status": await agents.actorStatus(id="${decision.id}"), "stop": await agents.stop(id="${decision.id}")}`);
+        expect(reconciled.isError).not.toBe(true);
+        expect(JSON.parse(visibleText(reconciled))).toMatchObject({ status: { id: decision.id }, stop: { acknowledged: true } });
+        await waitFor(() => state.participants.get(decision.id)?.status === "stopped");
+        expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
+        if (process.env.FABRIC_RESIDENT_OUTPUT_EVIDENCE) {
+          const prefix = `${process.env.FABRIC_RESIDENT_OUTPUT_EVIDENCE}.native-tail-${engine}-${ending}`;
+          fs.writeFileSync(`${prefix}.visible.txt`, text);
+          fs.writeFileSync(`${prefix}.json`, JSON.stringify({ success: collected.success, receipts: collected.residentOutcomes,
+            logs: collected.logs, crossed, decisions, reconciliation: JSON.parse(visibleText(reconciled)) }, null, 2));
+        }
+      } finally { clock.mockRestore(); await Promise.all(closed); await main.close(); await state.close(); }
+    });
+  }
+});
 describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_000 }, () => {
   for (const caller of ["main", "nested"] as const) for (const before of [true, false]) {
     it(`${caller} retry cancellation ${before ? "before" : "after"} commitment preserves the accepted removal obligation`, async () => {

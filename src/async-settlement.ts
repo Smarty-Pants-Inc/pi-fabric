@@ -13,8 +13,24 @@ const effectsFor = (signal: AbortSignal): Set<CancellationEffect> => {
   return effects;
 };
 
+// Actual host-originated uncertainties, independent of terminal cancellation.
+// Successful calls install cancellation effects but never enter this ledger.
+const residentOutcomes = new WeakMap<AbortSignal, Map<string, FabricResidentOutcomeReceipt>>();
+const outcomesFor = (signal: AbortSignal): Map<string, FabricResidentOutcomeReceipt> => {
+  let outcomes = residentOutcomes.get(signal);
+  if (!outcomes) residentOutcomes.set(signal, outcomes = new Map());
+  return outcomes;
+};
+
+export const recordResidentOutcome = (signal: AbortSignal | undefined, receipt: FabricResidentOutcomeReceipt): void => {
+  if (signal) outcomesFor(signal).set(receipt.requestId, receipt);
+};
+
 export const shareCancellationEffects = (signal: AbortSignal, parent?: AbortSignal): AbortSignal => {
-  if (parent) cancellationEffects.set(signal, effectsFor(parent));
+  if (parent) {
+    cancellationEffects.set(signal, effectsFor(parent));
+    residentOutcomes.set(signal, outcomesFor(parent));
+  }
   return signal;
 };
 
@@ -54,23 +70,29 @@ const residentOutcomeReceipts = (error: Error): FabricResidentOutcomeReceipt[] =
  * Mutate in place because QuickJS returns from try before its async finally runs.
  * Completed runs become failures when teardown found unawaited resident work,
  * even if its reply arrives during the grace window before cleanup aborts.
- * Ordinary successful replies keep their handles and are not uncertainty.
+ * Host-originated uncertainty survives even when the guest handles it and
+ * completes normally. Ordinary successful replies keep their handles and are
+ * not uncertainty unless the enclosing execution is interrupted.
  */
 export const preserveCancellationOutcome = <T extends Pick<FabricSandboxResult, "value" | "terminationReason" | "error" | "residentOutcomes">>(
   result: T,
   signal: AbortSignal,
   interrupted = signal.aborted,
 ): T => {
-  if (!interrupted) return result;
-  const reason = new Error(result.error ?? "Fabric guest ended before its host calls settled");
-  const outcome = cancellationError(signal, reason);
-  if (outcome !== reason) {
-    result.value = undefined;
-    result.error = outcome.message;
-    const receipts = residentOutcomeReceipts(outcome);
-    if (receipts.length > 0) result.residentOutcomes = [...new Map(receipts.map(receipt => [receipt.requestId, receipt])).values()];
-    if (result.terminationReason === "completed") result.terminationReason = "runtime_error";
+  if (interrupted) {
+    const reason = new Error(result.error ?? "Fabric guest ended before its host calls settled");
+    const outcome = cancellationError(signal, reason);
+    if (outcome !== reason) {
+      result.value = undefined;
+      result.error = outcome.message;
+      for (const receipt of residentOutcomeReceipts(outcome)) recordResidentOutcome(signal, receipt);
+      if (result.terminationReason === "completed") result.terminationReason = "runtime_error";
+    }
   }
+  const receipts = residentOutcomes.get(signal);
+  if (receipts?.size) result.residentOutcomes = [...new Map([
+    ...(result.residentOutcomes ?? []), ...receipts.values(),
+  ].map(receipt => [receipt.requestId, receipt])).values()];
   return result;
 };
 

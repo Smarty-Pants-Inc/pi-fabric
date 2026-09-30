@@ -20,8 +20,12 @@ const literal = new RegExp(`(?:#issuecomment-\\d{9,10}|(?<![\\w-])(?:session:${u
 // of these words followed by whitespace, ':' or '=' (JSON key quoting allowed).
 const shaWord = /\b(?:sha|commit|head|base|revision|rev)(?:["']?[ \t]*[:=][ \t]*["']?|[ \t]+)([0-9a-f]{7,40})(?![\w-])/gi;
 const shaTick = /(?<!`)`([0-9a-f]{7,40})`(?!`)/gi;
-const issueRepository = "[a-z0-9][a-z0-9-]*/[a-z0-9_.-]+";
-const issueReference = new RegExp(`(?<![\\w./-])(?:https://github\\.com/(${issueRepository})/(?:issues|pull)/(\\d+)|(${issueRepository})#(\\d+)|#(\\d{3,}))(?![\\w-])`, "gi");
+const issueOwner = "[a-z0-9][a-z0-9-]*";
+const issueRepository = `${issueOwner}/[a-z0-9_.-]+`;
+// C# / F# language tokens are not repository-only references. Like bare #N,
+// repository-only references need at least three digits to avoid prose noise.
+const issueRepoOnly = "(?![cf]#)[a-z0-9][a-z0-9_.-]*";
+const issueReference = new RegExp(`(?<![\\w./-])(?:https://github\\.com/(${issueRepository})/(?:issues|pull)/(\\d+)|(${issueRepository})#(\\d+)|(${issueRepoOnly})#(\\d{3,})|#(\\d{3,}))(?![\\w-])`, "gi");
 // Read text can contain raw git / PID / JSON API output. Search only the
 // outgoing candidates, not every token in a potentially multi-megabyte read.
 const readMatcher = (id: Identifier): RegExp => {
@@ -29,11 +33,16 @@ const readMatcher = (id: Identifier): RegExp => {
   const end = "(?![\\w-])";
   let token: string;
   if (id.kind === "issue") {
-    // A bare reference has no repository identity. A bare read can establish
-    // either qualified form; a qualified read must preserve its repository.
-    const repository = id.repository?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") ?? issueRepository;
+    // Qualified reads preserve owner/repo; repo-only reads match that repo
+    // under any owner, while bare reads have no repository identity at all.
+    const escape = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const name = id.repository?.split("/").at(-1);
+    const repository = id.repository?.includes("/") ? escape(id.repository)
+      : name ? `${issueOwner}/${escape(name)}` : issueRepository;
+    const repoOnly = id.value.length >= 3 && (!name || !/^[cf]$/i.test(name))
+      ? `|${name ? escape(name) : issueRepoOnly}#` : "";
     const bare = id.value.length >= 3 ? "|#" : "";
-    return new RegExp(`(?<![\\w./-])(?:https://github\\.com/${repository}/(?:issues|pull)/|${repository}#${bare})${id.value}(?![\\w-])`, "i");
+    return new RegExp(`(?<![\\w./-])(?:https://github\\.com/${repository}/(?:issues|pull)/|${repository}#${repoOnly}${bare})${id.value}(?![\\w-])`, "i");
   }
   if (id.kind === "session") token = `(?:session:)?${id.value}`;
   else if (id.kind === "comment") return new RegExp(`(?:#issuecomment-|${start}(?:comment[ \\t:=#-]*)?)${id.value}${end}`, "i");
@@ -90,8 +99,8 @@ const candidates = (text: string): Identifier[] => {
   // Ordinary legacy identifiers need no extra repository-pattern scan.
   if (text.includes("/") || /#\d{3}/.test(text)) {
     for (const match of text.matchAll(issueReference)) {
-      const repository = match[1] ?? match[3];
-      const value = match[2] ?? match[4] ?? match[5]!;
+      const repository = match[1] ?? match[3] ?? match[5];
+      const value = match[2] ?? match[4] ?? match[6] ?? match[7]!;
       add({ kind: "issue", value, ...(repository ? { repository: repository.toLowerCase() } : {}), display: `${repository ?? ""}#${value}`, at: match.index });
     }
   }

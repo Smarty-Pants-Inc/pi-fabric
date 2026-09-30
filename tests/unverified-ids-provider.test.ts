@@ -51,8 +51,12 @@ const read = (manager: SessionManager, text: string, toolName = "read") => manag
   role: "toolResult", toolCallId: "read-call", toolName, content: [{ type: "text", text }],
   isError: false, timestamp: 1,
 });
-const harness = (surface: typeof surfaces[number], manager = session()) => {
+const harness = (surface: typeof surfaces[number], manager = session(), routeLimit = false) => {
   const sent: string[] = [];
+  const accept = (text: string) => {
+    if (routeLimit && text.includes("unverified ids:")) throw new Error("Mesh event exceeds 262144 bytes");
+    sent.push(text);
+  };
   const ack = { queued: true as const, messageId: "ack", routed: "main" as const };
   let provider;
   if (surface.startsWith("legacy.")) {
@@ -61,16 +65,16 @@ const harness = (surface: typeof surfaces[number], manager = session()) => {
       identity: { id: "session:sender", name: "Sender", kind: "main" },
     } as Ports[1], {} as Ports[2], {
       id: "main", local: true, matches: (id: string) => id === "main",
-      deliverAgent: ({ message }: { message: string }) => { sent.push(message); return ack; },
+      deliverAgent: ({ message }: { message: string }) => { accept(message); return ack; },
     } as unknown as Ports[3], { get: () => undefined } as unknown as Ports[4], undefined, {} as Ports[6]);
   } else if (surface.startsWith("hosted.")) {
     provider = createAgentsProvider(createAgentServiceClient(async (_action, args) => {
-      sent.push(String(args.message)); return ack;
+      accept(String(args.message)); return ack;
     }, { steer: true, followUp: true }));
   } else {
     type Ports = ConstructorParameters<typeof MeshProvider>;
     provider = new MeshProvider({ publish: async (args: { text: string }) => {
-      sent.push(args.text); return { sequence: 1, ...args };
+      accept(args.text); return { sequence: 1, ...args };
     } } as unknown as Ports[0], { id: "session:sender", name: "Sender", kind: "main" }, {} as Ports[2]);
   }
   const context = invocation(manager);
@@ -215,6 +219,76 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
     expect(h.sent).toEqual([text]);
   });
 
+  it("round-1 omission: explains the missing recipient marker and logs each occurrence", async () => {
+    const log = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const h = harness(surface, session(), true);
+      const text = "o/pi-fabric#179";
+      const omitted = "unverified ids: o/pi-fabric#179 (recipient marker omitted: message at the route size limit)";
+      expect(await h.send(text)).toHaveProperty("notice", omitted);
+      expect(await h.send(text)).toHaveProperty("notice", omitted);
+      expect(h.sent).toEqual([text, text]); // One unmarked delivery per occurrence.
+      expect(log).toHaveBeenCalledTimes(2);
+      const rows = log.mock.calls.map(([line]) => JSON.parse(String(line).slice("[pi-fabric] ".length)));
+      const route = surface === "mesh.publish" ? surface : `agents.${surface.split(".")[1]}`;
+      expect(rows).toEqual([
+        { event: "recipient-marker-omitted", route, count: expect.any(Number) },
+        { event: "recipient-marker-omitted", route, count: rows[0].count + 1 },
+      ]);
+      const normal = harness(surface);
+      expect(await normal.send(text)).toHaveProperty("notice", "unverified ids: o/pi-fabric#179");
+      expect(await normal.send("Ready")).not.toHaveProperty("notice");
+      expect(log).toHaveBeenCalledTimes(2); // No count/log for normal marked or no-ID delivery.
+    } finally { log.mockRestore(); }
+  });
+
+  it("round-1 repository-only: flags unread references and clears finalized reads", async () => {
+    for (const text of ["smarty-dev#2175", "pi-fabric#179", "x#123"]) {
+      const h = harness(surface);
+      const notice = `unverified ids: ${text}`;
+      expect(await h.send(text)).toHaveProperty("notice", notice);
+      expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+      read(h.manager, text);
+      expect(await h.send(text)).not.toHaveProperty("notice");
+      expect(h.sent.at(-1)).toBe(text);
+    }
+  });
+
+  it("round-1 repository-only: normalizes reads across bare, qualified and URL forms", async () => {
+    const forms = ["#2175", "pi-fabric#2175", "Smarty-Pants-Inc/pi-fabric#2175",
+      "https://github.com/Smarty-Pants-Inc/pi-fabric/issues/2175",
+      "https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2175"];
+    for (const text of forms) for (const evidence of forms) {
+      const h = harness(surface);
+      read(h.manager, evidence);
+      expect(await h.send(text), `${text} after ${evidence}`).not.toHaveProperty("notice");
+      expect(h.sent).toEqual([text]);
+    }
+  });
+
+  it("round-1 repository-only: preserves repo and qualified owner identity", async () => {
+    for (const [text, evidence] of [
+      ["pi-fabric#2175", "smarty-dev#2175"],
+      ["pi-fabric#2175", "Smarty-Pants-Inc/smarty-dev#2175"],
+      ["Smarty-Pants-Inc/pi-fabric#2175", "other/pi-fabric#2175"],
+      ["Smarty-Pants-Inc/pi-fabric#2175", "https://github.com/other/pi-fabric/pull/2175"],
+      ["pi-fabric#2175", "pi-fabric#21750 pi-fabric#2175suffix pi-fabric#2175-thing"],
+      ["Smarty-Pants-Inc/pi-fabric#12", "pi-fabric#12 #12"],
+    ]) {
+      const h = harness(surface);
+      read(h.manager, evidence!);
+      expect(await h.send(text!)).toHaveProperty("notice", `unverified ids: ${text}`);
+      expect(h.sent).toEqual([`${text}\n\nunverified ids: ${text}`]);
+    }
+    for (const evidence of ["another/pi-fabric#2175", "https://github.com/another/pi-fabric/pull/2175", "smarty-dev#2175"]) {
+      const h = harness(surface);
+      read(h.manager, evidence);
+      const text = evidence.includes("smarty-dev") ? "#2175" : "pi-fabric#2175";
+      expect(await h.send(text)).not.toHaveProperty("notice");
+      expect(h.sent).toEqual([text]);
+    }
+  });
+
   it("does not let an issue send receipt launder an unread GitHub reference", async () => {
     const h = harness(surface);
     const text = "Smarty-Pants-Inc/pi-fabric#2175";
@@ -240,7 +314,7 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
   it("leaves no-identifier text untouched without accessing history", async () => {
     const h = harness(surface);
     vi.spyOn(h.manager, "getLeafId").mockImplementation(() => { throw new Error("must not read"); });
-    const texts = ["Ready for the review; no identifiers here.", "2175", "#1", "#12", "# Title", "## Heading", "# 2175"];
+    const texts = ["Ready for the review; no identifiers here.", "2175", "#1", "#12", "# Title", "## Heading", "# 2175", "C#12", "F#123", "issue#", "x#1", "x#12", "smarty-dev#12"];
     for (const text of texts) expect(await h.send(text)).not.toHaveProperty("notice");
     expect(h.sent).toEqual(texts);
   });

@@ -55,7 +55,11 @@ describe("conservative identifier classes", () => {
     ["https://github.com/o/r/pull/2175", ["o/r#2175"]],
     ["HTTPS://GITHUB.COM/O/R/PULL/2175?tab=files", ["O/R#2175"]],
     ["(o/repo.name#2175), #2176.", ["o/repo.name#2175", "#2176"]],
-    ["x#2175; #2175suffix; #2175-thing; o/r#2175suffix", []],
+    ["x#2175; #2175suffix; #2175-thing; o/r#2175suffix", ["x#2175"]],
+    ["smarty-dev#2175; pi-fabric#179", ["smarty-dev#2175", "pi-fabric#179"]],
+    ["C#12; F#123; issue#; x#1; x#12; smarty-dev#12", []],
+    ["(repo.name#2175), REPO.NAME#2175", ["repo.name#2175"]],
+    ["folder/repo#2175suffix; /repo#2175; ./repo#2175", []],
     ["https://github.com/o/r/issues/2175suffix; https://example.com/o/r/issues/2175", []],
     ["o/r#2175; https://github.com/O/R/pull/2175; https://github.com/o/r/issues/2175", ["o/r#2175"]],
     ["o/r#2175; o/other#2175", ["o/r#2175", "o/other#2175"]],
@@ -72,7 +76,7 @@ describe("conservative identifier classes", () => {
 });
 
 describe("actual sender-session read evidence", () => {
-  const issueForms = ["#2175", "o/r#2175", "https://github.com/o/r/issues/2175", "https://github.com/o/r/pull/2175"];
+  const issueForms = ["#2175", "r#2175", "o/r#2175", "https://github.com/o/r/issues/2175", "https://github.com/o/r/pull/2175"];
   it.each(issueForms.flatMap(text => issueForms.map(evidence => [text, evidence])))("normalizes issue forms %s after reading %s", (text, evidence) => {
     const manager = session();
     read(manager, evidence);

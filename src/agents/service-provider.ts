@@ -73,7 +73,7 @@ export function createAgentsProvider(client: AgentServiceClient): FabricProvider
       if (action !== "steer" && action !== "followUp") return client.dispatch(action as AgentServiceAction, validated, context.signal);
       const checked = await outgoingMessageNotice(validated.message as string, context);
       const result = await deliverWithMessageNotice(validated.message as string, checked,
-        message => client.dispatch(action, { ...validated, message }, context.signal));
+        message => client.dispatch(action, { ...validated, message }, context.signal), `agents.${action}`);
       return checked.notice ? { ...(result as object), notice: checked.notice } : result;
     },
   };

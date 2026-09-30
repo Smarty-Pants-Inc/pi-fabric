@@ -50,11 +50,11 @@ describe("message identifier checker first-use boundary", () => {
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(checkerLoaded).not.toHaveBeenCalled();
       const { outgoingMessageNotice } = await import("../src/providers/message-id-notice.js");
-      for (const text of ["Ready to review", "decafed abc1234 is prose", "color abcdef12", "comment 12", "pid nope", "session:not-an-id", "2175", "#1", "#12", "# Title", "## Heading", "# 2175"]) {
+      for (const text of ["Ready to review", "decafed abc1234 is prose", "color abcdef12", "comment 12", "pid nope", "session:not-an-id", "2175", "#1", "#12", "# Title", "## Heading", "# 2175", "C#12", "F#123", "issue#", "x#1", "x#12"]) {
         expect(await outgoingMessageNotice(text, { extensionContext: context } as Parameters<typeof outgoingMessageNotice>[1])).toEqual({ text });
       }
       expect(checkerLoaded).not.toHaveBeenCalled();
-      expect(await outgoingMessageNotice("o/r#2175", { extensionContext: context } as Parameters<typeof outgoingMessageNotice>[1]))
+      expect(await outgoingMessageNotice("smarty-dev#2175", { extensionContext: context } as Parameters<typeof outgoingMessageNotice>[1]))
         .toHaveProperty("notice", "unverified ids: check failed");
       expect(checkerLoaded).toHaveBeenCalledOnce();
     } finally {

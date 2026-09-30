@@ -16,8 +16,14 @@ if a marked send gets an explicit, pre-admission mesh/actor payload or Main
 follow-up quota refusal, Fabric makes one attempt with the original text and keeps
 the sender-side notice. When the marker cannot fit under a route's limit, the
 send wins: the recipient gets the original text and only the sender gets the
-notice. This is the owner's #2175 decision
-([comment 5910225030](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/2175#issuecomment-5910225030)).
+notice. Org accepted this exact near-limit exception on pi-fabric#179
+([comment 5911395961](https://github.com/Smarty-Pants-Inc/pi-fabric/pull/179#issuecomment-5911395961))
+with two conditions: the sender's notice explicitly adds
+`(recipient marker omitted: message at the route size limit)`, and each successful
+unmarked delivery writes one structured `recipient-marker-omitted` line with its
+public route (`agents.followUp`, `agents.steer`, or `mesh.publish`) and a running
+process-local `count` to Fabric's existing `[pi-fabric]` stderr diagnostic log.
+The counter spans all routes and resets on process restart; no new store is used.
 These refusals occur before persistence/enqueueing, so no
 message is duplicated. A remote owner's explicit admission rejection follows the
 same rule. Timeouts, unknown outcomes, stalled-but-accepted queues and all other
@@ -40,13 +46,17 @@ an outgoing SHA candidate.
 | Git SHA | 7–40 hex digits only after the whole word `sha`, `commit`, `head`, `base`, `revision`, or `rev`, separated by horizontal whitespace or `:` / `=` (optional JSON key/value quotes); or alone inside a single pair of inline backticks, not a triple-backtick fence |
 | GitHub comment | 9–10 decimal digits after `#issuecomment-`, or `comment` with zero or more horizontal-space / `:` / `=` / `#` / `-` separators |
 | PID | 1–10 decimal digits after `pid`, with those same separators |
-| GitHub issue/PR | `owner/repo#N`; bare `#N` with at least 3 digits; or `https://github.com/<owner>/<repo>/(issues\|pull)/N` |
+| GitHub issue/PR | `owner/repo#N`; repository-only `repo#N` or bare `#N` with at least 3 digits; or `https://github.com/<owner>/<repo>/(issues\|pull)/N` |
 
 An explicitly SHA-qualified 32-hex token is a SHA abbreviation, not also an
 actor/run at that position. Raw full SHAs, naked decimal numbers, bare `#1` /
 `#12`, and heading markers such as `# Title` are not outgoing candidates.
 Issue and pull URLs normalize to `owner/repo#N` in notices and read matching.
-Qualified forms preserve repository identity, case-insensitively. A bare `#N`
+Qualified forms preserve repository identity, case-insensitively. Repository-only
+`repo#N` matches qualified references and URLs with that repository name and number,
+under any owner; different repository names remain distinct. `C#` / `F#` language
+tokens, `issue#` without digits, and repository-only references with fewer than
+three digits are not candidates. A bare `#N`
 read matches qualified references with that number; an outgoing bare `#N`
 matches a read from any repository with that number. Different qualified
 repositories remain distinct. An `#issuecomment-` URL anchor is also checked as

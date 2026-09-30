@@ -784,6 +784,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#halted = false;
     this.#journal = journal;
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
+      if (typeof this.pi.on !== "function") return;
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);
       if (typeof off === "function") this.#unsubscribe.push(off as () => void);
     };

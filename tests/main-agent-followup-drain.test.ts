@@ -59,6 +59,19 @@ describe("Main followUp drain (unit)", () => {
     return { ...fake, state, ctx, main };
   };
 
+  it.each([0, 120_000])("tolerates a host without lifecycle subscriptions (flushMs=%s)", (flushMs) => {
+    const fake = fakePi();
+    const pi = { ...fake.pi, on: undefined } as unknown as ExtensionAPI;
+    const main = new MainAgentController(pi, "session:root", true, "/tmp/project", "root");
+    expect(() => main.attachFollowUpDrain(context({ idle: false }), flushMs)).not.toThrow();
+    expect(main.deliverAgent({ from: from("a"), message: "hello", delivery: "followUp" }))
+      .toMatchObject({ queued: true, pendingFollowUps: 0 });
+    expect(fake.sent).toHaveLength(1);
+    expect(fake.sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(fake.handlers.size).toBe(0);
+    main.closeFollowUpDrain();
+  });
+
   it("delivers to an idle Main as before, with a sent_at header", () => {
     const { main, sent } = setup(120_000, true);
     const result = main.deliverAgent({ from: from("a"), message: "hello", delivery: "followUp" });

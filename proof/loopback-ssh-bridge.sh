@@ -87,7 +87,8 @@ for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
 if grep -q '^uid=' "$T/run/forced-command-check.txt"; then echo "forced command NOT enforced" >&2; exit 1; fi
 
 set +e
-nice -n 19 bun "$here/proof/loopback-ssh-bridge.mjs" "$T/run" "$bridge_checkout/dist/index.js" "$bridge_bin" 127.0.0.1 "$T/bridge_key" "$port" "$T/known_hosts" \
+# The driver is plain JavaScript; use the same Node runtime as the bridge and Pi.
+nice -n 19 "$node" "$here/proof/loopback-ssh-bridge.mjs" "$T/run" "$bridge_checkout/dist/index.js" "$bridge_bin" 127.0.0.1 "$T/bridge_key" "$port" "$T/known_hosts" \
   2>&1 | tee "$T/run/driver.log"
 statuses=("${PIPESTATUS[@]}")
 set -e

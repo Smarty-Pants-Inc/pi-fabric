@@ -24,8 +24,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { spawn, execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn, execFile, execFileSync } from "node:child_process";
+import { promisify, isDeepStrictEqual } from "node:util";
 import { randomUUID } from "node:crypto";
 
 // BEGIN WORK INGRESS HELPER — extracted by .local/work-wake-probe.mjs without running this driver.
@@ -81,37 +81,187 @@ const assertFirstSend = (attempts, target, host, killedAt, boundMs = 10_000) => 
     (clause[1] === undefined || Number.isFinite(Number(clause[1])));
   const pending = error.startsWith(`Fabric lease mirrored from remote host ${host} lapsed for ${target};`) && error.includes("mesh bridge");
   const deadline = error.startsWith(`Fabric mesh bridge to remote host ${host} is not responding for ${target};`);
-  if (!preSend && !pending && !deadline) fail("unnamed or wrong host/target bridge condition");
+  const unpublished = error === `Fabric mesh bridge routing to remote host ${host} is unavailable for ${target}; the routed owner could not be revalidated; this attempt was not published.`;
+  if (!preSend && !unpublished && !pending && !deadline) fail("unnamed or wrong host/target bridge condition");
   if ((pending || deadline) && !error.includes("the outcome is unknown")) fail("pending/deadline failure lacks unknown-outcome warning");
-  return { condition: preSend ? "pre-send-lapsed" : pending ? "pending-lapsed" : "ack-deadline",
+  return { condition: unpublished ? "pre-send-unpublished" : preSend ? "pre-send-lapsed" : pending ? "pending-lapsed" : "ack-deadline",
     nativeTimestampDomain: "native-execution-host-local", nativeStartedAt, nativeCompletedAt, nativeMs,
     driverTimestampDomain: "local-driver", requestAfterKillMs: requestAt - killedAt,
     completionAfterKillMs: completedAt - killedAt, rpcModelDurationMs: completedAt - requestAt };
 };
 // END FIRST SEND VALIDATOR
 
+// BEGIN POSTKILL LEDGER — bounded actual-store read, cross-checked against its fresh log suffix.
+const validateLedgerEvent = (e) => {
+  const object = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  const string = (v) => typeof v === "string" && v.trim().length > 0;
+  const optional = (v, key, test) => !Object.hasOwn(v, key) || test(v[key]);
+  if (!object(e) || !string(e.id) || !string(e.topic) || !string(e.kind) ||
+      !Number.isSafeInteger(e.sequence) || e.sequence <= 0 || !Number.isFinite(e.createdAt) ||
+      !object(e.from) || !string(e.from.id) || !string(e.from.name) || !["main", "actor", "agent"].includes(e.from.kind) ||
+      !optional(e.from, "sessionId", (v) => typeof v === "string") ||
+      !optional(e, "to", (v) => typeof v === "string") || !optional(e, "text", (v) => typeof v === "string"))
+    throw new Error("malformed postkill ledger envelope");
+  if (e.topic === "fabric.control.command") {
+    const d = e.data;
+    if (!object(d) || d.version !== 1 || !string(d.commandId) || !string(d.targetId) || !string(d.replyTo) ||
+        !["steer", "followUp", "stop", "ask", "cancel"].includes(d.operation) || e.kind !== d.operation || !string(e.to) ||
+        !Number.isFinite(d.requestedAt) || !optional(d, "deadlineAt", Number.isFinite) ||
+        !optional(d, "message", (v) => typeof v === "string") || !optional(d, "triggerTurn", (v) => typeof v === "boolean") ||
+        !optional(d, "cancelCommandId", string) || !optional(d, "destinationRemoteHost", (v) => v === null || string(v)) ||
+        (["steer", "followUp", "ask"].includes(d.operation) && typeof d.message !== "string") ||
+        (d.operation === "cancel" && !string(d.cancelCommandId)) ||
+        !optional(d, "binding", (v) => object(v) && optional(v, "model", (x) => typeof x === "string") &&
+          optional(v, "thinking", (x) => typeof x === "string")))
+      throw new Error("malformed postkill ledger command");
+  }
+  return e;
+};
+const captureLedger = (store) => {
+  const file = path.join(store.root, "events.jsonl"), fd = fs.openSync(file, "r");
+  try {
+    const stat = fs.fstatSync(fd);
+    const sameFile = (next) => ["dev", "ino", "size", "mtimeMs", "ctimeMs"].every((key) => next[key] === stat[key]);
+    const recheck = () => {
+      if (!sameFile(fs.fstatSync(fd)) || !sameFile(fs.statSync(file))) throw new Error("postkill ledger changed during baseline capture");
+    };
+    // Last committed whole record, not the sequence allocator: bounded even on a fleet log.
+    const bytes = Math.min(stat.size, 4 * 1024 * 1024), buffer = Buffer.alloc(bytes);
+    if (fs.readSync(fd, buffer, 0, bytes, stat.size - bytes) !== bytes) throw new Error("short postkill ledger baseline read");
+    let after = 0;
+    if (bytes) {
+      if (buffer[bytes - 1] !== 10) throw new Error("incomplete postkill ledger baseline record");
+      const previous = buffer.lastIndexOf(10, bytes - 2);
+      if (previous < 0 && bytes !== stat.size) throw new Error("postkill ledger baseline record exceeds 4MiB");
+      const tail = buffer.subarray(previous + 1, bytes - 1), text = tail.toString("utf8");
+      if (!text || !Buffer.from(text, "utf8").equals(tail)) throw new Error("malformed postkill ledger baseline record");
+      after = validateLedgerEvent(JSON.parse(text)).sequence;
+    }
+    recheck();
+    return { file, device: stat.dev, inode: stat.ino, offset: stat.size, after };
+  } finally { fs.closeSync(fd); }
+};
+const readLedger = (store, start) => {
+  if (!Number.isSafeInteger(start.after) || start.after < 0 || !Number.isSafeInteger(start.offset) || start.offset < 0)
+    throw new Error("invalid postkill ledger baseline");
+  const fd = fs.openSync(start.file, "r");
+  let events, actual;
+  try {
+    const stat = fs.fstatSync(fd), bytes = stat.size - start.offset;
+    const sameFile = (next) => ["dev", "ino", "size", "mtimeMs", "ctimeMs"].every((key) => next[key] === stat[key]);
+    const recheck = () => {
+      if (!sameFile(fs.fstatSync(fd)) || !sameFile(fs.statSync(start.file)))
+        throw new Error("postkill ledger changed during raw/store read");
+    };
+    if (stat.dev !== start.device || stat.ino !== start.inode || bytes < 0 || bytes > 4 * 1024 * 1024)
+      throw new Error("postkill ledger rotated/truncated or exceeded 4MiB read bound");
+    const buffer = Buffer.alloc(bytes);
+    if (fs.readSync(fd, buffer, 0, bytes, start.offset) !== bytes) throw new Error("short postkill ledger read");
+    const text = buffer.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(buffer)) throw new Error("invalid UTF-8 postkill ledger");
+    if (text && !text.endsWith("\n")) throw new Error("incomplete postkill ledger record");
+    events = text ? text.slice(0, -1).split("\n").map((line) => {
+      if (!line.trim()) throw new Error("blank postkill ledger record");
+      return validateLedgerEvent(JSON.parse(line));
+    }) : [];
+    const ids = new Set(); let sequence = start.after;
+    for (const e of events) {
+      if (e.sequence <= sequence || ids.has(e.id)) throw new Error("postkill ledger stale/nonincreasing sequence or duplicate ID");
+      sequence = e.sequence; ids.add(e.id);
+    }
+    recheck();
+    const expected = events.filter((e) => e.sequence > start.after && e.topic === "fabric.control.command");
+    actual = store.read({ after: start.after, topic: "fabric.control.command", limit: 500 });
+    recheck();
+    if (!Array.isArray(actual) || actual.length >= 500 || !isDeepStrictEqual(actual, expected))
+      throw new Error("postkill actual-store ledger incomplete, changed, or saturated");
+  } finally { fs.closeSync(fd); }
+  return actual;
+};
+const assertPostkillLedger = (events, source, target, marker, host, condition) => {
+  const fail = (why) => { throw new Error(`postkill ledger ${source} -> ${target}: ${why}`); };
+  if (!Array.isArray(events)) fail("unreadable ledger");
+  const own = events.filter((e) => e.topic === "fabric.control.command" && e.from?.id === source && e.data?.targetId === target);
+  const sends = own.filter((e) => e.data?.operation === "steer" && e.data?.message === marker);
+  const cancels = own.filter((e) => e.data?.operation === "cancel");
+  const ids = [...new Set(sends.map((e) => e.data.commandId))];
+  if (sends.length > 1 || ids.length > 1) fail("second steer publication/replay");
+  const unpublished = condition === "pre-send-unpublished" || condition === "pre-send-lapsed";
+  if (unpublished ? sends.length !== 0 : sends.length !== 1) fail("publication count disagrees with native failure");
+  if (cancels.length > 1) fail("second cancellation publication");
+  const send = sends[0];
+  if (send && (typeof send.data.commandId !== "string" || !send.data.commandId || !send.to ||
+      send.kind !== "steer" || send.data.destinationRemoteHost !== host)) fail("missing/wrong original destination binding");
+  for (const cancel of cancels) {
+    if (!send || cancel.kind !== "cancel" || cancel.data.cancelCommandId !== send.data.commandId ||
+        cancel.to !== send.to || cancel.data.destinationRemoteHost !== send.data.destinationRemoteHost ||
+        typeof cancel.data.commandId !== "string" || !cancel.data.commandId || cancel.data.commandId === send.data.commandId)
+      fail("cancellation not bound to the same command/destination");
+  }
+  return { source, target, marker, host, condition, inspectedAt: Date.now(), examinedCommandRecords: events.length,
+    steerPublications: sends.length, commandIds: ids,
+    steerEventIds: sends.map((e) => e.id), cancellationPublications: cancels.length,
+    cancellations: cancels.map((e) => ({ eventId: e.id, commandId: e.data.commandId, cancelCommandId: e.data.cancelCommandId,
+      to: e.to, destinationRemoteHost: e.data.destinationRemoteHost })),
+    destination: send ? { to: send.to, destinationRemoteHost: send.data.destinationRemoteHost } : null };
+};
+// END POSTKILL LEDGER
+
 const exec = promisify(execFile);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const cleanupSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const quote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
 const shell = (args) => args.map(quote).join(" ");
 const assert = (value, message) => { if (!value) throw new Error(message); };
 const runId = `mesh-proof-${randomUUID()}`;
 const children = new Set();
 const results = { runId, startedAt: new Date().toISOString(), checks: {}, status: "FAIL" };
-let cfg, evidence, remoteOwned, bridge, bridgeSsh, remoteBridge, piA, piB;
+let cfg, evidence, remoteOwned, bridge, bridgeSsh, remoteBridge, piA, piB, ownershipMonitor;
+let cleanupPromise;
+const remoteOwners = new Map();
+// BEGIN FORGE CANCELLATION — inert probes extract the production wiring.
 let stopping = false;
 const pending = new Set();
-const interrupt = () => {
+const gate = () => { assert(!stopping, "proof interrupted"); };
+const stop = () => {
   stopping = true;
   for (const cancel of [...pending]) cancel(new Error("proof interrupted"));
 };
+const interrupt = () => {
+  results.status = "FAIL";
+  results.interrupted = true;
+  process.exitCode = 1;
+  results.failed ??= "proof interrupted by SIGTERM/SIGINT";
+  stop(); save();
+};
+const cancelWait = (operation) => {
+  gate();
+  return new Promise((resolve, reject) => {
+    const cancel = (error) => { pending.delete(cancel); reject(error); };
+    pending.add(cancel);
+    Promise.resolve(operation).then((value) => {
+      pending.delete(cancel);
+      try { gate(); resolve(value); } catch (error) { reject(error); }
+    }, cancel);
+  });
+};
+const sleep = (ms) => {
+  gate();
+  return new Promise((resolve, reject) => {
+    const cancel = (error) => { clearTimeout(timer); pending.delete(cancel); reject(error); };
+    const timer = setTimeout(() => { pending.delete(cancel); try { gate(); resolve(); } catch (error) { reject(error); } }, ms);
+    pending.add(cancel);
+  });
+};
+const finalStatus = (status, interrupted, errors) => status === "PASS" && !interrupted && errors.length === 0 ? "PASS" : "FAIL";
+// END FORGE CANCELLATION
 const save = () => { if (evidence) fs.writeFileSync(path.join(evidence, "results.json"), `${JSON.stringify(results, null, 2)}\n`, { mode: 0o600 }); };
-const check = (name, value) => { results.checks[name] = value; save(); };
+const check = (name, value) => { gate(); results.checks[name] = value; save(); };
 const waitFor = async (what, predicate, ms = 60_000) => {
   const until = Date.now() + ms;
   while (Date.now() < until) {
     assert(!stopping, "proof interrupted");
-    const value = await predicate(); // Async probes MUST be awaited.
+    const value = await cancelWait(predicate()); // Cancel now; never resume proof work after stop.
+    gate();
     if (value) return value;
     await sleep(1000);
   }
@@ -119,8 +269,15 @@ const waitFor = async (what, predicate, ms = 60_000) => {
 };
 const sshArgs = () => ["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
   "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", cfg.sshHost];
-const remote = async (command) => {
-  const { stdout } = await exec("ssh", [...sshArgs(), command], { timeout: 20_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
+const remote = async (command, cleanupOnly = false) => {
+  if (!cleanupOnly) gate();
+  const operation = exec("ssh", [...sshArgs(), command], { detached: true, timeout: 20_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
+  const transport = operation.child;
+  children.add(transport);
+  try { transport.owned = ownLocal(transport.pid); } catch (error) { transport.proofError = error; }
+  transport.once("error", (error) => { transport.proofError = error; });
+  const { stdout } = await (cleanupOnly ? operation : cancelWait(operation));
+  if (!cleanupOnly) gate();
   return stdout.trim();
 };
 // Process identity is PID + Linux start ticks, not a global name pattern. Forge
@@ -134,12 +291,114 @@ for(const pid of fs.readdirSync('/proc').filter(p=>/^\\d+$/.test(p))) { try {
  rows.push({pid:Number(pid),start:stat[19]}); }
 } catch {} } console.log(JSON.stringify(rows));`;
 const remoteAgents = async () => JSON.parse(await remote(shell([cfg.remoteNode, "-e", processScript, cfg.remoteMesh])));
-const alive = (p) => {
-  try { const s = fs.readFileSync(`/proc/${p.pid}/stat`, "utf8").split(") ")[1].split(" "); return s[0] !== "Z" && s[19] === p.start; }
-  catch (error) { if (error.code === "ENOENT") return false; throw error; }
+// BEGIN FORGE LIFECYCLE — shared by local cleanup and serialized remote cleanup.
+const processIdentity = (pid) => {
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const s = raw.slice(raw.lastIndexOf(")") + 2).split(" ");
+    return { pid: Number(pid), state: s[0], parent: Number(s[1]), group: Number(s[2]), session: Number(s[3]), start: s[19] };
+  } catch (error) { if (["ENOENT", "ESRCH"].includes(error.code)) return undefined; throw error; }
 };
-const ownLocal = (pid) => ({ pid, start: fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1].split(" ")[19] });
+const ownedMembers = (owner) => {
+  const all = fs.readdirSync("/proc").filter((p) => /^\d+$/.test(p)).map(processIdentity).filter(Boolean);
+  const known = new Map(owner.known.map((p) => [p.pid, p]));
+  const leader = all.find((p) => p.pid === owner.pid);
+  for (const p of all) {
+    const old = known.get(p.pid);
+    if (old && (old.start !== p.start || old.group !== p.group || old.session !== p.session))
+      throw new Error("owned PID reused or group/session changed");
+  }
+  if (leader && (leader.start !== owner.start || leader.group !== owner.group || leader.session !== owner.session))
+    throw new Error("owner incarnation changed");
+  const members = all.filter((p) => known.has(p.pid));
+  for (let size = -1; size !== members.length;) {
+    size = members.length;
+    for (const p of all) {
+      if (members.includes(p)) continue;
+      const descendant = members.some((m) => m.pid === p.parent);
+      const scoped = descendant || (!owner.tree &&
+        p.group === owner.group && p.session === owner.session &&
+        (leader || members.some((m) => m.group === owner.group && m.session === owner.session)));
+      if (!scoped) continue;
+      if (BigInt(p.start) < BigInt(owner.start)) throw new Error("pre-existing group member");
+      members.push(p);
+    }
+  }
+  if (!owner.tree && !leader && all.some((p) => p.group === owner.group && p.session === owner.session) && !members.length)
+    throw new Error("unauthenticated orphan group");
+  for (const p of members) known.set(p.pid, { ...p });
+  owner.known = [...known.values()];
+  return members.filter((p) => p.state !== "Z");
+};
+const ownLocal = (pid, tree = false) => {
+  const identity = processIdentity(pid);
+  if (!identity || (!tree && (identity.group !== pid || identity.session !== pid))) throw new Error("not an owned detached group");
+  return { ...identity, tree, known: [identity] };
+};
+const alive = (p) => {
+  const current = processIdentity(p.pid);
+  if (current && (current.start !== p.start || current.group !== p.group || current.session !== p.session)) throw new Error("process incarnation changed");
+  return current && current.state !== "Z";
+};
+// BEGIN OWNED PIDFD SIGNAL — self-contained for serialized remote lifecycle and probes.
+const signalOwned = (member, name) => {
+  const program = `import os, signal, sys, json
+m = json.loads(sys.argv[1])
+name = sys.argv[2]
+fd = None
+sent = False
+try:
+    if name not in ('SIGTERM', 'SIGKILL'):
+        raise ValueError('unsupported owned signal')
+    fd = os.pidfd_open(m['pid'])
+    with open('/proc/%d/stat' % m['pid']) as f:
+        fields = f.read().rsplit(') ', 1)[1].split()
+    if fields[19] != m['start'] or int(fields[2]) != m['group'] or int(fields[3]) != m['session']:
+        raise RuntimeError('owned process incarnation changed')
+    if fields[0] != 'Z':
+        signal.pidfd_send_signal(fd, getattr(signal, name))
+        sent = True
+except (ProcessLookupError, FileNotFoundError):
+    pass
+finally:
+    if fd is not None:
+        os.close(fd)
+print(json.dumps(sent))
+`;
+  return JSON.parse(execFileSync("python3", ["-c", program, JSON.stringify(member), name],
+    { encoding: "utf8", timeout: 2000, killSignal: "SIGKILL", maxBuffer: 64 * 1024 }));
+};
+// END OWNED PIDFD SIGNAL
+const cleanupOwned = async (owner) => {
+  const receipt = { pid: owner.pid, start: owner.start, signals: [], errors: [], dead: false };
+  try {
+    for (const [signal, ms] of [["SIGTERM", 2000], ["SIGKILL", 2000]]) {
+      const members = ownedMembers(owner);
+      if (!members.length) break;
+      for (const p of members) {
+        if (signalOwned(p, signal)) receipt.signals.push({ pid: p.pid, signal });
+      }
+      const until = Date.now() + ms;
+      while (ownedMembers(owner).length && Date.now() < until) await cleanupSleep(50);
+    }
+    receipt.dead = ownedMembers(owner).length === 0;
+    if (!receipt.dead) throw new Error("owned process/group survived cleanup");
+  } catch (error) { receipt.errors.push(String(error?.stack ?? error)); }
+  receipt.known = owner.known;
+  return receipt;
+};
+// END FORGE LIFECYCLE
+const remoteLifecycle = () => `const {execFileSync}=require("node:child_process"); const signalOwned=${signalOwned.toString()}; const processIdentity=${processIdentity.toString()}; const ownedMembers=${ownedMembers.toString()}; const ownLocal=${ownLocal.toString()}; const cleanupSleep=${cleanupSleep.toString()}; const cleanupOwned=${cleanupOwned.toString()};`;
+const snapshotRemote = async (identity, tree = false, cleanupOnly = false) => {
+  const previous = remoteOwners.get(identity.pid);
+  const program = `const fs=require('fs'); ${remoteLifecycle()}
+const expected=${JSON.stringify(identity)}; const owner=${JSON.stringify(previous ?? null)} ?? ownLocal(expected.pid,${tree});
+if(owner.start!==expected.start)throw Error('remote owner changed'); ownedMembers(owner); console.log(JSON.stringify(owner));`;
+  const owner = JSON.parse(await remote(shell([cfg.remoteNode, "-e", program]), cleanupOnly));
+  remoteOwners.set(owner.pid, owner); return owner;
+};
 const child = (exe, args, options, name) => {
+  gate();
   results.commands ??= [];
   results.commands.push({ name, executable: exe, args, cwd: options.cwd }); save();
   const p = spawn(exe, args, { ...options, detached: true });
@@ -224,10 +483,11 @@ const rpc = (p, name) => {
     }
     catch (error) { done(error); }
   });
-  const idle = async () => { const state = await request("get_state"); return !state.isStreaming; };
+  const idle = async () => { const state = await request("get_state"); gate(); return !state.isStreaming; };
   const execute = async (code, ms = 120_000) => {
     const started = Date.now();
     await waitFor(`${name} idle`, idle, Math.min(ms, 60_000));
+    gate();
     const token = randomUUID();
     const wrapped = `const value = await (async () => { ${code}\n})(); return { proofToken: ${JSON.stringify(token)}, value };`;
     const message = `Call fabric_exec exactly once with exactly the code below, byte for byte, resultFormat "json", timeoutMs ${Math.min(ms, 120_000)}. Do not call any other tool or communicate with any other root. Then reply only OK.\n${wrapped}`;
@@ -293,6 +553,7 @@ const rpc = (p, name) => {
     // Explicit RPC reads ONLY this new session. Some native custom messages are
     // not emitted as message_end, so the stream alone is not proof of absence.
     const data = await request("get_messages");
+    gate();
     for (const message of data?.messages ?? []) remember(message);
     for (const item of ingress.filter((m) => m.customType === "pi-fabric-agent-message")) {
       for (const match of item.text.matchAll(/(<fabric-agent-message\b[^>]*>)([\s\S]*?)<\/fabric-agent-message>/g)) {
@@ -307,51 +568,52 @@ const rpc = (p, name) => {
   const receivedWork = async (expected) => {
     // Same authoritative RPC path as received(): no model prompt, mesh read, or embedded tool output.
     const data = await request("get_messages");
+    gate();
     return workInboxIngress(data?.messages ?? [], expected);
   };
   return { p, execute, idle, received, receivedWork, request, promptCount: () => promptCount };
 };
 
-const cleanup = async () => {
-  interrupt();
-  const errors = [];
-  // First EOF, then bounded scoped TERM/KILL. Both Pis have an independent 900s
-  // timeout --kill-after=10s even when the Dev1 driver / network disappears.
-  for (const pi of [piA, piB]) pi?.p.stdin.end();
-  await sleep(1500);
-  if (remoteOwned && cfg) {
-    const script = `const fs=require('fs'); const pid=${remoteOwned.pid};
-const stat=p=>{try{return fs.readFileSync('/proc/'+p+'/stat','utf8').split(') ')[1].split(' ');}catch(e){if(e.code!=='ENOENT')throw e;}};
-const members=()=>fs.readdirSync('/proc').filter(p=>/^\\d+$/.test(p)).flatMap(p=>{const s=stat(p);return s&&s[0]!=='Z'&&Number(s[2])===pid?[{pid:Number(p),start:s[19]}]:[];});
-const leader=stat(pid); if(leader&&leader[19]===${JSON.stringify(remoteOwned.start)}&&Number(leader[2])===pid) {
- const owned=members(); process.kill(-pid,'SIGTERM');
- setTimeout(()=>{if(owned.some(p=>{const s=stat(p.pid);return s&&s[19]===p.start&&Number(s[2])===pid&&s[0]!=='Z';})) {
- try{process.kill(-pid,'SIGKILL');}catch(e){if(e.code!=='ESRCH')throw e;}}
- setTimeout(()=>{if(members().length) {console.error('owned remote process group survived cleanup');process.exitCode=1;}},500);},2000);
-} else if(members().length) {console.error('remote leader lost before cleanup; scoped group cannot be authenticated');process.exitCode=1;}`;
-    try { await remote(shell([cfg.remoteNode, "-e", script])); } catch (error) { errors.push(`remote Pi cleanup: ${error.message}`); }
-  }
+const cleanup = () => cleanupPromise ??= (async () => {
+  stop(); // Normal completion cancels proof waits, but is not a signal/failure.
+  clearInterval(ownershipMonitor);
+  const errors = [], receipts = [];
+  // Capture authenticated descendants BEFORE EOF can remove their leader.
   for (const p of children) {
-    if (p.owned && alive(p.owned)) { try { process.kill(-p.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") errors.push(error.message); } }
+    try { if (p.owned) ownedMembers(p.owned); else throw p.proofError ?? new Error(`missing local ownership: ${p.pid}`); }
+    catch (error) { errors.push(String(error)); }
   }
-  await sleep(2000);
+  for (const [identity, tree] of [[remoteOwned, false], [remoteBridge, true]]) {
+    if (!identity || !cfg) continue;
+    try { await snapshotRemote(identity, tree, true); }
+    catch (error) { errors.push(`remote ownership: ${error.message}`); }
+  }
+  for (const pi of [piA, piB]) {
+    try { if (pi?.p.stdin && !pi.p.stdin.destroyed && !pi.p.stdin.writableEnded) pi.p.stdin.end(); }
+    catch (error) { errors.push(String(error)); }
+  }
+  // Both Pis retain independent timeout --kill-after=10s 900s protection.
+  await cleanupSleep(1500);
+  for (const owner of remoteOwners.values()) {
+    const script = `const fs=require('fs'); ${remoteLifecycle()}
+(async()=>{console.log(JSON.stringify(await cleanupOwned(${JSON.stringify(owner)})));})().catch(e=>{console.error(e);process.exitCode=1;});`;
+    try {
+      const receipt = JSON.parse(await remote(shell([cfg.remoteNode, "-e", script]), true));
+      receipts.push({ remote: true, ...receipt }); errors.push(...receipt.errors);
+      if (!receipt.dead) errors.push(`remote group not dead: ${owner.pid}`);
+    } catch (error) { errors.push(`remote cleanup: ${error.message}`); }
+  }
+  // Includes ordinary SSH operation groups, bridge SSH, and both local Pi wrappers.
   for (const p of children) {
-    if (p.owned && alive(p.owned)) { try { process.kill(-p.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") errors.push(error.message); } }
+    if (!p.owned) { errors.push(`missing ownership: ${p.pid}`); continue; }
+    const receipt = await cleanupOwned(p.owned);
+    receipts.push({ remote: false, ...receipt }); errors.push(...receipt.errors);
   }
-  // A transport left by SIGKILL of its bridge is a child in the bridge's owned
-  // process group; reap only that group, never ssh by name.
-  if (bridgeSsh && alive(bridgeSsh)) {
-    try { process.kill(-bridge.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") errors.push(error.message); }
-  }
-  // SIGKILL is asynchronous: require actual death, not an immediate post-signal read.
-  const reapDeadline = Date.now() + 2000;
-  while (Date.now() < reapDeadline && [...children].some((p) => p.owned && alive(p.owned))) await sleep(50);
-  for (const p of children) if (p.owned && alive(p.owned)) errors.push(`owned local leader survived: ${p.pid}`);
-  results.cleanup = { remoteOwned, errors }; save();
+  results.cleanup = { remoteOwned, receipts, errors }; save();
   assert(errors.length === 0, errors.join("; "));
-};
-process.once("SIGTERM", interrupt);
-process.once("SIGINT", interrupt);
+})();
+process.on("SIGTERM", interrupt);
+process.on("SIGINT", interrupt);
 
 try {
   cfg = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
@@ -376,11 +638,19 @@ try {
   check("localProjectMeshConfig", { path: path.join(cfg.localCwd, ".pi/fabric.json"), meshRoot: localMeshConfig.mesh.root });
   const remoteMeshCheck = `const fs=require('fs'),path=require('path');const file=path.join(process.argv[1],'.pi/fabric.json');const c=JSON.parse(fs.readFileSync(file,'utf8'));if(c.mesh?.root!==process.argv[2])throw Error('remote project mesh.root mismatch');console.log(JSON.stringify({path:file,meshRoot:c.mesh.root}));`;
   check("remoteProjectMeshConfig", JSON.parse(await remote(shell([cfg.remoteNode, "-e", remoteMeshCheck, cfg.remoteCwd, cfg.remoteMesh]))));
+  ownershipMonitor = setInterval(() => {
+    if (stopping) return;
+    try { for (const p of children) if (p.owned) ownedMembers(p.owned); }
+    catch (error) { results.status = "FAIL"; results.failed ??= String(error); stop(); save(); }
+    // Remote groups are captured after launch and before kill/EOF; do not spawn
+    // repeated SSH probes merely to monitor an idle proof.
+  }, 250);
   const remoteRoot = path.join(cfg.remoteEvidenceRoot, runId);
   await remote([`test -d ${quote(cfg.remoteMesh)}`, `test -d ${quote(cfg.remoteAgentDir)}`, `test -d ${quote(cfg.remoteCwd)}`, `test -f ${quote(cfg.remoteFabric)}`, `umask 077; mkdir -p ${quote(remoteRoot)}`].join(" && "));
   const beforeRemote = await remoteAgents();
   assert(beforeRemote.length === 0, "existing bridge agent on selected remote mesh: cannot prove isolated bridge death");
-  const { MeshStore } = await import(pathToFileURL(path.join(path.dirname(cfg.localFabric), "mesh.js")).href);
+  const { MeshStore } = await cancelWait(import(pathToFileURL(path.join(path.dirname(cfg.localFabric), "mesh.js")).href));
+  gate();
   const store = new MeshStore(cfg.localMesh, 256 * 1024, 500);
   piA = rpc(child("timeout", ["--signal=TERM", "--kill-after=10s", "900s", "nice", "-n", "19", cfg.localPi, ...piArgs(cfg.localFabric, path.join(evidence, "sessions"))],
     { cwd: cfg.localCwd, env: { ...cleanEnv(), PI_CODING_AGENT_DIR: cfg.localAgentDir }, stdio: ["pipe", "pipe", "pipe"] }, `${cfg.localName} Pi`), cfg.localName);
@@ -393,6 +663,7 @@ try {
     assert(!piB.p.proofError && piB.p.exitCode === null && piB.p.signalCode === null, "remote Pi failed before reporting its owned leader");
     return remoteOwned;
   });
+  await snapshotRemote(remoteOwned);
   // Initial RPC commands are queued while native session_start binds extensions.
   // Allow that one cold bootstrap its own bound; later requests retain the 15s bound.
   const states = await Promise.all([piA, piB].map((pi) => pi.request("get_state", {}, 120_000)));
@@ -416,12 +687,14 @@ try {
     try {
       const pids = fs.readFileSync(`/proc/${bridge.pid}/task/${bridge.pid}/children`, "utf8").trim().split(/\s+/).filter(Boolean);
       const pid = pids.find((id) => fs.readFileSync(`/proc/${id}/comm`, "utf8").trim() === "ssh");
-      return pid && ownLocal(Number(pid));
+      return pid && ownLocal(Number(pid), true);
     } catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
   });
   remoteBridge = await waitFor("new exact remote bridge agent", async () => {
     const rows = await remoteAgents(); assert(rows.length <= 1, "multiple selected remote bridge agents interfere"); return rows[0];
   });
+  await snapshotRemote(remoteBridge, true);
+  ownedMembers(bridge.owned);
   check("ownedTransport", { bridge: bridge.owned, ssh: bridgeSsh, remoteAgent: remoteBridge });
   const discovered = await Promise.all([[piA, b.id, cfg.remoteName], [piB, a.id, cfg.localName]].map(async ([pi, target, host]) =>
     waitFor(`${host} peer discovery`, async () => { const v = await pi.execute(peerCode(target)); return v.ownTarget.some((p) => p.host === host) && v; })));
@@ -463,12 +736,14 @@ try {
   assert(correlatedIngress?.eventId === workRead.id, "native inbox remote event ID does not correlate with native bridged read");
   check("factoryWorkBridgedRead", { ...workRead, ingress: correlatedIngress });
   const prNeedle = `${runId}-pr.wake`, laneNeedle = `${runId}-lane-followUp`;
-  const prWake = await store.publish({ topic: "ops.owner", kind: "pr.wake", from: { id: "factory-host:owner", name: "factory-owner", kind: "main" }, to: b.id,
-    text: prNeedle, data: { rootId: b.id, repo: "Smarty-Pants-Inc/smarty-dev", pr: 2045 } });
+  gate();
+  const prWake = await cancelWait(store.publish({ topic: "ops.owner", kind: "pr.wake", from: { id: "factory-host:owner", name: "factory-owner", kind: "main" }, to: b.id,
+    text: prNeedle, data: { rootId: b.id, repo: "Smarty-Pants-Inc/smarty-dev", pr: 2045 } }));
+  gate();
   const now = Date.now();
-  const laneWake = await store.publish({ topic: "fabric.control.command", kind: "followUp", from: { id: "factory-host:stuck-work", name: "factory-stuck-work", kind: "main" }, to: b.id,
+  const laneWake = await cancelWait(store.publish({ topic: "fabric.control.command", kind: "followUp", from: { id: "factory-host:stuck-work", name: "factory-stuck-work", kind: "main" }, to: b.id,
     text: laneNeedle, data: { version: 1, commandId: randomUUID().replaceAll("-", ""), targetId: b.id, operation: "followUp", replyTo: "factory-host:stuck-work",
-      message: `${laneNeedle}: reply only OK; do not use tools.`, data: { ref: "smarty-dev#2045" }, requestedAt: now, deadlineAt: now + 120_000 } });
+      message: `${laneNeedle}: reply only OK; do not use tools.`, data: { ref: "smarty-dev#2045" }, requestedAt: now, deadlineAt: now + 120_000 } }));
   check("factoryLaneNativeIngress", { eventId: laneWake.id, ingress: await waitFor("factory lane followUp native ingress", () => piB.received(laneNeedle, "followUp", "factory-host:stuck-work"), 120_000) });
   const prRead = await waitFor("remote Main reads own factory pr.wake", async () => {
     const events = await piB.execute(`const self=(await agents.main()).id; const events=await mesh.read({topic:"ops.owner",to:self,limit:50}); return events.filter(e=>e.text===${JSON.stringify(prNeedle)}).map(e=>({id:e.id,kind:e.kind,to:e.to,bridge:e.data?.bridge}));`);
@@ -476,15 +751,39 @@ try {
   });
   check("factoryPrWakeRead", prRead);
   await Promise.all([piA, piB].map((pi) => waitFor("idle before bridge kill", pi.idle)));
+  // Read only the actual configured source meshes; never another session/profile.
+  const remoteLedger = async (start, marker, condition) => {
+    assert(!stopping, "proof interrupted before remote ledger operation");
+    const program = `import fs from "node:fs"; import path from "node:path"; import { isDeepStrictEqual } from "node:util";
+import { MeshStore } from ${JSON.stringify(pathToFileURL(path.join(path.dirname(cfg.remoteFabric), "mesh.js")).href)};
+const validateLedgerEvent = ${validateLedgerEvent.toString()};
+const captureLedger = ${captureLedger.toString()}; const readLedger = ${readLedger.toString()};
+const assertPostkillLedger = ${assertPostkillLedger.toString()};
+const store = new MeshStore(${JSON.stringify(cfg.remoteMesh)}, 256 * 1024, 500);
+const start = ${JSON.stringify(start ?? null)};
+console.log(JSON.stringify(start ? assertPostkillLedger(readLedger(store, start), ${JSON.stringify(b.id)},
+  ${JSON.stringify(a.id)}, ${JSON.stringify(marker ?? null)}, ${JSON.stringify(cfg.localName)}, ${JSON.stringify(condition ?? null)}) : captureLedger(store)));`;
+    return JSON.parse(await remote(shell([cfg.remoteNode, "--input-type=module", "-e", program])));
+  };
+  const ledgerStarts = { local: captureLedger(store), remote: await remoteLedger() };
+  gate(); // In particular, a canceled prekill SSH ledger must not reach SIGKILL.
+  const postkillMarkers = { local: `${runId}-${cfg.localName}-to-${cfg.remoteName}-postkill-${randomUUID()}`,
+    remote: `${runId}-${cfg.remoteName}-to-${cfg.localName}-postkill-${randomUUID()}` };
+  gate();
+  ownedMembers(bridge.owned);
+  await snapshotRemote(remoteBridge, true);
+  gate();
+  assert(alive(bridge.owned), "bridge incarnation missing before kill");
   assert(bridge.kill("SIGKILL"), "bridge SIGKILL failed");
   const killedAt = Date.now(); results.bridgeKilledAt = new Date(killedAt).toISOString(); save();
-  const firstSendProbe = async (pi, target, host) => {
+  const firstSendProbe = async (pi, source, target, host, marker) => {
     const requestAt = Date.now();
     // The outer RPC/model budget is not the native send budget. No retry, no delay,
     // and no preceding peer read that could refresh away the pending-lapse path.
-    const v = await pi.execute(`const nativeStartedAt = Date.now(); let outcome; try { outcome = { delivered: await agents.steer(${JSON.stringify(target)}, ${JSON.stringify(`${runId}-after-kill: reply only OK`)} ) }; } catch(error) { outcome = { error: String(error?.message ?? error) }; } const nativeCompletedAt = Date.now(); return { nativeStartedAt, nativeCompletedAt, nativeMs: nativeCompletedAt - nativeStartedAt, ...outcome };`, 120_000);
+    const v = await pi.execute(`const nativeStartedAt = Date.now(); let outcome; try { outcome = { delivered: await agents.steer(${JSON.stringify(target)}, ${JSON.stringify(marker)} ) }; } catch(error) { outcome = { error: String(error?.message ?? error) }; } const nativeCompletedAt = Date.now(); return { nativeStartedAt, nativeCompletedAt, nativeMs: nativeCompletedAt - nativeStartedAt, ...outcome };`, 120_000);
+    gate();
     const completedAt = Date.now();
-    const attempts = [{ ...v, nativeTimestampDomain: "native-execution-host-local",
+    const attempts = [{ ...v, source, target, marker, nativeTimestampDomain: "native-execution-host-local",
       driverTimestampDomain: "local-driver", requestAt, completedAt, requestAfterKillMs: requestAt - killedAt,
       completionAfterKillMs: completedAt - killedAt, rpcModelDurationMs: completedAt - requestAt }];
     results.afterKill ??= {}; results.afterKill[host] = attempts; save();
@@ -492,7 +791,7 @@ try {
     check(`firstPostkillSend-${host}`, validation);
     return validation;
   };
-  const probes = await Promise.allSettled([firstSendProbe(piA, b.id, cfg.remoteName), firstSendProbe(piB, a.id, cfg.localName)]);
+  const probes = await Promise.allSettled([firstSendProbe(piA, a.id, b.id, cfg.remoteName, postkillMarkers.local), firstSendProbe(piB, b.id, a.id, cfg.localName, postkillMarkers.remote)]);
   assert(probes.every((p) => p.status === "fulfilled"), probes.filter((p) => p.status === "rejected").map((p) => p.reason.message).join("; "));
   check("bothFirstPostkillSendsNamedBounded", true);
   const afterDeath = await Promise.all([[piA, a.id, b.id], [piB, b.id, a.id]].map(async ([pi, ownId, target]) => {
@@ -502,9 +801,28 @@ try {
   }));
   check("nativeMainPeersAfterDeath", afterDeath);
   // First assert natural EOF reaping, before scoped cleanup could mask a leak.
-  await waitFor("bridge SSH child exits after SIGKILL", () => !alive(bridgeSsh), 15_000);
-  await waitFor("forced remote agent exits on transport EOF", async () => !(await remoteAgents()).some((p) => p.pid === remoteBridge.pid && p.start === remoteBridge.start), 20_000);
+  await waitFor("bridge/SSH owned group exits after SIGKILL", () => ownedMembers(bridge.owned).length === 0, 15_000);
+  await waitFor("forced remote agent tree exits on transport EOF", async () => {
+    const owner = await snapshotRemote(remoteBridge, true);
+    gate();
+    const program = `const fs=require('fs'); ${remoteLifecycle()} console.log(JSON.stringify(ownedMembers(${JSON.stringify(owner)}).length));`;
+    return JSON.parse(await remote(shell([cfg.remoteNode, "-e", program]))) === 0;
+  }, 20_000);
   check("transportGoneAfterKill", true);
+  // Native settlement can precede best-effort publication/cancel completion. Observe
+  // after two bounded 10s mesh-lock windows, without retrying either native send.
+  const ledgerReadNotBefore = Math.max(...Object.values(results.afterKill).map((v) => v[0].completedAt)) + 20_000;
+  await waitFor("bounded postkill ledger observation", () => Date.now() >= ledgerReadNotBefore, 25_000);
+  assert(!stopping, "proof interrupted before ledger read");
+  results.postkillLedgerReadNotBefore = ledgerReadNotBefore;
+  const localCondition = results.checks[`firstPostkillSend-${cfg.remoteName}`].condition;
+  const remoteCondition = results.checks[`firstPostkillSend-${cfg.localName}`].condition;
+  check("postkillSourceLedgers", {
+    local: { window: ledgerStarts.local, ...assertPostkillLedger(readLedger(store, ledgerStarts.local),
+      a.id, b.id, postkillMarkers.local, cfg.remoteName, localCondition) },
+    remote: { window: ledgerStarts.remote, ...await remoteLedger(ledgerStarts.remote, postkillMarkers.remote, remoteCondition) },
+  });
+  assert(!stopping, "proof interrupted during ledger read");
   results.status = "PASS";
 } catch (error) {
   // Even invalid configuration gets a failure receipt, without touching auth.
@@ -512,6 +830,7 @@ try {
   results.status = "FAIL"; results.failed = String(error?.stack ?? error); save(); console.error(results.failed);
 } finally {
   try { await cleanup(); } catch (error) { results.status = "FAIL"; results.cleanupFailure = String(error?.stack ?? error); }
+  results.status = finalStatus(results.status, results.interrupted, results.cleanup?.errors ?? ["cleanup missing"]);
   results.finishedAt = new Date().toISOString(); save();
   console.log(JSON.stringify({ status: results.status, acceptanceScope: results.acceptanceScope, evidence, checks: Object.keys(results.checks), failure: results.failed ?? results.cleanupFailure }));
   process.exitCode = results.status === "PASS" ? 0 : 1;

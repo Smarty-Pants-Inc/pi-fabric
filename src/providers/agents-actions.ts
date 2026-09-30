@@ -405,6 +405,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         transport: runProperties.transport,
         timeoutMs: runProperties.timeoutMs,
         nice: runProperties.nice,
+        bashTimeoutSeconds: { type: "integer", minimum: 0, description: "Default timeout in seconds for a bash call without one in this actor's runs (default 600); 0 = no default timeout." },
         extensions: runProperties.extensions,
         inferenceContext: { type: "string", enum: ["full-history", "activation"], description: "Inference-only activation window (Pi only); journals remain complete. Default full-history." },
         requires: {

@@ -40,7 +40,8 @@ const fakePi = () => {
       commands.set(name, command),
     sendUserMessage: (text: string) => sent.push(text),
   };
-  const emit = (name: string, context: unknown) => handlers.get(name)?.forEach((handler) => handler({}, context));
+  const emit = (name: string, context: unknown, event: unknown = {}) =>
+    handlers.get(name)?.forEach((handler) => handler(event, context));
   return { pi, emit, commands, sent };
 };
 
@@ -90,7 +91,7 @@ describe("release detection", () => {
 });
 
 describe("installSelfReload", () => {
-  const setup = (options: { busy?: () => number; configured?: boolean } = {}) => {
+  const setup = (options: { busy?: () => number; configured?: boolean; halted?: () => boolean } = {}) => {
     const old = release("aaa");
     const next = release("bbb");
     activate(old);
@@ -100,6 +101,7 @@ describe("installSelfReload", () => {
       autoReloadConfigured: () => options.configured ?? true,
       moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
       settingsPath: settingsPath(),
+      ...(options.halted ? { halted: options.halted } : {}),
     });
     return { old, next, emit, commands, sent, selfReload };
   };
@@ -148,6 +150,41 @@ describe("installSelfReload", () => {
     expect(sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
     await vi.advanceTimersByTimeAsync(20_000);
     expect(sent).toHaveLength(1);
+  });
+
+  it("reports a reload held by background work once per target (smarty-dev#2216)", async () => {
+    vi.useFakeTimers();
+    const old = release("aaa");
+    const next = release("bbb");
+    activate(old);
+    const { pi, emit, sent } = fakePi();
+    const published: Array<{ reason: string; heldForMs: number; target: string }> = [];
+    const selfReload = installSelfReload(pi as never, {
+      busy: () => 1, // a dev server that never ends
+      autoReloadConfigured: () => true,
+      moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
+      settingsPath: settingsPath(),
+      heldNoticeMs: 60_000,
+      publishHeld: (data) => published.push(data),
+    });
+    const context = fakeContext("s-held", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    emit("agent_settled", context);
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(context.notices).toEqual([]);
+    expect(published).toEqual([]);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(context.notices).toHaveLength(1);
+    expect(context.notices[0]).toMatch(/^Fabric reload to bbb held \d+ min: 1 task agent/);
+    expect(context.notices[0]).not.toContain("\n");
+    expect(published).toEqual([{ reason: expect.stringContaining("still running"), heldForMs: expect.any(Number), target: fs.realpathSync(next) }]);
+    expect(published[0]!.heldForMs).toBeGreaterThanOrEqual(60_000);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    emit("agent_settled", context);
+    expect(context.notices).toHaveLength(1);
+    expect(published).toHaveLength(1);
+    expect(sent).toEqual([]);
   });
 
   it("never reloads under a prompt in preflight or during settle handlers (review/astra on #158)", async () => {
@@ -199,6 +236,54 @@ describe("installSelfReload", () => {
     expect(sent).toHaveLength(2);
     await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
     expect(context.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("an Escape halt holds the automatic reload until the user's next input (review/astra on #158)", async () => {
+    vi.useFakeTimers();
+    let halted = true;
+    let busy = 1;
+    const { next, emit, commands, sent, selfReload } = setup({ busy: () => busy, halted: () => halted });
+    const context = fakeContext("s-halted", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    emit("agent_settled", context, { outcome: "completed" });
+    busy = 0;
+    await vi.advanceTimersByTimeAsync(20_000); // no retry tick requests it either
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(sent).toEqual([]);
+    expect(context.reload).not.toHaveBeenCalled();
+    // An extension's prompt does not resume; the user's input does (and lifts the actor halt).
+    emit("input", context, { source: "extension" });
+    halted = false;
+    emit("input", context, { source: "interactive" });
+    emit("agent_settled", context, { outcome: "completed" });
+    expect(sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
+    await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+    expect(context.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("an aborted or failed settle holds the automatic reload until the user's next input", async () => {
+    vi.useFakeTimers();
+    let busy = 1;
+    const { next, emit, commands, sent, selfReload } = setup({ busy: () => busy });
+    const context = fakeContext("s-aborted", { idle: true, pending: false });
+    selfReload.sessionStart("startup", context as never);
+    activate(next);
+    for (const outcome of ["aborted", "error"]) {
+      emit("agent_settled", context, { outcome });
+      busy = 0;
+      await vi.advanceTimersByTimeAsync(20_000);
+      await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
+      emit("input", context, { source: "extension" });
+      emit("agent_settled", context, { outcome: "completed" }); // e.g. Fabric's inbox follow-up
+      expect(sent).toEqual([]);
+      expect(context.reload).not.toHaveBeenCalled();
+      busy = 1;
+    }
+    busy = 0;
+    emit("input", context, { source: "interactive" });
+    emit("agent_settled", context, { outcome: "completed" });
+    expect(sent).toEqual([`/${SELF_RELOAD_COMMAND} auto`]);
   });
 
   it("the command defers when a turn or a queued message arrived meanwhile", async () => {

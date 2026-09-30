@@ -309,6 +309,15 @@ const statStamp = (filePath: string): string | undefined => {
   }
 };
 
+/**
+ * Strict read-only check of a mesh root's state.json (pi-fabric#157). An absent file is a valid empty
+ * mesh; a present file that is empty, damaged, or not a state envelope (`{}`, `null`) throws. The
+ * runtime MeshStore stays tolerant; readers that must not report false absence call this first.
+ */
+export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STATE_BYTES): void => {
+  readState(path.join(root, "state.json"), maxBytes, false);
+};
+
 const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY): void => {
   // Compact: the file is rewritten under the mesh lock on every write, and indenting made it 22%
   // larger and slower to serialize (smarty-dev#2004).

@@ -1006,6 +1006,85 @@ describe("Main followUp journal across a live reload in a real Pi session", () =
   });
 });
 
+// pi-fabric#184 Astra R3: a provider retry continues without a user input event.
+describe("Main provider recovery in a real Pi session", () => {
+  it.each([0, 60_000].flatMap((flushMs) => [false, true].map((ownerHalt) => ({ flushMs, ownerHalt }))))(
+    "provider error then recovery wakes once for a peer followUp, unless the owner halted (flushMs=$flushMs, ownerHalt=$ownerHalt)",
+    async ({ flushMs, ownerHalt }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-recovery-"));
+      roots.push(root);
+      const journal = path.join(root, "journal.json");
+      const faux = fauxProvider();
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+      modelRuntime.registerNativeProvider(faux.provider);
+      let main: MainAgentController | undefined;
+      const inputs: string[] = [];
+      const turns: string[] = [];
+      let settled = 0;
+      const loader = new DefaultResourceLoader({
+        cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{
+          name: "provider-recovery",
+          factory: (pi: ExtensionAPI) => {
+            pi.on("session_start", (_event, ctx) => {
+              main = new MainAgentController(pi, "session:root", true, root, "root");
+              main.attachFollowUpDrain(ctx, flushMs, journal);
+            });
+            pi.on("input", (event) => { inputs.push(event.source); });
+            pi.on("turn_end", (event) => {
+              if (event.message.role !== "assistant") return;
+              turns.push(event.message.stopReason);
+              if (ownerHalt && event.message.stopReason === "error") main!.halt();
+            });
+            pi.on("agent_settled", () => { settled++; });
+          },
+        }],
+      });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(root), tools: [],
+        settingsManager: SettingsManager.inMemory({ retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 }, compaction: { enabled: false } }),
+      });
+      sessions.push(session);
+      await session.bindExtensions({});
+      const retries: boolean[] = [];
+      session.subscribe((event) => { if (event.type === "auto_retry_end") retries.push(event.success); });
+      try {
+        faux.setResponses([
+          fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 service unavailable" }),
+          fauxAssistantMessage("recovered"),
+          fauxAssistantMessage("peer result handled"),
+        ]);
+        await session.prompt("recover the provider");
+        await session.waitForIdle();
+        expect(turns).toEqual(["error", "stop"]);
+        expect(retries).toEqual([true]);
+        expect(inputs).toHaveLength(1); // Native retry did not provide user input to clear a latch.
+        expect(faux.state.callCount).toBe(2);
+        expect(settled).toBe(1);
+        const index = JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8"));
+        expect(index.halted).toBe(ownerHalt ? true : undefined);
+        const result = main!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+          message: "peer after recovery", delivery: "followUp", deliveryId: "peer-after-recovery" });
+        expect(main!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+          message: "peer after recovery", delivery: "followUp", deliveryId: "peer-after-recovery" })).toMatchObject({ duplicate: true });
+        await session.waitForIdle();
+        expect(faux.state.callCount).toBe(ownerHalt ? 2 : 3);
+        expect(settled).toBe(ownerHalt ? 1 : 2);
+        const custom = session.messages.filter((message) => message.role === "custom" && message.customType === "pi-fabric-agent-message");
+        expect(custom).toHaveLength(1);
+        expect(custom[0]).toMatchObject({ details: { id: result.messageId, triggerTurn: !ownerHalt } });
+        expect(inputs).toHaveLength(1);
+      } finally {
+        await session.abort();
+        await session.waitForIdle();
+        main?.closeFollowUpDrain();
+      }
+    },
+  );
+});
+
 // dev-lead's probe on pi-fabric#102: drain disabled, the process killed after the handoff to Pi
 // and before the session wrote it, then a restart: the followUp is delivered exactly once.
 describe("Main followUp journal across a kill with the drain off, in real Pi sessions", () => {

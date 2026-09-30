@@ -337,6 +337,30 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     expect(f.sent).toHaveLength(2);
   });
 
+  it.each([0, 60_000].flatMap((flushMs) => [false, true].map((ownerHalt) => ({ flushMs, ownerHalt }))))(
+    "a terminal provider failure stays passive until a successful turn, without lifting an owner halt (flushMs=$flushMs, ownerHalt=$ownerHalt)",
+    async ({ flushMs, ownerHalt }) => {
+      const f = await fixture();
+      const host = f.main(false, flushMs);
+      host.emit("turn_end", { message: { stopReason: "error" } });
+      host.emit("agent_before_settle", { outcome: "error", context: { pendingMessages: [] } });
+      host.emit("agent_settled", { outcome: "error" });
+      host.setIdle(true);
+      if (ownerHalt) host.controller.halt();
+      host.controller.deliverAgent({ from: sender, message: "failed provider", delivery: "followUp" });
+      expect(f.sent.at(-1)!.options.triggerTurn).toBe(false);
+      host.emit("agent_start");
+      host.emit("input", { source: "extension" });
+      host.controller.deliverAgent({ from: sender, message: "not recovered yet", delivery: "steer" });
+      expect(f.sent.at(-1)!.options.triggerTurn).toBe(false);
+      host.emit("turn_end", { message: { stopReason: "stop" }, context: { pendingMessages: [] } });
+      host.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
+      host.emit("agent_settled", { outcome: "completed" });
+      host.controller.deliverAgent({ from: sender, message: "provider recovered", delivery: "followUp" });
+      expect(f.sent.at(-1)!.options.triggerTurn).toBe(!ownerHalt);
+    },
+  );
+
   it.each([0, 60_000])("cancel then reload keeps replay passive until user input (flushMs=%s)", async (flushMs) => {
     const f = await fixture();
     const old = f.main(false, flushMs);
@@ -357,6 +381,122 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     fresh.controller.deliverAgent({ from: sender, message: "user resumed", delivery: "steer" });
     expect(f.sent.at(-1)!.options.triggerTurn).toBe(true);
     expect(fresh.controller.deliverAgent(request)).toMatchObject({ duplicate: true });
+  });
+
+  it.each([0, 60_000].flatMap((flushMs) => ["EACCES", "EIO", "parse", "shape"].map((failure) => ({ flushMs, failure }))))(
+    "an unreadable halt index keeps replay and gap control passive until user input ($failure, flushMs=$flushMs)", async ({ flushMs, failure }) => {
+      const f = await fixture();
+      const old = f.main(false, flushMs);
+      old.controller.prepareReload();
+      old.controller.deliverAgent({ from: sender, message: "unverified replay", delivery: "steer", deliveryId: "unverified-replay" });
+      old.controller.halt();
+      old.controller.closeFollowUpDrain();
+      const index = path.join(f.mesh().root, "main-followups", `${encodeURIComponent(sessionId)}.json.delivered`);
+      expect(JSON.parse(fs.readFileSync(index, "utf8")).halted).toBe(true);
+      if (failure === "parse") fs.writeFileSync(index, "{");
+      if (failure === "shape") fs.writeFileSync(index, JSON.stringify({ version: 1, ids: [], halted: "unknown" }));
+      const read = fs.readFileSync;
+      let attempts = 0;
+      const fault = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+        if (String(file) === index && ["EACCES", "EIO"].includes(failure)) {
+          attempts++;
+          throw Object.assign(new Error("halt index unreadable"), { code: failure });
+        }
+        return (read as (...args: unknown[]) => unknown)(file, ...args);
+      }) as typeof fs.readFileSync);
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const fresh = f.main(true, flushMs);
+        expect(f.sent).toHaveLength(1);
+        expect(f.sent[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: false });
+        if (failure === "EACCES") expect(attempts).toBe(5);
+        if (failure === "EIO") expect(attempts).toBe(1);
+        const owner = f.router(fresh.controller, f.owner, f.plane(identity));
+        const command = { version: 1 as const, commandId: "unverified-gap", targetId: identity.id, replyTo: sender.id,
+          operation: "followUp" as const, message: "unverified gap", requestedAt: Date.now() };
+        expect(await owner.acceptControl(command, sender)).toMatchObject({ accepted: true });
+        fresh.emit("agent_settled", { outcome: "completed" });
+        fresh.emit("input", { source: "extension" });
+        expect(f.sent.at(-1)!.options.triggerTurn).toBe(false);
+        expect(warning.mock.calls.filter(([message]) => String(message).includes("halt index"))).toHaveLength(1);
+        fault.mockRestore();
+        // Delivery must never overwrite unknown owner authority with a running state.
+        if (["EACCES", "EIO"].includes(failure)) expect(JSON.parse(read(index, "utf8")).halted).toBe(true);
+        fresh.emit("input", { source: "interactive" });
+        fresh.controller.deliverAgent({ from: sender, message: "user recovered", delivery: "steer" });
+        expect(f.sent.at(-1)!.options.triggerTurn).toBe(true);
+        expect(JSON.parse(read(index, "utf8")).halted).toBeUndefined();
+      } finally {
+        fault.mockRestore();
+        warning.mockRestore();
+      }
+    });
+
+  it.each([0, 60_000])("an unreadable halt index keeps gap control passive without a payload journal (flushMs=%s)", async (flushMs) => {
+    const f = await fixture();
+    const old = f.main(true, flushMs);
+    old.controller.halt();
+    old.controller.closeFollowUpDrain();
+    const journal = path.join(f.mesh().root, "main-followups", `${encodeURIComponent(sessionId)}.json`);
+    expect(fs.existsSync(journal)).toBe(false);
+    const read = fs.readFileSync;
+    const fault = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === `${journal}.delivered`) throw Object.assign(new Error("halt index unreadable"), { code: "EIO" });
+      return (read as (...args: unknown[]) => unknown)(file, ...args);
+    }) as typeof fs.readFileSync);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const fresh = f.main(true, flushMs);
+      const owner = f.router(fresh.controller, f.owner, f.plane(identity));
+      expect(await owner.acceptControl({ version: 1, commandId: "gap-only", targetId: identity.id, replyTo: sender.id,
+        operation: "steer", message: "gap without journal", requestedAt: Date.now() }, sender)).toMatchObject({ accepted: true });
+      expect(f.sent).toHaveLength(1);
+      expect(f.sent[0]!.options.triggerTurn).toBe(false);
+      expect(warning).toHaveBeenCalledTimes(1);
+    } finally {
+      fault.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
+  it.each([0, 60_000])("a transient halt-index read failure retries and retains readable running permission (flushMs=%s)", async (flushMs) => {
+    const f = await fixture();
+    const journal = path.join(f.mesh().root, "main-followups", `${encodeURIComponent(sessionId)}.json`);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(`${journal}.delivered`, JSON.stringify({ version: 1, ids: [] }));
+    const read = fs.readFileSync;
+    let attempts = 0;
+    const fault = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === `${journal}.delivered` && ++attempts <= 2) throw Object.assign(new Error("transient"), { code: "EBUSY" });
+      return (read as (...args: unknown[]) => unknown)(file, ...args);
+    }) as typeof fs.readFileSync);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const fresh = f.main(true, flushMs);
+      expect(attempts).toBe(3);
+      fresh.controller.deliverAgent({ from: sender, message: "read recovered", delivery: "steer" });
+      expect(f.sent[0]!.options.triggerTurn).toBe(true);
+      expect(warning).not.toHaveBeenCalled();
+    } finally {
+      fault.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
+  it.each([0, 60_000])("a readable not-halted index permits replay and gap control to wake (flushMs=%s)", async (flushMs) => {
+    const f = await fixture();
+    const old = f.main(false, flushMs);
+    old.controller.prepareReload();
+    old.controller.deliverAgent({ from: sender, message: "running replay", delivery: "steer", deliveryId: "running-replay" });
+    old.controller.closeFollowUpDrain();
+    const index = path.join(f.mesh().root, "main-followups", `${encodeURIComponent(sessionId)}.json.delivered`);
+    fs.writeFileSync(index, JSON.stringify({ version: 1, ids: [], halted: false }));
+    const fresh = f.main(true, flushMs);
+    expect(f.sent[0]!.options.triggerTurn).toBe(true);
+    const owner = f.router(fresh.controller, f.owner, f.plane(identity));
+    expect(await owner.acceptControl({ version: 1, commandId: "running-gap", targetId: identity.id, replyTo: sender.id,
+      operation: "steer", message: "running gap", requestedAt: Date.now() }, sender)).toMatchObject({ accepted: true });
+    expect(f.sent.at(-1)!.options.triggerTurn).toBe(true);
   });
 
   it("an Escape halt latch survives reload even without an aborted turn or settle", async () => {

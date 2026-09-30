@@ -240,6 +240,44 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     }), expect.objectContaining({ id: local.id }), expect.any(AbortSignal));
   });
 
+  it.each(["steer", "followUp"] as const)("refuses a cached native %s route replaced by a mirror without publication or replacement replay", async (kind) => {
+    const { meshRoot, mesh, directory, mirror, local, remote } = await setup({ heartbeatMs: 60_000 });
+    await mirror({ unmarked: true, host: { remoteHost: undefined } });
+    const native = directory.get(remote.id);
+    expect(native).toMatchObject({ id: remote.id });
+    expect(native?.remoteHost).toBeUndefined();
+    const get = directory.get.bind(directory);
+    const cached = vi.spyOn(directory, "get").mockImplementation((id, now, options) =>
+      id === remote.id && !options?.fresh ? native : get(id, now, options));
+    try {
+      await mesh.writeBatch({ identity: remote, ops: [
+        { kind: "delete", key: "topology/hosts/" + hash(remote.id) },
+        { kind: "delete", key: "topology/participants/" + hash(remote.id) },
+      ] });
+      removeHostLease(meshRoot, remote.id);
+      await mirror({ record: { remoteHost: "ryzen2" }, host: { remoteHost: "ryzen2" } });
+      expect(directory.get(remote.id, undefined, { fresh: true })).toMatchObject({ remoteHost: "ryzen2" });
+      const sender = senderOn(mesh, local, 300, directory);
+      const publish = vi.spyOn(sender.mesh, "publish");
+      const request = vi.spyOn(sender, "request");
+      const router = routerFor(directory, sender, local);
+      const failure = await router.routeMessage(remote.id, "private payload", { private: "native-only" }, kind).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ code: "FABRIC_ROUTE_AUTHORITY_CHANGED" });
+      expect(failure).toBeInstanceOf(Error);
+      expect(request).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      const writer = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      await writer.publish({ topic: "fabric.control.ack", kind: "rejected", from: remote, to: local.id,
+        data: { version: 1, commandId: "foreign-native-replacement", targetId: remote.id, accepted: false,
+          error: "replacement says not run", notRun: true, bridge: { from: "ryzen2" } } });
+      await sender.close();
+      expect(mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual([]);
+      expect(publish).not.toHaveBeenCalled();
+    } finally {
+      cached.mockRestore();
+    }
+  });
+
   // Lane A's security pass on pi-fabric#135 (F2): a faulty bridge must not answer for another
   // link's owner, or for a native one.
   it("accepts a mirrored owner's acknowledgement only through its own bridge", { timeout: 30_000 }, async () => {

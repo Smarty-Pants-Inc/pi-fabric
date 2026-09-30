@@ -51,6 +51,15 @@ export const unknownParticipant = (
   return new Error(`Unknown ${label}: ${id} (${when}, so the session has probably ended)`);
 };
 
+/** The selected root authority disappeared or changed before delivery; nothing was published. */
+export class FabricRouteAuthorityError extends Error {
+  readonly code = "FABRIC_ROUTE_AUTHORITY_CHANGED";
+  constructor(id: string) {
+    super(`Fabric native routing is unavailable for ${id}; the routed owner could not be revalidated; this attempt was not published. Retry after its native presence returns.`);
+    this.name = "FabricRouteAuthorityError";
+  }
+}
+
 export class AgentMessageRouter {
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
@@ -76,11 +85,17 @@ export class AgentMessageRouter {
   #rootRouteSnapshot(id: string): FabricParticipantInfo | undefined {
     const cached = this.participants.get(id);
     // Keep a mirrored root's original bridge for the control plane's fresh admission check.
-    // A fresh lookup here could silently reroute a cached target to a replacement bridge.
-    // Native roots still need fresh lifecycle state to enforce shutdown and reload bounds.
-    return (cached?.kind === "root" && cached.remoteHost
-      ? cached
-      : this.participants.get(id, undefined, { fresh: true })) ?? this.#recentlyLapsedRoot(id);
+    if (cached?.kind === "root" && cached.remoteHost) return cached;
+    const fresh = this.participants.get(id, undefined, { fresh: true });
+    if (cached?.kind === "root") {
+      // Refresh native lifecycle state only under the same authority. A replacement mirror
+      // with the same id must never turn a private native delivery into bridge publication.
+      if (!fresh || fresh.kind !== "root" || fresh.remoteHost || fresh.id !== cached.id ||
+        fresh.rootId !== cached.rootId || fresh.ownerHostId !== cached.ownerHostId ||
+        fresh.ownerIdentityId !== cached.ownerIdentityId) throw new FabricRouteAuthorityError(id);
+      return fresh;
+    }
+    return fresh ?? this.#recentlyLapsedRoot(id);
   }
 
   // A bare session UUID addresses its Main `session:<uuid>` when no participant has exactly

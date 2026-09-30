@@ -1,5 +1,6 @@
 import type { FabricProvider } from "../protocol.js";
 import { AgentService } from "./service.js";
+import { deliverWithMessageNotice, outgoingMessageNotice } from "../providers/message-id-notice.js";
 import { agentServiceArgs, agentServiceDescriptors } from "./service-schema.js";
 import type { AgentServiceAction, AgentServiceCapabilities, AgentServiceClient, AgentServiceDispatcher, AgentPublicRecord, AgentServiceRequest, AgentSessionRecord } from "./service-types.js";
 
@@ -67,6 +68,13 @@ export function createAgentsProvider(client: AgentServiceClient): FabricProvider
     list: async () => structuredClone(descriptors),
     describe: async (name) => structuredClone(descriptors.find((descriptor) => descriptor.name === name)),
     prepareArguments: (action, args) => validate(action, args),
-    invoke: async (action, args, context) => client.dispatch(action as AgentServiceAction, validate(action, args), context.signal),
+    invoke: async (action, args, context) => {
+      const validated = validate(action, args);
+      if (action !== "steer" && action !== "followUp") return client.dispatch(action as AgentServiceAction, validated, context.signal);
+      const checked = await outgoingMessageNotice(validated.message as string, context);
+      const result = await deliverWithMessageNotice(validated.message as string, checked,
+        message => client.dispatch(action, { ...validated, message }, context.signal));
+      return checked.notice ? { ...(result as object), notice: checked.notice } : result;
+    },
   };
 }

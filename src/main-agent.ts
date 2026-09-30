@@ -48,6 +48,8 @@ export interface FabricFollowUpQueueDepth {
 }
 
 export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDepth> {
+  /** Advisory identifier provenance notice; appended to delivered text when admission permits. */
+  notice?: string;
   queued: true;
   messageId: string;
   routed: "local" | "main" | "mesh";

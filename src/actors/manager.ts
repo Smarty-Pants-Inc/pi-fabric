@@ -472,7 +472,7 @@ export class ActorManager {
       onEvent: (event) => {
         if (event.topic === "fabric.steer") this.#relaySteer(event);
         else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
-        return true;
+        return event.topic === "fabric.steer" ? true : "ignored";
       },
     });
     this.#meshMonitor.start();
@@ -2600,7 +2600,7 @@ export class ActorManager {
 
   // Returns false when an owned receiver's queue was full; the monitor then offers the event
   // again while it catches up, and actors that already took it are skipped.
-  #dispatchMeshEvent(event: MeshEvent): boolean {
+  #dispatchMeshEvent(event: MeshEvent): boolean | "ignored" {
     // One ownership refresh per event. Each decision reads the participant directory, and
     // re-deciding for every actor per actor (and before the topic filter) cost 182 directory
     // reads per event on a host with 13 actors and saturated its event loop (smarty-dev#784).
@@ -2615,8 +2615,9 @@ export class ActorManager {
     }
   }
 
-  #deliverMeshEvent(event: MeshEvent): boolean {
+  #deliverMeshEvent(event: MeshEvent): boolean | "ignored" {
     let full = false;
+    let handedOn = false;
     for (const actor of this.#actors.values()) {
       if (actor.status === "stopped") continue;
       const addressed = event.to === actor.id || event.to === actor.name;
@@ -2641,6 +2642,7 @@ export class ActorManager {
           });
         }
         this.#delivered.add(delivery);
+        handedOn = true;
         if (this.#delivered.size > DELIVERED_EVENT_MEMORY) {
           this.#delivered.delete(this.#delivered.values().next().value!);
         }
@@ -2649,7 +2651,7 @@ export class ActorManager {
         if (error instanceof Error && error.message.startsWith("Fabric actor queue limit reached")) full = true;
       }
     }
-    return !full;
+    return full ? false : handedOn ? true : "ignored";
   }
 
   async #retainRunLog(actor: ManagedActor, runId: string): Promise<void> {

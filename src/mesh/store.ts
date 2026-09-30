@@ -153,8 +153,20 @@ const processAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
     return true;
+  } catch (error) {
+    return errorCode(error) === "EPERM"; // A process we cannot signal is not a dead holder.
+  }
+};
+
+/** Linux's PID incarnation; unavailable platforms/reads retain the legacy live-PID guard. */
+const processStartTime = (pid: number): string | undefined => {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const start = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+    return start && /^\d+$/.test(start) ? start : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 };
 
@@ -726,9 +738,15 @@ export class MeshStore {
   }
 
   latestOffset(): number {
+    return this.latestCursor().cursor;
+  }
+
+  /** Tail offset and sequence boundary from the same file handle, never the reservation/archive head. */
+  latestCursor(): { cursor: number; last?: { sequence: number; id: string } } {
     const generation = this.#readGeneration();
     let descriptor: number | undefined;
     let completeOffset = 0;
+    let last: { sequence: number; id: string } | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const size = fs.fstatSync(descriptor).size;
@@ -745,12 +763,32 @@ export class MeshStore {
           completeOffset = newline >= 0 ? size - readBytes + newline + 1 : 0;
         }
       }
+      if (completeOffset > 0) {
+        // Bounded startup work: just the last complete line, using the captured offset even
+        // if another publisher has since appended. A partial append is never an anchor.
+        const readBytes = Math.min(completeOffset, this.maxEventBytes + 2);
+        const tail = Buffer.allocUnsafe(readBytes);
+        const bytesRead = fs.readSync(descriptor, tail, 0, readBytes, completeOffset - readBytes);
+        if (bytesRead === readBytes) {
+          const lineStart = tail.lastIndexOf(0x0a, tail.length - 2) + 1;
+          if (lineStart > 0 || readBytes === completeOffset) {
+            try {
+              const event = JSON.parse(tail.subarray(lineStart, tail.length - 1).toString("utf8")) as MeshEvent;
+              if (Number.isSafeInteger(event.sequence) && event.sequence > 0 && typeof event.id === "string") {
+                last = { sequence: event.sequence, id: event.id };
+              }
+            } catch { /* unreadable boundary: a saved lastless cursor reconciles conservatively */ }
+          }
+        }
+      }
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
     }
-    return this.#encodeCursor(generation, completeOffset);
+    // Sequence zero is a start boundary, not a later reservation that could skip unread work.
+    if (completeOffset === 0) last = { sequence: 0, id: "" };
+    return { cursor: this.#encodeCursor(generation, completeOffset), ...(last ? { last } : {}) };
   }
 
   tail(cursor: number, limit = 100): MeshTailResult {
@@ -1422,25 +1460,46 @@ export class MeshStore {
     const deadline = Date.now() + this.#lockTimeoutMs;
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
+    const startTime = processStartTime(process.pid);
+    const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     // Attempts and the largest gap between two of them: a large gap means this waiter stalled
     // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
     let attempts = 0;
     let maxGapMs = 0;
     let lastAttemptAt = Date.now();
+    let retryCeilingMs = 20;
     while (true) {
       const attemptAt = Date.now();
       if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
       attempts += 1;
       lastAttemptAt = attemptAt;
       try {
-        fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
-          encoding: "utf8",
-          mode: 0o600,
-        });
+        // Never expose an ownerless canonical directory: a stalled initializer must not
+        // resume its owner write through a name that legacy recovery gave to a successor.
+        const staging = fs.mkdtempSync(`${this.#lockPath}.pending.${token}.`);
+        try {
+          fs.writeFileSync(path.join(staging, "owner"), ownerRecord, {
+            encoding: "utf8", flag: "wx", mode: 0o600,
+          });
+          // POSIX rename can replace an EMPTY directory, but a fresh ownerless legacy
+          // lock may be an in-flight creator. Route every observed canonical path through
+          // the original owner/stale checks instead of publishing over it.
+          try {
+            fs.lstatSync(this.#lockPath);
+            throw Object.assign(new Error("Fabric mesh lock already exists"), { code: "EEXIST" });
+          } catch (error) {
+            if (errorCode(error) !== "ENOENT") throw error;
+          }
+          // New-format competitors publish nonempty owners atomically. This does not fence
+          // old-format writers that create an empty canonical after the absence check.
+          fs.renameSync(staging, this.#lockPath);
+        } finally {
+          fs.rmSync(staging, { recursive: true, force: true });
+        }
         break;
       } catch (error) {
-        if (errorCode(error) !== "EEXIST") throw error;
+        const code = errorCode(error);
+        if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES") throw error;
         if (this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
           throw Object.assign(new Error(
@@ -1450,7 +1509,11 @@ export class MeshStore {
             code: "FABRIC_MESH_LOCK_TIMEOUT",
           });
         }
-        await delay(10);
+        // Equal-range jitter separates competing writers without hot 10 ms retries. Keep
+        // the floor at 10 ms, the ceiling at 250 ms, and never sleep past this wait's deadline.
+        const backoffMs = 10 + Math.floor(Math.random() * (retryCeilingMs - 10));
+        await delay(Math.min(backoffMs, Math.max(0, deadline - Date.now())));
+        retryCeilingMs = Math.min(250, retryCeilingMs * 2);
       }
     }
     try {
@@ -1463,8 +1526,12 @@ export class MeshStore {
     } finally {
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");
-        if (owner.startsWith(`${token}\n`)) {
-          fs.rmSync(this.#lockPath, { recursive: true, force: true });
+        if (owner === ownerRecord) {
+          // Detach the complete owned directory before unlinking anything inside it.
+          // Interrupted/resumed recursive cleanup must never follow the canonical name.
+          const released = `${this.#lockPath}.released.${token}`;
+          fs.renameSync(this.#lockPath, released);
+          fs.rmSync(released, { recursive: true, force: true });
         }
       } catch {
         // Another process already recovered or removed this lock.
@@ -1472,44 +1539,50 @@ export class MeshStore {
     }
   }
 
-  // Returns true when a stale lock was removed and acquisition should retry.
-  // A lock is stale when it outlived the stale window without a live owner:
-  // either the owner file names a dead process, or the owner file is missing
-  // or corrupt — the owner crashed between creating the lock directory and
-  // writing the owner file — and the untouched lock directory itself is
-  // stale. Removal re-reads the state it judged stale so a freshly rotated
-  // owner is never deleted mid-check.
+  // Dead holders are recoverable at once; only missing/corrupt records need the stale
+  // directory window. A live PID (including stopped/permission-denied) remains protected,
+  // unless Linux proves it is a different incarnation from the optional fourth owner line.
   #clearStaleLock(ownerPath: string): boolean {
-    let lockModifiedAt: number | undefined;
-    let owner: string | undefined;
     try {
-      owner = fs.readFileSync(ownerPath, "utf8");
-    } catch {
-      try {
-        lockModifiedAt = fs.statSync(this.#lockPath).mtimeMs;
-      } catch {
+      const stat = fs.lstatSync(this.#lockPath);
+      if (!stat.isDirectory()) return false;
+      const readOwner = (): string | undefined => {
+        try { return fs.readFileSync(ownerPath, "utf8"); }
+        catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+      };
+      const owner = readOwner();
+      const [token, pidText, createdText, startText] = owner?.trim().split("\n") ?? [];
+      // An in-flight/torn fourth line is not evidence of PID reuse.
+      const recordedStart = owner?.endsWith("\n") ? startText : undefined;
+      const pid = Number(pidText);
+      const validPid = Number.isSafeInteger(pid) && pid > 0;
+      const validOwner = !!token && validPid && createdText !== undefined &&
+        createdText.trim() !== "" && Number.isFinite(Number(createdText));
+      if (validPid && processAlive(pid)) {
+        if (!validOwner || !recordedStart || !/^\d+$/.test(recordedStart)) return false;
+        const actualStart = processStartTime(pid);
+        if (!actualStart || actualStart === recordedStart) return false;
+      } else if (!validOwner && Date.now() - stat.mtimeMs <= this.#staleLockMs) {
         return false;
       }
-    }
-    if (owner !== undefined) {
-      const [, pidText, createdText] = owner.trim().split("\n");
-      const createdAt = Number(createdText);
-      if (Number.isFinite(createdAt) && Date.now() - createdAt <= this.#staleLockMs) return false;
-      if (processAlive(Number(pidText))) return false;
-      try {
-        if (fs.readFileSync(ownerPath, "utf8") !== owner) return false;
-        fs.rmSync(this.#lockPath, { recursive: true, force: true });
-        return true;
-      } catch {
-        return false;
+      const unchanged = (): boolean => {
+        const current = fs.lstatSync(this.#lockPath);
+        return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino && readOwner() === owner;
+      };
+      if (!unchanged()) return false;
+      if (owner === undefined) {
+        // An empty orphan must also leave a NONEMPTY fence. Never overwrite an owner;
+        // identity/owner rechecks reject a successor even if this marker raced its mkdir.
+        if (fs.statSync(this.#lockPath).mtimeMs !== stat.mtimeMs) return false;
+        try { fs.writeFileSync(path.join(this.#lockPath, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
+        catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
       }
-    }
-    if (lockModifiedAt === undefined || Date.now() - lockModifiedAt <= this.#staleLockMs) {
-      return false;
-    }
-    try {
-      if (fs.statSync(this.#lockPath).mtimeMs !== lockModifiedAt) return false;
-      fs.rmSync(this.#lockPath, { recursive: true, force: true });
+      if (!unchanged()) return false;
+      const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner ?? ""}`).digest("hex")}`;
+      // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
+      // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting
+      // it, or recursively deleting the canonical name after a re-read, reopens that race.
+      fs.renameSync(this.#lockPath, fence);
       return true;
     } catch {
       return false;

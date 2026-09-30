@@ -889,7 +889,7 @@ export class QuickJsRuntime {
     const runtime = context.runtime;
     const jsonObject = context.getProp(context.global, "JSON");
     const jsonParse = context.getProp(jsonObject, "parse");
-    const executionDeadline = new ExecutionDeadline(options);
+    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
     let interruptedByDeadline = false;
     // Timers cannot police an uninterrupted chain of already-resolved host
     // promises. Every boundary and the CPU interrupt use this same deadline.

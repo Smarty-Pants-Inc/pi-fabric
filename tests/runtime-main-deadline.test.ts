@@ -75,6 +75,31 @@ for (const [backend, Runtime] of Object.entries(runtimes)) {
       } finally { timer.restore(); release?.(); await result; }
     });
 
+    it("extends the supplied host clamp record rather than a private runtime copy", async () => {
+      const reason = createMainExecutionCeilingError(5_000);
+      const maximumDeadlineAt = Date.now() + 5_000;
+      const executionDeadline = new ExecutionDeadline({ timeoutMs: 2_000, maximumDeadlineAt, maximumDeadlineReason: reason });
+      const timer = captureRuntimeDeadline(backend);
+      let signal: AbortSignal | undefined;
+      let release: (() => void) | undefined;
+      const result = new Runtime().execute(backend === "monty" || backend === "cpython"
+        ? 'return await tools.call(ref="demo.hold", args={})' : 'return tools.call({ ref: "demo.hold", args: {} });',
+        async (_ref, _args, hostSignal) => { signal = hostSignal; return new Promise<void>(resolve => { release = resolve; }); },
+        { timeoutMs: 2_000, executionDeadline, maximumDeadlineAt, maximumDeadlineReason: reason,
+          memoryLimitBytes: 128 * 1024 * 1024, minimumTimeoutMsForHostCall: () => 900_000 });
+      try {
+        await waitFor(() => Boolean(signal) && timer.ready());
+        expect(executionDeadline.at).toBe(maximumDeadlineAt);
+        timer.fireEarly(maximumDeadlineAt);
+        expect(signal!.aborted).toBe(false);
+        timer.fireAt(maximumDeadlineAt);
+        expect(executionDeadline.reason).toBe(reason);
+        expect(mainExecutionCeilingAbortReason(signal)).toBe(reason);
+        release!();
+        expect((await result).deadlineReason).toBe(reason);
+      } finally { timer.restore(); release?.(); await result; }
+    });
+
     it("does not brand a shorter timeout, even if its timer is observed beyond Main's deadline", async () => {
       const maximumDeadlineAt = Date.now() + 5_000;
       const timer = captureRuntimeDeadline(backend);

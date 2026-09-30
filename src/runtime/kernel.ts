@@ -1,3 +1,5 @@
+import type { ExecutionDeadline } from "./execution-deadline.js";
+
 // Language-neutral execution contract shared by all Fabric kernel backends.
 export type FabricKernel = "typescript" | "python";
 
@@ -18,6 +20,8 @@ export interface FabricSandboxResult {
 
 export interface FabricSandboxOptions {
   timeoutMs: number;
+  /** Host-only shared clamp record, including runtime host-call floor extensions. */
+  executionDeadline?: ExecutionDeadline;
   /** Host-owned absolute ceiling; host-call floors cannot extend it. */
   maximumDeadlineAt?: number;
   /** Opaque host-issued cause, used only when this runtime is clamped to that ceiling. */

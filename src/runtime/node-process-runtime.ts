@@ -104,7 +104,7 @@ export class NodeProcessRuntime {
       };
     }
     const hostAbortController = new AbortController();
-    const executionDeadline = new ExecutionDeadline(options);
+    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
     let abortHandler: (() => void) | undefined;
     let settled = false;
     let finishing = false;

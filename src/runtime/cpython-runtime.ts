@@ -111,7 +111,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
       return failure("runtime_error", "CPython memory limit must be a positive safe integer");
     }
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 1) return failure("runtime_error", "CPython timeout must be positive");
-    const executionDeadline = new ExecutionDeadline(options);
+    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
     let command: Awaited<ReturnType<typeof launch>>;
     try { command = await launch(this.binary, this.enforce, options.cwd ?? process.cwd()); }
     catch (error) { return failure("runtime_error", errorText(error)); }

@@ -581,21 +581,49 @@ export class FabricExecutionService {
     const mainDeadlineAt = mainBudget?.at;
     const mainCeilingReason = mainMaxTimeoutMs === undefined ? undefined : createMainExecutionCeilingError(mainMaxTimeoutMs);
     const mainCeilingError = mainCeilingReason?.message ?? "";
+    // Share the actual clamp record with the runtime: a lossy runtime-first
+    // abort must not erase the host cause, including after a host-call floor.
+    const runtimeDeadline = mainBudget ? new ExecutionDeadline({
+      timeoutMs: effectiveTimeoutMs,
+      maximumDeadlineAt: mainBudget.at,
+      maximumDeadlineReason: mainCeilingReason!,
+    }, mainBudget.startedAt) : undefined;
     mainBudget?.scheduleDeadline(() => mainCeiling!.abort(mainCeilingReason), true);
     const programSignal = mainCeiling
       ? options.signal ? AbortSignal.any([options.signal, mainCeiling.signal]) : mainCeiling.signal
       : options.signal;
-    // Native runtimes may replace an outer abort reason with "Execution
-    // cancelled". Providers must observe both sources directly, so Main's
-    // original reason survives without losing runtime-only cancellation.
+    // Observe the original outer signal before a runtime's lossy forwarding.
+    // For runtime-first expiry, consult the shared host-owned clamp record,
+    // never guest text/name or merely the fact that Main's wall time elapsed.
     const providerSignals = new WeakMap<AbortSignal, AbortSignal>();
+    const providerSignalCleanups: Array<() => void> = [];
     const providerSignal = (runtimeSignal: AbortSignal): AbortSignal => {
       if (!programSignal) return runtimeSignal;
       let combined = providerSignals.get(runtimeSignal);
       if (!combined) {
-        // Runtimes carry the clamped ceiling's opaque cause explicitly. Never
-        // promote another abort by clock, error name or guest exception text.
-        combined = AbortSignal.any([programSignal, runtimeSignal]);
+        const normalizedRuntime = new AbortController();
+        const forward = (): void => {
+          if (normalizedRuntime.signal.aborted) return;
+          if (programSignal.aborted) {
+            normalizedRuntime.abort(programSignal.reason);
+            return;
+          }
+          const deadlineReason = runtimeDeadline?.reached ? runtimeDeadline.reason : undefined;
+          if (isMainExecutionCeilingError(deadlineReason)) {
+            mainCeiling!.abort(deadlineReason);
+            normalizedRuntime.abort(deadlineReason);
+          } else {
+            // Shorter deadlines and ordinary first aborts remain ordinary,
+            // even if their settlement/cleanup crosses Main's absolute limit.
+            normalizedRuntime.abort(runtimeSignal.reason);
+          }
+        };
+        if (runtimeSignal.aborted) forward();
+        else {
+          runtimeSignal.addEventListener("abort", forward, { once: true });
+          providerSignalCleanups.push(() => runtimeSignal.removeEventListener("abort", forward));
+        }
+        combined = AbortSignal.any([programSignal, normalizedRuntime.signal]);
         providerSignals.set(runtimeSignal, combined);
       }
       return combined;
@@ -947,6 +975,7 @@ export class FabricExecutionService {
         }),
         {
           timeoutMs: effectiveTimeoutMs,
+          ...(runtimeDeadline ? { executionDeadline: runtimeDeadline } : {}),
           ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
           cwd: options.context.cwd,
           memoryLimitBytes: this.config.executor.memoryLimitBytes,
@@ -974,6 +1003,8 @@ export class FabricExecutionService {
       this.activity?.finish(options.parentToolCallId, false, message);
       throw error;
     } finally {
+      for (const cleanup of providerSignalCleanups) cleanup();
+      runtimeDeadline?.clear();
       mainBudget?.clear();
       await this.registry.endInvocation(options.parentToolCallId, invocationOutcome);
       flushEmit();

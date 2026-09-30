@@ -45,7 +45,7 @@ export class MontyRuntime implements FabricKernelRuntime {
       prepared = prepareMontySource(code, strings);
     } catch (error) { return failure("runtime_error", montyErrorText(error)); }
 
-    const executionDeadline = new ExecutionDeadline(options);
+    const executionDeadline = options.executionDeadline ?? new ExecutionDeadline(options);
     let pool: MontyNative.Monty | undefined;
     let session: MontyNative.MontySession | undefined;
     let workerPid: number | undefined;

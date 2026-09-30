@@ -27,7 +27,7 @@
 import { GuardBudget, GuardBudgetExceeded } from "./guard-budget.js";
 export { GUARD_BUDGET_REASON } from "./guard-budget.js";
 
-type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string; quoted?: boolean; provenance?: Feed };
+type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string; quoted?: boolean; assignment?: boolean; process?: boolean; provenance?: Feed };
 type Expansion = { subs: string[]; names: string[]; text?: string; dynamic?: boolean };
 
 let placeholders = 0;
@@ -49,13 +49,16 @@ const OPERATORS = ["&&", "||", ";;", "|&", "|", "&", ";", "(", ")"];
 function readBalanced(text: string, index: number, open: string, close: string, budget: GuardBudget): number {
   budget.enterReader();
   try {
-  budget.spend(text.length - index + 1);
   let depth = 1;
   while (index < text.length) {
     budget.spend();
     const c = text[index]!;
-    if (c === "\\") { index += 2; continue; }
-    if (c === "'" && close !== "`") { const end = text.indexOf("'", index + 1); index = end < 0 ? text.length : end + 1; continue; }
+    if (c === "\\") { budget.spend(); index += 2; continue; }
+    if (c === "'" && close !== "`") {
+      index += 1;
+      while (index < text.length && text[index] !== "'") { budget.spend(); index += 1; }
+      budget.spend(); index += 1; continue;
+    }
     if (c === "\"" && close !== "`") { index = readDouble(text, index + 1, { subs: [], names: [] }, budget); continue; }
     if (c === close) { depth -= 1; index += 1; if (depth === 0) return index; continue; }
     if (open !== close && c === open) depth += 1;
@@ -69,11 +72,10 @@ function readBalanced(text: string, index: number, open: string, close: string, 
 function readDouble(text: string, index: number, word: Expansion, budget: GuardBudget): number {
   budget.enterReader();
   try {
-  budget.spend(text.length - index + 1);
   while (index < text.length && text[index] !== "\"") {
     budget.spend((word.text?.length ?? 0) + 1);
     const c = text[index]!;
-    if (c === "\\") { word.text = (word.text ?? "") + (text[index + 1] ?? ""); index += 2; continue; }
+    if (c === "\\") { budget.spend(2); word.text = (word.text ?? "") + (text[index + 1] ?? ""); index += 2; continue; }
     if ((c === "$" && text[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
       const end = c === "`" ? readBalanced(text, start, "`", "`", budget) : readBalanced(text, start, "(", ")", budget);
@@ -85,13 +87,14 @@ function readDouble(text: string, index: number, word: Expansion, budget: GuardB
     // Batch literal runs: flattening a growing word on every character would turn an
     // ordinary 4096-byte quoted value into quadratic reader work.
     let end = index + 1;
-    while (end < text.length && !/["\\`]/.test(text[end]!) && !(text[end] === "$" && text[end + 1] === "(")) end += 1;
+    while (end < text.length && !/["\\`]/.test(text[end]!) && !(text[end] === "$" && text[end + 1] === "(")) { budget.spend(); end += 1; }
     budget.spend(end - index + 1);
     const fragment = text.slice(index, end);
     if (fragment.includes("$")) word.dynamic = true;
     word.text = (word.text ?? "") + fragment;
     index = end;
   }
+  budget.spend();
   return index + 1;
   } finally { budget.leaveReader(); }
 }
@@ -187,6 +190,7 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
     if ((c === "<" || c === ">") && text[index + 1] === "(") {
       const end = readBalanced(text, index + 2, "(", ")", budget);
       const w = current();
+      w.process = true;
       budget.spend(end - index + 1);
       const placeholder = substitute(w, text.slice(index + 2, end - 1), budget);
       w.text += placeholder;
@@ -227,6 +231,8 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
     const w = current();
     const before = w.text.length;
     if (c === "\"" || c === "'" || (c === "$" && text[index + 1] === "'")) w.quoted = true;
+    // Assignment syntax is lexical: quoting/escaping the name or '=' makes argv DATA.
+    if (!w.text.includes("=") && (w.quoted || c === "\\")) w.assignment = false;
     let bare = false;
     const kind = c === "\"" ? QUOTED : (c === "$" && text[index + 1] === "(") || c === "`" ? "$" : LITERAL;
     if (c === "'") {
@@ -255,6 +261,7 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
         !(text[end] === "$" && (text[end + 1] === "(" || text[end + 1] === "'"))) end += 1;
       budget.spend(end - index + 1);
       const fragment = text.slice(index, end);
+      if (w.assignment !== false && !w.text.includes("=") && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(w.text + fragment)) w.assignment = true;
       if (fragment.includes("$")) w.dynamic = true;
       w.text += fragment;
       index = end;
@@ -307,7 +314,7 @@ const MAX_VALUE = 4096;
 
 // Local nested scripts (sh -c, eval, substitutions) inherit the cwd and variables; ssh gets neither.
 // `owned` holds the placeholders of `mktemp` substitutions; `root` is the whole tool-call command.
-type Context = { root: string; owned: Set<string>; cwd?: string | undefined; values: ReadonlyMap<string, string>; unknown: ReadonlySet<string>; files?: ReadonlyMap<string, Feed | undefined>; inputs?: ReadonlyMap<number, Feed | undefined> | undefined; sinks?: ReadonlyMap<number, OutputSink>; lookupTail?: number | undefined; tmpTail?: number | undefined };
+type Context = { root: string; owned: Set<string>; cwd?: string | undefined; uncertainCwd?: boolean; sharedCwd?: boolean; alternatives?: ReadonlyMap<string, readonly string[]>; values: ReadonlyMap<string, string>; unknown: ReadonlySet<string>; files?: ReadonlyMap<string, Feed | undefined>; inputs?: ReadonlyMap<number, InputBinding | undefined> | undefined; sinks?: ReadonlyMap<number, OutputSink>; lookupTail?: number | undefined; tmpTail?: number | undefined };
 type PositionalTail = { lookup?: number; tmp?: number };
 
 /**
@@ -329,10 +336,16 @@ function tmpGlob(pattern: string, cwd: string | undefined): boolean {
 // `wipe`: a delete over a /tmp glob (smarty-dev#1998). `tmpList`: a stage or substitution may list other agents' dirs.
 type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean; sourceKnown?: boolean; output?: Feed; files?: ReadonlyMap<string, Feed | undefined> };
 type Feed = { lookup: boolean; tmp: boolean; literal?: string };
-type OutputSink = { file: string | undefined } | "stdout" | "other";
+type OutputSink = { file: string | undefined; targets?: readonly string[] | undefined } | "stdout" | "other";
+// Opening a regular file fixes its identity, not its bytes. Literal/process feeds are
+// immutable; regular-file descriptors consult the current file facts at consumption.
+type InputBinding = Feed | { file: string | undefined; fallback: Feed | undefined };
 // Safe provenance does NOT imply zero bytes (a recorded file may contain many names).
 const EMPTY_FEED: Feed = { lookup: false, tmp: false };
 const NO_OUTPUT: Feed = { lookup: false, tmp: false, literal: "" };
+// A NUL is not a shell filename. This fact conservatively records unsafe writes whose
+// target identity is unresolved; a later definite overwrite clears only THAT file's fact.
+const UNKNOWN_FILE = "\0unknown-file";
 const mergeFeed = (a: Feed, b: Feed): Feed => ({ lookup: a.lookup || b.lookup, tmp: a.tmp || b.tmp,
   ...(a.literal !== undefined && a.literal === b.literal ? { literal: a.literal } : {}) });
 function concatFeed(a: Feed, b: Feed, budget: GuardBudget): Feed {
@@ -375,7 +388,7 @@ function splitFields(text: string, budget: GuardBudget, ifs?: string, limit = In
   if (start < text.length) parts.push(text.slice(start));
   return parts;
 }
-type Command = { words: Word[]; redirects: Redirect[]; heredocs: Array<{ body: string; quoted: boolean }>; closed?: number };
+type Command = { words: Word[]; redirects: Redirect[]; heredocs: Array<{ body: string; quoted: boolean }>; closed?: number; conditional?: boolean; continues?: boolean };
 type InputScope = { target: Word; start?: Word };
 type SourceScopes = {
   inputs: Map<Word, InputScope>; members: Map<Word, number>; ends: Map<Token, number>; parents: Map<number, number>; outputs: Map<number, Redirect[]>;
@@ -417,11 +430,13 @@ function sourceScopes(tokens: Token[], budget: GuardBudget): SourceScopes {
       if (token.op === ")" && !token.arrayClose) close("group", i);
       head = true;
     } else if ("word" in token && head) {
-      const name = token.word.text;
+      const name = token.word.quoted || token.word.assignment === false ? "" : token.word.text;
       if (["for", "while", "until", "select"].includes(name)) stack.push({ kind: "loop", start: i });
       if (name === "{") stack.push({ kind: "brace", start: i });
+      if (name === "if") stack.push({ kind: "if", start: i });
       if (name === "done") close("loop", i);
       if (name === "}") close("brace", i);
+      if (name === "fi") close("if", i);
       head = ["{", "do", "then", "else", "if", "elif", "!"].includes(name);
     }
   });
@@ -446,25 +461,32 @@ function sourceScopes(tokens: Token[], budget: GuardBudget): SourceScopes {
 }
 
 /** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
-function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>, budget: GuardBudget, argv: (words: Word[]) => Word[]): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined; chdirs: Word[] } {
+function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>, budget: GuardBudget, argv: (words: Word[]) => Word[]): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined; chdirs: Word[]; assignments: Word[] } {
   let words = stageWords;
   let fedByXargs = false;
   let argFile: Word | undefined;
   const chdirs: Word[] = [];
+  const assignments: Word[] = [];
+  let environment = false;
   for (;;) {
     budget.spend(4 * words.length + 1);
-    while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(words[0].text)) {
+    while (words[0] && (words[0].assignment || (environment && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(words[0].text)))) {
       budget.spend(words.length + 1);
+      assignments.push(words[0]);
       words = words.slice(1);
     }
+    environment = false;
     const prefix = words[0]?.text.split("/").pop() ?? "";
     const options = PREFIXES[prefix];
-    if (!options) return { words, fedByXargs, argFile, chdirs };
+    // Reserved words are grammar only when unquoted/unescaped, not executable-name argv.
+    const quotedControl = ["!", "{", "then", "do", "else", "if", "elif", "while", "until"].includes(prefix) &&
+      (words[0]?.quoted || words[0]?.assignment === false);
+    if (!options || quotedControl) return { words, fedByXargs, argFile, chdirs, assignments };
     // Wrapper option values are actual argv: unquoted empty fields disappear before
     // deciding which word -C/-D consumes, and quoted values remain one field.
     if (options.length) words = argv(words);
     // `command -v pkill` names the command; it does not run it.
-    if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) return { words: [], fedByXargs, argFile, chdirs };
+    if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) return { words: [], fedByXargs, argFile, chdirs, assignments };
     if (prefix === "xargs") fedByXargs = true;
     words = words.slice(1);
     while (words[0]?.text.startsWith("-") && words[0].text.length > 1) {
@@ -505,10 +527,12 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
       if ((prefix === "env" || prefix === "sudo") && chdir && source && value !== undefined) {
         chdirs.push({ ...source, text: value, pattern: source.pattern.slice(source.text.length - value.length) });
       }
-      if (prefix === "env" && split && value && source) scripts.push({ text: value, source });
+      if (prefix === "env" && split && value && source) scripts.push({ text: value,
+        source: { ...source, text: value, pattern: source.pattern.slice(source.text.length - value.length) } });
       words = words.slice(takes ? 2 : 1);
     }
     if (prefix === "timeout" && words[0]) words = words.slice(1);
+    environment = prefix === "env";
   }
 }
 
@@ -594,7 +618,7 @@ function scan(script: string, depth: number, budget: GuardBudget, names: Readonl
 
 function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed | undefined>,
   depth: number, budget: GuardBudget, names: ReadonlySet<string>, tmpIn: ReadonlySet<string>, context: Context, fed: Feed, stdin?: Feed): Verdict {
-  budget.spend(4 * (names.size + tmpIn.size + context.values.size + context.unknown.size + (context.files?.size ?? 0) + (context.sinks?.size ?? 0) + (context.inputs?.size ?? 0)) + tokens.length + 1);
+  budget.spend(4 * (names.size + tmpIn.size + context.values.size + context.unknown.size + (context.files?.size ?? 0) + (context.alternatives?.size ?? 0) + (context.sinks?.size ?? 0) + (context.inputs?.size ?? 0)) + tokens.length + 1);
   const verdict: Verdict = { blocked: false, lookup: false, wipe: false, tmpList: false };
   // Variables whose value comes from a name lookup (`P=$(pgrep …)`, `for p in $(pgrep …)`,
   // `pgrep … | while read p`), and the placeholders of lookup substitutions. A `kill` of one is a
@@ -608,9 +632,16 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   // and the directory of the last `cd` (undefined when unknown).
   const tmpNames = new Set(tmpIn);
   const values = new Map(context.values);
+  const alternatives = new Map(context.alternatives);
   const unknown = new Set(context.unknown);
   let cwd = context.cwd;
+  let uncertainCwd = context.uncertainCwd ?? false;
+  let sharedCwd = context.sharedCwd ?? tmpGlob(".", cwd);
+  const inTmp = (pattern: string): boolean => tmpGlob(pattern, cwd) || (uncertainCwd && sharedCwd && tmpGlob(pattern, "/tmp"));
   let directoryStack: Array<string | undefined> = [cwd];
+  // Latent stack alternatives affect cwd only when a later pop/swap/rotation uses them.
+  let uncertainStack = false;
+  let sharedStack = false;
   const files = new Map(context.files);
   let stream: Feed = NO_OUTPUT;
   let streamKnown = true;
@@ -620,8 +651,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   const lookupName = (name: string): boolean => tainted.has(name) || tailHas(name, lookupTail);
   const tmpName = (name: string): boolean => tmpNames.has(name) || tailHas(name, tmpTail);
 
-  const nested = (text: string, extra: readonly string[] = [], tmpExtra: readonly string[] = [], local = true, input?: Feed, positionals?: Word[], sinks?: ReadonlyMap<number, OutputSink>, tails?: PositionalTail, inputs?: ReadonlyMap<number, Feed | undefined>): Verdict => {
-    budget.spend(2 * (tainted.size + tmpNames.size + extra.length + tmpExtra.length + values.size + unknown.size) + 1);
+  const nested = (text: string, extra: readonly string[] = [], tmpExtra: readonly string[] = [], local = true, input?: Feed, positionals?: Word[], sinks?: ReadonlyMap<number, OutputSink>, tails?: PositionalTail, inputs?: ReadonlyMap<number, InputBinding | undefined>): Verdict => {
+    budget.spend(2 * (tainted.size + tmpNames.size + extra.length + tmpExtra.length + values.size + alternatives.size + unknown.size) + 1);
     const innerNames = new Set(tainted);
     const innerTmp = new Set(tmpNames);
     let innerValues: ReadonlyMap<string, string> = values;
@@ -635,7 +666,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       }
       const all: string[] = [];
       positionals.forEach((arg, i) => {
-        const expanded = expand(arg.pattern.replaceAll(QUOTED, "$"));
+        // positionalFields already expanded these in the CALLER, before temporary env.
+        const expanded = arg.pattern.replaceAll(QUOTED, "$");
         budget.spend(3 * expanded.length + 1);
         if (expanded.length <= MAX_VALUE && ![...expanded.matchAll(REFERENCE)].some((match) => !context.owned.has(match[2]!))) {
           const literal = unmask(expanded);
@@ -653,9 +685,9 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     // A remote receiver gets no inherited input table, even when the caller has fd3.
     if (!local) budget.spend();
     const inner = scan(text, depth + 1, budget, innerNames, innerTmp,
-      local ? { ...context, cwd, values: innerValues, unknown: innerUnknown, files, inputs: inputs ?? context.inputs,
+      local ? { ...context, cwd, uncertainCwd, sharedCwd, alternatives, values: innerValues, unknown: innerUnknown, files, inputs: inputs ?? context.inputs,
         lookupTail: positionals ? tails?.lookup : lookupTail, tmpTail: positionals ? tails?.tmp : tmpTail,
-        ...(sinks ? { sinks } : {}) } : { ...context, cwd: undefined, values: new Map(), unknown: new Set(), files: new Map(), inputs: new Map(), sinks: new Map([[1, "stdout"]]) },
+        ...(sinks ? { sinks } : {}) } : { ...context, cwd: undefined, uncertainCwd: false, sharedCwd: false, alternatives: new Map(), values: new Map(), unknown: new Set(), files: new Map(), inputs: new Map(), sinks: new Map([[1, "stdout"]]) },
       local ? input : undefined);
     verdict.blocked ||= inner.blocked;
     verdict.lookup ||= inner.lookup;
@@ -674,6 +706,28 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   const expand = (pattern: string): string => budget.replace(pattern, REFERENCE,
     (match) => values.get(match[2]!) ?? match[0],
     (value, match) => values.has(match[2]!) && match[1] !== "$" ? mask(value) : value);
+  // Inline script argv expands in the CALLER. Restore outer quote/escape markers only
+  // afterwards: a single-quoted '$D' is receiver code, a double-quoted "$D" is caller data.
+  const receiverText = (pattern: string): string => {
+    budget.spend(3 * pattern.length + 1);
+    const aliases = new Map<string, string>();
+    // Unknown caller bytes still carry their CALLER provenance. A temporary P=4242
+    // in the receiver must not reinterpret an already-expanded lookup-selected "$P".
+    for (const match of pattern.matchAll(REFERENCE)) {
+      const key = match[2]!;
+      if ((!lookupName(key) && !tmpName(key)) || aliases.has(key)) continue;
+      budget.spend(64);
+      const alias = `__pk_arg_${++placeholders}`;
+      aliases.set(key, `\${${alias}}`);
+      if (lookupName(key)) tainted.add(alias);
+      if (tmpName(key)) tmpNames.add(alias);
+      if (unknown.has(key)) unknown.add(alias);
+    }
+    const frozen = aliases.size ? budget.replace(pattern, REFERENCE, (match) => aliases.get(match[2]!) ?? match[0]) : pattern;
+    const expanded = expand(frozen);
+    budget.spend(4 * expanded.length + 1);
+    return unmask(expanded).replaceAll(QUOTED, "$").replaceAll(LITERAL, "$");
+  };
   // Field splitting is applied only to characters supplied by an unquoted expansion, never to
   // literal/quoted spaces in a filename. Glob masks survive until each field is checked.
   const fields = (pattern: string): string[] => {
@@ -691,7 +745,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     budget.spend(3 * pattern.length + 1);
     return [...pattern.matchAll(REFERENCE)].some((match) => tmpName(match[2]!)) || fields(pattern).some((field) => {
       budget.spend(4 * (field.length + (cwd?.length ?? 0)) + 1);
-      return tmpGlob(field, cwd);
+      return inTmp(field);
     });
   };
   const positionalFields = (words: Word[], start: number): { words: Word[]; tails: PositionalTail } => {
@@ -724,8 +778,10 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   const pathKey = (word: Word): string | undefined => {
     const expanded = expand(word.pattern);
     budget.spend(6 * (expanded.length + (cwd?.length ?? 0)) + 1);
-    if (!expanded || expanded === "-" || [...expanded.matchAll(REFERENCE)].some((match) => !context.owned.has(match[2]!))) return undefined;
+    if (!expanded || expanded === "-" || /[*?[]/.test(expanded) || [...expanded.matchAll(REFERENCE)].some((match) => !context.owned.has(match[2]!))) return undefined;
     const path = unmask(expanded.replaceAll(LITERAL, "$"));
+    // An uncertain branch cwd must not map a later relative overwrite to one definite file.
+    if (!path.startsWith("/") && uncertainCwd) return undefined;
     const full = path.startsWith("/") ? path : cwd ? `${cwd}/${path}` : path;
     const parts: string[] = [];
     for (const part of full.split("/")) {
@@ -740,6 +796,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     budget.spend(2 * ((expanded?.length ?? 0) + (cwd?.length ?? 0)) + 1);
     const dir = expanded && unmask(expanded);
     cwd = dir?.startsWith("/") ? dir : dir && cwd && !/^[~$]/.test(dir) ? `${cwd}/${dir}` : undefined;
+    if (dir?.startsWith("/")) uncertainCwd = false;
+    sharedCwd = tmpGlob(".", cwd) || (uncertainCwd && sharedCwd);
   };
   // Round 1 on PR #148: an unquoted expansion of an unknown value, in a command that names /tmp.
   const unknownOperand = (pattern: string): boolean => {
@@ -749,6 +807,38 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
 
   // A known substitution output is a feed, not a known literal path for a later find root.
   const knownSubs = new Set<string>();
+  const evaluated = new Map<Expansion, boolean>();
+  const processFeeds = new Map<Expansion, Feed>();
+  const evaluateExpansion = (expansion: Expansion, input: Feed | undefined, sinks: ReadonlyMap<number, OutputSink>, inputs: ReadonlyMap<number, InputBinding | undefined>): boolean => {
+    budget.spend();
+    if (evaluated.has(expansion)) return evaluated.get(expansion)!;
+    if (!expansion.subs.length) return false;
+    budget.spend(2 * sinks.size + expansion.subs.length + 1);
+    const captureSinks = new Map(sinks);
+    captureSinks.set(1, "stdout");
+    let captured = false;
+    expansion.subs.forEach((sub, k) => {
+      const inner = nested(sub, [], [], true, input, undefined, captureSinks, undefined, inputs);
+      const name = expansion.names[k]!;
+      if (/^\s*mktemp(\s|$)/.test(sub)) context.owned.add(name);
+      const returned = inner.output ?? EMPTY_FEED;
+      if ("process" in expansion && expansion.process) processFeeds.set(expansion,
+        concatFeed(processFeeds.get(expansion) ?? NO_OUTPUT, returned, budget));
+      const known = inner.sourceKnown && (!returned.tmp || returned.literal !== undefined) && !returned.lookup;
+      if (returned.literal !== undefined) {
+        budget.spend(3 * returned.literal.length + 1);
+        values.set(name, returned.literal.replace(/\n+$/, ""));
+      }
+      if (known) knownSubs.add(name);
+      else if (returned.literal === undefined) unknown.add(name);
+      if ((returned.tmp && returned.literal === undefined) || (inTmp(".") && !known && !/^\s*mktemp(\s|$)/.test(sub))) {
+        tmpNames.add(name); verdict.tmpList = true;
+      }
+      if (returned.lookup) { captured = true; tainted.add(name); }
+    });
+    evaluated.set(expansion, captured);
+    return captured;
+  };
   const concrete = (word: Word): boolean => ![...expand(word.pattern).matchAll(REFERENCE)]
     .some((match) => !context.owned.has(match[2]!));
   budget.spend(3 * scopes.inputs.size + 1);
@@ -762,14 +852,64 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       compoundFeeds.set(scope, concatFeed(previous, feed, budget));
     }
   };
+  const fileLeaf = (file: string): string => file.split("/").at(-1) ?? "";
+  const unknownFileFeed = (file?: string, facts = files): Feed => {
+    budget.spend((file?.length ?? 0) + facts.size + 1);
+    const leaf = file === undefined ? undefined : fileLeaf(file);
+    let feed = facts.get(UNKNOWN_FILE) ?? EMPTY_FEED;
+    for (const [key, source] of facts) {
+      budget.spend(key.length + 1);
+      if (source && key.startsWith(`${UNKNOWN_FILE}/`) && (leaf === undefined || key === `${UNKNOWN_FILE}/${leaf}`)) feed = mergeFeed(feed, source);
+    }
+    return feed;
+  };
+  // Conditional aliases retain bounded literal alternatives for routing precision. A
+  // genuinely unresolved target still gets the global fallback, never a dropped write.
+  const targetLeaves = (word: Word): readonly string[] | undefined => {
+    const expanded = expand(word.pattern);
+    budget.spend(6 * expanded.length + 1);
+    const refs = [...expanded.matchAll(REFERENCE)];
+    if (/[*?[]/.test(expanded)) return undefined;
+    if (!refs.length) return [fileLeaf(unmask(expanded))];
+    if (refs.length !== 1) return undefined;
+    const options = alternatives.get(refs[0]![2]!);
+    if (!options) return undefined;
+    budget.spend(options.length + 1);
+    return options.map((value) => {
+      const path = budget.replace(expanded, REFERENCE, () => value);
+      budget.spend(3 * path.length + 1);
+      return fileLeaf(unmask(path));
+    });
+  };
+  const possibleFileFeed = (word?: Word): Feed => {
+    const candidate = word && expand(word.pattern);
+    const concreteCandidate = candidate && ![...candidate.matchAll(REFERENCE)].length ? candidate : undefined;
+    let feed = unknownFileFeed(concreteCandidate);
+    // With a concrete relative name but uncertain cwd, unrelated basenames are not
+    // possible identities. An unresolved alias can name any recorded file instead.
+    const expanded = word && expand(word.pattern);
+    budget.spend(6 * (expanded?.length ?? 0) + files.size + 1);
+    const suffix = expanded && !expanded.startsWith("/") && ![...expanded.matchAll(REFERENCE)].length && !expanded.split("/").includes("..")
+      ? unmask(expanded).split("/").filter((part) => part && part !== ".").join("/") : undefined;
+    const ending = suffix && `/${suffix}`;
+    for (const [file, source] of files) {
+      budget.spend(file.length + 1);
+      if (suffix && file !== suffix && !file.endsWith(ending!)) continue;
+      if (source?.lookup || source?.tmp) feed = mergeFeed(feed, source);
+    }
+    return { lookup: feed.lookup, tmp: feed.tmp };
+  };
   const inputSource = (word: Word): Feed | undefined => {
+    // A process-substitution pipe carries producer bytes, not the file named by those bytes.
+    if (word.process && processFeeds.has(word)) return processFeeds.get(word);
     const lookup = fromLookup(word.text);
     const tmp = tmpOperand(word.pattern);
     const known = word.text !== "-" && ![...expand(word.pattern).matchAll(REFERENCE)]
       .some((match) => !context.owned.has(match[2]!) && !knownSubs.has(match[2]!));
     const key = pathKey(word);
     if (key !== undefined && files.has(key)) return files.get(key);
-    return lookup || tmp ? { lookup, tmp } : known ? EMPTY_FEED : undefined;
+    const possible = key === undefined ? possibleFileFeed(word) : unknownFileFeed(key);
+    return lookup || tmp || possible.lookup || possible.tmp ? { lookup: lookup || possible.lookup, tmp: tmp || possible.tmp } : known ? EMPTY_FEED : undefined;
   };
   // A compound redirect is opened before its body: snapshot aliases/cwd and inherit its
   // descriptor routes. Closing syntax must not resolve a body-mutated alias or truncate again.
@@ -784,35 +924,29 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         sinks.set(redirect.fd, "other");
       } else {
         const key = pathKey(redirect.redirect);
-        sinks.set(redirect.fd, { file: key });
+        sinks.set(redirect.fd, { file: key, targets: key === undefined ? targetLeaves(redirect.redirect) : undefined });
         if (redirect.both) sinks.set(2, sinks.get(redirect.fd)!);
         if (key !== undefined && !redirect.append) files.set(key, NO_OUTPUT);
       }
     }
   };
-  const compoundSinks = (scope: number): Map<number, OutputSink> => {
-    const pending: number[] = [];
-    let current: number | undefined = scope;
-    while (current !== undefined && !outputScopes.has(current)) {
-      budget.spend();
-      if (pending.length >= 32) throw new GuardBudgetExceeded();
-      pending.push(current); current = scopes.parents.get(current);
-    }
-    budget.spend(2 * (context.sinks?.size ?? 1) + 1);
-    let sinks = current === undefined ? new Map<number, OutputSink>(context.sinks ?? [[1, "stdout"]]) : outputScopes.get(current)!;
-    for (const item of pending.reverse()) {
-      budget.spend(2 * sinks.size + 1);
-      sinks = new Map(sinks);
-      applyOutputRedirects(sinks, scopes.outputs.get(item) ?? []);
-      outputScopes.set(item, sinks);
-    }
+  const compoundSinks = (scope: number, input?: Feed): Map<number, OutputSink> => {
+    openCompound(scope, input);
     return outputScopes.get(scope)!;
   };
-  // Input descriptors are snapshots too. Keep the whole table across local children and
-  // captures, but copy it before command-local redirects so a child cannot change its parent.
+  // Snapshot descriptor identity/routing at entry, then read CURRENT conservative bytes.
+  // Copy tables across command-local children; dup copies a binding, not a live fd route.
+  const consumeInput = (binding: InputBinding | undefined): Feed | undefined => {
+    budget.spend();
+    if (!binding || !("file" in binding)) return binding;
+    if (binding.file === undefined) return mergeFeed(binding.fallback ?? EMPTY_FEED, possibleFileFeed());
+    if (files.has(binding.file)) return files.get(binding.file);
+    const possible = unknownFileFeed(binding.file);
+    return possible.lookup || possible.tmp ? mergeFeed(binding.fallback ?? EMPTY_FEED, possible) : binding.fallback;
+  };
   budget.spend();
-  const inputScopes = new Map<number, Map<number, Feed | undefined>>();
-  const applyInputRedirects = (inputs: Map<number, Feed | undefined>, redirects: Redirect[], late = false): void => {
+  const inputScopes = new Map<number, Map<number, InputBinding | undefined>>();
+  const applyInputRedirects = (inputs: Map<number, InputBinding | undefined>, redirects: Redirect[], late = false): void => {
     budget.spend(4 * redirects.length + 1);
     for (const redirect of redirects) {
       const word = redirect.redirect;
@@ -821,11 +955,16 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         redirect.write ? NO_OUTPUT : late && word.subs.length && sources.has(word) ? sources.get(word) :
         redirect.here ? hereFeed(word) : inputSource(word);
       budget.spend(2);
-      inputs.set(redirect.fd, source);
-      if (!late) sources.set(word, source);
+      const regular = !redirect.duplicate && !redirect.write && !redirect.here && !word.process;
+      const key = regular ? pathKey(word) : undefined;
+      // An unresolved regular-file identity still refers to live possible file contents,
+      // never to an immutable entry-time EMPTY_FEED after a later unsafe write.
+      const binding = regular ? { file: key, fallback: inputSource(word) } : source;
+      inputs.set(redirect.fd, binding);
+      if (!late) sources.set(word, consumeInput(binding));
     }
   };
-  const compoundInputs = (scope: number, input?: Feed): Map<number, Feed | undefined> => {
+  const openCompound = (scope: number, input?: Feed): void => {
     const pending: number[] = [];
     let current: number | undefined = scope;
     while (current !== undefined && !inputScopes.has(current)) {
@@ -833,15 +972,24 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (pending.length >= 32) throw new GuardBudgetExceeded();
       pending.push(current); current = scopes.parents.get(current);
     }
-    budget.spend(2 * (context.inputs?.size ?? 0) + 2);
+    budget.spend(2 * ((context.inputs?.size ?? 0) + (context.sinks?.size ?? 1)) + 2);
     let inputs = current === undefined ? new Map(context.inputs) : inputScopes.get(current)!;
-    if (current === undefined) inputs.set(0, input);
+    let sinks = current === undefined ? new Map<number, OutputSink>(context.sinks ?? [[1, "stdout"]]) : outputScopes.get(current)!;
+    if (current === undefined && !inputs.has(0)) inputs.set(0, input);
     for (const item of pending.reverse()) {
-      budget.spend(2 * inputs.size + 2);
-      inputs = new Map(inputs);
-      applyInputRedirects(inputs, scopes.outputs.get(item) ?? [], true);
-      inputScopes.set(item, inputs);
+      budget.spend(2 * (inputs.size + sinks.size) + 2);
+      inputs = new Map(inputs); sinks = new Map(sinks);
+      // Expand/open in entry state and descriptor order, once, never on the closing word.
+      for (const redirect of scopes.outputs.get(item) ?? []) {
+        evaluateExpansion(redirect.redirect, consumeInput(inputs.get(0)), sinks, inputs);
+        applyOutputRedirects(sinks, [redirect]);
+        applyInputRedirects(inputs, [redirect], true);
+      }
+      inputScopes.set(item, inputs); outputScopes.set(item, sinks);
     }
+  };
+  const compoundInputs = (scope: number, input?: Feed): Map<number, InputBinding | undefined> => {
+    openCompound(scope, input);
     return inputScopes.get(scope)!;
   };
   const literalSource = (word: Word): Feed => ({ lookup: fromLookup(word.text), tmp: tmpOperand(word.pattern) });
@@ -849,7 +997,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     budget.spend(4 * literal.length + 1);
     const tmp = splitFields(literal, budget, " \t\n").some((field) => {
       budget.spend(4 * (field.length + (cwd?.length ?? 0)) + 1);
-      return tmpGlob(mask(field), cwd);
+      return inTmp(mask(field));
     });
     return { lookup: fromLookup(literal), tmp, ...(literal.length <= MAX_VALUE ? { literal } : {}) };
   };
@@ -888,7 +1036,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     // in values and checked after the eventual operand's quote/suffix expansion. Only
     // unresolved stream provenance needs unconditional tmp taint across a quoted use.
     const tmp = [...raw.matchAll(REFERENCE)].some((match) => tmpName(match[2]!) && !values.has(match[2]!));
-    if (!append) { tainted.delete(variable); tmpNames.delete(variable); }
+    if (!append) { tainted.delete(variable); tmpNames.delete(variable); alternatives.delete(variable); }
     if (lookup) tainted.add(variable);
     if (tmp) tmpNames.add(variable);
     const expanded = expand(raw.replaceAll(QUOTED, "$"));
@@ -903,15 +1051,83 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     else values.set(variable, literal);
   };
 
+  // A potentially skipped command cannot strongly replace a prior variable/file fact.
+  // Join after EACH command so a later consumer in the same branch sees both paths.
+  const saveConditional = (): { values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmp: Set<string>; files: Map<string, Feed | undefined>; cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; lookupTail: number | undefined; tmpTail: number | undefined } => {
+    budget.spend(2 * (values.size + alternatives.size + unknown.size + tainted.size + tmpNames.size + files.size) + directoryStack.length + 1);
+    return { values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmp: new Set(tmpNames), files: new Map(files), cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail };
+  };
+  const joinConditional = (prior: ReturnType<typeof saveConditional>, joinCwd = true): void => {
+    budget.spend(4 * (prior.values.size + values.size + prior.alternatives.size + alternatives.size + prior.unknown.size + prior.tainted.size + prior.tmp.size + prior.files.size) + 1);
+    for (const key of new Set([...prior.values.keys(), ...values.keys(), ...prior.alternatives.keys(), ...alternatives.keys()])) {
+      const before = prior.values.get(key);
+      const after = values.get(key);
+      if (before === after && prior.alternatives.get(key) === alternatives.get(key)) continue;
+      const beforeOptions = prior.alternatives.get(key) ?? (before === undefined ? undefined : [before]);
+      const afterOptions = alternatives.get(key) ?? (after === undefined ? undefined : [after]);
+      // One unknown alternative means ANY target, not just the other branch's safe name.
+      budget.spend(3 * ((beforeOptions?.length ?? 0) + (afterOptions?.length ?? 0)) + 2);
+      if (beforeOptions && afterOptions) alternatives.set(key, [...new Set([...beforeOptions, ...afterOptions])]);
+      else alternatives.delete(key);
+      // Different literals become unresolved, but their destructive alternatives remain.
+      for (const [literal, base, ifs, sharedAlternative] of [[before, prior.cwd, prior.values.get("IFS"), prior.uncertainCwd && prior.sharedCwd], [after, cwd, values.get("IFS"), uncertainCwd && sharedCwd]] as const) {
+        if (literal !== undefined && splitFields(literal, budget, ifs ?? " \t\n").some((field) => {
+          budget.spend(4 * (field.length + (base?.length ?? 0)) + 1);
+          return tmpGlob(mask(field), base) || (sharedAlternative && tmpGlob(mask(field), "/tmp"));
+        })) tmpNames.add(key);
+      }
+      values.delete(key); unknown.add(key);
+    }
+    budget.spend(prior.stack.length + directoryStack.length + 3);
+    if (prior.stack.length !== directoryStack.length || prior.stack.some((entry, index) => entry !== directoryStack[index])) {
+      uncertainStack = true;
+      for (const stack of [prior.stack, directoryStack]) for (const entry of stack) {
+        budget.spend(4 * (entry?.length ?? 0) + 1);
+        sharedStack ||= tmpGlob(".", entry);
+      }
+      sharedStack ||= (prior.uncertainCwd && prior.sharedCwd) || (uncertainCwd && sharedCwd);
+    }
+    uncertainStack ||= prior.uncertainStack;
+    sharedStack ||= prior.sharedStack;
+    if (joinCwd && (prior.cwd !== cwd || prior.uncertainCwd || uncertainCwd)) {
+      sharedCwd ||= prior.sharedCwd;
+      cwd = undefined; uncertainCwd = true; directoryStack = [undefined];
+    }
+    for (const key of prior.unknown) unknown.add(key);
+    for (const key of prior.tainted) tainted.add(key);
+    for (const key of prior.tmp) tmpNames.add(key);
+    lookupTail = prior.lookupTail === undefined ? lookupTail : Math.min(prior.lookupTail, lookupTail ?? Infinity);
+    tmpTail = prior.tmpTail === undefined ? tmpTail : Math.min(prior.tmpTail, tmpTail ?? Infinity);
+    // A skipped first concrete write must not shadow earlier unresolved-target bytes.
+    // Existing concrete facts already encode any definite overwrite of those alternatives.
+    budget.spend(files.size + 1);
+    for (const [file, after] of files) {
+      budget.spend(file.length + 2);
+      if (prior.files.has(file) || file.startsWith(UNKNOWN_FILE)) continue;
+      const before = unknownFileFeed(file, prior.files);
+      if (before.lookup || before.tmp) {
+        budget.spend(2);
+        files.set(file, mergeFeed(before, after ?? EMPTY_FEED));
+      }
+    }
+    for (const [file, before] of prior.files) {
+      const after = files.get(file);
+      // Unknown bytes never erase a known unsafe alternative.
+      files.set(file, before && after ? mergeFeed(before, after) : before?.lookup || before?.tmp ? before : after?.lookup || after?.tmp ? after : undefined);
+    }
+  };
+
+  let pendingCwd: { cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean } | undefined;
   const runPipeline = (): void => {
     // The inherited fd is separate from replay's whole-script fallback. Captures and local
     // inline receivers inherit the actual fd; only consuming producers return its provenance.
-    let actual = stdin ?? context.inputs?.get(0);
+    let actual = context.inputs?.has(0) ? consumeInput(context.inputs.get(0)) : stdin;
     let pipeFeed = actual?.lookup ?? fed.lookup;
     let pipeTmp = actual?.tmp ?? fed.tmp;
     stages.forEach((stage, position) => {
       budget.spend(8 * (stage.words.length + stage.redirects.length + stage.heredocs.length + 1) +
         stage.words.reduce((size, word) => size + 4 * (word.text.length + word.pattern.length), 0));
+      const prior = stage.conditional ? saveConditional() : undefined;
       const piped = position < stages.length - 1;
       // An actual incoming pipe exists even when its unresolved producer is represented only
       // by replay fallback. Known owned/recorded output sets an explicit empty feed instead.
@@ -928,16 +1144,20 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         pipeTmp = input.tmp;
       }
       const parentCwd = cwd;
+      const parentUncertainCwd = uncertainCwd;
+      const parentSharedCwd = sharedCwd;
       const member = stage.words.reduce<number | undefined>((current, word) => scopes.members.get(word) ?? current, undefined);
-      const inheritedSinks = stage.closed !== undefined ? compoundSinks(stage.closed) : member !== undefined ? compoundSinks(member) : undefined;
+      const inheritedSinks = stage.closed !== undefined ? compoundSinks(stage.closed, actual) : member !== undefined ? compoundSinks(member, actual) : undefined;
       const inputScope = stage.closed ?? member;
       const inheritedInputs = inputScope !== undefined ? compoundInputs(inputScope, actual) : context.inputs;
       budget.spend(2 * (inheritedInputs?.size ?? 0) + 2);
       const inputs = new Map(inheritedInputs);
       // A pipe replaces fd0, not any other inherited descriptor. A compound entry's
       // late redirects still override that incoming pipe, before its body is expanded.
-      if (position === 0 || (scope?.start && stage.words.includes(scope.start))) actual = inheritedInputs?.get(0) ?? actual;
-      inputs.set(0, actual);
+      if (position === 0 || (scope?.start && stage.words.includes(scope.start))) {
+        if (inheritedInputs?.has(0)) actual = consumeInput(inheritedInputs.get(0));
+      }
+      if (position > 0 || !inputs.has(0)) inputs.set(0, actual);
       pipeFeed = actual?.lookup ?? pipeFeed;
       pipeTmp = actual?.tmp ?? pipeTmp;
       // Substitutions in words and redirection targets run; so do those of an unquoted heredoc
@@ -945,33 +1165,9 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // is tainted, so a script that receives its output knows which operand holds it.
       const heredocs = stage.heredocs.map((heredoc) => ({ ...(heredoc.quoted ? { text: heredoc.body, subs: [], names: [] } : expandHeredoc(heredoc.body, budget)), quoted: heredoc.quoted }));
       const expansions: Expansion[] = [...stage.words, ...stage.redirects.map((redirect) => redirect.redirect), ...heredocs];
-      budget.spend(2 * (inheritedSinks?.size ?? context.sinks?.size ?? 1) + 1);
-      const captureSinks = new Map<number, OutputSink>(inheritedSinks ?? context.sinks ?? [[1, "stdout"]]);
-      captureSinks.set(1, "stdout");
       let captured = false;
-      for (const expansion of expansions) expansion.subs.forEach((sub, k) => {
-        const inner = nested(sub, [], [], true, actual, undefined, captureSinks, undefined, inputs);
-        if (/^\s*mktemp(\s|$)/.test(sub)) context.owned.add(expansion.names[k]!);
-        const returned = inner.output ?? EMPTY_FEED;
-        const known = inner.sourceKnown && (!returned.tmp || returned.literal !== undefined) && !returned.lookup;
-        if (returned.literal !== undefined) {
-          budget.spend(3 * returned.literal.length + 1);
-          // A capture removes trailing newlines. Known empty output must really disappear
-          // before relative glob checks; an independent unknown file must not disappear.
-          values.set(expansion.names[k]!, returned.literal.replace(/\n+$/, ""));
-        }
-        if (known) knownSubs.add(expansion.names[k]!);
-        else if (returned.literal === undefined) unknown.add(expansion.names[k]!);
-        // Security F3: unresolved captured output after `cd /tmp` may list /tmp; explicit sources do not.
-        if ((returned.tmp && returned.literal === undefined) || (tmpGlob(".", cwd) && !known && !/^\s*mktemp(\s|$)/.test(sub))) {
-          tmpNames.add(expansion.names[k]!);
-          // A redirect on `done` has no consumer in this pass; retain its feed for the replay.
-          verdict.tmpList = true;
-        }
-        if (!returned.lookup) return;
-        captured = true;
-        tainted.add(expansion.names[k]!);
-      });
+      for (const expansion of expansions) captured = evaluateExpansion(expansion, actual,
+        inheritedSinks ?? context.sinks ?? new Map([[1, "stdout"]]), inputs) || captured;
       // Command redirects are expanded/opened in the caller's cwd and binding state,
       // before env/sudo chdir or child execution. Inline children inherit these fd routes.
       budget.spend(2 * (inheritedSinks?.size ?? context.sinks?.size ?? 1) + 1);
@@ -980,22 +1176,27 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (stage.closed === undefined) applyOutputRedirects(stageSinks, stage.redirects);
       const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean; positionals?: Word[]; tails?: PositionalTail }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
-      const { words, fedByXargs, argFile, chdirs } = unwrap(stage.words, envScripts, budget, (words) => {
+      const { words, fedByXargs, argFile, chdirs, assignments } = unwrap(stage.words, envScripts, budget, (words) => {
         const argv = positionalFields(words, 0).words;
         budget.spend(argv.reduce((size, word) => size + 2 * word.text.length + 1, 1));
         return argv.map((word) => ({ ...word, text: word.text.replaceAll(LITERAL, "$"), quoted: true }));
       });
       budget.spend(chdirs.length ? directoryStack.length + 1 : 1);
       const wrapperStack = chdirs.length ? [...directoryStack] : undefined;
+      const wrapperUncertainStack = uncertainStack, wrapperSharedStack = sharedStack;
       for (const target of chdirs) changeDir(target);
       // review/astra F6 on #105: an `env -S` script, with the placeholders of its word.
-      for (const { text } of envScripts) scripts.push({ text });
+      for (const { source } of envScripts) scripts.push({ text: receiverText(source.pattern) });
       const name = words[0]?.text.split("/").pop() ?? "";
       const args = words.slice(1);
       let lookup = LOOKUPS.has(name);
       if (KILL_BY_NAME.has(name)) verdict.blocked = true;
-      // Assignments and loop variables that take lookup output.
-      for (const [i, word] of stage.words.entries()) {
+      // Only leading assignment WORDS bind. An argv diagnostic containing '=' cannot
+      // erase provenance. Prefix bindings affect the child's environment, not caller argv.
+      const assign = (): void => {
+      for (const word of assignments) {
+        budget.spend(stage.words.length + 1);
+        const i = stage.words.indexOf(word);
         // Arrays glob their elements at binding time. += retains every prior element and its
         // provenance; do not mistake the subsequent array close for an unrelated assignment.
         const array = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=\(/.exec(word.pattern);
@@ -1010,6 +1211,33 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         const value = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=(.*)$/s.exec(word.pattern);
         if (value) bind(value[1]!, value[3]!, value[2] !== undefined);
       }
+      };
+      budget.spend(6 * assignments.length + 1);
+      const savedAssignments = assignments.map((word) => {
+        const key = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(word.text)![1]!;
+        return { key, value: values.get(key), alternatives: alternatives.get(key), unknown: unknown.has(key), lookup: tainted.has(key), tmp: tmpNames.has(key) };
+      });
+      const restoreAssignments = (): void => {
+        budget.spend(savedAssignments.length + 1);
+        for (const prior of savedAssignments) {
+          if (prior.value === undefined) values.delete(prior.key); else values.set(prior.key, prior.value);
+          if (prior.alternatives === undefined) alternatives.delete(prior.key); else alternatives.set(prior.key, prior.alternatives);
+          if (prior.unknown) unknown.add(prior.key); else unknown.delete(prior.key);
+          if (prior.lookup) tainted.add(prior.key); else tainted.delete(prior.key);
+          if (prior.tmp) tmpNames.add(prior.key); else tmpNames.delete(prior.key);
+        }
+      };
+      const temporary = <T>(action: () => T): T => {
+        try { assign(); return action(); } finally { restoreAssignments(); }
+      };
+      const standalone = !name || assignments.some((word) => /^\w+\+?=\(/.test(word.pattern));
+      if (standalone) assign();
+      // Declaration builtins really bind their assignment arguments, unlike echo/printf DATA.
+      if (["export", "readonly", "declare", "typeset", "local"].includes(name)) for (const word of args) {
+        const value = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=(.*)$/s.exec(word.pattern);
+        if (value) bind(value[1]!, value[3]!, value[2] !== undefined);
+      }
+      const readIfs = !standalone && assignments.some((word) => /^IFS=/.test(word.text)) ? temporary(() => values.get("IFS")) : values.get("IFS");
       if (name === "set") {
         const end = args.findIndex((arg) => arg.text === "--");
         const operands = end >= 0 ? args.slice(end + 1) : args[0]?.text.startsWith("-") ? undefined : args;
@@ -1057,7 +1285,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const unresolved = { lookup: pipeFeed || fed.lookup, tmp: pipeTmp || fed.tmp };
       applyInputRedirects(inputs, stage.redirects);
       if (!closing) {
-        actual = inputs.get(0);
+        actual = consumeInput(inputs.get(0));
         const input = actual ?? unresolved;
         pipeFeed = input.lookup; pipeTmp = input.tmp;
       }
@@ -1068,7 +1296,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       }
       // xargs' argument file is not its child's stdin; without -a xargs disconnects that fd.
       const receiverStdin = fedByXargs && !argFile ? EMPTY_FEED : actual;
-      inputs.set(0, receiverStdin);
+      if (fedByXargs && !argFile) inputs.set(0, receiverStdin);
       if (argFile) {
         const source = inputSource(argFile) ?? unresolved;
         pipeFeed = source.lookup;
@@ -1078,7 +1306,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (reads) {
         const options = readOptions(name, args, budget);
         const { destinations, fd, array } = options;
-        const selected = inputs.has(fd) ? inputs.get(fd) : fd === 0 ? actual : NO_OUTPUT;
+        const selected = inputs.has(fd) ? consumeInput(inputs.get(fd)) : fd === 0 ? actual : NO_OUTPUT;
         budget.spend(2 * (selected?.literal?.length ?? 0) + 1);
         const literalInput = selected?.literal !== undefined ? mask(selected.literal) : undefined;
         if (literalInput !== undefined && options.supported) {
@@ -1098,7 +1326,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
               else chars.push(char);
             }
             const line = chars.join("");
-            parts = options.exact ? [line] : splitFields(line, budget, values.get("IFS") ?? " \t\n", array ? Infinity : destinations.length);
+            parts = options.exact ? [line] : splitFields(line, budget, readIfs ?? " \t\n", array ? Infinity : destinations.length);
           } else {
             parts = [];
             let start = 0;
@@ -1153,7 +1381,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         (!fileFeed || (!fileFeed.lookup && !fileFeed.tmp));
       if (fileFeed) lookup ||= fileFeed.lookup;
       let listsTmp = name !== "mktemp" && (stage.words.some((word) => tmpOperand(word.pattern)) ||
-        ((piped || name === "ls" || name === "find") && !independent && tmpGlob(".", cwd))) || (fileFeed?.tmp ?? false);
+        ((piped || name === "ls" || name === "find") && !independent && inTmp("."))) || (fileFeed?.tmp ?? false);
       // An explicit producer does not read stdin. Do not clear an earlier real pipeline stage.
       if (position === 0 && piped && independent && !listsTmp && !lookup) {
         pipeFeed = false; pipeTmp = false; actual = { lookup: false, tmp: false };
@@ -1169,6 +1397,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         const argv = positionalFields(args, 0).words;
         const noChange = argv.some((arg) => arg.text === "-n");
         const rotation = argv.find((arg) => /^[+-]\d+$/.test(arg.text));
+        const target = argv.find((arg) => !arg.text.startsWith("-") && !/^[+]\d+$/.test(arg.text));
         if (rotation) {
           const count = Number(rotation.text.slice(1));
           const index = rotation.text[0] === "+" ? count : directoryStack.length - 1 - count;
@@ -1180,16 +1409,18 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         } else if (name === "popd") {
           if (directoryStack.length > 1) { directoryStack.splice(noChange ? 1 : 0, 1); if (!noChange) cwd = directoryStack[0]; }
         } else {
-          const target = argv.find((arg) => !arg.text.startsWith("-"));
           if (target) {
-            const previous = cwd;
+            const previous = cwd, previousUncertain = uncertainCwd, previousShared = sharedCwd;
             changeDir(target);
-            if (noChange) { directoryStack.splice(1, 0, cwd); cwd = previous; }
+            if (noChange) { directoryStack.splice(1, 0, cwd); cwd = previous; uncertainCwd = previousUncertain; sharedCwd = previousShared; }
             else directoryStack.unshift(cwd);
           } else if (directoryStack.length > 1) {
             [directoryStack[0], directoryStack[1]] = [directoryStack[1], directoryStack[0]];
             if (!noChange) cwd = directoryStack[0];
           }
+        }
+        if (!noChange && uncertainStack && (name === "popd" || rotation || !target)) {
+          cwd = undefined; uncertainCwd = true; sharedCwd ||= sharedStack;
         }
       }
       // smarty-dev#1998: rm (and xargs rm) of a /tmp glob, or find over one with -delete or -exec rm.
@@ -1201,7 +1432,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (name === "find") {
         const deletes = args.some((arg, i) => arg.text === "-delete" || (["-exec", "-execdir", "-ok", "-okdir"].includes(arg.text) &&
           /(^|[\s/])(rm|unlink|shred)(\s|$)/.test(args.slice(i + 1).map((a) => a.text).join(" ").split(/\s[;+](\s|$)/)[0]!)));
-        if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern)) : tmpGlob(".", cwd))) verdict.wipe = true;
+        if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern)) : inTmp("."))) verdict.wipe = true;
       }
       // xargs appends its input: from a lookup, `{}` and every positional parameter hold it.
       const xargsFeed = fedByXargs && pipeFeed;
@@ -1212,7 +1443,9 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         if (!probe && (byLookup || xargsFeed)) verdict.blocked = true;
       }
       // review/astra F6 on #105: a heredoc script as the shell receives it, placeholders included.
-      if (SHELLS.has(name) || name === "ssh") for (const heredoc of heredocs) scripts.push({ text: heredoc.text, remote: name === "ssh", heredoc: true });
+      if (SHELLS.has(name) || name === "ssh") for (const heredoc of heredocs) scripts.push({
+        text: receiverText(mask(heredoc.text).replaceAll("$", heredoc.quoted ? LITERAL : "$")), remote: name === "ssh", heredoc: true,
+      });
       if (SHELLS.has(name)) {
         const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg.text));
         const payload = flag >= 0 ? args[flag + 1] : undefined;
@@ -1233,20 +1466,20 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           });
           if (xargsFeed) extra.push(..."123456789@*".split(""), "{}");
           if (xargsTmp) tmpExtra.push(..."123456789@*".split(""), "{}");
-          scripts.push({ text: payload.text, extra, tmpExtra, positionals: positional, tails: bound.tails });
+          scripts.push({ text: receiverText(payload.pattern), extra, tmpExtra, positionals: positional, tails: bound.tails });
         }
       }
-      if (name === "eval") scripts.push({ text: args.map((arg) => arg.text).join(" ") });
+      if (name === "eval") scripts.push({ text: args.map((arg) => receiverText(arg.pattern)).join(" ") });
       if (name === "ssh") {
         let i = 0;
         while (args[i]?.text.startsWith("-")) i += SSH_VALUE_OPTIONS.has(args[i]!.text) ? 2 : 1;
-        scripts.push({ text: args.slice(i + 1).map((arg) => arg.text).join(" "), remote: true });
+        scripts.push({ text: args.slice(i + 1).map((arg) => receiverText(arg.pattern)).join(" "), remote: true });
       }
       let scriptOutput: Feed = NO_OUTPUT;
       let scriptKnown = true;
       for (const inner of scripts) {
-        const result = nested(inner.text, inner.extra, inner.tmpExtra, !inner.remote,
-          inner.heredoc ? undefined : receiverStdin, inner.positionals, stageSinks, inner.tails, inputs);
+        const result = temporary(() => nested(inner.text, inner.extra, inner.tmpExtra, !inner.remote,
+          inner.heredoc ? undefined : receiverStdin, inner.positionals, stageSinks, inner.tails, inputs));
         scriptOutput = concatFeed(scriptOutput, result.output ?? EMPTY_FEED, budget);
         scriptKnown &&= result.sourceKnown === true;
         lookup = (result.output?.lookup ?? false) || lookup;
@@ -1326,8 +1559,23 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const sink = stageSinks.get(1) ?? "other";
       if (typeof sink === "object" && sink.file !== undefined) {
         const recorded = known || output.lookup || output.tmp ? output : undefined;
-        const previous = files.has(sink.file) ? files.get(sink.file) : EMPTY_FEED;
+        const previous = files.has(sink.file) ? files.get(sink.file) : unknownFileFeed(sink.file);
         files.set(sink.file, previous && recorded ? concatFeed(previous, recorded, budget) : previous?.lookup || previous?.tmp ? previous : recorded?.lookup || recorded?.tmp ? recorded : undefined);
+      } else if (typeof sink === "object" && (output.lookup || output.tmp)) {
+        // Never drop an unsafe producer merely because its alias/cwd target is unknown.
+        // It may affect any existing/open file; definite later opens still strongly reset
+        // their concrete file facts, retaining the ordinary safe-overwrite allowance.
+        budget.spend(2 * files.size + 2);
+        const unsafe = { lookup: output.lookup, tmp: output.tmp };
+        for (const [file, previous] of files) {
+          budget.spend(file.length + 1);
+          if (!sink.targets || sink.targets.includes(fileLeaf(file))) files.set(file, mergeFeed(previous ?? EMPTY_FEED, unsafe));
+        }
+        for (const target of sink.targets ?? [undefined]) {
+          budget.spend((target?.length ?? 0) + 32);
+          const key = target === undefined ? UNKNOWN_FILE : `${UNKNOWN_FILE}/${target}`;
+          files.set(key, mergeFeed(files.get(key) ?? EMPTY_FEED, unsafe));
+        }
       }
       const emitted = sink === "stdout" ? output : NO_OUTPUT;
       const emittedKnown = sink !== "stdout" || known;
@@ -1343,34 +1591,75 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           if (name !== "for" && name !== "select") recordOutput(member, emittedKnown, emitted);
         } else { stream = concatFeed(stream, emitted, budget); streamKnown &&= emittedKnown; }
       }
-      if (chdirs.length) { cwd = parentCwd; directoryStack = wrapperStack!; }
+      if (chdirs.length) { cwd = parentCwd; uncertainCwd = parentUncertainCwd; sharedCwd = parentSharedCwd; directoryStack = wrapperStack!; uncertainStack = wrapperUncertainStack; sharedStack = wrapperSharedStack; }
+      // A builtin may assign one of its own temporary prefix variables (read/printf -v).
+      // Its new value must not escape that temporary binding into the calling shell.
+      if (!standalone && assignments.length) restoreAssignments();
+      if (prior) {
+        // A later && command is reached only after this cd succeeded. Keep that routing
+        // for the chain's consumer, then join the skipped path when the chain ends.
+        if (stage.continues) {
+          if (!pendingCwd) pendingCwd = { cwd: prior.cwd, uncertainCwd: prior.uncertainCwd, sharedCwd: prior.sharedCwd };
+          else pendingCwd.sharedCwd ||= prior.sharedCwd;
+        }
+        joinConditional(prior, !stage.continues);
+      }
+      if (!stage.continues && pendingCwd) {
+        if (pendingCwd.cwd !== cwd || pendingCwd.uncertainCwd || uncertainCwd) {
+          sharedCwd ||= pendingCwd.sharedCwd;
+          cwd = undefined; uncertainCwd = true; directoryStack = [undefined];
+        }
+        pendingCwd = undefined;
+      }
     });
     stages = [];
   };
 
-  const groupStates: Array<{ cwd: string | undefined; stack: Array<string | undefined>; values: Map<string, string>; unknown: Set<string>; tainted: Set<string>; tmpNames: Set<string>; lookupTail: number | undefined; tmpTail: number | undefined }> = [];
+  const groupStates: Array<{ cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmpNames: Set<string>; lookupTail: number | undefined; tmpTail: number | undefined }> = [];
+  // This is a conservative control-flow annotation, not shell execution. Conditions,
+  // short-circuit RHSs and loop bodies may be skipped, including zero iterations.
+  const controls: Array<{ kind: string; conditional: boolean }> = [];
+  let shortCircuit = false;
+  let statementHead = true;
+  const conditional = (): boolean => shortCircuit || controls.some((control) => control.conditional);
   for (const token of tokens) {
-    budget.spend();
+    budget.spend(controls.length + 1);
     if ("word" in token) {
+      if (statementHead) {
+        const name = token.word.quoted || token.word.assignment === false ? "" : token.word.text;
+        if (["if", "for", "while", "until", "select", "case"].includes(name)) controls.push({ kind: name === "if" ? "if" : name === "case" ? "case" : "loop", conditional: true });
+        command.conditional ||= conditional();
+        if (name === "{") controls.push({ kind: "brace", conditional: conditional() });
+        const end = name === "fi" ? "if" : name === "done" ? "loop" : name === "esac" ? "case" : name === "}" ? "brace" : undefined;
+        if (end && controls.at(-1)?.kind === end) controls.pop();
+        statementHead = ["then", "do", "else", "{", "if", "elif", "while", "until", "!"].includes(name);
+      }
       command.words.push(token.word);
       const closed = scopes.ends.get(token);
       if (closed !== undefined) command.closed = closed;
       continue;
     }
-    if ("redirect" in token) { command.redirects.push(token); continue; }
+    if ("redirect" in token) { command.conditional ||= conditional(); command.redirects.push(token); continue; }
     if ("heredoc" in token) { command.heredocs.push(token.heredoc); continue; }
+    command.continues = token.op === "&&";
     if (command.words.length > 0 || command.redirects.length > 0 || command.heredocs.length > 0 || command.closed !== undefined) stages.push(command);
     command = { words: [], redirects: [], heredocs: [] };
+    statementHead = true;
     if (token.op !== "|" && token.op !== "|&") runPipeline();
+    if (["&&", "||"].includes(token.op)) shortCircuit = true;
+    else if (!["|", "|&", "("].includes(token.op)) shortCircuit = false;
     if (token.op === "(") {
-      budget.spend(2 * (values.size + unknown.size + tainted.size + tmpNames.size) + directoryStack.length + 1);
-      groupStates.push({ cwd, stack: [...directoryStack], lookupTail, tmpTail, values: new Map(values), unknown: new Set(unknown), tainted: new Set(tainted), tmpNames: new Set(tmpNames) });
+      controls.push({ kind: "group", conditional: conditional() });
+      budget.spend(2 * (values.size + alternatives.size + unknown.size + tainted.size + tmpNames.size) + directoryStack.length + 1);
+      groupStates.push({ cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail, values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmpNames: new Set(tmpNames) });
     }
     if (token.op === ")" && !token.arrayClose) {
+      if (controls.at(-1)?.kind === "group") controls.pop();
       const saved = groupStates.pop();
       if (saved) {
-        cwd = saved.cwd; directoryStack = saved.stack; lookupTail = saved.lookupTail; tmpTail = saved.tmpTail;
+        cwd = saved.cwd; uncertainCwd = saved.uncertainCwd; sharedCwd = saved.sharedCwd; directoryStack = saved.stack; uncertainStack = saved.uncertainStack; sharedStack = saved.sharedStack; lookupTail = saved.lookupTail; tmpTail = saved.tmpTail;
         values.clear(); saved.values.forEach((value, key) => values.set(key, value));
+        alternatives.clear(); saved.alternatives.forEach((value, key) => alternatives.set(key, value));
         unknown.clear(); saved.unknown.forEach((key) => unknown.add(key));
         tainted.clear(); saved.tainted.forEach((key) => tainted.add(key));
         tmpNames.clear(); saved.tmpNames.forEach((key) => tmpNames.add(key));

@@ -9,7 +9,7 @@ import type { MeshIdentity } from "../src/mesh/store.js";
 
 const sender: MeshIdentity = { id: "agent:verified-worker", kind: "agent", name: "Worker" };
 const expected = (from = sender, via = "steer", verified = "mesh") => ({
-  v: 1, channel: "fabric", sender: { id: from.id, kind: from.kind, name: from.name, verified }, via,
+  v: 1, channel: "fabric", sender: { id: from.id, kind: verified === "bridge" ? "remote" : from.kind, name: from.name, verified }, via,
 });
 const roots: string[] = [];
 const controllers: MainAgentController[] = [];
@@ -21,10 +21,10 @@ afterEach(() => {
 });
 
 // A recording host at the production Pi API boundary, never a mocked Fabric delivery function.
-const fixture = (supportsProvenance = true, entries: unknown[] = [], idle = false) => {
+const fixture = (turnProvenance = true, entries: unknown[] = [], idle = false) => {
   const handlers = new Map<string, Array<(event: any, context: ExtensionContext) => void>>();
   const pi = {
-    supportsProvenance,
+    ...(turnProvenance ? { hostCapabilities: { turnProvenance: 1 } } : {}),
     sendMessage: vi.fn(), sendUserMessage: vi.fn(), getThinkingLevel: () => "off",
     on: (name: string, handler: (event: any, context: ExtensionContext) => void) => {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
@@ -64,7 +64,7 @@ describe("Fabric Main provenance at the Pi API", () => {
 
   it("direct Fabric user injection is fabric, never keyboard", () => {
     const { pi, main } = fixture();
-    main.deliverUser("  Paul says do it  ", "steer");
+    main.deliverUser("  Paul says do it  ", "steer", { id: "session:root", name: "main", kind: "main" });
     expect(pi.sendUserMessage).toHaveBeenCalledWith("Paul says do it", {
       deliverAs: "steer", provenance: expected({ id: "session:root", name: "main", kind: "main" }),
     });
@@ -87,7 +87,7 @@ describe("Fabric Main provenance at the Pi API", () => {
     expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(bridged, "steer", "bridge"));
   });
 
-  it("durable held replay retains admission and Fabric send time; Pi stamps the first receipt", () => {
+  it("durable held replay retains admission and Fabric send time; Pi stamps a new receipt", () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date("2026-09-30T10:00:00Z"));
     const file = journal();
     const first = fixture(); first.main.attachFollowUpDrain(first.context, 120_000, file);
@@ -103,6 +103,26 @@ describe("Fabric Main provenance at the Pi API", () => {
     expect(JSON.parse(fs.readFileSync(file, "utf8")).items[0].provenance).toEqual(original.provenance);
     expect(replay.pi.sendMessage.mock.calls[0]![1].provenance).not.toHaveProperty("turnId");
     expect(replay.pi.sendMessage.mock.calls[0]![1].provenance).not.toHaveProperty("receivedAt");
+  });
+
+  it("replay preserves the original verified sender and never sends an old Pi receipt", () => {
+    const file = journal();
+    const original = { ...sender, verified: "bridge" as const };
+    fs.writeFileSync(file, JSON.stringify({ version: 1, items: [{ id: "old-receipt", from: original,
+      message: "Paul here", sentAt: 1, provenance: { ...expected(original, "steer", "bridge"),
+        turnId: "old-turn", receivedAt: "2026-09-30T10:00:00Z" } }] }));
+    const { pi, main, context, emit } = fixture(); main.attachFollowUpDrain(context, 120_000, file);
+    emit("agent_before_settle");
+    const options = pi.sendMessage.mock.calls[0]![1];
+    expect(options.provenance).toEqual(expected(original, "replay", "bridge"));
+    expect(options.provenance).not.toHaveProperty("turnId");
+    expect(options.provenance).not.toHaveProperty("receivedAt");
+  });
+
+  it("user injection from an unknown caller makes no provenance claim even on a capable host", () => {
+    const { pi, main } = fixture();
+    main.deliverUser("not known to be Main", "steer");
+    expect(pi.sendUserMessage).toHaveBeenCalledWith("not known to be Main", { deliverAs: "steer" });
   });
 
   it("reload does not re-inject an already queued handoff; a lost one first receives via replay", () => {
@@ -204,5 +224,7 @@ describe("Fabric Main provenance at the Pi API", () => {
     expect(pi.sendUserMessage.mock.calls).toEqual([["hello", { deliverAs: "steer" }], ["again", { deliverAs: "followUp" }]]);
     expect(pi.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(warn.mock.calls.filter(call => String(call[0]).includes("provenance"))).toHaveLength(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("hostCapabilities.turnProvenance === 1"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("turnProvenance.fabricExtensions"));
   });
 });

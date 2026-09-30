@@ -16,14 +16,15 @@ import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
 import type { MeshEvent, MeshIdentity } from "../src/mesh/store.js";
 import type { FabricLifecycleEvent, FabricLifecycleSubscription } from "../src/lifecycle/types.js";
-import { sendFabricUserMessage } from "../src/fabric-provenance.js";
+import { sendFabricMessage, sendFabricUserMessage } from "../src/fabric-provenance.js";
 
 const host: MeshIdentity = { id: "session:host", name: "main", kind: "main" };
 const provenance = (sender: MeshIdentity, via: string) => ({ v: 1, channel: "fabric", sender: {
-  id: sender.id, kind: sender.kind, name: sender.name, verified: sender.verified ?? "mesh",
+  id: sender.id, kind: sender.verified === "bridge" ? "remote" : sender.kind, name: sender.name, verified: sender.verified ?? "mesh",
 }, via });
-const recording = (supportsProvenance = true) => {
-  const fake = { supportsProvenance, sendMessage: vi.fn(), sendUserMessage: vi.fn(), on: vi.fn(() => () => {}) };
+const recording = (turnProvenance = true) => {
+  const fake = { ...(turnProvenance ? { hostCapabilities: { turnProvenance: 1 } } : {}),
+    sendMessage: vi.fn(), sendUserMessage: vi.fn(), on: vi.fn(() => () => {}) };
   return { fake, pi: fake as unknown as ExtensionAPI };
 };
 const actorOutput = (delivery: "steer" | "followUp" | "nextTurn", triggerTurn: boolean, source = "host") => ({
@@ -34,6 +35,37 @@ const event = (from: MeshIdentity, id: string): MeshEvent => ({ id, sequence: 1,
   text: "Paul speaking", createdAt: 1 });
 
 describe("Fabric delivery producers record provenance at the Pi call", () => {
+  it("hostCapabilities.turnProvenance === 1 puts provenance in both Pi API options", () => {
+    const { fake, pi } = recording();
+    const message = { customType: "probe", content: "Paul here", display: true };
+    sendFabricMessage(pi, message, { deliverAs: "steer", triggerTurn: true }, host, "steer");
+    sendFabricUserMessage(pi, "Paul here", host, "followUp", { deliverAs: "followUp" });
+    expect(fake.sendMessage).toHaveBeenCalledWith(message, { deliverAs: "steer", triggerTurn: true,
+      provenance: provenance(host, "steer") });
+    expect(fake.sendUserMessage).toHaveBeenCalledWith("Paul here", { deliverAs: "followUp",
+      provenance: provenance(host, "followUp") });
+  });
+
+  it("absent capability ignores the deprecated flag and leaves legacy calls unchanged", () => {
+    const { fake, pi } = recording(false);
+    Object.assign(fake, { supportsProvenance: true });
+    const message = { customType: "probe", content: "legacy", display: true };
+    const options = { deliverAs: "steer" as const, triggerTurn: false };
+    const sender = vi.fn(() => host);
+    sendFabricMessage(pi, message, options, sender, "steer");
+    sendFabricUserMessage(pi, "legacy", sender, "followUp");
+    expect(fake.sendMessage.mock.calls).toEqual([[message, options]]);
+    expect(fake.sendMessage.mock.calls[0]![1]).toBe(options);
+    expect(fake.sendUserMessage.mock.calls).toEqual([["legacy"]]);
+    expect(sender).not.toHaveBeenCalled();
+  });
+
+  it.each([true, "1", 2])("capability value %s does not advertise v1", value => {
+    const { fake, pi } = recording(false);
+    Object.assign(fake, { hostCapabilities: { turnProvenance: value } });
+    sendFabricUserMessage(pi, "legacy", host, "followUp");
+    expect(fake.sendUserMessage.mock.calls).toEqual([["legacy"]]);
+  });
   it.each([["steer", true], ["followUp", true], ["followUp", false], ["nextTurn", false]] as const)(
     "actor %s triggerTurn=%s identifies the emitting actor and preserves delivery", (delivery, triggerTurn) => {
       const { fake, pi } = recording();

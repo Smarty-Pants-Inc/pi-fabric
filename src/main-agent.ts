@@ -313,13 +313,15 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   deliverUser(
     message: string, delivery: FabricAgentMessageDelivery,
-    from: MeshIdentity = { id: this.id, name: "main", kind: "main" },
+    from?: MeshIdentity,
   ): FabricAgentMessageResult {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
     const text = message.trim();
     if (!text) throw new Error("Main agent message must not be empty");
     const messageId = randomUUID();
-    this.pi.sendUserMessage(text, fabricProvenanceOptions(this.pi, { deliverAs: delivery }, fabricTurnProvenance(from, delivery)));
+    const options = { deliverAs: delivery };
+    // An unknown caller cannot claim this Main's identity. Pi records the unclaimed turn as terminal.
+    this.pi.sendUserMessage(text, from ? fabricProvenanceOptions(this.pi, options, fabricTurnProvenance(from, delivery)) : options);
     return { queued: true, messageId, routed: "main" };
   }
 

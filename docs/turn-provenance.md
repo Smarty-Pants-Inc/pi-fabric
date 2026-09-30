@@ -22,7 +22,7 @@ The sender comes from the mesh command/event envelope or the registered local pr
 
 ## Host API compatibility
 
-The Fabric adapter requires the explicit Pi extension capability `pi.supportsProvenance === true`. That capability must mean that **both** `pi.sendUserMessage(text, { deliverAs, provenance })` and `pi.sendMessage(message, { deliverAs, triggerTurn, provenance })` accept and persist v1 provenance. The current pinned Pi dependency predates that capability. The Pi owner must expose the capability and custom-message option alongside the user-message option before this adapter activates.
+The Fabric adapter requires the explicit Pi extension capability `pi.hostCapabilities?.turnProvenance === 1`. On that host, **both** `pi.sendUserMessage(text, { deliverAs, provenance })` and `pi.sendMessage(message, { deliverAs, triggerTurn, provenance })` receive the v1 claim. The deprecated `pi.supportsProvenance` flag does not activate this adapter. The current pinned Pi dependency predates the settled capability; older hosts keep legacy calls.
 
 JavaScript function arity cannot prove option support. Fabric makes no probing delivery, version guess, catch-and-resend, or silent conversion of passive custom messages to triggering user messages. Without the explicit capability, it passes the original arguments unchanged and records one compatibility warning per Pi process, including across extension reloads. A user injection that previously used one argument still uses one argument.
 
@@ -30,10 +30,24 @@ JavaScript function arity cannot prove option support. Fabric makes no probing d
 
 Pi writes `turnId` and `receivedAt` at the first receipt. Fabric never creates either field. The `main-followups` journal stores the original verified sender and admission metadata before acknowledging a durable message. Its `sentAt` records Fabric send time; it is not Pi receipt time.
 
-After restart or reload, an unreceived journal item goes to Pi with the original sender and `via: "replay"`. Its admission record and send time remain unchanged. An item already held by any persisted session branch is never re-injected. During a live reload, a handed-over item still in Pi's queue or in-memory session is also left alone. Compaction, fork, export, and session-entry stamping remain Pi responsibilities.
+After restart or reload, an unreceived journal item goes to Pi with the original verified sender and `via: "replay"`. Fabric sends no `turnId` or `receivedAt`, including stamps found in an older journal. Pi creates a new authoritative receipt and ignores any receipt fields supplied in extension claims. Its admission record and Fabric send time remain unchanged. An item already held by any persisted session branch is never re-injected. During a live reload, a handed-over item still in Pi's queue or in-memory session is also left alone. Compaction, fork, export, and session-entry stamping remain Pi responsibilities.
 
 Only Pi assigns `keyboard`, `terminal`, and `voice`. Unattested pane writes are terminal input, with no human principal. Fabric never claims `keyboard` or `voice`, never supplies a principal, and does not bind voice from global settings or message text. Consumers treat absent provenance and unknown versions as UNKNOWN.
 
 ## Trust boundary
+
+Pi accepts a Fabric claim only from an extension listed in the host's **global** `settings.json` under `turnProvenance.fabricExtensions`. The profile uses `PI_CODING_AGENT_DIR`; trust is never configured through project settings. For the fleet's release layout, the global entry is:
+
+```json
+{
+  "turnProvenance": {
+    "fabricExtensions": ["/home/paul/.local/share/smarty-dev/fabric/releases/"]
+  }
+}
+```
+
+Without trust, or with an invalid claim, Pi still delivers the message and records `terminal`. The host capability advertises API support, not installation trust. Bridged messages use `sender.kind: "remote"` and `sender.verified: "bridge"`; local participants retain their admitted kind. A user-message injection with no known calling participant carries no claim.
+
+Process workers receive prompts over RPC. RPC cannot claim a channel, so those turns record `terminal` (UNKNOWN to k3) until the worker's Pi delivers through the trusted Fabric extension's `sendMessage` or `sendUserMessage` API. Fabric does not stamp worker RPC prompts.
 
 Mesh verification uses Fabric's existing trusted local runtime and filesystem admission boundary. The bridge additionally validates remote participant ownership at commit. These metadata fields do not provide cryptographic isolation from a process that can edit mesh state, journals, or the Pi session file. They attribute the emitting participant; they grant no approval or authority.

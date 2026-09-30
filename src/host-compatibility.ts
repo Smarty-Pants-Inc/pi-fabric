@@ -127,7 +127,7 @@ export const resolveFabricIdentity = (
 
 /** Explicit host capability: option acceptance cannot be inferred from a JS function's arity. */
 export const fabricProvenanceSupported = (pi: ExtensionAPI): boolean =>
-  (pi as ExtensionAPI & { supportsProvenance?: unknown }).supportsProvenance === true;
+  (pi as ExtensionAPI & { hostCapabilities?: { turnProvenance?: unknown } }).hostCapabilities?.turnProvenance === 1;
 
 // Survives extension generations in the same Pi process.
 const WARNING_KEY = Symbol.for("pi-fabric.turn-provenance.compatibility-warning.v1");
@@ -144,7 +144,7 @@ export const fabricProvenanceOptions = <Options extends object | undefined>(
   const diagnostics = globalThis as typeof globalThis & { [key: symbol]: unknown };
   if (diagnostics[WARNING_KEY] !== true) {
     diagnostics[WARNING_KEY] = true;
-    console.warn("[pi-fabric] Pi does not advertise supportsProvenance; delivering without turn provenance (legacy behavior). Upgrade to a provenance-capable Pi host.");
+    console.warn("[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.");
   }
   return options;
 };
@@ -158,7 +158,7 @@ export const fabricTurnProvenance = (
   channel: "fabric",
   sender: {
     id: from.id,
-    kind: from.kind,
+    kind: from.verified === "bridge" ? "remote" : from.kind,
     ...(typeof from.name === "string" && from.name ? { name: from.name } : {}),
     verified: from.verified === "bridge" ? "bridge" : "mesh",
   },

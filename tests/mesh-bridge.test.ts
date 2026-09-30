@@ -143,7 +143,7 @@ describe("mesh bridge", () => {
     const lane = await addRoot(hub, "lane");
     const remote = await addRoot(far, "remote");
     const sendMessage = vi.fn();
-    const pi = { supportsProvenance: true, sendMessage, sendUserMessage: vi.fn() } as unknown as ExtensionAPI;
+    const pi = { hostCapabilities: { turnProvenance: 1 }, sendMessage, sendUserMessage: vi.fn() } as unknown as ExtensionAPI;
     const main = new MainAgentController(pi, lane.identity.id, true, os.tmpdir(), "lane");
     const router = new AgentMessageRouter({} as any, { identity: lane.identity } as any, main,
       { get: () => undefined } as any, undefined, binding => binding);
@@ -156,7 +156,7 @@ describe("mesh bridge", () => {
       await bridge.step();
       await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
       expect(sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true,
-        provenance: { v: 1, channel: "fabric", sender: { id: remote.identity.id, kind: "main", name: "main", verified: "bridge" }, via: "followUp" } });
+        provenance: { v: 1, channel: "fabric", sender: { id: remote.identity.id, kind: "remote", name: "main", verified: "bridge" }, via: "followUp" } });
       expect(on(hub, "fabric.control.command")[0]!.from.verified).toBe("bridge");
     } finally {
       await control.close();

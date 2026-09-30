@@ -598,6 +598,13 @@ describe("runtime observation receipts", () => {
     const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => { record("background completion", { id: result.id, status: result.status }); inbox.enqueue(result); });
     const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
     const registry = new ActionRegistry(); registry.register(h.provider);
+    let admitGuest: (() => void) | undefined;
+    registry.register({
+      name: "receipt_probe", description: "Receipt regression guest readiness",
+      async list() { return [{ name: "ready", description: "Mark guest admission", risk: "read" as const, inputSchema: { type: "object", properties: {} } }]; },
+      async describe() { return (await this.list({}, context))[0]; },
+      async invoke() { admitGuest?.(); return null; },
+    });
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.memoryLimitBytes = 128 * 1024 * 1024;
     const python = backend === "monty" || backend === "cpython";
@@ -606,20 +613,35 @@ describe("runtime observation receipts", () => {
     config.executor.mainMaxTimeoutMs = 5_000;
     const service = new FabricExecutionService(registry, config);
     const mainContext = { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "receipt-main" } } as unknown as ExtensionContext;
+    // Bound even a broken startup handshake, independently of the mocked budget
+    // clock, and leave time for cancellation/cleanup before Vitest's 45s limit.
+    const lifetime = new AbortController();
+    const lifetimeGuard = setTimeout(() => {
+      record("receipt test: startup/cleanup hang guard");
+      lifetime.abort(new Error("Receipt regression exceeded its 35-second lifetime guard"));
+    }, 35_000);
     const execute = async (parentToolCallId: string, code: string) => {
       record(`${parentToolCallId}: start`);
       const controller = new AbortController();
-      // Keep a real hang guard separate from the controlled Main budget, so a
-      // broken Windows IPC handshake still settles and emits diagnostics.
-      const guard = setTimeout(() => {
-        record(`${parentToolCallId}: hang guard`);
-        controller.abort(new Error("Receipt regression execution exceeded its 12-second hang guard"));
-      }, 12_000);
+      let guard: ReturnType<typeof setTimeout> | undefined;
+      // As with the admission-clock regressions, startup is not the tested
+      // boundary. CPython starts a fresh interpreter/Windows IPC for every call;
+      // a warmup cannot make later starts cheap. Arm the active-work guard only
+      // when a real guest host call proves admission, not before cold startup.
+      admitGuest = () => {
+        if (guard !== undefined) return;
+        record(`${parentToolCallId}: guest admitted`);
+        guard = setTimeout(() => {
+          record(`${parentToolCallId}: hang guard`);
+          controller.abort(new Error("Receipt regression execution exceeded its 12-second admitted hang guard"));
+        }, 12_000);
+      };
       try {
-        const result = await service.execute({ code, context: mainContext, signal: controller.signal, parentToolCallId, onPartial() {} });
+        const ready = python ? 'await tools.call(ref="receipt_probe.ready", args={})\n' : 'await tools.call({ ref: "receipt_probe.ready", args: {} });\n';
+        const result = await service.execute({ code: ready + code, context: mainContext, signal: AbortSignal.any([controller.signal, lifetime.signal]), parentToolCallId, onPartial() {} });
         record(`${parentToolCallId}: end`, { success: result.success, error: result.error, logs: result.logs, phases: result.phases, audits: result.audits });
         return result;
-      } finally { clearTimeout(guard); }
+      } finally { clearTimeout(guard); admitGuest = undefined; }
     };
     const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
     try {
@@ -646,6 +668,7 @@ describe("runtime observation receipts", () => {
         record("encoding host call", { ref });
         const value = await invoke(ref, args, callContext);
         record("encoding host result", { ref });
+        if (ref !== "agents.wait") return value;
         // Registry admission precedes guest promise/frame publication.
         Object.defineProperty(value, "text", { enumerable: true, get: () => encode(callContext.mainDeadlineAt!) });
         return value;
@@ -704,7 +727,7 @@ describe("runtime observation receipts", () => {
         steps, consumptionCalls: consumed.mock.calls, completionIds: completed.mock.calls.map(([result]) => result.id),
       }, null, 2));
       throw error;
-    } finally { inbox.close(); await registry.close(); vi.unstubAllEnvs(); }
+    } finally { clearTimeout(lifetimeGuard); lifetime.abort(); inbox.close(); await registry.close(); vi.unstubAllEnvs(); }
   }, 45_000);
 });
 

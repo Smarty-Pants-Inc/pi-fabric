@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -37,6 +38,33 @@ describe.skipIf(process.platform === "win32")("jev-fabric binary resolution", ()
     expect(found.skipped).toEqual([{ path: path.join(workspace, "bin", "jev-fabric"), reason: "inside the workspace" }]);
   });
 
+  it.each(["repository", "worktree"])("SEC-2 never probes repository binaries from nested cwd or symlink PATH (%s)", async (layout) => {
+    const dir = root();
+    const repository = path.join(dir, "repository");
+    fs.mkdirSync(repository);
+    execFileSync("git", ["init", "-q", repository]);
+    let workspace = repository;
+    if (layout === "worktree") {
+      execFileSync("git", ["-C", repository, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "fixture"]);
+      workspace = path.join(dir, "worktree");
+      execFileSync("git", ["-C", repository, "worktree", "add", "--detach", "-q", workspace, "HEAD"]);
+    }
+    const cwd = path.join(workspace, "packages", "nested");
+    fs.mkdirSync(cwd, { recursive: true });
+    const binary = fake(path.join(workspace, "tools"), current);
+    const marker = path.join(dir, "repository-executed");
+    fs.writeFileSync(binary, fs.readFileSync(binary, "utf8").replace("#!/bin/sh\n", `#!/bin/sh\ntouch '${marker}'\n`), { mode: 0o755 });
+    const linked = path.join(dir, "host-looking-tools");
+    fs.symlinkSync(path.dirname(binary), linked, "dir");
+    const bundled = fake(path.join(dir, "bundled"), current);
+    for (const entry of [path.dirname(binary), linked]) {
+      const resolution = await resolveJevFabric({ configured: "auto", cwd, agentDir: dir, home: dir,
+        requirement: "sessions", env: { PATH: entry }, bundled: () => bundled });
+      expect(resolution).toMatchObject({ path: bundled, source: "bundled" });
+      expect(resolution.skipped).toContainEqual(expect.objectContaining({ reason: "inside the workspace" }));
+      expect(fs.existsSync(marker)).toBe(false);
+    }
+  });
   it("prefers a compatible user install, including a newer one", async () => {
     const dir = root();
     const user = fake(path.join(dir, "user"), newer);

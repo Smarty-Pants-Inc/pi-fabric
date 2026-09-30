@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -47,6 +47,22 @@ export class DurableTaskRegistry {
   constructor(stateDirectory: string) { this.directory = path.join(stateDirectory, DURABLE_TASKS_DIRECTORY); }
 
   #file(taskId: string): string { return path.join(this.directory, `${safeId(taskId)}.json`); }
+
+  /** Persistent output provenance lives alongside the backend job, so another
+   * session/agent directory and terminal-binding cleanup cannot erase it. */
+  #policyFile(home: string, jobId: string): string {
+    return path.join(home, `.fabric-output-filter-${createHash("sha256").update(jobId).digest("hex")}`);
+  }
+
+  async protect(home: string, jobId: string): Promise<void> {
+    try { await fs.promises.writeFile(this.#policyFile(home, jobId), "filtered\n", { flag: "wx", mode: 0o600 }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  }
+
+  async isProtected(home: string, jobId: string): Promise<boolean> {
+    try { await fs.promises.lstat(this.#policyFile(home, jobId)); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  }
 
   async add(record: DurableTaskRecord): Promise<void> {
     await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });

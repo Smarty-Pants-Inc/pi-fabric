@@ -80,6 +80,15 @@ const executable = (file: string): boolean => {
   try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; }
 };
 
+// .git may be a directory or the gitdir file of a linked worktree. Walk all
+// ancestors so nested repositories cannot hide an enclosing trust boundary.
+const repositoryRoot = (directory: string): string | undefined => {
+  let root: string | undefined;
+  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
+    if (fs.existsSync(path.join(current, ".git"))) root = current;
+    if (path.dirname(current) === current) return root;
+  }
+};
 /**
  * The user's own installs: PATH entries plus the installer's default
  * `~/.local/bin`, which GUI-launched Pi often lacks. Anything inside the
@@ -87,7 +96,8 @@ const executable = (file: string): boolean => {
  * that receives Jev credentials and runs every durable command.
  */
 export function userCandidates(cwd: string, env: NodeJS.ProcessEnv = process.env, home = os.homedir()): { found: string[]; skipped: Array<{ path: string; reason: string }> } {
-  const workspace = real(cwd);
+  // Preserve both logical and physical workspace boundaries (symlinked cwd).
+  const workspaces = [path.resolve(cwd), real(path.resolve(cwd))].map(directory => repositoryRoot(directory) ?? directory);
   const directories = (env.PATH ?? "").split(path.delimiter).filter(Boolean);
   directories.push(path.join(home, ".local", "bin"));
   const found: string[] = [];
@@ -100,7 +110,10 @@ export function userCandidates(cwd: string, env: NodeJS.ProcessEnv = process.env
     if (seen.has(resolved)) continue;
     seen.add(resolved);
     if (!path.isAbsolute(directory)) skipped.push({ path: file, reason: "relative PATH entry" });
-    else if (inside(file, workspace) || inside(resolved, workspace)) skipped.push({ path: file, reason: "inside the workspace" });
+    else if (workspaces.some(workspace => inside(file, workspace) || inside(resolved, workspace))) skipped.push({ path: file, reason: "inside the workspace" });
+    // PATH may point at a different checkout too. Automatic selection never
+    // grants repository trust; an explicit trusted configuration is the opt-in.
+    else if (repositoryRoot(path.dirname(file)) || repositoryRoot(path.dirname(resolved))) skipped.push({ path: file, reason: "inside a repository" });
     else found.push(file);
   }
   return { found, skipped };

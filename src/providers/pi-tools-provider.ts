@@ -281,6 +281,32 @@ export class PiToolsProvider implements FabricProvider {
     this.#getShellHangMs = hostCapabilities.getShellHangMs;
   }
 
+  /** Interactive backends cannot preserve opaque overrides/middleware. Reuse bash
+   * authority and the host's tool_call admission, or fail closed. */
+  async admitInteractiveShell(args: Record<string, unknown>, context: FabricInvocationContext): Promise<Record<string, unknown>> {
+    this.#assertAllowed("bash");
+    if (this.#catalog?.get("bash")) throw new Error("Interactive sessions would bypass bash shell protection");
+    const runner = this.#catalog?.runner;
+    if (!runner) throw new Error("Interactive sessions require host shell admission");
+    const input = this.prepareArguments("bash", args);
+    const original = { ...input };
+    const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
+      type: "tool_call", toolName: "bash", toolCallId: context.nestedToolCallId, input,
+    }));
+    if (preflight?.block) throw new Error(preflight.reason || "Pi tool bash was blocked");
+    // Only a host-owned timeout can be carried to the interactive backend.
+    if (Object.keys(input).some(key => key !== "timeout" && input[key] !== original[key])
+      || Object.keys(original).some(key => key !== "timeout" && input[key] !== original[key])) {
+      throw new Error("Interactive sessions cannot preserve shell admission argument changes");
+    }
+    if (input.timeout !== undefined && (typeof input.timeout !== "number" || !Number.isFinite(input.timeout) || input.timeout <= 0)) {
+      throw new Error("Invalid host shell admission timeout");
+    }
+    throwIfAborted(context.signal);
+    if (this.#catalog?.get("bash")) throw new Error("Interactive sessions would bypass bash shell protection");
+    return input;
+  }
+
   get shellJobs(): FabricShellJobStore {
     return this.#shellJobs;
   }

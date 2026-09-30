@@ -8,7 +8,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { FabricMemorySourceConfig } from "../config.js";
-import { readSessionHeader } from "./normalize.js";
 import {
   MEMORY_SOURCE_INTERFACE_VERSION,
   createMemorySourceRegistry,
@@ -100,6 +99,51 @@ const resolveSessionFile = (root: string, sessionKey: string): string | null => 
   return resolved;
 };
 
+/** No symlink components below the configured root. Compare the opened inode
+ * with both path snapshots before reading, so a directory/leaf replacement
+ * cannot turn a validated archive key into an outside read. */
+const readContainedSession = (root: string, sessionKey: string): { content: string } => {
+  const rootReal = fs.realpathSync.native(root);
+  if (rootReal !== root) throw new Error("Memory source root changed");
+  const file = resolveSessionFile(rootReal, sessionKey);
+  if (!file) throw new Error("Invalid session key");
+  const validate = (): fs.Stats => {
+    let current = rootReal;
+    for (const segment of path.relative(rootReal, file).split(path.sep)) {
+      current = path.join(current, segment);
+      if (fs.lstatSync(current).isSymbolicLink()) throw new Error("Memory source symlinks are not allowed");
+    }
+    const actual = fs.realpathSync.native(file);
+    if (!actual.startsWith(rootReal + path.sep)) throw new Error("Memory session escaped source root");
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile()) throw new Error("Memory session is not a regular file");
+    return stat;
+  };
+  const before = validate();
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fs.fstatSync(fd);
+    // Linux exposes the opened object's actual target, independent of a
+    // concurrently replaced ancestor pathname. Fail closed if it escaped.
+    if (process.platform === "linux") {
+      const target = fs.realpathSync.native(`/proc/self/fd/${fd}`);
+      if (!target.startsWith(rootReal + path.sep)) throw new Error("Opened memory session escaped source root");
+    }
+    const after = validate();
+    if (!opened.isFile() || before.dev !== opened.dev || before.ino !== opened.ino
+      || after.dev !== opened.dev || after.ino !== opened.ino) throw new Error("Memory session changed during open");
+    return { content: fs.readFileSync(fd, "utf8") };
+  } finally { fs.closeSync(fd); }
+};
+
+// Parse the header from the already-validated bytes, never reopen the pathname.
+const headerForContent = (content: string): { sessionId?: string; cwd?: string } | null => {
+  try {
+    const raw = JSON.parse(content.split("\n", 1)[0]!) as Record<string, unknown>;
+    if (raw?.type !== "session") return null;
+    return { ...(typeof raw.id === "string" ? { sessionId: raw.id } : {}), ...(typeof raw.cwd === "string" ? { cwd: raw.cwd } : {}) };
+  } catch { return null; }
+};
 /** Content-sensitive revision matching the filesystem index fingerprintSource
  *  convention: SHA-256 over the raw file bytes, so an mtime-only touch keeps
  *  the revision while any content change invalidates follow pointers. */
@@ -131,24 +175,27 @@ const parseRecords = (content: string): MemorySourceRecord[] => {
 /** Build a filesystem adapter for one configured source entry. */
 export const createFileSystemMemorySource = (
   options: FileSystemMemorySourceOptions,
-): PortableMemorySource =>
-  defineMemorySource({
+): PortableMemorySource => {
+  // Resolve configured aliases once, not again after a root symlink is retargeted.
+  let root: string;
+  try { root = fs.realpathSync.native(options.root); } catch { root = path.resolve(options.root); }
+  return defineMemorySource({
     interfaceVersion: MEMORY_SOURCE_INTERFACE_VERSION,
     id: options.id,
     async listSessions({ limit, signal }) {
       signal?.throwIfAborted();
       const boundedLimit = Math.max(0, Math.floor(limit));
-      const { sessions: discovered, scanCapped } = discoverSessionFiles(options.root);
+      const { sessions: discovered, scanCapped } = discoverSessionFiles(root);
       const descriptors: MemorySourceSessionDescriptor[] = [];
       for (const found of discovered.slice(0, boundedLimit)) {
         signal?.throwIfAborted();
         let content: string;
         try {
-          content = fs.readFileSync(found.file, "utf8");
+          content = readContainedSession(root, found.sessionKey).content;
         } catch {
           continue;
         }
-        const header = readSessionHeader(found.file);
+        const header = headerForContent(content);
         descriptors.push({
           sessionKey: found.sessionKey,
           sessionId: sessionIdFor(found.file, header),
@@ -172,15 +219,15 @@ export const createFileSystemMemorySource = (
     },
     async loadSession(sessionKey, { signal }) {
       signal?.throwIfAborted();
-      const file = resolveSessionFile(options.root, sessionKey);
+      const file = resolveSessionFile(root, sessionKey);
       if (!file) return null;
       let content: string;
       try {
-        content = fs.readFileSync(file, "utf8");
+        content = readContainedSession(root, sessionKey).content;
       } catch {
         return null;
       }
-      const header = readSessionHeader(file);
+      const header = headerForContent(content);
       return {
         sessionKey,
         sessionId: sessionIdFor(file, header),
@@ -194,6 +241,7 @@ export const createFileSystemMemorySource = (
       } satisfies MemorySourceSnapshot;
     },
   });
+};
 
 /** Build a source registry from validated fabric.json entries. The kind
  *  dispatch lives here so the runtime wiring stays a single call. */

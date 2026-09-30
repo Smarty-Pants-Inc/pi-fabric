@@ -262,6 +262,20 @@ describe("runtime memory source wiring", () => {
     expect(sessions.sessions[0]!.file.startsWith("memory-source:laptop/")).toBe(true);
   });
 
+  it.each(["leaf", "directory"])("SEC-5 source-qualified memory.expand rejects %s symlink escapes", async (kind) => {
+    const root = track(rootDir("expand-symlink"));
+    const outside = track(rootDir("expand-outside"));
+    const secret = writeSessionFile(outside, "secret.jsonl", recordsFor("outside-secret", "/outside", ["OUTSIDE_ARCHIVE_SECRET"]));
+    const session = kind === "leaf" ? "linked.jsonl" : "linked/secret.jsonl";
+    fs.symlinkSync(kind === "leaf" ? secret : outside, path.join(root, kind === "leaf" ? session : "linked"), kind === "leaf" ? "file" : "dir");
+    const provider = await installMemoryProvider(normalizeFabricConfig({
+      memory: { enabled: true, sources: [{ id: "archive", kind: "fs", root }] },
+    }));
+    const expanded = await provider.invoke("expand", { source: "archive", session, entryRange: { first: 0, last: 0 } }, invocation());
+    expect(JSON.stringify(expanded)).not.toContain("OUTSIDE_ARCHIVE_SECRET");
+    expect(expanded).toMatchObject({ error: expect.any(Object) });
+    expect((await createFileSystemMemorySource({ id: "archive", root }).listSessions({ limit: 10 }))).toEqual([]);
+  });
   it("keeps source-less configuration failing closed for unknown sources", async () => {
     const provider = await installMemoryProvider(normalizeFabricConfig({
       memory: { enabled: true },

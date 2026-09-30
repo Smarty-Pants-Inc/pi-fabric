@@ -137,6 +137,7 @@ else if (command === "stop") {
       return { id, stream, offset, bytes: slice.length, omittedBytes: 0, ...(r.encoding === "base64" ? { data: slice.toString("base64") } : { text: slice.toString("utf8") }),
         next: offset + slice.length, eof: Boolean(receipt(id)) && offset + slice.length >= data.length, state: state(id).state };
     },
+    events: (r, id) => { const retained = events(id).filter(event => event.sequence > (r.after ?? 0)); return { events: retained, next: retained.at(-1)?.sequence ?? (r.after ?? 0) }; },
     status: (r, id) => ({ ...state(id), lifetime: "durable" }),
     wait: async (r, id) => { const until = Date.now() + (r.timeoutMs ?? 30000); while (!receipt(id) && Date.now() < until) await sleep(25); return { ...state(id), lifetime: "durable" }; },
   };
@@ -181,7 +182,9 @@ else if (command === "stop") {
     const c = { id, lifetime, label: r.label, proc, out: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, waiters: [] };
     for (const stream of ["stdout", "stderr"]) proc[stream].on("data", (chunk) => { c.out[stream] = Buffer.concat([c.out[stream], chunk]); settle(c); });
     proc.stdin.on("error", () => {});
+    const deadline = setTimeout(() => { c.stopped = true; try { process.kill(-proc.pid, "SIGTERM"); } catch {} }, r.timeoutMs ?? 3600000);
     proc.on("close", (code) => {
+      clearTimeout(deadline);
       c.receipt = { id, lifetime, state: c.stopped ? "cancelled" : code === 0 ? "exited" : "failed", exitCode: code, ...(c.label ? { label: c.label } : {}) };
       settle(c);
     });

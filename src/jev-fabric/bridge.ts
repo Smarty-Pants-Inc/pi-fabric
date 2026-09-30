@@ -114,6 +114,15 @@ export class DurableShellBridge {
       maxTimeoutMs: JEV_FABRIC_START_MAX_MS,
       label: options.label,
       onStarted: async (jobId, scriptPath) => {
+        if (options.filtered) {
+          // Policy belongs to the store/job, not a removable session binding.
+          try { await registry.protect(home, jobId); } catch (error) {
+            await cli.stop(jobId);
+            throw error;
+          }
+        }
+        // Do not publish a backend ID through task metadata until its required
+        // output policy is persisted; another session can adopt a visible ID.
         if (job.durable) job.durable.jobId = jobId;
         if (!options.ownerId) return;
         // A lost binding orphans nothing: tasks.external still lists the job.
@@ -171,12 +180,15 @@ export class DurableShellBridge {
     const existing = this.jobs.list().find(job => job.durable?.jobId === jobId);
     if (existing) return existing;
     const status = await cli.status(jobId);
+    const filtered = await registry.isProtected(this.home, jobId)
+      || (await registry.all()).some(record => record.home === this.home && record.jobId === jobId && record.filtered);
+    if (filtered) await registry.protect(this.home, jobId);
     const { randomUUID } = await import("node:crypto");
     const record: DurableTaskRecord = {
       taskId: randomUUID(), jobId, home: this.home, ownerId: this.options.ownerId ?? "",
       command: status.label ?? `jev-fabric job ${jobId}`,
       ...(description ?? status.label ? { description: description ?? status.label! } : {}),
-      cwd: this.options.cwd, startedAt: Date.now(), filtered: false,
+      cwd: this.options.cwd, startedAt: Date.now(), filtered,
     };
     if (this.options.ownerId) await registry.add(record).catch(() => undefined);
     return this.#attach(record);

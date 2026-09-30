@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { FabricActionDescriptor, FabricInvocationContext, FabricProvider, FabricProviderListRequest } from "../protocol.js";
+import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
+import { throwIfAborted } from "../async-settlement.js";
 import { validationMessage } from "../core/action-arguments.js";
 import type { DurableShellBridge } from "../jev-fabric/bridge.js";
 import type { JevFabricServe } from "../jev-fabric/serve.js";
 
 const DAY_MS = 24 * 3_600_000;
-const id = { type: "string", minLength: 1, maxLength: 128, description: "Session ID from sessions.open (`s-…` for session lifetime) or a durable jev-fabric job ID." };
+const id = { type: "string", minLength: 1, maxLength: 128, description: "Session ID from sessions.open (`s-…` for session lifetime). Output reads require a child opened here; use tasks.* for durable batch output." };
 const idOnly = { type: "object", properties: { id }, required: ["id"], additionalProperties: false };
 const waitMs = { type: "integer", minimum: 1, maximum: 300000, description: "Long-poll ceiling; ready evidence returns at once. Never stops the child." };
 
@@ -75,18 +77,26 @@ export class SessionsProvider implements FabricProvider {
   #serve: Promise<JevFabricServe> | undefined;
   readonly #opened = new Map<string, Opened>();
   #closed = false;
+  readonly #allowedTools = readChildToolAllowlist();
+  readonly #launches = new Map<Promise<unknown>, string>();
+  readonly #retiredOwners = new Set<string>();
 
   constructor(
     readonly bridge: DurableShellBridge,
-    readonly options: { cwd: string; shellOverride: () => boolean },
+    readonly options: { cwd: string; shellOverride: () => boolean;
+      admitShell?: (args: Record<string, unknown>, context: FabricInvocationContext) => Promise<Record<string, unknown>> },
   ) {}
 
   async list(request: FabricProviderListRequest): Promise<FabricActionDescriptor[]> {
+    if (this.#allowedTools && !this.#allowedTools.has("bash")) return [];
     const query = request.query?.toLowerCase();
     return query ? descriptors.filter(d => `${d.name} ${d.description}`.toLowerCase().includes(query)) : descriptors;
   }
 
-  async describe(name: string): Promise<FabricActionDescriptor | undefined> { return descriptors.find(d => d.name === name); }
+  async describe(name: string): Promise<FabricActionDescriptor | undefined> {
+    if (this.#allowedTools && !this.#allowedTools.has("bash")) return undefined;
+    return descriptors.find(d => d.name === name);
+  }
 
   #connect(): Promise<JevFabricServe> {
     if (this.#closed) return Promise.reject(new Error("Sessions provider is closed"));
@@ -105,14 +115,23 @@ export class SessionsProvider implements FabricProvider {
   }
 
   async invoke(name: string, args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
+    if (this.#allowedTools && !this.#allowedTools.has("bash")) throw new Error("Pi tool bash is not permitted by this child's tool allowlist");
     const descriptor = await this.describe(name);
     if (!descriptor) throw new Error(`Unknown sessions action: ${name}`);
     const invalid = validationMessage(descriptor.inputSchema, args);
     if (invalid) throw new Error(`Invalid sessions.${name} arguments: ${invalid}`);
     if (name === "list") return [...this.#opened.values()].map(opened => ({ ...opened }));
-    if (name === "open") return this.#open(args, context);
-    const serve = await this.#connect();
+    if (name === "open") {
+      const launch = this.#open(args, context);
+      this.#launches.set(launch, context.parentToolCallId);
+      try { return await launch; } finally { this.#launches.delete(launch); }
+    }
     const job = args.id as string;
+    // Batch output belongs exclusively to tasks.*, with its launch-time filter.
+    if ((name === "read" || name === "events") && !this.#opened.has(job)) {
+      throw new Error("Session output is available only for children opened here; use tasks for durable batch jobs");
+    }
+    const serve = await this.#connect();
     switch (name) {
       case "write": return serve.request("write", { job, text: args.text }, context.signal);
       case "closeInput": return serve.request("closeInput", { job }, context.signal);
@@ -133,10 +152,21 @@ export class SessionsProvider implements FabricProvider {
     const cwd = path.resolve(this.options.cwd, typeof args.cwd === "string" ? args.cwd : ".");
     if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Working directory does not exist: ${cwd}`);
     const argv = Array.isArray(args.argv) ? args.argv as string[] : [fs.existsSync("/bin/bash") ? "/bin/bash" : "bash", "-c", args.cmd as string];
+    if (!this.options.admitShell) throw new Error("Interactive sessions require host shell admission");
+    const command = typeof args.cmd === "string" ? args.cmd : argv.map(value => "'" + value.replaceAll("'", "'\\''") + "'").join(" ");
+    const admitted = await this.options.admitShell({ command, cwd,
+      ...(typeof args.timeoutMs === "number" ? { timeout: args.timeoutMs / 1000 } : {}),
+    }, context);
+    const timeoutMs = typeof admitted.timeout === "number" ? Math.min(DAY_MS, Math.ceil(admitted.timeout * 1000)) : (args.timeoutMs ?? 3_600_000);
     const durable = args.durable === true;
     const serve = await this.#connect();
-    const fields = { argv, cwd, ...pick(args, ["timeoutMs", "label"]) };
-    const result = await serve.request<Record<string, unknown>>(durable ? "start" : "spawn", durable ? { ...fields, input: "pipe" } : fields, context.signal);
+    throwIfAborted(context.signal);
+    if (this.#closed || this.#retiredOwners.has(context.parentToolCallId)) throw new Error("Session launch owner ended");
+    if (this.options.shellOverride()) throw new Error("Interactive sessions would bypass bash shell protection");
+    const fields = { argv, cwd, timeoutMs, ...pick(args, ["label"]) };
+    // A spawn cannot be cancelled at the wire: keep its response so ownership
+    // is never lost between dispatch and recording. Compensate before rejecting.
+    const result = await serve.request<Record<string, unknown>>(durable ? "start" : "spawn", durable ? { ...fields, input: "pipe" } : fields);
     const opened: Opened = {
       id: String(result.id), lifetime: durable ? "durable" : "session",
       ...(typeof args.label === "string" ? { label: args.label } : {}),
@@ -144,22 +174,31 @@ export class SessionsProvider implements FabricProvider {
       ...(!durable && context.parentToolCallId.startsWith("jev:") ? { owner: context.parentToolCallId } : {}),
     };
     this.#opened.set(opened.id, opened);
+    if (!durable && (context.signal?.aborted || this.#closed || this.#retiredOwners.has(context.parentToolCallId))) {
+      try { await serve.request("stop", { job: opened.id }); } catch { await serve.close(); }
+      this.#opened.delete(opened.id);
+      throwIfAborted(context.signal);
+      throw new Error("Session launch owner ended");
+    }
     return { ...result, lifetime: opened.lifetime };
   }
 
   async invocationEnded(parentToolCallId: string): Promise<void> {
     if (!parentToolCallId.startsWith("jev:")) return;
+    this.#retiredOwners.add(parentToolCallId);
+    await Promise.allSettled([...this.#launches].filter(([, owner]) => owner === parentToolCallId).map(([pending]) => pending));
     const owned = [...this.#opened.values()].filter(opened => opened.owner === parentToolCallId);
     if (!owned.length || !this.#serve) return;
     const serve = await this.#serve.catch(() => undefined);
     await Promise.allSettled(owned.map(async opened => {
+      try { await serve?.request("stop", { job: opened.id }); } catch { await serve?.close(); }
       this.#opened.delete(opened.id);
-      await serve?.request("stop", { job: opened.id });
     }));
   }
 
   async close(): Promise<void> {
     this.#closed = true;
+    await Promise.allSettled(this.#launches.keys());
     const serve = await this.#serve?.catch(() => undefined);
     this.#opened.clear();
     // Ending the connection stops its session children; durable jobs stay in their store.

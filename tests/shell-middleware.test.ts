@@ -11,6 +11,10 @@ import { FABRIC_BASH_MIDDLEWARE, type FabricBashMiddlewareV1 } from "../src/prot
 import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { DurableShellBridge } from "../src/jev-fabric/bridge.js";
+import { FabricShellJobStore } from "../src/core/shell-jobs.js";
+import { DurableTaskRegistry } from "../src/jev-fabric/registry.js";
+import { SessionsProvider } from "../src/providers/sessions-provider.js";
+import { TasksProvider } from "../src/providers/tasks-provider.js";
 
 const SECRET = "fabric-test-secret-not-a-credential";
 const registries: ActionRegistry[] = [];
@@ -102,11 +106,76 @@ const harness = (options: { middleware?: unknown; optIn?: boolean; hangMs?: numb
 };
 
 describe("cooperative bash middleware", () => {
+  it.skipIf(process.platform === "win32").each(["stdout", "stderr", "base64", "events", "adopt-running", "adopt-terminal"])("SEC-3 protects filtered durable output through %s", async (reader) => {
+    vi.stubEnv("FAKE_JEV_FABRIC_FEATURES", "follow,list,label,sessions,serve-concurrent,read,cwd,serve-24h,durable-input");
+    const h = harness();
+    const fake = new URL("./fixtures/fake-jev-fabric.mjs", import.meta.url).pathname;
+    const binary = process.env.PI_FABRIC_JEV_FABRIC_BIN || path.join(h.cwd, "jev-fabric");
+    if (!process.env.PI_FABRIC_JEV_FABRIC_BIN) fs.writeFileSync(binary, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`, { mode: 0o755 });
+    const home = path.join(h.cwd, "home");
+    const settings = () => ({ binary, home, timeoutMs: 60_000 });
+    const jobs = h.provider.shellJobs;
+    jobs.durable = new DurableShellBridge(jobs, { cwd: h.cwd, agentDir: path.join(h.cwd, "agent"), ownerId: "filtered-owner",
+      settings, middleware: () => readFabricBashMiddleware(h.catalog.get("bash")?.definition) });
+    const release = path.join(h.cwd, "release-filtered-job");
+    const result = await h.invoke({ command: `printf '${SECRET}\\n'; printf '${SECRET}\\n' >&2; while [ ! -f '${release}' ]; do sleep 0.05; done`, durable: true });
+    const taskId = (result.details as any).taskId as string;
+    await vi.waitFor(() => expect(jobs.get(taskId)?.durable?.jobId).toBeDefined());
+    const jobId = jobs.get(taskId)!.durable!.jobId!;
+    const sessions = new SessionsProvider(jobs.durable, { cwd: h.cwd, shellOverride: () => false });
+    const adoptedStores: FabricShellJobStore[] = [];
+    try {
+      await vi.waitFor(async () => {
+        const page = await new TasksProvider(jobs).invoke("wait", { id: taskId, timeoutMs: 1 }, h.context) as any;
+        expect(page.output).toContain("[filtered]");
+        expect(page.output).not.toContain(SECRET);
+      });
+      if (["stdout", "stderr", "base64"].includes(reader)) {
+        await expect(sessions.invoke("read", { id: jobId, ...(reader === "base64" ? { encoding: "base64" } : { stream: reader }) }, h.context)).rejects.toThrow("only for children opened here");
+        return;
+      }
+      if (reader === "events") {
+        await expect(sessions.invoke("events", { id: jobId }, h.context)).rejects.toThrow("only for children opened here");
+        return;
+      }
+      const adoptWithoutFilter = async (ownerId: string) => {
+        const store = new FabricShellJobStore(); adoptedStores.push(store);
+        // A different agent directory must not erase a store/job's policy.
+        store.durable = new DurableShellBridge(store, { cwd: h.cwd, agentDir: path.join(h.cwd, ownerId), ownerId, settings, middleware: () => undefined });
+        const tasks = new TasksProvider(store);
+        const adopted = await tasks.invoke("adopt", { jobId }, h.context) as any;
+        let page: any;
+        await vi.waitFor(async () => {
+          page = await tasks.invoke("wait", { id: adopted.task.id, timeoutMs: 10 }, h.context);
+          expect(page.output).toMatch(/Output withheld|fabric-test-secret-not-a-credential/);
+        });
+        expect(page.output).toContain("Output withheld");
+        expect(page.output).not.toContain(SECRET);
+        return { tasks, id: adopted.task.id };
+      };
+      if (reader === "adopt-running") {
+        const other = await adoptWithoutFilter("unfiltered-owner");
+        fs.writeFileSync(release, "done");
+        await other.tasks.invoke("wait", { id: other.id, timeoutMs: 10_000 }, h.context);
+      } else {
+        fs.writeFileSync(release, "done");
+        await vi.waitFor(() => expect(jobs.get(taskId)?.finished).toBe(true));
+        await vi.waitFor(async () => expect(await new DurableTaskRegistry(path.join(h.cwd, "agent", "fabric")).all()).toEqual([]));
+        // Terminal cleanup removed the binding, but must not remove provenance.
+        await adoptWithoutFilter("terminal-reader");
+      }
+    } finally {
+      fs.writeFileSync(release, "done");
+      await sessions.close();
+      await Promise.all(adoptedStores.map(store => store.close()));
+      await vi.waitFor(() => expect(jobs.get(taskId)?.finished).toBe(true), { timeout: 10_000 });
+    }
+  });
   it.skipIf(process.platform === "win32")("wraps durable jev-fabric operations with the same filters, prefix and spawn hook", async () => {
     const h = harness();
     const fake = new URL("./fixtures/fake-jev-fabric.mjs", import.meta.url).pathname;
-    const binary = path.join(h.cwd, "jev-fabric");
-    fs.writeFileSync(binary, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`, { mode: 0o755 });
+    const binary = process.env.PI_FABRIC_JEV_FABRIC_BIN || path.join(h.cwd, "jev-fabric");
+    if (!process.env.PI_FABRIC_JEV_FABRIC_BIN) fs.writeFileSync(binary, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`, { mode: 0o755 });
     const jobs = h.provider.shellJobs;
     jobs.durable = new DurableShellBridge(jobs, {
       cwd: h.cwd, agentDir: path.join(h.cwd, "agent"), ownerId: "middleware-test",

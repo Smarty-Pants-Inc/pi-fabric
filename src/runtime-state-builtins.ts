@@ -47,6 +47,7 @@ export class RuntimeStateBuiltins {
     shell: { jobs: FabricShellJobStore; getHangMs: () => number },
   ): Promise<void> {
     let mcpProvider: McpProvider | undefined;
+    let piTools: PiToolsProvider | undefined;
     const enforceSchema = config.schema.mode === "enforce";
     const effectiveFullCodeMode = config.fullCodeMode || enforceSchema;
     // Enforce keeps this provider private to the Pi adapter: core overrides
@@ -61,7 +62,7 @@ export class RuntimeStateBuiltins {
       await this.install(createProviderComponent({
         provider: "pi",
         description: "Pi core tools adapter",
-        create: () => new PiToolsProvider(
+        create: () => piTools = new PiToolsProvider(
           cwd,
           capturedTools,
           capturedToolsProvider,
@@ -85,7 +86,12 @@ export class RuntimeStateBuiltins {
         this.#sessions = true;
         await this.install(createProviderComponent({
           provider: "sessions", description: "Interactive jev-fabric children: open, write, read, wait and stop",
-          create: () => new SessionsProvider(durable, { cwd, shellOverride: () => capturedTools.get("bash") !== undefined }),
+          create: () => new SessionsProvider(durable, { cwd, shellOverride: () => capturedTools.get("bash") !== undefined,
+            admitShell: (args, context) => {
+              if (!piTools) throw new Error("Shell admission is unavailable");
+              return piTools.admitInteractiveShell(args, context);
+            },
+          }),
         }));
       }
     }

@@ -43,25 +43,63 @@ const asStringRecord = (record: Record<string, unknown>): Record<string, string>
   return record as Record<string, string>;
 };
 
+// smarty-dev#2340: payloads are literal strings. A value that is only a
+// placeholder token (`__CONTENT__`) or a single file reference (`@/path`,
+// `file:///path`) means the model expected the host to expand it; the program
+// would silently run against the token text instead. Ordinary text that merely
+// contains such a token, and the empty string, stay valid.
+// `(?![\s\S])` pins the true end of the value: no trailing-newline leniency,
+// independent of regex flags.
+const PAYLOAD_PLACEHOLDER = /^__[A-Z_]+__$/;
+const PAYLOAD_FILE_REFERENCE = /^(?:@\/|file:\/\/)\S*$/;
+
+const PAYLOADS_LITERAL_ERROR =
+  "payloads are literal: read the file with a native tool first and pass its content";
+
+// Exact whole-value contract: no trimming, so padded or multi-line values are
+// ordinary text and pass through unchanged.
+const isPayloadPlaceholder = (value: string): boolean =>
+  PAYLOAD_PLACEHOLDER.test(value) || PAYLOAD_FILE_REFERENCE.test(value);
+
+const assertLiteralPayloads = (payloads: Record<string, string>): Record<string, string> => {
+  for (const [key, value] of Object.entries(payloads)) {
+    if (isPayloadPlaceholder(value)) {
+      throw new Error(
+        `fabric_exec payload ${JSON.stringify(key)} is only a placeholder or file reference (${JSON.stringify(value)}); ${PAYLOADS_LITERAL_ERROR}.`,
+      );
+    }
+  }
+  return payloads;
+};
+
 // Silent repair for the named-payload map. The declared shape is
 // Record<string, string>, but models stringify nested maps (the highest-entropy
 // escaped field in an otherwise flat tool), which strict schema validation
 // rejects at the cost of a zero-work round trip. `strings` is a legacy alias:
 // the name collides with the JSON string type and taught models to pass one.
+// Placeholder-only values throw unless `validate` is false
+// (render previews must never throw).
 const normalizeFabricExecStrings = (
   input: unknown,
+  validate = true,
 ): Record<string, string> | undefined => {
-  if (isRecord(input)) return asStringRecord(input);
-  if (typeof input !== "string") return undefined;
-  const parsed = parseJsonObject(input);
-  return parsed ? asStringRecord(parsed) : undefined;
+  let record: Record<string, string> | undefined;
+  if (isRecord(input)) record = asStringRecord(input);
+  else if (typeof input === "string") {
+    const parsed = parseJsonObject(input);
+    record = parsed ? asStringRecord(parsed) : undefined;
+  }
+  return record && validate ? assertLiteralPayloads(record) : record;
 };
 
+// Shared by prepareArguments and execute: every runtime (QuickJS, node process,
+// Monty, CPython) receives payloads only through this resolution.
 export const resolveFabricExecPayloads = (params: {
   payloads?: unknown;
   strings?: unknown;
-}): Record<string, string> | undefined =>
-  normalizeFabricExecStrings(params.payloads) ?? normalizeFabricExecStrings(params.strings);
+}, options: { validate?: boolean } = {}): Record<string, string> | undefined =>
+  normalizeFabricExecStrings(params.payloads, options.validate)
+    ?? normalizeFabricExecStrings(params.strings, options.validate);
 
 export const prepareFabricExecArguments = (input: unknown, kernel: FabricKernel = "typescript"): unknown => {
   if (typeof input === "string") return { code: kernel === "python" ? input : repairFabricGuestCode(input) };

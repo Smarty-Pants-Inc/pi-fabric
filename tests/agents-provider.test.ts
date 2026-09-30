@@ -6,6 +6,7 @@ import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorDirectory } from "../src/actors/directory.js";
 import type { FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
@@ -218,6 +219,70 @@ const setup = (
   };
 };
 
+describe("#169 round 1 agents.remove cleanup routing", () => {
+  it("discovers a resident cleanup-only marker without restart and routes its exact id using retained ownership", async () => {
+    const state = setup();
+    await state.actors.close();
+    const actorRoots = { project: path.join(state.root, "project-actors"), session: path.join(state.root, "session-actors") };
+    const owner = new ActorDirectory(["test", state.identity, state.mesh, DEFAULT_FABRIC_CONFIG.mesh, state.agents, () => {},
+      { persistent: true, rootId: state.identity.id, claimResidency: "durable" }], actorRoots, "project");
+    const passive = new ActorDirectory(["test", state.identity, state.mesh, DEFAULT_FABRIC_CONFIG.mesh, state.agents, () => {},
+      { persistent: true, rootId: state.identity.id, canManageActor: () => false }], actorRoots, "project");
+    actorManagers.push(owner, passive);
+    const actor = await owner.create({ name: "resident obligation", instructions: "Work.", residency: "durable" });
+    expect(passive.list().map((entry) => entry.id)).toContain(actor.id); // Main had the pre-removal view.
+    const dir = path.join(actorRoots.project, actor.id);
+    const rm = fs.rmSync.bind(fs);
+    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (target === dir) throw new Error("cleanup unavailable");
+      return rm(target, options);
+    });
+    try { await owner.remove(actor.id); } finally { failing.mockRestore(); }
+    const removeActor = vi.fn((id: string) => owner.remove(id));
+    const provider = new AgentsProvider(state.agents, passive, state.globalActors, state.mainAgent, state.participants,
+      state.control, state.lifecycle, undefined, { removeActor } as unknown as ResidencyClient);
+    await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
+    expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id);
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
+  });
+
+  it.each(["project", "session"] as const)("reports and retries a cleanup-only %s id through the provider, preserving its successor", async (scope) => {
+    const state = setup();
+    await state.actors.close();
+    const actorRoots = { project: path.join(state.root, "project-actors"), session: path.join(state.root, "session-actors") };
+    const directory = new ActorDirectory(["test", state.identity, state.mesh, DEFAULT_FABRIC_CONFIG.mesh, state.agents, () => {},
+      { persistent: true, rootId: state.identity.id }], actorRoots, "project");
+    actorManagers.push(directory);
+    const provider = new AgentsProvider(state.agents, directory, state.globalActors, state.mainAgent, state.participants,
+      state.control, state.lifecycle, undefined, undefined, undefined, () => DEFAULT_FABRIC_CONFIG.models);
+    const actor = await directory.create({ scope, name: "retry worker", instructions: "Work." });
+    const dir = path.join(actorRoots[scope], actor.id);
+    const rm = fs.rmSync.bind(fs);
+    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (target === dir) throw new Error("cleanup unavailable");
+      return rm(target, options);
+    });
+    try {
+      await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true, cleaned: false });
+      // No participant/presence entry remains. agents.actors must still expose the stopped obligation.
+      expect(state.participants.get(actor.id)).toBeUndefined();
+      expect(await provider.invoke("actors", {}, context)).toContainEqual(expect.objectContaining({
+        id: actor.id, scope, status: "stopped", rootId: state.identity.id, removal: expect.objectContaining({ state: expect.stringContaining("cleanup failed") }),
+      }));
+      const successor = await directory.create({ scope, name: "retry worker", instructions: "Successor." });
+      fs.writeFileSync(successor.sessionFile!, "successor history\n");
+      await expect(provider.invoke("remove", { id: actor.id.slice(0, 12) }, context)).rejects.toThrow();
+      failing.mockRestore();
+      await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
+      expect(directory.pendingRemovals()).toEqual([]);
+      expect(fs.existsSync(dir)).toBe(false);
+      expect(fs.readFileSync(successor.sessionFile!, "utf8")).toBe("successor history\n");
+      expect(directory.status("retry worker").id).toBe(successor.id);
+      expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
+    } finally { failing.mockRestore(); }
+  });
+});
 // smarty-dev#1439: agents.compact on an actor id pointed nowhere ("Unknown Fabric agent").
 describe("AgentsProvider actor session reset", () => {
   it("answers agents.compact on an actor id with a pointer to resetSession, and routes resetSession", async () => {
@@ -1727,6 +1792,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/session", thinking: "low" },
       }),
       "identity:owner",
+      { routedRemoteHost: null },
     );
   });
 
@@ -1742,8 +1808,10 @@ describe("AgentsProvider shared actor definitions", () => {
     const { provider } = setup([], [child], { request } as unknown as FabricControlPlane);
     for (const kind of ["steer", "followUp"] as const) {
       await expect(provider.routeMessage(child.id, `correct it (${kind})`, { key: "k" }, kind)).resolves.toMatchObject({ acknowledged: true });
-      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId);
+      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" } }, child.ownerIdentityId, { routedRemoteHost: null });
     }
+    await expect(provider.stopParticipant(child.id)).resolves.toMatchObject({ acknowledged: true });
+    expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, "stop", {}, child.ownerIdentityId, { routedRemoteHost: null });
     const unsteerable = setup([], [{ ...child, capabilities: ["stop"] }], { request } as unknown as FabricControlPlane).provider;
     await expect(unsteerable.routeMessage(child.id, "no", undefined, "steer")).rejects.toThrow("does not support steer");
   });
@@ -1812,6 +1880,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "followUp",
       expect.objectContaining({ message: "queue" }),
       "identity:resident",
+      { routedRemoteHost: null },
     );
   });
 
@@ -2241,13 +2310,49 @@ describe("AgentsProvider global actors", () => {
   it("edits instructions for project and global scopes", async () => {
     const { provider, actors, globalActors } = setup();
     const actor = (await provider.invoke("create", createRequest, context)) as { id: string };
-    await provider.invoke("setInstructions", { id: actor.id, instructions: "Be brief." }, context);
+    await provider.invoke("setInstructions", { id: actor.id, instructions: "Be brief.", replace: true }, context);
     expect(actors.instructions(actor.id)).toBe("Be brief.");
 
     await provider.invoke("create", { ...createRequest, name: "templar", scope: "global" }, context);
     const globalId = globalActors.resolve("templar")!.id;
-    await provider.invoke("setInstructions", { id: globalId, instructions: "Template brief.", scope: "global" }, context);
+    await provider.invoke("setInstructions", { id: globalId, instructions: "Template brief.", scope: "global", replace: true }, context);
     expect(globalActors.resolve("templar")!.instructions).toBe("Template brief.");
+  });
+
+  // smarty-dev#2340: a >80% shrink is refused unless replace: true.
+  it("guards setInstructions against a >80% shrink in project and global scopes", async () => {
+    const { provider, actors, globalActors } = setup();
+    const long = "x".repeat(100);
+    const actor = (await provider.invoke("create", createRequest, context)) as { id: string };
+    await provider.invoke("create", { ...createRequest, name: "templar", scope: "global" }, context);
+    const globalId = globalActors.resolve("templar")!.id;
+    const read = {
+      project: () => actors.instructions(actor.id),
+      global: () => globalActors.resolve("templar")!.instructions,
+    };
+    for (const scope of ["project", "global"] as const) {
+      const id = scope === "global" ? globalId : actor.id;
+      const set = (instructions: string, extra: Record<string, unknown> = {}) =>
+        provider.invoke("setInstructions", { id, instructions, scope, ...extra }, context);
+      await set(long, { replace: true });
+      expect(read[scope]()).toBe(long);
+      // Refused: 19 chars is more than 80% shorter than 100.
+      const error = await set("y".repeat(19)).then(() => undefined, (e: Error) => e);
+      expect(error?.message).toMatch(/19/);
+      expect(error?.message).toMatch(/100/);
+      expect(error?.message).toMatch(/replace: true/);
+      expect(read[scope]()).toBe(long);
+      // Exact 80% boundary (20 of 100) is allowed.
+      await set("z".repeat(20));
+      expect(read[scope]()).toBe("z".repeat(20));
+      // Normal edit allowed.
+      await set("z".repeat(18) + "ab");
+      expect(read[scope]()).toBe("z".repeat(18) + "ab");
+      // Explicit replace allows a large shrink.
+      await set(long, { replace: true });
+      await set("tiny", { replace: true });
+      expect(read[scope]()).toBe("tiny");
+    }
   });
 
   it("removes a global template via scoped remove", async () => {

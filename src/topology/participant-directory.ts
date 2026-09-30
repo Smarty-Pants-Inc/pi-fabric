@@ -658,7 +658,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // unmirrored host's id, root or identity on this mesh.
   // ponytail: a mirror that overwrote another local host's child agent is not detectable here;
   // that host's next heartbeat takes its key back, and the bridge never overwrites unmirrored keys.
-  #collides(participant: FabricParticipantRecord, hosts: ReadonlyMap<string, FabricHostRecord>): boolean {
+  #collides(participant: FabricParticipantRecord, hosts: ReadonlyMap<string, FabricHostRecord>, report = true): boolean {
     if (participant.remoteHost === undefined) return false;
     const ids = new Set([participant.id, participant.rootId]);
     let collides = [...ids].some((id) =>
@@ -668,7 +668,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       collides = host.remoteHost === undefined &&
         (ids.has(host.id) || ids.has(host.rootId) || ids.has(host.identity.id));
     }
-    if (collides) this.#reportCollision(participant);
+    if (collides && report) this.#reportCollision(participant);
     return collides;
   }
 
@@ -698,6 +698,37 @@ export class ParticipantDirectory implements FabricParticipantSource {
       text: `Refused mirrored record ${id} from remote host ${remoteHost}: ${reason}`,
       data: { id, remoteHost, reason, ...data },
     }).catch(() => undefined);
+  }
+
+  /** Validated mirror attribution, including expired leases; fresh and without publishing refusals. */
+  mirroredControlOwner(
+    ownerHostId: string,
+    ownerIdentityId: string | undefined,
+    targetId: string,
+  ): { remoteHost: string; expiresAt: number } | undefined {
+    if (!this.options.enabled || ownerIdentityId === undefined) return undefined;
+    const read = { fresh: true };
+    const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, targetId), read);
+    const participant = entry ? participantFromEntry(entry) : undefined;
+    if (
+      !participant?.remoteHost ||
+      participant.id !== targetId ||
+      participant.kind !== "root" ||
+      participant.rootId !== targetId ||
+      participant.ownerHostId !== ownerHostId ||
+      participant.ownerIdentityId !== ownerIdentityId
+    ) return undefined;
+    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read));
+    const owner = hosts.get(ownerHostId);
+    if (
+      !owner ||
+      !ownerMatches(participant, owner, this.options.hostId) ||
+      owner.identity.id !== ownerIdentityId ||
+      owner.rootId !== participant.rootId ||
+      !Number.isFinite(owner.expiresAt) ||
+      this.#collides(participant, hosts, false)
+    ) return undefined;
+    return { remoteHost: participant.remoteHost, expiresAt: owner.expiresAt };
   }
 
   lastKnown(id: string, now = Date.now()): { participant: FabricParticipantInfo; lapsedMs: number } | undefined {

@@ -173,6 +173,8 @@ class ResidentHost {
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
+      readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
+        this.participants.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
     if (config.agents.budgetUsd > 0) {
       const budgetFile = path.join(config.residencyRoot, "budget.jsonl");
@@ -514,6 +516,7 @@ class ResidentHost {
       subscription.delivery,
       { message, data: event, triggerTurn: subscription.triggerTurn },
       target.ownerIdentityId,
+      { routedRemoteHost: target.remoteHost ?? null },
     );
   }
 
@@ -691,13 +694,14 @@ class ResidentHost {
           completedAt: Date.now(),
         };
       } else {
-        if (!this.actors.owns(command.id)) {
+        const cleanup = this.actors.cleanupObligation(command.id);
+        if (!this.actors.owns(command.id) || (cleanup && cleanup.residency !== "durable")) {
           throw new Error(`Resident host does not own ${command.id}`);
         }
         // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
         const removed = await this.actors.remove(command.id, { wait: false });
+        this.#writeRemovals();
         if (removed.pending) {
-          this.#writeRemovals();
           void this.actors.removalSettled(command.id)?.finally(() => {
             this.#writeRemovals();
             this.participants.scheduleRefresh();
@@ -708,6 +712,7 @@ class ResidentHost {
           requestId,
           ok: true,
           ...(removed.pending ? { pending: removed.pending } : {}),
+          ...(removed.cleaned !== undefined ? { cleaned: removed.cleaned } : {}),
           completedAt: Date.now(),
         };
       }

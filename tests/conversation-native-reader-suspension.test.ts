@@ -35,6 +35,112 @@ afterEach(() => {
 });
 
 describe("native reader disk suspension", () => {
+  it.each(["session", "events"] as const)("bounds duplicate %s page verification across loadLatest and suspension", (kind) => {
+    const file = path.join(workspace(), `${kind}.jsonl`);
+    const record = (i: number) => kind === "session" ? entry(i, 16)
+      : { type: "message_end", message: entry(i, 16).message };
+    const bytes = jsonl([...(kind === "session" ? [header] : []), record(0)]);
+    fs.writeFileSync(file, bytes);
+    const input = { id: "reader", status: "running", ...(kind === "session" ? { sessionFile: file } : { eventsFile: file }) };
+    const reader = new NativeConversationReader();
+    const before = reader.read(input, false);
+    const replaceIdentically = (replacementBytes = bytes) => {
+      const inode = fs.statSync(file).ino;
+      fs.writeFileSync(`${file}.new`, replacementBytes);
+      fs.renameSync(`${file}.new`, file);
+      expect(fs.statSync(file).ino).not.toBe(inode);
+    };
+    const reads = vi.spyOn(fs, "readSync");
+    replaceIdentically();
+    reads.mockClear();
+    const baseline = reader.read(input, false);
+    expect(content(baseline)).toEqual(content(before));
+    expect(baseline.revision).toBe(before.revision);
+    const baselineReads = reads.mock.calls.length;
+    expect(baselineReads).toBe(1);
+    trackCheckpoints();
+    let resumedVerificationReads = 0;
+    for (let round = 0; round < 2; round++) {
+      for (let i = 0; i < 128; i++) {
+        const latest = reader.loadLatest()!;
+        expect(content(latest)).toEqual(content(before));
+        expect(latest.status).toBe(before.status);
+        expect(latest.unavailable).toBeUndefined();
+        expect(latest.error).toBeUndefined();
+      }
+      if (round === 0) {
+        const latest = reader.last!;
+        expect(reader.suspend()).toBe(true);
+        const resumed = reader.last!;
+        expect(content(resumed)).toEqual(content(latest));
+        expect(resumed.revision).toBe(latest.revision + 1);
+        // Validate before any post-resume page reload could recreate evidence.
+        replaceIdentically();
+        reads.mockClear();
+        const verifiedResume = reader.read(input, false);
+        resumedVerificationReads = reads.mock.calls.length;
+        expect(content(verifiedResume)).toEqual(content(resumed));
+        expect(verifiedResume.revision).toBe(resumed.revision);
+      }
+    }
+    const latest = reader.last!;
+    replaceIdentically();
+    reads.mockClear();
+    const pinned = reader.read(input, false);
+    const verificationReads = reads.mock.calls.length;
+    expect(content(pinned)).toEqual(content(before));
+    expect(pinned.revision).toBe(latest.revision);
+    expect(pinned.status).toBe(before.status);
+    expect(pinned.unavailable).toBeUndefined();
+    expect(pinned.error).toBeUndefined();
+    expect(verificationReads).toBe(baselineReads);
+    expect(resumedVerificationReads).toBe(baselineReads);
+    fs.appendFileSync(file, jsonl([record(1)]));
+    const appended = reader.read(input, false);
+    expect(appended.messages).toEqual(before.messages);
+    expect(appended.hasNewer).toBe(true);
+    expect(appended.revision).toBe(pinned.revision + 1);
+    const newer = reader.loadNewer()!;
+    expect(newer.messages).toEqual([...before.messages, entry(1, 16).message]);
+    expect(newer.hasNewer).toBe(false);
+    expect(newer.revision).toBe(appended.revision + 1);
+    const appendedBytes = bytes + jsonl([record(1)]);
+    replaceIdentically(appendedBytes);
+    reads.mockClear();
+    expect(content(reader.read(input, false))).toEqual(content(newer));
+    expect(reads.mock.calls.length).toBe(2); // Original page plus appended page.
+    for (let i = 0; i < 128; i++) expect(content(reader.loadLatest()!)).toEqual(content(newer));
+    replaceIdentically(appendedBytes);
+    reads.mockClear();
+    expect(content(reader.read(input, false))).toEqual(content(newer));
+    // The overlapping full page is distinct evidence, not a replacement for
+    // either earlier fingerprint; duplicate invocations still add nothing.
+    expect(reads.mock.calls.length).toBe(3);
+    reader.clear();
+  });
+
+  it.each(["missing", "corrupt"])("retains prior digests after reloading mutated offsets with a %s checkpoint", (failure) => {
+    const file = path.join(workspace(), "session.jsonl");
+    const original = jsonl([header, entry(0, 16)]);
+    fs.writeFileSync(file, original);
+    const reader = new NativeConversationReader();
+    reader.read(source(file), false);
+    for (let i = 0; i < 128; i++) reader.loadLatest();
+    fs.writeFileSync(file, original.replace(/x/g, "y"));
+    reader.loadLatest();
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[0]!.value as string, "checkpoint");
+    if (failure === "missing") fs.unlinkSync(checkpoint);
+    else fs.writeFileSync(checkpoint, "corrupt");
+    const failed = reader.read({ ...source(file), status: "completed" }, false);
+    expect(failed.messages).toEqual([]);
+    expect(failed.error).toContain("Unable to restore reader history");
+    expect(failed.unavailable?.sessionFile).toBe(true);
+    expect(failed.status).toBe("completed");
+    expect(reader.suspended).toBe(true);
+    reader.clear();
+  });
   it("checkpoints only final-sized live tool state and replays older pages exactly after resume", () => {
     const file = path.join(workspace(), "events.jsonl");
     const oldMessage = { role: "user", content: "old" + "o".repeat(300000), timestamp: 1 };

@@ -616,7 +616,11 @@ export class NativeConversationReader {
   #rememberRange(kind: FileKind, page: RecordPage): void {
     if (page.end <= page.start) return;
     const pages = this.#loadedPages.get(kind) ?? [];
-    pages.push({ start: page.start, end: page.end, digest: this.#pageDigest(page.records) });
+    const digest = this.#pageDigest(page.records);
+    // Re-reading an identical page adds no identity evidence. Keep different
+    // digests at the same offsets so checkpoint recovery still fails closed.
+    if (pages.some((previous) => previous.start === page.start && previous.end === page.end && previous.digest === digest)) return;
+    pages.push({ start: page.start, end: page.end, digest });
     this.#loadedPages.set(kind, pages);
     const ranges = [...(this.#loadedRanges.get(kind) ?? []), [page.start, page.end] as [number, number]];
     ranges.sort((a, b) => a[0] - b[0]);

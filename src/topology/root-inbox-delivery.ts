@@ -8,7 +8,10 @@ const eventProvenance = (event: MeshEvent) => event.verification === "mesh" || e
   ? fabricTurnProvenance(event.from, "followUp", event.verification) : undefined;
 
 /** Pi injection stays separate from the mesh inbox's storage and pure message shaping. */
-export const deliverRootInbox = (pi: ExtensionAPI, events: readonly MeshEvent[]): void => {
+export const deliverRootInbox = (
+  pi: ExtensionAPI, events: readonly MeshEvent[],
+  options: Parameters<ExtensionAPI["sendMessage"]>[1] = { deliverAs: "followUp", triggerTurn: true },
+): void => {
   if (!events.length) return;
   let start = 0;
   while (start < events.length) {
@@ -20,7 +23,6 @@ export const deliverRootInbox = (pi: ExtensionAPI, events: readonly MeshEvent[])
       end = start + 1;
       while (end < events.length && JSON.stringify(eventProvenance(events[end]!)) === key) end++;
     }
-    const options = { deliverAs: "followUp" as const, triggerTurn: true };
     pi.sendMessage(rootInboxMessage(events.slice(start, end)), provenance ? fabricProvenanceOptions(pi, options, provenance) : options);
     start = end;
   }

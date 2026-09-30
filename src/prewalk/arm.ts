@@ -45,7 +45,7 @@ export const armFabricPrewalkSession = async (
         display: false,
         details: { mode: prewalk.mode, model: input.model },
       },
-      { deliverAs: "nextTurn" }, fabricHostIdentity(sessionId), "actor",
+      { deliverAs: "nextTurn" }, fabricHostIdentity(sessionId), "actor", "mesh",
     );
   }
   context.ui.setStatus("fabric-prewalk", `armed (${prewalk.mode}) → ${input.model}`);

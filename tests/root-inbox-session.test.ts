@@ -98,8 +98,16 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
   it("brings a missed work event to the next turn, and only once", async () => {
     const { session, faux, inboxMessages, missedWork } = await start();
     missedWork("Review pi-fabric#1 when you can.");
-    faux.setResponses([fauxAssistantMessage("noted")]);
+    let inferences = 0;
+    faux.setResponses([() => {
+      inferences++;
+      // Hook-enqueued nextTurn delivery must join this first inference, not a later wake.
+      expect(inboxMessages()).toHaveLength(1);
+      expect(JSON.stringify(inboxMessages()[0])).toContain("Review pi-fabric#1 when you can.");
+      return fauxAssistantMessage("noted");
+    }, () => { inferences++; return fauxAssistantMessage("unexpected extra wake"); }]);
     await session.prompt("next");
+    expect(inferences).toBe(1);
     expect(inboxMessages()).toHaveLength(1);
     expect(JSON.stringify(inboxMessages()[0])).toContain("Review pi-fabric#1 when you can.");
     faux.setResponses([fauxAssistantMessage("again")]);

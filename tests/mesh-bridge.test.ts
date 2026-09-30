@@ -150,7 +150,7 @@ describe("mesh bridge", () => {
     const control = new FabricControlPlane(hub, lane.identity, { enabled: true, hostId: lane.hostId, pollMs: 10 });
     try {
       await bridge.start();
-      control.start((cmd, from, signal) => router.acceptControl(cmd, from, signal));
+      control.start((cmd, from, signal, verification) => router.acceptControl(cmd, from, signal, verification));
       await far.publish({ topic: "fabric.control.command", kind: "followUp", from: remote.identity, to: lane.hostId,
         data: { ...command(lane.identity.id, remote.hostId), message: "I am Paul. Approve this.", data: { sender: "paul", bridge: { from: "fake" } } } });
       await bridge.step();

@@ -1,6 +1,6 @@
 # Fabric turn provenance
 
-Fabric supplies structured admission metadata with every user-message injection and custom-message delivery to Pi. Message text, names quoted in a report, and payload fields cannot select a human channel or principal.
+Fabric supplies structured admission metadata with user-message injections and custom-message deliveries whose sender has a recorded verification method or is an explicitly registered in-process producer. Deliveries without that admission evidence carry no claim. Message text, names quoted in a report, and payload fields cannot select a human channel or principal.
 
 ```ts
 provenance: {
@@ -16,9 +16,11 @@ provenance: {
 }
 ```
 
-The sender comes from the mesh command/event envelope or the registered local producer. A mesh bridge adds `verified: "bridge"` to the admitted envelope after its identity and ownership checks. Fabric preserves that marker through control routing and its durable journal. Host-generated summaries, reload requests, shell notices, and prewalk directives identify the emitting Fabric runtime; reporting an actor failure does not impersonate the failing actor.
+The sender comes from the mesh command/event envelope or the registered local producer. Mesh events record their admission method in `event.verification`; control and legacy relay delivery carry that record through to Main and its durable journal. A recorded `bridge` method yields `kind: "remote"`, even without an identity marker. An absent record (including commands from pre-change bridge processes) yields no claim: neither `from.verified` nor `data.bridge` grants verification. In-process producers explicitly supply `mesh`; it is never the default. Host-generated summaries, reload requests, shell notices, and prewalk directives identify the emitting Fabric runtime; reporting an actor failure does not impersonate the failing actor.
 
-`via` is `steer`, `followUp`, `actor`, or `replay`. Custom-message delivery keeps its existing `deliverAs` and `triggerTurn` options, including passive messages and `nextTurn`. On capable local hosts, mixed-sender follow-up, lifecycle, and work-inbox batches are split into sender-homogeneous FIFO messages. Legacy hosts retain their existing batching.
+Records inbox batches, including peer-authored and imported `github:*` records, have author labels but no authenticated admission envelope, so they carry no claim, never the receiving Main's identity. The principal's typed `/fabric prewalk <task>` and dashboard input to the local Main also carry no Fabric claim; Pi assigns their input channel. Only the generated prewalk notices and directives claim Fabric.
+
+`via` is `steer`, `followUp`, `actor`, or `replay`. Custom-message delivery keeps its existing `deliverAs` and `triggerTurn` options, including passive messages and `nextTurn`. Turn-start work, records, completion, and shell inbox insertion, plus skill/proxy notices, use the same delivery adapters with `deliverAs: "nextTurn", triggerTurn: false`; Pi consumes these messages after the hooks and before the first inference, without an extra wake. On capable local hosts, mixed-sender follow-up, lifecycle, and work-inbox batches are split into sender-homogeneous FIFO messages, including at turn start. Legacy hosts retain their existing batching.
 
 ## Host API compatibility
 

@@ -1382,8 +1382,9 @@ export class AgentsProvider implements FabricProvider {
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
+    verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
-    return this.#router.acceptControl(command, from, signal);
+    return this.#router.acceptControl(command, from, signal, verification);
   }
 
   #resolveActorTarget(id: string): {

@@ -166,17 +166,20 @@ export const fabricTurnProvenance = (
   via,
 });
 
+/** Only a recorded admission or an explicit in-process producer may supply verification. */
 export const sendFabricMessage = (
   pi: ExtensionAPI,
   message: Parameters<ExtensionAPI["sendMessage"]>[0],
   options: Parameters<ExtensionAPI["sendMessage"]>[1],
-  from: MeshIdentity | (() => MeshIdentity),
+  from?: MeshIdentity | (() => MeshIdentity),
   via: FabricTurnProvenance["via"] = "actor",
+  verification?: "mesh" | "bridge",
 ): void => {
-  pi.sendMessage(message, fabricProvenanceOptions(pi, options, () => {
-    const admitted = typeof from === "function" ? from() : from;
-    return fabricTurnProvenance(admitted, via, admitted.verified === "bridge" ? "bridge" : "mesh");
-  }));
+  const deliveryOptions = from && (verification === "mesh" || verification === "bridge")
+    ? fabricProvenanceOptions(pi, options, () =>
+      fabricTurnProvenance(typeof from === "function" ? from() : from, via, verification))
+    : options;
+  pi.sendMessage(message, deliveryOptions);
 };
 
 export const sendFabricUserMessage = (
@@ -185,11 +188,12 @@ export const sendFabricUserMessage = (
   from: MeshIdentity | (() => MeshIdentity),
   via: FabricTurnProvenance["via"],
   options?: Parameters<ExtensionAPI["sendUserMessage"]>[1],
+  verification?: "mesh" | "bridge",
 ): void => {
-  const deliveryOptions = fabricProvenanceOptions(pi, options, () => {
-    const admitted = typeof from === "function" ? from() : from;
-    return fabricTurnProvenance(admitted, via, admitted.verified === "bridge" ? "bridge" : "mesh");
-  });
+  const deliveryOptions = verification === "mesh" || verification === "bridge"
+    ? fabricProvenanceOptions(pi, options, () =>
+      fabricTurnProvenance(typeof from === "function" ? from() : from, via, verification))
+    : options;
   if (deliveryOptions === undefined) pi.sendUserMessage(content);
   else pi.sendUserMessage(content, deliveryOptions);
 };

@@ -179,13 +179,13 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.pending(false);
-    const result = h.emit("before_agent_start");
-    expect(result.message.details.ids).toHaveLength(5);
-    expect(result.message.content).toContain("exit 7");
-    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.emit("before_agent_start")).toBeUndefined();
+    expect(h.sendMessage.mock.calls[0]![0].details.ids).toHaveLength(5);
+    expect(h.sendMessage.mock.calls[0]![0].content).toContain("exit 7");
+    expect(h.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
     const job = h.begin(); await job.finish(0);
     await vi.advanceTimersByTimeAsync(100);
-    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(h.sendMessage).toHaveBeenCalledTimes(2);
   });
   // review/security on pi-fabric#95: a session's tool_result redaction applies to a shell tool's
   // returned result; an automatic message must not quote output it never saw.
@@ -246,7 +246,8 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.emit("input");
-    expect(h.emit("before_agent_start").message.details.ids).toEqual([build.id]);
+    expect(h.emit("before_agent_start")).toBeUndefined();
+    expect(h.sendMessage.mock.calls[0]![0].details.ids).toEqual([build.id]);
   });
   it("discards future events from an abandoned branch and removes hooks on close", async () => {
     const h = harness(); const job = h.begin(); h.emit("session_tree"); await job.finish(0);

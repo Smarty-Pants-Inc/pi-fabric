@@ -90,7 +90,7 @@ const queuePrewalkFollowUp = (
   try {
     sendFabricMessage(extension,
       { customType, content, display: false, details },
-      { deliverAs: "followUp", triggerTurn: true }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp",
+      { deliverAs: "followUp", triggerTurn: true }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp", "mesh",
     );
   } catch {
     // Swallow: a missed follow-up turn must not fail the handoff.
@@ -340,7 +340,7 @@ const runInPlacePrewalk = async (
       },
       timestamp: Date.now(),
     };
-    sendFabricMessage(extension, continuationMessage, { triggerTurn: false }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor");
+    sendFabricMessage(extension, continuationMessage, { triggerTurn: false }, () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
   } catch (error) {
     const restored = await setModelSafely(extension, returnModel);
     if (!restored) {

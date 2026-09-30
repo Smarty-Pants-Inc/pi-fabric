@@ -139,6 +139,7 @@ export class AgentMessageRouter {
         });
         return this.mainAgent.deliverAgent({
           from: options.from ?? this.actorManager.identity,
+          verification: "mesh", // In-process registered producer, not a received command.
           message,
           delivery: kind,
           ...(typeof options.triggerTurn === "boolean"
@@ -268,6 +269,7 @@ export class AgentMessageRouter {
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
+    verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
@@ -331,6 +333,7 @@ export class AgentMessageRouter {
       try {
         result = this.mainAgent.deliverAgent({
         from,
+        ...(verification === undefined ? {} : { verification }),
         message,
         delivery: command.operation,
         ...(typeof command.triggerTurn === "boolean"

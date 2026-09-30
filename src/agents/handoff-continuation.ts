@@ -40,7 +40,7 @@ export const queueHandoffFailureContinuation = (
     extension.appendEntry(HANDOFF_CONTINUATION_MESSAGE_TYPE, details);
     sendFabricMessage(extension,
       { customType: HANDOFF_CONTINUATION_MESSAGE_TYPE, content: EXECUTOR_CONTINUATION_PROMPT, display: false, details },
-      { deliverAs: "followUp", triggerTurn: true }, identity, "followUp",
+      { deliverAs: "followUp", triggerTurn: true }, identity, "followUp", "mesh",
     );
     return true;
   } catch {

@@ -55,10 +55,10 @@ export class AgentCompletionInbox {
         this.#context = ctx;
         // A prompt-started run: its results join the first inference.
         this.#suspended = false;
-        let message: CompletionMessage | undefined;
-        // Join the user's first inference; do not enqueue an extra turn behind it.
-        this.#flush((value) => { message = value; });
-        return message ? { message } : undefined;
+        // Pi consumes nextTurn messages after the hooks; join its first inference, no wake.
+        this.#flush(message => sendFabricMessage(this.pi, message,
+          { deliverAs: "nextTurn", triggerTurn: false },
+          () => fabricHostIdentity(ctx.sessionManager.getSessionId()), "actor", "mesh"));
       });
     subscribe("agent_settled", (_event, ctx) => {
         if (this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
@@ -135,7 +135,7 @@ export class AgentCompletionInbox {
   }
 
   #flush(deliver: (message: CompletionMessage) => void = (message) =>
-    sendFabricMessage(this.pi, message, { deliverAs: "steer", triggerTurn: true }, () => fabricHostIdentity(this.#context.sessionManager.getSessionId()), "steer")): void {
+    sendFabricMessage(this.pi, message, { deliverAs: "steer", triggerTurn: true }, () => fabricHostIdentity(this.#context.sessionManager.getSessionId()), "steer", "mesh")): void {
     if (this.#closed || this.#suspended || this.#context.signal?.aborted || !this.#pending.size) return;
     const batch = [...this.#pending.values()].slice(0, 32);
     const perResult = Math.max(0, Math.min(SUMMARY_CHARS, Math.floor(BATCH_CHARS / batch.length) - 320));

@@ -37,7 +37,7 @@ export const queueHandoffCompletion = (
         display: true,
         details: { displayText, status, model, agent, completed: result.completed === true },
       },
-      { deliverAs: "followUp", triggerTurn: true }, host, "followUp",
+      { deliverAs: "followUp", triggerTurn: true }, host, "followUp", "mesh",
     );
   } catch {
     // The authoritative result remains available in the handoff tool result.

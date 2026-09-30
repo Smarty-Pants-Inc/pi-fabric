@@ -389,7 +389,7 @@ export class FabricRuntimeState {
       throw new Error("Pi Fabric has not initialized");
     }
     if (this.#mainAgent.matches(targetId) && this.#mainAgent.local) {
-      return this.#mainAgent.deliverUser(message, delivery, this.#identity);
+      return this.#mainAgent.deliverUser(message, delivery);
     }
     return this.#agentsProvider.routeMessage(targetId, message, undefined, delivery);
   }
@@ -914,8 +914,8 @@ export class FabricRuntimeState {
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
     );
     this.#agentsProvider = agentsProvider;
-    this.#control.start((command, from, signal) =>
-      agentsProvider.acceptControl(command, from, signal));
+    this.#control.start((command, from, signal, verification) =>
+      agentsProvider.acceptControl(command, from, signal, verification));
     try {
       await this.#participants.start();
     } catch (error) {
@@ -954,7 +954,7 @@ export class FabricRuntimeState {
               content: [`<fabric-jev name=${JSON.stringify(escapeXmlText(advice.name))} id=${JSON.stringify(advice.runId)}>\n${escapeXmlText(advice.message)}\n</fabric-jev>`, actorDeliveryNotice(advice.delivery, advice.triggerTurn)].filter(Boolean).join("\n"),
               display: true,
               details: { runId: advice.runId, eventId: advice.eventId, delivery: { mode: advice.delivery, triggerTurn: advice.triggerTurn } },
-            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn }, identity, "actor");
+            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn }, identity, "actor", "mesh");
           }) : undefined;
           this.#jevObservationHost = observationHost;
           // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.

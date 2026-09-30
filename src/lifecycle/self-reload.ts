@@ -205,7 +205,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     const busy = deps.busy();
     if (busy > 0) noteHeld(context, target, busy);
     if (busy > 0 || context.hasPendingMessages()) return false;
-    sendFabricUserMessage(pi, `/${SELF_RELOAD_COMMAND} auto`, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp", { expandPromptTemplates: true });
+    sendFabricUserMessage(pi, `/${SELF_RELOAD_COMMAND} auto`, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp", { expandPromptTemplates: true }, "mesh");
     return true;
   };
 

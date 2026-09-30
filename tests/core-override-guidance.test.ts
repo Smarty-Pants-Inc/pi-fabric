@@ -79,7 +79,9 @@ describe("core override prompt guidance", () => {
 
   it("adds the live override guidance to the full-code before-agent prompt", async () => {
     const handlers = new Map<string, Array<(event: unknown, context: unknown) => unknown>>();
+    const sendMessage = vi.fn();
     const pi = {
+      sendMessage,
       events: { emit: vi.fn(), on: vi.fn(() => () => {}) },
       getActiveTools: vi.fn(() => ["fabric_exec"]),
       getAllTools: vi.fn(() => []),
@@ -182,9 +184,12 @@ describe("core override prompt guidance", () => {
         const skillPrompt = (skillResult as { systemPrompt: string }).systemPrompt;
         expect(skillPrompt).toBe(guidedPrompt);
         expect(skillPrompt).not.toContain("The active skill");
-        const skillMessage = (skillResult as { message?: { content: string } }).message;
-        expect(skillMessage?.content).toContain('The active skill "active" is already expanded');
-        expect(skillMessage?.content).toContain('- /dependency -> "/skills/dependency/SKILL.md"');
+        expect(skillResult).not.toHaveProperty("message");
+        expect(sendMessage).toHaveBeenCalledOnce();
+        const [skillMessage, deliveryOptions] = sendMessage.mock.calls[0]!;
+        expect(skillMessage.content).toContain('The active skill "active" is already expanded');
+        expect(skillMessage.content).toContain('- /dependency -> "/skills/dependency/SKILL.md"');
+        expect(deliveryOptions).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
       } finally {
         modelGuidance.mockRestore();
       }

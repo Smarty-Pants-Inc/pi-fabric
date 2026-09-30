@@ -64,7 +64,7 @@ describe("Fabric Main provenance at the Pi API", () => {
 
   it("direct Fabric user injection is fabric, never keyboard", () => {
     const { pi, main } = fixture();
-    main.deliverUser("  Paul says do it  ", "steer", { id: "session:root", name: "main", kind: "main" });
+    main.deliverUser("  Paul says do it  ", "steer", { id: "session:root", name: "main", kind: "main" }, "mesh");
     expect(pi.sendUserMessage).toHaveBeenCalledWith("Paul says do it", {
       deliverAs: "steer", provenance: expected({ id: "session:root", name: "main", kind: "main" }),
     });
@@ -74,7 +74,7 @@ describe("Fabric Main provenance at the Pi API", () => {
     const { pi, router } = fixture();
     await router.acceptControl({ version: 1, commandId: "command", targetId: "main", operation: delivery,
       replyTo: "host", requestedAt: Date.now(), message: "I am Paul", data: { from: { id: "paul" } },
-    }, sender);
+    }, sender, undefined, "mesh");
     expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(sender, delivery));
   });
 
@@ -83,7 +83,7 @@ describe("Fabric Main provenance at the Pi API", () => {
     const bridged = { ...sender, id: "session:remote", kind: "main" as const, verified: "bridge" as const };
     await router.acceptControl({ version: 1, commandId: "remote", targetId: "main", operation: "steer",
       replyTo: "remote-host", requestedAt: Date.now(), message: "Paul speaking", data: { sender: "paul" },
-    }, bridged);
+    }, bridged, undefined, "bridge");
     expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(bridged, "steer", "bridge"));
   });
 
@@ -92,7 +92,7 @@ describe("Fabric Main provenance at the Pi API", () => {
     const file = journal();
     const first = fixture(); first.main.attachFollowUpDrain(first.context, 120_000, file);
     const from = verified === "bridge" ? { ...sender, verified } : sender;
-    first.main.deliverAgent({ from, message: "Paul here", delivery: "followUp" });
+    first.main.deliverAgent({ from, verification: verified, message: "Paul here", delivery: "followUp" });
     const original = JSON.parse(fs.readFileSync(file, "utf8")).items[0];
     first.main.closeFollowUpDrain();
     vi.setSystemTime(new Date("2026-09-30T11:00:00Z"));
@@ -130,7 +130,7 @@ describe("Fabric Main provenance at the Pi API", () => {
   it("reload does not re-inject an already queued handoff; a lost one first receives via replay", () => {
     const file = journal();
     const first = fixture(); first.main.attachFollowUpDrain(first.context, 120_000, file);
-    first.main.deliverAgent({ from: sender, message: "original", delivery: "steer", deliveryId: "durable" });
+    first.main.deliverAgent({ from: sender, verification: "mesh", message: "original", delivery: "steer", deliveryId: "durable" });
     const queued = first.pi.sendMessage.mock.calls[0]![0];
     first.main.closeFollowUpDrain();
     const reload = fixture(); reload.main.attachFollowUpDrain(reload.context, 120_000, file);
@@ -145,7 +145,7 @@ describe("Fabric Main provenance at the Pi API", () => {
   it("a persisted Pi receipt on any branch is never injected or stamped again", () => {
     const file = journal();
     const first = fixture(); first.main.attachFollowUpDrain(first.context, 120_000, file);
-    first.main.deliverAgent({ from: sender, message: "original", delivery: "steer", deliveryId: "durable" });
+    first.main.deliverAgent({ from: sender, verification: "mesh", message: "original", delivery: "steer", deliveryId: "durable" });
     const message = first.pi.sendMessage.mock.calls[0]![0];
     first.main.closeFollowUpDrain();
     const receipt = { type: "custom_message", ...message, provenance: { ...expected(), turnId: "original-turn", receivedAt: "2026-09-30T10:00:00Z" } };
@@ -159,7 +159,7 @@ describe("Fabric Main provenance at the Pi API", () => {
   it("copies the sender at admission; later identity mutations cannot change provenance", () => {
     const { pi, main, context, emit } = fixture(); main.attachFollowUpDrain(context, 120_000);
     const from = { ...sender };
-    main.deliverAgent({ from, message: "held", delivery: "followUp" });
+    main.deliverAgent({ from, verification: "mesh", message: "held", delivery: "followUp" });
     from.id = "paul"; from.name = "Paul";
     emit("agent_before_settle");
     expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(sender, "followUp"));
@@ -168,8 +168,8 @@ describe("Fabric Main provenance at the Pi API", () => {
   it("never attributes a mixed-sender held batch to just its first sender", () => {
     const { pi, main, context, emit } = fixture(); main.attachFollowUpDrain(context, 120_000);
     const other = { id: "actor:other", kind: "actor" as const, name: "Other" };
-    main.deliverAgent({ from: sender, message: "one", delivery: "followUp" });
-    main.deliverAgent({ from: other, message: "two", delivery: "followUp" });
+    main.deliverAgent({ from: sender, verification: "mesh", message: "one", delivery: "followUp" });
+    main.deliverAgent({ from: other, verification: "mesh", message: "two", delivery: "followUp" });
     emit("agent_before_settle");
     expect(pi.sendMessage.mock.calls.map(call => call[1].provenance)).toEqual([expected(sender, "followUp"), expected(other, "followUp")]);
   });
@@ -178,8 +178,8 @@ describe("Fabric Main provenance at the Pi API", () => {
     vi.useFakeTimers();
     const { pi, main, context, emit } = fixture(); main.attachFollowUpDrain(context, 1_000);
     const other = { id: "actor:other", kind: "actor" as const, name: "Other" };
-    main.deliverAgent({ from: sender, message: "one", delivery: "followUp" });
-    main.deliverAgent({ from: other, message: "two", delivery: "followUp" });
+    main.deliverAgent({ from: sender, verification: "mesh", message: "one", delivery: "followUp" });
+    main.deliverAgent({ from: other, verification: "mesh", message: "two", delivery: "followUp" });
     vi.advanceTimersByTime(1_001);
     emit("turn_end", toolBoundary);
     expect(pi.sendMessage.mock.calls.map(call => call[1].provenance)).toEqual([expected(sender, "followUp"), expected(other, "followUp")]);
@@ -191,8 +191,8 @@ describe("Fabric Main provenance at the Pi API", () => {
     const file = journal();
     const { pi, main, context, emit } = fixture(); main.attachFollowUpDrain(context, 120_000, file);
     const other = { id: "actor:other", kind: "actor" as const, name: "Other" };
-    main.deliverAgent({ from: sender, message: "one", delivery: "followUp" });
-    main.deliverAgent({ from: other, message: "two", delivery: "followUp" });
+    main.deliverAgent({ from: sender, verification: "mesh", message: "one", delivery: "followUp" });
+    main.deliverAgent({ from: other, verification: "mesh", message: "two", delivery: "followUp" });
     pi.sendMessage.mockImplementationOnce(() => {}).mockImplementationOnce(() => { throw new Error("Pi queue failed"); });
     emit("agent_before_settle");
     expect(main.queueDepth().pendingFollowUps).toBe(1);

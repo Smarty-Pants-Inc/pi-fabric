@@ -31,6 +31,8 @@ export interface FabricMainAgentInfo {
 
 export interface FabricMainAgentDeliveryRequest {
   from: MeshIdentity;
+  /** Recorded admission only; absence (including old bridges) makes no sender claim. */
+  verification?: "mesh" | "bridge";
   message: string;
   delivery: FabricMainAgentDelivery;
   triggerTurn?: boolean;
@@ -313,7 +315,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   deliverUser(
     message: string, delivery: FabricAgentMessageDelivery,
-    from?: MeshIdentity,
+    from?: MeshIdentity, verification?: "mesh" | "bridge",
   ): FabricAgentMessageResult {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
     const text = message.trim();
@@ -321,7 +323,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const messageId = randomUUID();
     const options = { deliverAs: delivery };
     // An unknown caller cannot claim this Main's identity. Pi records the unclaimed turn as terminal.
-    this.pi.sendUserMessage(text, from ? fabricProvenanceOptions(this.pi, options, fabricTurnProvenance(from, delivery, from.verified === "bridge" ? "bridge" : "mesh")) : options);
+    this.pi.sendUserMessage(text, from && (verification === "mesh" || verification === "bridge") ? fabricProvenanceOptions(this.pi, options, fabricTurnProvenance(from, delivery, verification)) : options);
     return { queued: true, messageId, routed: "main" };
   }
 
@@ -342,7 +344,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     const item: HeldAgentMessage = {
       id: randomUUID(),
       from: sender,
-      provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, sender.verified === "bridge" ? "bridge" : "mesh"),
+      ...(request.verification === "mesh" || request.verification === "bridge" ? {
+        provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification),
+      } : {}),
       message,
       sentAt: Date.now(),
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),

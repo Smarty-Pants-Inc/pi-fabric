@@ -651,6 +651,7 @@ export class ResidencyClient {
     // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
     this.options.mainAgent.deliverAgent({
       from: value.from,
+      verification: "mesh", // The authenticated resident-host record was checked above.
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,

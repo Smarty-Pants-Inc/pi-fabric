@@ -55,7 +55,7 @@ export const deliverPrewalkPlanCheckpoint = (
           ...(files.length > 0 ? { files } : {}),
         },
       },
-      { deliverAs: "steer", triggerTurn: true }, fabricHostIdentity(arm.sessionId), "steer",
+      { deliverAs: "steer", triggerTurn: true }, fabricHostIdentity(arm.sessionId), "steer", "mesh",
     );
     return true;
   } catch {

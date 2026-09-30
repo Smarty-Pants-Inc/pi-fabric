@@ -1,5 +1,4 @@
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { fabricHostIdentity, sendFabricUserMessage } from "../fabric-provenance.js";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import type { CapturedToolCatalog } from "../capture/catalog.js";
 import type { FabricActorHostEvent } from "../actors/types.js";
@@ -186,7 +185,8 @@ const armPrewalk = async (
       : `Fabric prewalk armed for the next task; ${modeLabel} with ${model}${state.config.prewalk.alwaysRearm ? "; always re-arm enabled" : ""}`,
     "info",
   );
-  if (task) sendFabricUserMessage(pi, task, () => fabricHostIdentity(context.sessionManager.getSessionId()), "followUp");
+  // This is the principal's typed task, not a host-generated Fabric directive.
+  if (task) pi.sendUserMessage(task);
   return { ok: true };
 };
 

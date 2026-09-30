@@ -38,8 +38,8 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
   it("hostCapabilities.turnProvenance === 1 puts provenance in both Pi API options", () => {
     const { fake, pi } = recording();
     const message = { customType: "probe", content: "Paul here", display: true };
-    sendFabricMessage(pi, message, { deliverAs: "steer", triggerTurn: true }, host, "steer");
-    sendFabricUserMessage(pi, "Paul here", host, "followUp", { deliverAs: "followUp" });
+    sendFabricMessage(pi, message, { deliverAs: "steer", triggerTurn: true }, host, "steer", "mesh");
+    sendFabricUserMessage(pi, "Paul here", host, "followUp", { deliverAs: "followUp" }, "mesh");
     expect(fake.sendMessage).toHaveBeenCalledWith(message, { deliverAs: "steer", triggerTurn: true,
       provenance: provenance(host, "steer") });
     expect(fake.sendUserMessage).toHaveBeenCalledWith("Paul here", { deliverAs: "followUp",
@@ -52,8 +52,8 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
     const message = { customType: "probe", content: "legacy", display: true };
     const options = { deliverAs: "steer" as const, triggerTurn: false };
     const sender = vi.fn(() => host);
-    sendFabricMessage(pi, message, options, sender, "steer");
-    sendFabricUserMessage(pi, "legacy", sender, "followUp");
+    sendFabricMessage(pi, message, options, sender, "steer", "mesh");
+    sendFabricUserMessage(pi, "legacy", sender, "followUp", undefined, "mesh");
     expect(fake.sendMessage.mock.calls).toEqual([[message, options]]);
     expect(fake.sendMessage.mock.calls[0]![1]).toBe(options);
     expect(fake.sendUserMessage.mock.calls).toEqual([["legacy"]]);
@@ -63,7 +63,7 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
   it.each([true, "1", 2])("capability value %s does not advertise v1", value => {
     const { fake, pi } = recording(false);
     Object.assign(fake, { hostCapabilities: { turnProvenance: value } });
-    sendFabricUserMessage(pi, "legacy", host, "followUp");
+    sendFabricUserMessage(pi, "legacy", host, "followUp", undefined, "mesh");
     expect(fake.sendUserMessage.mock.calls).toEqual([["legacy"]]);
   });
   it.each([["steer", true], ["followUp", true], ["followUp", false], ["nextTurn", false]] as const)(
@@ -219,8 +219,8 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
 
   it("the legacy user-message adapter preserves a one-argument call and explicit template expansion", () => {
     const { fake, pi } = recording(false);
-    sendFabricUserMessage(pi, "task", host, "followUp");
-    sendFabricUserMessage(pi, "/fabric-release-reload auto", host, "followUp", { expandPromptTemplates: true });
+    sendFabricUserMessage(pi, "task", host, "followUp", undefined, "mesh");
+    sendFabricUserMessage(pi, "/fabric-release-reload auto", host, "followUp", { expandPromptTemplates: true }, "mesh");
     expect(fake.sendUserMessage.mock.calls).toEqual([["task"], ["/fabric-release-reload auto", { expandPromptTemplates: true }]]);
   });
 });

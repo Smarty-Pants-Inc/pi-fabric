@@ -53,9 +53,9 @@ export class ShellEventInbox {
     on("input", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
     on("before_agent_start", (_event, ctx) => {
       this.#context = ctx;
-      let message: Message | undefined;
-      this.#flush(value => { message = value; });
-      return message ? { message } : undefined;
+      this.#flush(message => sendFabricMessage(this.pi, message,
+        { deliverAs: "nextTurn", triggerTurn: false },
+        () => fabricHostIdentity(ctx.sessionManager.getSessionId()), "actor", "mesh"));
     });
     on("session_tree", (_event, ctx) => {
       this.#context = ctx;
@@ -135,7 +135,7 @@ export class ShellEventInbox {
     this.#timer.unref?.();
   }
 
-  #flush(deliver: (message: Message) => void = message => sendFabricMessage(this.pi, message, { deliverAs: "steer", triggerTurn: true }, () => fabricHostIdentity(this.#context.sessionManager.getSessionId()), "steer")): void {
+  #flush(deliver: (message: Message) => void = message => sendFabricMessage(this.pi, message, { deliverAs: "steer", triggerTurn: true }, () => fabricHostIdentity(this.#context.sessionManager.getSessionId()), "steer", "mesh")): void {
     if (this.#closed || this.#suspended || this.#context.signal?.aborted || !this.#pending.size) return;
     const batch = [...this.#pending.values()].slice(0, 8);
     const content = [

@@ -560,7 +560,7 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
 }
 
 /** Bash read/mapfile option values are not destinations; omitted destinations use shell defaults. */
-function readDestinations(name: string, args: Word[], budget: GuardBudget): string[] {
+function readDestinations(name: string, args: Word[], budget: GuardBudget): string[] | undefined {
   budget.spend(4 * args.length + 1);
   const read = name === "read";
   const valueOptions = read ? "adinNptu" : "nOsuCcd";
@@ -583,10 +583,14 @@ function readDestinations(name: string, args: Word[], budget: GuardBudget): stri
   const destinations = read && array !== undefined ? [array] : args.slice(index).map((arg) => arg.text);
   if (destinations.length === 0) destinations.push(read ? "REPLY" : "MAPFILE");
   // read -a ignores scalar names; mapfile takes only one array name. Array elements taint the base.
-  return (read ? destinations : destinations.slice(0, 1)).flatMap((destination) => {
+  const selected = read ? destinations : destinations.slice(0, 1);
+  const resolved = selected.flatMap((destination) => {
+    budget.spend(destination.length + 1);
     const match = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[.*\])?$/.exec(destination);
     return match ? [match[1]!] : [];
   });
+  // One unresolved operand can create an untracked cell even beside resolved names.
+  return resolved.length === selected.length ? resolved : undefined;
 }
 
 /**
@@ -1111,12 +1115,14 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     budget.spend(supplied.length + 1);
     if (!formatWord || formatWord.unprovedLiteral || supplied.some((word) => word.unprovedLiteral)) return undefined;
     budget.spend(3 * formatWord.pattern.length + 1);
-    if ([...formatWord.pattern.matchAll(REFERENCE)].some((match) => lookupName(match[2]!) || tmpName(match[2]!))) return undefined;
+    // ponytail: an unquoted format expansion may disappear/split/select argv. Decline
+    // exact bytes instead of adding an option/format interpreter; quoted forms remain.
+    if ([...formatWord.pattern.matchAll(REFERENCE)].some((match) => match[1] === "$" || lookupName(match[2]!) || tmpName(match[2]!))) return undefined;
     const format = expand(formatWord.pattern);
     budget.spend(4 * format.length + 4 * supplied.length + 1);
     // Option selection (including --) is outside the literal-format subset. Do not
     // render a terminator as output, or interpret an unproved option/format boundary.
-    const stringFormat = !format.startsWith("-") && !/%(?![%s])/.test(format) && !/\\(?![\\nrt])/.test(format) && ![...format.matchAll(REFERENCE)].length;
+    const stringFormat = !format.startsWith("-") && !/[*?[]/.test(format) && !/%(?![%s])/.test(format) && !/\\(?![\\nrt])/.test(format) && ![...format.matchAll(REFERENCE)].length;
     // printf receives the caller's expanded argv, including only unquoted IFS splitting.
     const argv = positionalFields(supplied, 0).words;
     budget.spend(argv.length + 1);
@@ -1458,9 +1464,22 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         }
       }
       if (name === "set") {
-        const end = args.findIndex((arg) => arg.text === "--");
-        const operands = end >= 0 ? args.slice(end + 1) : args[0]?.text.startsWith("-") ? undefined : args;
-        if (operands) {
+        // No-argument set is diagnostic, not empty replacement. Prove only simple
+        // standalone replacements; options/execution may fail and retain old argv.
+        const head = args[0];
+        const operands = head?.text === "--" ? args.slice(1) : head && !/^[-+]/.test(head.text) ? args : undefined;
+        const replacement = operands !== undefined && stage.words[0] === words[0] && words[0]?.text === name &&
+          !assignments.length && !childBinding && !redirectBinding && !head?.unprovedLiteral &&
+          ![...head!.pattern.matchAll(REFERENCE)].length;
+        if (head && !replacement) {
+          budget.spend(2 * (values.size + alternatives.size + tainted.size + tmpNames.size + unknown.size) + 1);
+          for (const key of new Set([...values.keys(), ...alternatives.keys(), ...tainted, ...tmpNames, ...unknown])) {
+            if (/^(?:[1-9][0-9]*|[@*])$/.test(key)) markUnknown(key);
+          }
+          markUnknown("@"); markUnknown("*");
+          lookupTail = 1; tmpTail = 1;
+        }
+        if (replacement && operands) {
           budget.spend(4 * operands.length + 1);
           const bound = positionalFields(operands, 1);
           const positionals = bound.words.map((word) => word.pattern);
@@ -1545,8 +1564,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         // None are proved here. Even a recorded literal must not erase an unsafe old
         // value, assert its first line repeatedly, or grant ownership to the result.
         // This also covers mapfile/readarray; option arguments are not destinations.
-        for (const destination of destinations) markUnknown(destination);
-        if (destinations.length === 0) markBindingsUnknown();
+        if (destinations === undefined) { opaqueAttributes = true; markBindingsUnknown(true); }
+        else for (const destination of destinations) markUnknown(destination);
       }
       // mktemp creates one exact path; naming /tmp there does not list other agents' entries.
       // Security F3: after `cd /tmp`, a piped stage may list the cwd (`ls`, `find` without a root).

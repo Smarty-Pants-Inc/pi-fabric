@@ -1596,6 +1596,32 @@ describe("AgentManager", () => {
     await expect(completion).resolves.toMatch(/^live attempt \d+ complete$/);
   }, 15_000);
 
+  it.each([false, true])("cancels only a Main wait observation and preserves completion (already aborted: %s)", async alreadyAborted => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-wait-"));
+    roots.push(root);
+    const consumed = vi.fn();
+    let resolveCompletion!: (text: string) => void;
+    const completion = new Promise<string>(resolve => { resolveCompletion = resolve; });
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      onBackgroundComplete: result => resolveCompletion(result.text),
+      onResultConsumed: consumed,
+    });
+    managers.push(manager);
+    const handle = await manager.spawn({ task: "LIVE_WITH_PROGRESS", transport: "process" });
+    const controller = new AbortController();
+    if (alreadyAborted) controller.abort(new Error("Main ceiling hit"));
+    const wait = manager.wait(handle.id, { timeoutMs: 60_000, signal: controller.signal });
+    if (!alreadyAborted) controller.abort(new Error("Main ceiling hit"));
+    // A bounded assertion lets the regression fail promptly on the unfixed base.
+    const observation = Promise.race([wait, new Promise((_, reject) => setTimeout(() => reject(new Error("observation remained blocked")), 100))]);
+    await expect(observation).rejects.toThrow("Main ceiling hit");
+    expect(manager.status(handle.id).status).toBe("running");
+    expect(consumed).not.toHaveBeenCalled();
+    await expect(completion).resolves.toMatch(/^live attempt \d+ complete$/);
+    expect(consumed).not.toHaveBeenCalled();
+  });
+
   it("surfaces the run-log tail when a worker exits without a terminal result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

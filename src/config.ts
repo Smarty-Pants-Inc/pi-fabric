@@ -54,6 +54,8 @@ interface FabricExecutorConfig {
   /** Policy maximum for any executor deadline, including per-invocation
    * requests and per-ref floors. Values above this are visibly normalized. */
   maxTimeoutMs: number;
+  /** Fixed whole-program ceiling for interactive Main only; overrides every deadline floor. */
+  mainMaxTimeoutMs: number;
   /** Exact-ref deadline floors (ms) for known long-running host calls, e.g.
    * "extensions.subagent". Keys are exact refs; no wildcard matching. */
   hostCallTimeouts: Record<string, number>;
@@ -367,8 +369,8 @@ export const MAX_EXECUTOR_TIMEOUT_MS = 24 * 3_600_000;
 export const MIN_AGENT_TIMEOUT_MS = 1_000;
 export const MAX_AGENT_TIMEOUT_MS = 24 * 3_600_000;
 /** Default per-run wall-clock budget. It equals the policy ceiling on purpose:
- *  an orchestration program inherits agents.timeoutMs as its own whole-program
- *  deadline floor, so any lower default truncates long participants at a
+ *  outside interactive Main, an orchestration program inherits agents.timeoutMs
+ *  as its whole-program deadline floor, so any lower default truncates participants at a
  *  fraction of the maximum the policy already allows. Narrow one run by setting
  *  agents.timeoutMs explicitly; per-call values can only raise it. */
 const DEFAULT_AGENT_TIMEOUT_MS = MAX_AGENT_TIMEOUT_MS;
@@ -396,6 +398,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     runtime: "quickjs",
     timeoutMs: 120_000,
     maxTimeoutMs: 900_000,
+    mainMaxTimeoutMs: 600_000,
     hostCallTimeouts: {},
     shellHangMs: DEFAULT_SHELL_HANG_MS,
     memoryLimitBytes: 64 * 1024 * 1024,
@@ -868,6 +871,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.executor.maxTimeoutMs,
         1_000,
         MAX_EXECUTOR_TIMEOUT_MS,
+      ),
+      mainMaxTimeoutMs: boundedInteger(
+        executor.mainMaxTimeoutMs,
+        Math.min(DEFAULT_FABRIC_CONFIG.executor.mainMaxTimeoutMs, executorMaxTimeoutMs),
+        Math.min(60_000, executorMaxTimeoutMs),
+        executorMaxTimeoutMs,
       ),
       hostCallTimeouts: Object.fromEntries(
         Object.entries(objectValue(executor.hostCallTimeouts))

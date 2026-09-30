@@ -534,6 +534,9 @@ describe("FabricUiController dashboard wiring", () => {
       const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 2_000 });
       const writer = new MeshStore(root, 64 * 1024, 100);
       await writer.put({ key: "status", value: "A0", identity });
+      const stateFile = path.join(root, "state.json");
+      const reads = vi.spyOn(fs, "readFileSync");
+      const readCount = () => reads.mock.calls.filter(([file]) => String(file) === stateFile).length;
       const state = stubState();
       state.config.ui.refreshMs = 500;
       vi.mocked(state.actors.list).mockReturnValue([]);
@@ -550,15 +553,121 @@ describe("FabricUiController dashboard wiring", () => {
         await writer.put({ key: "status", value: "A", identity });
         expect(mesh.get("status")?.value).toBe("A");             // another reader parses A: a warm cache
         await writer.put({ key: "status", value: "B", identity });
+        const afterWrite = readCount(); // Exclude the writer's own canonical read under its lock.
         if (order === "an event-driven rebuild") {
           activity.beginCall("live", { callId: "c1", ref: "pi.read", args: {} });   // consumes the cached A
           await vi.advanceTimersByTimeAsync(150);
           expect(shown()).toBe("A");
+          expect(readCount()).toBe(afterWrite); // Local events retain ordinary warm-cache semantics.
         }
         await vi.advanceTimersByTimeAsync(order === "an event-driven rebuild" ? 5_500 : 1_000);
         expect(shown()).toBe("B");
+        expect(readCount()).toBe(afterWrite + 1); // New generation needs exactly ONE canonical parse.
       } finally {
         controller.stop();
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("keeps stationary mesh state at zero extra canonical reads across idle UI polls", async () => {
+    vi.useFakeTimers();
+    const scratch = path.resolve(".local/check-temp");
+    fs.mkdirSync(scratch, { recursive: true });
+    const root = fs.mkdtempSync(path.join(scratch, "dashboard-stationary-"));
+    const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 2_000 });
+    await mesh.put({ key: "status", value: "A", identity: { id: "session:writer", name: "writer", kind: "main" } });
+    const stateFile = path.join(root, "state.json");
+    const reads = vi.spyOn(fs, "readFileSync");
+    const readCount = () => reads.mock.calls.filter(([file]) => String(file) === stateFile).length;
+    const state = stubState();
+    state.config.ui.refreshMs = 500;
+    vi.mocked(state.actors.list).mockReturnValue([]);
+    const activity = new FabricActivityStore();
+    Object.assign(state, { activity, config: { ...state.config, mesh: { enabled: true } }, mesh });
+    const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      activity.start("live", { name: "local work" }); // Keep the UI polling while mesh state is idle.
+      await vi.advanceTimersByTimeAsync(200);
+      const before = readCount();
+      const stamp = mesh.cachedStateStamp();
+      for (let index = 0; index < 6; index++) {
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(mesh.cachedStateStamp(true)).toBe(stamp);
+        expect(controller.snapshot().state.find((entry) => entry.key === "status")?.value).toBe("A");
+        expect(readCount()).toBe(before); // Includes observer calls and the 15 s ceiling rebuilds.
+      }
+      expect(context.ui.notify).not.toHaveBeenCalled();
+    } finally {
+      controller.stop();
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["ordinary poll consumed latest", "legacy unrelated writer copied marker"] as const)(
+    "remote UI rebuild adds zero canonical reads when %s",
+    async (order) => {
+      vi.useFakeTimers();
+      const scratch = path.resolve(".local/check-temp");
+      fs.mkdirSync(scratch, { recursive: true });
+      const root = fs.mkdtempSync(path.join(scratch, "dashboard-coalesced-"));
+      const identity = { id: "session:writer", name: "writer", kind: "main" as const };
+      const writer = new MeshStore(root, 64 * 1024, 100);
+      const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 2_000 });
+      await writer.put({ key: "status", value: "A0", identity });
+      const stateFile = path.join(root, "state.json");
+      const realRead = fs.readFileSync;
+      const reads = vi.spyOn(fs, "readFileSync");
+      const readCount = () => reads.mock.calls.filter(([file]) => String(file) === stateFile).length;
+      const state = stubState();
+      state.config.ui.refreshMs = 500;
+      vi.mocked(state.actors.list).mockReturnValue([]);
+      const activity = new FabricActivityStore();
+      Object.assign(state, { activity, config: { ...state.config, mesh: { enabled: true } }, mesh });
+      const context = { mode: "tui", ui: { setWidget: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+      const controller = new FabricUiController(state);
+      const shown = () => controller.snapshot().state.find((entry) => entry.key === "status")?.value;
+      const gathered = vi.spyOn(mesh, "list");
+      try {
+        controller.start(context);
+        activity.start("live", { name: "local work" });
+        await vi.advanceTimersByTimeAsync(4_700);
+        expect(shown()).toBe("A0");
+        await writer.put({ key: "status", value: "A", identity });
+        const afterWrite = readCount();
+        const consumedToken = mesh.stateToken(); // Ordinary topology/poll reader already paid for A.
+        expect(mesh.get("status")?.value).toBe("A");
+        expect(readCount()).toBe(afterWrite + 1);
+        const consumedStamp = mesh.cachedStateStamp();
+        if (order === "legacy unrelated writer copied marker") {
+          // A pre-generation writer replaces real canonical bytes under the real lock, retaining UUID.
+          // This is not evidence of a new minted generation; do not restore old F1's forced full read.
+          await writer.exclusive(() => {
+            const disk = JSON.parse(String(realRead(stateFile, "utf8")));
+            disk.entries.unrelated = { ...disk.entries.status, key: "unrelated", value: "legacy unrelated metadata change" };
+            fs.writeFileSync(`${stateFile}.legacy-tmp`, JSON.stringify(disk));
+            fs.renameSync(`${stateFile}.legacy-tmp`, stateFile);
+          });
+          expect(mesh.stateStamp()).not.toBe(consumedStamp);
+        }
+        const beforeUi = readCount();
+        const beforeGather = gathered.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(gathered.mock.calls.length).toBe(beforeGather + 1); // Exercise the real remote rebuild.
+        expect(shown()).toBe("A");
+        expect(mesh.stateToken()).toBe(consumedToken);
+        expect(mesh.cachedStateStamp(true)).toBe(consumedStamp);
+        expect(readCount()).toBe(beforeUi); // Observer + snapshot + ordinary reader share ONE parse.
+        expect(context.ui.notify).not.toHaveBeenCalled();
+      } finally {
+        controller.stop();
+        vi.restoreAllMocks();
         vi.useRealTimers();
         fs.rmSync(root, { recursive: true, force: true });
       }

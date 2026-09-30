@@ -292,6 +292,101 @@ it("header EIO permits within-TTL reuse but requires a canonical parse at expiry
   expect(count()).toBe(before + 1);
 });
 
+for (const metadata of ["changed-stat", "same-stat"] as const) it(`explicit remote generation check parses a warm new UUID once with ${metadata}`, async () => {
+  const { reader, writer, freeze, count } = await setup();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  if (metadata === "same-stat") freeze();
+  const oldToken = reader.stateToken();
+  const oldStamp = reader.cachedStateStamp();
+  now += 100; // Well inside the ordinary 2 s reuse window.
+  await writer.put({ key, value: { owner: "new" }, identity });
+  const before = count(); // Excludes writer's necessary locked read.
+  expect(reader.cachedStateStamp(true)).toBe(oldStamp); // True observer semantics do not change.
+  expect(reader.get(key)?.value).toEqual({ owner: "old" });
+  expect(count()).toBe(before);
+  const consumed = reader.cachedStateStamp(true, true);
+  if (metadata === "same-stat") expect(consumed).toBe(oldStamp); // Metadata is NOT a generation token.
+  else expect(consumed).not.toBe(oldStamp);
+  expect(reader.stateToken()).not.toBe(oldToken);
+  expect(reader.get(key)?.value).toEqual({ owner: "new" });
+  expect(count()).toBe(before + 1);
+  expect(reader.cachedStateStamp(true, true)).toBe(consumed);
+  expect(reader.cachedStateStamp(true)).toBe(consumed);
+  expect(count()).toBe(before + 1); // UI and ordinary readers share the one necessary parse.
+});
+
+it("explicit generation checks of stationary state add zero canonical reads after TTL expiry", async () => {
+  const { reader, count } = await setup();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const token = reader.stateToken();
+  const stamp = reader.cachedStateStamp();
+  const before = count();
+  for (const elapsed of [100, 1_999, 2_000, 5_000, 15_000, 30_000]) {
+    now += elapsed;
+    expect(reader.cachedStateStamp(true, true)).toBe(stamp);
+    expect(reader.stateToken()).toBe(token);
+    expect(count()).toBe(before);
+  }
+});
+
+for (const writerMode of ["current", "copied-marker legacy"] as const) it(`explicit generation check coalesces with an ordinary ${writerMode} expiry parse`, async () => {
+  const { reader, writer, replace, disk, count } = await setup();
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const oldToken = reader.stateToken();
+  const generation = disk().readGeneration;
+  if (writerMode === "current") await writer.put({ key, value: { owner: "larger-new-owner" }, identity });
+  else {
+    await replace((state) => { state.entries[key]!.value = { owner: "legacy-larger-new-owner" }; });
+    expect(disk().readGeneration).toBe(generation);
+  }
+  const before = count();
+  now += RUNTIME_MESH_READ_CACHE_MS;
+  const currentToken = reader.stateToken(); // Ordinary poll already consumed latest canonical bytes.
+  expect(currentToken).not.toBe(oldToken);
+  expect(count()).toBe(before + 1);
+  const consumed = reader.cachedStateStamp();
+  expect(reader.cachedStateStamp(true, true)).toBe(consumed);
+  expect(reader.cachedStateStamp(true)).toBe(consumed);
+  expect(reader.stateToken()).toBe(currentToken);
+  expect(count()).toBe(before + 1); // No forced UI duplicate for either writer kind.
+});
+
+for (const marker of ["copied", "unknown", "EIO"] as const) it(`explicit ${marker} generation fallback neither relabels the payload nor extends its TTL`, async () => {
+  const { reader, replace, count } = await setup();
+  if (marker === "unknown") await replace((state) => { delete state.readGeneration; });
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const oldToken = reader.stateToken();
+  const old = reader.get(key);
+  const consumed = reader.cachedStateStamp();
+  const parsedAt = now;
+  await replace((state) => { state.entries[key]!.value = { owner: "legacy-larger-new-owner" }; });
+  const onDisk = reader.stateStamp();
+  expect(onDisk).not.toBe(consumed);
+  const before = count();
+  const headers = marker === "EIO" ? vi.spyOn(fs, "readSync").mockImplementation(() => {
+    throw Object.assign(new Error("canonical header unavailable"), { code: "EIO" });
+  }) : vi.spyOn(fs, "readSync");
+  for (const elapsed of [0, RUNTIME_MESH_READ_CACHE_MS / 2, RUNTIME_MESH_READ_CACHE_MS - 1]) {
+    now = parsedAt + elapsed;
+    expect(reader.cachedStateStamp(true, true)).toBe(consumed);
+    expect(reader.stateToken()).toBe(oldToken);
+    expect(reader.get(key)).toEqual(old);
+    expect(count()).toBe(before); // Changed metadata alone does not force warm-window duplicates.
+  }
+  expect(headers).toHaveBeenCalled(); // Explicit mode checked the header; default true does not.
+  now += 1; // Original TTL boundary, not two seconds after the last explicit observation.
+  expect(reader.cachedStateStamp(true, true)).toBe(onDisk);
+  expect(reader.get(key)?.value).toEqual({ owner: "legacy-larger-new-owner" });
+  expect(reader.stateToken()).not.toBe(oldToken);
+  expect(count()).toBe(before + 1);
+  expect(reader.cachedStateStamp(true, true)).toBe(onDisk);
+  expect(count()).toBe(before + 1);
+});
+
 it("unchanged public fresh payload calls still perform canonical full reads", async () => {
   const { reader, count } = await setup();
   reader.get(key);

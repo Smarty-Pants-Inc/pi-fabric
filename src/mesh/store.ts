@@ -1334,12 +1334,21 @@ export class MeshStore {
    * revalidate through the ordinary read-cache window, not authoritative payload freshness.
    * This UI observer may lag remote changes by readCacheMs; observing a cached payload does
    * not extend its age window. Expired reads use ordinary metadata/header validation and fallback.
+   * An explicit remote rebuild may opt into revalidateGeneration: a new canonical UUID bypasses
+   * even a warm window. Matching/copied, missing or unreadable markers keep ordinary TTL behavior;
+   * this is not authority or proof against legacy copied-marker ABA.
    * A reader records what it consumed, not what is on disk (review/astra F2 on #84).
    */
-  cachedStateStamp(fresh = false): string | undefined {
+  cachedStateStamp(fresh = false, revalidateGeneration = false): string | undefined {
     if (fresh) {
       try {
-        this.#readCachedState(false, false); // observer only; public fresh payload reads stay canonical
+        const cached = this.#stateCache;
+        let changed = false;
+        if (revalidateGeneration && cached && this.#readCacheMs > 0 && Date.now() - cached.parsedAt < this.#readCacheMs) {
+          const generation = this.#canonicalGeneration();
+          changed = typeof generation === "string" && generation !== cached.generation;
+        }
+        this.#readCachedState(changed, false); // observer only; public fresh payload reads stay canonical
       } catch {
         return undefined;
       }

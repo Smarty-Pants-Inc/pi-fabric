@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import type * as MontyNative from "@pydantic/monty/node";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, runAbortable, settleWithin } from "../async-settlement.js";
 import { MAX_EXECUTOR_TIMEOUT_MS } from "../config.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
@@ -82,7 +82,8 @@ export class MontyRuntime implements FabricKernelRuntime {
     const stop = (reason: "aborted" | "timed_out"): void => {
       if (stopped) return;
       stopped = reason;
-      hostAbort.abort(new Error(reason === "aborted" ? "Execution cancelled" : "Execution timed out"));
+      hostAbort.abort((reason === "aborted" ? mainExecutionCeilingAbortReason(options.signal) : undefined) ??
+        new Error(reason === "aborted" ? "Execution cancelled" : "Execution timed out"));
       kill();
     };
     const abort = (): void => stop("aborted");

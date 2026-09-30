@@ -28,6 +28,7 @@ export const isInteractiveMain = (
   environment: NodeJS.ProcessEnv = process.env,
 ): boolean => {
   if (context?.mode !== "tui" && context?.mode !== "rpc") return false;
+  if (typeof context.sessionManager?.getSessionId !== "function") return false;
   return resolveFabricIdentity(context.sessionManager.getSessionId(), environment).identity.kind === "main";
 };
 

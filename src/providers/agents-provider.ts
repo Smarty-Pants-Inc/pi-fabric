@@ -1008,7 +1008,10 @@ export class AgentsProvider implements FabricProvider {
             this.#transcripts,
             actor.id,
             actor.name,
-            this.actorManager.ask(actor.id, message, args.data, context.signal, { overrides }),
+            this.actorManager.ask(actor.id, message, args.data, context.signal, {
+              overrides,
+              detachOnMainCeiling: isInteractiveMain(context.extensionContext),
+            }),
             context,
             this.agentToolPreviewEnabled,
           );

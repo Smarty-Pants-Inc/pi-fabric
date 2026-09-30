@@ -97,7 +97,9 @@ describe("registered fabric_exec compact transcript rendering", () => {
   it.each([true, false])("advertises Main bounds in full-code mode %s", fullCodeMode => {
     const state = stateFor("compact");
     state.config.fullCodeMode = fullCodeMode;
-    expect(toolFor(state).promptGuidelines).toContain(
+    const guidelines = toolFor(state).promptGuidelines ?? [];
+    expect(guidelines).toHaveLength(7); // six visible clauses plus the QuickJS host-globals clause
+    expect(guidelines.join("\n")).toContain(
       "In a Main, a fabric_exec program ends after 10 min and agents.run/wait return after 60 s; spawned agents keep running and report back.",
     );
   });

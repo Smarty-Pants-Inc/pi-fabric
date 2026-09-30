@@ -6,7 +6,7 @@ import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
-import type { FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
+import type { FabricActorDeliveryRequest, FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type {
@@ -141,7 +141,8 @@ const setup = (
     ...(options?.switchModel ? { switchModel: options.switchModel } : {}),
     flushHeldAtNextBoundary: vi.fn(),
   };
-  const actors = new ActorManager("test", identity, mesh, meshConfig, agents, () => {}, {
+  const actorDeliveries: FabricActorDeliveryRequest[] = [];
+  const actors = new ActorManager("test", identity, mesh, meshConfig, agents, request => actorDeliveries.push(request), {
     actorRoot: path.join(root, "actors"),
     persistent: true,
     mainAgent,
@@ -217,6 +218,7 @@ const setup = (
     globalActors,
     provider,
     mainDeliveries,
+    actorDeliveries,
   };
 };
 
@@ -1324,6 +1326,149 @@ describe("AgentsProvider runner support", () => {
       expect(agents.list()).toHaveLength(1);
       expect(agents.list()[0]).toMatchObject({ status: "running" });
     } finally { clearTimeout(timer); vi.unstubAllEnvs(); }
+  });
+
+  it.each([
+    ["tui", true, "quickjs"],
+    ["rpc", false, "quickjs"],
+    ["rpc", false, "node-process"],
+    ["rpc", false, "monty"],
+    ["rpc", false, "cpython"],
+  ] as const)(
+    "detaches only a zero-progress local actor ASK observation at the Main ceiling (%s, fullCodeMode=%s, backend=%s)",
+    async (mode, fullCodeMode, backend) => {
+      const { provider, actors, agents, actorDeliveries } = setup();
+      vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+      vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+      const actor = await actors.create({
+        name: "late-advisor", instructions: "Advise.", responseMode: "text", delivery: "followUp", triggerTurn: false, transport: "process",
+      });
+      const registry = new ActionRegistry();
+      registry.register(provider);
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+      config.fullCodeMode = fullCodeMode;
+      config.executor.memoryLimitBytes = 128 * 1024 * 1024;
+      const python = backend === "monty" || backend === "cpython";
+      if (python) { config.executor.kernel = "python"; config.executor.pythonRuntime = backend; }
+      else config.executor.runtime = backend;
+      config.executor.mainMaxTimeoutMs = 700;
+      const stop = vi.spyOn(agents, "stop");
+      const run = vi.spyOn(agents, "run");
+      try {
+        const result = await new FabricExecutionService(registry, config).execute({
+          code: python
+            ? `return await agents.ask(id=${JSON.stringify(actor.id)}, message="LIVE_WITHOUT_PROGRESS")`
+            : `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: "LIVE_WITHOUT_PROGRESS" });`,
+          signal: AbortSignal.timeout(3_000), parentToolCallId: "main-local-ask-ceiling",
+          context: { ...context.extensionContext, cwd: process.cwd(), mode, sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+          onPartial() {},
+        });
+        expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
+        expect(result.trace.outcome).toBe("timed_out");
+        expect(run).toHaveBeenCalledOnce();
+        expect(actors.status(actor.id).inFlightRun).toBeDefined();
+        expect(agents.list()).toHaveLength(1);
+        expect(agents.list()[0]).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
+        expect(stop).not.toHaveBeenCalled();
+        expect(actorDeliveries).toEqual([]);
+        // The actor, not the expired observer, owns result history and delivery.
+        await waitFor(() => actorDeliveries.length === 1 && actors.status(actor.id).status === "idle", 3_000);
+        expect(actorDeliveries[0]).toMatchObject({ delivery: "followUp", message: { actorId: actor.id, text: "live attempt 1 complete" } });
+        expect(actors.messages(actor.id).filter(message => message.direction === "out")).toMatchObject([
+          { actorId: actor.id, text: "live attempt 1 complete" },
+        ]);
+        expect(run).toHaveBeenCalledOnce();
+        expect(stop).not.toHaveBeenCalled();
+        expect(agents.list()).toHaveLength(0); // completed actor run was retained then cleaned
+      } finally { vi.unstubAllEnvs(); }
+    },
+  );
+
+  it.each(["Escape", "ordinary deadline", "explicit stop", "non-Main abort"] as const)(
+    "still stops a zero-progress local actor ASK on %s",
+    async cancellation => {
+      const { provider, actors, agents, actorDeliveries } = setup();
+      vi.stubEnv("PI_FABRIC_PARENT_RUN", cancellation === "non-Main abort" ? "parent-run" : "");
+      vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+      const actor = await actors.create({ name: "stoppable-advisor", instructions: "Advise.", responseMode: "text", delivery: "followUp", triggerTurn: false, transport: "process" });
+      const controller = new AbortController();
+      const stop = vi.spyOn(agents, "stop");
+      const observation = provider.invoke("ask", { id: actor.id, message: "HANG" }, {
+        ...context, signal: controller.signal,
+        extensionContext: { ...context.extensionContext, mode: "rpc", sessionManager: { getSessionId: () => "caller" } } as unknown as ExtensionContext,
+      });
+      const outcome = observation.catch(error => error);
+      try {
+        await waitFor(() => {
+          const worker = agents.list()[0];
+          return Boolean(actors.status(actor.id).inFlightRun) && worker?.status === "running" && "turns" in worker;
+        });
+        expect(agents.list()[0]).toMatchObject({ turns: 0, toolCalls: 0 });
+        if (cancellation === "explicit stop") await provider.invoke("stop", { id: actor.id }, context);
+        else controller.abort(cancellation === "non-Main abort"
+          ? new Error("MainExecutionCeilingError: Main ceiling hit after 700ms (executor.mainMaxTimeoutMs).")
+          : new Error(cancellation === "ordinary deadline" ? "Execution timed out" : "Escape"));
+        expect(await outcome).toBeInstanceOf(Error);
+        expect((await outcome as Error).message).toMatch(/Agent stopped|Operation aborted/);
+        await waitFor(() => agents.list().every(run => run.status === "stopped"));
+        expect(stop).toHaveBeenCalled();
+        expect(actorDeliveries).toEqual([]);
+        expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
+      } finally { vi.unstubAllEnvs(); }
+    },
+  );
+
+  it("keeps explicit stop effective after Main's ceiling detaches a local ASK", async () => {
+    const { provider, actors, agents, actorDeliveries } = setup();
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const actor = await actors.create({ name: "stop-after-ceiling", instructions: "Advise.", responseMode: "text", transport: "process" });
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.mainMaxTimeoutMs = 700;
+    try {
+      const result = await new FabricExecutionService(registry, config).execute({
+        code: `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: "HANG" });`,
+        signal: AbortSignal.timeout(3_000), parentToolCallId: "main-ask-stop-after-ceiling",
+        context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+        onPartial() {},
+      });
+      expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
+      expect(agents.list()[0]).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
+      await provider.invoke("stop", { id: actor.id }, context);
+      await waitFor(() => agents.list().every(run => run.status === "stopped"));
+      expect(actors.status(actor.id).status).toBe("stopped");
+      expect(actorDeliveries).toEqual([]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("preserves a queued local ASK and its late delivery at Main's ceiling", async () => {
+    const { provider, actors, agents, actorDeliveries } = setup();
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const actor = await actors.create({ name: "queued-advisor", instructions: "Advise.", responseMode: "text", delivery: "followUp", triggerTurn: false, transport: "process" });
+    const first = actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS");
+    const firstOutcome = first.catch(error => error);
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.mainMaxTimeoutMs = 100;
+    try {
+      await waitFor(() => Boolean(actors.status(actor.id).inFlightRun) && "turns" in agents.list()[0]!);
+      const result = await new FabricExecutionService(registry, config).execute({
+        code: `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: "queued advice" });`,
+        signal: AbortSignal.timeout(3_000), parentToolCallId: "main-queued-ask-ceiling",
+        context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
+        onPartial() {},
+      });
+      expect(result.error).toMatch(/MainExecutionCeilingError.*Main ceiling hit/);
+      expect(actors.status(actor.id).queued).toBe(1);
+      expect(await firstOutcome).toMatchObject({ text: "live attempt 1 complete" });
+      await waitFor(() => actorDeliveries.length === 2 && actors.status(actor.id).status === "idle");
+      expect(actorDeliveries.map(delivery => delivery.message.text)).toEqual(["live attempt 1 complete", "fake worker complete"]);
+      expect(actors.messages(actor.id).filter(message => message.direction === "out")).toHaveLength(2);
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("ends only the durable wait at the Main program ceiling, without stopping or acknowledging its run", async () => {

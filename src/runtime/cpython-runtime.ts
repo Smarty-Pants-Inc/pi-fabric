@@ -6,7 +6,7 @@ import net from "node:net";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
@@ -191,7 +191,11 @@ export class CPythonRuntime implements FabricKernelRuntime {
         if (truncated) logs.push("[Pi Fabric log output truncated]");
         resolve({ ...result, logs });
       };
-      const abort = (): void => void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
+      const abort = (): void => {
+        const reason = mainExecutionCeilingAbortReason(options.signal);
+        if (reason && !hostAbort.signal.aborted) hostAbort.abort(reason);
+        void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
+      };
       const fail = (message: string): void => void finish({ value: undefined, terminationReason: "runtime_error", error: message });
       // A child that dies at startup (bwrap without user namespaces) resets its
       // pipes before "close" reports its exit status and stderr. Let that

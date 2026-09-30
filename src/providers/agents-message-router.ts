@@ -163,6 +163,7 @@ export class AgentMessageRouter {
             : {}),
         },
         participant.ownerIdentityId,
+        { routedRemoteHost: participant.remoteHost ?? null },
       );
     }
 
@@ -193,6 +194,7 @@ export class AgentMessageRouter {
         kind,
         { message, data },
         remoteAgent.ownerIdentityId,
+        { routedRemoteHost: remoteAgent.remoteHost ?? null },
       );
     }
 
@@ -253,6 +255,7 @@ export class AgentMessageRouter {
         ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
       },
       participant.ownerIdentityId,
+      { routedRemoteHost: participant.remoteHost ?? null },
     );
   }
 

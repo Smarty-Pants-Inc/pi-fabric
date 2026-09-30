@@ -205,7 +205,7 @@ export class DashboardDetailRenderer {
     const lines = [this.topBorder(width, `${kindLabel} · ${entity.label}${viewLabel}`)];
     const content = transcriptView
       ? this.transcriptLines(entity, innerWidth)
-      : this.detailLines(entity, innerWidth, snapshot.now, snapshot.main.cwd ?? process.cwd());
+      : this.detailLines(entity, innerWidth, snapshot.now, snapshot.main.cwd ?? process.cwd(), snapshot);
     const terminalRows = this.tui.terminal?.rows ?? process.stdout.rows ?? 28;
     const maxBody = Math.max(1, Math.min(24, terminalRows - 8 - actionLines.length));
     const maxScroll = Math.max(0, content.length - maxBody);
@@ -492,7 +492,7 @@ export class DashboardDetailRenderer {
       .map((line) => truncateToWidth(`${padding}${line}`, width, ""));
   }
 
-  private detailLines(entity: Entity, width: number, now: number, cwd: string): string[] {
+  private detailLines(entity: Entity, width: number, now: number, cwd: string, snapshot: FabricDashboardSnapshot): string[] {
     const lines: string[] = [];
     const field = (label: string, value: unknown): void => {
       const text = safeText(value);
@@ -670,7 +670,12 @@ export class DashboardDetailRenderer {
       field("Elapsed", formatDuration(Math.max(0, now - peer.startedAt)));
     } else if (entity.kind === "agent") {
       const agent = entity.value;
+      const root = snapshot.main.id === agent.rootId
+        ? snapshot.main
+        : snapshot.peers.find((peer) => peer.id === agent.rootId)
+          ?? snapshot.participants?.find((participant) => participant.kind === "root" && participant.id === agent.rootId);
       field("ID", agent.id);
+      field("Root", agent.rootId ? `${agent.rootId}${root?.name ? ` (${root.name})` : ""}` : "unknown");
       field("Runner", agent.runner);
       field("Residency", agent.residency ?? "session");
       field("Model", agent.model);
@@ -870,7 +875,7 @@ export class DashboardDetailRenderer {
       (entity.kind === "agent" || entity.kind === "actor") && this.detailView === "transcript";
     const content = transcriptView
       ? this.transcriptLines(entity, width)
-      : this.detailLines(entity, width, snapshot.now, snapshot.main.cwd ?? process.cwd());
+      : this.detailLines(entity, width, snapshot.now, snapshot.main.cwd ?? process.cwd(), snapshot);
     const terminalRows = this.tui.terminal?.rows ?? process.stdout.rows ?? 28;
     const maxBody = Math.max(1, terminalRows - 2);
     this.detailMaxScroll = Math.max(0, content.length - maxBody);

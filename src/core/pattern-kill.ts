@@ -1374,19 +1374,25 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           // Live option/name selection is unproved too; do not resolve an option
           // interpreter and then forget the attributes on subsequent assignments.
           if ([...arg.pattern.matchAll(REFERENCE)].length) { unsupported = true; break; }
-          if (arg.text === "--" || !/^[-+][a-zA-Z]+$/.test(arg.text)) break;
-          if (arg.text.startsWith("-") && /[pfF]/.test(arg.text)) diagnostic = true;
+          if (arg.text === "--") break;
+          // Validate every option-looking word, including numeric/long/mixed forms
+          // and options following operands, without interpreting unknown flags.
+          if (!/^[-+]/.test(arg.text)) continue;
+          if (/^-[pfF]+$/.test(arg.text)) diagnostic = true;
           // Attribute flags are not universal builtin options. Only declare/typeset
           // have proved literal -r/-x scalar forms; local's function context is unknown.
           if (!(["declare", "typeset"].includes(name) && /^-[rx]+$/.test(arg.text)) && !/^-[pfF]+$/.test(arg.text)) unsupported = true;
         }
-        if (unsupported) declarationProved = false;
-        if (unsupported && !diagnostic) { opaqueAttributes = true; markBindingsUnknown(true); }
+        if (unsupported) {
+          declarationProved = false;
+          diagnostic = false; // Unsupported/mixed flags cannot prove a quiet metadata form.
+          opaqueAttributes = true; markBindingsUnknown(true);
+        }
         for (const arg of args) {
           if (options && arg.text === "--") { options = false; continue; }
-          if (options && /^[-+][a-zA-Z]+$/.test(arg.text)) {
-            if (arg.text.startsWith("-") && arg.text.includes("r") && name !== "export") attribute = true;
-            if (arg.text.startsWith("-") && /[pfF]/.test(arg.text)) diagnostic = true;
+          if (options && /^[-+]/.test(arg.text)) {
+            if (!unsupported && arg.text.startsWith("-") && arg.text.includes("r") && name !== "export") attribute = true;
+            if (!unsupported && /^-[pfF]+$/.test(arg.text)) diagnostic = true;
             continue;
           }
           options = false;

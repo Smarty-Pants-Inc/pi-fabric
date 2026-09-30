@@ -126,6 +126,9 @@ export class ResidencyClient {
   readonly #deliveryPrefix: string;
   readonly #hostPath: string;
   #deliveryTimer: NodeJS.Timeout | undefined;
+  #deliveryWatcher: fs.FSWatcher | undefined;
+  #deliveryStarted = false;
+  #deliveryWakePending = false;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
   #closed = false;
@@ -143,20 +146,21 @@ export class ResidencyClient {
   }
 
   start(): void {
-    if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
+    if (this.#deliveryStarted || this.#closed || !this.options.mainAgent.local) return;
     this.syncPiModels();
-    this.#deliveryTimer = setInterval(
-      () => void this.#drainDeliveries().catch(() => undefined),
-      Math.max(20, this.options.config.mesh.actorPollMs),
-    );
-    this.#deliveryTimer.unref();
-    void this.#drainDeliveries().catch(() => undefined);
+    this.#deliveryStarted = true;
+    // Subscribe before the first snapshot, closing the startup read/watch gap.
+    this.#watchDeliveries();
+    void this.#drainDeliveries();
   }
 
   async close(): Promise<void> {
     this.#closed = true;
-    if (this.#deliveryTimer) clearInterval(this.#deliveryTimer);
+    if (this.#deliveryTimer) clearTimeout(this.#deliveryTimer);
     this.#deliveryTimer = undefined;
+    this.#deliveryWatcher?.close();
+    this.#deliveryWatcher = undefined;
+    this.#deliveryWakePending = false;
     while (this.#drainingDeliveries) await delay(10);
   }
 
@@ -590,14 +594,96 @@ export class ResidencyClient {
     return owner;
   }
 
-  async #drainDeliveries(): Promise<void> {
-    if (this.#drainingDeliveries || this.#closed || !this.options.mainAgent.local) return;
-    this.#drainingDeliveries = true;
+  #watchDeliveries(): void {
+    if (this.#deliveryWatcher || this.#closed || !this.#deliveryStarted) return;
     try {
-      const entries = this.options.mesh.listAll(this.#deliveryPrefix);
-      for (const entry of entries) await this.#deliver(entry);
+      // Watch the directory, not the inode: creation, compaction and atomic
+      // replacement must not detach us from events.jsonl. mesh.put writes
+      // state.json BEFORE any separately published event (and need not publish
+      // one at all), so state replacement is also an authoritative wake hint.
+      const watcher = fs.watch(this.options.mesh.root, (_event, filename) => {
+        if (this.#closed) return;
+        const name = filename?.toString();
+        if (name !== undefined && name !== "events.jsonl" && name !== "state.json") return;
+        if (this.#drainingDeliveries) {
+          this.#deliveryWakePending = true;
+          return;
+        }
+        // Coalesce bursts, but never let notifications defeat failure backoff.
+        if (this.#deliveryWakePending) return;
+        this.#scheduleDeliveryDrain(0);
+      });
+      this.#deliveryWatcher = watcher;
+      watcher.on("error", () => {
+        watcher.close();
+        if (this.#deliveryWatcher === watcher) this.#deliveryWatcher = undefined;
+        // The existing reconciliation/retry timer reopens the watch. Do not
+        // recursively retry a failed watch or shorten receiver backpressure.
+      });
+      watcher.on("close", () => {
+        if (this.#deliveryWatcher === watcher) this.#deliveryWatcher = undefined;
+      });
+      watcher.unref();
+    } catch {
+      // Missing directory, descriptor exhaustion, etc.: bounded reconciliation
+      // remains active and retries watch installation in the next drain.
+    }
+  }
+
+  #scheduleDeliveryDrain(ms: number): void {
+    if (this.#closed || !this.#deliveryStarted) return;
+    if (this.#deliveryTimer) clearTimeout(this.#deliveryTimer);
+    this.#deliveryTimer = setTimeout(() => {
+      this.#deliveryTimer = undefined;
+      void this.#drainDeliveries();
+    }, ms);
+    this.#deliveryTimer.unref();
+  }
+
+  async #drainDeliveries(): Promise<void> {
+    if (this.#closed || !this.options.mainAgent.local) return;
+    if (this.#drainingDeliveries) {
+      this.#deliveryWakePending = true;
+      return;
+    }
+    if (this.#deliveryTimer) clearTimeout(this.#deliveryTimer);
+    this.#deliveryTimer = undefined;
+    this.#deliveryWakePending = false;
+    this.#drainingDeliveries = true;
+    let retry = false;
+    try {
+      this.#watchDeliveries();
+      const entries = this.options.mesh.listAll(this.#deliveryPrefix, { fresh: true });
+      for (const entry of entries) {
+        if (this.#closed) break;
+        try {
+          await this.#deliver(entry);
+        } catch {
+          // Keep failed deliveries durable; one receiver failure must not
+          // starve the other records in this snapshot.
+          retry = true;
+        }
+      }
+      // Completion inboxes and full receivers may retain their envelopes even
+      // without throwing. Retry only while work remains, not on an idle mesh.
+      if (!this.#closed && entries.length > 0 && !retry) {
+        const remaining = this.options.mesh.listAll(this.#deliveryPrefix, { fresh: true });
+        const attempted = new Set(entries.map((entry) => entry.key));
+        // Newly published work is not receiver backpressure: drain it promptly.
+        // Only envelopes retained from this attempt get the bounded retry floor.
+        retry = remaining.some((entry) => attempted.has(entry.key));
+        if (remaining.length > 0) this.#deliveryWakePending = true;
+      }
+    } catch {
+      retry = true;
     } finally {
       this.#drainingDeliveries = false;
+      if (!this.#closed) {
+        const wake = this.#deliveryWakePending;
+        // This flag also fences notification bursts during receiver backoff.
+        this.#deliveryWakePending = retry;
+        this.#scheduleDeliveryDrain(retry ? 1_000 : wake ? 0 : 30_000);
+      }
     }
   }
 

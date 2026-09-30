@@ -131,6 +131,8 @@ function expandHeredoc(body: string, budget: GuardBudget): Expansion & { text: s
     let end = index + 1;
     while (end < body.length && !/[\\`]/.test(body[end]!) && !(body[end] === "$" && body[end + 1] === "(")) end += 1;
     budget.spend(end - index + 1);
+    // These are live heredoc expansion bytes; escaped dollars were consumed above.
+    checkParameterSyntax(body.slice(index, end), budget);
     expansion.text += body.slice(index, end);
     index = end;
   }
@@ -229,7 +231,7 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
     const operator = !word || c === ";" || c === "|" || c === "&" || c === ")" || c === "("
       ? OPERATORS.find((op) => text.startsWith(op, index))
       : undefined;
-    if (operator && !(operator === "(" && word)) {
+    if (operator && !(operator === "(" && word && /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(word.text))) {
       endWord();
       const arrayClose = operator === ")" && arrayDepth > 0;
       if (arrayClose) arrayDepth -= 1;
@@ -249,9 +251,9 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       w.text += text.slice(index + 1, end < 0 ? text.length : end);
       index = end < 0 ? text.length : end + 1;
     } else if (c === "$" && text[index + 1] === "'") {
-      const end = text.indexOf("'", index + 2);
-      w.text += text.slice(index + 2, end < 0 ? text.length : end);
-      index = end < 0 ? text.length : end + 1;
+      // Lexer membership, not a search through quoted DATA. No ANSI-C decoder or
+      // raw escape bytes may attest a value, executable name or option boundary.
+      throw new ShellStateRefused();
     } else if (c === "\"") {
       index = readDouble(text, index + 1, w, budget);
     } else if ((c === "$" && text[index + 1] === "(") || c === "`") {
@@ -316,7 +318,7 @@ const unmask = (text: string): string => text.replace(/[\uE000-\uE003]/g, (c) =>
 const QUOTED = "\u0002";
 const LITERAL = "\u0003";
 // A `$NAME` (live) or quoted `"$NAME"` reference in a pattern.
-const REFERENCE = /([$\u0002])\{?([A-Za-z_][A-Za-z0-9_]*|(?<=\{)[0-9]+|[0-9@*])(?:\[[@*]\])?\}?/g;
+const REFERENCE = /([$\u0002])(?=\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*])(?:\[[@*]\])?\}|[A-Za-z_0-9@*])\{?([A-Za-z_][A-Za-z0-9_]*|(?<=\{)[0-9]+|[0-9@*])(?:\[[@*]\])?\}?/g;
 const MENTIONS_TMP = /(^|[^\w.-])\/(private\/)?(var\/)?tmp(\/|\b)/;
 // Security S3 on PR #148: a longer assignment value is unknown, so a doubling chain stays linear.
 const MAX_VALUE = 4096;
@@ -596,6 +598,12 @@ function readDestinations(name: string, args: Word[], budget: GuardBudget): stri
 // Owner scope cut: unsupported shell state refuses the WHOLE tool command. This
 // sentinel propagates out of receivers/captures, rather than becoming a safe feed.
 class ShellStateRefused extends Error {}
+/** Only complete supported braced references can cross syntax admission. The
+ * caller supplies lexer-live bytes, never raw single-quoted/escaped dollar DATA. */
+function checkParameterSyntax(pattern: string, budget: GuardBudget): void {
+  budget.spend(4 * pattern.length + 1);
+  if (/[$\u0002]\{/.test(pattern.replace(REFERENCE, ""))) throw new ShellStateRefused();
+}
 const SHELL_STATE_BUILTINS = new Set(["declare", "typeset", "export", "read", "mapfile", "readarray", "eval", "source", ".", "local", "let", "getopts", "trap", "enable", "alias", "unalias", "shopt", "function", "unset", "shift", "hash", "bind"]);
 
 /** Admit syntax, never a remembered whole-command fixture or inferred execution. */
@@ -616,8 +624,14 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
     // Refuse these explicit state assignments without interpreting bootstrap files.
     return !!match && !["IFS", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"].includes(match[1]!) && simpleWord(word);
   };
+    for (const word of stage.words) checkParameterSyntax(word.pattern, budget);
+    for (const redirect of stage.redirects) checkParameterSyntax(redirect.redirect.pattern, budget);
     if (!stage.words.length) return;
     const { words, assignments } = receiver ?? unwrap(stage.words, [], budget, (words) => words);
+    if (receiver) {
+      for (const word of words) checkParameterSyntax(word.pattern, budget);
+      for (const word of assignments) checkParameterSyntax(word.pattern, budget);
+    }
     for (const assignment of assignments) if (!scalar(assignment)) throw new ShellStateRefused();
     // A live executable/option boundary cannot be treated as an unrelated literal
     // command. No command-name interpreter: decline its entire command instead.
@@ -660,11 +674,37 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
 function checkShellState(tokens: Token[], scopes: SourceScopes, context: Context, budget: GuardBudget): void {
   let stage: Command = { words: [], redirects: [], heredocs: [] };
   let piped = false;
-  for (const token of tokens) {
+  for (let index = 0; index < tokens.length; index += 1) {
     budget.spend();
-    if ("word" in token) stage.words.push(token.word);
+    const token = tokens[index]!;
+    if ("word" in token) {
+      // NAME() is definition syntax, not an empty group followed by an executed
+      // body. Inspect lexer operators only; quoted parentheses remain word DATA.
+      let next = index + 1;
+      const skipNewlines = (): void => {
+        for (;;) {
+          budget.spend();
+          const candidate = tokens[next];
+          if (!candidate || !("op" in candidate) || candidate.op !== "\n") return;
+          next += 1;
+        }
+      };
+      skipNewlines();
+      const open = tokens[next];
+      if (open && "op" in open && open.op === "(") {
+        next += 1;
+        skipNewlines();
+        const close = tokens[next];
+        if (close && "op" in close && close.op === ")") throw new ShellStateRefused();
+      }
+      stage.words.push(token.word);
+    }
     else if ("redirect" in token) stage.redirects.push(token);
-    else if ("heredoc" in token) stage.heredocs.push(token.heredoc);
+    else if ("heredoc" in token) {
+      // An unquoted delimiter executes expansions even for a non-shell reader.
+      if (!token.heredoc.quoted) expandHeredoc(token.heredoc.body, budget);
+      stage.heredocs.push(token.heredoc);
+    }
     else if (!token.arrayClose) {
       checkShellReceiver(stage, scopes, context, budget, piped, token.op);
       stage = { words: [], redirects: [], heredocs: [] };

@@ -1,10 +1,14 @@
 # `records-paul-steps.sh` dry run
 
-Generated on Dev1 (no PostgreSQL installed yet), from a copy of the script at `/run/user/1000/smarty-step.sh` (the root step runs it as `/run/smarty-step.sh`), with the digests of a clean `bun run build`:
+Captured on Dev1 (no PostgreSQL installed yet), from a copy of the script at `/run/user/1000/smarty-step.sh` (the root step runs it as `/run/smarty-step.sh`), with the digests of a clean `bun run build`:
 
 ```
 smarty-step.sh --org smarty-pants --org-user paul --operator relay:relay:fabric --package-root <package> --node <node> --bundle-sha256 c567433b7473017ef20bf3a7cdfe48d3e3a06791fc058f24b76f7ce40df02123 --node-sha256 41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c --dry-run
 ```
+
+The service-unit and verification excerpts below are updated to match the socket-directory fix
+(smarty-dev#1546); the historical build digests and other host-specific output are retained.
+There is no separate generator: this is the script's `--dry-run` output.
 
 ```
 # DRY RUN: nothing below is executed or written.
@@ -131,13 +135,13 @@ digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
     | Type=simple
     | User=smarty-pants-records
     | Group=smarty-pants-records
-    | RuntimeDirectory=smarty-pants-records
-    | RuntimeDirectoryMode=0750
     | UMask=0007
     | # The socket directory belongs to the org's agents' group, setgid, so the socket the service
     | # creates in it is theirs to connect to; the service itself joins no group of theirs.
-    | ExecStartPre=+/bin/chgrp paul /run/smarty-pants-records
-    | ExecStartPre=+/bin/chmod 2750 /run/smarty-pants-records
+    | # ponytail: RuntimeDirectory would reset mode/group before each command (systemd.exec).
+    | # install -d fixes existing directories and recreates /run after reboot; no tmpfiles entry
+    | # to order or roll back. RecordsServer.listen removes stale sockets and refuses live ones.
+    | ExecStartPre=+/usr/bin/install -d -m 2750 -o smarty-pants-records -g paul /run/smarty-pants-records
     | ExecStart=/opt/smarty-pants-records/node /opt/smarty-pants-records/service-main.mjs serve --config /etc/smarty-pants-records/service.json
     | # The service re-reads roles from /etc/smarty-pants-records/service.json on SIGHUP (after an --operator grant).
     | ExecReload=/bin/kill -HUP $MAINPID
@@ -178,6 +182,7 @@ digest check: bundle ok, node ok  (a real run refuses a MISMATCH)
 ? runuser -u smarty-pants-records -- '/usr/lib/postgresql/<N>/bin/pg_isready' -h /run/smarty-pants-records-pg -p 5433  (PostgreSQL ready)
 ? runuser -u smarty-pants-records -- python3 -c 'import ctypes; ctypes.CDLL(None).getsockopt'  (peer audit (python3 ctypes))
 ? test -S /run/smarty-pants-records/records.sock  (service socket)
+? runuser -u paul -- python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5); s.connect(sys.argv[1]); s.close()' /run/smarty-pants-records/records.sock  (service socket connect as paul)
 ? ss -Hltnp  (no PostgreSQL TCP listener: none on :5432 or :5433, no postgres process on any port; else fail)
 ? du -sh /var/lib/smarty-pants-records/pg/pg_wal  (info only: WAL size; max_wal_size = 1GB is a soft target, not a quota)
 

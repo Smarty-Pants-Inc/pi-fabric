@@ -131,11 +131,11 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(svc).toContain("User=test-org-records\n");
 		expect(svc).toContain("Group=test-org-records\n");
 		expect(svc).not.toContain("SupplementaryGroups");
-		expect(svc).toContain("ExecStartPre=+/bin/chmod 2750 /run/test-org-records\n");
+		expect(svc).toContain("ExecStartPre=+/usr/bin/install -d -m 2750 -o test-org-records -g nobodyuser /run/test-org-records\n");
 		expect(svc).toContain("Requires=test-org-records-pg.service\n");
-		expect(svc).toContain("RuntimeDirectoryMode=0750\n");
+		expect(svc).not.toMatch(/^RuntimeDirectory(?:Mode|Preserve)?=/m);
+		expect(svc).not.toMatch(/^ExecStartPre=.*\/(?:chgrp|chmod) /m);
 		expect(svc).toContain("UMask=0007\n");
-		expect(svc).toContain("ExecStartPre=+/bin/chgrp nobodyuser /run/test-org-records\n");
 		expect(svc).toContain(
 			"ExecStart=/opt/test-org-records/node /opt/test-org-records/service-main.mjs serve --config /etc/test-org-records/service.json\n",
 		);
@@ -200,6 +200,9 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 		expect(r.out).toContain("? via a temp file in /var/lib/test-org-records-installer (root-only), then + install -m 0644 -o root -g root /var/lib/test-org-records-installer/write.XXXXXX /etc/systemd/system/test-org-records.service\n");
 		expect(r.out).toContain("+ install -d -m 0700 -o test-org-records -g test-org-records /run/test-org-records-pg\n");
 		expect(r.out).toContain("+ install -d -m 2750 -o test-org-records -g nobodyuser /run/test-org-records\n");
+		const svc = r.out.split("+ write /etc/systemd/system/test-org-records.service")[1]!.split("+ systemctl daemon-reload")[0];
+		expect(svc).not.toMatch(/\| RuntimeDirectory(?:Mode|Preserve)?=/);
+		expect(svc).toContain("    | ExecStartPre=+/usr/bin/install -d -m 2750 -o test-org-records -g nobodyuser /run/test-org-records\n");
 		expect(r.out).not.toContain("/etc/test-org-records/credentials");
 		for (const [path, mode] of [
 			["/var/lib/test-org-records/pg/pg_hba.conf", "0600"],
@@ -685,7 +688,8 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 	// Root-side install/chown/chmod log their args; install really runs only inside the temp system root.
 	// runuser drops "-u USER --" and runs the rest (the real binaries) as this user.
 	const relayRun = (layout: "plain" | "dest-link" | "config-link", pgFrom: "tree17" | "tree16" = "tree17", prep?: (root: string, t: string) => void, real?: { bundle: string; port: number }) => {
-		const t = mkdtempSync(join(tmpdir(), "records-paul-steps-relay-"));
+		// This root also holds Unix sockets: keep the prefix short for deep checkout-local TMPDIRs.
+		const t = mkdtempSync(join(tmpdir(), "relay-"));
 		const L = join(t, "calls.log");
 		const bin = join(t, "bin");
 		// A detected /usr/lib/postgresql/17 or 16 under the test root.
@@ -1454,6 +1458,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			`? runuser -u test-org-records -- ${q(`${hostPgBin}/pg_isready`)} -h /run/test-org-records-pg -p 5433`,
 			"? runuser -u test-org-records -- python3 -c 'import ctypes; ctypes.CDLL(None).getsockopt'",
 			"? test -S /run/test-org-records/records.sock",
+			"? runuser -u nobodyuser -- python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5); s.connect(sys.argv[1]); s.close()' /run/test-org-records/records.sock  (service socket connect as nobodyuser)",
 		])
 			expect(r.out).toContain(check);
 		const out = r.out.trimEnd().split("\n");
@@ -1482,6 +1487,50 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			expect(down.out).not.toContain("## ROLLBACK");
 		} finally {
 			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("an EACCES connecting as the org user fails step 9 and never prints success", () => {
+		const { t, r, again, bin, L } = relayRun("plain");
+		try {
+			expect(r.code, r.err + r.out).toBe(0);
+			expect(r.out).toContain(`OK: service socket connect as ${me}`);
+			writeFileSync(join(bin, "python3"), `#!/bin/bash\necho "python3 $*" >> "${L}"\ncase $2 in *s.connect*) echo 'PermissionError: [Errno 13] Permission denied (EACCES)' >&2; exit 1 ;; esac\n`);
+			writeFileSync(L, "");
+			const denied = again([]);
+			expect(denied.code).toBe(1);
+			expect(denied.err).toContain("Permission denied (EACCES)");
+			expect(denied.err).toContain(`FAILED at step 9 (Verification)`);
+			expect(denied.err).toContain(`check failed (service socket connect as ${me}): runuser -u ${me} -- python3 -c`);
+			expect(denied.out).not.toContain("C10_RECORDS_INSTALLED org=");
+			expect(denied.out).not.toContain("## ROLLBACK");
+			expect(readFileSync(L, "utf8")).toContain("runuser python3 -c import socket, sys;");
+		} finally {
+			rmSync(t, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.getuid?.() === 0)("the printed connect probe really connects and reports directory EACCES", async () => {
+		const preview = run([...dryBase, "--dry-run"], fakeEnv);
+		const code = preview.out.match(/\? runuser -u nobodyuser -- python3 -c '([^']*s\.connect[^']*)'/)?.[1];
+		expect(code).toBeDefined();
+		const { createServer } = await import("node:net");
+		const dir = mkdtempSync(join(tmpdir(), "connect-"));
+		const socket = join(dir, "records.sock");
+		const server = createServer((client) => client.destroy());
+		try {
+			await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
+			const probe = () => spawnSync("python3", ["-c", code!, socket], { encoding: "utf8", timeout: 10_000 });
+			const ok = probe();
+			expect(ok.status, ok.stderr).toBe(0);
+			chmodSync(dir, 0o000);
+			const denied = probe();
+			expect(denied.status).toBe(1);
+			expect(denied.stderr).toContain("PermissionError: [Errno 13] Permission denied");
+		} finally {
+			chmodSync(dir, 0o700);
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 

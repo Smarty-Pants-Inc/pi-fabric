@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { readFileRetrying, writeFileAtomic } from "./core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
+import { takeCompactionDecline } from "./compaction/cancellation.js";
 
 const MAIN_AGENT_ALIAS = "main";
 export type FabricAgentMessageDelivery = "steer" | "followUp";
@@ -253,7 +254,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #suspended = false;
   // Owner stop, unlike a run's signal: survives reload and lifts only on user input.
   #halted = false;
-  // Provider failures suppress wakes, but are not owner stops: native recovery lifts this gate.
+  // Provider/compaction failures suppress wakes, but are not owner stops: recovery lifts this gate.
   #providerFailed = false;
   // Preserve an unreadable owner index until explicit user input authorizes replacing it.
   #haltIndexUnknown = false;
@@ -261,6 +262,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   #reloading = false;
   #wake: ReturnType<typeof setInterval> | undefined;
   #operation: AbortSignal | undefined;
+  // Keep the veto signal through both settlement notifications, including late owner aborts.
+  #compactionDecline: AbortSignal | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -784,12 +787,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     // precedes Pi's retry/overflow recovery decision, so never persist it as an owner stop.
     on("turn_end", (event: { message?: { stopReason?: string } }, ctx) => {
       const reason = event.message?.stopReason;
+      this.#compactionDecline = undefined;
       if (ctx.signal?.aborted || reason === "aborted") this.halt();
       else if (reason === "error") { this.#providerFailed = true; this.#stopWake(); }
       else if (reason !== undefined) this.#providerFailed = false;
     });
     const settleGate = (event: { outcome?: string }, ctx: ExtensionContext): void => {
-      if (ctx.signal?.aborted || event.outcome === "aborted") this.halt();
+      if (ctx.signal?.aborted || this.#compactionDecline?.aborted ||
+        (event.outcome === "aborted" && !this.#compactionDecline)) this.halt();
       else if (event.outcome === "error") { this.#providerFailed = true; this.#stopWake(); }
       else if (event.outcome === "completed") this.#providerFailed = false;
       // Older hosts omit outcome: neither grant recovery nor invent an owner stop.
@@ -799,25 +804,45 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Observe the operation in BOTH drain modes. Pi also reports an extension's benign
     // decline as aborted, but only the operation signal proves an owner cancellation.
     on("session_before_compact", (event: { reason?: string; signal?: AbortSignal }) => {
-      this.#operation = event.reason === "manual" ? event.signal : undefined;
+      this.#operation = event.signal;
+      this.#compactionDecline = undefined;
     });
     on("session_compact_failed", (event: { reason?: string; aborted?: boolean; willRetry?: boolean; errorMessage?: string }, ctx) => {
       this.#context = ctx;
       // The aborted bit alone is ambiguous: an earlier handler may decline and stop
       // dispatch before we see the signal. Escape/halt is explicit; a seen signal
       // proves cancellation. Never manufacture durable owner intent from a decline.
-      const ownerCancelled = ctx.signal?.aborted || this.#operation?.aborted;
+      const decline = takeCompactionDecline(this.pi);
+      const operation = decline && decline.reason === event.reason ? decline.signal : this.#operation;
+      const ownerCancelled = ctx.signal?.aborted || (event.aborted && operation?.aborted);
       // Exact Pi no-op outcomes, with or without the host's error envelope. A provider
-      // error merely quoting these phrases is still a terminal failure, not a no-op.
+      // error merely quoting these phrases is still a recoverable failure, not a no-op.
       const message = event.errorMessage?.replace(/^Compaction failed: /, "");
       const benign = message === "Already compacted" || message === "Nothing to compact (session too small)" ||
         message === "Compaction cancelled";
-      if (ownerCancelled || (!event.aborted && !event.willRetry && !benign)) this.halt();
+      if (ownerCancelled) this.halt();
+      else if (event.aborted && event.reason !== "manual" && operation && !operation.aborted) {
+        // Pi settles an automatic extension veto as aborted. Retain its provenance
+        // rather than converting the outcome into a durable owner stop.
+        this.#compactionDecline = operation;
+      } else if (!event.aborted && !event.willRetry && !benign) {
+        this.#providerFailed = true;
+        this.#stopWake();
+      }
       // Unsuccessful boundaries never wake their queued replay, even for a benign rejection.
-      // Later peer deliveries retain their own permission unless the owner really stopped.
+      // Later peer deliveries retain permission after a veto; errors await recovery,
+      // but only a real owner stop survives reload.
       if (event.reason === "manual" && ctx.isIdle()) this.#release(false);
       this.#operation = undefined;
     });
+    on("session_compact", (event: { reason?: string }, ctx) => {
+      this.#context = ctx;
+      this.#providerFailed = false; // Operation recovery never clears a genuine owner halt.
+      this.#compactionDecline = undefined;
+      if (event.reason === "manual" && flushMs > 0) this.#wakeWhenIdle();
+      else this.#operation = undefined;
+    });
+    on("agent_start", () => { this.#compactionDecline = undefined; });
     if (!(flushMs > 0) || typeof this.pi.on !== "function") {
       // Drain off: what an earlier drain journalled goes to Pi's own queue, under the same rule.
       // Each stays in the journal until the session holds it (review/astra F4 on pi-fabric#102).
@@ -873,10 +898,6 @@ export class MainAgentController implements FabricMainAgentTarget {
     // The operation's own abort signal says whether the user cancelled it: Pi can report that
     // cancel after Main is idle again, or not at all (review/astra on pi-fabric#102).
     on("session_before_tree", (event: { signal?: AbortSignal }) => { this.#operation = event.signal; });
-    on("session_compact", (event: { reason?: string }, ctx) => {
-      this.#context = ctx;
-      if (event.reason === "manual") this.#wakeWhenIdle();
-    });
     // A branch summary on /tree navigation is the same: busy without a run. A cancelled one
     // emits nothing, so its followUps wait for the next run.
     on("session_tree", (_event, ctx) => {
@@ -908,6 +929,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#journal = undefined;
     this.#context = undefined;
     this.#operation = undefined;
+    this.#compactionDecline = undefined;
+    takeCompactionDecline(this.pi);
   }
 
   #drainActive(): boolean {

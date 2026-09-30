@@ -11,6 +11,7 @@ import { calculateContextTokens, DEFAULT_COMPACTION_SETTINGS, estimateTokens } f
 import { buildSessionContext, sessionEntryToContextMessages } from "../core/session-context.js";
 import { clipUtf8, MAX_SUMMARY_BYTES, utf8Bytes } from "./bounds.js";
 import { modelCompactionKey } from "./threshold.js";
+import { recordCompactionDecline } from "./cancellation.js";
 import { NO_BUILTIN_ENRICHERS, runEnrichers, type CompactionEnricher } from "./enrichers.js";
 import { compileFabricBranchSummary } from "./branch-summary.js";
 import {
@@ -867,6 +868,10 @@ const notifyInstructionError = (
 };
 
 export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHookOptions): void => {
+  const decline = (event: SessionBeforeCompactEvent): { cancel: true } => {
+    recordCompactionDecline(pi, event);
+    return { cancel: true };
+  };
   pi.on("session_before_compact", (event: SessionBeforeCompactEvent, context: ExtensionContext) => {
     if (event.customInstructions === "__pi_vcc__") return;
     const { preparation, branchEntries } = event;
@@ -880,7 +885,7 @@ export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHook
       && typeof thresholdTokens === "number"
       && preparation.tokensBefore < thresholdTokens
     ) {
-      return { cancel: true };
+      return decline(event);
     }
     const threshold = modelKey === undefined || typeof thresholdTokens === "number"
       ? undefined
@@ -891,7 +896,7 @@ export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHook
       && typeof contextWindow === "number"
       && preparation.tokensBefore / contextWindow < threshold
     ) {
-      return { cancel: true };
+      return decline(event);
     }
     if (options.getEngine() !== "fabric") return;
     const targetContextRatio = options.getTargetContextRatio?.();
@@ -929,12 +934,12 @@ export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHook
     if ("cancel" in result) {
       if (result.instructionError) {
         notifyInstructionError(context, result.instructionError);
-        return { cancel: true };
+        return decline(event);
       }
       if ((event as SessionBeforeCompactEvent & { _piVccOverriding?: unknown })._piVccOverriding) {
         return;
       }
-      return { cancel: true };
+      return decline(event);
     }
     (event as SessionBeforeCompactEvent & { _fabricCompaction?: boolean })._fabricCompaction = true;
     return { compaction: result.compaction };

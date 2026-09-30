@@ -320,17 +320,17 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
   });
 
   it.each([0, 60_000].flatMap(flushMs => [
-    { errorMessage: "Already compacted", willRetry: false, stopped: false },
-    { errorMessage: "Compaction failed: Already compacted", willRetry: false, stopped: false },
-    { errorMessage: "Nothing to compact (session too small)", willRetry: false, stopped: false },
-    { errorMessage: "Compaction failed: Nothing to compact (session too small)", willRetry: false, stopped: false },
-    { errorMessage: "Compaction cancelled", willRetry: false, stopped: false },
-    { errorMessage: "Compaction failed: provider quoted Already compacted", willRetry: false, stopped: true },
-    { errorMessage: "Compaction failed: unavailable", willRetry: false, stopped: true },
-    { errorMessage: "Compaction failed: unavailable", willRetry: true, stopped: false },
+    { errorMessage: "Already compacted", willRetry: false, failed: false },
+    { errorMessage: "Compaction failed: Already compacted", willRetry: false, failed: false },
+    { errorMessage: "Nothing to compact (session too small)", willRetry: false, failed: false },
+    { errorMessage: "Compaction failed: Nothing to compact (session too small)", willRetry: false, failed: false },
+    { errorMessage: "Compaction cancelled", willRetry: false, failed: false },
+    { errorMessage: "Compaction failed: provider quoted Already compacted", willRetry: false, failed: true },
+    { errorMessage: "Compaction failed: unavailable", willRetry: false, failed: true },
+    { errorMessage: "Compaction failed: unavailable", willRetry: true, failed: false },
   ].map(test => ({ flushMs, ...test }))))(
     "compaction failure keeps boundary replay passive without inventing an owner stop ($errorMessage, retry=$willRetry, flushMs=$flushMs)",
-    async ({ flushMs, errorMessage, willRetry, stopped }) => {
+    async ({ flushMs, errorMessage, willRetry, failed }) => {
       const f = await fixture();
       const old = f.main(true, flushMs);
       old.controller.prepareReload();
@@ -342,11 +342,15 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
       fresh.emit("session_compact_failed", { reason: "manual", aborted: false, errorMessage, willRetry });
       expect(f.sent[0]!.options.triggerTurn).toBe(false);
       fresh.controller.deliverAgent({ from: sender, message: "later peer", delivery: "followUp" });
-      expect(f.sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+      expect(f.sent.at(-1)!.options.triggerTurn).toBe(!failed);
       fresh.controller.closeFollowUpDrain();
       const reloaded = f.main(true, flushMs);
       reloaded.controller.deliverAgent({ from: sender, message: "peer after reload", delivery: "steer" });
-      expect(f.sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+      expect(f.sent.at(-1)!.options.triggerTurn).toBe(true); // Failure is not durable owner intent.
+      reloaded.emit("session_compact_failed", { reason: "manual", aborted: false, errorMessage, willRetry });
+      reloaded.emit("session_compact", { reason: "manual" }); // Recovery, with no user input.
+      reloaded.controller.deliverAgent({ from: sender, message: "peer after recovery", delivery: "steer" });
+      expect(f.sent.at(-1)!.options.triggerTurn).toBe(true);
     },
   );
 

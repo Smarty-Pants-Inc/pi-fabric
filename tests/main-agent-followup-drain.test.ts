@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { followUpDrainSupported } from "../src/host-compatibility.js";
 import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { registerCompactionHook } from "../src/compaction/hook.js";
 import { rootInboxSession } from "../src/topology/root-inbox.js";
 
 // smarty-dev#1495: a followUp to a Main that chains turns arrived about an hour late.
@@ -1092,6 +1093,124 @@ describe("Main benign compaction rejection and owner cancellation in a real Pi s
           const runs = stopped ? 0 : phase === "before" ? 1 : 2;
           expect(starts - initialStarts).toBe(runs);
           expect(faux.state.callCount - initialCalls).toBe(runs);
+        }
+      } finally {
+        await session.abort();
+        await session.waitForIdle();
+        mains.at(-1)?.closeFollowUpDrain();
+      }
+    },
+  );
+});
+
+// pi-fabric#184 Astra R6: operation outcomes are not durable owner intent.
+describe("Main non-owner automatic decline and compaction recovery in a real Pi session", () => {
+  const cases = [0, 60_000].flatMap(flushMs => (["automatic-decline", "failure-recovery"] as const).flatMap(outcome =>
+    (["followUp", "steer"] as const).flatMap(delivery => [false, true].flatMap(ownerHalt =>
+      [false, true].map(reloadFirst => ({ flushMs, outcome, delivery, ownerHalt, reloadFirst }))))));
+  it.each(cases)(
+    "$outcome permits exactly one peer $delivery run before and after reload unless owner halted (flushMs=$flushMs, ownerHalt=$ownerHalt, reloadFirst=$reloadFirst)",
+    async ({ flushMs, outcome, delivery, ownerHalt, reloadFirst }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-compaction-r6-"));
+      roots.push(root);
+      const journal = path.join(root, "journal.json");
+      const faux = fauxProvider();
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+      modelRuntime.registerNativeProvider(faux.provider);
+      const mains: MainAgentController[] = [];
+      const failures: Array<{ reason: string; aborted: boolean; willRetry: boolean }> = [];
+      const settlements: string[] = [];
+      const inputs: string[] = [];
+      const operationSignals: AbortSignal[] = [];
+      let starts = 0;
+      let recovered = 0;
+      let recovering = false;
+      const loader = new DefaultResourceLoader({
+        cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{
+          name: "compaction-r6",
+          factory: (pi: ExtensionAPI) => {
+            pi.on("agent_start", () => { starts++; });
+            pi.on("input", event => { inputs.push(event.source); });
+            pi.on("agent_settled", event => { settlements.push((event as { outcome?: string }).outcome ?? "unknown"); });
+            pi.on("session_compact_failed", event => { failures.push(event); });
+            pi.on("session_compact", () => { recovered++; });
+            pi.on("session_before_compact", event => {
+              operationSignals.push(event.signal);
+              if (ownerHalt) mains.at(-1)!.halt(); // Escape, including while compaction is active.
+              if (recovering) return { compaction: {
+                summary: "recovered summary", firstKeptEntryId: event.preparation.firstKeptEntryId,
+                tokensBefore: event.preparation.tokensBefore,
+              } };
+            });
+            // Register the actual Fabric veto BEFORE Main's handler. Pi short-circuits
+            // cancel dispatch, so the drain cannot rely on seeing session_before_compact.
+            registerCompactionHook(pi, { getEngine: () => "pi", getThresholdTokens: () => outcome === "automatic-decline" ? 100_000 : undefined });
+            pi.on("session_start", (_event, ctx) => {
+              const main = new MainAgentController(pi, "session:root", true, root, "root");
+              main.attachFollowUpDrain(ctx, flushMs, journal);
+              mains.push(main);
+            });
+            pi.on("session_shutdown", () => { mains.at(-1)?.closeFollowUpDrain(); });
+          },
+        }],
+      });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(root), noTools: "all",
+        settingsManager: SettingsManager.inMemory({ retry: { enabled: false }, compaction: {
+          enabled: true, keepRecentTokens: 1,
+          reserveTokens: faux.getModel().contextWindow - 1_000,
+        } }),
+      });
+      sessions.push(session);
+      await session.bindExtensions({ shutdownHandler: () => undefined });
+      try {
+        faux.setResponses([
+          fauxAssistantMessage("first"), fauxAssistantMessage("second"),
+          ...(outcome === "failure-recovery" ? [fauxAssistantMessage("", { stopReason: "error", errorMessage: "summarizer unavailable" })] : []),
+          fauxAssistantMessage("peer before"), fauxAssistantMessage("peer after"),
+        ]);
+        await session.prompt("first question");
+        await session.prompt(`second question ${"x".repeat(8_000)}`);
+        if (outcome === "automatic-decline") {
+          expect(failures).toMatchObject([{ reason: "threshold", aborted: true, willRetry: false }]);
+          // Pi 0.87 omits outcome; installed-host probes must observe the aborted settlement.
+          expect(settlements).toEqual(settlements[0] === "unknown" ? ["unknown", "unknown"] : ["completed", "aborted"]);
+        } else {
+          expect(failures).toMatchObject([{ reason: "threshold", aborted: false, willRetry: false, errorMessage: "Auto-compaction failed: Summarization failed: summarizer unavailable" }]);
+          expect(settlements).toEqual(settlements[0] === "unknown" ? ["unknown", "unknown"] : ["completed", "error"]);
+          recovering = true;
+          await session.compact(); // Successful native operation, without any user input.
+          expect(recovered).toBe(1);
+        }
+        expect(operationSignals.every(signal => !signal.aborted)).toBe(true);
+        expect(inputs).toEqual(["interactive", "interactive"]);
+        expect(starts).toBe(2); // Failure/decline/recovery itself never wakes Main.
+        const initialCalls = faux.state.callCount;
+        if (reloadFirst) {
+          await session.reload(); // Prove a false persisted halt cannot hide behind earlier recovery/delivery.
+          expect(mains).toHaveLength(2);
+        }
+        for (const phase of ["before", "after"] as const) {
+          if (phase === "after") {
+            await session.reload();
+            expect(mains).toHaveLength(reloadFirst ? 3 : 2);
+          }
+          const request = { from: { id: "session:peer", name: "peer", kind: "main" as const },
+            message: `peer ${phase} reload`, delivery, deliveryId: `r6-peer-${phase}` };
+          const result = mains.at(-1)!.deliverAgent(request);
+          expect(mains.at(-1)!.deliverAgent(request)).toMatchObject({ duplicate: true });
+          await session.waitForIdle();
+          const runs = ownerHalt ? 0 : phase === "before" ? 1 : 2;
+          expect(starts - 2).toBe(runs);
+          expect(faux.state.callCount - initialCalls).toBe(runs);
+          const received = session.messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
+          expect(received).toHaveLength(phase === "before" ? 1 : 2);
+          expect(received.at(-1)).toMatchObject({ details: { id: result.messageId, triggerTurn: !ownerHalt } });
+          expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(ownerHalt ? true : undefined);
+          expect(inputs.filter(source => source !== "extension")).toEqual(["interactive", "interactive"]);
         }
       } finally {
         await session.abort();

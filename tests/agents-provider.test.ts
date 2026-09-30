@@ -920,6 +920,30 @@ describe("AgentsProvider runner support", () => {
     ).resolves.toEqual([]);
   });
 
+  // smarty-dev#2184: an actor's activation run (id = run id, name = actor name, no root) listed
+  // as a standalone agent read as "the reviewer is now <run id>, with no root session".
+  it("omits actor activation runs from agents.list; the actor is listed by agents.actors", async () => {
+    const { provider, agents } = setup();
+    const run = await agents.spawn({
+      task: "actor activation",
+      name: "playground-review-astra",
+      actorId: "7a3e1e35-actor",
+      actorName: "playground-review-astra",
+    });
+    const task = await agents.spawn({ task: "plain task", name: "worker" });
+    for (const scope of [undefined, "local", "project", "lineage"]) {
+      const listed = (await provider.invoke("list", scope ? { scope } : {}, context)) as Array<{ id: string }>;
+      expect(listed.map((record) => record.id), String(scope)).not.toContain(run.id);
+    }
+    const local = (await provider.invoke("list", {}, context)) as Array<{ id: string }>;
+    expect(local.map((record) => record.id)).toContain(task.id);
+    // A direct lookup of the run id still answers, and names its actor.
+    await expect(provider.invoke("status", { id: run.id }, context)).resolves.toMatchObject({
+      id: run.id,
+      actorId: "7a3e1e35-actor",
+    });
+  });
+
   // smarty-dev#266: during a mesh write stall, user-facing listings report it instead of [].
   it("reports a mesh write stall from user-facing listings but not from local ones", async () => {
     const stalled = new Error("Fabric mesh is write-stalled: Timed out waiting for the Fabric mesh lock");

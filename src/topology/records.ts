@@ -103,5 +103,15 @@ export const actorParticipantRecord = (
   updatedAt: actor.updatedAt,
   actorQueued: actor.queued,
   actorMessages: actor.messages,
+  ...(actor.inFlightRun ? { actorRun: { id: actor.inFlightRun.id, startedAt: actor.inFlightRun.startedAt } } : {}),
+  ...(actor.removal
+    ? {
+        actorRemoval: {
+          requestedAt: actor.removal.requestedAt,
+          ...(actor.removal.runId ? { runId: actor.removal.runId } : {}),
+          ...(actor.removal.runStartedAt ? { runStartedAt: actor.removal.runStartedAt } : {}),
+        },
+      }
+    : {}),
   controlProtocol: "v1",
 });

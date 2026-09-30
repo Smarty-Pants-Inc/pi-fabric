@@ -160,6 +160,11 @@ export class ShellEventInbox {
     }
   }
 
+  /** Events not yet delivered to the Main, held while suspended (Escape) until the next input. */
+  pendingCount(): number {
+    return this.#closed ? 0 : this.#pending.size;
+  }
+
   close(): void {
     this.#closed = true;
     if (this.#timer) clearTimeout(this.#timer);

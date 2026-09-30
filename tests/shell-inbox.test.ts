@@ -138,6 +138,19 @@ describe("live shell awareness", () => {
 });
 
 describe("shell event delivery", () => {
+  it("counts a completion notice held by an interrupted Main until it is delivered (smarty-dev#2216)", async () => {
+    const h = harness(); h.idle();
+    const build = h.begin();
+    h.emit("turn_end", { message: { stopReason: "aborted" } }); // Escape suspends delivery
+    await build.finish(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.inbox.pendingCount()).toBe(1); // a reload now would drop it: the busy gate counts it
+    h.emit("input");
+    h.emit("before_agent_start");
+    expect(h.inbox.pendingCount()).toBe(0);
+  });
+
   it("delivers one terminal deadline notice without renewing a monitor", async () => {
     const h = harness(); h.idle();
     const job = h.jobs.begin("bash", "watch", { monitor: parseShellMonitor({ delivery: "wake", timeoutMs: 1000 })! }); job.spill();

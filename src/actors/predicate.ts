@@ -7,6 +7,9 @@ import type {
 
 const PREDICATE_VERSION = 1;
 const MAX_PREDICATE_SOURCE_CHARS = 16_000;
+// Loaded runners may spend more than 100ms preparing the sandbox/program.
+// Bound that work separately; untrusted predicate execution still gets 100ms.
+const PREDICATE_SETUP_TIMEOUT_MS = 2_000;
 const PREDICATE_TIMEOUT_MS = 100;
 const PREDICATE_MEMORY_BYTES = 16 * 1024 * 1024;
 
@@ -43,6 +46,7 @@ const execute = async (source: FabricActorValidWhileSource, facts?: FabricActorV
       throw new Error("validWhile cannot call host tools");
     },
     {
+      setupTimeoutMs: PREDICATE_SETUP_TIMEOUT_MS,
       timeoutMs: PREDICATE_TIMEOUT_MS,
       memoryLimitBytes: PREDICATE_MEMORY_BYTES,
       maxLogChars: 0,

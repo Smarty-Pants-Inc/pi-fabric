@@ -573,7 +573,7 @@ export class FabricRuntimeState {
       meshRoot,
       this.#config.mesh.maxEventBytes,
       this.#config.mesh.maxReadEvents,
-      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS },
+      { readCacheMs: RUNTIME_MESH_READ_CACHE_MS, lockProtocol: this.#config.mesh.lockProtocol },
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled

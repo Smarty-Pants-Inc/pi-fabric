@@ -192,6 +192,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "actorRunArchiveMs": 604800000
   },
   "mesh": {
+    "lockProtocol": 1,
     "enabled": true,
     "announce": false,
     "actorScope": "project",
@@ -538,6 +539,21 @@ See the [interface reference](interface.md).
 Mesh data lives at `<project>/.pi/fabric/mesh` by default. Set `mesh.root` to a relative or absolute path to relocate durable topics, shared state, and actor sessions. Add `.pi/fabric/mesh/` to the project's ignore file unless you version the coordination log on purpose. Set `mesh.enabled` to `false` to disable both mesh actions and ambient actor restoration.
 
 Sessions that share one `mesh.root` share one participant directory, so each sees the others through `agents.sessions()` and can `steer` or `followUp` them. A Main normally joins that directory when it first uses Fabric. Set `mesh.announce` to `true` in the project configuration to join at session start instead, so an idle peer is reachable. Announcing loads the Fabric runtime during startup, so avoid it in a global configuration that applies to every project.
+
+`mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
+when each mesh store is constructed; editing configuration does not switch an existing
+store. Protocol 1 uses the B68 canonical-directory mkdir, three-line token/PID/time
+owner and token-prefix recursive canonical release. Protocol 2 uses fully initialized
+private-directory publication and detached release. Both retain immediate dead-holder
+recovery, recovery fences, bounded jitter/backoff and typed lock timeouts. There is no
+environment fallback, runtime marker, transition guard or hot reload for this selector.
+
+Keep `1` for compatibility with B68 writers. Protocol 2 activation is deferred to the
+coordinated rollout in smarty-dev#2570: drain/terminate all old-format-capable writers
+and prevent their restart or rollback on the shared root before selecting `2`. Mixed
+protocol 1/2 operation on one root is not safe. Standalone `mesh-bridge` does not load
+Fabric config: set `--lock-protocol 1|2` separately on each `run` and `agent` startup
+(default `1`); an SSH forced command must pin the remote agent's selection explicitly.
 
 When several projects share a root, project-scoped actors are shared too: any live Main on that root can adopt a project actor whose owner has gone. Set `mesh.actorScope` to `"session"` so new actors default to their root Pi session, which other sessions do not load or adopt. This is only the default for `agents.create`: existing project actors, and actors created with an explicit `scope: "project"`, stay shared. Session actors do not survive `/new`.
 

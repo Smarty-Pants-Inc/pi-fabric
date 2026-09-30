@@ -314,7 +314,7 @@ const MAX_VALUE = 4096;
 
 // Local nested scripts (sh -c, eval, substitutions) inherit the cwd and variables; ssh gets neither.
 // `owned` holds the placeholders of `mktemp` substitutions; `root` is the whole tool-call command.
-type Context = { root: string; owned: Set<string>; cwd?: string | undefined; uncertainCwd?: boolean; sharedCwd?: boolean; alternatives?: ReadonlyMap<string, readonly string[]>; values: ReadonlyMap<string, string>; unknown: ReadonlySet<string>; files?: ReadonlyMap<string, Feed | undefined>; inputs?: ReadonlyMap<number, InputBinding | undefined> | undefined; sinks?: ReadonlyMap<number, OutputSink>; lookupTail?: number | undefined; tmpTail?: number | undefined };
+type Context = { root: string; owned: Set<string>; cwd?: string | undefined; uncertainCwd?: boolean; sharedCwd?: boolean; alternatives?: ReadonlyMap<string, readonly string[]>; values: ReadonlyMap<string, string>; unknown: ReadonlySet<string>; protectedAliases?: ReadonlyMap<string, Feed>; readonlyNames?: ReadonlySet<string> | undefined; uncertainReadonly?: ReadonlySet<string> | undefined; files?: ReadonlyMap<string, Feed | undefined>; inputs?: ReadonlyMap<number, InputBinding | undefined> | undefined; sinks?: ReadonlyMap<number, OutputSink>; lookupTail?: number | undefined; tmpTail?: number | undefined };
 type PositionalTail = { lookup?: number; tmp?: number };
 
 /**
@@ -334,7 +334,7 @@ function tmpGlob(pattern: string, cwd: string | undefined): boolean {
 
 // `blocked`: a kill by pattern. `lookup`: runs a name lookup (LOOKUPS) anywhere.
 // `wipe`: a delete over a /tmp glob (smarty-dev#1998). `tmpList`: a stage or substitution may list other agents' dirs.
-type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean; sourceKnown?: boolean; output?: Feed; files?: ReadonlyMap<string, Feed | undefined> };
+type Verdict = { blocked: boolean; lookup: boolean; wipe: boolean; tmpList: boolean; sourceKnown?: boolean; output?: Feed; files?: ReadonlyMap<string, Feed | undefined>; readonlyNames?: ReadonlySet<string>; uncertainReadonly?: ReadonlySet<string>; readonlyState?: { values: ReadonlyMap<string, string>; alternatives: ReadonlyMap<string, readonly string[]>; unknown: ReadonlySet<string>; lookup: ReadonlySet<string>; tmp: ReadonlySet<string> } };
 type Feed = { lookup: boolean; tmp: boolean; literal?: string };
 type OutputSink = { file: string | undefined; targets?: readonly string[] | undefined } | "stdout" | "other";
 // Opening a regular file fixes its identity, not its bytes. Literal/process feeds are
@@ -613,12 +613,13 @@ function scan(script: string, depth: number, budget: GuardBudget, names: Readonl
     wipe: first.wipe || second.wipe, tmpList: first.tmpList || second.tmpList,
     sourceKnown: first.sourceKnown === true && second.sourceKnown === true,
     output: mergeFeed(first.output ?? EMPTY_FEED, second.output ?? EMPTY_FEED), ...(second.files ? { files: second.files } : {}),
+    ...(second.readonlyNames ? { readonlyNames: second.readonlyNames, uncertainReadonly: second.uncertainReadonly!, readonlyState: second.readonlyState! } : {}),
   };
 }
 
 function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed | undefined>,
   depth: number, budget: GuardBudget, names: ReadonlySet<string>, tmpIn: ReadonlySet<string>, context: Context, fed: Feed, stdin?: Feed): Verdict {
-  budget.spend(4 * (names.size + tmpIn.size + context.values.size + context.unknown.size + (context.files?.size ?? 0) + (context.alternatives?.size ?? 0) + (context.sinks?.size ?? 0) + (context.inputs?.size ?? 0)) + tokens.length + 1);
+  budget.spend(4 * (names.size + tmpIn.size + context.values.size + context.unknown.size + (context.files?.size ?? 0) + (context.alternatives?.size ?? 0) + (context.sinks?.size ?? 0) + (context.inputs?.size ?? 0) + (context.readonlyNames?.size ?? 0) + (context.uncertainReadonly?.size ?? 0) + (context.protectedAliases?.size ?? 0)) + tokens.length + 1);
   const verdict: Verdict = { blocked: false, lookup: false, wipe: false, tmpList: false };
   // Variables whose value comes from a name lookup (`P=$(pgrep …)`, `for p in $(pgrep …)`,
   // `pgrep … | while read p`), and the placeholders of lookup substitutions. A `kill` of one is a
@@ -634,6 +635,17 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   const values = new Map(context.values);
   const alternatives = new Map(context.alternatives);
   const unknown = new Set(context.unknown);
+  // Attributes are shell-local, unlike the conservative inherited value provenance.
+  // Caller-expanded bytes are private attribution cells, not shell variables or real
+  // readonly attributes. A receiver cannot rewrite their provenance through a binder.
+  const protectedAliases = new Map(context.protectedAliases);
+  const readonlyNames = new Set(context.readonlyNames);
+  const uncertainReadonly = new Set(context.uncertainReadonly);
+  const markReadonly = (key: string): void => {
+    budget.spend(key.length + 2);
+    // Each insertion is reserved on the original cumulative budget, including replay.
+    readonlyNames.add(key); uncertainReadonly.delete(key);
+  };
   let cwd = context.cwd;
   let uncertainCwd = context.uncertainCwd ?? false;
   let sharedCwd = context.sharedCwd ?? tmpGlob(".", cwd);
@@ -648,10 +660,10 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   let lookupTail = context.lookupTail;
   let tmpTail = context.tmpTail;
   const tailHas = (name: string, tail: number | undefined): boolean => tail !== undefined && /^[0-9]+$/.test(name) && Number(name) >= tail;
-  const lookupName = (name: string): boolean => tainted.has(name) || tailHas(name, lookupTail);
-  const tmpName = (name: string): boolean => tmpNames.has(name) || tailHas(name, tmpTail);
+  const lookupName = (name: string): boolean => tainted.has(name) || protectedAliases.get(name)?.lookup === true || tailHas(name, lookupTail);
+  const tmpName = (name: string): boolean => tmpNames.has(name) || protectedAliases.get(name)?.tmp === true || tailHas(name, tmpTail);
 
-  const nested = (text: string, extra: readonly string[] = [], tmpExtra: readonly string[] = [], local = true, input?: Feed, positionals?: Word[], sinks?: ReadonlyMap<number, OutputSink>, tails?: PositionalTail, inputs?: ReadonlyMap<number, InputBinding | undefined>): Verdict => {
+  const nested = (text: string, extra: readonly string[] = [], tmpExtra: readonly string[] = [], local = true, input?: Feed, positionals?: Word[], sinks?: ReadonlyMap<number, OutputSink>, tails?: PositionalTail, inputs?: ReadonlyMap<number, InputBinding | undefined>, inheritReadonly = true, sameShell = false): Verdict => {
     budget.spend(2 * (tainted.size + tmpNames.size + extra.length + tmpExtra.length + values.size + alternatives.size + unknown.size) + 1);
     const innerNames = new Set(tainted);
     const innerTmp = new Set(tmpNames);
@@ -685,10 +697,33 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     // A remote receiver gets no inherited input table, even when the caller has fd3.
     if (!local) budget.spend();
     const inner = scan(text, depth + 1, budget, innerNames, innerTmp,
-      local ? { ...context, cwd, uncertainCwd, sharedCwd, alternatives, values: innerValues, unknown: innerUnknown, files, inputs: inputs ?? context.inputs,
+      local ? { ...context, protectedAliases, cwd, uncertainCwd, sharedCwd, alternatives, values: innerValues, unknown: innerUnknown,
+        readonlyNames: inheritReadonly ? readonlyNames : undefined, uncertainReadonly: inheritReadonly ? uncertainReadonly : undefined,
+        files, inputs: inputs ?? context.inputs,
         lookupTail: positionals ? tails?.lookup : lookupTail, tmpTail: positionals ? tails?.tmp : tmpTail,
-        ...(sinks ? { sinks } : {}) } : { ...context, cwd: undefined, uncertainCwd: false, sharedCwd: false, alternatives: new Map(), values: new Map(), unknown: new Set(), files: new Map(), inputs: new Map(), sinks: new Map([[1, "stdout"]]) },
+        ...(sinks ? { sinks } : {}) } : { ...context, protectedAliases, cwd: undefined, uncertainCwd: false, sharedCwd: false, alternatives: new Map(), values: new Map(), unknown: new Set(), readonlyNames: undefined, uncertainReadonly: undefined, files: new Map(), inputs: new Map(), sinks: new Map([[1, "stdout"]]) },
       local ? input : undefined);
+    if (sameShell && inner.readonlyNames) {
+      budget.spend(2 * (inner.readonlyNames.size + (inner.uncertainReadonly?.size ?? 0)) + 1);
+      readonlyNames.clear(); uncertainReadonly.clear();
+      for (const key of inner.readonlyNames) {
+        if (protectedAliases.has(key)) continue;
+        readonlyNames.add(key);
+        // An eval-created attribute belongs to this shell. Transfer only its associated
+        // binding, not a new general mutable-eval state model; attributes cannot be
+        // imported while silently retaining a different parent value/provenance.
+        const state = inner.readonlyState;
+        if (!state) continue;
+        budget.spend(key.length + 6);
+        const value = state.values.get(key), options = state.alternatives.get(key);
+        if (value === undefined) values.delete(key); else values.set(key, value);
+        if (options === undefined) alternatives.delete(key); else alternatives.set(key, options);
+        if (state.unknown.has(key)) unknown.add(key); else unknown.delete(key);
+        if (state.lookup.has(key)) tainted.add(key); else tainted.delete(key);
+        if (state.tmp.has(key)) tmpNames.add(key); else tmpNames.delete(key);
+      }
+      for (const key of inner.uncertainReadonly ?? []) uncertainReadonly.add(key);
+    }
     verdict.blocked ||= inner.blocked;
     verdict.lookup ||= inner.lookup;
     verdict.wipe ||= inner.wipe;
@@ -716,8 +751,17 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     for (const match of pattern.matchAll(REFERENCE)) {
       const key = match[2]!;
       if ((!lookupName(key) && !tmpName(key)) || aliases.has(key)) continue;
+      let alias: string;
+      do {
+        // Reserve both candidate allocation and the root-text search before either.
+        // Root text includes quoted/escaped spellings; conservative substring avoidance
+        // also keeps literal user identifiers from acquiring synthetic provenance.
+        budget.spend(context.root.length + 64);
+        alias = `__pk_arg_${++placeholders}`;
+      } while (values.has(alias) || alternatives.has(alias) || unknown.has(alias) || tainted.has(alias) || tmpNames.has(alias) ||
+        readonlyNames.has(alias) || protectedAliases.has(alias) || context.root.includes(alias));
       budget.spend(64);
-      const alias = `__pk_arg_${++placeholders}`;
+      protectedAliases.set(alias, { lookup: lookupName(key), tmp: tmpName(key) });
       aliases.set(key, `\${${alias}}`);
       if (lookupName(key)) tainted.add(alias);
       if (tmpName(key)) tmpNames.add(alias);
@@ -1029,8 +1073,19 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     for (let repeat = 0; repeat < repeats; repeat++) chunks.push(fmt.replace(/%%|%s/g, (part) => part === "%%" ? "%" : arguments_[at++] ?? ""));
     return chunks.join("").replace(/\\([nrt\\])/g, (_whole, char: string) => ({ n: "\n", r: "\r", t: "\t", "\\": "\\" })[char]!);
   };
-  const bind = (variable: string, raw: string, append = false): void => {
+  const bind = (variable: string, raw: string, append = false, writableAlternative = false): void => {
     budget.spend(4 * raw.length + 1);
+    if (protectedAliases.has(variable)) return;
+    if (!writableAlternative && readonlyNames.has(variable)) {
+      // A known failed write preserves all value/provenance facts. A possible attribute
+      // joins failure with the writable path, rather than inventing either outcome.
+      if (uncertainReadonly.has(variable)) {
+        const prior = saveConditional();
+        bind(variable, raw, append, true);
+        joinConditional(prior, false);
+      }
+      return;
+    }
     const lookup = fromLookup(raw.replaceAll(QUOTED, "$"));
     // A scalar assignment/printf/read does not glob its value. Exact literals are kept
     // in values and checked after the eventual operand's quote/suffix expansion. Only
@@ -1053,11 +1108,18 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
 
   // A potentially skipped command cannot strongly replace a prior variable/file fact.
   // Join after EACH command so a later consumer in the same branch sees both paths.
-  const saveConditional = (): { values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmp: Set<string>; files: Map<string, Feed | undefined>; cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; lookupTail: number | undefined; tmpTail: number | undefined } => {
-    budget.spend(2 * (values.size + alternatives.size + unknown.size + tainted.size + tmpNames.size + files.size) + directoryStack.length + 1);
-    return { values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmp: new Set(tmpNames), files: new Map(files), cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail };
+  const saveConditional = (): { values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmp: Set<string>; readonlyNames: Set<string>; uncertainReadonly: Set<string>; files: Map<string, Feed | undefined>; cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; lookupTail: number | undefined; tmpTail: number | undefined } => {
+    budget.spend(2 * (values.size + alternatives.size + unknown.size + tainted.size + tmpNames.size + readonlyNames.size + uncertainReadonly.size + files.size) + directoryStack.length + 1);
+    return { values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmp: new Set(tmpNames), readonlyNames: new Set(readonlyNames), uncertainReadonly: new Set(uncertainReadonly), files: new Map(files), cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail };
   };
   const joinConditional = (prior: ReturnType<typeof saveConditional>, joinCwd = true): void => {
+    budget.spend(2 * (readonlyNames.size + prior.readonlyNames.size + prior.uncertainReadonly.size) + 1);
+    for (const key of readonlyNames) {
+      if (!prior.readonlyNames.has(key) || prior.uncertainReadonly.has(key)) uncertainReadonly.add(key);
+      else uncertainReadonly.delete(key);
+    }
+    for (const key of prior.readonlyNames) readonlyNames.add(key);
+    for (const key of prior.uncertainReadonly) uncertainReadonly.add(key);
     budget.spend(4 * (prior.values.size + values.size + prior.alternatives.size + alternatives.size + prior.unknown.size + prior.tainted.size + prior.tmp.size + prior.files.size) + 1);
     for (const key of new Set([...prior.values.keys(), ...values.keys(), ...prior.alternatives.keys(), ...alternatives.keys()])) {
       const before = prior.values.get(key);
@@ -1201,6 +1263,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         // provenance; do not mistake the subsequent array close for an unrelated assignment.
         const array = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=\(/.exec(word.pattern);
         if (array) {
+          if (protectedAliases.has(array[1]!) || (readonlyNames.has(array[1]!) && !uncertainReadonly.has(array[1]!))) break;
           const elements = [word.pattern.slice(array[0].length), ...stage.words.slice(i + 1).map((w) => w.pattern)];
           budget.spend(3 * elements.reduce((size, element) => size + element.length + 1, 0) + 1);
           bind(array[1]!, (array[2] ? " " : "") + elements.join(" "), array[2] !== undefined);
@@ -1233,9 +1296,29 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const standalone = !name || assignments.some((word) => /^\w+\+?=\(/.test(word.pattern));
       if (standalone) assign();
       // Declaration builtins really bind their assignment arguments, unlike echo/printf DATA.
-      if (["export", "readonly", "declare", "typeset", "local"].includes(name)) for (const word of args) {
-        const value = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=(.*)$/s.exec(word.pattern);
-        if (value) bind(value[1]!, value[3]!, value[2] !== undefined);
+      if (["export", "readonly", "declare", "typeset", "local"].includes(name)) {
+        let attribute = name === "readonly";
+        let diagnostic = false;
+        let options = true;
+        for (const arg of args) {
+          if (options && arg.text === "--") { options = false; continue; }
+          if (options && /^[-+][a-zA-Z]+$/.test(arg.text)) {
+            if (arg.text.startsWith("-") && arg.text.includes("r") && name !== "export") attribute = true;
+            if (arg.text.startsWith("-") && /[pf]/.test(arg.text)) diagnostic = true;
+            continue;
+          }
+          options = false;
+          if (diagnostic) continue;
+          // Assignment words suppress splitting; other declaration operands are actual
+          // quote/escape-removed argv (including quoted/escaped NAME=value and names).
+          const operands = arg.assignment ? [arg] : positionalFields([arg], 0).words;
+          for (const word of operands) {
+            const value = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=(.*)$/s.exec(word.pattern);
+            if (value) bind(value[1]!, value[3]!, value[2] !== undefined);
+            const key = value?.[1] ?? (/^[A-Za-z_][A-Za-z0-9_]*$/.test(word.text) ? word.text : undefined);
+            if (attribute && key) markReadonly(key);
+          }
+        }
       }
       const readIfs = !standalone && assignments.some((word) => /^IFS=/.test(word.text)) ? temporary(() => values.get("IFS")) : values.get("IFS");
       if (name === "set") {
@@ -1264,8 +1347,9 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       }
       if (name === "printf" && args[0]?.text === "-v" && args[1]) {
         const destination = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[.*\])?$/.exec(args[1].text)?.[1];
-        if (destination) {
+        if (destination && !protectedAliases.has(destination) && (!readonlyNames.has(destination) || uncertainReadonly.has(destination))) {
           const supplied = args.slice(3);
+          const beforeWrite = readonlyNames.has(destination) ? saveConditional() : undefined;
           const raw = renderPrintf(args[2]?.pattern ?? "", supplied);
           if (raw !== undefined) bind(destination, raw);
           else {
@@ -1275,6 +1359,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
             if (supplied.some((arg) => tmpOperand(arg.pattern))) tmpNames.add(destination);
             unknown.add(destination); values.delete(destination);
           }
+          if (beforeWrite) joinConditional(beforeWrite, false);
         }
       }
       if (name === "for" && args[0] && args.slice(2).some((arg) => fromLookup(arg.text))) tainted.add(args[0].text);
@@ -1305,7 +1390,11 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const reads = name === "read" || name === "mapfile" || name === "readarray";
       if (reads) {
         const options = readOptions(name, args, budget);
-        const { destinations, fd, array } = options;
+        const { fd, array } = options;
+        const destinations = options.destinations;
+        // Keep destination positions for multi-name read, but never mutate a definite
+        // readonly destination. Possible attributes retain failure and success paths.
+        const beforeWrite = destinations.some((key) => uncertainReadonly.has(key)) ? saveConditional() : undefined;
         const selected = inputs.has(fd) ? consumeInput(inputs.get(fd)) : fd === 0 ? actual : NO_OUTPUT;
         budget.spend(2 * (selected?.literal?.length ?? 0) + 1);
         const literalInput = selected?.literal !== undefined ? mask(selected.literal) : undefined;
@@ -1340,18 +1429,21 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           }
           if (array && destinations[0]) {
             bind(destinations[0], mask(parts.join(" ")));
-            if (parts.some((part) => tmpOperand(mask(part)))) tmpNames.add(destinations[0]);
+            if (!protectedAliases.has(destinations[0]) && !readonlyNames.has(destinations[0]) && parts.some((part) => tmpOperand(mask(part)))) tmpNames.add(destinations[0]);
           } else destinations.forEach((destination, i) => bind(destination, mask(parts[i] ?? "")));
         } else for (const destination of destinations) {
+          if (protectedAliases.has(destination) || (readonlyNames.has(destination) && !uncertainReadonly.has(destination))) continue;
           values.delete(destination); unknown.add(destination);
           if (selected !== undefined) { tainted.delete(destination); tmpNames.delete(destination); }
         }
         const unresolvedLiteral = literalInput === undefined || !options.supported;
         const readFeed = selected ?? (fd === 0 ? unresolved : EMPTY_FEED);
         for (const destination of destinations) {
+          if (protectedAliases.has(destination) || (readonlyNames.has(destination) && !uncertainReadonly.has(destination))) continue;
           if (unresolvedLiteral && readFeed.lookup) tainted.add(destination);
           if (unresolvedLiteral && readFeed.tmp) tmpNames.add(destination);
         }
+        if (beforeWrite) joinConditional(beforeWrite, false);
       }
       // mktemp creates one exact path; naming /tmp there does not list other agents' entries.
       // Security F3: after `cd /tmp`, a piped stage may list the cwd (`ls`, `find` without a root).
@@ -1479,7 +1571,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       let scriptKnown = true;
       for (const inner of scripts) {
         const result = temporary(() => nested(inner.text, inner.extra, inner.tmpExtra, !inner.remote,
-          inner.heredoc ? undefined : receiverStdin, inner.positionals, stageSinks, inner.tails, inputs));
+          inner.heredoc ? undefined : receiverStdin, inner.positionals, stageSinks, inner.tails, inputs, name === "eval", name === "eval"));
         scriptOutput = concatFeed(scriptOutput, result.output ?? EMPTY_FEED, budget);
         scriptKnown &&= result.sourceKnown === true;
         lookup = (result.output?.lookup ?? false) || lookup;
@@ -1615,7 +1707,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     stages = [];
   };
 
-  const groupStates: Array<{ cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmpNames: Set<string>; lookupTail: number | undefined; tmpTail: number | undefined }> = [];
+  const groupStates: Array<{ cwd: string | undefined; uncertainCwd: boolean; sharedCwd: boolean; stack: Array<string | undefined>; uncertainStack: boolean; sharedStack: boolean; values: Map<string, string>; alternatives: Map<string, readonly string[]>; unknown: Set<string>; tainted: Set<string>; tmpNames: Set<string>; readonlyNames: Set<string>; uncertainReadonly: Set<string>; lookupTail: number | undefined; tmpTail: number | undefined }> = [];
   // This is a conservative control-flow annotation, not shell execution. Conditions,
   // short-circuit RHSs and loop bodies may be skipped, including zero iterations.
   const controls: Array<{ kind: string; conditional: boolean }> = [];
@@ -1650,8 +1742,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     else if (!["|", "|&", "("].includes(token.op)) shortCircuit = false;
     if (token.op === "(") {
       controls.push({ kind: "group", conditional: conditional() });
-      budget.spend(2 * (values.size + alternatives.size + unknown.size + tainted.size + tmpNames.size) + directoryStack.length + 1);
-      groupStates.push({ cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail, values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmpNames: new Set(tmpNames) });
+      budget.spend(2 * (values.size + alternatives.size + unknown.size + tainted.size + tmpNames.size + readonlyNames.size + uncertainReadonly.size) + directoryStack.length + 1);
+      groupStates.push({ cwd, uncertainCwd, sharedCwd, stack: [...directoryStack], uncertainStack, sharedStack, lookupTail, tmpTail, values: new Map(values), alternatives: new Map(alternatives), unknown: new Set(unknown), tainted: new Set(tainted), tmpNames: new Set(tmpNames), readonlyNames: new Set(readonlyNames), uncertainReadonly: new Set(uncertainReadonly) });
     }
     if (token.op === ")" && !token.arrayClose) {
       if (controls.at(-1)?.kind === "group") controls.pop();
@@ -1663,6 +1755,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         unknown.clear(); saved.unknown.forEach((key) => unknown.add(key));
         tainted.clear(); saved.tainted.forEach((key) => tainted.add(key));
         tmpNames.clear(); saved.tmpNames.forEach((key) => tmpNames.add(key));
+        readonlyNames.clear(); saved.readonlyNames.forEach((key) => readonlyNames.add(key));
+        uncertainReadonly.clear(); saved.uncertainReadonly.forEach((key) => uncertainReadonly.add(key));
       }
     }
     const closed = scopes.ends.get(token);
@@ -1673,6 +1767,10 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   verdict.output = stream;
   verdict.sourceKnown = streamKnown;
   verdict.files = files;
+  verdict.readonlyNames = readonlyNames;
+  verdict.uncertainReadonly = uncertainReadonly;
+  budget.spend();
+  verdict.readonlyState = { values, alternatives, unknown, lookup: tainted, tmp: tmpNames };
   return verdict;
 }
 

@@ -525,6 +525,58 @@ describe("durable completion receipts", () => {
       } finally { fail = false; synced.mockRestore(); await client.close(); main.main.closeFollowUpDrain(); await state.participants.close(); }
     });
 
+    it.skipIf(process.platform === "win32")("#169 security S1 retains the source until a retry completes the containing-directory barrier", { timeout: 15_000 }, async () => {
+      const state = await rootHarness("delivery-owed-directory-barrier");
+      const key = await actorReply(state);
+      const main = await realMain(state, []);
+      const containingDirectory = state.config.meshRoot;
+      const leaf = path.join(containingDirectory, "main-followups");
+      const descriptors = new Map<number, string>();
+      const events: string[] = [];
+      const open = fs.openSync.bind(fs);
+      const sync = fs.fsyncSync.bind(fs);
+      let fail = true;
+      const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+        const fd = open(file, flags, mode);
+        descriptors.set(fd, String(file));
+        return fd;
+      });
+      const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+        if (descriptors.get(fd) === containingDirectory) {
+          events.push("containing-directory");
+          if (fail) throw new Error("directory link barrier unavailable");
+        }
+        sync(fd);
+      });
+      const deliver = vi.spyOn(main.main, "deliverAgent");
+      const removeSource = state.mesh.delete.bind(state.mesh);
+      const deleted = vi.spyOn(state.mesh, "delete").mockImplementation(async (request) => {
+        if (request.key === key) events.push("source-delete");
+        return removeSource(request);
+      });
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      try {
+        client.start();
+        await waitFor(() => deliver.mock.results.length >= 2);
+        expect(fs.statSync(leaf).isDirectory()).toBe(true); // Retry sees the failed attempt's existing leaf.
+        expect(deliver.mock.results.every((result) => result.type === "throw")).toBe(true);
+        expect(events.filter((event) => event === "containing-directory").length).toBeGreaterThanOrEqual(2);
+        expect(events).not.toContain("source-delete");
+        expect(state.mesh.get(key)).toBeDefined();
+        expect(main.sent).toHaveLength(0);
+        events.length = 0;
+        fail = false;
+        await waitFor(() => state.mesh.get(key) === undefined);
+        expect(events.indexOf("containing-directory")).toBeGreaterThanOrEqual(0);
+        expect(events.indexOf("source-delete")).toBeGreaterThan(events.indexOf("containing-directory"));
+        expect(main.sent).toHaveLength(1);
+      } finally {
+        fail = false;
+        deleted.mockRestore(); synced.mockRestore(); opened.mockRestore();
+        await client.close(); main.main.closeFollowUpDrain(); await state.participants.close();
+      }
+    });
+
     it("#169 round 2 isolates a refused first source while delivering a steer and another sender, then retries after a boundary", { timeout: 15_000 }, async () => {
       // Barrier order and failures are covered by tests/atomic-write-durable.test.ts and the barrier regressions.
       const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});

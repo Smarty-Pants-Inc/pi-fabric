@@ -7,7 +7,8 @@ export interface AtomicWriteOptions {
   // parent directory (default 0o700).
   mode?: number;
   dirMode?: number;
-  // Opt in to stable-storage ordering: sync the file before rename and its parent after.
+  // Opt in to stable-storage ordering: sync the file before rename, then its directory
+  // and all containing directories through the filesystem root (except on Windows).
   durable?: boolean;
   // Windows transiently rejects rename() with EPERM/EACCES/EEXIST/EBUSY while
   // an antivirus scan, indexer, or sibling reader probes the destination —
@@ -55,10 +56,11 @@ export const readFileRetrying = (file: string, attempts = 5, delayMs = 5): strin
   }
 };
 
+// Rename-only: callers needing stable storage must provide their own barriers.
 export const renameAtomic = (
   source: string,
   target: string,
-  options?: AtomicWriteOptions,
+  options?: Omit<AtomicWriteOptions, "durable">,
 ): void => {
   const attempts = Math.max(1, options?.renameRetries ?? 8);
   const delay = options?.renameRetryDelayMs ?? 25;
@@ -124,10 +126,20 @@ export const writeFileAtomic = (
       });
     }
     renameAtomic(temporary, filePath, options);
-    // ponytail: Windows cannot open directories for fsync; only this barrier is skipped.
+    // ponytail: Windows cannot open directories for fsync; only directory barriers are skipped.
     if (options?.durable && process.platform !== "win32") {
-      const fd = fs.openSync(path.dirname(filePath), fs.constants.O_RDONLY);
-      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      // Existence is not a durability receipt: a previous attempt (or process) may have
+      // left an unsynced directory link behind. Re-establish the whole chain on EVERY
+      // durable write, bottom up, through the filesystem root; no cached/volatile ancestor
+      // is assumed durable. Keep the pre-file barriers above for newly created directories.
+      let current = path.resolve(directory);
+      for (;;) {
+        const fd = fs.openSync(current, fs.constants.O_RDONLY);
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        const parent = path.dirname(current);
+        if (parent === current) break;
+        current = parent;
+      }
     }
   } finally {
     // No-op right after a successful rename; removes the temp on failure.

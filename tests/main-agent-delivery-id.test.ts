@@ -97,12 +97,19 @@ describe("#169 round 3 receiver receipt durability", () => {
       const fd = open(target, flags, mode); descriptors.set(fd, String(target)); return fd;
     });
     const syncOrder = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-      events.push(descriptors.get(fd) === file ? "session" : fs.fstatSync(fd).isDirectory() ? "directory" : "consumed");
+      events.push(descriptors.get(fd) === file ? "session" : fs.fstatSync(fd).isDirectory() ? descriptors.get(fd)! : "consumed");
       sync(fd);
     });
     try {
       first.emit("agent_settled", { outcome: "completed" }, context);
-      expect(events).toEqual(process.platform === "win32" ? ["session", "consumed"] : ["session", "consumed", "directory"]);
+      const directoryBarriers: string[] = [];
+      if (process.platform !== "win32") {
+        for (let directory = path.dirname(journal); ; directory = path.dirname(directory)) {
+          directoryBarriers.push(directory);
+          if (path.dirname(directory) === directory) break;
+        }
+      }
+      expect(events).toEqual(["session", "consumed", ...directoryBarriers]);
       expect(fs.existsSync(journal)).toBe(false);
       expect(fs.readFileSync(`${journal}.delivered`, "utf8")).toContain("sync-receipt");
     } finally { syncOrder.mockRestore(); opened.mockRestore(); main.closeFollowUpDrain(); }

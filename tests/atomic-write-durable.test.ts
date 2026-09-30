@@ -1,10 +1,104 @@
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { writeFileAtomic, writeJsonAtomic, writeJsonAtomicAsync } from "../src/core/atomic-write.js";
+import { renameAtomic, writeFileAtomic, writeJsonAtomic, writeJsonAtomicAsync } from "../src/core/atomic-write.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { MeshStore } from "../src/mesh/store.js";
+
+const directoryChain = (directory: string): string[] => {
+  const chain: string[] = [];
+  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
+    chain.push(current);
+    if (path.dirname(current) === current) return chain;
+  }
+};
+
+describe("#169 security S1 directory-link retries and P3 rename contract", () => {
+  const cases = ["outer", "inner", "parent"].flatMap((barrier) =>
+    ["same-process", "fresh-process"].map((retry) => ({ barrier, retry })),
+  );
+  it.skipIf(process.platform === "win32").each(cases)("retries the owed $barrier barrier before acknowledgment in $retry", ({ barrier, retry }) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-owed-barrier-"));
+    const outer = path.join(root, "new");
+    const inner = path.join(outer, "nested");
+    const target = path.join(inner, "record");
+    const failingPath = { outer, inner, parent: root }[barrier as "outer" | "inner" | "parent"];
+    const descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs);
+    const sync = fs.fsyncSync.bind(fs);
+    let fail = true;
+    const events: string[] = [];
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode);
+      descriptors.set(fd, String(file));
+      return fd;
+    });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const file = descriptors.get(fd)!;
+      events.push(file);
+      if (fail && file === failingPath) throw new Error("owed directory barrier unavailable");
+      sync(fd);
+    });
+    try {
+      expect(() => writeFileAtomic(target, "first", { durable: true })).toThrow("owed directory barrier unavailable");
+      expect(fs.statSync(inner).isDirectory()).toBe(true); // Leave the entire failed tree in place.
+      events.length = 0;
+      if (retry === "same-process") {
+        expect(() => writeFileAtomic(target, "retry", { durable: true })).toThrow("owed directory barrier unavailable");
+        expect(events).toContain(failingPath);
+        events.length = 0;
+        fail = false;
+        writeFileAtomic(target, "accepted", { durable: true });
+        events.push("acknowledged");
+        expect(events.indexOf(failingPath)).toBeGreaterThanOrEqual(0);
+        expect(events.indexOf(failingPath)).toBeLessThan(events.indexOf("acknowledged"));
+      } else {
+        const child = spawnSync(process.execPath, [path.resolve("tests/fixtures/atomic-write-retry.mjs"),
+          path.resolve("src/core/atomic-write.ts"), target, failingPath], { encoding: "utf8", timeout: 5_000 });
+        expect(child.error).toBeUndefined();
+        expect(child.status, child.stderr).toBe(0);
+        const attempts = JSON.parse(child.stdout) as Array<{ acknowledged: boolean; events: string[]; error?: string }>;
+        expect(attempts[0]).toMatchObject({ acknowledged: false, error: "owed directory barrier unavailable" });
+        expect(attempts[0]!.events).toContain(failingPath);
+        expect(attempts[1]!.acknowledged).toBe(true);
+        expect(attempts[1]!.events.indexOf(failingPath)).toBeGreaterThanOrEqual(0);
+        expect(attempts[1]!.events.indexOf(failingPath)).toBeLessThan(attempts[1]!.events.indexOf("acknowledged"));
+      }
+      expect(fs.readFileSync(target, "utf8")).toBe("accepted");
+    } finally {
+      synced.mockRestore(); opened.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps renameAtomic rename-only, retries contention and rejects durable options at type level", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-rename-contract-"));
+    const source = path.join(root, "source");
+    const target = path.join(root, "target");
+    fs.writeFileSync(source, "payload");
+    const rename = fs.renameSync.bind(fs);
+    let calls = 0;
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (++calls === 1) throw Object.assign(new Error("contended"), { code: "EBUSY" });
+      rename(from, to);
+    });
+    const synced = vi.spyOn(fs, "fsyncSync");
+    try {
+      renameAtomic(source, target, { renameRetries: 2, renameRetryDelayMs: 0 });
+      if (false) {
+        // @ts-expect-error Rename-only operations cannot promise stable-storage durability.
+        renameAtomic(source, target, { durable: true });
+      }
+      expect(calls).toBe(2);
+      expect(synced).not.toHaveBeenCalled();
+      expect(fs.readFileSync(target, "utf8")).toBe("payload");
+    } finally {
+      synced.mockRestore(); renamed.mockRestore(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("#169 round 4 new-directory durability and async contract", () => {
   it.skipIf(process.platform === "win32")("syncs new nested directories top down and their existing parent before file barriers", () => {
@@ -33,7 +127,7 @@ describe("#169 round 4 new-directory durability and async contract", () => {
     });
     try {
       writeJsonAtomic(target, { value: 1 }, { durable: true });
-      expect(events).toEqual([outer, inner, root, "file", "rename", inner]);
+      expect(events).toEqual([outer, inner, root, "file", "rename", ...directoryChain(inner)]);
       expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ value: 1 });
     } finally {
       renamed.mockRestore(); synced.mockRestore(); opened.mockRestore();
@@ -102,7 +196,8 @@ describe("#169 round 3 durable atomic writes", () => {
       return fd;
     });
     const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-      events.push(descriptors.get(fd) === root ? "sync-directory" : "sync-file");
+      const file = descriptors.get(fd)!;
+      events.push(file.startsWith(`${target}.`) ? "sync-file" : file);
       sync(fd);
     });
     const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
@@ -112,7 +207,7 @@ describe("#169 round 3 durable atomic writes", () => {
     try {
       if (kind === "json") writeJsonAtomic(target, { value: 1 }, { durable: true });
       else writeFileAtomic(target, "payload", { durable: true });
-      expect(events).toEqual(process.platform === "win32" ? ["sync-file", "rename"] : ["sync-file", "rename", "sync-directory"]);
+      expect(events).toEqual(["sync-file", "rename", ...(process.platform === "win32" ? [] : directoryChain(root))]);
       synced.mockClear();
       writeFileAtomic(target, "ordinary");
       writeJsonAtomic(target, { ordinary: true });

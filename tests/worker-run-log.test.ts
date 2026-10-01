@@ -721,6 +721,34 @@ describe("worker run log", () => {
     expect(fs.readdirSync(directory).sort()).toEqual(["events.jsonl", "foreign.compact.tmp"]);
   });
 
+  it("invalidates growing replacements when Windows file IDs round to the same number", () => {
+    const live = write(capEvents("").events, true, false).text;
+    const file = logFile(live);
+    retainCompactionGeneration(file);
+    const originalInode = fs.statSync(file, { bigint: true }).ino;
+    const windowsId = 2n ** 54n;
+    expect(Number(windowsId + 1n)).toBe(Number(windowsId));
+    const fstat = fs.fstatSync;
+    // Keep real descriptors, sizes and replacement I/O; model only Windows' wide IDs.
+    const stat = vi.spyOn(fs, "fstatSync").mockImplementation((descriptor, options) => {
+      const actual = fstat(descriptor, options);
+      const id = fstat(descriptor, { bigint: true }).ino === originalInode ? windowsId : windowsId + 1n;
+      Object.defineProperty(actual, "ino", { value: options?.bigint ? id : Number(id) });
+      return actual;
+    });
+    try {
+      const source = { id: "wide-id", status: "completed", logFile: file };
+      const reader = new AgentTranscriptReader();
+      const before = reader.read(source, false);
+      const replacement = `${file}.replacement`;
+      fs.writeFileSync(replacement, `${live}${JSON.stringify({ type: "agent_end", padding: "x".repeat(256) })}\n`);
+      fs.renameSync(replacement, file);
+      expect(reader.read(source, false).entries).toEqual(before.entries);
+      fs.appendFileSync(file, `${JSON.stringify({ type: "message_end", message: { role: "user", content: "new-path-offset", timestamp: 99 } })}\n`);
+      expect(reader.read(source).entries.at(-1)).toMatchObject({ kind: "user", text: "new-path-offset" });
+    } finally { stat.mockRestore(); }
+  });
+
   describe.each(["quiescent", "Windows EPERM denial", "Windows EBUSY denial", "POSIX held-FD replacement", "Windows native denial"])("reader replacement: %s", (capability) => {
     describe.skipIf((capability.startsWith("POSIX") && process.platform === "win32") || (capability === "Windows native denial" && process.platform !== "win32"))("native replacement capability", () => {
       it.each(["x".repeat(9 * 1024), ""])("invalidates held reader offsets on atomic replacement (body length=%s)", (body) => {

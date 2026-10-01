@@ -636,6 +636,9 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
     // Reserved words are grammar only when unquoted/unescaped, not executable-name argv.
     const quotedControl = ["!", "{", "then", "do", "else", "if", "elif", "while", "until"].includes(prefix) &&
       (words[0]?.text !== prefix || words[0]?.quoted || words[0]?.assignment === false);
+    // Basenames discover dangerous consumers, never executable identity. An
+    // unproved path-qualified wrapper cannot confer a child or silence grant.
+    if (options && !quotedControl && words[0]?.text !== prefix) throw new ShellStateRefused();
     if (!options || quotedControl) {
       // Absence AFTER executable-wrapper removal is not lexical standalone
       // assignment syntax. Refuse before either pass can bind wrapper argv in
@@ -782,11 +785,19 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
     for (const assignment of assignments) if (!scalar(assignment)) throw new ShellStateRefused();
     // A live executable/option boundary cannot be treated as an unrelated literal
     // command. No command-name interpreter: decline its entire command instead.
-    if (words[0]?.dynamic || (words[0] && !simpleWord(words[0]))) throw new ShellStateRefused();
+    // Bare [ is the literal test builtin, not a bracket glob (no closing ]).
+    const literalWord = (word: Word): boolean => !word.dynamic && !word.unprovedLiteral && !word.process && !word.subs.length &&
+      (word.pattern === "[" || !/[$\u0002*?[]/.test(word.pattern));
+    // Operator/option selection is not data expansion. Even a known scalar can
+    // disappear or select an interpreting builtin; admit original literal words only.
+    if (words[0] && !literalWord(words[0])) throw new ShellStateRefused();
     const name = words[0]?.text.split("/").pop() ?? "";
     // A PRESENT receiver with an empty basename is not assignment-only syntax.
     if (words.length && !name) throw new ShellStateRefused();
     if (SHELL_STATE_BUILTINS.has(name)) throw new ShellStateRefused();
+    // Only a bare original literal shell receives child-admission credit; paths
+    // can fail before any supposed payload emits bytes. No filesystem proof.
+    if (SHELLS.has(name) && words[0]?.text !== name) throw new ShellStateRefused();
     // A for/select destination writes shell state too; quote removal already
     // resolved its name. Refuse IFS without interpreting iterations or values.
     if (["for", "select"].includes(words[0]?.text ?? "") && !words[0]?.quoted && words[0]?.assignment !== false && words[1]?.text === "IFS") throw new ShellStateRefused();
@@ -794,6 +805,16 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
     if (name === "for" && !words[0]?.quoted && words[0]?.assignment !== false &&
       (words[2]?.pattern !== "in" || words[2]?.quoted || words[2]?.assignment === false)) throw new ShellStateRefused();
     const args = words.slice(1);
+    if (["test", "["].includes(name) && args.some((arg) => !literalWord(arg))) throw new ShellStateRefused();
+    if (SHELLS.has(name)) {
+      const flag = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg.text));
+      // Before payload selection, Bash removes/splits live caller expansions.
+      // No option-slot interpreter: the -c slot and its ONE payload word must
+      // already be literal. Positional data after that payload retains its proof.
+      const boundary = flag >= 0 ? args.slice(0, flag + 2) : args;
+      if (boundary.some((arg) => !literalWord(arg)) ||
+        (flag >= 0 && (args[flag]?.text !== "-c" || !args[flag + 1]))) throw new ShellStateRefused();
+    }
     if (["test", "["].includes(name) && args.some((arg) => arg.text === "-v")) {
       // Only a literal scalar existence check has proved non-writing argv.
       // Bash interprets subscript strings even when their quotes were DATA.
@@ -2053,7 +2074,27 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // file (including one written earlier here) supplies its own independent contents.
       let output: Feed = { lookup, tmp: listsTmp };
       let known = independent || lookup || listsTmp;
-      const silent = reads || silentCd || killSilent || DELETERS.has(name) || [":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
+      // A deleter's stderr is not stdout, but verbose/help/unknown options can
+      // emit bytes. Silence belongs only to this explicit quiet-option subset;
+      // -- ends option selection, never granting success or filesystem facts.
+      // shred may itself write stdout (e.g. the '-' operand); no silence proof.
+      let deleterSilent = name === "rm" || name === "unlink";
+      if (deleterSilent) {
+        let ended = false;
+        for (const arg of positionalFields(args, 0).words) {
+          budget.spend(arg.pattern.length + 1);
+          if (ended) continue;
+          if (!concrete(arg) || /[*?[]/.test(arg.pattern)) { deleterSilent = false; break; }
+          if (arg.text === "--") { ended = true; continue; }
+          if (arg.text.startsWith("-") && arg.text !== "-" &&
+            !(name === "rm" && (/^-[rRfd]+$/.test(arg.text) || ["--recursive", "--force", "--dir"].includes(arg.text)))) {
+            deleterSilent = false; break;
+          }
+        }
+        // xargs appends unproved argv, which can supply -v without a proved --.
+        if (fedByXargs && !ended) deleterSilent = false;
+      }
+      const silent = reads || silentCd || killSilent || deleterSilent || [":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
         (name === "set" && words[0]?.text === "set" && !wrapped && args.length > 0) ||
         (name === "printf" && args[0]?.text === "-v") || (stage.words[0] && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(stage.words[0].text) && words.length === 0);
       if (scripts.length) { output = scriptOutput; known = scriptKnown; }
@@ -2131,8 +2172,13 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // Output proof is separate from child discovery. Unproved wrapper/shell
       // startup or redirect execution must not contribute an invented prefix,
       // including the exact literal produced by an otherwise simple builtin.
-      const shellOutputProved = !SHELLS.has(name) || args.length === 0 || (args[0]?.text === "-c" && args[1] !== undefined);
-      if ((wrapped && !outputProved) || !shellOutputProved ||
+      const shellOutputProved = !SHELLS.has(name) || args.length === 0 || (args[0]?.text === "-c" && args[1] !== undefined &&
+        !args[0].subs.length && !args[1].subs.length && !/[$\u0002]/.test(args[0].pattern + args[1].pattern));
+      // Every safe-output/silence branch above is a bare-command subset. A
+      // path-qualified producer may fail without its invented prefix; dangerous
+      // basename discovery remains, but its output is UNKNOWN before composition.
+      const bareOutputReceiver = !words.length || words[0]?.text === name;
+      if (!bareOutputReceiver || (wrapped && !outputProved) || !shellOutputProved ||
         (redirectBinding && output.literal !== undefined && output.literal !== "")) {
         output = mergeFeed(output, UNKNOWN_FEED); known = false;
       }
@@ -2214,6 +2260,14 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
           cwd = undefined; uncertainCwd = true; directoryStack = [undefined];
         }
         pendingCwd = undefined;
+      }
+      // Bash maintains these implicit cells across cwd changes and ordinary
+      // command argv. Drop stale tracked proof AFTER caller argv/output use and
+      // temporary/conditional restoration; never re-derive ambient values.
+      if (words.length) for (const key of ["PWD", "OLDPWD", "_"]) {
+        budget.spend(key.length + 6);
+        values.delete(key); alternatives.delete(key); unknown.add(key);
+        tainted.add(key); tmpNames.add(key);
       }
     });
     stages = [];

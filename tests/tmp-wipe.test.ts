@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { expectRound16Migration } from "./pr166-round16-policy.js";
 import { killsByPattern, TMP_WIPE_REASON, wipesTmp, scanCommand } from "../src/core/pattern-kill.js";
 
 // R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
@@ -50,6 +51,7 @@ const round13IntentionalState = new Set<string>([
   'cd "$D" && ls | xargs rm -f',
 ]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  if (expectRound16Migration(command, result)) return;
   if (round11IntentionalTmp.has(command) && !round13IntentionalState.has(command)) {
     expect(result, command).toStrictEqual({ blocked: false, wipe: true, exhausted: false });
     expect(killsByPattern(command), command).toBe(false);

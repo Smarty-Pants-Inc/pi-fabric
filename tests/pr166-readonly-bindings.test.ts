@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { expectRound16Migration } from "./pr166-round16-policy.js";
 import { scanCommand, killsByPattern, wipesTmp } from "../src/core/pattern-kill.js";
 
 // R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
@@ -15,6 +16,7 @@ const round5IntentionalState = new Set<string>([
   "readonly D=/own; D=/tmp printf -v D %s /tmp; echo D\\=/tmp; rm -rf \"$D\""
 ]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  if (expectRound16Migration(command, result)) return;
   const intentional = round5IntentionalState.has(command);
   const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
   if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);

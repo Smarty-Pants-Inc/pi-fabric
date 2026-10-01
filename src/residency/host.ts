@@ -52,6 +52,8 @@ import { deliveryRoot, projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun } from "../storage/retention.js";
 import { ownedStat } from "../storage/scratch.js";
+import { ResidentRequestRetention } from "./retention.js";
+import { assertResidentRequestNotExpired, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 
 export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 
@@ -140,6 +142,13 @@ const atomicWrite = (filePath: string, value: unknown): void => {
   writeJsonAtomic(filePath, value, { space: 2 });
 };
 
+const residentActorRoots = (config: ResidentHostConfig): { project: string; session: string } =>
+  config.sessionActorRoot
+    ? { project: config.actorRoot, session: config.sessionActorRoot }
+    : config.mesh.actorScope === "session"
+      ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
+      : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
+
 const readJson = <T>(filePath: string): T | undefined => {
   try {
     return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
@@ -226,6 +235,7 @@ export class ResidentHost {
   #started = false;
   #idleSince = Date.now();
   #admissions = 0;
+  readonly #requestRetention: ResidentRequestRetention;
 
   constructor(
     readonly config: ResidentHostConfig,
@@ -243,6 +253,8 @@ export class ResidentHost {
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#removalsPath = residentRemovalsPath(config.residencyRoot);
     this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
+    this.#requestRetention = new ResidentRequestRetention(config.residencyRoot,
+      [...new Set(Object.values(residentActorRoots(config)))]);
   }
 
   #initialize(): void {
@@ -357,11 +369,7 @@ export class ResidentHost {
     };
     const lineageAlive = (rootId: string): boolean =>
       this.participants.get(rootId) !== undefined;
-    const actorRoots = config.sessionActorRoot
-      ? { project: config.actorRoot, session: config.sessionActorRoot }
-      : config.mesh.actorScope === "session"
-        ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
-        : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
+    const actorRoots = residentActorRoots(config);
     this.actors = new ActorDirectory([
       config.sessionId,
       this.identity,
@@ -472,6 +480,7 @@ export class ResidentHost {
         readyAt: now,
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
+        requestExpiry: 1,
       };
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
@@ -489,6 +498,7 @@ export class ResidentHost {
     this.#closed = true;
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
+    this.#requestRetention.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
     const actorsClosed = this.actors?.close();
     while (this.#pollingRequests || this.#admissions) await delay(10);
@@ -711,8 +721,22 @@ export class ResidentHost {
       }
     } finally {
       this.#pollingRequests = false;
+      this.#maintainRequests();
       this.#checkIdle();
     }
+  }
+
+  #maintainRequests(): void {
+    const now = Date.now();
+    if (this.#closed || !this.#requestRetention.due(now)) return;
+    const live = new Set<string>();
+    for (const agent of this.agents.listForUi()) if (agent.status === "queued" || agent.status === "running") live.add(agent.id);
+    for (const actor of this.actors.listOwned()) if (actor.status !== "stopped") live.add(actor.id);
+    for (const removal of this.actors.pendingRemovals()) {
+      live.add(removal.id);
+      if (removal.runId) live.add(removal.runId);
+    }
+    this.#requestRetention.sweep(now, live);
   }
 
   #checkIdle(): void {
@@ -753,12 +777,13 @@ export class ResidentHost {
     let response: ResidentCommandResponse;
     try {
       if (
-        (command?.format !== RESIDENT_HOST_FORMAT && command?.format !== RESIDENT_ACTOR_COMMAND_FORMAT) ||
+        (command?.format !== RESIDENT_HOST_FORMAT && command?.format !== RESIDENT_ACTOR_COMMAND_FORMAT && command?.format !== RESIDENT_EXPIRING_COMMAND_FORMAT) ||
         command.rootId !== this.config.rootId ||
         command.requestId !== requestId
       ) {
         throw new Error("Invalid Fabric residency request");
       }
+      assertResidentRequestNotExpired(this.config.residencyRoot, requestId, command.format);
       // Validate the runtime JSON discriminant before any actor lookup/mutation.
       if (!isResidentCommandOperation(command.operation)) {
         throw new ResidentCommandUnsupportedError(`Unsupported Fabric residency command: ${String(command.operation)}`);
@@ -907,7 +932,7 @@ export class ResidentHost {
         requestId,
         ok: false,
         error: errorMessage(error),
-        ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError
+        ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
           ? { errorCode: error.code } : {}),
         completedAt: Date.now(),
       };

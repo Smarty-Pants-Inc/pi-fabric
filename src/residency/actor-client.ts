@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -6,16 +7,23 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import {
   abandonResidentRequest,
+  ResidentActorAuthorizationError,
+  ResidentCommandUnsupportedError,
+  assertResidentCommandSupported,
+  type ResidentHostOwner,
+  assertResidentActorToolCeiling,
+  type ResidentActorCaller,
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
   registerResidentCancellation,
   RESIDENT_HOST_FORMAT,
+  RESIDENT_ACTOR_COMMAND_FORMAT,
   residentHostStateNote,
   residentRoot,
   sleepUnlessAborted,
   type ResidentCommand,
   type ResidentCommandResponse,
-  type ResidentHostOwner,
+  type ResidentActorMutation,
 } from "./protocol.js";
 
 const COMMAND_TIMEOUT_MS = 30_000;
@@ -36,6 +44,7 @@ const readJson = <T>(filePath: string): T | undefined => {
  */
 export class ResidentActorClient {
   readonly #rootId: string;
+  readonly #toolCeiling = readChildToolAllowlist();
   readonly #requestsPath: string;
   readonly #responsesPath: string;
   readonly #ownerPath: string;
@@ -55,6 +64,44 @@ export class ResidentActorClient {
     const meshRoot = process.env.PI_FABRIC_MESH_ROOT;
     if (!rootId || !meshRoot) return undefined;
     return new ResidentActorClient(meshRoot, rootId);
+  }
+
+  isLive(): boolean {
+    const owner = readJson<{ pid?: number }>(this.#ownerPath);
+    if (!owner?.pid || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) return false;
+    try { process.kill(owner.pid, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+  }
+
+  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
+    // Nested proxies cannot manufacture the Main's control identity. A genuine
+    // Main fallback must supply the identity captured by its provider.
+    if (this.#toolCeiling !== undefined && caller) caller = { ...caller, toolCeiling: [...this.#toolCeiling] };
+    if (mutation.operation === "setTools") assertResidentActorToolCeiling(mutation.tools, caller?.toolCeiling);
+    const response = await this.#send({
+      ...mutation, ...(caller ? { caller } : {}), format: RESIDENT_ACTOR_COMMAND_FORMAT, requestId: randomUUID(),
+      rootId: this.#rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor from setter");
+    return response.actor;
+  }
+
+  async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
+    const response = await this.#send({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actorStatus", id,
+      requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor status");
+    return response.actor;
+  }
+
+  async actors(signal?: AbortSignal): Promise<FabricActorInfo[]> {
+    const response = await this.#send({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actors", requestId: randomUUID(),
+      rootId: this.#rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actors) throw new Error("Resident host returned no actors");
+    return response.actors;
   }
 
   async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
@@ -84,7 +131,11 @@ export class ResidentActorClient {
   }
 
   async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
-    if (readJson<ResidentHostOwner>(this.#ownerPath)?.requestFence !== 1) {
+    if (!this.isLive()) throw new Error("Root resident host is not live");
+    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+    if (!owner) throw new Error("Root resident host is not live");
+    assertResidentCommandSupported(owner, command.operation);
+    if (owner.requestFence !== 1) {
       throw new Error("Root resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }
     throwIfAborted(signal);
@@ -99,7 +150,11 @@ export class ResidentActorClient {
         const response = readJson<ResidentCommandResponse>(responsePath);
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           fs.rmSync(responsePath, { force: true });
-          if (!response.ok) throw new Error(response.error ?? "Resident host rejected actor request");
+          if (!response.ok) {
+            if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
+            if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
+            throw new Error(response.error ?? "Resident host rejected actor request");
+          }
           if (command.operation === "createActor" && !response.actor) throw new Error("Resident host returned no created actor");
           return response;
         }

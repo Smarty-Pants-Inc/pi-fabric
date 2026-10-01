@@ -222,11 +222,16 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
   it.each(["halt", "close"] as const)("keeps a repair alarm passive after %s interrupts model resolution", async (operation) => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    let resolutions = 0;
+    let holdResolution = false;
+    let resolutionHeld = false;
     const { actors, agents, mesh, deliveries, sendMessage } = setup({
       resolvePiModel: (model) => {
-        // Creation and enqueue resolve synchronously; hold the drain's admission resolution.
-        if (++resolutions === 3) return gate.then(() => model);
+        // Arm after creation: unpinned owner defaults resolve at drain admission,
+        // not enqueue. Hold that resolution without depending on a call count.
+        if (holdResolution) {
+          resolutionHeld = true;
+          return gate.then(() => model);
+        }
         return model;
       },
     });
@@ -236,10 +241,11 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     fs.writeFileSync(actor.sessionFile!, orphan);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     // Attach the rejection handler before interrupting; settle all started work even on failure.
+    holdResolution = true;
     const activation = actors.ask(actor.id, "cancelled activation").then(() => undefined, (error: Error) => error);
     let closing: Promise<void> | undefined;
     try {
-      await waitFor(() => resolutions === 3);
+      await waitFor(() => resolutionHeld);
       expect(actors.inFlightCount()).toBe(1);
       expect(launch).not.toHaveBeenCalled();
       if (operation === "halt") expect(actors.haltAll()).toEqual({ halted: 1 });

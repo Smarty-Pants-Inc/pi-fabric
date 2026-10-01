@@ -526,7 +526,7 @@ Omit `model` or `thinking` to clear the selected layer. A cleared session bindin
 
 `FabricActorInfo.model` and `thinking` show the effective values for the caller. `binding` shows the session layer. `projectDefaults` shows the shared definition layer.
 
-Fabric stores the resolved binding on each mailbox item before it queues. Later binding changes cannot alter a running activation or an older queued item. `ask` waits for the owner to return a result. `tell`, `steer`, and `followUp` enqueue through the same owner. Pi and Claude actors both support these direct-call bindings.
+Own-root requests queue only explicit per-call model/thinking pins; omitted fields resolve from the owner's current session/project defaults when the activation launches, including after mailbox restoration. Foreign requests queue an already-resolved caller view: later owner binding changes cannot alter it, and absent fields use Fabric or runner configuration, never the owner's private session layer. This distinction survives persistence and restoration. An already-launched activation keeps its launch-time binding. `ask` waits for the owner to return a result. `tell`, `steer`, and `followUp` enqueue through the same owner. Pi and Claude actors both support these direct-call bindings.
 
 The mailbox, history, and runner session remain shared. Host events and mesh subscriptions run once on the owner and use the owner's session binding. Opening another Pi session does not start another copy of the actor.
 

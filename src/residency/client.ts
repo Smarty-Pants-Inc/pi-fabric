@@ -21,11 +21,18 @@ import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
+  ResidentActorAuthorizationError,
+  ResidentCommandUnsupportedError,
+  assertResidentCommandSupported,
+  assertResidentActorMain,
+  assertResidentActorToolCeiling,
+  type ResidentActorCaller,
   ResidentOutcomeUnknownError,
   readResidentRequestDecision,
   registerResidentCancellation,
   commitResidentRequest,
   RESIDENT_HOST_FORMAT,
+  RESIDENT_ACTOR_COMMAND_FORMAT,
   isResidentHostId,
   residentDeliveryPrefix,
   residentHostId,
@@ -35,6 +42,7 @@ import {
   type ResidentAgentMetadata,
   type ResidentCommand,
   type ResidentCommandResponse,
+  type ResidentActorMutation,
   type ResidentDeliveryRecord,
   type ResidentHostConfig,
   type ResidentHostOwner,
@@ -297,6 +305,46 @@ export class ResidencyClient {
     return response.actor;
   }
 
+  /** Setters/status use only an existing owner, never create hidden residency. */
+  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
+    const self = this.options.participants.self();
+    if (!this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId ||
+      self.kind !== "root" || self.id !== this.options.config.rootId || !self.sessionId) {
+      throw new ResidentActorAuthorizationError();
+    }
+    caller ??= { identity: { id: self.id, name: self.name, kind: "main", sessionId: self.sessionId }, hostId: self.ownerHostId };
+    assertResidentActorMain(caller, this.options.config.rootId);
+    if (this.#inheritedToolAllowlist !== undefined) caller = { ...caller, toolCeiling: [...this.#inheritedToolAllowlist] };
+    if (mutation.operation === "setTools") assertResidentActorToolCeiling(mutation.tools, caller.toolCeiling);
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      ...mutation, caller, format: RESIDENT_ACTOR_COMMAND_FORMAT, requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor from setter");
+    return response.actor;
+  }
+
+  async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actorStatus", id,
+      requestId: randomUUID(), rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor status");
+    return response.actor;
+  }
+
+  async actors(signal?: AbortSignal): Promise<FabricActorInfo[]> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actors", requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actors) throw new Error("Resident host returned no actors");
+    return response.actors;
+  }
+
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
     const resolvedRequest = request.cwd === undefined
       ? request
@@ -532,7 +580,10 @@ export class ResidencyClient {
   }
 
   async #command(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
-    if (this.#liveOwner()?.requestFence !== 1) {
+    const owner = this.#liveOwner();
+    if (!owner) throw new Error("Root resident host is not live");
+    assertResidentCommandSupported(owner, command.operation);
+    if (owner.requestFence !== 1) {
       throw new Error("Fabric resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }
     throwIfAborted(signal);
@@ -546,7 +597,11 @@ export class ResidencyClient {
         const response = readJson<ResidentCommandResponse>(responsePath);
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           fs.rmSync(responsePath, { force: true });
-          if (!response.ok) throw new Error(response.error ?? "Fabric resident host rejected request");
+          if (!response.ok) {
+            if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
+            if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
+            throw new Error(response.error ?? "Fabric resident host rejected request");
+          }
           if ((command.operation === "spawn" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
             throw new Error("Fabric resident host returned no created entity");
           }

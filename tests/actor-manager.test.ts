@@ -1557,7 +1557,7 @@ describe("ActorManager", () => {
     });
   });
 
-  it("pins a queued activation before later session binding changes", async () => {
+  it("keeps a launched activation pinned across later session binding changes", async () => {
     const { actors, agents } = setup();
     const runSpy = vi.spyOn(agents, "run");
     const actor = await actors.create({
@@ -1570,6 +1570,7 @@ describe("ActorManager", () => {
     await actors.setThinking(actor.id, "low");
 
     const first = actors.ask(actor.id, "first");
+    await waitFor(() => runSpy.mock.calls.length === 1);
     await actors.setModel(actor.id, "provider/session-new");
     await actors.setThinking(actor.id, "high");
     await first;

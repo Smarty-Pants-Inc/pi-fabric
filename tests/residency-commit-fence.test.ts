@@ -119,9 +119,9 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
       for (const [name, previous] of signalListeners) {
         for (const listener of process.listeners(name)) if (!previous.has(listener)) process.removeListener(name, listener);
       }
-      // Host shutdown confirms worker exit, and CPython controls also await guest
-      // close. Windows can still transiently retain a cwd/directory in the OS;
-      // opt into Node's bounded recursive-rm retry rather than masking EBUSY.
+      // Host shutdown confirms resident worker exit. Public CPython cases must
+      // separately confirm guest close: runtime settlement bounds its reap wait.
+      // After those barriers, retry only transient OS cwd/directory retention.
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
     },
   };
@@ -1192,9 +1192,55 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
       } finally { controller.abort(); state.release.resolve(); await main.close(); await state.close(); }
     });
   }
-  for (const engine of engines) for (const settlesDuringGrace of [false, true]) {
-    it(`${engine} teardown exposes a committed unawaited mutation ${settlesDuringGrace ? "that settles during grace" : "still pending after grace"} rather than false success`, async () => {
+  for (const engine of engines) for (const settlesDuringGrace of [false, true])
+    for (const holdGuestExit of engine === "cpython" && settlesDuringGrace ? [false, true] : [false]) {
+    it(`${engine} teardown exposes a committed unawaited mutation ${settlesDuringGrace ? "that settles during grace" : "still pending after grace"} rather than false success${holdGuestExit ? " with guest exit delayed past reap grace" : ""}`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state);
+      const trace = engine === "cpython" ? await captureDurableExecutionTrace() : undefined;
+      const rm = fs.rmSync.bind(fs);
+      let guest: childProcess.ChildProcess | undefined;
+      let killGuest: (() => void) | undefined;
+      let guestExited = false; let guestClosed = false; let removals = 0;
+      let restoreCleanup: (() => void) | undefined;
+      if (holdGuestExit) {
+        const spawn = vi.mocked(childProcess.spawn).getMockImplementation()!;
+        const kill = process.kill.bind(process);
+        vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+          // Model slow Windows termination, not a held pipe after process exit.
+          if (guest?.pid && pid === -guest.pid && signal === "SIGKILL") return true;
+          return kill(pid, signal);
+        });
+        vi.mocked(childProcess.spawn).mockImplementation(((...args: Parameters<typeof childProcess.spawn>) => {
+          if (Array.isArray(args[1]) && args[1].includes("-I")) {
+            const argv = [...args[1]]; const source = argv.indexOf("-c") + 1;
+            argv[source] = "import atexit, time; atexit.register(time.sleep, 10)\n" + argv[source];
+            args[1] = argv;
+            expect(args[2]?.cwd).toBe(state.root);
+            guest = spawn(...args);
+            guest.once("exit", () => { guestExited = true; });
+            guest.once("close", () => { guestClosed = true; });
+            const terminate = guest.kill.bind(guest);
+            killGuest = () => { terminate("SIGKILL"); };
+            vi.spyOn(guest, "kill").mockReturnValue(true);
+            return guest;
+          }
+          return spawn(...args);
+        }) as typeof childProcess.spawn);
+        const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+          if (String(target) === state.root) {
+            removals++;
+            if (!guestExited) {
+              // Linux permits cwd removal. Inject the Windows failure only while
+              // the recorded real child is alive; retries cannot release its cwd.
+              for (let retry = 0; retry <= (options?.maxRetries ?? 0); retry++) kill(guest!.pid!, 0);
+              throw Object.assign(new Error(`Injected Windows EBUSY: live CPython guest ${guest!.pid} holds cwd ${state.root} after ${(options?.maxRetries ?? 0) + 1} attempts`), { code: "EBUSY" });
+            }
+            expect(guestClosed).toBe(true);
+          }
+          return rm(target, options);
+        });
+        restoreCleanup = () => cleanup.mockRestore();
+      }
       const original = ActorDirectory.prototype.create;
       vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
         const actor = await original.apply(this, args); state.entered.resolve(); await state.release.promise; return actor;
@@ -1219,10 +1265,30 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
             ? `${call.replace(/^await /, "")}\nawait tools.call(ref="probe.ready", args={})\nreturn "guest ended"`
             : `void ${call.replace(/^await /, "")}; await tools.call({ref:"probe.ready",args:{}}); return "guest ended";`;
         const result = await run(code); expect(result.success).toBe(false); expect(result.value).toBeUndefined();
+        if (holdGuestExit) {
+          expect(guest?.pid).toBeDefined(); expect(guestExited).toBe(false); expect(guestClosed).toBe(false);
+          expect(process.kill(guest!.pid!, 0)).toBe(true);
+        }
         const decisions = decisionsFor(state); expect(decisions).toHaveLength(1); assertReceipts(result.error, decisions);
         state.release.resolve(); await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
         expect(new ActorRegistryStore(state.config.actorRoot).records()).toHaveLength(1);
-      } finally { clearTimeout(releaseTimer); state.release.resolve(); await main.close(); await state.close(); }
+      } finally {
+        clearTimeout(releaseTimer); state.release.resolve();
+        // Hold the actual child beyond both the runtime's 250 ms reap grace and
+        // the harness's 375 ms recursive-rm retry window, then confirm its close.
+        const killTimer = holdGuestExit ? setTimeout(() => killGuest?.(), 1_000) : undefined;
+        try {
+          // A runtime result is not an exit barrier once its bounded reap grace
+          // expires. Observe the owned guest's real close before deleting its cwd.
+          await trace?.waitForGuests();
+          await main.close(); await state.close();
+          if (holdGuestExit) { expect(removals).toBe(1); expect(guestExited).toBe(true); expect(guestClosed).toBe(true); }
+        } finally {
+          clearTimeout(killTimer); killGuest?.(); await trace?.waitForGuests();
+          restoreCleanup?.();
+          if (holdGuestExit) rm(state.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+        }
+      }
     });
   }
   for (const engine of engines) for (const ending of ["abort", "deadline", "failure"] as const) {

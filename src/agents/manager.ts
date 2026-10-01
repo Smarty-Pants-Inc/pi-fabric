@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertFabricModelAllowed } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import {
@@ -716,6 +717,15 @@ export class AgentManager {
     }
   }
 
+  defaultModel(runner: FabricAgentRunner = this.config.runner): string | undefined {
+    return runner === "claude" ? this.config.claude.model
+      : runner === "veda" ? this.config.veda.model : this.config.model;
+  }
+
+  assertModelAllowed(model: string | undefined): void {
+    assertFabricModelAllowed(model, this.config);
+  }
+
   async #prepareModel(model: string | undefined): Promise<string | undefined> {
     if (!this.#preparePiModel) return model;
     const key = model?.trim() || "<session-default>";
@@ -868,13 +878,8 @@ export class AgentManager {
     const tools = this.#childTools(request, runner, requiresFabricKernel);
     if (runner === "claude") mapClaudeTools(tools);
     if (runner === "veda") mapVedaTools(tools);
-    let model =
-      request.model ??
-      (runner === "claude"
-        ? this.config.claude.model
-        : runner === "veda"
-          ? this.config.veda.model
-          : this.config.model);
+    let model = request.model?.trim() || this.defaultModel(runner);
+    this.assertModelAllowed(model);
     if (runner === "claude" && model) normalizeClaudeModel(model);
     if (runner === "veda" && model) normalizeVedaModel(model);
     if (this.#budget) {
@@ -903,6 +908,7 @@ export class AgentManager {
     const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
       try {
         if (runner === "pi") model = await this.#prepareModel(model);
+        this.assertModelAllowed(model);
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();

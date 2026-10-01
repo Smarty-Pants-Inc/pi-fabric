@@ -72,6 +72,9 @@ const usage = {
 };
 
 const visiblePiModels = [
+  { provider: "cliproxyapi", id: "gpt-6.1-sol" },
+  { provider: "cliproxyapi", id: "gpt-6-astra" },
+  { provider: "cliproxyapi", id: "gpt-6-sol" },
   { provider: "anthropic", id: "executor", name: "Executor" },
   { provider: "anthropic", id: "frontier", name: "Frontier" },
   { provider: "provider", id: "project" },
@@ -81,6 +84,66 @@ const visiblePiModels = [
   { provider: "provider", id: "model-a" },
   { provider: "provider", id: "model-b" },
 ];
+
+describe("fleet model policy (#2490)", () => {
+  const policy = { model: "cliproxyapi/gpt-6-astra", thinking: "low" as const, deniedModels: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" };
+  it.each(["actor", "agent"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
+    const { provider, agents, actors } = setup([], [], undefined, {
+      identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
+      agentsConfig: policy, callerThinking: "max",
+    });
+    const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
+    const child = await provider.invoke("spawn", { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
+    await agents.wait(child.id);
+    const actor = await provider.invoke("create", { name: "nested", instructions: "review" }, parentContext) as FabricActorInfo;
+    expect(actors.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
+  });
+  it.each(["spawn", "create"])("%s refuses explicit, alias, inherited and default denied models before creation", async (action) => {
+    const { provider, agents, actors, globalActors } = setup([], [], undefined, { agentsConfig: policy, modelsConfig: { aliases: { review: { targets: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6.1-sol"] } } } });
+    const args = action === "spawn" ? { task: "review" } : { name: "review", instructions: "review" };
+    for (const model of ["cliproxyapi/gpt-6-astra", " CLIPROXYAPI/GPT-6-SOL ", "review", "gpt-6-astra", undefined]) {
+      await expect(provider.invoke(action, { ...args, ...(model ? { model } : {}) }, context)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", message: expect.stringMatching(/#2236.*cliproxyapi\/gpt-6\.1-sol/) });
+    }
+    const inherited = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6-astra" } } as unknown as ExtensionContext };
+    await expect(provider.invoke(action, args, inherited)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    if (action === "create") await expect(provider.invoke(action, { ...args, scope: "global", model: "review" }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
+    expect(globalActors.list()).toEqual([]);
+  });
+  it("refuses denied unavailable keys before registry refresh, fuzzy fallback or durable admission", async () => {
+    const { provider, agents, actors } = setup([], [], undefined, { agentsConfig: policy });
+    const refresh = vi.fn();
+    const noDeniedModels = { ...context, extensionContext: {
+      modelRegistry: { getAvailable: () => [visiblePiModels[0]!], refresh },
+    } as unknown as ExtensionContext };
+    await expect(provider.invoke("spawn", { task: "review", model: "cliproxyapi/gpt-6-astra", residency: "durable" }, noDeniedModels)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    await expect(provider.invoke("create", { name: "review", instructions: "review", model: "cliproxyapi/gpt-6-astra", residency: "durable" }, noDeniedModels)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(refresh).not.toHaveBeenCalled();
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
+  });
+  it.each(["spawn", "create"])("%s admits an allowed explicit override of a denied default", async (action) => {
+    const { provider, agents } = setup([], [], undefined, { agentsConfig: policy });
+    const args = action === "spawn" ? { task: "review", transport: "process" } : { name: "review", instructions: "review" };
+    const result = await provider.invoke(action, { ...args, model: "cliproxyapi/gpt-6.1-sol" }, context) as AgentHandleInfo;
+    expect(result.model).toBe("cliproxyapi/gpt-6.1-sol");
+    if (action === "spawn") await agents.wait(result.id);
+  });
+  it("refuses denied actor setters, global setters and Main switches", async () => {
+    const switchModel = vi.fn(async () => ({ ok: true }));
+    const { provider, actors } = setup([], [], undefined, { agentsConfig: policy, switchModel });
+    const actor = await provider.invoke("create", { name: "review", instructions: "review", model: "cliproxyapi/gpt-6.1-sol" }, context) as FabricActorInfo;
+    const global = await provider.invoke("create", { name: "template", instructions: "review", scope: "global", model: "cliproxyapi/gpt-6.1-sol" }, context) as FabricActorInfo;
+    for (const scope of ["session", "project", "global"]) {
+      await expect(provider.invoke("setModel", { id: scope === "global" ? global.id : actor.id, scope, model: "CLIPROXYAPI/GPT-6-ASTRA" }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    }
+    await expect(provider.invoke("switchModel", { model: "gpt-6-astra" }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(switchModel).not.toHaveBeenCalled();
+    expect(actors.definition(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+  });
+});
 
 const visibleModelRegistry = {
   getAvailable: () => visiblePiModels,
@@ -105,6 +168,7 @@ const setup = (
   options?: {
     identity?: MeshIdentity;
     switchModel?: FabricMainAgentTarget["switchModel"];
+    callerThinking?: string;
     modelsConfig?: FabricModelsConfig;
     agentsConfig?: Partial<FabricAgentConfig>;
     workerPath?: string;
@@ -231,6 +295,7 @@ const setup = (
     undefined,
     undefined,
     () => options?.modelsConfig ?? DEFAULT_FABRIC_CONFIG.models,
+    () => options?.callerThinking,
   );
   return {
     root,

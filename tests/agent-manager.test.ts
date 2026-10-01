@@ -119,6 +119,26 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
+describe("AgentManager fleet model admission (#2490)", () => {
+  it.each(["explicit", "default", "resolved"])("refuses a denied %s before creating a child", async (source) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-policy-"));
+    roots.push(root);
+    const denied = "cliproxyapi/gpt-6-astra";
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...(source === "default" ? { model: denied } : {}), deniedModels: [denied], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: async (model) => source === "resolved" ? denied : model,
+    });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "review", ...(source === "explicit" ? { model: " CLIPROXYAPI/GPT-6-ASTRA " } : {}) })).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", model: denied, replacement: "cliproxyapi/gpt-6.1-sol" });
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+    } finally { launch.mockRestore(); }
+  });
+});
+
 describe("AgentManager", () => {
   it("F1 tracked retention retries the full failed save before collection, without pinning session or actor runs", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-save-fault-"));

@@ -98,6 +98,21 @@ return results.map(result => result.status === "fulfilled"
   : { ok: false, error: String(result.reason) });
 ```
 
+### Parent inheritance and fleet model policy
+
+Without an explicit `model`, Pi children and live actors inherit the spawning run's **actual admitted model and thinking**, ahead of `agents.model` / `agents.thinking`. This includes actor/task parents, not just Main. Explicit model/effort choices still win; a different runner does not inherit a Pi model. Global actor templates retain deferred inheritance until import.
+
+The trusted host's `<agentDir>/fabric.json` can set:
+
+```json
+{ "agents": {
+  "deniedModels": ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"],
+  "deniedModelReplacement": "cliproxyapi/gpt-6.1-sol"
+} }
+```
+
+These policy keys are ignored in project/workspace `.pi/fabric.json`, even in trusted projects. The default deny-list is empty. Fabric checks requested selectors and canonical selections case-insensitively, including aliases, inherited models and defaults, before spawn/create or model-setter mutation. A denial raises `FabricModelDeniedError` (`code: "FABRIC_MODEL_DENIED"`), names #2236 and the configured replacement, and never silently falls back to another model. Deploy the host policy to enforce the fleet list; rebuilding does not retroactively change existing workers.
+
 ### Requested models are authoritative
 
 For Pi workers, Fabric reapplies the resolved `provider/model` over RPC **after startup extensions finish**, reapplies the requested thinking level, and independently reads `get_state` before sending the task. A successful `set_model` response alone is insufficient: it can echo the requested model even when an extension switches away during `model_select`. Thinking is reported at Pi's effective, capability-clamped level.

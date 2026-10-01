@@ -1238,3 +1238,4 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 export * from "./audit/index.js";
 export * from "./entropy/index.js";
 export * from "./protocol.js";
+export { FabricModelDeniedError } from "./core/model-policy.js";

@@ -566,7 +566,10 @@ export class ActorManager {
     });
     const pythonRuntime = kernel ? this.agents.resolvePythonRuntime(request.pythonRuntime) : undefined;
     const requestedModel = typeof request.model === "string" ? request.model.trim() : "";
-    const model = requestedModel ? await this.#resolvedModel(runner, requestedModel) : undefined;
+    const effectiveModel = requestedModel || this.agents.defaultModel(runner);
+    const admittedModel = effectiveModel ? await this.#resolvedModel(runner, effectiveModel) : undefined;
+    // No binding keeps actor defaults dynamic, but must still admit the current default.
+    const model = requestedModel ? admittedModel : undefined;
     const requirements = normalizeCapabilityRequirements(request.requires);
     if (requirements.length > 0 && !this.#acquireCapabilityView) {
       throw new Error("This Fabric host cannot commit actor capability requirements");
@@ -737,10 +740,16 @@ export class ActorManager {
     if (scope === "session") this.#syncActorsFromRegistry();
     const actor = scope === "session" ? this.#requireActor(id) : this.#requireOwnedActor(id);
     const resolved = next
-      ? scope === "project" || this.#canManage(actor.id)
+      ? scope === "project" || this.#canManage(actor.id) || this.agents.config.deniedModels.length > 0
         ? await this.#resolvedModel(actor.runner, next)
         : next
       : undefined;
+    this.agents.assertModelAllowed(resolved);
+    if (!resolved) {
+      const fallback = scope === "session" ? actor.model ?? this.agents.defaultModel(actor.runner)
+        : this.agents.defaultModel(actor.runner);
+      if (fallback) await this.#resolvedModel(actor.runner, fallback);
+    }
     // Fence after model refresh and (for session scope) binding-lock acquisition.
     if (scope === "session") {
       await this.#bindings.setModel(actor.id, resolved, beforeCommit);
@@ -3427,9 +3436,10 @@ export class ActorManager {
   }
 
   #resolvedModel(runner: FabricAgentRunner, model: string): string | Promise<string> {
-    return runner === "pi" && this.#resolvePiModel
-      ? this.#resolvePiModel(model)
-      : model;
+    this.agents.assertModelAllowed(model);
+    const resolved = runner === "pi" && this.#resolvePiModel ? this.#resolvePiModel(model) : model;
+    const admit = (key: string): string => { this.agents.assertModelAllowed(key); return key; };
+    return resolved instanceof Promise ? resolved.then(admit) : admit(resolved);
   }
 
   #resolvedRunBinding(

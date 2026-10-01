@@ -660,6 +660,7 @@ export class FabricRuntimeState {
         registry: context.modelRegistry,
         aliases: modelsConfig.aliases,
         defaultModel,
+        policy: agentConfig,
       });
       const model = visiblePiModels().find(
         (candidate) =>
@@ -912,6 +913,7 @@ export class FabricRuntimeState {
       this.#residency,
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
+      () => this.pi.getThinkingLevel(),
     );
     this.#agentsProvider = agentsProvider;
     this.#control.start((command, from, signal, verification) =>

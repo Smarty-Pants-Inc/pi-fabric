@@ -92,6 +92,38 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ActorManager fleet model policy (#2490)", () => {
+  it("refuses denied aliases in a foreign actor's caller-local session setter", async () => {
+    let owns = true;
+    const { actors } = setup(false, () => owns, undefined, {
+      resolvePiModel: (model) => model === "bad-alias" ? "cliproxyapi/gpt-6-astra" : model,
+    }, {}, { deniedModels: ["cliproxyapi/gpt-6-astra"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" });
+    const actor = await actors.create({ name: "foreign", instructions: "Review.", model: "cliproxyapi/gpt-6.1-sol" });
+    owns = false;
+    await expect(actors.setModel(actor.id, "bad-alias")).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(actors.status(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+  });
+  const denied = "cliproxyapi/gpt-6-astra";
+  const policy = { deniedModels: [denied], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol", model: denied };
+  it("refuses an explicit or default denied actor before registry mutation", async () => {
+    const { actors } = setup(false, undefined, undefined, undefined, {}, policy);
+    for (const model of [denied, undefined]) {
+      await expect(actors.create({ name: "review", instructions: "review", ...(model ? { model } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    }
+    expect(actors.list()).toEqual([]);
+  });
+  it("validates canonical model resolutions and both setter scopes", async () => {
+    const { actors } = setup(false, undefined, undefined, { resolvePiModel: (model) => model === "bad-alias" ? denied : model }, {}, policy);
+    await expect(actors.create({ name: "bad", instructions: "review", model: "bad-alias" })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    const actor = await actors.create({ name: "good", instructions: "review", model: "cliproxyapi/gpt-6.1-sol" });
+    for (const scope of ["session", "project"] as const) {
+      await expect(actors.setModel(actor.id, "bad-alias", scope)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      await expect(actors.setModel(actor.id, " CLIPROXYAPI/GPT-6-ASTRA ", scope)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    }
+    expect(actors.definition(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+  });
+});
+
 describe("ActorManager closing ingress", () => {
   it("P2-1 rejects tell while closing rather than accepting memory-only work", async () => {
     const { actors } = setup(true);

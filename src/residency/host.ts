@@ -299,6 +299,7 @@ export class ResidentHost {
         aliases: normalizeModelAliases(state?.aliases),
         defaultModel: state?.defaultModel,
         snapshot,
+        policy: config.agents,
       });
       return `${resolved.provider}/${resolved.id}`;
     };

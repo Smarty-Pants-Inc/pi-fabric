@@ -27,6 +27,7 @@ import {
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
   RESIDENT_HOST_FORMAT,
+  RESIDENT_ACTOR_COMMAND_FORMAT,
   isResidentHostId,
   residentDeliveryPrefix,
   residentHostId,
@@ -305,7 +306,7 @@ export class ResidencyClient {
     if (mutation.operation === "setTools") assertResidentActorToolCeiling(mutation.tools, caller.toolCeiling);
     if (!this.#liveOwner()) throw new Error("Root resident host is not live");
     const response = await this.#command({
-      ...mutation, caller, format: RESIDENT_HOST_FORMAT, requestId: randomUUID(),
+      ...mutation, caller, format: RESIDENT_ACTOR_COMMAND_FORMAT, requestId: randomUUID(),
       rootId: this.options.config.rootId, createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Resident host returned no actor from setter");
@@ -315,7 +316,7 @@ export class ResidencyClient {
   async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
     if (!this.#liveOwner()) throw new Error("Root resident host is not live");
     const response = await this.#command({
-      format: RESIDENT_HOST_FORMAT, operation: "actorStatus", id,
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actorStatus", id,
       requestId: randomUUID(), rootId: this.options.config.rootId, createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Resident host returned no actor status");
@@ -325,7 +326,7 @@ export class ResidencyClient {
   async actors(signal?: AbortSignal): Promise<FabricActorInfo[]> {
     if (!this.#liveOwner()) throw new Error("Root resident host is not live");
     const response = await this.#command({
-      format: RESIDENT_HOST_FORMAT, operation: "actors", requestId: randomUUID(),
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actors", requestId: randomUUID(),
       rootId: this.options.config.rootId, createdAt: Date.now(),
     }, signal);
     if (!response.actors) throw new Error("Resident host returned no actors");

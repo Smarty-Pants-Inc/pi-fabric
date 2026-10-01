@@ -17,7 +17,9 @@ process.on("message", async (message) => {
   try {
     // Explicitly stop only this fixture actor: a progress-making turn otherwise
     // survives close until the legacy host's 30s shutdown grace expires.
-    if (actor) await host.actors.stop(actor.id).catch(() => undefined);
+    if (actor) {
+      try { await host.actors.stop(actor.id); } catch { /* A destructive legacy command may already have removed it. */ }
+    }
     // Legacy stop aborts observation but can detach a progress-making worker.
     // Join the fixture agent manager too, before waiting on the host drain.
     await host.agents.close();
@@ -28,14 +30,21 @@ process.on("message", async (message) => {
   catch (error) { console.error(error); process.exitCode = 1; process.disconnect(); }
 });
 try {
-  await host.start();
-  actor = await host.actors.create({ name: "mixed-release", instructions: "Original", residency: "durable", scope: "project", coalesce: false }, { asRegistryOwner: true });
-  host.actors.tell(actor.id, "HANG_WITH_PROGRESS");
-  await waitFor(() => host.actors.status(actor.id).status === "running");
-  host.actors.tell(actor.id, "queued-mailbox-one");
-  host.actors.tell(actor.id, "queued-mailbox-two");
-  await waitFor(() => host.actors.status(actor.id).queued === 2);
-  process.send({ actor });
+  if (process.argv[4] === "recover") {
+    const registry = JSON.parse(fs.readFileSync(config.actorRoot + "/actors.json", "utf8"));
+    actor = registry.actors[0];
+    await host.start();
+    process.send({ actor: host.actors.listOwned().find(candidate => candidate.id === actor.id) });
+  } else {
+    await host.start();
+    actor = await host.actors.create({ name: "mixed-release", instructions: "Original", residency: "durable", scope: "project", coalesce: false }, { asRegistryOwner: true });
+    host.actors.tell(actor.id, "HANG_WITH_PROGRESS");
+    await waitFor(() => host.actors.status(actor.id).status === "running");
+    host.actors.tell(actor.id, "queued-mailbox-one");
+    host.actors.tell(actor.id, "queued-mailbox-two");
+    await waitFor(() => host.actors.status(actor.id).queued === 2);
+    process.send({ actor });
+  }
 } catch (error) {
   console.error(error);
   await host.close();

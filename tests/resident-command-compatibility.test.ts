@@ -11,7 +11,8 @@ import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
-import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { RESIDENT_COMMANDS, RESIDENT_HOST_FORMAT, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { launchLog, stopAllOwned } from "./helpers/owned-processes.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 
 // CI can supply a pinned prior release; local rollout probes use installed B70.
@@ -104,6 +105,127 @@ describe.skipIf(!fs.existsSync(legacyHost))("real B70 mixed-release resident com
       fs.rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+describe("rollback-safe resident actor command envelopes", () => {
+  it.each((["Main", "proxy"] as const).flatMap(clientKind =>
+    [...operations, "actors", "setActivationFilter"].map(operation => [clientKind, operation] as const)))
+  ("%s persists %s with a format B70 rejects", async (clientKind, operation) => {
+    const { root, config } = fixture();
+    const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 1_000 });
+    participants.registerSource(() => [{ format: 1, id: identity.id, kind: "root", rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id,
+      name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host", capabilities: ["fabric"], cwd: config.cwd, sessionId: config.sessionId,
+      startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1" }]);
+    await participants.start();
+    const main = new ResidencyClient({ config, mesh, participants, mainAgent: { id: identity.id, local: true } as FabricMainAgentTarget });
+    const client = clientKind === "Main" ? main : new ResidentActorClient(config.meshRoot, config.rootId);
+    const abort = new AbortController();
+    let result: Promise<unknown> | undefined;
+    try {
+      // Publish a live owner that can write but deliberately never consumes a
+      // request. This isolates each real writer's wire format from host parsing.
+      fs.mkdirSync(path.join(config.residencyRoot, "requests"), { recursive: true });
+      fs.writeFileSync(path.join(config.residencyRoot, "owner.json"), JSON.stringify({
+        format: 1, rootId: config.rootId, hostId: residentHostId(config.rootId), pid: process.pid,
+        startedAt: Date.now(), readyAt: Date.now(), commands: RESIDENT_COMMANDS,
+      }));
+      const id = "actor-wire-format";
+      const caller = { identity, hostId: identity.id };
+      result = (operation === "actorStatus" ? client.actorStatus(id, abort.signal) :
+        operation === "actors" ? client.actors(abort.signal) : client.setActor(
+          operation === "setInstructions" ? { operation, id, instructions: "Changed" } :
+          operation === "setModel" ? { operation, id, model: "fixture/visible", scope: "project" } :
+          operation === "setThinking" ? { operation, id, thinking: "high", scope: "project" } :
+          operation === "setActivationFilter" ? { operation, id, activationFilter: null } :
+          { operation: "setTools", id, tools: ["read"] }, abort.signal, caller)).catch(error => error);
+      const requests = path.join(config.residencyRoot, "requests");
+      expect(fs.readdirSync(requests)).toHaveLength(1);
+      const envelope = JSON.parse(fs.readFileSync(path.join(requests, fs.readdirSync(requests)[0]!), "utf8"));
+      expect(envelope).toMatchObject({ format: 2, operation, rootId: config.rootId });
+      expect(config.format).toBe(1);
+      expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "owner.json"), "utf8")).format).toBe(1);
+      abort.abort();
+      expect(await result).toMatchObject({ message: expect.stringContaining("aborted") });
+      expect(fs.readdirSync(requests)).toEqual([]);
+    } finally {
+      abort.abort();
+      await result;
+      await main.close(); await participants.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!fs.existsSync(legacyHost) || !fs.existsSync(path.resolve("dist/residency/host.js")))("real B70 rollback recovery of unclaimed current-release commands", () => {
+  it.each([...operations, "actors", "setActivationFilter"] as const)("rejects persisted %s after SIGKILL without removing identity, registry or queued mailbox", async operation => {
+    const { root, config, configPath } = fixture();
+    const launches = launchLog(root);
+    let output = "";
+    let legacy: ChildProcess | undefined;
+    const current = fork(path.resolve("tests/fixtures/crash-resident-host.mjs"), [path.resolve("dist/residency/host.js"), configPath, operation], {
+      env: { ...process.env, ...launches.env }, stdio: ["ignore", "pipe", "pipe", "ipc"],
+    });
+    current.stdout?.on("data", data => { output += String(data); }); current.stderr?.on("data", data => { output += String(data); });
+    try {
+      const exit = await Promise.race([once(current, "exit"), delay(15_000).then(() => { throw new Error(`Current host crash timeout: ${output}`); })]);
+      expect(exit, output).toEqual([null, "SIGKILL"]);
+      const requestDir = path.join(config.residencyRoot, "requests");
+      const requestFiles = fs.readdirSync(requestDir);
+      expect(requestFiles).toHaveLength(1);
+      expect(fs.readdirSync(path.join(config.residencyRoot, "processing"))).toEqual([]);
+      const envelope = JSON.parse(fs.readFileSync(path.join(requestDir, requestFiles[0]!), "utf8"));
+      expect(envelope.operation).toBe(operation);
+      const registryPath = path.join(config.actorRoot, "actors.json");
+      const beforeRegistry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+      const actor = beforeRegistry.actors[0];
+      const actorDir = path.join(config.actorRoot, actor.id);
+      const queues = () => !fs.existsSync(actorDir) ? [] : fs.readdirSync(actorDir).filter(file => file.startsWith("queue-")).flatMap(file =>
+        JSON.parse(fs.readFileSync(path.join(actorDir, file), "utf8")).items);
+      const beforeItems = queues();
+      const mailbox = beforeItems.filter((item: { payload: { message: string } }) => item.payload.message.startsWith("queued-mailbox-"));
+      expect(mailbox.map((item: { payload: { message: string } }) => item.payload.message)).toEqual(["queued-mailbox-one", "queued-mailbox-two"]);
+      // The host crashed, not its detached worker. Stop only recorded fixture
+      // descendants before rollback; normal actor recovery must restore the queue.
+      await stopAllOwned(launches.owned(), 2_000, 2_000);
+      legacy = fork(path.resolve("tests/fixtures/legacy-resident-host.mjs"), [legacyHost, configPath, "recover"], {
+        env: { ...process.env, ...launches.env }, stdio: ["ignore", "pipe", "pipe", "ipc"],
+      });
+      legacy.stdout?.on("data", data => { output += String(data); }); legacy.stderr?.on("data", data => { output += String(data); });
+      const recovered = await Promise.race([
+        once(legacy, "message").then(([message]) => message as { actor?: FabricActorInfo }),
+        once(legacy, "exit").then(([code]) => { throw new Error(`B70 exited ${code}: ${output}`); }),
+        delay(15_000).then(() => { throw new Error(`B70 recovery timeout: ${output}`); }),
+      ]);
+      const response = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "responses", `${envelope.requestId}.json`), "utf8"));
+      expect.soft(response, `${operation}: ${output}`).toMatchObject({ ok: false, error: "Invalid Fabric residency request" });
+      expect.soft(recovered.actor).toMatchObject({ id: actor.id, name: actor.name, rootId: actor.rootId, residency: "durable" });
+      const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+      expect.soft(registry.actors).toHaveLength(beforeRegistry.actors.length);
+      // Recovery legitimately updates running status, timestamps and run history,
+      // but must not rewrite identity or any of the actor's persistent settings.
+      const settings = ({ status: _status, updatedAt: _updatedAt, lastRunId: _lastRunId,
+        messages: _messages, runnerSessionId: _runnerSessionId, ...entry }: Record<string, unknown>) => entry;
+      expect.soft(registry.actors.map(settings)).toEqual(beforeRegistry.actors.map(settings));
+      expect.soft(registry.actors[0]?.removal).toBeUndefined();
+      const afterItems = queues();
+      // B70 retries recovered deliveries and predates bindingVersion. Preserve
+      // every queued message's identity/content/order, not retry bookkeeping.
+      const queuedMessages = (items: typeof beforeItems) => items
+        .filter((item: { payload: { message: string } }) => item.payload.message.startsWith("queued-mailbox-"))
+        .map((item: { id: string; payload: unknown }) => ({ id: item.id, payload: item.payload }));
+      expect.soft(queuedMessages(afterItems)).toEqual(queuedMessages(mailbox));
+      expect(fs.readdirSync(requestDir)).toEqual([]);
+      expect(fs.readdirSync(path.join(config.residencyRoot, "processing"))).toEqual([]);
+    } finally {
+      try { if (legacy) await stop(legacy, () => output); }
+      finally {
+        await stopAllOwned(launches.owned(), 2_000, 2_000);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  }, 40_000);
 });
 
 describe("strict resident command parser", () => {

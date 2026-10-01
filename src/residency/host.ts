@@ -26,6 +26,7 @@ import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
   RESIDENT_HOST_FORMAT,
+  RESIDENT_ACTOR_COMMAND_FORMAT,
   ResidentActorAuthorizationError,
   ResidentCommandUnsupportedError,
   RESIDENT_COMMANDS,
@@ -735,7 +736,7 @@ export class ResidentHost {
     let response: ResidentCommandResponse;
     try {
       if (
-        command?.format !== RESIDENT_HOST_FORMAT ||
+        (command?.format !== RESIDENT_HOST_FORMAT && command?.format !== RESIDENT_ACTOR_COMMAND_FORMAT) ||
         command.rootId !== this.config.rootId ||
         command.requestId !== requestId
       ) {

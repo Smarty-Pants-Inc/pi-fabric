@@ -13,6 +13,7 @@ import {
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
   RESIDENT_HOST_FORMAT,
+  RESIDENT_ACTOR_COMMAND_FORMAT,
   residentHostStateNote,
   residentRoot,
   sleepUnlessAborted,
@@ -74,7 +75,7 @@ export class ResidentActorClient {
     if (this.#toolCeiling !== undefined && caller) caller = { ...caller, toolCeiling: [...this.#toolCeiling] };
     if (mutation.operation === "setTools") assertResidentActorToolCeiling(mutation.tools, caller?.toolCeiling);
     const response = await this.#send({
-      ...mutation, ...(caller ? { caller } : {}), format: RESIDENT_HOST_FORMAT, requestId: randomUUID(),
+      ...mutation, ...(caller ? { caller } : {}), format: RESIDENT_ACTOR_COMMAND_FORMAT, requestId: randomUUID(),
       rootId: this.#rootId, createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Resident host returned no actor from setter");
@@ -83,7 +84,7 @@ export class ResidentActorClient {
 
   async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
     const response = await this.#send({
-      format: RESIDENT_HOST_FORMAT, operation: "actorStatus", id,
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actorStatus", id,
       requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Resident host returned no actor status");
@@ -92,7 +93,7 @@ export class ResidentActorClient {
 
   async actors(signal?: AbortSignal): Promise<FabricActorInfo[]> {
     const response = await this.#send({
-      format: RESIDENT_HOST_FORMAT, operation: "actors", requestId: randomUUID(),
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actors", requestId: randomUUID(),
       rootId: this.#rootId, createdAt: Date.now(),
     }, signal);
     if (!response.actors) throw new Error("Resident host returned no actors");

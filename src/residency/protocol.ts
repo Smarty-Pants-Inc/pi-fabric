@@ -99,6 +99,11 @@ export const residentHostStateNote = (residencyRoot: string, now = Date.now()): 
 };
 
 export const RESIDENT_HOST_FORMAT = 1 as const;
+// Only command envelopes for post-B70 registry operations use format 2.
+// B70 validates format before dispatch and otherwise treats unknown operations
+// as removeActor: an unclaimed request MUST remain safe across crash/rollback.
+// Keep host config, owner records, responses and the five legacy commands at 1.
+export const RESIDENT_ACTOR_COMMAND_FORMAT = 2 as const;
 const RESIDENT_DELIVERY_PREFIX = "residency/deliveries/";
 
 const digest = (value: string): string =>
@@ -259,14 +264,14 @@ export type ResidentActorMutation =
 
 type ResidentActorMutationCommand = ResidentActorMutation & {
   caller?: ResidentActorCaller;
-  format: typeof RESIDENT_HOST_FORMAT;
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
   requestId: string;
   rootId: string;
   createdAt: number;
 };
 
 interface ResidentActorStatusCommand {
-  format: typeof RESIDENT_HOST_FORMAT;
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
   operation: "actorStatus" | "actors";
   requestId: string;
   rootId: string;

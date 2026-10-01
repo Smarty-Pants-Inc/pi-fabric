@@ -6,6 +6,9 @@ import { ActorManager } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { deliverActorToMain } from "../src/actors/main-delivery.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // smarty-dev#1439: a long-lived actor's session grows until compaction fails. resetSession
 // and actors.maxSessionBytes start its next run on a fresh session and keep its mailbox.
@@ -23,7 +26,11 @@ const waitFor = async (predicate: () => boolean, timeoutMs = process.env.CI ? 10
 
 interface SessionRun { task: string; prior: string[] }
 
-const setup = (options: { maxSessionBytes?: number; canManageActor?: (id: string) => boolean | undefined } = {}) => {
+const setup = (options: {
+  maxSessionBytes?: number;
+  canManageActor?: (id: string) => boolean | undefined;
+  resolvePiModel?: (model: string) => string | Promise<string>;
+} = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reset-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -33,13 +40,17 @@ const setup = (options: { maxSessionBytes?: number; canManageActor?: (id: string
   });
   const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
   const deliveries: string[] = [];
-  const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, ({ message }) => {
-    if (message.text) deliveries.push(message.text);
+  const sendMessage = vi.fn();
+  const pi = { sendMessage } as unknown as ExtensionAPI;
+  const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, (request) => {
+    if (request.message.text) deliveries.push(request.message.text);
+    deliverActorToMain(pi, identity, request);
   }, {
     actorRoot: path.join(root, "actors"),
     persistent: true,
     ...(options.maxSessionBytes !== undefined ? { maxSessionBytes: options.maxSessionBytes } : {}),
     ...(options.canManageActor ? { canManageActor: options.canManageActor } : {}),
+    ...(options.resolvePiModel ? { resolvePiModel: options.resolvePiModel } : {}),
   });
   managers.push(actors, agents);
   // The fake worker appends each run's turns to its --session file, as Pi does: a run's
@@ -58,7 +69,7 @@ const setup = (options: { maxSessionBytes?: number; canManageActor?: (id: string
     return run(request, signal);
   });
   return {
-    actors, agents, runs, root, mesh, deliveries,
+    actors, agents, runs, root, mesh, deliveries, sendMessage,
     hold: () => {
       let release!: () => void;
       gate = new Promise((resolve) => { release = resolve; });
@@ -208,8 +219,56 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     } finally { spy.mockRestore(); }
   });
 
+  it.each(["halt", "close"] as const)("keeps a repair alarm passive after %s interrupts model resolution", async (operation) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let resolutions = 0;
+    const { actors, agents, mesh, deliveries, sendMessage } = setup({
+      resolvePiModel: (model) => {
+        // Creation and enqueue resolve synchronously; hold the drain's admission resolution.
+        if (++resolutions === 3) return gate.then(() => model);
+        return model;
+      },
+    });
+    const actor = await actors.create({ name: "interrupted-repair", instructions: "Work.", model: "test/actor", delivery: "mailbox", transport: "process" });
+    const orphan = '{"type":"message","id":"orphan"}\n';
+    fs.mkdirSync(path.dirname(actor.sessionFile!), { recursive: true });
+    fs.writeFileSync(actor.sessionFile!, orphan);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    // Attach the rejection handler before interrupting; settle all started work even on failure.
+    const activation = actors.ask(actor.id, "cancelled activation").then(() => undefined, (error: Error) => error);
+    let closing: Promise<void> | undefined;
+    try {
+      await waitFor(() => resolutions === 3);
+      expect(actors.inFlightCount()).toBe(1);
+      expect(launch).not.toHaveBeenCalled();
+      if (operation === "halt") expect(actors.haltAll()).toEqual({ halted: 1 });
+      else closing = actors.close();
+    } finally {
+      release();
+      await activation;
+      if (closing) await closing;
+      await waitFor(() => actors.inFlightCount() === 0);
+    }
+    expect(await activation).toBeInstanceOf(Error);
+    if (operation === "halt") expect(actors.halted).toBe(true);
+    const alarms = mesh.read({ topic: "ops.owner" }).filter((event) => event.kind === "actor.session.repaired");
+    expect(alarms).toHaveLength(1);
+    expect(alarms[0]).toMatchObject({ data: { actorId: actor.id, archived: expect.stringContaining("orphan-noheader") } });
+    const evidence = actors.messages(actor.id, 50).filter((message) => message.text?.includes("session repaired"));
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]).toMatchObject({ source: "fabric-host", data: alarms[0]!.data });
+    const archived = (alarms[0]!.data as { archived: string }).archived;
+    expect(fs.readFileSync(archived, "utf8")).toBe(orphan);
+    expect(sessionHeader(actor.sessionFile!)).toMatchObject({ type: "session", version: 3 });
+    expect(launch).not.toHaveBeenCalled();
+    expect(agents.list()).toEqual([]);
+    expect(sendMessage).not.toHaveBeenCalled(); // No Pi delivery can start a new Main turn.
+    expect(deliveries).toEqual([]);
+  });
+
   it("publishes the repair alarm once on ops.owner, including for a silent mailbox actor", async () => {
-    const { actors, mesh, deliveries } = setup();
+    const { actors, mesh, deliveries, sendMessage } = setup();
     const actor = await actors.create({ name: "alarm", instructions: "Work.", delivery: "mailbox" });
     fs.mkdirSync(path.dirname(actor.sessionFile!), { recursive: true });
     fs.writeFileSync(actor.sessionFile!, '{"type":"message","id":"orphan"}\n');
@@ -220,6 +279,8 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
     expect(alarms).toHaveLength(1);
     expect(alarms[0]).toMatchObject({ from: { id: "session:test" }, data: { actorId: actor.id, archived: expect.stringContaining("orphan-noheader") } });
     expect(deliveries.filter((text) => text.includes("session repaired"))).toHaveLength(1);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
   });
 });
 

@@ -1054,6 +1054,8 @@ export class ActorManager {
     };
     this.#recordMessage(this.#liveActor(actor), message);
     void this.mesh.publish({ topic: "ops.owner", kind: `actor.session.${outcome}`, from: this.identity, to: actor.rootId, text, data }).catch(() => undefined);
+    // Preserve the alarm above, but ESC/shutdown must not restart Main with a followUp.
+    if (this.#halted || this.#closing) return;
     // Host alarms are visible even when the actor's own delivery policy is silent/mailbox.
     try { this.onDeliver({ actor: this.#publicInfo(actor), message, delivery: "followUp", triggerTurn: true }); } catch { /* alarm remains in the mesh/message log */ }
   }

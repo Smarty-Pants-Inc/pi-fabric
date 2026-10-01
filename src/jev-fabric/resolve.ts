@@ -73,7 +73,7 @@ const unmet = (capabilities: JevFabricCapabilities, requirement: JevFabricRequir
 
 const inside = (child: string, parent: string): boolean => {
   const relative = path.relative(parent, child);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 };
 const real = (file: string): string => { try { return fs.realpathSync.native(file); } catch { return file; } };
 const executable = (file: string): boolean => {
@@ -106,15 +106,20 @@ export function userCandidates(cwd: string, env: NodeJS.ProcessEnv = process.env
   for (const directory of directories) {
     const file = path.join(directory, "jev-fabric");
     if (!executable(file)) continue;
-    const resolved = real(file);
+    let resolved: string;
+    let symlinked: boolean;
+    try {
+      resolved = fs.realpathSync.native(file);
+      symlinked = fs.lstatSync(file).isSymbolicLink() || resolved !== path.resolve(file);
+    } catch { continue; } // Unverifiable candidates must never reach capability probing.
     if (seen.has(resolved)) continue;
-    seen.add(resolved);
     if (!path.isAbsolute(directory)) skipped.push({ path: file, reason: "relative PATH entry" });
     else if (workspaces.some(workspace => inside(file, workspace) || inside(resolved, workspace))) skipped.push({ path: file, reason: "inside the workspace" });
+    else if (symlinked) skipped.push({ path: file, reason: "symlinked PATH candidate" });
     // PATH may point at a different checkout too. Automatic selection never
     // grants repository trust; an explicit trusted configuration is the opt-in.
     else if (repositoryRoot(path.dirname(file)) || repositoryRoot(path.dirname(resolved))) skipped.push({ path: file, reason: "inside a repository" });
-    else found.push(file);
+    else { seen.add(resolved); found.push(file); }
   }
   return { found, skipped };
 }

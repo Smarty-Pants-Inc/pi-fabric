@@ -9,6 +9,7 @@ import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { JevClient } from "../src/jev/client.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { JevRunInfo } from "../src/jev/types.js";
 
 describe("Main lifecycle to Jev observer integration", () => {
@@ -37,15 +38,52 @@ describe("Main lifecycle to Jev observer integration", () => {
     const launch = vi.spyOn(AgentManager.prototype, "spawn");
     const spawn = () => runtime.registry.invoke("agents.spawn", { task: "lookup", model: "auto", pinModel: "test/sol", pinThinking: "high", routeClass: "bounded-lookup", protected: false }, invocation);
     let pending: Promise<unknown> | undefined;
+    let reload: Promise<unknown> | undefined;
     try {
       await runtime.initialize(context, config); pending = spawn(); await entered;
-      await runtime.registry.invoke("components.reload", { id: "fabric.provider.jev" }, invocation);
+      let reloaded = false;
+      reload = runtime.registry.invoke("components.reload", { id: "fabric.provider.jev" }, invocation).then(result => { reloaded = true; return result; });
+      await vi.waitFor(() => expect(captured.aborted).toBe(true));
+      if (phase === "credential") {
+        await new Promise(resolve => setTimeout(resolve, 30));
+        expect(reloaded).toBe(false); // Cancellation of the waiter is not settlement of host auth.
+        expect(fetchCalls).toBe(0);
+        release();
+      }
+      await reload;
       expect(captured.aborted).toBe(true);
       expect(await pending).toMatchObject({ routeDecision: { reasonCode: "jev-error", model: "test/sol" } });
       release(); await new Promise(resolve => setTimeout(resolve, 5));
       expect(fetchCalls).toBe(phase === "credential" ? 0 : 1);
       expect(await spawn()).toMatchObject({ routeDecision: { reasonCode: "shadow-choice" } }); expect(launch).toHaveBeenCalledTimes(2);
-    } finally { release(); await pending?.catch(() => {}); await runtime.shutdown(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); fs.rmSync(cwd, { recursive: true, force: true }); }
+    } finally { release(); await reload?.catch(() => {}); await pending?.catch(() => {}); await runtime.shutdown(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  }, 20000);
+
+  it.each(["startup-retry", "resume"])("SR-3 rechecks exact availability, never the similar authenticated model, on %s", async recovery => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-pin-recovery-"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent")); vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
+    const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "high", sendMessage: vi.fn(), appendEntry: vi.fn(), on: vi.fn(() => () => {}) } as unknown as ExtensionAPI;
+    let available = [{ provider: "test", id: "sol" }];
+    const auth = vi.fn(async () => ({ ok: true, apiKey: "offline-test-only", headers: {} }));
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ model: "jev-latest", answers: { route: { type: "choice", choice: "candidate-0", confidence: 1, probabilities: { "candidate-0": 1 } } }, usage: { input_tokens: 1, output_tokens: 1 } }))));
+    const context = { cwd, hasUI: false, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+      modelRegistry: { getAvailable: () => available, refresh: vi.fn(), find: () => available[0], getApiKeyAndHeaders: auth, getProviderAuthStatus: () => ({ configured: true }), getApiKeyForProvider: async () => "offline-test-only" },
+      sessionManager: { getSessionId: () => "pin-recovery", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined }, ui: { setStatus: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    const config = normalizeFabricConfig({ fullCodeMode: true, mcp: { enabled: false }, mesh: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false }, agents: { enabled: true }, approvals: { agent: "allow", execute: "allow", read: "allow", network: "allow" } });
+    const fixture = path.join(cwd, "unused.mjs"); fs.writeFileSync(fixture, "export default {};");
+    const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: { extension: fixture, worker: path.resolve(recovery === "startup-retry" ? "tests/fixtures/fake-worker-startup-retry.mjs" : "tests/fixtures/fake-worker.mjs"), residentHost: fixture, skills: cwd } });
+    const invocation = { cwd, signal: undefined, parentToolCallId: "pin", nestedToolCallId: "pin", extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 32768 };
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await runtime.initialize(context, config);
+      const handle = await runtime.registry.invoke("agents.spawn", { task: recovery === "startup-retry" ? "Recover startup" : "RESUME_AFTER_STOP", model: "auto", pinModel: "test/sol", pinThinking: "high", routeClass: "bounded-lookup", protected: false }, invocation) as { id: string };
+      available = [{ provider: "test", id: "sol-similar" }];
+      const result = await runtime.registry.invoke("agents.wait", { id: handle.id }, invocation);
+      expect(result).toMatchObject({ error: expect.stringMatching(/Role pin.*not available/) });
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect(auth).toHaveBeenCalledTimes(1);
+      expect(auth.mock.calls[0]).toEqual([expect.objectContaining({ id: "sol" })]);
+    } finally { await runtime.shutdown(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); fs.rmSync(cwd, { recursive: true, force: true }); }
   }, 20000);
 
   it.each([false, true])("delivers real host hooks and cleans up with mesh=%s", async (mesh) => {

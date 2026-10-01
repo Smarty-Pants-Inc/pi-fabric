@@ -7,7 +7,7 @@ import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
-import { resolvePiModel } from "./core/model-refresh.js";
+import { resolvePiModel, resolvePiRoutePin } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -653,14 +653,11 @@ export class FabricRuntimeState {
       };
     };
     // Task agents and actors share one single-flight refresh per registry (smarty-dev#1830).
-    const resolveParticipantPiModel = async (selector?: string) => {
+    const resolveParticipantPiModel = async (selector?: string, exact = false) => {
       const defaultModel = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
-      const resolved = await resolvePiModel({
-        selector,
-        registry: context.modelRegistry,
-        aliases: modelsConfig.aliases,
-        defaultModel,
-      });
+      const resolved = exact
+        ? await resolvePiRoutePin({ selector: selector ?? "", registry: context.modelRegistry, aliases: {} })
+        : await resolvePiModel({ selector, registry: context.modelRegistry, aliases: modelsConfig.aliases, defaultModel });
       const model = visiblePiModels().find(
         (candidate) =>
           String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
@@ -722,8 +719,8 @@ export class FabricRuntimeState {
           keepRecentTokens: settings.keepRecentTokens,
         };
       },
-      preparePiModel: async (modelKey) => {
-        const resolved = await resolveParticipantPiModel(modelKey);
+      preparePiModel: async (modelKey, options) => {
+        const resolved = await resolveParticipantPiModel(modelKey, options?.exact);
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
@@ -971,13 +968,22 @@ export class FabricRuntimeState {
           this.#jevObservationHost = observationHost;
           // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.
           const jevRoute = resolveJevModelRoute(this.#config!.jev.model).route;
+          // Host credential lookup has no cancellation API. Own the actual promise,
+          // not just JevClient's abort race, until this component has joined it.
+          const credentialPending = new Set<Promise<unknown>>();
           const provider = new JevProvider({
             registry: this.#registry!, config: this.#config!, observationHost,
             credentialSource: {
               configured: () => context.modelRegistry.getProviderAuthStatus?.(jevRoute.providerId)?.configured ?? false,
               resolve: async (signal) => {
                 signal.throwIfAborted();
-                return context.modelRegistry.getApiKeyForProvider?.(jevRoute.providerId);
+                const pending = Promise.resolve().then(() => {
+                  signal.throwIfAborted();
+                  return context.modelRegistry.getApiKeyForProvider?.(jevRoute.providerId);
+                });
+                credentialPending.add(pending);
+                void pending.then(() => credentialPending.delete(pending), () => credentialPending.delete(pending));
+                return pending;
               },
             },
             authorize: (ref, parentToolCallId) => this.#schema!.authorize(ref, parentToolCallId),
@@ -997,7 +1003,7 @@ export class FabricRuntimeState {
             observationHost?.close();
             if (this.#jevObservationHost === observationHost) this.#jevObservationHost = undefined;
             if (this.#jevPrograms === provider.manager) this.#jevPrograms = undefined;
-            await Promise.allSettled([...owner.pending]);
+            await Promise.allSettled([...owner.pending, ...credentialPending]);
             await provider.manager.close();
           }, { label: "jev-program-owner", kind: "transactional", resources: ["jev:programs"], ordering: "ordered" });
           return provider;

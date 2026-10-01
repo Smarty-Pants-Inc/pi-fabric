@@ -284,6 +284,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   model?: string;
   thinking?: AgentRunRequest["thinking"];
   routeOutcome?: (result: AgentRunResult) => void;
+  /** Immutable authority, never replaced by participant fuzzy resolution during recovery. */
+  routePin?: Readonly<{ model: string; effort: NonNullable<AgentRunRequest["thinking"]> }>;
   actorId?: string;
   actorName?: string;
   capabilityRequirements?: string[];
@@ -509,6 +511,12 @@ const failedRecord = (
   error: string,
 ): AgentRunResult => {
   const now = Date.now();
+  const previous = readRecord(managed.statusFile) ?? managed.latestRecord;
+  const progress = managed.observedProgress;
+  const usage = { ...progress.usage };
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
+    usage[key] = Math.max(usage[key], previous?.usage[key] ?? 0);
+  }
   return {
     id: managed.id,
     name: managed.name,
@@ -522,11 +530,11 @@ const failedRecord = (
     startedAt: now,
     updatedAt: now,
     finishedAt: now,
-    turns: 0,
-    toolCalls: 0,
+    turns: Math.max(progress.turns, previous?.turns ?? 0),
+    toolCalls: Math.max(progress.toolCalls, previous?.toolCalls ?? 0),
     text: "",
     error,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    usage,
     ...(managed.model ? { model: managed.model } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
     ...(managed.latestRecord?.admittedModel ? { admittedModel: managed.latestRecord.admittedModel } : {}),
@@ -602,7 +610,7 @@ export class AgentManager {
   readonly #previousRuns = new Map<string, AgentRunResult>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #preparePiModel:
-    | ((model: string | undefined) => Promise<string | void>)
+    | ((model: string | undefined, options?: { exact: boolean }) => Promise<string | void>)
     | undefined;
   readonly #resolveHandoffCompactionBudget:
     | ((model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>)
@@ -656,7 +664,7 @@ export class AgentManager {
       /** Every terminal result, foreground or background, before its run directory can be removed. */
       onSettled?: (result: AgentRunResult) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
-      preparePiModel?: (model: string | undefined) => Promise<string | void>;
+      preparePiModel?: (model: string | undefined, options?: { exact: boolean }) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
       resolveParticipantGuidance?: AgentParticipantGuidanceResolver;
       resolveInheritedSessionPins?: () => InheritedSessionPin[] | undefined;
@@ -721,12 +729,12 @@ export class AgentManager {
     }
   }
 
-  async #prepareModel(model: string | undefined): Promise<string | undefined> {
+  async #prepareModel(model: string | undefined, exact = false): Promise<string | undefined> {
     if (!this.#preparePiModel) return model;
-    const key = model?.trim() || "<session-default>";
+    const key = `${exact ? "exact:" : "participant:"}${model?.trim() || "<session-default>"}`;
     const existing = this.#piModelPreparations.get(key);
     if (existing) return existing;
-    const preparation = this.#preparePiModel(model).then((prepared) => {
+    const preparation = (exact ? this.#preparePiModel(model, { exact: true }) : this.#preparePiModel(model)).then((prepared) => {
       if (typeof prepared !== "string") return model;
       return prepared.trim() || model;
     });
@@ -833,6 +841,7 @@ export class AgentManager {
       request.actorId || request.actorName || request.sessionSeed || request.sessionFile)) {
       throw new Error("Shadow routing is only supported for new process/Pi task sessions");
     }
+    const routePin = request.routeDecision ? Object.freeze({ ...request.routeDecision.pin }) : undefined;
     const kernel = this.resolveKernel({
       ...request,
       ...(request.recursive === true ? { extensions: true } : {}),
@@ -880,7 +889,7 @@ export class AgentManager {
     if (runner === "claude") mapClaudeTools(tools);
     if (runner === "veda") mapVedaTools(tools);
     let model =
-      request.routeDecision?.pin.model ?? request.model ??
+      routePin?.model ?? request.model ??
       (runner === "claude"
         ? this.config.claude.model
         : runner === "veda"
@@ -918,8 +927,8 @@ export class AgentManager {
     }
     const startPrepared = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
       try {
-        if (runner === "pi") model = await this.#prepareModel(model);
-        if (request.routeDecision && model !== request.routeDecision.pin.model) throw new Error("Shadow route pin changed during model preparation");
+        if (runner === "pi") model = await this.#prepareModel(model, !!routePin);
+        if (routePin && model !== routePin.model) throw new Error("Shadow route pin changed during model preparation");
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
@@ -992,7 +1001,7 @@ export class AgentManager {
           this.config.timeoutMs,
           request.timeoutMs,
         );
-        const thinking = request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking;
+        const thinking = routePin?.effort ?? request.thinking ?? this.config.thinking;
         const nice = effectiveAgentNice(this.config.nice ?? 0, request.nice);
         const recursive = runner === "pi" && request.recursive === true;
         const extensions = recursive ? true : (request.extensions ?? this.config.extensions);
@@ -1167,6 +1176,7 @@ export class AgentManager {
           ...(model ? { model } : {}),
           ...(thinking ? { thinking } : {}),
           ...(routeDispatch ? { routeOutcome: routeDispatch.outcome } : {}),
+          ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
           ...(request.capabilityRequirements
@@ -2047,7 +2057,8 @@ export class AgentManager {
   ): Promise<boolean> {
     try {
       if (managed.runner === "pi") {
-        const model = await this.#prepareModel(managed.model);
+        const model = await this.#prepareModel(managed.routePin?.model ?? managed.model, !!managed.routePin);
+        if (managed.routePin && model !== managed.routePin.model) throw new Error("Shadow route pin changed during model preparation");
         const modelIndex = managed.launch.workerArguments.indexOf("--model");
         if (model) {
           if (modelIndex >= 0) managed.launch.workerArguments[modelIndex + 1] = model;

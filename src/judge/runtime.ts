@@ -77,10 +77,14 @@ export async function judge(value: unknown, deps: JudgeDependencies, signal?: Ab
       schema: replySchema(request), replyTool: true, routeDecision: route, routeRecord: { ledger: deps.ledger, decisionRecorded: true }, nice: 10,
     }, { timeoutMs: remaining, maxTokens: request.budget.maxTokens - envelope.cost.tokens }, combined);
     envelope.cost.tokens += result.usage.input + result.usage.output + result.usage.cacheRead + result.usage.cacheWrite;
-    appendRouteRecord(deps.ledger, { type: "judgment-attempt", decisionId, backend: "pi-process", childAgentId: result.id, status: result.status, admittedModel: result.admittedModel ?? null, admittedEffort: result.admittedThinking ?? null, usage: result.usage, at: Date.now() });
+    appendRouteRecord(deps.ledger, { type: "judgment-attempt", decisionId, backend: "pi-process", childAgentId: result.id, status: result.status, admittedModel: result.admittedModel ?? null, admittedEffort: result.admittedThinking ?? null, usage: result.usage, error: result.error?.startsWith("agent_cleanup_unresolved:") ? result.error : null, at: Date.now() });
     // Jev pricing is unknown: never claim that an unpriced attempt is free.
     combined.throwIfAborted();
     if (elapsed() >= request.timeboxMs) return envelope = unknown("timeout");
+    if (result.error?.startsWith("agent_cleanup_unresolved:")) return envelope = unknown("agent_cleanup_unresolved");
+    // The worker intentionally uses timed_out for its token guard too. Preserve
+    // that explicit cause before treating timed_out as a wall-clock deadline.
+    if (/^Fabric token limit reached:/.test(result.error ?? "")) return envelope = unknown("token_budget");
     if (result.status !== "completed") return envelope = unknown(result.status === "timed_out" ? "timeout" : result.status === "stopped" ? "cancelled" : /refus/i.test(`${result.error ?? ""} ${result.text}`) ? "refusal" : /invalid|schema|structured|reply missing|fabric_reply/i.test(result.error ?? "") ? "invalid_schema" : /token/i.test(result.error ?? "") ? "token_budget" : "agent_failed");
     if (envelope.cost.tokens > request.budget.maxTokens) return envelope = unknown("token_budget");
     if (result.replyVia !== "tool") return envelope = unknown(/refus/i.test(result.text) ? "refusal" : "invalid_schema");
@@ -88,7 +92,7 @@ export async function judge(value: unknown, deps: JudgeDependencies, signal?: Ab
     return envelope = { ...envelope, ...reply, confidenceProvenance: reply.confidence === null ? "unavailable" : "agent-self-report", status: reply.verdict === "unknown" ? "unknown" : "completed", reasonCode: reply.verdict === "unknown" ? "incomplete_evidence" : "agent_accepted" };
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
-    return envelope = unknown(signal?.aborted ? "cancelled" : deadline.signal.aborted || /timeout|timed out|cancelled/i.test(message) ? "timeout" : /invalid|typed response|schema/i.test(message) ? "invalid_schema" : /refus/i.test(message) ? "refusal" : /429|529/.test(message) ? "budget_wait" : "inference_failed");
+    return envelope = unknown(signal?.aborted ? "cancelled" : /agent_cleanup_unresolved/.test(message) ? "agent_cleanup_unresolved" : deadline.signal.aborted || /timeout|timed out|cancelled/i.test(message) ? "timeout" : /invalid|typed response|schema/i.test(message) ? "invalid_schema" : /refus/i.test(message) ? "refusal" : /429|529/.test(message) ? "budget_wait" : "inference_failed");
   } finally {
     clearTimeout(timer);
     try { appendRouteRecord(deps.ledger, { type: "judgment-outcome", ...envelope, latencyMs: Math.round(elapsed()), truth: null, at: Date.now() }); }

@@ -50,6 +50,17 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     expect(events.filter(event => event.type === "fake_received").some(event => event.frame.type === "prompt")).toBe(false);
     expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null });
   });
+  it.each(["effort-downgrade", "effort-missing", "effort-malformed"])("refuses shadow effort %s before prompt without claiming admission", async scenario => {
+    const { result, rows, events } = await run(scenario);
+    expect(result).toMatchObject({ status: "failed" });
+    expect(events.filter(event => event.type === "fake_received").some(event => event.frame.type === "prompt")).toBe(false);
+    expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null });
+  });
+  it("keeps ordinary explicit-model effort clamping separate from routed admission", async () => {
+    const { result, events } = await run("effort-downgrade", false);
+    expect(result).toMatchObject({ status: "completed", thinking: "low" });
+    expect(events.filter(event => event.type === "fake_received").some(event => event.frame.type === "prompt")).toBe(true);
+  });
   it("clears parent route metadata for unrelated explicit-model tasks", async () => {
     const { result, launch } = await run("success", false);
     expect(result.status).toBe("completed");

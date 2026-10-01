@@ -220,6 +220,37 @@ describe("durable route dispatch", () => {
     expect(rows).toHaveLength(2);
     expect(rows[1]).toMatchObject({ type: "outcome", decisionId: decision.decisionId, status: "completed", admittedModel: pin.model, admittedEffort: pin.effort, tokens: { input: 1, output: 2 } });
   });
+  it.each(["startup-retry", "resume"])("refuses a substitute model on routed %s when the original pin disappears", async recovery => {
+    const dir = root();
+    const decision = await decideModelRoute(input, async () => response());
+    let preparations = 0;
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
+      workerPath: path.resolve(recovery === "startup-retry" ? "tests/fixtures/fake-worker-startup-retry.mjs" : "tests/fixtures/fake-worker.mjs"),
+      runRoot: path.join(dir, "runs"),
+      preparePiModel: async () => ++preparations === 1 ? pin.model : "test/sol-similar",
+    }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const result = await manager.run({ task: recovery === "startup-retry" ? "Recover startup" : "RESUME_AFTER_STOP", routeDecision: decision, transport: "process" });
+    expect(result.status).not.toBe("completed");
+    expect(result.error).toMatch(/pin.*changed/i);
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(preparations).toBe(2);
+    const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows.at(-1)).toMatchObject({ decisionId: decision.decisionId, admittedModel: null });
+  });
+  it.each(["startup-retry", "resume"])("allows routed %s only at the original matching pin", async recovery => {
+    const dir = root();
+    const decision = await decideModelRoute(input, async () => response());
+    const prepared = vi.fn(async () => pin.model);
+    const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true }, {
+      workerPath: path.resolve(recovery === "startup-retry" ? "tests/fixtures/fake-worker-startup-retry.mjs" : "tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"), preparePiModel: prepared,
+    }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const result = await manager.run({ task: recovery === "startup-retry" ? "Recover startup" : "RESUME_AFTER_STOP", routeDecision: decision, transport: "process" });
+    expect(result.status).toBe("completed");
+    expect(launch).toHaveBeenCalledTimes(2);
+    for (const [args] of launch.mock.calls) expect(args.workerArguments[args.workerArguments.indexOf("--model") + 1]).toBe(pin.model);
+  });
   it("dispatches pin and marks record-failed when durable state cannot be written", async () => {
     const dir = root();
     fs.writeFileSync(process.env.PI_CODING_AGENT_DIR!, "not a directory");

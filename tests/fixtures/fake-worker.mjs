@@ -24,7 +24,7 @@ if (task.includes("HANG_WITH_PROGRESS")) {
   fs.writeFileSync(statusFile, JSON.stringify({
     id: args.get("id"), name: args.get("name"), task, status: "running", runner: args.get("runner") ?? "pi",
     transport: args.get("transport"), cwd: args.get("cwd"), startedAt: Date.now(), updatedAt: Date.now(),
-    turns: 3, toolCalls: 1, text: "", exitCode: null, usage: { input: 30, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.001 },
+    turns: 3, toolCalls: 1, text: "", exitCode: null, usage: { input: 30, output: 10, cacheRead: task.includes("HANG_WITH_PROGRESS_CACHE") ? 5 : 0, cacheWrite: task.includes("HANG_WITH_PROGRESS_CACHE") ? 7 : 0, cost: 0.001 },
   }));
   const stay = () => setTimeout(stay, 1_000);
   stay();

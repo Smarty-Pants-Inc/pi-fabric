@@ -49,7 +49,7 @@ process.stdin.on("data", chunk => {
       reply();
     } else if (frame.type === "get_state") {
       reply(behavior === "malformed" ? {} : {
-        model, thinkingLevel, isStreaming: false, isCompacting: false,
+        model, ...(behavior === "effort-missing" ? {} : { thinkingLevel: behavior === "effort-malformed" ? "turbo" : thinkingLevel }), isStreaming: false, isCompacting: false,
         ...(activation ? {
           autoCompactionEnabled: activation === "still-enabled",
           ...(activation === "ignored-flag" ? {} : { autoCompactionDisabledForProcess: true }),

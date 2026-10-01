@@ -97,11 +97,13 @@ endpoint/authentication override.
 UNKNOWN reason codes include `incomplete_evidence`, `evaluation_budget`,
 `agent_budget`, `token_budget`, `timeout`, `cancelled`, `refusal`, `invalid_schema`,
 `invalid_citation`, `budget_wait`, `agent_failed`, `inference_failed`,
-`record_failed`, `outcome_record_failed`; rejected transport/configuration inputs
+`record_failed`, `outcome_record_failed`, `agent_cleanup_unresolved`; rejected transport/configuration inputs
 use `invalid_input`, `invalid_config`, `invalid_policy` before inference (no
 accepted decision record when there is no valid request/trusted policy). No
 automatic human ask follows an error. Cancellation stops owned workers and
-awaits exit; cancelling an observation alone is never considered cleanup.
+awaits exit, then accounts for the stopped child's final reported input/output/cache
+usage and attempt on the same decision ID while retaining `cancelled`/`timeout`.
+Cancelling an observation alone is never considered cleanup.
 
 ## Proof and explicit limits
 
@@ -137,7 +139,12 @@ configuration and remain within the total deadline; this slice disables Fabric
 startup/resume retries, not upstream retry or reservation semantics. Tool
 allowlisting is **not a same-UID OS sandbox**. Worker-owned temporary
 transport files are not remediation writes; only the shared ledger persists on
-normal completion. An unresolved worker keeps its owned receipt for reconciliation.
+normal completion. A run retained by the manager (unsaved child outcome or
+unconfirmed exit, even if its marker could not be written) keeps its entire owned
+root for reconciliation and returns UNKNOWN. The `pi-process` attempt records
+the retained root in its host-generated `error`; join by `decisionId` to inspect
+`pending-route-outcome.json` and the native receipt. No automatic reconciler or
+permission to delete an unconfirmed worker's files is added.
 
 The judge has its own build entry and is forbidden from the extension's static
 startup graph; it is not registered as a session hook/provider or idle service.

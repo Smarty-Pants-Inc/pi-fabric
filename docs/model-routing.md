@@ -36,7 +36,12 @@ and Fabric's default medium effort do **not** qualify as role pins. Pins resolve
 only as exact registered provider/model keys or exact targets of an explicitly
 configured alias, including after one registry refresh. Missing or invalid pins
 refuse spawn with `ModelRoutePinError` (`MODEL_ROUTE_PIN_UNAVAILABLE`) before
-inference or dispatch; ordinary non-auto fuzzy selection is unchanged.
+inference or dispatch; ordinary non-auto fuzzy selection is unchanged. The
+canonical route pin is immutable for the run: initial launch, startup retry and
+resume recheck exact availability and reject a changed/unavailable pin before
+starting another worker. Every routed worker requires valid actual effort equal
+to its pin before sending the prompt; missing, malformed or lower readback
+records no verified admission. Ordinary explicit-model clamping is unchanged.
 
 ```json
 {
@@ -69,8 +74,11 @@ answer, backend error or timeout records a fixed reason and uses the pin. Caller
 cancellation still cancels launch. The existing Jev provider/client supplies the
 backend; `jev.enabled: false`, Schema enforce's unavailable Jev programs, or owner
 retirement yields `jev-error` and pinned dispatch rather than relaxing that gate.
-Evaluation captures the Jev generation's revocation signal; retirement aborts
-credential/network work and joins the evaluations before owner cleanup completes.
+Evaluation captures the Jev generation's revocation signal; retirement revokes
+evaluations and aborts network work. Cleanup also joins the real host credential
+lookup, not just its abort-raced waiter. The host lookup has no cancellation API:
+retirement stays pending until it settles, and cannot send old-generation HTTP
+afterward.
 
 The handle includes `routeDecision` with `{ model, effort, confidence, probability,
 reasonCode, decisionId, ... }`. `model/effort` describes the accepted **would-be**

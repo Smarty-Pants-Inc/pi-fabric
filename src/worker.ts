@@ -585,8 +585,8 @@ const main = async (): Promise<void> => {
     },
     admitted(model, effectiveThinking) {
       if (terminalStatus) return;
-      if (options.judgment && effectiveThinking !== thinking) {
-        modelControl.fail("judgment effort pin was not admitted; task was not sent");
+      if ((options.routeHeader || options.judgment) && (!thinking || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effectiveThinking ?? "") || effectiveThinking !== thinking)) {
+        modelControl.fail("routed effort pin was not admitted; task was not sent");
         return;
       }
       if (activationWindow && !activationWindowReady) {
@@ -599,7 +599,7 @@ const main = async (): Promise<void> => {
       }
       if (options.routeHeader) {
         if (record.model) record.admittedModel = record.model;
-        if (record.thinking) record.admittedThinking = record.thinking;
+        if (effectiveThinking) record.admittedThinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
       update();
       child.stdin?.write(`${JSON.stringify({ type: "prompt", message: task, ...(images.length > 0 ? { images } : {}) })}\n`);

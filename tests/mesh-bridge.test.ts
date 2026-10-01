@@ -404,6 +404,52 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
 });
 
 describe("mesh bridge", () => {
+  it("accepts and ACKs a bridged control command after 10 s of injected transport latency", async () => {
+    const { hub, far, bridge, remote } = setup(undefined, { realPipe: true, presenceMs: 5_000 });
+    const lane = await addRoot(hub, "lane", 60_000);
+    const target = await addRoot(far, "remote", 60_000);
+    const directory = new ParticipantDirectory(hub, { enabled: true, hostId: lane.hostId, rootId: lane.identity.id, identity: lane.identity });
+    const sender = new FabricControlPlane(hub, lane.identity, { enabled: true, hostId: lane.hostId, pollMs: 20,
+      readMirroredOwner: (host, owner, id) => directory.mirroredControlOwner(host, owner, id) });
+    const receiver = new FabricControlPlane(far, target.identity, { enabled: true, hostId: target.hostId, pollMs: 20 });
+    const receive = vi.fn(() => ({ accepted: true, messageId: "delayed-delivery" }));
+    let observation: Promise<unknown> | undefined;
+    try {
+      await remote.hello();
+      await bridge.start();
+      await bridge.syncPresence();
+      sender.start(() => ({ accepted: false }));
+      receiver.start(receive);
+      const publish = remote.publish.bind(remote);
+      vi.spyOn(remote, "publish").mockImplementation(async (...args) => {
+        if (args[0].topic === "fabric.control.command" && args[0].kind !== "cancel") {
+          await new Promise(resolve => setTimeout(resolve, 10_000));
+        }
+        return publish(...args);
+      });
+      observation = sender.request(target.hostId, target.identity.id, "followUp", { message: "arrives late" }, target.identity.id,
+        { routedRemoteHost: "forge" });
+      void observation.catch(() => undefined);
+      await waitFor(() => on(hub, "fabric.control.command").length === 1);
+      const sent = on(hub, "fabric.control.command")[0]!.data as { requestedAt: number; deadlineAt: number };
+      const firstPass = await bridge.step();
+      await waitFor(() => on(far, "fabric.control.ack").length === 1);
+      const secondPass = await bridge.step();
+      await expect(observation).resolves.toMatchObject({ acknowledged: true, messageId: "delayed-delivery" });
+      expect(sent.deadlineAt - sent.requestedAt).toBe(30_000);
+      expect(firstPass.toRemote).toBe(1);
+      expect(firstPass.toLocal + secondPass.toLocal).toBe(1);
+      expect(receive).toHaveBeenCalledOnce();
+      expect(on(hub, "fabric.control.command")).toHaveLength(1); // first try, no replay/cancel
+    } finally {
+      await sender.close();
+      await receiver.close();
+      await observation?.catch(() => undefined);
+      await bridge.stop();
+      remote.close();
+    }
+  }, 20_000);
+
   it("carries admitted remote provenance through real bridge and control delivery to Pi", async () => {
     const { hub, far, bridge } = setup();
     const lane = await addRoot(hub, "lane");
@@ -564,7 +610,7 @@ describe("mesh bridge", () => {
       stopMs: 100,
       local: (store, peer) => {
         const side = new StoreBridgeSide(store, peer);
-        side.latestSequence = async () => { calls++; throw lockTimeout(); };
+        side.latestCursor = async () => { calls++; throw lockTimeout(); };
         return side;
       },
     });
@@ -583,7 +629,7 @@ describe("mesh bridge", () => {
       const { bridge, logs } = setup(undefined, {
         local: (store, peer) => {
           const side = new StoreBridgeSide(store, peer);
-          side.latestSequence = async () => { throw error; };
+          side.latestCursor = async () => { throw error; };
           return side;
         },
       });

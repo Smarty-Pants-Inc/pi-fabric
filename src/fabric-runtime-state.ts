@@ -600,6 +600,7 @@ export class FabricRuntimeState {
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
+      bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });

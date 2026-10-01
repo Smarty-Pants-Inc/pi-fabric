@@ -7,7 +7,7 @@ import { hostLeaseExpiry, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS,
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
-import type { MeshEvent, MeshIdentity, MeshStateEntry, MeshStore } from "./store.js";
+import { meshCursorGeneration, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -95,7 +95,11 @@ export interface BridgeRead {
   skipped?: BridgeSkip[];
   /** The last sequence read (the cursor to resume from). */
   through: number;
+  /** Generation-tagged byte offset after the whole page; absent for legacy sequence reads. */
+  offset?: number;
 }
+
+export interface BridgeHead { through: number; offset?: number }
 
 export interface BridgePublish {
   topic: string;
@@ -110,6 +114,9 @@ export interface BridgePublish {
 export interface BridgeSide {
   latestSequence(): Promise<number>;
   read(after: number): Promise<BridgeRead>;
+  /** Optional v1 capability: old peers and sequence-only cursor files remain readable. */
+  latestCursor?(): Promise<BridgeHead>;
+  tail?(after: number, offset?: number): Promise<BridgeRead>;
   presence(): Promise<BridgePresence>;
   /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
   publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
@@ -175,25 +182,59 @@ export class StoreBridgeSide implements BridgeSide {
   // pass the byte budget, and `through` stays at the last event it covers. One event that alone
   // passes the budget is skipped with evidence, never a stall of the cursor.
   async read(after: number, pageBytes = BRIDGE_PAGE_BYTES): Promise<BridgeRead> {
-    const page = this.store.read({ after, limit: this.store.maxReadEvents });
+    return this.#page(this.store.read({ after, limit: this.store.maxReadEvents }), after, pageBytes);
+  }
+
+  async latestCursor(): Promise<BridgeHead> {
+    const head = this.store.latestCursor();
+    // An unreadable last complete line is not a sequence/offset anchor. Keep sequence
+    // reconciliation until a publisher leaves a readable boundary, rather than skipping work.
+    return head.last ? { through: head.last.sequence, offset: head.cursor } : { through: this.store.latestSequence() };
+  }
+
+  async tail(after: number, offset?: number, pageBytes = BRIDGE_PAGE_BYTES): Promise<BridgeRead> {
+    if (offset !== undefined) {
+      const page = this.store.tail(offset, this.store.maxReadEvents);
+      if (meshCursorGeneration(page.nextOffset) === meshCursorGeneration(offset) && page.nextOffset >= offset) {
+        return this.#page(page.events, after, pageBytes, { start: offset, cursors: page.cursors ?? [], end: page.nextOffset });
+      }
+      // Compaction changed the generation (or a truncation invalidated the offset). Sequence
+      // reconciliation can use the archive; a raw tail reset alone would lose older work.
+    }
+    // Capture the committed boundary BEFORE the sequence read. Never adopt a later head
+    // after an empty read: an append between those observations would be skipped forever.
+    const head = await this.latestCursor();
+    if (head.offset !== undefined && after >= head.through) return { events: [], through: after, offset: head.offset };
+    const page = await this.read(after, pageBytes);
+    return { ...page, ...(head.offset !== undefined && page.through >= head.through ? { offset: head.offset } : {}) };
+  }
+
+  #page(
+    page: MeshEvent[], after: number, pageBytes: number,
+    offsets?: { start: number; cursors: number[]; end: number },
+  ): BridgeRead {
     const events: MeshEvent[] = [];
     const skipped: BridgeSkip[] = [];
     let bytes = 0;
     let through = after;
-    for (const event of page) {
-      if (isBridgedTopic(event) && !hasBridgeField(event)) {
+    let offset = offsets?.start;
+    let complete = true;
+    for (const [index, event] of page.entries()) {
+      if (event.sequence > after && isBridgedTopic(event) && !hasBridgeField(event)) {
         const size = Buffer.byteLength(JSON.stringify(event), "utf8");
         if (size > pageBytes) {
           skipped.push({ id: event.id, sequence: event.sequence, topic: event.topic, bytes: size });
         } else {
-          if (bytes + size > pageBytes) break;
+          if (bytes + size > pageBytes) { complete = false; break; }
           bytes += size;
           events.push(event);
         }
       }
-      through = event.sequence;
+      through = Math.max(through, event.sequence);
+      if (offsets) offset = offsets.cursors[index] ?? offset;
     }
-    return { events, through, ...(skipped.length ? { skipped } : {}) };
+    if (offsets && complete) offset = offsets.end;
+    return { events, through, ...(offset !== undefined ? { offset } : {}), ...(skipped.length ? { skipped } : {}) };
   }
 
   async presence(): Promise<BridgePresence> {
@@ -451,6 +492,9 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {
+    // At the saved mark there is usually no recovery work. Do not seed sequence hints
+    // by scanning a large log just to discover that its committed head is already covered.
+    if (after >= (await this.latestCursor()).through) return { ids: [], through: after, done: true };
     const ids: string[] = [];
     let cursor = after;
     while (true) {
@@ -498,7 +542,7 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
 // ---------------------------------------------------------------------------------------------
 // Stdio transport: one JSON request or response per line.
 
-type RpcOp = "hello" | "latestSequence" | "read" | "presence" | "publish" | "mirror" | "bridgedIds";
+type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "mirror" | "bridgedIds";
 
 interface RpcRequest { id: number; op: RpcOp; args?: unknown }
 
@@ -589,8 +633,11 @@ const presenceArg = (args: unknown): Pick<BridgePresence, "hosts" | "participant
 
 const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unknown> => {
   switch (request.op) {
-    case "hello": return { version: BRIDGE_PROTOCOL_VERSION };
+    case "hello": return { version: BRIDGE_PROTOCOL_VERSION, tail: true };
     case "latestSequence": return side.latestSequence();
+    case "latestCursor": return side.latestCursor();
+    case "tail": return side.tail(numberArg(request.args, "after"),
+      isObject(request.args) && request.args.offset !== undefined ? numberArg(request.args, "offset") : undefined);
     case "read": return side.read(numberArg(request.args, "after"));
     case "presence": return { ...boundPresence(await side.presence()).presence, reserved: [] };
     case "publish": return side.publish(checkBridgePublish(request.args));
@@ -603,6 +650,7 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unk
 /** The hub's view of the remote side, over the transport's stdio. */
 export class RemoteBridgeSide implements BridgeSide {
   #next = 1;
+  #supportsTail = false;
   #closed: Error | undefined;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #onClosed: (error: Error) => void;
@@ -669,12 +717,19 @@ export class RemoteBridgeSide implements BridgeSide {
   }
 
   async hello(): Promise<void> {
-    const reply = await this.#call<{ version?: unknown }>("hello");
+    const reply = await this.#call<{ version?: unknown; tail?: unknown }>("hello");
     if (reply?.version !== BRIDGE_PROTOCOL_VERSION) throw new Error(`Bridge agent speaks protocol ${String(reply?.version)}`);
+    this.#supportsTail = reply.tail === true;
   }
 
   latestSequence(): Promise<number> { return this.#call("latestSequence"); }
   read(after: number): Promise<BridgeRead> { return this.#call("read", { after }); }
+  latestCursor(): Promise<BridgeHead> {
+    return this.#supportsTail ? this.#call("latestCursor") : this.latestSequence().then(through => ({ through }));
+  }
+  tail(after: number, offset?: number): Promise<BridgeRead> {
+    return this.#supportsTail ? this.#call("tail", { after, ...(offset !== undefined ? { offset } : {}) }) : this.read(after);
+  }
   presence(): Promise<BridgePresence> { return this.#call("presence"); }
   publish(event: BridgePublish): Promise<{ sequence: number }> { return this.#call("publish", event); }
   mirror(presence: Pick<BridgePresence, "hosts" | "participants">): Promise<void> { return this.#call("mirror", presence); }
@@ -687,6 +742,8 @@ export class RemoteBridgeSide implements BridgeSide {
 interface DirectionCursor {
   /** The last source sequence handled. */
   after: number;
+  /** Source byte offset, tagged with the live-log generation; old cursor files omit it. */
+  offset?: number;
   /** The destination sequence of the last event bridged in (restart dedupe starts after it). */
   mark: number;
 }
@@ -846,11 +903,14 @@ export class MeshBridge {
     if (saved) {
       this.#cursor = saved;
     } else {
-      const [localHead, remoteHead] = await Promise.all([local.latestSequence(), remote.latestSequence()]);
+      const [localHead, remoteHead]: [BridgeHead, BridgeHead] = await Promise.all([
+        local.latestCursor?.() ?? local.latestSequence().then(through => ({ through })),
+        remote.latestCursor?.() ?? remote.latestSequence().then(through => ({ through })),
+      ]);
       this.#cursor = {
         format: 1, local: localName, remote: remoteName,
-        toRemote: { after: localHead, mark: remoteHead },
-        toLocal: { after: remoteHead, mark: localHead },
+        toRemote: { after: localHead.through, ...(localHead.offset !== undefined ? { offset: localHead.offset } : {}), mark: remoteHead.through },
+        toLocal: { after: remoteHead.through, ...(remoteHead.offset !== undefined ? { offset: remoteHead.offset } : {}), mark: localHead.through },
       };
       this.#save();
     }
@@ -935,8 +995,10 @@ export class MeshBridge {
     let dropped = 0;
     while (true) {
       const start = cursor.after;
-      const page = await source.read(start);
-      let rules = await authority();
+      const startOffset = cursor.offset;
+      const page = await (source.tail?.(start, startOffset) ?? source.read(start));
+      // Empty polls need no routing authority: it is revalidated before every actual event.
+      let rules = page.events.length ? await authority() : { recipients: new Set<string>() };
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
@@ -1021,9 +1083,12 @@ export class MeshBridge {
         cursor.after = event.sequence;
       }
       // The page may end in events the allow-list filtered out; a page that moved may have more.
-      if (page.through <= start) break;
       cursor.after = Math.max(cursor.after, page.through);
-      this.#save();
+      if (page.offset !== undefined) cursor.offset = page.offset;
+      else delete cursor.offset;
+      const moved = cursor.after > start || cursor.offset !== startOffset;
+      if (moved) this.#save();
+      if (!moved) break;
     }
     return { forwarded, dropped };
   }

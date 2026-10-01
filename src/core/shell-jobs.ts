@@ -554,7 +554,9 @@ export class FabricShellJobStore {
   constructor(readonly tempRoot = tmpdir()) {}
 
   #prune(): void {
-    const completed = [...this.#jobs.values()].filter((job) => job.finishedAt !== undefined);
+    // finishedAt precedes async log/PID cleanup. Only announced jobs are safe to evict:
+    // otherwise retention pressure can remove the last reload hold before the inbox sees it.
+    const completed = [...this.#jobs.values()].filter((job) => job.announced && job.finishedAt !== undefined);
     completed.sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
     for (const [index, job] of completed.entries()) {
       if (index < completed.length - SHELL_COMPLETED_HANDLES || Date.now() - (job.finishedAt ?? 0) >= SHELL_COMPLETED_MAX_AGE_MS) this.#jobs.delete(job.id);

@@ -62,7 +62,9 @@ describe("generation-bound byte log cursors", () => {
 
   describe.each(["quiescent", "Windows EPERM denial", "Windows EBUSY denial", "POSIX held-FD replacement", "Windows native denial"])("terminal compaction: %s", (capability) => {
     it.skipIf((capability.startsWith("POSIX") && process.platform === "win32") || (capability === "Windows native denial" && process.platform !== "win32"))("holds an agents.log byte cursor across actual terminal compaction", () => {
-      const content = [{ type: "text", text: "complete durable result ".repeat(100) }];
+      // This fixture exercises replacement, so its duplicate result exceeds
+      // the small-result inline compatibility threshold.
+      const content = [{ type: "text", text: "complete durable result ".repeat(400) }];
       const events = [
         { type: "tool_execution_start", toolCallId: "held", toolName: "bash", args: {} },
         { type: "tool_execution_end", toolCallId: "held", toolName: "bash", result: { content }, isError: false },

@@ -67,7 +67,11 @@ interface ActorQueueItem {
   createdAt: number;
   coalesceKey?: string;
   activation: FabricActorActivation;
+  /** Supplied fields, interpreted according to bindingMode (including absent fields). */
   binding: FabricActorRunBinding;
+  /** Only raw own-root work inherits current owner defaults at launch. */
+  bindingMode: "owner-defaults" | "resolved";
+  bindingVersion?: 2;
   resolve?: (message: FabricActorMessage) => void;
   reject?: (error: Error) => void;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
@@ -687,7 +691,7 @@ export class ActorManager {
     return this.#canManage(actor.id);
   }
 
-  /** Resolve the immutable model/thinking view that a direct activation will pin. */
+  /** Resolve a caller-local view for foreign routing; own-root defaults stay dynamic. */
   resolveBinding(
     id: string,
     overrides: FabricActorRunBinding = {},
@@ -724,6 +728,7 @@ export class ActorManager {
     id: string,
     model: string | undefined,
     scope: FabricActorBindingScope = "session",
+    beforeCommit?: (id: string) => void,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -736,11 +741,13 @@ export class ActorManager {
         ? await this.#resolvedModel(actor.runner, next)
         : next
       : undefined;
+    // Fence after model refresh and (for session scope) binding-lock acquisition.
     if (scope === "session") {
-      await this.#bindings.setModel(actor.id, resolved);
+      await this.#bindings.setModel(actor.id, resolved, beforeCommit);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
+    beforeCommit?.(actor.id);
     if (resolved) actor.model = resolved;
     else delete actor.model;
     actor.updatedAt = Date.now();
@@ -756,6 +763,7 @@ export class ActorManager {
     id: string,
     thinking: string | undefined,
     scope: FabricActorBindingScope = "session",
+    beforeCommit?: (id: string) => void,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -768,11 +776,12 @@ export class ActorManager {
     if (scope === "session") {
       this.#syncActorsFromRegistry();
       const actor = this.#requireActor(id);
-      await this.#bindings.setThinking(actor.id, next);
+      await this.#bindings.setThinking(actor.id, next, beforeCommit);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
     const actor = this.#requireOwnedActor(id);
+    beforeCommit?.(actor.id);
     if (next) actor.thinking = next;
     else delete actor.thinking;
     actor.updatedAt = Date.now();
@@ -787,9 +796,11 @@ export class ActorManager {
    * and a Claude actor with no tools — unless the Pi actor was created with
    * `extensions: false`, in which case an empty list leaves it with no tools.
    */
-  async setTools(id: string, tools: string[]): Promise<FabricActorInfo> {
+  async setTools(id: string, tools: string[], beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
-    actor.tools = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
+    const next = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
+    beforeCommit?.(actor.id);
+    actor.tools = next;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -833,9 +844,10 @@ export class ActorManager {
    * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
    * queued work from the next item on; the filtered count is kept.
    */
-  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null): Promise<FabricActorInfo> {
+  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
+    beforeCommit?.(actor.id);
     if (filter.length > 0) actor.activationFilter = filter;
     else delete actor.activationFilter;
     delete actor.invalidActivationFilter;
@@ -1069,12 +1081,13 @@ export class ActorManager {
    * keeps the instructions it was launched with. Lets a steering user refine an
    * actor's role from the dashboard without recreating it.
    */
-  async setInstructions(id: string, instructions: string): Promise<FabricActorInfo> {
+  async setInstructions(id: string, instructions: string, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     if (!instructions.trim()) throw new Error("Actor instructions must not be empty");
     if (Buffer.byteLength(instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
     }
+    beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
@@ -1264,27 +1277,55 @@ export class ActorManager {
 
   readLog(
     id: string,
-    opts: { type?: "session" | "run" | "all"; lines?: number; runId?: string; before?: number } = {},
+    opts: { type?: "session" | "run" | "all"; lines?: number; runId?: string; before?: number; beforeGeneration?: string } = {},
   ): FabricActorLog {
     this.#syncActorsFromRegistry();
     const actor = this.#requireActor(id);
     const type = opts.type ?? "session";
+    if (type === "all" && opts.beforeGeneration !== undefined) {
+      throw new Error("Generation-bound actor paging requires type session or run; re-read all without a cursor");
+    }
     const lines = Math.max(1, Math.min(opts.lines ?? 200, 5000));
     const sessionFile = actor.sessionFile;
     const logDir = path.join(path.dirname(sessionFile), "runs");
+    const retainedRuns = this.#logs.retainedRunIds(actor);
     const sessionPage = type === "run"
       ? { lines: [], hasMore: false }
-      : readJsonlPage(sessionFile, lines, opts.before);
+      : readJsonlPage(sessionFile, lines, opts.before, undefined, opts.beforeGeneration);
     const session = sessionPage.lines;
     let run: FabricActorLog["run"];
     if (type !== "session") {
       const targetRunId = opts.runId ?? actor.lastRunId;
-      if (targetRunId) {
-        const runPath = path.join(logDir, targetRunId);
-        if (fs.existsSync(runPath)) {
-          const statusRecord = readRunRecord(path.join(runPath, "status.json"));
+      if (targetRunId !== undefined) {
+        // Run IDs are produced by AgentManager, not caller-selected paths.
+        if (targetRunId.length !== 32 || !/^[0-9a-f]{32}$/.test(targetRunId)) {
+          throw new Error("Invalid retained run ID: expected 32 lowercase hexadecimal characters");
+        }
+        if (!retainedRuns.includes(targetRunId)) {
+          if (opts.runId !== undefined) {
+            throw new Error(`Run ${targetRunId} is not retained by actor ${actor.id}`);
+          }
+        } else {
+          const runPath = path.join(logDir, targetRunId);
+          const realRunPath = fs.realpathSync(runPath);
+          if (path.dirname(realRunPath) !== fs.realpathSync(logDir)) {
+            throw new Error(`Run ${targetRunId} is outside actor log directory`);
+          }
+          const statusFile = path.join(runPath, "status.json");
           const eventsFile = path.join(runPath, "events.jsonl");
-          const page = readJsonlPage(eventsFile, lines, opts.before);
+          for (const file of [statusFile, eventsFile]) {
+            if (fs.existsSync(file) && path.dirname(fs.realpathSync(file)) !== realRunPath) {
+              throw new Error(`Run ${targetRunId} log file is outside retained run directory`);
+            }
+          }
+          const statusRecord = readRunRecord(statusFile);
+          // Older archives and synthetic workers may omit actor attribution;
+          // their direct archive membership still binds them to this actor.
+          if (!statusRecord || statusRecord.id !== targetRunId ||
+            (statusRecord.actorId !== undefined && statusRecord.actorId !== actor.id)) {
+            throw new Error(`Run ${targetRunId} does not belong to actor ${actor.id}`);
+          }
+          const page = readJsonlPage(eventsFile, lines, opts.before, undefined, opts.beforeGeneration);
           run = {
             runId: targetRunId,
             eventsFile,
@@ -1292,6 +1333,7 @@ export class ActorManager {
             events: page.lines,
             hasMore: page.hasMore,
             ...(page.before !== undefined ? { before: page.before } : {}),
+            ...(page.generation !== undefined ? { generation: page.generation } : {}),
           };
         }
       }
@@ -1304,8 +1346,9 @@ export class ActorManager {
       session,
       sessionHasMore: sessionPage.hasMore,
       ...(sessionPage.before !== undefined ? { sessionBefore: sessionPage.before } : {}),
+      ...(sessionPage.generation !== undefined ? { sessionGeneration: sessionPage.generation } : {}),
       ...(run ? { run } : {}),
-      retainedRuns: this.#logs.retainedRunIds(actor),
+      retainedRuns,
     };
   }
 
@@ -1982,9 +2025,8 @@ export class ActorManager {
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
-    const unresolved = options.binding !== undefined
-      ? this.#validatedRunBinding(options.binding)
-      : this.#runBinding(actor, options.overrides);
+    const bindingMode = options.binding !== undefined ? "resolved" : "owner-defaults";
+    const unresolved = this.#validatedRunBinding(options.binding ?? options.overrides ?? {});
     // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
     // learns at once. A resolver that may refresh the registry is async: #drain resolves the
     // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
@@ -2006,6 +2048,8 @@ export class ActorManager {
         existing.createdAt = createdAt;
         existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
         existing.binding = binding;
+        existing.bindingMode = bindingMode;
+        existing.bindingVersion = 2;
         this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
         return existing;
@@ -2028,6 +2072,8 @@ export class ActorManager {
       createdAt,
       activation: this.#activation(itemId, source, payload, sequence, createdAt),
       binding,
+      bindingMode,
+      bindingVersion: 2,
       ...(options.resolve ? { resolve: options.resolve } : {}),
       ...(options.reject ? { reject: options.reject } : {}),
       ...(options.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
@@ -2175,12 +2221,15 @@ export class ActorManager {
             delete actor.capabilityDigest;
           }
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
-          item.binding = await this.#resolvedRunBinding(actor, item.binding);
+          // Foreign caller views are already resolved: missing fields must reach the
+          // runner/config fallback, never the owner's private session binding.
+          const launchBinding = await this.#resolvedRunBinding(actor, item.bindingMode === "resolved"
+            ? item.binding : this.#runBinding(actor, item.binding));
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.
           this.#ensurePiSession(actor);
           const result = await this.agents.run(
-            this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
+            this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
             (handle) => {
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
@@ -2414,6 +2463,7 @@ export class ActorManager {
   #runRequest(
     actor: ManagedActor,
     item: ActorQueueItem,
+    binding: FabricActorRunBinding,
     inferenceContext: FabricActorInferenceContext | undefined,
     capabilityRequirements?: string[],
     capabilityDigest?: string,
@@ -2444,8 +2494,8 @@ export class ActorManager {
         ? { schema: directiveSchema, ...(actor.runner === "pi" ? { replyTool: true } : {}) }
         : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
-      ...(item.binding.model ? { model: item.binding.model } : {}),
-      ...(item.binding.thinking ? { thinking: item.binding.thinking } : {}),
+      ...(binding.model ? { model: binding.model } : {}),
+      ...(binding.thinking ? { thinking: binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
       ...(actor.timeoutMs ? { timeoutMs: actor.timeoutMs } : {}),
@@ -3241,7 +3291,7 @@ export class ActorManager {
         try {
           return [JSON.parse(JSON.stringify({
             id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
-            activation: item.activation, binding: item.binding,
+            activation: item.activation, binding: item.binding, bindingMode: item.bindingMode, bindingVersion: 2,
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
@@ -3344,7 +3394,15 @@ export class ActorManager {
         payload: value.payload,
         createdAt: value.createdAt,
         activation: shift(value.activation as FabricActorActivation),
-        binding: typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        // Old mesh/host bindings were enqueue-time defaults. Old direct bindings may be
+        // genuine resolved caller views: preserve them conservatively. Unmarked version 2
+        // records retain their prior raw-field interpretation; new records preserve the mode.
+        binding: (value.bindingVersion === 2 || value.source === "direct") &&
+          typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        bindingMode: value.bindingMode === "resolved" ||
+          (value.bindingMode === undefined && value.bindingVersion !== 2 && value.source === "direct")
+          ? "resolved" : "owner-defaults",
+        bindingVersion: 2,
         ...(Array.isArray(value.images) ? { images: value.images } : {}),
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),
         ...((value as { resumed?: unknown }).resumed === true ? { resumed: true } : {}),
@@ -3771,6 +3829,7 @@ export class ActorManager {
         first.createdAt = item.createdAt;
         first.activation = { ...item.activation, id: first.id };
         first.binding = item.binding;
+        first.bindingVersion = 2;
       }
       if (item.resumed) first.resumed = true;
       merged.add(item);

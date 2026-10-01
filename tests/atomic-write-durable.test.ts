@@ -177,8 +177,13 @@ describe("#169 security S1 directory-link retries and P3 rename contract", () =>
         expect(events.indexOf(failingPath)).toBeGreaterThanOrEqual(0);
         expect(events.indexOf(failingPath)).toBeLessThan(events.indexOf("acknowledged"));
       } else {
+        // Source TypeScript need not be erasable by Node's strip-only parser. Keep
+        // a parameter property in the fresh-process entry so this remains true when
+        // production sources gain one (the PR #198 CI failure happened before retry).
+        const retryModule = path.join(root, "retry-module.ts");
+        fs.writeFileSync(retryModule, `export { writeFileAtomic } from ${JSON.stringify(path.resolve("src/core/atomic-write.ts"))};\nexport class Receipt { constructor(readonly target: string) {} }\n`);
         const child = spawnSync(process.execPath, [path.resolve("tests/fixtures/atomic-write-retry.mjs"),
-          path.resolve("src/core/atomic-write.ts"), target, failingPath], { encoding: "utf8", timeout: 5_000 });
+          retryModule, target, failingPath], { encoding: "utf8", timeout: 5_000 });
         expect(child.error).toBeUndefined();
         expect(child.status, child.stderr).toBe(0);
         const attempts = JSON.parse(child.stdout) as Array<{ acknowledged: boolean; events: string[]; error?: string }>;

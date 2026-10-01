@@ -682,8 +682,12 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     const now = Date.now() + 120_000;
     const get = f.observer.get.bind(f.observer);
     const known = f.observer.lastKnown.bind(f.observer);
+    const peers = f.observer.peers.bind(f.observer);
     vi.spyOn(f.observer, "get").mockImplementation((id, _now, options) => get(id, now, options));
     vi.spyOn(f.observer, "lastKnown").mockImplementation((id) => known(id, now));
+    // Discovery and admission must observe the same expired lease, including #201's peer hint.
+    vi.spyOn(f.observer, "peers").mockImplementation(() => peers(now));
     await expect(f.sendRouter.routeMessage(identity.id, "too late", undefined, kind)).rejects.toThrow("Unknown Fabric participant");
+    expect(f.mesh().read({ topic: "fabric.control.command", limit: 100 })).toEqual([]);
   });
 });

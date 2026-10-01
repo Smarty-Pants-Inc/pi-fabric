@@ -120,7 +120,7 @@ export const captureDurableExecutionTrace = async (startupCrLf = false) => {
   record("trace installed");
   return {
     record, events,
-    // The runtime kills on settlement but bounds its own exit wait to 250 ms.
+    // The runtime kills on settlement but bounds its own close/drain wait to 250 ms.
     // Do not remove a Windows guest's cwd until its process and pipes close.
     waitForGuests: () => Promise.all(guests.map(guest => guest.closed)),
     report: (engine: string, operation: string, snapshot: unknown) => console.error("Durable execution trace", JSON.stringify({

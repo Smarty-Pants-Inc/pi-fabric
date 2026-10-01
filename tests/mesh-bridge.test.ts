@@ -273,6 +273,75 @@ describe("real participant directory over a pipe", () => {
 });
 
 describe("presence mirror under contention (smarty-dev#2761)", () => {
+  it.each([
+    ["toRemote", "filtered"], ["toRemote", "skip-only"],
+    ["toLocal", "filtered"], ["toLocal", "skip-only"],
+  ] as const)("renews live leases during a long %s %s page drain (smarty-dev#2854)", async (direction, traffic) => {
+    let now = 1_800_000_000_000;
+    const startedAt = now;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { hub, far, bridge, remote } = setup(undefined, {
+      presenceMs: 5_000,
+      // One log record per page, including the real remote agent's scanner.
+      local: (store, peer) => new StoreBridgeSide(new MeshStore(store.root, 64 * 1024, 1), peer),
+      agent: (store) => {
+        const side = new StoreBridgeSide(new MeshStore(store.root, 64 * 1024, 1), "dev1");
+        const read = side.read.bind(side);
+        // RemoteBridgeSide uses the protocol frame budget; shrink the agent's budget for
+        // this test so small real events exercise skips through the actual RPC path.
+        vi.spyOn(side, "read").mockImplementation((after) => read(after, 2_000));
+        return side;
+      },
+    });
+    const lane = await addRoot(hub, "lane");
+    const root = await addRoot(far, "remote");
+    await bridge.start();
+    await bridge.syncPresence();
+    expect(readHostLeases(hub.root).get(root.hostId)!.expiresAt).toBe(startedAt + BRIDGE_LEASE_MS);
+    const local = bridge.options.local as StoreBridgeSide;
+    const source = direction === "toRemote" ? local : remote;
+    const store = direction === "toRemote" ? hub : far;
+    const sender = direction === "toRemote" ? lane : root;
+    for (let index = 0; index < 3; index++) {
+      await store.publish({ topic: traffic === "filtered" ? "probe.unrelated" : "fleet.work.big", kind: "ask",
+        from: sender.identity, to: direction === "toRemote" ? root.hostId : lane.hostId, text: "x".repeat(4_000) });
+    }
+    const read = source.read.bind(source);
+    let advancingPages = 0;
+    vi.spyOn(source, "read").mockImplementation(async (after: number) => {
+      // Real scanner/transport filtering and oversized skips, not fabricated empty pages.
+      const page = await read(after, 2_000);
+      expect(page.events).toEqual([]);
+      if (page.through > after) {
+        advancingPages++;
+        now += 6_000; // Each read < 30 s RPC timeout; one drain > the initial 15 s lease.
+        for (const [mesh, owner] of [[hub, lane], [far, root]] as const) {
+          writeHostLease(mesh.root, { id: owner.hostId, rootId: owner.hostId, identityId: owner.identity.id,
+            updatedAt: now, expiresAt: now + BRIDGE_LEASE_MS });
+        }
+      }
+      return page;
+    });
+    const presence = vi.spyOn(bridge, "syncPresence");
+    const owned = vi.spyOn(local, "owned");
+    expect(await bridge.step()).toEqual({ toRemote: 0, toLocal: 0, dropped: traffic === "filtered" ? 0 : 3 });
+    expect(advancingPages).toBe(3);
+    expect(now - startedAt).toBe(18_000);
+    // Both mirror directions stay live beyond the initial lease. This is the fresh owner
+    // port the control-plane watchdog uses, as well as the user-visible directory listing.
+    expect(readHostLeases(hub.root).get(root.hostId)!.expiresAt).toBe(now + BRIDGE_LEASE_MS);
+    expect(readHostLeases(far.root).get(lane.hostId)!.expiresAt).toBe(now + BRIDGE_LEASE_MS);
+    const directory = new ParticipantDirectory(hub, {
+      enabled: true, hostId: lane.hostId, rootId: lane.hostId, identity: lane.identity,
+    });
+    expect(directory.mirroredControlOwner(root.hostId, root.identity.id, root.identity.id))
+      .toEqual({ remoteHost: "forge", expiresAt: now + BRIDGE_LEASE_MS });
+    expect(directory.list({ scope: "project", fresh: true }).find((participant) => participant.id === root.identity.id))
+      .toMatchObject({ stale: false });
+    expect(presence).toHaveBeenCalledTimes(3);
+    expect(owned).not.toHaveBeenCalled();
+  });
+
   it.each([3_000, 15_000, 60_000])("mirrors the remote %i ms lease TTL from this side's sync time, capped", async (ttl) => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);

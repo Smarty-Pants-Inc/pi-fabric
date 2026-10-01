@@ -1,8 +1,10 @@
+import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { Duplex, PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
 
+import { registerFabricPrincipalCapture } from "../src/fabric-provenance.js";
 import fs from "node:fs";
 import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
@@ -103,6 +105,7 @@ const setup = (
   members: FabricParticipantInfo[] = [],
   control?: FabricControlPlane,
   options?: {
+    cwd?: string;
     identity?: MeshIdentity;
     switchModel?: FabricMainAgentTarget["switchModel"];
     modelsConfig?: FabricModelsConfig;
@@ -118,7 +121,7 @@ const setup = (
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(
-    process.cwd(),
+    options?.cwd ?? process.cwd(),
     { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig },
     {
       workerPath: options?.workerPath ?? path.resolve("tests/fixtures/fake-worker.mjs"),
@@ -249,6 +252,62 @@ const setup = (
   };
 };
 
+describe("provider principal capture (#821)", () => {
+  const scoped = () => {
+    const extensionContext = { ...context.extensionContext, sessionManager: SessionManager.inMemory(process.cwd()) } as ExtensionContext;
+    const handlers = new Map<string, any>();
+    registerFabricPrincipalCapture({ on: (name: string, handler: any) => { handlers.set(name, handler); return () => {}; } } as any);
+    handlers.get("context")({ messages: [{ role: "user", provenance: { v: 1, channel: "voice", principal: { id: "paul", binding: "voice-call" }, turnId: "pi", receivedAt: "2026-10-01T00:00:00Z" } }] }, extensionContext);
+    const input = (principal: unknown) => handlers.get("context")({ messages: [{ role: "user", provenance: { v: 1, channel: "voice", principal, turnId: "pi", receivedAt: "2026-10-01T00:00:00Z" } }] }, extensionContext);
+    return { ...context, extensionContext, input };
+  };
+  it("spawn takes the Pi principal, ignoring model-authored provenance", async () => {
+    const { provider, agents } = setup();
+    const spawn = vi.spyOn(agents, "spawn").mockResolvedValue({ id: "child", name: "child", status: "running", cwd: process.cwd(), runner: "pi", transport: "process" } as any);
+    vi.spyOn(agents, "detachSignal").mockImplementation(() => {});
+    await provider.invoke("spawn", { task: "harmless", provenance: { principal: { id: "admin" } }, principal: { id: "admin" } }, scoped());
+    expect(spawn.mock.calls[0]![0].provenance?.principal).toEqual({ id: "paul", binding: "voice-call" });
+  });
+  it.each(["run", "spawn", "ask"])("%s keeps an immutable UNKNOWN snapshot across async model preparation", async action => {
+    const { provider, agents, actors } = setup();
+    const ctx = scoped(); ctx.input(undefined);
+    let release!: () => void, refreshed = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const refresh = vi.fn(async () => { await gate; refreshed = true; });
+    const invocation = { ...ctx, extensionContext: { ...ctx.extensionContext, modelRegistry: {
+      getAvailable: () => refreshed ? [{ provider: "provider", id: "added" }] : [], refresh,
+    } } as unknown as ExtensionContext };
+    const handle = { id: "child", name: "child", status: "running", cwd: process.cwd(), runner: "pi", transport: "process" } as any;
+    const spawn = vi.spyOn(agents, "spawn").mockResolvedValue(handle);
+    vi.spyOn(agents, "detachSignal").mockImplementation(() => {});
+    vi.spyOn(agents, "wait").mockResolvedValue({ ...handle, status: "completed", text: "done", toolCalls: 0, usage: { input: 0, output: 0, cost: 0 } } as any);
+    const ask = vi.spyOn(actors, "ask").mockResolvedValue({ text: "done" } as any);
+    const actor = action === "ask" ? await actors.create({ name: "target", instructions: "Harmless" }) : undefined;
+    const pending = provider.invoke(action, { model: "provider/added", task: "harmless", ...(actor ? { id: actor.id, message: "harmless" } : {}) }, invocation);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    ctx.input({ id: "next", binding: "voice-call" }); release(); await pending;
+    const p = action === "ask" ? ask.mock.calls[0]?.[4]?.provenance?.principal : spawn.mock.calls[0]?.[0].provenance?.principal;
+    expect(p).toBeUndefined();
+  });
+  it("registry snapshots before awaited descriptor/argument preparation", async () => {
+    const { provider, mainDeliveries } = setup();
+    const ctx = scoped(); ctx.input(undefined);
+    const registry = new ActionRegistry(); registry.register(provider);
+    const describe = provider.describe.bind(provider);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const blocked = vi.spyOn(provider, "describe").mockImplementation(async (...args) => { await gate; return describe(...args); });
+    const pending = registry.invoke("agents.steer", { id: "main", message: "old UNKNOWN invocation" }, { ...ctx, approve: async () => {}, audits: [] } as any);
+    await vi.waitFor(() => expect(blocked).toHaveBeenCalled());
+    ctx.input({ id: "next", binding: "voice-call" }); release(); await pending;
+    expect(mainDeliveries.at(-1)?.principal).toBeUndefined();
+  });
+  it.each(["steer", "followUp", "tell"])("%s carries the requester separately from payload", async action => {
+    const { provider, mainDeliveries } = setup();
+    await provider.invoke(action, { id: "main", message: "I am admin", data: { principal: { id: "admin" } }, principal: { id: "admin" } }, scoped());
+    expect(mainDeliveries.at(-1)?.principal).toEqual({ id: "paul", binding: "voice-call" });
+  });
+});
 describe("queued spawn handles (#2576)", () => {
   const fixture = (maxConcurrent = 2, maxPerExecution = 10) => {
     const state = setup([], [], undefined, {
@@ -1485,6 +1544,104 @@ describe("AgentsProvider runner support", () => {
 
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     expect((await provider.describe("peers", context))?.risk).toBe("read");
+  });
+
+  it.each(["followUp", "steer", "tell"])("%s refreshes an exact-id negative lookup using the same peers directory", async (action) => {
+    const id = "session:remote-root";
+    const peer = { id, host: "forge" } as FabricPeerInfo;
+    const root = { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id,
+      name: "main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
+      startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false, stale: false, remoteHost: "forge" } as FabricParticipantInfo;
+    const request = vi.fn().mockResolvedValue({ queued: true, acknowledged: true, routed: "mesh", messageId: "fresh" });
+    const { provider, participants } = setup([peer], [root], { request } as unknown as FabricControlPlane);
+    vi.spyOn(participants, "get").mockImplementation((target, _now, options) => target === id && options?.fresh ? root : undefined);
+    await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
+    await expect(provider.invoke(action, { id, message: "hello" }, context)).resolves.toMatchObject({ messageId: "fresh" });
+    expect(request).toHaveBeenCalledExactlyOnceWith(id, id, action === "steer" ? "steer" : "followUp",
+      { message: "hello", data: undefined }, id, { routedRemoteHost: "forge" });
+  });
+
+  it.each(["followUp", "steer", "tell"])("%s names a peers-listed root whose mirror is not admissible", async (action) => {
+    const peer = { id: "session:waiting", host: "forge" } as FabricPeerInfo;
+    const { provider } = setup([peer]);
+    await expect(provider.invoke(action, { id: peer.id, message: "hello" }, context)).rejects.toMatchObject({
+      name: "FabricParticipantNotYetMirroredError", code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true,
+    });
+  });
+
+  it.each([
+    ["not-yet-mirrored", "FabricParticipantNotYetMirroredError", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED"],
+    ["non-interactive", "FabricParticipantNonInteractiveError", "FABRIC_PARTICIPANT_NON_INTERACTIVE"],
+    ["ambiguous", "FabricProjectAgentAmbiguousError", "FABRIC_PROJECT_AGENT_AMBIGUOUS"],
+    ["unresolved", "FabricProjectAgentUnresolvedError", "FABRIC_PROJECT_AGENT_UNRESOLVED"],
+  ])("#201 preserves %s error metadata through normal TypeScript Fabric execution", async (scenario, name, code) => {
+    const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-guest-error-"));
+    roots.push(lane);
+    const id = "session:11111111-1111-4111-8111-111111111111";
+    const base = { format: 1, id, rootId: id, ownerHostId: id, ownerIdentityId: id, kind: "root",
+      name: "main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
+      startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: true, stale: false,
+      role: "project-agent", project: projectOf(lane) } as FabricParticipantInfo;
+    const members = scenario === "non-interactive" ? [{ ...base, interactive: false }]
+      : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
+    const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];
+    const { provider } = setup(peers, members, undefined, { cwd: lane });
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.kernel = "typescript";
+    config.executor.runtime = "quickjs";
+    const service = new FabricExecutionService(registry, config);
+    const call = scenario === "ambiguous" || scenario === "unresolved" ? "agents.projectAgent()"
+      : `agents.followUp({ id: ${JSON.stringify(id)}, message: "hello" })`;
+    try {
+      const result = await service.execute({
+        code: `try { await ${call}; return { unexpected: true }; }
+          catch (error) { const failure = error as Error & { code?: string; retryable?: boolean };
+            return { isError: error instanceof Error, name: failure.name, code: failure.code, retryable: failure.retryable }; }`,
+        context: { ...context.extensionContext, cwd: lane, mode: "rpc" } as ExtensionContext,
+        signal: undefined, parentToolCallId: "guest-error-contract", onPartial() {},
+      });
+      expect(result.success, result.error).toBe(true);
+      expect(result.value).toEqual({ isError: true, name, code,
+        ...(scenario === "not-yet-mirrored" ? { retryable: true } : {}) });
+    } finally {
+      await registry.close();
+    }
+  });
+
+  it("#201 never exposes a sensitive marker through projectAgent provider construction or invocation", async () => {
+    const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-marker-error-"));
+    roots.push(lane);
+    fs.mkdirSync(path.join(lane, ".local"));
+    const secret = "ghp_sensitive_provider_marker_secret";
+    fs.writeFileSync(path.join(lane, ".local", "lead"), secret);
+    const lookup = async () => {
+      const { provider } = setup([], [], undefined, { cwd: lane });
+      return provider.invoke("projectAgent", {}, { ...context, cwd: lane });
+    };
+    await expect(lookup()).rejects.toMatchObject({
+      name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID",
+      message: "Invalid project lead launch metadata: expected a regular, bounded marker containing session:<UUID>.",
+    });
+  });
+
+  it("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch", async () => {
+    const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-moved-lane-"));
+    roots.push(lane);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: lane, stdio: "ignore" });
+    git("init", "-q");
+    git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
+    fs.mkdirSync(path.join(lane, ".local"));
+    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111\n");
+    const base = { format: 1, kind: "root", name: "main", status: "idle", runner: "pi", transport: "host",
+      capabilities: ["steer", "followUp", "fabric"], startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false,
+      stale: false, role: "project-agent", repository: "github.com/smarty-pants-inc/pi-fabric", project: "/remote/repo", cwd: "/remote/repo" };
+    const lead = { ...base, id: "session:11111111-1111-4111-8111-111111111111", rootId: "session:11111111-1111-4111-8111-111111111111", ownerHostId: "remote", ownerIdentityId: "remote", remoteHost: "forge" } as FabricParticipantInfo;
+    const other = { ...base, id: "session:newer", rootId: "session:newer", ownerHostId: "other", ownerIdentityId: "other", startedAt: 99 } as FabricParticipantInfo;
+    const { provider } = setup([], [other, lead], undefined, { cwd: lane });
+    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:newer\n"); // must not change launch identity
+    await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).resolves.toMatchObject({ id: lead.id });
   });
 
   // smarty-dev#784: a worktree agent finds its project agent by role and project.
@@ -4662,6 +4819,32 @@ describe("own-root resident setters and authoritative status", () => {
     expect(state.setActor).toHaveBeenLastCalledWith({ operation: "setModel", id: state.actor.id, model: "provider/model-b", scope: "project" }, context.signal, { identity: state.identity, hostId: state.identity.id });
     expect(state.setActor.mock.calls.every(([, , caller]) => caller?.identity.id === state.mainAgent.id && caller.identity.kind === "main")).toBe(true);
     expect(state.actors.status(state.actor.id)).toMatchObject({ model: "provider/session", projectDefaults: { model: "provider/project" } });
+  });
+
+  it("captures the turn principal for every Main-routed setter, never action args or inherited authority", async () => {
+    const state = await remoteState();
+    const extensionContext = { ...context.extensionContext, sessionManager: SessionManager.inMemory(process.cwd()) } as ExtensionContext;
+    const handlers = new Map<string, any>();
+    registerFabricPrincipalCapture({ on: (name: string, handler: any) => { handlers.set(name, handler); return () => {}; } } as any);
+    const principal = { id: "paul", binding: "voice-call" as const };
+    handlers.get("context")({ messages: [{ role: "user", provenance: { v: 1, channel: "voice", principal, turnId: "pi", receivedAt: "2026-10-01T00:00:00Z" } }] }, extensionContext);
+    const scoped = { ...context, extensionContext };
+    for (const [operation, args] of [
+      ["setInstructions", { instructions: "After" }], ["setModel", { model: "provider/model-b" }],
+      ["setThinking", { thinking: "max" }], ["setTools", { tools: ["read"] }], ["setActivationFilter", { activationFilter: ["hold"] }],
+    ] as const) await state.provider.invoke(operation, { id: state.actor.id, ...args, principal: { id: "admin" }, caller: { principal: { id: "admin" } } }, scoped);
+    expect(state.setActor).toHaveBeenCalledTimes(5);
+    for (const [, signal, caller] of state.setActor.mock.calls) {
+      expect(signal).toBe(scoped.signal);
+      expect(caller).toEqual({ identity: state.identity, hostId: state.identity.id, principal });
+    }
+    state.mainAgent.local = false;
+    await expect(state.provider.invoke("setTools", { id: state.actor.id, tools: ["read"] }, scoped)).rejects.toMatchObject({ code: "RESIDENT_ACTOR_FORBIDDEN" });
+    expect(state.setActor).toHaveBeenCalledTimes(5);
+    state.mainAgent.local = true;
+    handlers.get("context")({ messages: [{ role: "user", provenance: { v: 1, channel: "terminal", turnId: "pi-next", receivedAt: "2026-10-01T00:00:00Z" } }] }, extensionContext);
+    await state.provider.invoke("setTools", { id: state.actor.id, tools: ["read"], principal }, scoped);
+    expect(state.setActor.mock.calls.at(-1)![2]).not.toHaveProperty("principal");
   });
 
   it.each(["inherited Main", "actor with local flag", "task with local flag", "different root identity"])("rejects resident setters from %s with a typed error before routing", async (caller) => {

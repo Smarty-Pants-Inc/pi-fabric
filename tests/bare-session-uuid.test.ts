@@ -57,7 +57,14 @@ describe("a bare session UUID (smarty-dev#1729)", () => {
   it("leaves actor ids unchanged", async () => {
     const { router, request, tell } = setup();
     await expect(router.routeMessage(ACTOR, "hi", undefined, "followUp")).resolves.toMatchObject({ routed: "local" });
-    expect(tell).toHaveBeenCalledWith(ACTOR, "hi", undefined, {});
+    // The actor ID is unchanged; the registered local producer owns sender metadata.
+    // An invocation without a stamped requester must not manufacture a principal.
+    expect(tell).toHaveBeenCalledWith(ACTOR, "hi", undefined, {
+      provenance: {
+        v: 1, channel: "fabric", via: "followUp",
+        sender: { id: "session:self", name: "main", kind: "main", verified: "mesh" },
+      },
+    });
     expect(request).not.toHaveBeenCalled();
     await expect(router.routeMessage("0".repeat(32), "hi", undefined, "followUp")).rejects.toThrow(/mesh root\)$/);
   });

@@ -10,17 +10,17 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
-const update = (type: string, contentIndex = 0, delta?: string) => ({
-  type: "message_update", assistantMessageEvent: { type, contentIndex, delta },
-});
-const setup = () => {
-  vi.useFakeTimers();
-  const fail = vi.fn();
-  const guard = new ToolCallStreamGuard(fail, () => ({ model: "openai-codex/gpt-5.6-sol", effort: "high" }));
-  return { guard, fail, delta: (text: string, index = 0) => guard.observe(update("toolcall_delta", index, text)) };
-};
+describe.each(["assistantMessageEvent", "event"])("ToolCallStreamGuard (%s)", (field) => {
+  const update = (type: string, contentIndex = 0, delta?: string) => ({
+    type: "message_update", [field]: { type, contentIndex, delta },
+  });
+  const setup = () => {
+    vi.useFakeTimers();
+    const fail = vi.fn();
+    const guard = new ToolCallStreamGuard(fail, () => ({ model: "openai-codex/gpt-5.6-sol", effort: "high" }));
+    return { guard, fail, delta: (text: string, index = 0) => guard.observe(update("toolcall_delta", index, text)) };
+  };
 
-describe("ToolCallStreamGuard", () => {
   it("aborts exactly at 64 KiB with a typed and attributed error, once", () => {
     const { guard, fail, delta } = setup();
     expect(TOOL_CALL_WHITESPACE_MAX_BYTES).toBe(65536);
@@ -160,7 +160,7 @@ describe("ToolCallStreamGuard", () => {
 
   it("does not bound a toolcall_start before any argument delta arrives", () => {
     const { guard, fail } = setup();
-    guard.observe({ type: "message_update", assistantMessageEvent: {
+    guard.observe({ type: "message_update", [field]: {
       type: "toolcall_start", contentIndex: 0, partial: { content: [{ partialJson: "", arguments: {} }] },
     } });
     vi.advanceTimersByTime(120_000);
@@ -184,7 +184,7 @@ describe("ToolCallStreamGuard", () => {
     { partialJson: "", arguments: { code: "already supplied" } },
   ])("respects meaningful provider-supplied initial arguments: %j", block => {
     const { guard, fail, delta } = setup();
-    guard.observe({ type: "message_update", assistantMessageEvent: {
+    guard.observe({ type: "message_update", [field]: {
       type: "toolcall_start", contentIndex: 0, partial: { content: [{ type: "toolCall", ...block }] },
     } });
     delta(" ".repeat(100_000));
@@ -208,10 +208,10 @@ describe("ToolCallStreamGuard", () => {
 
   it("counts initial raw whitespace arguments without counting cumulative partials twice", () => {
     const { guard, fail } = setup();
-    guard.observe({ type: "message_update", assistantMessageEvent: {
+    guard.observe({ type: "message_update", [field]: {
       type: "toolcall_start", contentIndex: 0, partial: { content: [{ partialJson: " ".repeat(32_768), arguments: {} }] },
     } });
-    guard.observe({ type: "message_update", assistantMessageEvent: {
+    guard.observe({ type: "message_update", [field]: {
       type: "toolcall_delta", contentIndex: 0, delta: " ".repeat(32_768),
       partial: { content: [{ partialJson: " ".repeat(65536), arguments: {} }] },
     } });

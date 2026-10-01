@@ -19,6 +19,33 @@ describe("cancellation effect settlement", () => {
     expect(await outcome).toBe(reason); expect(events).toEqual(["fenced", "rejected"]);
   });
 
+  it.each(["immediate", "late"] as const)("observes %s rejection when the operation aborts synchronously before returning its promise", async (ending) => {
+    const controller = new AbortController();
+    const reason = new Error("startup deadline crossed synchronously");
+    const rejection = new Error("operation rejected after cancellation");
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => { unhandled.push(error); };
+    process.on("unhandledRejection", onUnhandled);
+    let reject!: (error: Error) => void;
+    try {
+      const outcome = runAbortable(controller.signal, () => {
+        controller.abort(reason);
+        return ending === "immediate" ? Promise.reject(rejection) : new Promise<never>((_, fail) => { reject = fail; });
+      });
+      await expect(outcome).rejects.toBe(reason);
+      if (ending === "late") reject(rejection);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally { process.removeListener("unhandledRejection", onUnhandled); }
+  });
+
+  it("does not start an already-aborted operation", async () => {
+    const controller = new AbortController(); controller.abort(new Error("not admitted"));
+    let called = false;
+    await expect(runAbortable(controller.signal, () => { called = true; return 1; })).rejects.toBe(controller.signal.reason);
+    expect(called).toBe(false);
+  });
+
   it("shares only an invocation lineage, never an unrelated provider/shutdown lineage", () => {
     const parent = new AbortController(); const shutdown = new AbortController();
     const invocation = shareCancellationEffects(AbortSignal.any([parent.signal, shutdown.signal]), parent.signal);

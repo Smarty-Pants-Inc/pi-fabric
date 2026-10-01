@@ -222,17 +222,19 @@ describe("FabricControlPlane", () => {
       await f.once(0);
     });
 
-    it.each(["lapse", "abort", "close"] as const)("settles %s during publish without waiting, then cancels the committed command once", async (winner) => {
+    it.each(["lapse", "abort", "close"] as const)("settles %s during publish completion without waiting, then cancels the committed command once", async (winner) => {
       const f = await setup();
       const controller = new AbortController();
       const publish = f.sender.mesh.publish.bind(f.sender.mesh);
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
       vi.spyOn(f.sender.mesh, "publish").mockImplementation(async (input) => {
+        const event = await publish(input);
         if (input.topic === "fabric.control.command" && input.kind === "ask") await gate;
-        return publish(input);
+        return event;
       });
       const outcome = settle(f.sender.requestResult("host:owner", "agent:target", "ask", {}, "identity:owner", { signal: controller.signal }));
+      await vi.waitFor(() => expect(f.sender.mesh.read({ topic: "fabric.control.command" }).some(event => event.kind === "ask")).toBe(true));
       if (winner === "lapse") f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
       if (winner === "abort") controller.abort();
       if (winner === "close") await f.sender.close();
@@ -305,12 +307,14 @@ describe("FabricControlPlane", () => {
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
       vi.spyOn(f.sender.mesh, "publish").mockImplementation(async (input) => {
+        const event = await publish(input);
         if (input.topic === "fabric.control.command" && input.kind === "ask") await gate;
-        return publish(input);
+        return event;
       });
       const outcome = settle(f.sender.requestResult("host:owner", "agent:target", "ask",
         { message: "private", data: { destinationRemoteHost: "ryzen2" } }, "identity:owner",
         { signal: controller.signal, routedRemoteHost }));
+      await vi.waitFor(() => expect(f.sender.mesh.read({ topic: "fabric.control.command" }).some(event => event.kind === "ask")).toBe(true));
       try {
         f.setLease({ remoteHost: "ryzen2", expiresAt: Date.now() + 60_000 });
         controller.abort();
@@ -1635,22 +1639,27 @@ describe("FabricControlPlane", () => {
     await vi.waitFor(() => expect(askAborted).toBe(true));
   });
 
-  it("publishes an immediately cancelled command before its cancellation", async () => {
+  it("fences an immediately cancelled command before mesh admission", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
     const sender = plane(meshRoot, "host:sender");
     const receiver = plane(meshRoot, "host:receiver");
     const publish = sender.mesh.publish.bind(sender.mesh);
+    let release!: () => void, finish!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const finished = new Promise<void>(resolve => { finish = resolve; });
     vi.spyOn(sender.mesh, "publish").mockImplementation(async (input) => {
-      if (input.topic === "fabric.control.command" && input.kind === "ask") {
-        await new Promise((resolve) => setTimeout(resolve, 60));
-      }
-      return publish(input);
+      try {
+        if (input.topic === "fabric.control.command" && input.kind === "ask") await gate;
+        return await publish(input);
+      } finally { finish(); }
     });
     let ownerAborted = false;
+    let ownerEntered = false;
     receiver.start((command, _from, signal) => {
       if (command.operation !== "ask") return { accepted: true };
+      ownerEntered = true;
       return new Promise((resolve) => {
         signal.addEventListener("abort", () => {
           ownerAborted = true;
@@ -1672,12 +1681,11 @@ describe("FabricControlPlane", () => {
     controller.abort();
 
     await expect(request).rejects.toThrow("Remote Fabric request cancelled");
-    await vi.waitFor(() => expect(ownerAborted).toBe(true));
-    const kinds = new MeshStore(meshRoot, 64 * 1024, 1_000)
-      .tail(0, 10)
-      .events.filter((event) => event.topic === "fabric.control.command")
-      .map((event) => event.kind);
-    expect(kinds.indexOf("ask")).toBeLessThan(kinds.indexOf("cancel"));
+    release(); await finished;
+    const commands = new MeshStore(meshRoot, 64 * 1024, 1_000).read({ topic: "fabric.control.command" });
+    expect(commands).toHaveLength(0);
+    expect(ownerAborted).toBe(false);
+    expect(ownerEntered).toBe(false);
   });
 
   it("retains a completed ask outcome through its request deadline", async () => {

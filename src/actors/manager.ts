@@ -67,8 +67,10 @@ interface ActorQueueItem {
   createdAt: number;
   coalesceKey?: string;
   activation: FabricActorActivation;
-  /** Only supplied fields are pinned; defaults are resolved at launch. */
+  /** Supplied fields, interpreted according to bindingMode (including absent fields). */
   binding: FabricActorRunBinding;
+  /** Only raw own-root work inherits current owner defaults at launch. */
+  bindingMode: "owner-defaults" | "resolved";
   bindingVersion?: 2;
   resolve?: (message: FabricActorMessage) => void;
   reject?: (error: Error) => void;
@@ -1915,6 +1917,7 @@ export class ActorManager {
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
+    const bindingMode = options.binding !== undefined ? "resolved" : "owner-defaults";
     const unresolved = this.#validatedRunBinding(options.binding ?? options.overrides ?? {});
     // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
     // learns at once. A resolver that may refresh the registry is async: #drain resolves the
@@ -1937,6 +1940,7 @@ export class ActorManager {
         existing.createdAt = createdAt;
         existing.activation = this.#activation(existing.id, source, payload, sequence, createdAt);
         existing.binding = binding;
+        existing.bindingMode = bindingMode;
         existing.bindingVersion = 2;
         this.#persistQueue(actor.id);
         this.#ensureDrain(actor);
@@ -1960,6 +1964,7 @@ export class ActorManager {
       createdAt,
       activation: this.#activation(itemId, source, payload, sequence, createdAt),
       binding,
+      bindingMode,
       bindingVersion: 2,
       ...(options.resolve ? { resolve: options.resolve } : {}),
       ...(options.reject ? { reject: options.reject } : {}),
@@ -2108,7 +2113,10 @@ export class ActorManager {
             delete actor.capabilityDigest;
           }
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
-          const launchBinding = await this.#resolvedRunBinding(actor, this.#runBinding(actor, item.binding));
+          // Foreign caller views are already resolved: missing fields must reach the
+          // runner/config fallback, never the owner's private session binding.
+          const launchBinding = await this.#resolvedRunBinding(actor, item.bindingMode === "resolved"
+            ? item.binding : this.#runBinding(actor, item.binding));
           const result = await this.agents.run(
             this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
@@ -3167,7 +3175,7 @@ export class ActorManager {
         try {
           return [JSON.parse(JSON.stringify({
             id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
-            activation: item.activation, binding: item.binding, bindingVersion: 2,
+            activation: item.activation, binding: item.binding, bindingMode: item.bindingMode, bindingVersion: 2,
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
@@ -3271,9 +3279,13 @@ export class ActorManager {
         createdAt: value.createdAt,
         activation: shift(value.activation as FabricActorActivation),
         // Old mesh/host bindings were enqueue-time defaults. Old direct bindings may be
-        // genuine per-call values: preserve them conservatively. New records carry raw fields.
+        // genuine resolved caller views: preserve them conservatively. Unmarked version 2
+        // records retain their prior raw-field interpretation; new records preserve the mode.
         binding: (value.bindingVersion === 2 || value.source === "direct") &&
           typeof value.binding === "object" && value.binding !== null ? value.binding : {},
+        bindingMode: value.bindingMode === "resolved" ||
+          (value.bindingMode === undefined && value.bindingVersion !== 2 && value.source === "direct")
+          ? "resolved" : "owner-defaults",
         bindingVersion: 2,
         ...(Array.isArray(value.images) ? { images: value.images } : {}),
         ...(typeof value.coalesceKey === "string" ? { coalesceKey: value.coalesceKey } : {}),

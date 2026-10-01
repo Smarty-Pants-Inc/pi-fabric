@@ -215,8 +215,12 @@ export const controlActorBindingOptions = (
     }
     return { overrides: command.binding ?? {} };
   }
-  // Legacy direct/foreign callers may intentionally supply a resolved session view.
-  return command.binding !== undefined ? { binding: command.binding } : {};
+  // An explicit caller view is fixed, even when one or both fields are absent.
+  if (command.binding !== undefined) return { binding: command.binding };
+  // Preserve legacy unbound own-root requests, but never promote an empty foreign
+  // view into the owner's private session defaults.
+  return actorRootId && (from.id === actorRootId || senderRootId === actorRootId)
+    ? {} : { binding: {} };
 };
 
 export interface FabricControlRequestOptions {

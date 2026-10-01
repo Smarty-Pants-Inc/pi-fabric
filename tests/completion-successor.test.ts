@@ -100,6 +100,176 @@ const providerFor = (h: ReturnType<typeof harness>, client: ResidencyClient, man
   { local: true, matches: () => false } as any, h.participants, undefined, {} as any, () => false, client, false,
 );
 
+const legacyFenceFaults = ["malformed", "root mismatch", "run mismatch", "invalid consumption", "unreadable", "dangling"] as const;
+const damageLegacyFence = (h: ReturnType<typeof harness>, fault: typeof legacyFenceFaults[number]) => {
+  const file = path.join(residentRoot(h.meshRoot, h.recipient.rootId), "agents", `${h.result.id}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const consumed = { rootId: h.recipient.rootId, id: h.result.id, completionConsumedAt: 3 };
+  fs.writeFileSync(file, JSON.stringify(consumed));
+  if (fault === "malformed") fs.writeFileSync(file, "{torn");
+  if (fault === "root mismatch") fs.writeFileSync(file, JSON.stringify({ ...consumed, rootId: "session:other" }));
+  if (fault === "run mismatch") fs.writeFileSync(file, JSON.stringify({ ...consumed, id: "c".repeat(32) }));
+  if (fault === "invalid consumption") fs.writeFileSync(file, JSON.stringify({ ...consumed, completionConsumedAt: "unknown" }));
+  if (fault === "dangling") { fs.unlinkSync(file); fs.symlinkSync(path.join(h.root, "missing-metadata"), file); }
+  let readFault: ReturnType<typeof vi.spyOn> | undefined;
+  if (fault === "unreadable") {
+    const read = fs.readFileSync;
+    readFault = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+      if (String(target) === file) throw Object.assign(new Error("legacy metadata inaccessible"), { code: "EACCES" });
+      return (read as any)(target, ...args);
+    }) as typeof fs.readFileSync);
+  }
+  return { file, repair: () => {
+    readFault?.mockRestore();
+    if (fault === "dangling") fs.unlinkSync(file);
+    fs.writeFileSync(file, JSON.stringify(consumed));
+  } };
+};
+
+// Fail only AFTER this target's rename, not its temporary-file sync or mkdir barriers.
+const postRenameFault = (target: string) => {
+  const rename = fs.renameSync; const sync = fs.fsyncSync;
+  const state = { renamed: false, barrier: "directory" as "directory" | "file" | "none", fileSyncs: 0, directorySyncs: 0 };
+  vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+    rename(source, destination);
+    if (String(destination) === target) state.renamed = true;
+  });
+  vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+    const directory = fs.fstatSync(fd).isDirectory();
+    if (state.renamed) {
+      if (directory) state.directorySyncs++; else state.fileSyncs++;
+      if ((directory && state.barrier === "directory") || (!directory && state.barrier === "file")) {
+        throw new Error(`post-rename ${state.barrier} barrier failed`);
+      }
+    }
+    sync(fd);
+  });
+  return state;
+};
+
+describe("round 4 completion fences", () => {
+  it.each(legacyFenceFaults)("F4/journal: unknown legacy fence (%s) blocks claims, bodies and replacement receipts repeatedly", async fault => {
+    if (fault === "dangling" && process.platform === "win32") return; // symlink privilege is not portable
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result);
+    const damaged = damageLegacyFence(h, fault);
+    h.setLive([h.participant("B", 200)]); const delivered = vi.fn();
+    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, delivered);
+    for (let index = 0; index < 3; index++) {
+      await expect(journal.drain()).rejects.toThrow(/legacy.*replay fence/i);
+      expect(() => journal.result(h.result.id)).toThrow(/legacy.*replay fence/i);
+      expect(() => journal.acknowledge(h.result.id, true)).toThrow(/legacy.*replay fence/i);
+      expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+    }
+    expect(delivered).not.toHaveBeenCalled();
+    expect(fs.readdirSync(path.join(h.meshRoot, "agent-completions")).filter(file => file.endsWith(".json"))).toHaveLength(1);
+    damaged.repair(); await journal.drain(); expect(delivered).not.toHaveBeenCalled();
+  });
+
+  it.each(legacyFenceFaults)("F4/import: unknown old-Main fence (%s) retains source and reports one diagnostic until repaired", async fault => {
+    if (fault === "dangling" && process.platform === "win32") return;
+    const h = harness(); const source = await h.seedResident(); const damaged = damageLegacyFence(h, fault);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
+    await waitFor(() => warning.mock.calls.length > 0); await new Promise(resolve => setTimeout(resolve, 80));
+    expect(warning).toHaveBeenCalledOnce(); expect(String(warning.mock.calls[0]![0])).toMatch(/remains pending.*legacy.*replay fence/i);
+    expect(h.mesh.get(source)).toBeDefined(); expect(b.completed).not.toHaveBeenCalled();
+    expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
+    expect(fs.existsSync(path.join(h.meshRoot, "agent-completions"))).toBe(false);
+    expect(fs.existsSync(residentResultPath(residentRoot(h.meshRoot, h.recipient.rootId), h.result.id))).toBe(true);
+    damaged.repair(); await waitFor(() => completionConsumed(h.meshRoot, h.result.id));
+    await waitFor(() => !h.mesh.get(source)); b.turn(); expect(b.completed).not.toHaveBeenCalled(); expect(b.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("F4: legacy consumption must be a positive finite number, or proven absent", () => {
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result);
+    const file = path.join(residentRoot(h.meshRoot, h.recipient.rootId), "agents", `${h.result.id}.json`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    for (const completionConsumedAt of [null, 0, -1, "3"]) {
+      fs.writeFileSync(file, JSON.stringify({ rootId: h.recipient.rootId, id: h.result.id, completionConsumedAt }));
+      expect(() => pendingCompletions(h.meshRoot, h.root)).toThrow(/legacy.*replay fence/i);
+    }
+    fs.writeFileSync(file, `{"rootId":"${h.recipient.rootId}","id":"${h.result.id}","completionConsumedAt":1e400}`);
+    expect(() => pendingCompletions(h.meshRoot, h.root)).toThrow(/legacy.*replay fence/i);
+    fs.writeFileSync(file, JSON.stringify({ rootId: h.recipient.rootId, id: h.result.id }));
+    expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
+    fs.unlinkSync(file); expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform === "win32")("F5/receipt: visible failed rename cannot confirm consumption or retire a claim until file AND namespace barriers pass", async () => {
+    const h = harness(); h.setLive([h.participant("B", 200)]);
+    let delivered!: () => void;
+    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, (_result, callback) => { delivered = callback; });
+    journal.save(h.result); await journal.drain();
+    const dir = path.join(h.meshRoot, "agent-completions", "receipts"); fs.mkdirSync(dir);
+    const target = path.join(dir, fs.readdirSync(path.join(h.meshRoot, "agent-completions")).find(file => file.endsWith(".json"))!);
+    const fault = postRenameFault(target);
+    expect(() => delivered()).toThrow(/post-rename directory barrier failed/);
+    expect(fault.renamed).toBe(true); const original = fs.readFileSync(target, "utf8");
+    const retry = new CompletionJournal(h.meshRoot, journal.recipient, h.participants, h.mesh, () => {});
+    for (const barrier of ["directory", "file", "directory"] as const) {
+      fault.barrier = barrier;
+      expect(() => consumeCompletion(h.meshRoot, h.result.id, "C")).toThrow(/post-rename .* barrier failed/);
+      expect(() => completionConsumed(h.meshRoot, h.result.id)).toThrow(/post-rename .* barrier failed/);
+      await expect(retry.drain(false)).rejects.toThrow(/post-rename .* barrier failed/);
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
+      expect(fs.readFileSync(target, "utf8")).toBe(original);
+    }
+    fault.barrier = "none"; fault.fileSyncs = 0; fault.directorySyncs = 0;
+    consumeCompletion(h.meshRoot, h.result.id, "C");
+    expect(fault.fileSyncs).toBeGreaterThan(0); expect(fault.directorySyncs).toBeGreaterThan(0);
+    expect(JSON.parse(fs.readFileSync(target, "utf8"))).toMatchObject({ sessionId: "B" });
+    expect(fs.readFileSync(target, "utf8")).toBe(original);
+    await retry.drain(false); expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+  });
+
+  it.skipIf(process.platform === "win32")("F5/envelope: a failed post-rename save keeps its candidate until retry barriers pass", () => {
+    const h = harness(); const run = path.join(h.root, "run"); fs.mkdirSync(run);
+    fs.writeFileSync(path.join(run, "completion-recipient.json"), JSON.stringify({ meshRoot: h.meshRoot, recipient: h.recipient, supervisor: { pid: process.pid } }));
+    saveWorkerCompletion(path.join(run, "status.json"), h.result);
+    const dir = path.join(h.meshRoot, "agent-completions");
+    const candidate = path.join(dir, "attempts", fs.readdirSync(path.join(dir, "attempts"))[0]!);
+    const target = path.join(dir, path.basename(candidate)); const fault = postRenameFault(target);
+    expect(() => saveCompletion(h.meshRoot, h.recipient, h.result)).toThrow(/post-rename directory barrier failed/);
+    expect(fault.renamed).toBe(true); const original = fs.readFileSync(target, "utf8");
+    for (const barrier of ["directory", "file", "directory"] as const) {
+      fault.barrier = barrier;
+      expect(() => saveCompletion(h.meshRoot, h.recipient, h.result)).toThrow(/post-rename .* barrier failed/);
+      expect(fs.existsSync(candidate)).toBe(true); expect(fs.readFileSync(target, "utf8")).toBe(original);
+    }
+    fault.barrier = "none"; fault.fileSyncs = 0; fault.directorySyncs = 0;
+    saveCompletion(h.meshRoot, h.recipient, h.result);
+    expect(fault.fileSyncs).toBeGreaterThan(0); expect(fault.directorySyncs).toBeGreaterThan(0);
+    expect(fs.existsSync(candidate)).toBe(false); expect(fs.readFileSync(target, "utf8")).toBe(original);
+  });
+
+  it.skipIf(process.platform === "win32")("F5/manager: settlement-save retry cannot collect a worker source after failed rename barriers", async () => {
+    const h = harness(); const a = h.client("A", 100); const manager = managerFor(h, a);
+    const dir = path.join(h.meshRoot, "agent-completions"); fs.mkdirSync(dir, { recursive: true });
+    const rename = fs.renameSync; const sync = fs.fsyncSync; let target: string | undefined; let barrier: "directory" | "file" | "none" = "directory";
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      rename(source, destination);
+      if (path.dirname(String(destination)) === dir) target = String(destination);
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (target && ((barrier === "directory" && fs.fstatSync(fd).isDirectory()) || (barrier === "file" && fs.fstatSync(fd).isFile()))) throw new Error("post-rename barrier failed");
+      sync(fd);
+    });
+    const result = await manager.run({ task: "LARGE_RESULT", transport: "process" });
+    const run = manager.runDirectory(result.id)!; const worker = fs.readFileSync(path.join(run, "status.json"), "utf8");
+    expect(target).toBeDefined(); expect(result.warnings?.join(" ")).toMatch(/save failed.*retained/i);
+    for (const required of ["directory", "file", "directory"] as const) {
+      barrier = required;
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/Terminal result save failed.*post-rename/);
+      expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
+    }
+    barrier = "none"; await manager.cleanup(result.id);
+    expect(fs.existsSync(run)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(target!, "utf8")).result).toMatchObject({ id: result.id, text: "x".repeat(100_000), value: { output: "x".repeat(100_000) } });
+  }, 15_000);
+});
+
 describe("round 3 completion fences", () => {
   it.each([
     { mode: "credential startup", scope: "session" }, { mode: "recoverable stop", scope: "session" },

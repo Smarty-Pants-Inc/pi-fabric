@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { CompletionJournal, completionConsumed, consumeCompletion, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
+import { CompletionJournal, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -859,8 +859,7 @@ export class ResidencyClient {
     if (!config || config.rootId !== value.rootId || path.resolve(config.residencyRoot) !== root ||
       typeof config.projectRoot !== "string" || typeof config.cwd !== "string" ||
       !samePath(config.projectRoot, this.options.config.projectRoot)) return;
-    const metadata = readJson<ResidentAgentMetadata>(path.join(root, "agents", `${id}.json`));
-    if (metadata?.completionConsumedAt) {
+    if (legacyCompletionConsumed(this.options.config.meshRoot, value.rootId, id)) {
       consumeCompletion(this.options.config.meshRoot, id, config.sessionId);
       return;
     }
@@ -875,13 +874,15 @@ export class ResidencyClient {
     this.#drainingDeliveries = true;
     try {
       const entries = this.options.mesh.listAll("residency/deliveries/");
+      let fault: unknown;
       for (const entry of entries) {
         try {
           if (entry.key.startsWith(this.#deliveryPrefix)) await this.#deliver(entry);
           else await this.#adoptCompletion(entry);
-        } catch { /* Retain the durable source for retry; other senders still drain. */ }
+        } catch (error) { fault ??= error; } // Retain the source; other senders still drain.
       }
       await this.#completions.drain(this.options.config.agents.notifyOnComplete);
+      if (fault !== undefined) throw fault; // Legacy-import faults need the same deduplicated diagnostic.
       this.#completionFault = undefined;
     } catch (error) {
       const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;

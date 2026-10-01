@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
 import type { MeshStore } from "../mesh/store.js";
 import type { AgentHandleInfo, AgentRunRecord, AgentRunResult } from "./types.js";
@@ -70,9 +70,8 @@ const files = (dir: string): string[] => {
 };
 interface CompletionReceipt { id: string; sessionId: string; consumedAt: number }
 /** Only proven absence authorizes delivery. An unknown replay fence is a storage fault. */
-const readReceipt = (file: string, id?: string): CompletionReceipt | undefined => {
-  let value: CompletionReceipt;
-  try { value = JSON.parse(fs.readFileSync(file, "utf8")) as CompletionReceipt; }
+const readReplayFence = <T>(file: string, label = "Completion"): T | undefined => {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       // A dangling receipt symlink exists but cannot be read: ENOENT alone is not absence.
@@ -80,13 +79,31 @@ const readReceipt = (file: string, id?: string): CompletionReceipt | undefined =
         if ((absence as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       }
     }
-    throw new Error(`Completion replay fence is unreadable at ${file}: ${String(error)}`);
+    throw new Error(`${label} replay fence is unreadable at ${file}: ${String(error)}`);
   }
+};
+/** A readable rename may have failed its post-rename barrier. Confirm this attempt,
+ * binding both the validated bytes and reopenable namespace to the synced inode. */
+const syncCompletionFile = (file: string, value: unknown): void => {
+  const fd = fs.openSync(file, "r");
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || JSON.stringify(JSON.parse(fs.readFileSync(fd, "utf8"))) !== JSON.stringify(value)) {
+      throw new Error(`Completion file changed before durability confirmation at ${file}`);
+    }
+    fs.fsyncSync(fd);
+    syncPathNamespace(file, stat);
+  } finally { fs.closeSync(fd); }
+};
+const readReceipt = (file: string, id?: string): CompletionReceipt | undefined => {
+  const value = readReplayFence<CompletionReceipt>(file);
+  if (value === undefined) return undefined;
   if (!value || typeof value.id !== "string" || (id !== undefined && value.id !== id) ||
     path.basename(file) !== `${key(value.id)}.json` || typeof value.sessionId !== "string" || !value.sessionId ||
     typeof value.consumedAt !== "number" || !Number.isFinite(value.consumedAt) || value.consumedAt <= 0) {
     throw new Error(`Completion replay fence is invalid at ${file}; retain the outcome for repair`);
   }
+  syncCompletionFile(file, value);
   return value;
 };
 export const completionConsumed = (meshRoot: string, id: string): boolean =>
@@ -100,10 +117,14 @@ export const consumeCompletion = (meshRoot: string, id: string, sessionId: strin
 export const saveCompletion = (meshRoot: string, recipient: CompletionRecipient, result: AgentRunResult): void => {
   if (result.actorId) return;
   if (!completionConsumed(meshRoot, result.id)) {
+    legacyCompletionConsumed(meshRoot, recipient.rootId, result.id);
     const file = envelopePath(meshRoot, result.id);
     const existing = read<CompletionEnvelope>(file);
     if (!(existing?.format === 1 && existing.result?.id === result.id)) {
       writeJsonAtomic(file, { format: 1, recipient, result } satisfies CompletionEnvelope, { durable: true });
+    } else {
+      // A preceding save may have renamed successfully but thrown before durability.
+      syncCompletionFile(file, existing);
     }
   }
   fs.rmSync(candidatePath(meshRoot, result.id), { force: true });
@@ -154,12 +175,17 @@ const savedCompletion = (meshRoot: string, projectRoot: string, id: string): Com
     canonical(value.recipient.projectRoot) !== canonical(projectRoot)) return undefined;
   return value;
 };
-const legacyCompletionConsumed = (meshRoot: string, envelope: CompletionEnvelope): boolean => {
+export const legacyCompletionConsumed = (meshRoot: string, rootId: string, id: string): boolean => {
   // A B72 Main may consume a newer host's result using only its existing metadata receipt.
-  const metadata = read<{ rootId?: string; id?: string; completionConsumedAt?: number }>(
-    path.join(meshRoot, "residency", key(envelope.recipient.rootId), "agents", `${envelope.result.id}.json`));
-  return metadata?.rootId === envelope.recipient.rootId && metadata.id === envelope.result.id &&
-    typeof metadata.completionConsumedAt === "number" && metadata.completionConsumedAt > 0;
+  const file = path.join(meshRoot, "residency", key(rootId), "agents", `${id}.json`);
+  const metadata = readReplayFence<{ rootId?: string; id?: string; completionConsumedAt?: number }>(file, "Legacy completion");
+  if (metadata === undefined) return false;
+  if (!metadata || metadata.rootId !== rootId || metadata.id !== id ||
+    (metadata.completionConsumedAt !== undefined && (typeof metadata.completionConsumedAt !== "number" ||
+      !Number.isFinite(metadata.completionConsumedAt) || metadata.completionConsumedAt <= 0))) {
+    throw new Error(`Legacy completion replay fence is invalid at ${file}; retain the outcome for repair`);
+  }
+  return metadata.completionConsumedAt !== undefined;
 };
 export const pendingCompletions = (meshRoot: string, projectRoot: string): CompletionEnvelope[] => {
   promoteOrphans(meshRoot, projectRoot);
@@ -177,7 +203,7 @@ export const pendingCompletions = (meshRoot: string, projectRoot: string): Compl
       file !== `${key(value.result.id)}.json` ||
       !["completed", "failed", "stopped", "timed_out"].includes(value.result.status) ||
       canonical(value.recipient.projectRoot) !== canonical(projectRoot) || completionConsumed(meshRoot, value.result.id)) return [];
-    return legacyCompletionConsumed(meshRoot, value) ? [] : [value];
+    return legacyCompletionConsumed(meshRoot, value.recipient.rootId, value.result.id) ? [] : [value];
   });
 };
 export const pendingCompletionResult = (envelope: CompletionEnvelope): AgentRunResult => ({
@@ -205,7 +231,7 @@ export class CompletionJournal {
   result(id: string): AgentRunResult | CompletionSummary | undefined {
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);
     if (!envelope) return undefined;
-    const consumed = completionConsumed(this.meshRoot, id) || legacyCompletionConsumed(this.meshRoot, envelope);
+    const consumed = completionConsumed(this.meshRoot, id) || legacyCompletionConsumed(this.meshRoot, envelope.recipient.rootId, id);
     if (!this.#canRead(envelope)) {
       const r = envelope.result;
       return { id: r.id, name: r.name.slice(0, 80), status: r.status, runner: r.runner, transport: r.transport,
@@ -273,6 +299,8 @@ export class CompletionJournal {
     try { await this.mesh.delete({ key: snapshot.key, ifVersion: snapshot.version }); } catch { /* next drain reconciles */ }
   }
   #canRead(envelope: CompletionEnvelope): boolean {
+    // Unknown legacy fences block body access and acknowledgment as well as idle delivery.
+    legacyCompletionConsumed(this.meshRoot, envelope.recipient.rootId, envelope.result.id);
     if (envelope.recipient.rootId === this.recipient.rootId && envelope.recipient.sessionId === this.recipient.sessionId) return true;
     if (!sameRecipientLane(envelope.recipient, this.recipient) || this.recipient.startedAt <= envelope.recipient.startedAt) return false;
     const receipt = readReceipt(receiptPath(this.meshRoot, envelope.result.id), envelope.result.id);

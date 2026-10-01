@@ -20,8 +20,10 @@ Mains, and durable shared receipts suppress replay to subsequent successors.
 Inbox delivery is receipted after Pi's session entries contain the completion
 carrier, not merely after an in-memory steer is accepted. Explicit successful
 wait/status consumption also receipts the outcome. Legacy resident metadata
-receipts remain authoritative. Hosts without session-entry inspection retain
-the prior send-admission receipt behavior.
+receipts remain authoritative. Inbox receipts require the matching session JSONL
+file/header and successful file and namespace durability barriers; hosts without
+a verifiable persisted carrier retain the pending outcome instead of receipting
+send admission.
 
 Without a successor, results remain pending. `agents.list` includes pending
 outcomes and `agents.status` exposes

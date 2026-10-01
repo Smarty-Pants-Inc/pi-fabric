@@ -98,6 +98,26 @@ describe("automatic per-host reload admission", () => {
     expect(fs.readdirSync(slots)).toEqual([]);
   });
 
+  it("re-arms idle retry when the delivered automatic command finds the host slots full", async () => {
+    const first = main({ selfReloadConcurrency: () => 1 });
+    const second = main({ selfReloadConcurrency: () => 1, reloadJitterMs: () => 5_000 });
+    const finish = hold(first.context); activate(next);
+    first.emit("agent_settled"); first.queue();
+    await vi.waitFor(() => expect(first.context.reload).toHaveBeenCalledOnce());
+    // Actual Pi can enter a delivered command synchronously inside the timer's request.
+    // That request then stops the timer, including the command's pre-admission re-arm.
+    let delivered!: Promise<void>;
+    second.pi.sendUserMessage = (text: string) => { second.sent.push(text); delivered = second.queue(); };
+    second.emit("agent_settled"); expect(second.sent).toEqual([]);
+    await vi.advanceTimersByTimeAsync(5_000); await delivered;
+    expect(second.sent).toHaveLength(1);
+    expect(second.context.reload).not.toHaveBeenCalled();
+    finish(); await flush();
+    await vi.advanceTimersByTimeAsync(5_000); await flush();
+    expect(second.sent).toHaveLength(2);
+    expect(second.context.reload).toHaveBeenCalledOnce();
+  });
+
   it("defaults to six slots without an explicit config dependency", async () => {
     const fleet = Array.from({ length: 7 }, () => main());
     fleet.forEach(agent => hold(agent.context)); activate(next);
@@ -105,7 +125,7 @@ describe("automatic per-host reload admission", () => {
     expect(fleet.filter(agent => agent.context.reload.mock.calls.length)).toHaveLength(6);
   });
 
-  it("releases the old module's lease at new session_start, not session_shutdown", async () => {
+  it("transfers the old module's lease to activation, not session_shutdown", async () => {
     const first = main({ selfReloadConcurrency: () => 1 });
     const second = main({ selfReloadConcurrency: () => 1 });
     hold(first.context); activate(next);
@@ -115,7 +135,10 @@ describe("automatic per-host reload admission", () => {
     expect(second.context.reload).not.toHaveBeenCalled();
     const fresh = installSelfReload(first.pi as never, { busy: () => 0, autoReloadConfigured: () => true,
       moduleUrl: pathToFileURL(path.join(next, "index.js")).href, settingsPath: settings });
-    expect(fresh.sessionStart("reload", first.context as never)).toEqual({ old: "old", new: "next" });
+    const receipt = fresh.sessionStart("reload", first.context as never)!;
+    expect(receipt).toMatchObject({ old: "old", new: "next", releaseSlot: expect.any(Function) });
+    expect(fs.readdirSync(slots)).toEqual(["slot-0"]);
+    receipt.releaseSlot!();
     await vi.advanceTimersByTimeAsync(5_000); await second.execute();
     expect(second.context.reload).toHaveBeenCalledOnce();
   });

@@ -681,19 +681,26 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     const stoppedUndelivered = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []).undelivered.length > 0;
     // A self-reload (smarty-dev#2160) re-arms the actors this Main hosts and reports on the mesh.
     const selfReloaded = selfReload.sessionStart(event?.reason ?? "", context);
-    if (selfReloaded && context.hasUI) {
-      const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
-      context.ui.notify(notice, "info");
-      // The TUI's own "Reloaded ..." status line replaces an info notice; the footer keeps it
-      // until the user's next input.
-      context.ui.setStatus(SELF_RELOAD_STATUS, notice);
-    }
-    if (stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
-    if (selfReloaded) {
-      await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
-        ...selfReloaded,
-        sessionId: context.sessionManager.getSessionId(),
-      });
+    const { releaseSlot, ...reloadReport } = selfReloaded ?? {};
+    try {
+      if (selfReloaded && context.hasUI) {
+        const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
+        context.ui.notify(notice, "info");
+        // The TUI's own "Reloaded ..." status line replaces an info notice; the footer keeps it
+        // until the user's next input.
+        context.ui.setStatus(SELF_RELOAD_STATUS, notice);
+      }
+      if (stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+      if (selfReloaded) {
+        await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
+          ...reloadReport,
+          sessionId: context.sessionManager.getSessionId(),
+        });
+      }
+    } finally {
+      // Activation includes actor re-arm inside ensure and the reload report. Both success and
+      // failure settle before admitting another Main; the lease timeout remains the backstop.
+      releaseSlot?.();
     }
   });
 

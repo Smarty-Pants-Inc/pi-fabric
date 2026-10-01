@@ -96,7 +96,7 @@ export const tryAcquireReloadSlot = (concurrency: number, directory = reloadSlot
     try { fs.unlinkSync(path.join(slot, owner)); } catch { /* expired/reclaimed or inaccessible */ }
     removeEmpty(slot);
   };
-  // Also survives native session_shutdown until the new runtime consumes the handoff.
+  // Survives native session_shutdown and handoff claim until the new activation settles.
   const timeout = setTimeout(release, RELOAD_SLOT_STALE_MS);
   timeout.unref?.();
   return release;

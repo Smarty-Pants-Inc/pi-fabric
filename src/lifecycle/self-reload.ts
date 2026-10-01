@@ -165,12 +165,10 @@ export const attemptedSelfReload = (sessionId: string, target: string): boolean 
   handoffs().get(sessionId)?.target === target
   || (((globalThis as Record<symbol, unknown>)[ATTEMPTS] as Map<string, Set<string>> | undefined)?.get(sessionId)?.has(target) ?? false);
 
-/** The finished self-reload for the new runtime, once. */
+/** Claim the self-reload for the new runtime once; activation still owns its lease. */
 export const takeSelfReload = (sessionId: string, reason: string): SelfReloadHandoff | undefined => {
   const handoff = handoffs().get(sessionId);
   if (reason !== "reload" || !handoff || handoff.reported) return undefined;
-  handoff.releaseSlot?.();
-  delete handoff.releaseSlot;
   handoff.reported = true;
   return handoff;
 };
@@ -486,6 +484,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       if (auto && (admitting || !jitterReady(candidate))) return;
       const commandGeneration = generation;
       let releaseSlot: (() => void) | undefined;
+      let handoff: SelfReloadHandoff | undefined;
       admitting = true;
       try {
         if (auto && concurrency() > 0) {
@@ -498,7 +497,12 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
             || autoReloadOptedOut(deps.autoReloadConfigured()) || !safe(context, candidate) || !recheck(candidate)) return;
           try { releaseSlot = slots.tryAcquireReloadSlot(concurrency(), deps.reloadSlotsDirectory); }
           catch { return; } // inaccessible host state fails closed, without consuming the target
-          if (!releaseSlot) return;
+          if (!releaseSlot) {
+            // Scheduling the delivered command stopped the idle timer. A full host must
+            // re-arm it here so this pending target can run once activation frees capacity.
+            armRetry(context);
+            return;
+          }
         }
         // No await between final profile/safety checks, lease acquisition and native reload.
         if (!safe(context, candidate) || !recheck(candidate)) return;
@@ -507,20 +511,25 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
           pending.delete(pendingKey(candidate));
           handoffs().set(id, { old: candidate.loaded, target: candidate.target, owner: candidate.owner!, resource: candidate.resource! });
         } else rememberSelfReload(id, candidate.loaded, candidate.target);
-        // The new module can release the old module's lease at session_start, even if the old
-        // ctx.reload promise has not yet resolved. Shutdown alone must not free it early.
-        if (releaseSlot) handoffs().get(id)!.releaseSlot = releaseSlot;
+        // Transfer ownership at session_start, but hold capacity through ensure/re-arm/publish.
+        // Shutdown alone must not free it early; an unclaimed native failure releases below.
+        handoff = handoffs().get(id)!;
+        if (releaseSlot) handoff.releaseSlot = releaseSlot;
         await context.reload();
       } finally {
-        releaseSlot?.();
+        // A claimed handoff belongs to the new activation, even if native reload resolves early.
+        if (!handoff?.reported) {
+          if (handoff) delete handoff.releaseSlot;
+          releaseSlot?.();
+        }
         admitting = false;
       }
     },
   });
 
   return {
-    /** Arm the watch and clear session-scoped resource proofs; report a finished native reload once. */
-    sessionStart(reason: string, context: ExtensionContext): { old: string; new: string; owner?: string; resource?: string; target?: string } | undefined {
+    /** Claim native reload once. The caller releases its lease after activation and reporting settle. */
+    sessionStart(reason: string, context: ExtensionContext): { old: string; new: string; owner?: string; resource?: string; target?: string; releaseSlot?: () => void } | undefined {
       generation++;
       stopRetry(); bindings.clear(); pending.clear(); notBefore.clear(); scheduled = undefined;
       noticed = undefined; held = undefined; stopped = false;
@@ -529,13 +538,21 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       if (!unsubscribe) unsubscribe = pi.events?.on(RELOAD_TARGET_TOPIC, receive);
       const done = takeSelfReload(sessionId, reason);
       const loaded = loadedFabricRoot(deps.moduleUrl);
-      if (!loaded || !contextNow) { watch = undefined; return undefined; }
+      if (!loaded || !contextNow) {
+        watch = undefined;
+        done?.releaseSlot?.();
+        if (done) delete done.releaseSlot;
+        return undefined;
+      }
       // Session switches keep the Fabric watch's original profile eligibility proof.
       if (watch?.loaded !== loaded) watch = new ActiveReleaseWatch(loaded, deps.settingsPath);
       statusShown = done !== undefined;
       if (!done) return undefined;
-      return done.resource ? { old: releaseLabel(done.old), new: releaseLabel(done.target), owner: done.owner!, resource: done.resource, target: done.target }
+      const releaseSlot = done.releaseSlot;
+      delete done.releaseSlot;
+      const receipt = done.resource ? { old: releaseLabel(done.old), new: releaseLabel(done.target), owner: done.owner!, resource: done.resource, target: done.target }
         : { old: releaseLabel(done.old), new: releaseLabel(loaded) };
+      return releaseSlot ? { ...receipt, releaseSlot } : receipt;
     },
   };
 };

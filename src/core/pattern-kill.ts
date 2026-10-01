@@ -598,7 +598,7 @@ function sourceScopes(tokens: Token[], budget: GuardBudget): SourceScopes {
 }
 
 /** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
-function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>, budget: GuardBudget, argv: (words: Word[]) => Word[]): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined; chdirs: Word[]; assignments: Word[] } {
+function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>, budget: GuardBudget, argv: (words: Word[]) => Word[]): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined; chdirs: Word[]; assignments: Word[]; wrapped: boolean } {
   let words = stageWords;
   let fedByXargs = false;
   let argFile: Word | undefined;
@@ -624,7 +624,7 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
       // assignment syntax. Refuse before either pass can bind wrapper argv in
       // the parent; genuine leading assignment-only commands remain supported.
       if (wrapped && !words.length) throw new ShellStateRefused();
-      return { words, fedByXargs, argFile, chdirs, assignments };
+      return { words, fedByXargs, argFile, chdirs, assignments, wrapped };
     }
     // Wrapper option values are actual argv: unquoted empty fields disappear before
     // deciding which word -C/-D consumes, and quoted values remain one field.
@@ -1602,7 +1602,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (stage.closed === undefined) applyOutputRedirects(stageSinks, stage.redirects, inheritedRedirect);
       const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean; positionals?: Word[]; tails?: PositionalTail }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
-      const { words, fedByXargs, argFile, chdirs, assignments } = unwrap(stage.words, envScripts, budget, (words) => {
+      const { words, fedByXargs, argFile, chdirs, assignments, wrapped } = unwrap(stage.words, envScripts, budget, (words) => {
         const argv = positionalFields(words, 0).words;
         budget.spend(argv.reduce((size, word) => size + 2 * word.text.length + 1, 1));
         return argv.map((word) => ({ ...word, text: word.text.replaceAll(LITERAL, "$"), quoted: true }));
@@ -1870,11 +1870,14 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       }
       // Security F1: `xargs -a <(ls /tmp/…)` reads its input from a /tmp listing.
       const xargsTmp = fedByXargs && (pipeTmp || stage.words.some((word) => tmpOperand(word.pattern)));
-      if (name === "cd") {
+      // Only a direct parent-shell builtin proves a cwd effect. Executable
+      // wrappers (including command/builtin) do not confer parent-state credit.
+      const directCwd = !wrapped && ["cd", "pushd", "popd"].includes(name);
+      if (directCwd && name === "cd") {
         changeDir(positionalFields(args, 0).words.find((arg) => !arg.text.startsWith("-")));
         directoryStack[0] = cwd;
       }
-      if (name === "pushd" || name === "popd") {
+      if (directCwd && (name === "pushd" || name === "popd")) {
         budget.spend(3 * directoryStack.length + args.length + 1);
         const argv = positionalFields(args, 0).words;
         const noChange = argv.some((arg) => arg.text === "-n");
@@ -1992,7 +1995,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // file (including one written earlier here) supplies its own independent contents.
       let output: Feed = { lookup, tmp: listsTmp };
       let known = independent || lookup || listsTmp;
-      const silent = reads || DELETERS.has(name) || ["kill", "cd", "pushd", "popd", "set", ":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
+      const silent = reads || directCwd || DELETERS.has(name) || ["kill", "set", ":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
         (name === "printf" && args[0]?.text === "-v") || (stage.words[0] && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(stage.words[0].text) && words.length === 0);
       if (scripts.length) { output = scriptOutput; known = scriptKnown; }
       else if (silent) { output = NO_OUTPUT; known = true; }
@@ -2063,6 +2066,14 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (stage.closed !== undefined) {
         known = compoundKnown.get(stage.closed) ?? true;
         output = compoundFeeds.get(stage.closed) ?? NO_OUTPUT;
+      }
+      // F36: a lexical visit does not prove a conditional/loop producer ran
+      // once (or at all). Before any stream/file composition, discard exact
+      // bytes and retain both destructive alternatives. Proven silence stays
+      // silent, so a no-output guard cannot invent uncertainty in later bytes.
+      if (stage.conditional && output.literal !== "") {
+        output = mergeFeed(output, UNKNOWN_FEED);
+        known = false;
       }
       // F9: apply descriptors in order. Opening stderr/fd3 does not save stdout; an
       // explicit 1>&3 does. Duplication copies the current destination, not a later fd

@@ -33,7 +33,22 @@ const round7IntentionalState = new Set<string>([
 const round9IntentionalState = new Set<string>([
   'set -- /tmp/tmp.AbC123 /var/tmp/tmp.Def456; rm -rf "$@"',
 ]);
+// R11 owner UNKNOWN-output cut: exact formerly-allowed conditional/loop
+// feeds only; baseline A receipts are recorded separately, IDs/bytes retained.
+const round11IntentionalTmp = new Set<string>([
+  'cd "$D" && ls | xargs rm -f',
+  'cd /tmp/tmp.AbC123 && ls | xargs rm -f',
+  "for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do find \"$t\" -maxdepth 1 -name '*.json'; done | xargs rm -f",
+  'ls /tmp; for suffix in log tmp; do find /tmp/tmp.AbC123 -name "*.$suffix" -print0; done | xargs -0 rm -f',
+  "for t in /tmp/tmp.AbC123 /var/tmp/tmp.Def456; do find \"$t\" -name '*.json'; done > .local/selected.list; cat .local/selected.list | xargs rm -rf",
+]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  if (round11IntentionalTmp.has(command)) {
+    expect(result, command).toStrictEqual({ blocked: false, wipe: true, exhausted: false });
+    expect(killsByPattern(command), command).toBe(false);
+    expect(wipesTmp(command), command).toBe(true);
+    return;
+  }
   const intentional = round5IntentionalState.has(command) || round7IntentionalState.has(command) || round9IntentionalState.has(command);
   const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
   if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);

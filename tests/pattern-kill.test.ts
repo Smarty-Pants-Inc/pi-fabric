@@ -26,7 +26,21 @@ const round9IntentionalState = new Set<string>([
   'command -v pkill',
   'set -- 4242 4243; kill "$@"',
 ]);
+// R11 owner UNKNOWN-output cut: exact formerly-allowed loop feeds only.
+// Original test IDs and command bytes remain unchanged; each baseline A was
+// independently observed before this expectation-only migration (#2656).
+const round11IntentionalPattern = new Set<string>([
+  'for file in .local/server.pid .local/worker.pid; do cat "$file"; done | xargs kill',
+  'grep -q ready .local/server.log; for i in once; do cat .local/server.pid; done | xargs kill',
+  'for file in .local/server.pid .local/worker.pid; do cat "$file"; done > .local/selected.pids; cat .local/selected.pids | xargs kill',
+]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  if (round11IntentionalPattern.has(command)) {
+    expect(result, command).toStrictEqual({ blocked: true, wipe: false, exhausted: false });
+    expect(killsByPattern(command), command).toBe(true);
+    expect(wipesTmp(command), command).toBe(false);
+    return;
+  }
   const intentional = round5IntentionalState.has(command) || round9IntentionalState.has(command);
   const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
   if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);

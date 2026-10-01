@@ -160,7 +160,8 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(received).toEqual([[kind, remote.id, "first-minute reply", local.id]]);
     expect(directory.peers()).toEqual([expect.objectContaining({ id: remote.id, host: "forge" })]);
     expect(request).toHaveBeenCalledExactlyOnceWith(remote.id, remote.id, kind,
-      { message: "first-minute reply", data: undefined }, remote.id, { routedRemoteHost: "forge" });
+      { message: "first-minute reply", data: undefined, principal: undefined,
+        ...(kind === "followUp" ? { triggerTurn: true } : {}) }, remote.id, { routedRemoteHost: "forge" });
   });
 
   // The far side of the bridge: the owner runs on its own mesh; a relay carries commands there and
@@ -225,7 +226,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(request).toHaveBeenNthCalledWith(1, remote.id, remote.id, "steer",
       { message: "steer me", data: undefined }, remote.id, { routedRemoteHost: "forge" });
     expect(request).toHaveBeenNthCalledWith(2, remote.id, remote.id, "followUp",
-      { message: "later", data: undefined }, remote.id, { routedRemoteHost: "forge" });
+      { message: "later", data: undefined, principal: undefined, triggerTurn: true }, remote.id, { routedRemoteHost: "forge" });
     expect(received).toEqual([
       ["steer", remote.id, "steer me", local.id],
       ["followUp", remote.id, "later", local.id],

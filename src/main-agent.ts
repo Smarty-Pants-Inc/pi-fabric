@@ -281,6 +281,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   #providerFailureRecorded = false;
   #providerWake: ReturnType<typeof setTimeout> | undefined;
   #providerReleaseUntil: number | undefined;
+  // Never place a second native continuation beyond a retry whose outcome is still unknown.
+  #providerAttemptInFlight = false;
   // Preserve an unreadable owner index until explicit user input authorizes replacing it.
   #haltIndexUnknown = false;
   #closed = false;
@@ -401,7 +403,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     };
     const triggerTurn = (request.triggerTurn ?? true) && !this.#halted;
     const providerHeld = triggerTurn && request.delivery !== "nextTurn" &&
-      !this.#context?.signal?.aborted && this.#providerBackoffActive();
+      !this.#context?.signal?.aborted && (this.#providerBackoffActive() || this.#providerAttemptInFlight);
     if (providerHeld && request.delivery === "steer") {
       item.deliverAs = request.delivery;
       item.triggerTurn = true;
@@ -498,7 +500,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     return {
       queued: true, messageId: item.id, routed: "main",
       ...(triggered === undefined ? {} : { triggered }),
-      ...(providerHeld ? { reason: `provider-backoff until ${new Date(this.#providerRetryAt).toISOString()}` } : {}),
+      ...(providerHeld ? { reason: this.#providerAttemptInFlight ? "provider-retry in flight" : `provider-backoff until ${new Date(this.#providerRetryAt).toISOString()}` } : {}),
       ...(replaced ? { coalesced: true as const, replacedMessageId: replaced.id } : {}),
       // Only a followUp that waits in the held queue can be stalled; a non-triggering one went
       // straight to Pi (#123 review F1).
@@ -925,7 +927,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#context = ctx;
       this.#recoverProvider(false); // Only a successful turn resets consecutive failures.
       this.#compactionDecline = undefined;
-      if (event.reason === "manual" && flushMs > 0) this.#wakeWhenIdle();
+      if (event.reason === "manual") this.#wakeWhenIdle();
       else this.#operation = undefined;
     });
     on("agent_start", () => {
@@ -1040,7 +1042,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #flushDue(): void {
-    if (!this.#held.length || this.#suspended || this.#reloading) return;
+    if (!this.#held.length || this.#suspended || this.#reloading || this.#providerAttemptInFlight) return;
     if (this.#halted || this.#context?.signal?.aborted) { this.#release(false); return; }
     if (this.#providerBackoffActive()) { this.#scheduleProviderWake(); return; }
     // A successful automatic retry can recover within the same run, without agent_start.
@@ -1126,7 +1128,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const operation = this.#operation;
     // Retain cancellation evidence while later completion handlers still run.
     this.#wake = setInterval(() => {
-      if (this.#closed || !operation || operation.aborted) this.#stopWake();
+      if (!this.#context || !operation || operation.aborted) this.#stopWake();
       else if (this.#context?.isIdle()) {
         if (this.#operation === operation) this.#operation = undefined;
         this.#held.length ? this.#release(true) : this.#stopWake();
@@ -1140,6 +1142,8 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #recordProviderFailure(newFailure = false): void {
+    this.#providerAttemptInFlight = false;
+    this.#stopProviderWake();
     if (newFailure || !this.#providerFailureRecorded) {
       // Saturate the exponent too: consecutive failures can continue indefinitely.
       this.#providerFailures = Math.min(this.#providerFailures + 1, 6);
@@ -1152,6 +1156,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #recoverProvider(resetFailures = true): void {
+    this.#providerAttemptInFlight = false;
     this.#providerFailed = false;
     if (resetFailures) this.#providerFailures = 0;
     this.#providerRetryAt = 0;
@@ -1161,7 +1166,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   #scheduleProviderWake(): void {
     // #closed also means the ordinary busy drain is disabled. Backoff holds work in both modes.
-    if (this.#providerWake || !this.#context || this.#reloading || this.#halted ||
+    if (this.#providerWake || this.#providerAttemptInFlight || !this.#context || this.#reloading || this.#halted ||
       this.#context.signal?.aborted || !this.#held.some(item =>
         item.deliverAs !== "nextTurn" && (item.triggerTurn ?? true))) return;
     const until = this.#providerRetryAt;
@@ -1187,14 +1192,29 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   #release(triggerTurn: boolean, closing = false): void {
     if (this.#reloading) return;
+    if (!closing && this.#providerAttemptInFlight && !this.#halted && !this.#context?.signal?.aborted) return;
     // An error settle must not downgrade a held wake into passive Pi context forever.
     if (!closing && this.#providerFailed && !this.#halted && !this.#context?.signal?.aborted &&
-      (this.#providerBackoffActive() || !triggerTurn)) { this.#scheduleProviderWake(); return; }
+      (this.#providerBackoffActive() || !triggerTurn)) {
+      // A failed boundary must still reconcile reload replay as passive context. Holding
+      // it until recovery would revive its saved wake permission at an unrelated settle.
+      // Fresh peer wakes are different: leave them journalled for the provider retry.
+      while (this.#held[0] && this.#replayed.has(this.#held[0].id)) {
+        const first = this.#held[0];
+        first.deliverAs ??= "followUp";
+        first.triggerTurn = false;
+        if (!this.#handOver(1, first.deliverAs, false, false)) break;
+      }
+      this.#stopProviderWake();
+      if (!this.#held.length) this.#providerReleaseUntil = undefined;
+      this.#scheduleProviderWake();
+      return;
+    }
     this.#stopWake();
     const until = !closing && triggerTurn && !this.#halted && !this.#context?.signal?.aborted
       ? this.#providerReleaseUntil : undefined;
     const before = until === undefined ? [] : this.#held.map(item => item.id);
-    this.#releaseQueue(triggerTurn);
+    this.#releaseQueue(triggerTurn, !closing && this.#providerFailed && triggerTurn && !this.#halted && !this.#context?.signal?.aborted);
     if (until !== undefined) {
       const remaining = new Set(this.#held.map(item => item.id));
       const messageIds = before.filter(id => !remaining.has(id));
@@ -1203,24 +1223,31 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
   }
 
-  #releaseQueue(triggerTurn: boolean): void {
-    // In byte-bounded messages, oldest first; a failed send keeps the rest for a retry.
+  #releaseQueue(triggerTurn: boolean, singleWake = false): void {
+    // In byte/provenance-bounded messages, oldest first; a failed send keeps the rest.
     while (this.#held.length) {
-      // Reload-time in-flight controls were never handed to Pi. Preserve their mode and policy.
       const first = this.#held[0]!;
-      if (first.deliverAs !== undefined) {
-        // A sender's saved permission cannot override a later cancelled/failed boundary.
-        if (!this.#handOver(1, first.deliverAs, triggerTurn && (first.triggerTurn ?? true), false)) return;
-        continue;
+      const deliverAs = first.deliverAs ?? "followUp";
+      const wake = triggerTurn && (first.triggerTurn ?? true);
+      let count = 1;
+      if (first.deliverAs === undefined) {
+        count = 0;
+        let bytes = 0;
+        while (count < this.#held.length && this.#held[count]!.deliverAs === undefined) {
+          bytes += itemBytes(this.#held[count]!);
+          if (count > 0 && bytes > FOLLOW_UP_LIMITS.batchBytes) break;
+          count++;
+        }
       }
-      let count = 0;
-      let bytes = 0;
-      while (count < this.#held.length && this.#held[count]!.deliverAs === undefined) {
-        bytes += itemBytes(this.#held[count]!);
-        if (count > 0 && bytes > FOLLOW_UP_LIMITS.batchBytes) break;
-        count++;
+      // Pi immediately consumes queued followUps even after an error. Keep every later
+      // batch in Fabric until this attempt succeeds or records its next failure deadline.
+      const attempt = singleWake && wake && deliverAs !== "nextTurn";
+      if (attempt) this.#providerAttemptInFlight = true;
+      if (!this.#handOver(count, deliverAs, wake, false)) {
+        if (attempt) this.#providerAttemptInFlight = false;
+        return;
       }
-      if (!this.#handOver(count, "followUp", triggerTurn, false)) return;
+      if (attempt) return;
     }
   }
 
@@ -1278,6 +1305,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       },
       provenance ? fabricProvenanceOptions(this.pi, options, provenance) : options,
     );
+    // A fresh delivery can win the deadline without going through #releaseQueue. It is
+    // still the one retry attempt; later peer wakes must wait for its actual outcome.
+    if (triggerTurn && deliverAs !== "nextTurn" && this.#providerFailed) this.#providerAttemptInFlight = true;
     return triggered;
   }
 }

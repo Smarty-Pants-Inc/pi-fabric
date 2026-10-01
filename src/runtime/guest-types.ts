@@ -814,6 +814,10 @@ interface FabricMessageDelivery {
   messageId: string;
   routed?: "local" | "main" | "mesh";
   acknowledged?: boolean;
+  /** Whether this delivery started an idle Main turn; absent when the route cannot prove it. */
+  triggered?: boolean;
+  /** Why a requested wake was held, including provider-backoff until an ISO timestamp. */
+  reason?: string;
   /** For a Main target: your own followUps it still holds unread. Switch to steer when this or oldestAgeS grows. */
   pendingFollowUps?: number;
   /** For a Main target: the age in seconds of your oldest followUp it still holds (0 when none). */
@@ -879,8 +883,8 @@ interface FabricAgentsApi {
   }): Promise<FabricActorInfo>;
   ask(args: FabricActorMessageArgs): Promise<FabricActorMessage>;
   ask(id: string, message: string): Promise<FabricActorMessage>;
-  tell(args: FabricActorMessageArgs): Promise<{ queued: true; messageId: string }>;
-  tell(id: string, message: string): Promise<{ queued: true; messageId: string }>;
+  tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
+  tell(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs): Promise<FabricMessageDelivery>;

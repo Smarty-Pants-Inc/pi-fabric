@@ -296,12 +296,14 @@ const main = async (): Promise<void> => {
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
   if (options.runner === "pi") {
-    // A worker relaunch keeps the Fabric run ID but Pi can mint a new native
-    // session. Preserve already observed joins in the same status record.
+    // The manager removes the old status to fence terminal verdicts on relaunch.
+    // History is explicitly handed across that boundary, not a Pi resume target.
+    if (options.runnerSessionIds?.length) record.runnerSessionIds = [...options.runnerSessionIds];
+    // Also accept a matching prior status for a direct worker restart.
     try {
       const prior = JSON.parse(fs.readFileSync(options.statusFile, "utf8")) as AgentRunRecord;
       if (prior.id === options.id) {
-        const ids = [...(Array.isArray(prior.runnerSessionIds) ? prior.runnerSessionIds : []), prior.runnerSessionId]
+        const ids = [...(record.runnerSessionIds ?? []), ...(Array.isArray(prior.runnerSessionIds) ? prior.runnerSessionIds : []), prior.runnerSessionId]
           .filter((id): id is string => typeof id === "string" && Boolean(id.trim()));
         if (ids.length) record.runnerSessionIds = [...new Set(ids)];
       }

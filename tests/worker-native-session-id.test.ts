@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import runnerSession from "../src/worker/session-id.js";
+import { parseWorkerOptions } from "../src/worker/options.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorManager } from "../src/actors/manager.js";
@@ -102,7 +103,7 @@ describe("native Pi runner session attribution", () => {
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
   });
 
-  it.each([true, false])("keeps earlier identities on same-run relaunch, not unrelated records (matching ID: %s)", async matching => {
+  it.each([true, false])("reads only matching prior status identities (matching ID: %s)", async matching => {
     const { agents } = setup();
     const launch = ProcessTransport.prototype.launch;
     const earlier = "01900000-0000-7000-8000-000000000000";
@@ -118,6 +119,53 @@ describe("native Pi runner session attribution", () => {
     expect(result).toMatchObject({ status: "completed", runnerSessionId: first });
     expect(result.runnerSessionIds).toEqual(matching ? [earlier, first] : [first]);
   }, 15_000);
+
+  it.each(["startup-retry", "resume"])("carries every native identity through the actual manager %s boundary", async kind => {
+    const dir = root();
+    const recoveryPi = path.resolve("tests/fixtures/fake-pi-session-recovery.mjs");
+    const manager = new AgentManager(dir, config, {
+      workerPath, piBinary: recoveryPi, runRoot: path.join(dir, "recovery-runs"),
+      mainAgentId: "session:" + parent, fabricSessionId: parent,
+    });
+    close.push(() => manager.close());
+    const launch = ProcessTransport.prototype.launch;
+    const attempts: { id: string; freshStatus: boolean }[] = [];
+    const workerArguments: string[][] = [];
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const file = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      attempts.push({ id: request.id, freshStatus: !fs.existsSync(file) });
+      workerArguments.push([...request.workerArguments]);
+      return launch.call(this, request);
+    });
+    const handle = await manager.spawn({ task: kind, name: "recover-native-sessions", transport: "process", extensions: false });
+    if (kind === "resume") {
+      await until(() => {
+        const status = manager.status(handle.id);
+        return status.runnerSessionId === latest && "turns" in status && status.turns > 0;
+      });
+      // An unexpected real worker stop, NOT manager.stop (which forbids recovery).
+      process.kill(Number(handle.sessionId), "SIGTERM");
+    }
+    const result = await manager.wait(handle.id, { timeoutMs: 10_000 });
+    const expectedIds = [first, latest, "01900000-0000-7000-8000-000000000003", "01900000-0000-7000-8000-000000000004"];
+    expect(result.status).toBe("completed");
+    expect(attempts).toEqual([{ id: handle.id, freshStatus: true }, { id: handle.id, freshStatus: true }]);
+    expect(fs.readFileSync(path.join(dir, "native-session-attempts"), "utf8")).toBe("2");
+    const runDirectory = manager.runDirectory(handle.id)!;
+    const relaunches = fs.readFileSync(path.join(runDirectory, "relaunches.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(relaunches).toEqual([expect.objectContaining({ kind })]);
+    expect(result).toMatchObject({ runnerSessionId: expectedIds[3], runnerSessionIds: expectedIds, fabricSessionId: parent });
+    expect(manager.status(handle.id)).toMatchObject({ runnerSessionId: expectedIds[3], runnerSessionIds: expectedIds });
+    expect(readRecord(path.join(runDirectory, "status.json"))).toMatchObject({ runnerSessionId: expectedIds[3], runnerSessionIds: expectedIds });
+    const argv = ["node", workerPath, ...workerArguments[1]!];
+    expect(parseWorkerOptions(argv)).toMatchObject({ runnerSessionIds: [first, latest] });
+    expect(parseWorkerOptions(argv).runnerSessionId).toBeUndefined(); // history is not a resume target
+    expect(parseWorkerOptions([...argv, "--runner-session-ids", JSON.stringify([first, first])]).runnerSessionIds).toEqual([first]);
+    for (const malformed of ["{", "null", "{}", JSON.stringify([first, null]), JSON.stringify([""])]) {
+      expect(() => parseWorkerOptions([...argv, "--runner-session-ids", malformed])).toThrow("Invalid worker runner session IDs");
+    }
+    if (kind === "resume") expect(result.turns).toBe(2);
+  }, 20_000);
 
   it("preserves native identity, history and parent Main on a host-synthesized stop record", async () => {
     const { agents, events } = setup();

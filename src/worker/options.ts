@@ -99,6 +99,16 @@ export const parseWorkerOptions = (
   const nice = optional(args, "nice");
   const carryOverSource = optional(args, "carry-over");
   const runnerSessionId = optional(args, "runner-session-id");
+  const runnerSessionIdsSource = optional(args, "runner-session-ids");
+  let runnerSessionIds: string[] | undefined;
+  if (runnerSessionIdsSource) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(runnerSessionIdsSource); } catch { /* rejected below */ }
+    if (!Array.isArray(parsed) || parsed.some(id => typeof id !== "string" || !id.trim())) {
+      throw new Error("Invalid worker runner session IDs");
+    }
+    runnerSessionIds = [...new Set(parsed as string[])];
+  }
   const inheritedSessionPinsSource = optional(args, "inherited-session-pins");
   const inheritedSessionPins = inheritedSessionPinsSource
     ? JSON.parse(inheritedSessionPinsSource) as AgentWorkerOptions["inheritedSessionPins"]
@@ -193,6 +203,7 @@ export const parseWorkerOptions = (
     ...(ownerHostId ? { ownerHostId } : {}),
     ...(ownerIdentityId ? { ownerIdentityId } : {}),
     ...(runnerSessionId ? { runnerSessionId } : {}),
+    ...(runnerSessionIds ? { runnerSessionIds } : {}),
     ...(runRoot ? { runRoot } : {}),
     ...(steerFile ? { steerFile } : {}),
     ...(branch ? { branch } : {}),

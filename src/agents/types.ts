@@ -268,6 +268,8 @@ export interface AgentWorkerOptions {
   branch?: string;
   worktree?: string;
   inheritedSessionPins?: InheritedSessionPin[];
+  /** Observed native Pi session history carried across a same-run worker relaunch. Not a resume target. */
+  runnerSessionIds?: string[];
   carryOver?: AgentRunCarryOver;
 }
 

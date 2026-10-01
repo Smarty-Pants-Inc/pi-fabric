@@ -2071,6 +2071,18 @@ export class AgentManager {
       // the previous attempt published (token usage above all) before discarding
       // the journal it landed in.
       this.#drainLifecycle(managed);
+      if (managed.runner === "pi") {
+        // status.json must be removed to fence the new attempt from the old
+        // terminal verdict. Hand off its native-session joins separately, after
+        // confirmed exit so the previous worker's final observations are included.
+        const ids = [record, managed.latestRecord, readRecord(managed.statusFile)]
+          .filter((prior): prior is AgentRunRecord => prior?.id === managed.id)
+          .flatMap(prior => [...(Array.isArray(prior.runnerSessionIds) ? prior.runnerSessionIds : []), prior.runnerSessionId])
+          .filter((id): id is string => typeof id === "string" && Boolean(id.trim()));
+        if (ids.length) {
+          setWorkerArgument(managed.launch.workerArguments, "runner-session-ids", JSON.stringify([...new Set(ids)]));
+        }
+      }
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);

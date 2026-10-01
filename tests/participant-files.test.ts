@@ -1,13 +1,15 @@
 import { spawn } from "node:child_process";
+import childProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
+import { processIncarnation } from "../src/core/atomic-write.js";
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { LIVENESS_POLICY_KEY, removeHostLease } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, readHostLease, removeHostLease } from "../src/topology/host-leases.js";
 import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
 import * as participantFiles from "../src/topology/participant-files.js";
 import { readParticipantFiles, writeParticipantFile } from "../src/topology/participant-files.js";
@@ -20,6 +22,7 @@ const roots: string[] = [];
 const directories: ParticipantDirectory[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -50,11 +53,120 @@ const directory = (root: string, name: string, source: () => FabricParticipantRe
 };
 const stateParticipants = (root: string) =>
   new MeshStore(root, 64 * 1024, 1_000).listAll(PREFIX, { fresh: true });
+const mockNativePlatform = (platform: "darwin" | "win32", start: string) => {
+  vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+  vi.stubEnv("SystemRoot", "C:\\Windows");
+  // A simulated non-Linux host must not accidentally expose this runner's /proc.
+  const read = fs.readFileSync.bind(fs);
+  vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+    if (String(file).startsWith("/proc/")) throw Object.assign(new Error("no procfs"), { code: "ENOENT" });
+    return (read as (...args: unknown[]) => unknown)(file, ...args);
+  }) as typeof fs.readFileSync);
+  return vi.spyOn(childProcess, "execFileSync").mockReturnValue(start + "\n");
+};
 const setPolicy = (root: string) => new MeshStore(root, 64 * 1024, 1_000).put({
   key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files", participants: "files" }, identity: identityOf("owner"),
 });
 
 describe("participant files", () => {
+  it.each([false, true])("renews a live host through per-key contention (files-only=%s), retries and lets dead hosts expire", async (filesOnly) => {
+    vi.useFakeTimers({ now: Date.now() });
+    const root = meshRoot();
+    if (filesOnly) await setPolicy(root);
+    let status: "idle" | "running" = "idle";
+    const make = (name: string, source: () => FabricParticipantRecord[]) => {
+      // No legacy main-session fallback: assert the actual participant host lease.
+      const identity: MeshIdentity = { ...identityOf(name), kind: "agent" };
+      const value = new ParticipantDirectory(new MeshStore(root, 64 * 1024, 1_000), {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 2_000,
+        reapDeadHosts: false,
+      });
+      value.registerSource(source);
+      directories.push(value);
+      return value;
+    };
+    const alpha = make("alpha", () => [record("alpha", { status }), record("healthy")]);
+    const dead = make("dead", () => [record("dead")]);
+    const reader = make("reader", () => [record("reader")]);
+    let pending: Promise<void> | undefined;
+    let lock = "";
+    try {
+      await alpha.start();
+      await dead.refresh(); // no timer: this host genuinely stops renewing
+      await reader.refresh();
+      const leaseBefore = readHostLease(root, "session:alpha")!;
+      lock = path.join(root, "participants", ".locks", keyOf("session:alpha").slice(PREFIX.length));
+      fs.mkdirSync(lock, { recursive: true });
+      fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n\nlive-holder\n`);
+      if (filesOnly) status = "running";
+      else fs.rmSync(path.join(root, "participants", `${keyOf("session:alpha").slice(PREFIX.length)}.json`));
+      pending = alpha.refresh().catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(3_000); // > lease, still inside the key wait
+      expect(readHostLease(root, "session:alpha")!.updatedAt).toBeGreaterThan(leaseBefore.updatedAt);
+      expect(reader.list({ scope: "project", includeStale: true }).find((item) => item.id === "session:alpha")).toMatchObject({ stale: false });
+      expect(reader.list({ scope: "project", includeStale: true }).find((item) => item.id === "session:dead")).toMatchObject({ stale: true });
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toContain("live-holder");
+      await vi.advanceTimersByTimeAsync(3_000); // > key timeout; failed keys must be retried
+      expect(readHostLease(root, "session:alpha")!.expiresAt).toBeGreaterThan(Date.now());
+      fs.rmSync(lock, { recursive: true });
+      await vi.advanceTimersByTimeAsync(200);
+      await pending;
+      await alpha.refresh(); // failed per-key copy/write is retried
+      expect(readParticipantFiles(root, { maxAgeMs: 0 }).find((entry) => entry.key === keyOf("session:alpha")))
+        .toMatchObject({ value: { status: filesOnly ? "running" : "idle" } });
+    } finally {
+      if (lock) fs.rmSync(lock, { recursive: true, force: true });
+      await vi.advanceTimersByTimeAsync(200);
+      await pending;
+      await alpha.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("renews during a contended initial publish, before start has returned", async () => {
+    vi.useFakeTimers({ now: Date.now() });
+    const root = meshRoot();
+    await setPolicy(root);
+    const write = participantFiles.writeParticipantFileIf;
+    let resume!: () => void;
+    const gate = new Promise<void>((resolve) => { resume = resolve; });
+    vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementationOnce(async (...args) => {
+      await gate;
+      return write(...args);
+    });
+    const alpha = directory(root, "alpha", () => [record("alpha")]);
+    const starting = alpha.start();
+    try {
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(readHostLease(root, "session:alpha")!.expiresAt).toBeGreaterThan(Date.now());
+    } finally {
+      resume();
+      await starting;
+      await alpha.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["write", "cleanup"] as const)("isolates a failed per-key %s so healthy keys publish and the failure retries", async (operation) => {
+    const root = meshRoot();
+    await setPolicy(root);
+    let includeOld = true;
+    let status: "idle" | "running" = "idle";
+    const alpha = directory(root, "alpha", () => [record("alpha", { status }), record("healthy", { status }), ...(includeOld ? [record("old")] : [])]);
+    await alpha.refresh();
+    status = "running";
+    includeOld = false;
+    const method = operation === "write" ? "writeParticipantFileIf" : "removeParticipantFileIf";
+    vi.spyOn(participantFiles, method).mockRejectedValueOnce(new Error("owned key is contended"));
+    await expect(alpha.refresh()).resolves.toBeUndefined();
+    expect(readParticipantFiles(root, { maxAgeMs: 0 }).find((entry) => entry.key === keyOf("session:healthy")))
+      .toMatchObject({ value: { status: "running" } });
+    await alpha.refresh();
+    expect(readParticipantFiles(root, { maxAgeMs: 0 }).map((entry) => entry.key)).not.toContain(keyOf("session:old"));
+    expect(readParticipantFiles(root, { maxAgeMs: 0 }).find((entry) => entry.key === keyOf("session:alpha")))
+      .toMatchObject({ value: { status: "running" } });
+  });
+
   it("before the fleet owner's switch, write each committed record to the shared state and its file", async () => {
     const root = meshRoot();
     const alpha = directory(root, "alpha", () => [record("alpha")]);
@@ -382,6 +494,151 @@ describe("participant files", () => {
       child.once("exit", () => resolve(child.pid!));
     });
 
+    it("serializes a paused leftover sweep with recovery rather than restoring an ownerless canonical lock", async () => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const lock = holdLock(root, "session:a", 999999999);
+      const old = new Date(Date.now() - 2 * 3_600_000);
+      fs.utimesSync(lock, old, old);
+      const rename = fs.renameSync.bind(fs);
+      const remove = fs.rmSync.bind(fs);
+      let armed = true;
+      let sweep: Promise<number> | undefined;
+      let ownerlessRestore = false;
+      vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+        if (String(file).startsWith(`${lock}.`) && String(file).endsWith(".dead") && armed) {
+          // An interrupted recursive sweep has unlinked owner but not yet rmdir'd.
+          remove(path.join(String(file), "owner"), { force: true });
+          throw Object.assign(new Error("paused sweep after owner unlink"), { code: "EBUSY" });
+        }
+        return remove(file, options);
+      });
+      vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        rename(from, to);
+        if (String(from) === lock && armed) {
+          sweep = reapDeadHostRecords(mesh, identityOf("sweeper"), { ownHostId: "session:sweeper" });
+          armed = false;
+        } else if (String(to) === lock && !fs.existsSync(path.join(lock, "owner"))) {
+          ownerlessRestore = true;
+        }
+      });
+      await participantFiles.writeParticipantFileIf(mesh, keyOf("session:a"), () => ({
+        key: keyOf("session:a"), value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a"),
+      }));
+      await sweep;
+      expect(sweep).toBeDefined();
+      expect(ownerlessRestore).toBe(false);
+      expect(readParticipantFiles(root)).toHaveLength(1);
+    });
+
+    it("ordinarily sweeps old staging/tombstone leftovers but leaves recent ones and canonical locks", async () => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const canonical = holdLock(root, "session:a", process.pid);
+      const old = new Date(Date.now() - 2 * 3_600_000);
+      for (const suffix of ["old.tmp", "old.dead", "recent.tmp", "recent.dead"]) {
+        const leftover = `${canonical}.${suffix}`;
+        fs.mkdirSync(leftover);
+        fs.writeFileSync(path.join(leftover, "owner"), "leftover\n");
+        if (suffix.startsWith("old")) fs.utimesSync(leftover, old, old);
+      }
+      await reapDeadHostRecords(mesh, identityOf("sweeper"), { ownHostId: "session:sweeper" });
+      expect(fs.readdirSync(path.dirname(canonical)).sort()).toEqual([
+        path.basename(canonical), `${path.basename(canonical)}.recent.dead`, `${path.basename(canonical)}.recent.tmp`,
+      ].sort());
+    });
+
+    it.skipIf(!["linux", "darwin", "win32"].includes(process.platform))("native participant publication records incarnation and recovers a proven reused PID", async () => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const key = keyOf("session:a");
+      const start = processIncarnation(process.pid);
+      expect(start).toBeDefined();
+      await participantFiles.writeParticipantFileIf(mesh, key, () => {
+        expect(fs.readFileSync(path.join(lockOf(root, "session:a"), "owner"), "utf8").split("\n")[1]).toBe(start);
+        return undefined;
+      });
+      const lock = holdLock(root, "session:a", process.pid);
+      const different = process.platform === "linux" ? String(BigInt(start!) + 1n)
+        : process.platform === "win32" ? `win32:${BigInt(start!.slice(6)) + 1n}` : "darwin:Fri Jan  1 00:00:00 1999";
+      fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n${different}\nreused\n`);
+      await expect(participantFiles.writeParticipantFileIf(mesh, key, () => ({
+        key, value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a"),
+      }))).resolves.toBe(true);
+    });
+
+    it.skipIf(process.platform !== "linux")("keeps unreadable, torn and permission-denied live Linux key holders", async () => {
+      vi.useFakeTimers({ now: Date.now() });
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const lock = holdLock(root, "session:a", process.pid);
+      const start = processIncarnation(process.pid)!;
+      const read = fs.readFileSync.bind(fs);
+      try {
+        for (const scenario of ["unreadable", "torn", "permission"] as const) {
+          fs.writeFileSync(path.join(lock, "owner"), scenario === "torn"
+            ? `${process.pid}\n${start.slice(0, -1) || "0"}`
+            : `${process.pid}\n${scenario === "unreadable" ? BigInt(start) + 1n : start}\nheld\n`);
+          if (scenario === "unreadable") {
+            vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+              if (String(file) === `/proc/${process.pid}/stat`) throw Object.assign(new Error("unreadable"), { code: "EACCES" });
+              return (read as (...args: unknown[]) => unknown)(file, ...args);
+            }) as typeof fs.readFileSync);
+          }
+          if (scenario === "permission") vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("denied"), { code: "EPERM" }); });
+          const decide = vi.fn(() => undefined);
+          const pending = participantFiles.writeParticipantFileIf(mesh, keyOf("session:a"), decide).catch((error: unknown) => error);
+          await vi.advanceTimersByTimeAsync(5_000);
+          expect(await pending).toMatchObject({ message: expect.stringMatching(/Timed out waiting/) });
+          expect(decide).not.toHaveBeenCalled();
+          expect(fs.existsSync(lock)).toBe(true);
+          vi.restoreAllMocks();
+        }
+      } finally {
+        // Restore native functions before fixture teardown; never signal a numeric id.
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+      }
+    });
+
+    it.each(["darwin", "win32"] as const)("uses native %s incarnation to recover a reused PID", async (platform) => {
+      vi.useFakeTimers({ now: Date.now() });
+      mockNativePlatform(platform, platform === "darwin" ? "Thu Oct  1 12:00:00 2026" : "639264528000000000");
+      const root = meshRoot();
+      const lock = holdLock(root, "session:a", process.pid);
+      fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n${platform === "darwin" ? "darwin:Wed Sep 30 12:00:00 2026" : "win32:639263664000000000"}\nheld\n`);
+      const key = keyOf("session:a");
+      const pending = participantFiles.writeParticipantFileIf(new MeshStore(root, 64 * 1024, 1_000), key, () => ({
+        key, value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a"),
+      })).catch((error: unknown) => error);
+      try {
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(await pending).toBe(true);
+        expect(childProcess.execFileSync).toHaveBeenCalled();
+      } finally { vi.useRealTimers(); }
+    });
+
+    it.each(["darwin", "win32"] as const)("keeps live/unknown %s incarnations, even past stale age", async (platform) => {
+      vi.useFakeTimers({ now: Date.now() });
+      const identity = platform === "darwin" ? "darwin:Thu Oct  1 12:00:00 2026" : "win32:639264528000000000";
+      const native = mockNativePlatform(platform, identity.slice(identity.indexOf(":") + 1));
+      const root = meshRoot();
+      const lock = holdLock(root, "session:a", process.pid);
+      fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n${identity}\nheld\n`);
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      try {
+        for (const unknown of [false, true]) {
+          if (unknown) native.mockImplementation(() => { throw new Error("identity unreadable"); });
+          const decide = vi.fn(() => undefined);
+          const pending = participantFiles.writeParticipantFileIf(mesh, keyOf("session:a"), decide).catch((error: unknown) => error);
+          await vi.advanceTimersByTimeAsync(5_000);
+          expect(await pending).toMatchObject({ message: expect.stringMatching(/Timed out waiting/) });
+          expect(decide).not.toHaveBeenCalled();
+          expect(fs.existsSync(lock)).toBe(true);
+        }
+      } finally { vi.useRealTimers(); }
+    });
+
     for (const cleanup of ["rmdir", "recursive"] as const) {
       it.skipIf(process.platform === "win32")(`holder release preserves a successor installed during ${cleanup} cleanup`, async () => {
         const root = meshRoot();
@@ -473,6 +730,7 @@ describe("participant files", () => {
     it("a live holder past any age keeps its lock; a contender times out and writes nothing", async () => {
       const root = meshRoot();
       const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      const closed = new Promise<void>((resolve) => holder.once("close", () => resolve()));
       try {
         await new Promise((resolve) => holder.once("spawn", resolve));
         const lock = holdLock(root, "session:a", holder.pid!);
@@ -482,7 +740,8 @@ describe("participant files", () => {
         expect(fs.existsSync(lock)).toBe(true);
         expect(readParticipantFiles(root, { maxAgeMs: 0 })).toEqual([]);
       } finally {
-        holder.kill("SIGKILL");
+        if (holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
+        await closed;
       }
     }, 30_000);
 

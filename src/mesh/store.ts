@@ -3,7 +3,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeFileAtomic } from "../core/atomic-write.js";
+import { processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
@@ -165,18 +165,6 @@ const processAlive = (pid: number): boolean => {
     return true;
   } catch (error) {
     return errorCode(error) === "EPERM"; // A process we cannot signal is not a dead holder.
-  }
-};
-
-/** Linux's PID incarnation; unavailable platforms/reads retain the legacy live-PID guard. */
-const processStartTime = (pid: number): string | undefined => {
-  if (process.platform !== "linux") return undefined;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const start = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
-    return start && /^\d+$/.test(start) ? start : undefined;
-  } catch {
-    return undefined;
   }
 };
 
@@ -1491,7 +1479,7 @@ export class MeshStore {
     const deadline = Date.now() + this.#lockTimeoutMs;
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
-    const startTime = this.#lockProtocol === 2 ? processStartTime(process.pid) : undefined;
+    const startTime = this.#lockProtocol === 2 ? processIncarnation(process.pid) : undefined;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     // Attempts and the largest gap between two of them: a large gap means this waiter stalled
     // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -1585,7 +1573,7 @@ export class MeshStore {
 
   // Dead holders are recoverable at once; only missing/corrupt records need the stale
   // directory window. A live PID (including stopped/permission-denied) remains protected,
-  // unless Linux proves it is a different incarnation from the optional fourth owner line.
+  // unless the native platform proves a different incarnation from the optional fourth owner line.
   #clearStaleLock(ownerPath: string): boolean {
     try {
       const stat = fs.lstatSync(this.#lockPath);
@@ -1603,8 +1591,8 @@ export class MeshStore {
       const validOwner = !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (validPid && processAlive(pid)) {
-        if (!validOwner || !recordedStart || !/^\d+$/.test(recordedStart)) return false;
-        const actualStart = processStartTime(pid);
+        if (!validOwner || !validProcessIncarnation(recordedStart)) return false;
+        const actualStart = processIncarnation(pid);
         if (!actualStart || actualStart === recordedStart) return false;
       } else if (!validOwner && Date.now() - stat.mtimeMs <= this.#staleLockMs) {
         return false;

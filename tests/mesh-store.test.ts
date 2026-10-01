@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,6 +20,16 @@ const identity: MeshIdentity = {
   sessionId: "test",
 };
 
+const mockNativePlatform = (platform: "darwin" | "win32", start: string) => {
+  vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+  vi.stubEnv("SystemRoot", "C:\\Windows");
+  const read = fs.readFileSync.bind(fs);
+  vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+    if (String(file).startsWith("/proc/")) throw Object.assign(new Error("no procfs"), { code: "ENOENT" });
+    return (read as (...args: unknown[]) => unknown)(file, ...args);
+  }) as typeof fs.readFileSync);
+  return vi.spyOn(childProcess, "execFileSync").mockReturnValue(start + "\n");
+};
 const createStore = (options?: MeshStoreOptions): MeshStore => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-"));
   roots.push(root);
@@ -27,6 +38,7 @@ const createStore = (options?: MeshStoreOptions): MeshStore => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   vi.useRealTimers();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -816,6 +828,46 @@ describe("MeshStore lock recovery", () => {
     expect(operation).toHaveBeenCalledOnce();
     expect(refused).toBeDefined();
     expect(fs.readdirSync(store.root).filter((name) => name.startsWith(".lock.dead."))).toHaveLength(1);
+  });
+
+  it.each(["darwin", "win32"] as const)("publishes native %s incarnation and recovers a reused PID", async (platform) => {
+    vi.useFakeTimers({ now: Date.now() });
+    const start = platform === "darwin" ? "Thu Oct  1 12:00:00 2026" : "639264528000000000";
+    mockNativePlatform(platform, start);
+    const store = createStore({ lockProtocol: 2, lockTimeoutMs: 100 });
+    await store.exclusive(() => {
+      expect(fs.readFileSync(path.join(store.root, ".lock", "owner"), "utf8").split("\n")[3]).toBe(`${platform}:${start}`);
+    });
+    holdLock(store, `reused\n${process.pid}\n${Date.now()}\n${platform === "darwin" ? "darwin:Wed Sep 30 12:00:00 2026" : "win32:639263664000000000"}\n`);
+    const operation = vi.fn();
+    const pending = store.exclusive(operation).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    await pending;
+    expect(operation).toHaveBeenCalledOnce();
+  });
+
+  it.each(["darwin", "win32"] as const)("protects old live, unknown and torn %s incarnations and recovers dead holders", async (platform) => {
+    vi.useFakeTimers({ now: Date.now() });
+    const start = platform === "darwin" ? "Thu Oct  1 12:00:00 2026" : "639264528000000000";
+    const native = mockNativePlatform(platform, start);
+    const store = createStore({ lockProtocol: 2, lockTimeoutMs: 100 });
+    const owner = `live\n${process.pid}\n${Date.now() - 60_000}\n${platform}:${start}\n`;
+    const lock = holdLock(store, owner);
+    for (const scenario of ["live", "unknown", "torn", "legacy"] as const) {
+      if (scenario === "unknown") native.mockImplementation(() => { throw new Error("identity unreadable"); });
+      if (scenario === "torn") fs.writeFileSync(path.join(lock, "owner"), owner.slice(0, -2));
+      if (scenario === "legacy") fs.writeFileSync(path.join(lock, "owner"), `live\n${process.pid}\n${Date.now() - 60_000}\n`);
+      const operation = vi.fn();
+      const pending = store.exclusive(operation).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(operation).not.toHaveBeenCalled();
+      expect(fs.existsSync(lock)).toBe(true);
+    }
+    fs.writeFileSync(path.join(lock, "owner"), `dead\n999999999\n${Date.now()}\n${platform}:${start}\n`);
+    const operation = vi.fn();
+    await store.exclusive(operation);
+    expect(operation).toHaveBeenCalledOnce();
   });
 
   it.skipIf(process.platform !== "linux")("publishes Linux start time and distinguishes a reused PID from its live incarnation", async () => {

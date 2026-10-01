@@ -1,6 +1,50 @@
 import { randomUUID } from "node:crypto";
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+
+const DARWIN_START = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) {1,2}\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
+
+/** Only identities from this platform's native reader are comparable; unknown stays live. */
+export const validProcessIncarnation = (value: string | undefined): boolean => {
+  if (!value) return false;
+  if (process.platform === "linux") return /^\d+$/.test(value);
+  if (process.platform === "win32") return /^win32:\d+$/.test(value);
+  if (process.platform === "darwin") return value.startsWith("darwin:") && DARWIN_START.test(value.slice(7));
+  return false;
+};
+
+/**
+ * Native creation identity, never an age heuristic. Keep Linux's field-22 wire unchanged.
+ * macOS ps has second precision: reuse within one second remains conservatively live.
+ * UTC/C locale makes ps output independent of each writer's timezone/locale.
+ * Missing tools, permissions, malformed output and unsupported platforms are UNKNOWN.
+ */
+export const processIncarnation = (pid: number): string | undefined => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  try {
+    if (process.platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const start = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      return validProcessIncarnation(start) ? start : undefined;
+    }
+    const options = { encoding: "utf8" as const, timeout: 2_000, maxBuffer: 4_096, windowsHide: true };
+    let start: string;
+    if (process.platform === "darwin") {
+      start = childProcess.execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+        ...options, env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+      }).trim();
+    } else if (process.platform === "win32") {
+      if (!process.env.SystemRoot) return undefined;
+      const powershell = path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      start = childProcess.execFileSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks.ToString([System.Globalization.CultureInfo]::InvariantCulture)`,
+      ], options).trim();
+    } else return undefined;
+    const identity = `${process.platform}:${start}`;
+    return validProcessIncarnation(identity) ? identity : undefined;
+  } catch { return undefined; }
+};
 
 export interface AtomicWriteOptions {
   // File mode for the committed file (default 0o600) and for mkdir -p of its

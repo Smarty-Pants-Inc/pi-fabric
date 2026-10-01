@@ -8,6 +8,8 @@ export interface JsonlPage {
   lines: FabricLogLine[];
   hasMore: boolean;
   before?: number;
+  /** Device/inode of the opened descriptor; bind the next before to this value. */
+  generation?: string;
 }
 
 const parseLine = (offset: number, raw: string): FabricLogLine => {
@@ -54,9 +56,18 @@ export const readJsonlPageFromDescriptor = (
   before?: number,
   knownSize?: number,
   maxBytes?: number,
+  beforeGeneration?: string,
 ): JsonlPage => {
   try {
-    const size = knownSize ?? fs.fstatSync(descriptor).size;
+    const stat = fs.fstatSync(descriptor, { bigint: true });
+    const generation = `${stat.dev}:${stat.ino}`;
+    if (beforeGeneration !== undefined && beforeGeneration !== generation) {
+      const error = new Error("cursor-stale: Log generation changed; re-read from start without before or beforeGeneration");
+      error.name = "cursor-stale";
+      throw error;
+    }
+    // Sample identity and read bytes from the same FD, including across rename.
+    const size = knownSize ?? Number(stat.size);
     const fileEnd = typeof before === "number" && Number.isSafeInteger(before)
       ? Math.max(0, Math.min(before, size))
       : size;
@@ -97,25 +108,29 @@ export const readJsonlPageFromDescriptor = (
     return {
       lines: selected.map((line) => parseLine(line.offset, line.raw)),
       hasMore,
+      generation,
       ...(hasMore ? { before: selected[0]!.offset } : {}),
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === "cursor-stale") throw error;
     return { lines: [], hasMore: false };
   }
 };
 
-/** Read a bounded JSONL page backwards, touching only enough file chunks to fill it. */
+/** Read a bounded JSONL page backwards. Bare legacy before offsets remain unbound. */
 export const readJsonlPage = (
   filePath: string,
   limit: number,
   before?: number,
   maxBytes?: number,
+  beforeGeneration?: string,
 ): JsonlPage => {
   let descriptor: number | undefined;
   try {
     descriptor = fs.openSync(filePath, "r");
-    return readJsonlPageFromDescriptor(descriptor, limit, before, undefined, maxBytes);
-  } catch {
+    return readJsonlPageFromDescriptor(descriptor, limit, before, undefined, maxBytes, beforeGeneration);
+  } catch (error) {
+    if (error instanceof Error && error.name === "cursor-stale") throw error;
     return { lines: [], hasMore: false };
   } finally {
     if (descriptor !== undefined) {

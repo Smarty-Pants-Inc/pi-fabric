@@ -1,7 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
-import { fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
+import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp } from "./core/pattern-kill.js";
@@ -226,6 +226,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
+  registerFabricPrincipalCapture(pi);
   if (!options.managedHost) registerJevAuth(pi);
   const codePreviewSettings = defaultCodePreviewSettings();
   const decorateShell: FabricToolShellDecorator = withCodePreviewShell;

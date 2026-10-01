@@ -31,6 +31,10 @@ search DATA. Unsupported dollar quoting, continuation or heredoc syntax cannot
 hide visible protected names. Known opaque executors with inner quotes/escapes
 refuse rather than decoding quote-concatenated or escaped receiver spellings;
 when the protected class itself is unproved, the stable signal reason is used.
+Protected basenames behind a lexical relative or absolute path prefix remain
+protected inside opaque execution strings; a path-regex miss is not a DATA grant.
+`trap` action strings are executable text, not unrelated argv DATA. No cwd,
+executable lookup, trap state or deferred-handler execution is modelled.
 
 TMPDIR is read **at each guard call**, never from the submitted shell text. Missing,
 relative, expansion-bearing, traversing or shared-root TMPDIR values confer no
@@ -60,6 +64,9 @@ the TMPDIR itself is refused; the literal operand must be below it.
 - `tests/literal-bash-guard-round2.test.ts`: exact Astra F1–F3 / security S1–S4
   fixtures, explicitly derived fragmented-script spellings, and independent
   literal/inert-DATA controls.
+- `tests/literal-bash-guard-round3.test.ts`: derived relative shell/eval receivers
+  and EXIT/zero trap action witnesses, with independent bare-literal, non-protected
+  trap and inert printed-DATA controls.
 
 No corpus command is dispatched to Bash. Round 2 additionally requires one real
 Pi 0.87.1 run on the freshly built head: only an owned PID's literal signal-zero

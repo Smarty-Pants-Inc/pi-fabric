@@ -9,7 +9,7 @@ const SIGNALS = new Set(["kill", "pkill", "killall", "killall5"]);
 const DATA = new Set(["echo", "printf", "grep", "rg"]);
 // These are grammar/execution prefixes, never proof that following words are DATA.
 const RESERVED = new Set(["!", "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "in", "esac", "select", "coproc", "function", "time", "{", "}"]);
-const EXECUTORS = new Set(["sudo", "doas", "env", "command", "builtin", "exec", "nice", "ionice", "timeout", "time", "nohup", "setsid", "stdbuf", "xargs", "bash", "sh", "zsh", "dash", "ksh", "ssh", "eval", "source", ".", "find"]);
+const EXECUTORS = new Set(["sudo", "doas", "env", "command", "builtin", "exec", "nice", "ionice", "timeout", "time", "nohup", "setsid", "stdbuf", "xargs", "bash", "sh", "zsh", "dash", "ksh", "ssh", "eval", "source", ".", "find", "trap"]);
 const basename = (word: string): string => word.slice(word.lastIndexOf("/") + 1);
 
 /** Literal words only. No expansion, bindings, output, shell argv, or execution interpretation. */
@@ -64,9 +64,10 @@ function split(source: string): Split {
   return { words, simple };
 }
 
-// An opaque script/capture mentioning a protected operation is NOT interpreted or admitted.
-const SIGNAL_TEXT = /(?:^|[\s;|&()<>"'`=]|-[A-Za-z]*S)(?:\/[\w./-]+\/)?(?:kill|pkill|killall|killall5)(?=$|[\s;|&()<>"'`])/;
-const DELETE_TEXT = /(?:^|[\s;|&()<>"'`=]|-[A-Za-z]*S)(?:\/[\w./-]+\/)?(?:rm|find|shred)(?=$|[\s;|&()<>"'`])/;
+// Opaque executable text (including trap actions) never receives a literal-command grant.
+// A lexical path prefix may be relative or absolute; no cwd/executable lookup is inferred.
+const SIGNAL_TEXT = /(?:^|[\s;|&()<>"'`=]|-[A-Za-z]*S)(?:[^\s;|&()<>"'`]+\/)?(?:kill|pkill|killall|killall5)(?=$|[\s;|&()<>"'`])/;
+const DELETE_TEXT = /(?:^|[\s;|&()<>"'`=]|-[A-Za-z]*S)(?:[^\s;|&()<>"'`]+\/)?(?:rm|find|shred)(?=$|[\s;|&()<>"'`])/;
 
 function literalKill(words: Word[]): boolean {
   if (words[0]?.text !== "kill" || words.some(word => !word.literal)) return false;

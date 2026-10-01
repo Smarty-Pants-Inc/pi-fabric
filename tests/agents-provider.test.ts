@@ -39,6 +39,7 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentsProvider, collectAgentToolPreviewNodes } from "../src/providers/agents-provider.js";
 import type { ResidencyClient } from "../src/residency/client.js";
+import { ResidentOutcomeUnknownError } from "../src/residency/protocol.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -417,7 +418,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
     const provider = new AgentsProvider(state.agents, passive, state.globalActors, state.mainAgent, state.participants,
       state.control, state.lifecycle, undefined, { removeActor } as unknown as ResidencyClient);
     await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
-    expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id);
+    expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id, context.signal);
     expect(fs.existsSync(dir)).toBe(false);
     expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
   });
@@ -465,7 +466,7 @@ describe("Main remote ASK observation ownership", () => {
   ] as const)("preserves accepted %s owner work at the Main ceiling (queued=%s)", async (route, queued) => {
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
-    const owner = setup([], [], undefined, { identity: { id: "session:remoteowner", name: "remote owner", kind: "main", sessionId: "remoteowner" } });
+    const owner = setup([], [], undefined, { workerPath: path.resolve("tests/fixtures/ask-owner-worker.mjs"), identity: { id: "session:remoteowner", name: "remote owner", kind: "main", sessionId: "remoteowner" } });
     const actor = await owner.actors.create({ name: "remote survivor", instructions: "Reply.", transport: "process", responseMode: "text", delivery: "followUp", triggerTurn: false });
     const ownerId = owner.identity.id;
     const senderIdentity: MeshIdentity = { id: "session:observer", name: "observer", kind: "main" };
@@ -498,14 +499,30 @@ describe("Main remote ASK observation ownership", () => {
     const sender = setup([], [member], senderControl);
     const stop = vi.spyOn(owner.agents, "stop");
     const run = vi.spyOn(owner.agents, "run");
+    const publishWorkerStatus = async () => {
+      // inFlightRun only proves acceptance; AgentManager can still expose a handle
+      // without counters until the child writes its first status.json (notably Windows).
+      const handle = owner.agents.list()[0]!;
+      expect(handle.status).toBe("running");
+      expect(handle).not.toHaveProperty("turns"); // Deliberately hold child initialization.
+      fs.writeFileSync(path.join(owner.root, "runs", "owner-worker-ready"), "ready\n");
+      await waitFor(() => {
+        const record = owner.agents.status(handle.id);
+        return "turns" in record && "toolCalls" in record;
+      }, 5_000);
+    };
     try {
       const first = queued ? owner.actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS").catch(error => error) : undefined;
-      if (queued) await waitFor(() => Boolean(owner.actors.status(actor.id).inFlightRun));
+      if (queued) {
+        await waitFor(() => Boolean(owner.actors.status(actor.id).inFlightRun));
+        await publishWorkerStatus();
+      }
       const controller = new AbortController();
       const observation = sender.provider.invoke("ask", { id: actor.id, message: queued ? "accepted queued request" : "LIVE_WITHOUT_PROGRESS" }, {
         ...context, signal: controller.signal, extensionContext: { ...context.extensionContext, mode: "rpc", sessionManager: { getSessionId: () => "observer" } } as unknown as ExtensionContext,
       }).catch(error => error);
       await waitFor(() => queued ? owner.actors.status(actor.id).queued === 1 : Boolean(owner.actors.status(actor.id).inFlightRun));
+      if (!queued) await publishWorkerStatus();
       const ceiling = createMainExecutionCeilingError(700);
       controller.abort(ceiling);
       const rejection = await observation;
@@ -515,6 +532,9 @@ describe("Main remote ASK observation ownership", () => {
       expect(stop).not.toHaveBeenCalled();
       if (queued) expect(owner.actors.status(actor.id).queued).toBe(1);
       else expect(owner.agents.list()[0]).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
+      // Completion is explicitly gated, not a 1.5 s scheduling assumption. Release
+      // accepted work only after proving the unchanged zero-progress ownership law.
+      fs.writeFileSync(path.join(owner.root, "runs", "owner-worker-complete"), "complete\n");
       await first;
       await waitFor(() => owner.actorDeliveries.length === (queued ? 2 : 1) && owner.actors.status(actor.id).status === "idle", 5_000);
       expect(owner.actors.messages(actor.id).filter(message => message.direction === "out")).toHaveLength(queued ? 2 : 1);
@@ -1052,7 +1072,7 @@ describe("AgentsProvider actor session reset", () => {
     fs.mkdirSync(path.dirname(actor.sessionFile!), { recursive: true });
     fs.writeFileSync(actor.sessionFile!, "{}\n");
     await expect(provider.invoke("resetSession", { id: actor.id }, context)).resolves.toMatchObject({ id: actor.id });
-    expect(fs.existsSync(actor.sessionFile!)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(actor.sessionFile!, "utf8").split("\n", 1)[0]!)).toMatchObject({ type: "session", version: 3 });
     expect(fs.readdirSync(path.dirname(actor.sessionFile!)).some((name) => /^session\.jsonl\..+\.bak$/.test(name))).toBe(true);
   });
 });
@@ -1384,6 +1404,7 @@ describe("AgentsProvider runner support", () => {
       () => DEFAULT_FABRIC_CONFIG.models,
     );
 
+    const invocationContext = { ...context, signal: new AbortController().signal };
     const created = (await provider.invoke(
       "create",
       {
@@ -1391,7 +1412,7 @@ describe("AgentsProvider runner support", () => {
         instructions: "Created via the resident host.",
         residency: "durable",
       },
-      context,
+      invocationContext,
     )) as FabricActorInfo;
     state.globalActors.create({
       name: "durable-template",
@@ -1401,7 +1422,7 @@ describe("AgentsProvider runner support", () => {
     const imported = (await provider.invoke(
       "import",
       { name: "durable-template" },
-      context,
+      invocationContext,
     )) as FabricActorInfo;
 
     expect(created).toMatchObject({ id: "resident-actor-1", name: "second-durable" });
@@ -1409,53 +1430,40 @@ describe("AgentsProvider runner support", () => {
     expect(createActor).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({ name: "second-durable", residency: "durable" }),
+      invocationContext.signal,
     );
     expect(createActor).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({ name: "durable-template", residency: "durable" }),
+      invocationContext.signal,
     );
   });
 
-  it("does not reroute a failed local durable activation", async () => {
+  it("never hides resident uncertainty in local activation compensation or reclaim", async () => {
     const state = setup();
-    const activationError = new Error(
-      "Fabric actor registry is owned by another host after local creation",
-    );
-    const createActor = vi.fn();
+    const activationError = new Error("publication failed after local creation");
+    const unknown = new ResidentOutcomeUnknownError({
+      format: 1, operation: "removeActor", requestId: "committed-removal", rootId: "session:main",
+      id: "known-actor", createdAt: Date.now(),
+    }, { state: "committed", requestId: "committed-removal", id: "known-actor", ownerHostId: "resident:test" }, activationError);
+    const createActor = vi.fn().mockRejectedValue(unknown);
+    const ensureActor = vi.fn().mockRejectedValue(activationError);
+    const removeActor = vi.fn().mockRejectedValue(unknown);
+    const localCreate = vi.spyOn(state.actors, "create");
+    const reclaim = vi.spyOn(state.actors, "reclaim");
     const residency = {
-      ensureHost: vi.fn(async () => undefined),
-      ensureActor: vi.fn(async () => {
-        throw activationError;
-      }),
-      removeActor: vi.fn(async () => ({ removed: true })),
-      createActor,
+      ensureHost: vi.fn(async () => undefined), ensureActor, removeActor, createActor,
     } as unknown as ResidencyClient;
     const provider = new AgentsProvider(
-      state.agents,
-      state.actors,
-      state.globalActors,
-      state.mainAgent,
-      state.participants,
-      state.control,
-      state.lifecycle,
-      undefined,
-      residency,
-      undefined,
-      () => DEFAULT_FABRIC_CONFIG.models,
+      state.agents, state.actors, state.globalActors, state.mainAgent, state.participants,
+      state.control, state.lifecycle, undefined, residency, undefined, () => DEFAULT_FABRIC_CONFIG.models,
     );
-
-    await expect(
-      provider.invoke(
-        "create",
-        {
-          name: "activation-failure",
-          instructions: "Do not reroute this failed transfer.",
-          residency: "durable",
-        },
-        context,
-      ),
-    ).rejects.toBe(activationError);
-    expect(createActor).not.toHaveBeenCalled();
+    await expect(provider.invoke("create", {
+      name: "activation-failure", instructions: "Do not reclaim an uncertain transfer.", residency: "durable",
+    }, context)).rejects.toBe(unknown);
+    expect(createActor).toHaveBeenCalledOnce();
+    expect(localCreate).not.toHaveBeenCalled(); expect(ensureActor).not.toHaveBeenCalled();
+    expect(removeActor).not.toHaveBeenCalled(); expect(reclaim).not.toHaveBeenCalled();
   });
   it("lists live peer sessions separately from Main", async () => {
     const peer: FabricPeerInfo = {

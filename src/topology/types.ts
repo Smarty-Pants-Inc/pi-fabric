@@ -37,6 +37,8 @@ export interface FabricParticipantRecord {
   /** False for print/JSON roots: discoverable observers, never message or lead targets. */
   interactive?: boolean;
   status: string;
+  /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
+  reloadUntil?: number;
   residency?: FabricParticipantResidency;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport | "host";

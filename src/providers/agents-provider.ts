@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { formatAge } from "../residency/protocol.js";
-import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
+import { ActorManager, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
@@ -1005,7 +1005,7 @@ export class AgentsProvider implements FabricProvider {
       case "cleanup": {
         const id = String(args.id);
         return this.residency?.hasAgent(id)
-          ? this.residency.cleanupAgent(id, args.deleteBranch === true)
+          ? this.residency.cleanupAgent(id, args.deleteBranch === true, context.signal)
           : this.manager.cleanup(id, args.deleteBranch === true);
       }
       case "create": {
@@ -1014,7 +1014,7 @@ export class AgentsProvider implements FabricProvider {
           return this.globalActors.create(actorRequest(createArgs, context, this.manager, false));
         }
         const request = actorRequest(createArgs, context, this.manager);
-        const actor = await this.#createActor(request);
+        const actor = await this.#createActor(request, context.signal);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;
@@ -1243,8 +1243,8 @@ export class AgentsProvider implements FabricProvider {
           if (this.actorManager.owns(cleanup.id)) return this.actorManager.remove(cleanup.id);
           if (cleanup.residency !== "durable") throw new Error("Only the owning host can remove this actor");
           return this.residency
-            ? this.residency.removeActor(cleanup.id)
-            : this.#residentActorClient().removeActor(cleanup.id);
+            ? this.residency.removeActor(cleanup.id, context.signal)
+            : this.#residentActorClient().removeActor(cleanup.id, context.signal);
         }
         let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
         try {
@@ -1262,8 +1262,8 @@ export class AgentsProvider implements FabricProvider {
         if (residency !== "durable") throw new Error("Only the owning host can remove this actor");
         const id = actor?.id ?? participant!.id;
         return this.residency
-          ? this.residency.removeActor(id)
-          : this.#residentActorClient().removeActor(id);
+          ? this.residency.removeActor(id, context.signal)
+          : this.#residentActorClient().removeActor(id, context.signal);
       }
       case "setInstructions": {
         const id = String(args.id);
@@ -1302,7 +1302,7 @@ export class AgentsProvider implements FabricProvider {
               )).model as string,
             }
           : request;
-        const actor = await this.#createActor(resolvedRequest);
+        const actor = await this.#createActor(resolvedRequest, context.signal);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;
@@ -1402,7 +1402,7 @@ export class AgentsProvider implements FabricProvider {
     return this.#router.resolveActorTarget(id);
   }
 
-  async #createActor(request: FabricActorRequest): Promise<FabricActorInfo> {
+  async #createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     // Also freeze imported templates before any resident host sees the request.
     const extensions = request.extensions ?? true;
     const kernel = this.manager.resolveKernel({ ...request, extensions });
@@ -1414,18 +1414,12 @@ export class AgentsProvider implements FabricProvider {
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
     };
     if (request.residency !== "durable") return this.actorManager.create(request);
-    if (!this.residency) return this.#residentActorClient().createActor(request);
-
-    await this.residency.ensureHost();
-    let actor: FabricActorInfo;
-    try {
-      actor = await this.actorManager.create(request);
-    } catch (error) {
-      if (!(error instanceof ActorRegistryOwnershipError)) throw error;
-      return this.residency.createActor(request);
-    }
-    await this.#activateDurableActor(actor);
-    return actor;
+    // Even the first actor in an empty registry must use the authoritative
+    // host's capability check and request fence. A local-create/cede path can
+    // publish after cancellation with neither a decision nor a known-ID receipt.
+    return this.residency
+      ? this.residency.createActor(request, signal)
+      : this.#residentActorClient().createActor(request, signal);
   }
 
   /**
@@ -1475,23 +1469,6 @@ export class AgentsProvider implements FabricProvider {
       );
     }
     return this.residency;
-  }
-
-  async #activateDurableActor(actor: FabricActorInfo): Promise<void> {
-    const residency = this.#resident();
-    await this.actorManager.cede(actor.id);
-    await this.participants.refresh();
-    try {
-      await residency.ensureActor(actor.id);
-    } catch (error) {
-      try {
-        await residency.removeActor(actor.id);
-      } catch {
-        this.actorManager.reclaim(actor.id);
-      }
-      await this.participants.refresh().catch(() => undefined);
-      throw error;
-    }
   }
 
   #listAgents(scopeValue: unknown): Array<AgentRunRecord | AgentHandleInfo | ReturnType<FabricParticipantSource["self"]>> {

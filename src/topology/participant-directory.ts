@@ -40,6 +40,8 @@ const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
 const PARTICIPANT_LEASE_MS = 15_000;
+/** Addressable across a live reload, but a failed reload stops accepting after this lease. */
+export const MAIN_RELOAD_LEASE_MS = 30_000;
 /**
  * Change-driven refreshes (agent UI updates, actor changes) run at most once per this
  * interval, and write only when a published record changed (smarty-dev#367: each write
@@ -220,7 +222,7 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
     participant.kind !== "root" ||
     !participant.cwd ||
     !participant.sessionId ||
-    (participant.status !== "idle" && participant.status !== "running" && participant.status !== "stopping")
+    (participant.status !== "idle" && participant.status !== "running" && participant.status !== "stopping" && participant.status !== "reloading")
   ) {
     return undefined;
   }
@@ -402,6 +404,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshError: unknown;
   #deadHostSweepAt = Date.now();
   #quiescing = false;
+  #reloadUntil: number | undefined;
+  #reloadPublished = false;
   /** When a committed write last carried this host's participant records. */
   #recordsWrittenAt = 0;
 
@@ -543,6 +547,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const stale =
         !owner ||
         owner.expiresAt < now ||
+        (participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) ||
         owner.identity.id !== participant.ownerIdentityId ||
         owner.rootId !== participant.rootId;
       if (stale && !options.includeStale) continue;
@@ -774,6 +779,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (
           owner &&
           ownerMatches(participant, owner, this.options.hostId) &&
+          !(participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) &&
           hostLeaseExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner) >= now &&
           owner.identity.id === participant.ownerIdentityId &&
           owner.rootId === participant.rootId
@@ -933,14 +939,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }).catch(() => undefined);
   }
 
-  async quiesce(): Promise<void> {
+  async quiesce(reason?: string): Promise<void> {
     if (this.#closed || this.#quiescing) return;
     this.#quiescing = true;
+    if (reason === "reload" && this.options.identity.kind === "main" && this.options.hostId === this.options.rootId) {
+      this.#reloadUntil = Date.now() + MAIN_RELOAD_LEASE_MS;
+    }
     await this.#refreshing?.catch(() => undefined);
     await this.refresh();
+    this.#reloadPublished = this.#reloadUntil !== undefined;
   }
 
   async close(): Promise<void> {
+    if (this.#closed) return;
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
@@ -951,7 +962,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!this.options.enabled) return;
     const own = (entry: MeshStateEntry): boolean => {
       const participant = participantFromEntry(entry);
-      return participant !== undefined && isLocal(participant, this.options.hostId);
+      return participant !== undefined && isLocal(participant, this.options.hostId) &&
+        !(this.#reloadPublished && participant.kind === "root" && participant.id === this.options.rootId);
     };
     await Promise.allSettled(readParticipantFiles(this.mesh.root, { maxAgeMs: 0 }).filter(own)
       .map((entry) => removeParticipantFileIf(this.mesh, entry.key, own)));
@@ -964,6 +976,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         await this.mesh.delete({ key: legacy.key, ifVersion: legacy.version }).catch(() => undefined);
       }
     }
+    // A reload leaves only its root and fixed host lease; the next session_start replaces both.
+    if (this.#reloadPublished) return;
     removeHostLease(this.mesh.root, this.options.hostId);
     const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
     if (hostEntry && hostFromEntry(hostEntry)?.remoteHost === undefined) {
@@ -986,7 +1000,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
           ownerHostId: this.options.hostId,
           ownerIdentityId: this.options.identity.id,
           // A root that is shutting down takes no new steer, and says why (smarty-dev#1113).
-          ...(this.#quiescing ? { capabilities: [], status: "stopping" } : {}),
+          ...(this.#quiescing
+            ? this.#reloadUntil !== undefined && candidate.kind === "root" && candidate.id === this.options.rootId
+              ? { status: "reloading", reloadUntil: this.#reloadUntil }
+              : { capabilities: [], status: "stopping" }
+            : {}),
           controlProtocol: "v1",
         };
         desired.set(record.id, record);
@@ -1176,7 +1194,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // The file lease is renewed first and on every heartbeat, without the mesh lock
     // (smarty-dev#816). Under the fleet owner's policy, a renewal that changes nothing writes
     // only the file, plus the shared host record every STATE_LEASE_RENEW_MS.
-    if (!this.#quiescing) {
+    if (!this.#quiescing || this.#reloadUntil !== undefined) {
       const leaseAt = this.#renewFileLease();
       if (!changed && fileLeasesOnly(this.mesh.get(LIVENESS_POLICY_KEY)?.value)) {
         const own = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
@@ -1211,7 +1229,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         identity: this.options.identity,
         startedAt: this.#startedAt,
         updatedAt: leaseAt,
-        expiresAt: leaseAt + this.#leaseMs,
+        expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
       }),
     });
     const results = await this.mesh.writeBatch({ identity: this.options.identity, ops });
@@ -1243,7 +1261,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: this.options.rootId,
       identityId: this.options.identity.id,
       updatedAt: leaseAt,
-      expiresAt: leaseAt + this.#leaseMs,
+      expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
     });
     return leaseAt;
   }

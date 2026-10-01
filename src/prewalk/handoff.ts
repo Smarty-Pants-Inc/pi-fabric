@@ -8,6 +8,7 @@ import type { FabricResultFormat } from "../config.js";
 import type { FabricCallAudit } from "../core/action-registry.js";
 import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX as NESTED_TOOL_CALL_ID_PREFIX } from "../protocol.js";
 import type { FabricExecutionResult } from "../execution-service.js";
+import type { FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import type {
   FabricInvocationActivityUpdate,
   FabricInvocationContext,
@@ -123,6 +124,12 @@ export interface PendingFabricHandoff {
   args: Record<string, unknown>;
   audit: FabricCallAudit;
   resultFormat: FabricResultFormat;
+  /** Host snapshot from execute, never recovered by parsing model-visible prose. */
+  executionOutcome?: Readonly<{
+    success: boolean;
+    error?: string;
+    residentOutcomes: readonly FabricResidentOutcomeReceipt[];
+  }>;
   triggerRef?: string;
   // Session-monotonic claim order from the controller; rides result trigger
   // fields so follow-ups and audit surfaces can reference the Nth claim.

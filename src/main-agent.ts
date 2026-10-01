@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import { writeFileAtomic } from "./core/atomic-write.js";
+import { readFileRetrying, syncPathNamespace, writeFileAtomic } from "./core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
+import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
-export { resolveFabricIdentity, type FabricIdentityResolution } from "./fabric-provenance.js";
 
 const MAIN_AGENT_ALIAS = "main";
 export type FabricAgentMessageDelivery = "steer" | "followUp";
@@ -91,6 +91,9 @@ export interface FabricMainAgentTarget {
   /** Local host capability, used to keep sender-specific lifecycle batches attributable. */
   supportsProvenance?(): boolean;
 }
+
+// Keep identity resolution available to existing callers without making startup import the drain.
+export { resolveFabricIdentity, type FabricIdentityResolution } from "./fabric-provenance.js";
 
 const escapeXmlText = (value: string): string =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -244,9 +247,11 @@ export class MainAgentController implements FabricMainAgentTarget {
   // entries of the former, bytes of the latter.
   #source: string | undefined;
   #scanned: number | undefined;
+  #sessionFileIdentity: string | undefined;
   #journal: string | undefined;
   // Delivery ids whose message the session holds, or that will never go (replaced, dropped):
-  // persisted beside the journal, bounded, oldest first. With the journal's own items they make
+  // persisted beside the journal, bounded, oldest first. This index also retains the owner halt
+  // after the message journal is empty. With the journal's own items they make
   // deliverAgent idempotent by deliveryId across restarts and release reloads.
   #consumed = new Set<string>();
   #consumedDirty = false;
@@ -256,9 +261,18 @@ export class MainAgentController implements FabricMainAgentTarget {
   #flushAll = false;
   #stallS = 600;
   #suspended = false;
+  // Owner stop, unlike a run's signal: survives reload and lifts only on user input.
+  #halted = false;
+  // Provider/compaction failures suppress wakes, but are not owner stops: recovery lifts this gate.
+  #providerFailed = false;
+  // Preserve an unreadable owner index until explicit user input authorizes replacing it.
+  #haltIndexUnknown = false;
   #closed = false;
+  #reloading = false;
   #wake: ReturnType<typeof setInterval> | undefined;
   #operation: AbortSignal | undefined;
+  // Keep the veto signal through both settlement notifications, including late owner aborts.
+  #compactionDecline: AbortSignal | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -327,6 +341,20 @@ export class MainAgentController implements FabricMainAgentTarget {
     return { queued: true, messageId, routed: "main" };
   }
 
+  /** No more Pi handoffs once reload starts; an already-admitted control command journals only. */
+  prepareReload(): void {
+    this.#reloading = true;
+    this.#stopWake();
+  }
+
+  /** Escape can halt an idle Main without producing an aborted run event. */
+  halt(): void {
+    this.#halted = true;
+    this.#consumedDirty = true;
+    this.#stopWake();
+    this.#trySave();
+  }
+
   deliverAgent(request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
     const message = request.message.trim();
@@ -352,7 +380,16 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),
       ...(deliveryId === undefined ? {} : { deliveryId }),
     };
-    const triggerTurn = request.triggerTurn ?? true;
+    const triggerTurn = (request.triggerTurn ?? true) && !this.#halted && !this.#providerFailed;
+    if (this.#reloading) {
+      if (!this.#journal) throw new Error("Main has no follow-up journal open; retry after reload");
+      item.deliverAs = request.delivery;
+      item.triggerTurn = triggerTurn;
+      this.#admit(item);
+      this.#held.push(item);
+      try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
+      return { queued: true, messageId: item.id, routed: "main", ...this.queueDepth(item.from.id) };
+    }
     let replaced: HeldAgentMessage | undefined;
     // Pi releases its own followUp queue only when Main has no more work, so a Main that
     // chains turns reads it an hour late (smarty-dev#1495). Fabric holds a triggering
@@ -360,13 +397,20 @@ export class MainAgentController implements FabricMainAgentTarget {
     // agent_settled releases the rest as a followUp. A non-triggering one never waited.
     const held = request.delivery === "followUp" && triggerTurn && this.#drainActive();
     if (held) {
-      // smarty-dev#1495: a held followUp with the same sender and data.coalesceKey is replaced
-      // in place, so a sender that notifies on each state change leaves one message, the newest.
+      // smarty-dev#1495: replace a held same-sender/key followUp in place with the newest.
+      // Reload can also hold direct deliveries: never consume one with a different mode or
+      // trigger policy (pi-fabric#184 R1). Ordinary held followUps mean followUp/true.
       const key = followUpCoalesceKey(item.data);
       const index = key === undefined ? -1 : this.#held.findIndex((held) =>
-        held.from.id === item.from.id && followUpCoalesceKey(held.data) === key);
+        held.from.id === item.from.id && held.from.kind === item.from.kind && followUpCoalesceKey(held.data) === key &&
+        (held.deliverAs ?? "followUp") === request.delivery && (held.triggerTurn ?? true) === triggerTurn);
       replaced = index < 0 ? undefined : this.#held[index];
       if (replaced) {
+        // A compatible journalled replay still goes at its original boundary and policy.
+        if (replaced.deliverAs !== undefined) {
+          item.deliverAs = replaced.deliverAs;
+          item.triggerTurn = replaced.triggerTurn ?? true;
+        }
         item.sentAt = replaced.sentAt;
         item.replacedAt = Date.now();
         item.chain = replaced.chain ?? replaced.id;
@@ -484,8 +528,22 @@ export class MainAgentController implements FabricMainAgentTarget {
   #admitted(deliveryId: string): string | undefined {
     const item = [...this.#unverified, ...this.#sent, ...this.#held].find((item) =>
       item.deliveryId === deliveryId || item.supersedes?.includes(deliveryId));
-    if (item) return item.id;
-    if (this.#consumed.has(deliveryId) || this.#refreshDelivered().has(deliveryKey(deliveryId))) return deliveryId;
+    if (item) {
+      // A replayed rename can be visible even though its post-rename barriers failed.
+      // Reading it (or a failed best-effort replay save) is not a durability receipt.
+      // Re-establish the complete journal barrier chain before duplicate acceptance
+      // lets the resident client delete its source; propagate failure for a later drain.
+      this.#save();
+      return item.id;
+    }
+    if (this.#consumed.has(deliveryId)) {
+      // The same uncertainty applies to a recovered consumed-ID replacement, even
+      // with no payload journal left. Force its own barriers, not just the journal's.
+      this.#consumedDirty = true;
+      this.#save();
+      return deliveryId;
+    }
+    if (this.#refreshDelivered(true).has(deliveryKey(deliveryId))) return deliveryId;
     return undefined;
   }
 
@@ -509,10 +567,10 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** Write the held and unconfirmed followUps (0600), or remove the journal when none are left. */
   #save(): void {
     if (!this.#journal) return;
-    if (this.#consumedDirty) {
+    if (this.#consumedDirty && !this.#haltIndexUnknown) {
       // Before the journal: an item leaves the journal only once its id is recorded as consumed.
       const file = this.#consumedPath()!;
-      writeFileAtomic(file, JSON.stringify({ version: 1, ids: [...this.#consumed] }), { durable: true });
+      writeFileAtomic(file, JSON.stringify({ version: 1, ids: [...this.#consumed], ...(this.#halted ? { halted: true } : {}) }), { durable: true });
       this.#consumedDirty = false;
     }
     const items = [...this.#unverified, ...this.#sent, ...this.#held];
@@ -533,12 +591,12 @@ export class MainAgentController implements FabricMainAgentTarget {
    * writes it, and does not roll it back when the write fails, so getEntries() is no receipt
    * (security round 3 S1 on pi-fabric#160). Pi also defers a new session's first write until its
    * first assistant message; until then nothing is confirmed and every item stays journalled.
-   * The file only grows within a session; a shorter file or another path starts over.
+   * Appends are indexed incrementally; a shorter file, replacement inode or another path starts over.
    *
    * An in-memory session has no durable store at all: its entry list is the only record, so it
    * counts as it did before.
    */
-  #refreshDelivered(): Set<string> {
+  #refreshDelivered(failClosed = false): Set<string> {
     try {
       const manager = this.#context?.sessionManager as
         { getEntries?: () => readonly unknown[]; getSessionFile?: () => string | undefined; isPersisted?: () => boolean } | undefined;
@@ -548,8 +606,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (this.#source !== "" || this.#scanned === undefined || entries.length < this.#scanned) this.#restartIndex("");
       for (let index = this.#scanned!; index < entries.length; index++) addDelivered(this.#delivered, entries[index] as SessionEntryLike);
       this.#scanned = entries.length;
-    } catch {
+    } catch (error) {
       // A failed session barrier supplies no receipt: keep every journalled payload.
+      // A duplicate lookup must also retain the resident source, not fall through to
+      // admitting/sending a second copy because its persisted receipt is uncertain.
+      if (failClosed) throw new Error(`Main could not confirm the session receipt: ${error instanceof Error ? error.message : String(error)}`);
       return new Set();
     }
     return this.#delivered;
@@ -559,6 +620,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#delivered = new Set();
     this.#source = source;
     this.#scanned = 0;
+    this.#sessionFileIdentity = undefined;
   }
 
   /** Read the complete lines appended to the session file since the last call, in 1 MiB chunks. */
@@ -569,15 +631,22 @@ export class MainAgentController implements FabricMainAgentTarget {
       fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      if (this.#source !== file) this.#restartIndex(file);    // not written yet: nothing persisted
+      this.#restartIndex(file);    // not written (or removed): no cached persisted receipt
       return;
     }
     try {
-      const size = fs.fstatSync(fd).size;
-      // Reading a complete line is not a stable-storage receipt. Sync before indexing new
-      // bytes (including on restart); a failure leaves the index and journal untouched.
-      if (this.#source !== file || this.#scanned === undefined || size !== this.#scanned) fs.fsyncSync(fd);
-      if (this.#source !== file || this.#scanned === undefined || size < this.#scanned) this.#restartIndex(file);
+      const stat = fs.fstatSync(fd);
+      const size = stat.size;
+      const identity = `${stat.dev}:${stat.ino}`;
+      fs.fsyncSync(fd);
+      // Bind every namespace hop (including hidden link targets) to the opened
+      // receipt inode, and recheck the walk after ALL required barriers. Any
+      // uncertain hop retains the journal/source and propagates duplicate retries.
+      syncPathNamespace(file, stat);
+      if (this.#source !== file || this.#scanned === undefined || size < this.#scanned || this.#sessionFileIdentity !== identity) {
+        this.#restartIndex(file);
+      }
+      this.#sessionFileIdentity = identity;
       const buffer = Buffer.allocUnsafe(1 << 20);
       let position = this.#scanned!;
       let carry: Buffer[] = [];
@@ -664,12 +733,20 @@ export class MainAgentController implements FabricMainAgentTarget {
   #replay(): void {
     if (!this.#journal) return;
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.#consumedPath()!, "utf8")) as { ids?: unknown };
-      if (Array.isArray(parsed.ids)) {
-        for (const id of parsed.ids.slice(-CONSUMED_DELIVERIES_MAX)) if (typeof id === "string") this.#consumed.add(id);
+      const parsed = JSON.parse(readFileRetrying(this.#consumedPath()!)) as { version?: unknown; ids?: unknown; halted?: unknown } | null;
+      if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.ids) ||
+        parsed.ids.some((id) => typeof id !== "string") ||
+        (parsed.halted !== undefined && typeof parsed.halted !== "boolean")) throw new Error("Malformed halt index");
+      this.#halted ||= parsed.halted === true;
+      for (const id of parsed.ids.slice(-CONSUMED_DELIVERIES_MAX)) this.#consumed.add(id);
+    } catch (error) {
+      // Only absence proves there is no persisted owner stop. Unknown authority fails closed,
+      // including when the payload journal is absent; incoming control messages stay passive.
+      if ((error as { code?: unknown } | null)?.code !== "ENOENT") {
+        this.#halted = true;
+        this.#haltIndexUnknown = true;
+        console.warn(`[pi-fabric] cannot read halt index ${this.#consumedPath()}; keeping Main halted until user input`, error);
       }
-    } catch {
-      // none consumed yet
     }
     let items: HeldAgentMessage[] = [];
     try {
@@ -740,11 +817,86 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#stallS = stallSeconds;
     this.#context = context;
     this.#closed = false;
+    this.#reloading = false;
+    this.#halted = false;
+    this.#providerFailed = false;
+    this.#haltIndexUnknown = false;
     this.#journal = journal;
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
+      if (typeof this.pi.on !== "function") return;
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);
       if (typeof off === "function") this.#unsubscribe.push(off as () => void);
     };
+    on("input", (event: { source?: string }, ctx) => {
+      this.#context = ctx;
+      if (event.source === "extension") return;
+      this.#halted = false;
+      this.#providerFailed = false;
+      this.#haltIndexUnknown = false;
+      this.#consumedDirty = true;
+      this.#suspended = false;
+      this.#trySave();
+    });
+    // Set gates before either drain branch can reconcile a lost Pi handoff. A turn error
+    // precedes Pi's retry/overflow recovery decision, so never persist it as an owner stop.
+    on("turn_end", (event: { message?: { stopReason?: string } }, ctx) => {
+      const reason = event.message?.stopReason;
+      this.#compactionDecline = undefined;
+      if (ctx.signal?.aborted || reason === "aborted") this.halt();
+      else if (reason === "error") { this.#providerFailed = true; this.#stopWake(); }
+      else if (reason !== undefined) this.#providerFailed = false;
+    });
+    const settleGate = (event: { outcome?: string }, ctx: ExtensionContext): void => {
+      if (ctx.signal?.aborted || this.#compactionDecline?.aborted ||
+        (event.outcome === "aborted" && !this.#compactionDecline)) this.halt();
+      else if (event.outcome === "error") { this.#providerFailed = true; this.#stopWake(); }
+      else if (event.outcome === "completed") this.#providerFailed = false;
+      // Older hosts omit outcome: neither grant recovery nor invent an owner stop.
+    };
+    on("agent_before_settle", settleGate);
+    on("agent_settled", settleGate);
+    // Observe the operation in BOTH drain modes. Pi also reports an extension's benign
+    // decline as aborted, but only the operation signal proves an owner cancellation.
+    on("session_before_compact", (event: { reason?: string; signal?: AbortSignal }) => {
+      this.#operation = event.signal;
+      this.#compactionDecline = undefined;
+    });
+    on("session_compact_failed", (event: { reason?: string; aborted?: boolean; willRetry?: boolean; errorMessage?: string }, ctx) => {
+      this.#context = ctx;
+      // The aborted bit alone is ambiguous: an earlier handler may decline and stop
+      // dispatch before we see the signal. Escape/halt is explicit; a seen signal
+      // proves cancellation. Never manufacture durable owner intent from a decline.
+      const decline = takeCompactionDecline(this.pi);
+      const operation = decline && decline.reason === event.reason ? decline.signal : this.#operation;
+      const ownerCancelled = ctx.signal?.aborted || (event.aborted && operation?.aborted);
+      // Exact Pi no-op outcomes, with or without the host's error envelope. A provider
+      // error merely quoting these phrases is still a recoverable failure, not a no-op.
+      const message = event.errorMessage?.replace(/^Compaction failed: /, "");
+      const benign = message === "Already compacted" || message === "Nothing to compact (session too small)" ||
+        message === "Compaction cancelled";
+      if (ownerCancelled) this.halt();
+      else if (event.aborted && event.reason !== "manual" && operation && !operation.aborted) {
+        // Pi settles an automatic extension veto as aborted. Retain its provenance
+        // rather than converting the outcome into a durable owner stop.
+        this.#compactionDecline = operation;
+      } else if (!event.aborted && !event.willRetry && !benign) {
+        this.#providerFailed = true;
+        this.#stopWake();
+      }
+      // Unsuccessful boundaries never wake their queued replay, even for a benign rejection.
+      // Later peer deliveries retain permission after a veto; errors await recovery,
+      // but only a real owner stop survives reload.
+      if (event.reason === "manual" && ctx.isIdle()) this.#release(false);
+      this.#operation = undefined;
+    });
+    on("session_compact", (event: { reason?: string }, ctx) => {
+      this.#context = ctx;
+      this.#providerFailed = false; // Operation recovery never clears a genuine owner halt.
+      this.#compactionDecline = undefined;
+      if (event.reason === "manual" && flushMs > 0) this.#wakeWhenIdle();
+      else this.#operation = undefined;
+    });
+    on("agent_start", () => { this.#compactionDecline = undefined; });
     if (!(flushMs > 0) || typeof this.pi.on !== "function") {
       // Drain off: what an earlier drain journalled goes to Pi's own queue, under the same rule.
       // Each stays in the journal until the session holds it (review/astra F4 on pi-fabric#102).
@@ -764,12 +916,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#flushMs = flushMs;
     on("turn_end", (event: BoundaryEvent & { message?: { stopReason?: string } }, ctx) => {
       this.#context = ctx;
-      this.#reconcile(event);
       if (ctx.signal?.aborted || ["aborted", "error"].includes(event.message?.stopReason ?? "")) {
         this.#suspended = true;
         this.#flushAll = false;
         return;
       }
+      this.#reconcile(event);
       this.#confirm();
       this.#flushDue();
       this.#flushAll = false;
@@ -799,27 +951,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     // leaves them to that run's boundaries.
     // The operation's own abort signal says whether the user cancelled it: Pi can report that
     // cancel after Main is idle again, or not at all (review/astra on pi-fabric#102).
-    on("session_before_compact", (event: { reason?: string; signal?: AbortSignal }) => {
-      this.#operation = event.reason === "manual" ? event.signal : undefined;
-    });
     on("session_before_tree", (event: { signal?: AbortSignal }) => { this.#operation = event.signal; });
-    on("session_compact", (event: { reason?: string }, ctx) => {
-      this.#context = ctx;
-      if (event.reason === "manual") this.#wakeWhenIdle();
-    });
     // A branch summary on /tree navigation is the same: busy without a run. A cancelled one
     // emits nothing, so its followUps wait for the next run.
     on("session_tree", (_event, ctx) => {
       this.#context = ctx;
       this.#wakeWhenIdle();
     });
-    on("session_compact_failed", (event: { reason?: string }, ctx) => {
-      this.#context = ctx;
-      // Pi clears the compaction state before this event, so Main is idle here.
-      if (event.reason === "manual" && ctx.isIdle()) this.#release(false);
-    });
     on("agent_start", (_event, ctx) => { this.#context = ctx; this.#suspended = false; this.#stopWake(); });
-    on("input", (_event, ctx) => { this.#context = ctx; this.#suspended = false; });
     this.#replay();
     if (this.#held.length && context.isIdle()) this.#release(true);
   }
@@ -841,8 +980,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#delivered = new Set();
     this.#source = undefined;
     this.#scanned = undefined;
+    this.#sessionFileIdentity = undefined;
     this.#journal = undefined;
     this.#context = undefined;
+    this.#operation = undefined;
+    this.#compactionDecline = undefined;
+    takeCompactionDecline(this.pi);
   }
 
   #drainActive(): boolean {
@@ -859,12 +1002,18 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #flushDue(): void {
-    if (!this.#held.length || this.#suspended) return;
+    if (!this.#held.length || this.#suspended || this.#reloading) return;
+    if (this.#halted || this.#providerFailed || this.#context?.signal?.aborted) { this.#release(false); return; }
+    // A replayed reload-time steer/nextTurn keeps its own mode, even when Main is busy.
+    while (this.#held[0]?.deliverAs !== undefined) {
+      const first = this.#held[0]!;
+      if (!this.#handOver(1, first.deliverAs!, first.triggerTurn ?? true, false)) return;
+    }
     const now = Date.now();
     const age = this.#flushAll ? 0 : this.#flushMs;
     let due = 0;
     let bytes = 0;
-    while (due < this.#held.length && now - this.#held[due]!.sentAt >= age) {
+    while (due < this.#held.length && this.#held[due]!.deliverAs === undefined && now - this.#held[due]!.sentAt >= age) {
       bytes += itemBytes(this.#held[due]!);
       // A byte-bounded FIFO prefix per boundary; the rest waits for the next one.
       if (due > 0 && bytes > FOLLOW_UP_LIMITS.batchBytes) break;
@@ -883,11 +1032,11 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   /** Send the first count held items as one message; they leave the queue only once it is sent. */
-  #handOver(count: number, deliverAs: FabricAgentMessageDelivery, triggerTurn: boolean, flushed: boolean): boolean {
+  #handOver(count: number, deliverAs: FabricMainAgentDelivery, triggerTurn: boolean, flushed: boolean): boolean {
     // smarty-dev#1826: an item that cannot be rendered fails every retry and, first in the queue,
     // holds every later followUp. It leaves the queue, with a report; the rest go. A failure of
     // Pi's queue itself keeps them all for the next boundary.
-    const delivery: FabricAgentMessageDelivery = flushed ? "followUp" : deliverAs;
+    const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
     for (let index = 0; index < Math.min(count, this.#held.length);) {
       const item = this.#held[index]!;
       try {
@@ -934,10 +1083,13 @@ export class MainAgentController implements FabricMainAgentTarget {
     // session_compact_failed, or held for the next run). Without the signal, success is unknown.
     if (this.#wake) return;
     const operation = this.#operation;
-    this.#operation = undefined;
+    // Retain cancellation evidence while later completion handlers still run.
     this.#wake = setInterval(() => {
       if (this.#closed || !operation || operation.aborted) this.#stopWake();
-      else if (this.#context?.isIdle()) this.#held.length ? this.#release(true) : this.#stopWake();
+      else if (this.#context?.isIdle()) {
+        if (this.#operation === operation) this.#operation = undefined;
+        this.#held.length ? this.#release(true) : this.#stopWake();
+      }
     }, 25);
     this.#wake.unref?.();
   }
@@ -948,12 +1100,20 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #release(triggerTurn: boolean): void {
+    if (this.#reloading) return;
     this.#stopWake();
     // In byte-bounded messages, oldest first; a failed send keeps the rest for a retry.
     while (this.#held.length) {
+      // Reload-time in-flight controls were never handed to Pi. Preserve their mode and policy.
+      const first = this.#held[0]!;
+      if (first.deliverAs !== undefined) {
+        // A sender's saved permission cannot override a later cancelled/failed boundary.
+        if (!this.#handOver(1, first.deliverAs, triggerTurn && (first.triggerTurn ?? true), false)) return;
+        continue;
+      }
       let count = 0;
       let bytes = 0;
-      while (count < this.#held.length) {
+      while (count < this.#held.length && this.#held[count]!.deliverAs === undefined) {
         bytes += itemBytes(this.#held[count]!);
         if (count > 0 && bytes > FOLLOW_UP_LIMITS.batchBytes) break;
         count++;
@@ -974,6 +1134,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     triggerTurn: boolean,
     flushed: boolean,
   ): void {
+    triggerTurn &&= !this.#halted && !this.#providerFailed && !this.#context?.signal?.aborted;
+    // Persist a downgraded explicit replay policy, including handoffs retried after a later reload.
+    if (!triggerTurn) for (const item of items) if (item.deliverAs !== undefined) item.triggerTurn = false;
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.
     const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
     const blocks = items.map((item) => agentMessageBlock(item, delivery));

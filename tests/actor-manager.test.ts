@@ -3003,7 +3003,8 @@ describe("ActorManager", () => {
     expect(log.actorName).toBe("reviewer");
     expect(log.sessionFile).toContain("session.jsonl");
     const sessionRoles = log.session.map(
-      (line) => (line.parsed as { role?: string } | undefined)?.role,
+      (line) => (line.parsed as { message?: { role?: string }; role?: string } | undefined)?.message?.role
+        ?? (line.parsed as { role?: string } | undefined)?.role,
     );
     expect(sessionRoles).toContain("user");
     expect(sessionRoles).toContain("assistant");
@@ -3989,6 +3990,68 @@ describe("ActorManager removal behind an in-flight run", () => {
     });
     return { release, runId };
   };
+  it.each(["acceptance", "unrelated update"])("#169 security S2 syncs the final pending-decision replacement after %s", async (phase) => {
+    const { actors, agents, root } = setup(true);
+    const { release, runId } = hangingRun(agents);
+    const actor = await actors.create({ name: "pending-decision", instructions: "Work." });
+    const other = await actors.create({ name: "unrelated", instructions: "Wait." });
+    actors.tell(actor.id, "go");
+    await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
+    const actorRoot = path.join(root, "actors");
+    const registry = path.join(actorRoot, "actors.json");
+    const descriptors = new Map<number, string>();
+    const syncedFiles = new Set<string>();
+    const replacements: Array<{ pending: boolean; fileSynced: boolean; directories: string[] }> = [];
+    const open = fs.openSync.bind(fs);
+    const sync = fs.fsyncSync.bind(fs);
+    const rename = fs.renameSync.bind(fs);
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode);
+      descriptors.set(fd, String(file));
+      return fd;
+    });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const file = descriptors.get(fd)!;
+      sync(fd);
+      if (file.startsWith(`${registry}.`)) syncedFiles.add(file);
+      else replacements.at(-1)?.directories.push(file);
+    });
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === registry) {
+        const records = JSON.parse(fs.readFileSync(from, "utf8")).actors as Array<{ removal?: unknown }>;
+        replacements.push({ pending: records.some((record) => !!record.removal),
+          fileSynced: syncedFiles.has(String(from)), directories: [] });
+      }
+      rename(from, to);
+    });
+    try {
+      const accepted = await actors.remove(actor.id, { wait: false }); // Exercise the whole public call, including presence save.
+      expect(accepted).toMatchObject({ removed: true, pending: expect.stringContaining(runId) });
+      if (phase === "unrelated update") {
+        replacements.length = 0;
+        await actors.setNice(other.id, 7);
+      } else {
+        expect(replacements.filter((replacement) => replacement.pending).length).toBeGreaterThanOrEqual(2);
+      }
+      const pending = replacements.filter((replacement) => replacement.pending);
+      expect(pending.length).toBeGreaterThan(0);
+      for (const replacement of pending) {
+        expect(replacement.fileSynced, "every pending-decision replacement needs its own file barrier").toBe(true);
+        if (process.platform !== "win32") {
+          expect(replacement.directories).toContain(actorRoot);
+          expect(replacement.directories).toContain(path.parse(actorRoot).root);
+        }
+      }
+      const saved = JSON.parse(fs.readFileSync(registry, "utf8"));
+      expect(saved.actors.find((record: { id: string }) => record.id === actor.id).removal.runId).toBe(runId);
+      if (phase === "unrelated update") expect(saved.actors.find((record: { id: string }) => record.id === other.id).nice).toBe(7);
+    } finally {
+      renamed.mockRestore(); synced.mockRestore(); opened.mockRestore();
+      release();
+      await actors.removalSettled(actor.id);
+    }
+  });
+
   it.each(process.platform === "win32" ? [1] : [1, 2])("#169 round 3 refuses the pending removal decision at barrier %i", async (barrier) => {
     const { actors, agents, root } = setup(true);
     const { release, runId } = hangingRun(agents);

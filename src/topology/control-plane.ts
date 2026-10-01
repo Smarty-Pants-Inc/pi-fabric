@@ -243,6 +243,7 @@ export class FabricControlPlane {
   #mirrorWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   #closed = false;
+  #paused = false;
   #handler: FabricControlHandler | undefined;
   #seenCleanupAt = 0;
   #legacySeenCleanupAt = Date.now();
@@ -278,6 +279,7 @@ export class FabricControlPlane {
     this.#handler = handler;
     if (!this.options.enabled || this.#timer) return;
     this.#closed = false;
+    this.#paused = false;
     this.#timer = setInterval(() => void this.#poll().catch(() => undefined), this.#pollMs);
     this.#timer.unref();
   }
@@ -580,12 +582,19 @@ export class FabricControlPlane {
     }).catch(() => undefined);
   }
 
+  /** Reload: leave new commands unclaimed in the durable mesh log for the next runtime. */
+  pause(): void {
+    this.#paused = true;
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = undefined;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     await this.#polling?.catch(() => undefined);
-    await this.#drain().catch(() => undefined);
+    if (!this.#paused) await this.#drain().catch(() => undefined);
     this.#closed = true;
     this.#sharedClaims.clear();
     this.#unpublished.clear();
@@ -603,7 +612,7 @@ export class FabricControlPlane {
   }
 
   async #poll(): Promise<void> {
-    if (this.#closed || !this.options.enabled) return;
+    if (this.#closed || this.#paused || !this.options.enabled) return;
     if (this.#polling) return this.#polling;
     const operation = this.#drain();
     this.#polling = operation;
@@ -621,6 +630,7 @@ export class FabricControlPlane {
     while (true) {
       const tail = this.mesh.tail(this.#offset, 100);
       for (const event of tail.events) {
+        if (this.#paused) return;
         if (event.sequence <= this.#lastSequence) continue;
         // An event is consumed only once handled: a command that hit a lock timeout throws,
         // and the next poll reads this page again from it (smarty-dev#424). Each retry is

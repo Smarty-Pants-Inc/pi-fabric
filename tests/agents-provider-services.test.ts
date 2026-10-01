@@ -262,6 +262,31 @@ describe("agents provider message routing service boundaries", () => {
     expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined }, "owner", { routedRemoteHost: null });
   });
 
+  it.each(["absent", "rootId", "ownerHostId", "ownerIdentityId", "remoteHost"] as const)("refuses a cached native root when fresh authority changes (%s)", async (change) => {
+    const { router, participants, control, actors } = routing();
+    const native = { ...participant(), id: "session:peer", rootId: "session:peer" };
+    const fresh = change === "absent" ? undefined : { ...native, [change]: "replacement" };
+    participants.get.mockImplementation((_id, _now, options) => options?.fresh ? fresh : native);
+    await expect(router.routeMessage(native.id, "private", { secret: true }, "followUp"))
+      .rejects.toMatchObject({ name: "FabricRouteAuthorityError", code: "FABRIC_ROUTE_AUTHORITY_CHANGED" });
+    expect(control.request).not.toHaveBeenCalled();
+    expect(actors.steerRemote).not.toHaveBeenCalled();
+  });
+
+  it.each(["absent", "rootId", "ownerHostId", "ownerIdentityId", "remoteHost"] as const)("refuses a remote Main alias when fresh authority changes (%s)", async (change) => {
+    const { router, participants, control, actors, main } = routing();
+    main.local = false;
+    main.id = "session:main-root";
+    const native = { ...participant(), id: main.id, rootId: main.id };
+    const fresh = change === "absent" ? undefined : { ...native, [change]: "replacement" };
+    participants.get.mockImplementation((_id, _now, options) => options?.fresh ? fresh : native);
+    await expect(router.routeMessage("main", "private", { secret: true }, "followUp"))
+      .rejects.toMatchObject({ name: "FabricRouteAuthorityError", code: "FABRIC_ROUTE_AUTHORITY_CHANGED" });
+    expect(control.request).not.toHaveBeenCalled();
+    expect(actors.steerRemote).not.toHaveBeenCalled();
+    expect(main.deliverAgent).not.toHaveBeenCalled();
+  });
+
   it("names why a remote Main cannot be resolved", async () => {
     const { router, participants, control, main } = routing();
     main.local = false;
@@ -314,9 +339,10 @@ describe("agents provider message routing service boundaries", () => {
     expect(control.request).not.toHaveBeenCalled();
   });
 
-  it("refuses direct and incoming control delivery to a local non-interactive Main", async () => {
+  it.each([false, true])("refuses direct and incoming control delivery to a local non-interactive Main (fresh-only=%s)", async (freshOnly) => {
     const { router, participants, main } = routing();
-    participants.get.mockReturnValue({ ...participant(), id: main.id, interactive: false, capabilities: ["fabric"] });
+    const root: FabricParticipantInfo = { ...participant(), id: main.id, interactive: false, capabilities: ["fabric"] };
+    participants.get.mockImplementation((_id, _now, options) => !freshOnly || options?.fresh ? root : undefined);
     await expect(router.routeMessage(main.id, "audit must not answer", undefined, "followUp"))
       .rejects.toMatchObject({ name: "FabricParticipantNonInteractiveError" });
     await expect(router.acceptControl({ ...command("steer"), targetId: main.id }, { id: "sender", name: "Sender", kind: "main" }))

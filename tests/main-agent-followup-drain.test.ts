@@ -103,6 +103,58 @@ describe("Main followUp drain (unit)", () => {
     main.closeFollowUpDrain();
   });
 
+  it.each([true, false])("releases acknowledged followUps in FIFO order when preflight ends without a run (idle=%s, #754)", (idle) => {
+    const { main, sent, ctx, state } = setup(120_000, idle);
+    let preflight = true;
+    Object.assign(ctx, { isPromptPending: () => preflight });
+    const handoff = main.deliverAgent({ from: from("lane"), message: "HANDOFF", delivery: "followUp" });
+    const correction = main.deliverAgent({ from: from("lane"), message: "correction", delivery: "followUp" });
+    vi.advanceTimersByTime(1_000);
+    expect(sent).toHaveLength(0);
+    preflight = false; // handled input or failed validation: Pi emits no run boundaries.
+    state.idle = true;
+    vi.advanceTimersByTime(25);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.details.items.map((item: { id: string }) => item.id))
+      .toEqual([handoff.messageId, correction.messageId]);
+    expect(sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(main.queueDepth().pendingFollowUps).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    main.closeFollowUpDrain();
+  });
+
+  it("waits for idle if no-run preflight completion leaves another async operation finishing (#754)", () => {
+    const { main, sent, ctx, state } = setup(120_000, true);
+    let preflight = true;
+    Object.assign(ctx, { isPromptPending: () => preflight });
+    main.deliverAgent({ from: from("lane"), message: "HANDOFF", delivery: "followUp" });
+    state.idle = false;
+    preflight = false;
+    vi.advanceTimersByTime(1_000);
+    expect(sent).toHaveLength(0);
+    state.idle = true;
+    vi.advanceTimersByTime(25);
+    expect(sent.map(entry => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+    expect(vi.getTimerCount()).toBe(0);
+    main.closeFollowUpDrain();
+  });
+
+  it.each(["halt", "signal", "reload"])("does not wake a no-run preflight after %s (#754)", (end) => {
+    const { main, sent, ctx, state } = setup(120_000, true);
+    let preflight = true;
+    Object.assign(ctx, { isPromptPending: () => preflight });
+    main.deliverAgent({ from: from("lane"), message: "HANDOFF", delivery: "followUp" });
+    if (end === "halt") main.halt();
+    if (end === "signal") state.aborted = true;
+    if (end === "reload") main.prepareReload();
+    preflight = false;
+    vi.advanceTimersByTime(1_000);
+    expect(sent.map(entry => entry.options.triggerTurn)).toEqual(end === "signal" ? [false] : []);
+    expect(main.queueDepth().pendingFollowUps).toBe(end === "signal" ? 0 : 1);
+    expect(vi.getTimerCount()).toBe(0);
+    main.closeFollowUpDrain();
+  });
+
   it("stamps a steer with sent_at and sends it at once, even to a busy Main", () => {
     const { main, sent } = setup();
     main.deliverAgent({ from: from("a"), message: "now", delivery: "steer" });

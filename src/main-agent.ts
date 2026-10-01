@@ -275,6 +275,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   #closed = false;
   #reloading = false;
   #wake: ReturnType<typeof setInterval> | undefined;
+  #preflightWake: ReturnType<typeof setInterval> | undefined;
   #operation: AbortSignal | undefined;
   // Keep the veto signal through both settlement notifications, including late owner aborts.
   #compactionDecline: AbortSignal | undefined;
@@ -445,7 +446,8 @@ export class MainAgentController implements FabricMainAgentTarget {
         if (replaced) { this.#consumedDirty = true; this.#trySave(); }
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
-      if (this.#context!.isIdle() && !promptPending(this.#context!)) this.#release(true);
+      if (promptPending(this.#context!)) this.#wakeAfterPreflight();
+      else if (this.#context!.isIdle()) this.#release(true);
     } else if (deliveryId !== undefined) {
       // A sent message may wait in Pi's volatile queue (prompt preflight, a settle): it stays in
       // the journal until the session holds it, and a restart replays it (#confirm, #replay).
@@ -1099,9 +1101,27 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#wake.unref?.();
   }
 
+  #wakeAfterPreflight(): void {
+    // Handled input and failed validation clear isPromptPending without any run/settle
+    // event. Observe that completion only after admission is journalled. If a run starts,
+    // leave FIFO delivery to its boundaries; halt/reload/close cancel this waiter too.
+    if (this.#preflightWake) return;
+    this.#preflightWake = setInterval(() => {
+      const ctx = this.#context;
+      // A no-run preflight may also leave an async compaction handler finishing. Busy
+      // alone is not proof of agent_start; that event explicitly cancels this waiter.
+      if (ctx && (promptPending(ctx) || !ctx.isIdle())) return;
+      if (ctx) this.#release(true); // #send retains owner/provider vetoes.
+      else this.#stopWake();
+    }, 25);
+    this.#preflightWake.unref?.();
+  }
+
   #stopWake(): void {
     if (this.#wake) clearInterval(this.#wake);
+    if (this.#preflightWake) clearInterval(this.#preflightWake);
     this.#wake = undefined;
+    this.#preflightWake = undefined;
   }
 
   #release(triggerTurn: boolean): void {

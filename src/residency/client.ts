@@ -451,11 +451,11 @@ export class ResidencyClient {
     }
   }
 
-  readAgentLog(id: string, options: { lines?: number; before?: number } = {}): FabricAgentLog {
+  readAgentLog(id: string, options: { lines?: number; before?: number; beforeGeneration?: string } = {}): FabricAgentLog {
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
     const logFile = path.join(metadata.runDirectory, "events.jsonl");
-    const page = readJsonlPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before);
+    const page = readJsonlPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before, undefined, options.beforeGeneration);
     const status = this.#record(metadata);
     return {
       id,
@@ -465,6 +465,7 @@ export class ResidencyClient {
       events: page.lines,
       hasMore: page.hasMore,
       ...(page.before !== undefined ? { before: page.before } : {}),
+      ...(page.generation !== undefined ? { generation: page.generation } : {}),
     };
   }
 
@@ -827,6 +828,7 @@ export class ResidencyClient {
     this.options.mainAgent.deliverAgent({
       from: value.from,
       verification: "mesh", // The authenticated resident-host record was checked above.
+      principal: value.principal,
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,

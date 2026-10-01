@@ -20,6 +20,24 @@ const hostWith = (initial: string[]) => {
 };
 
 describe("FabricToolOwnership", () => {
+  it("gates native codemode/search even without capture and restores them on release", () => {
+    const state = hostWith(["read", "codemode", "tool_search", "fabric_exec"]);
+    const ownership = new FabricToolOwnership(state.host);
+    ownership.apply(true);
+    expect(state.active()).toEqual(["fabric_exec"]);
+    // A refresh/keepVisible request cannot re-enable competing orchestrators.
+    state.host.setActiveTools(["fabric_exec", "codemode", "tool_search"]);
+    ownership.apply(true, new Set());
+    expect(state.active()).toEqual(["fabric_exec"]);
+    ownership.release();
+    expect(state.active()).toEqual(["read", "codemode", "tool_search", "fabric_exec"]);
+  });
+
+  it("leaves native orchestrators alone outside exclusive mode", () => {
+    const state = hostWith(["codemode", "tool_search", "fabric_exec"]);
+    expect(new FabricToolOwnership(state.host).apply(false)).toBe(false);
+    expect(state.active()).toEqual(["codemode", "tool_search", "fabric_exec"]);
+  });
   it("gives Fabric exclusive ownership of active Pi core tools", () => {
     const state = hostWith(["read", "bash", "grep", "custom_tool"]);
     const ownership = new FabricToolOwnership(state.host);

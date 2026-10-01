@@ -275,10 +275,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   const { reassert: reassertToolOwnership, schedule: scheduleOwnershipReassert } =
     createToolOwnershipReassertion({
       ready: () => state.cwd !== undefined,
-      active: () => {
-        const policy = capturePolicy();
-        return policy.enabled && policy.hideFromModel && fabricOwnsModelTools();
-      },
+      active: fabricOwnsModelTools,
       hiddenNames: hiddenCapturedToolNames,
       apply: (hidden) => toolOwnership.apply(true, hidden),
     });
@@ -331,6 +328,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     () => state.initialized ? state.execution.authorizer : undefined,
     () => state.initialized ? directToolApproval : undefined,
     () => ownsRunReplyTool(pi.getAllTools()),
+    fabricOwnsModelTools,
   );
 
   const inactiveCapturePolicy = {

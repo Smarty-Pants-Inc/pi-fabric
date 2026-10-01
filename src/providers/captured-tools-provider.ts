@@ -3,7 +3,8 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
-import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
+import { createCapturedToolContext } from "../capture/tool-context.js";
+import { classifyPiBashError, classifyPiBashResult, piBashResultError } from "../core/pi-bash-error.js";
 import { isPiShellToolName } from "../core/pi-tools.js";
 import type {
   FabricActionDescriptor,
@@ -183,7 +184,7 @@ export class CapturedToolsProvider implements FabricProvider {
       executionStarted = true;
       const requestedCwd = args.cwd;
       const executionContext = isPiShellToolName(entry.name) && typeof requestedCwd === "string"
-        ? { ...runner.createContext(), cwd: requestedCwd }
+        ? createCapturedToolContext(runner, toolCallId, context.signal, undefined, requestedCwd)
         : undefined;
       result = await runAbortable(context.signal, () =>
         wrappedTool.execute(toolCallId, args, context.signal, (partialResult) => {
@@ -202,6 +203,10 @@ export class CapturedToolsProvider implements FabricProvider {
           .catch(() => undefined);
         }, executionContext),
       );
+      isError = (result as AgentToolResult<unknown> & { isError?: boolean }).isError === true;
+      if (isError && isPiShellToolName(entry.name)) {
+        thrown = classifyPiBashResult(result as AgentToolResult<unknown> & { isError?: boolean; structuredContent?: unknown });
+      }
     } catch (error) {
       thrown = isPiShellToolName(entry.name) && executionStarted ? classifyPiBashError(error) : error;
       isError = true;
@@ -236,6 +241,7 @@ export class CapturedToolsProvider implements FabricProvider {
       isError = patch.isError ?? isError;
     }
 
+    result = { ...result, isError } as AgentToolResult<unknown>;
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_end",
       toolCallId,

@@ -66,7 +66,7 @@ describe.skipIf(!built)("Fabric across /reload in a real Pi session", () => {
               oldExec = undefined;
               if (!exec) return;
               lateCall = Promise.resolve()
-                .then(() => exec.execute("late", { code: "return 1" } as never, undefined, undefined, ctx))
+                .then(() => exec.execute("late", { code: "return 1" } as never, undefined, undefined, ctx as Parameters<typeof exec.execute>[4]))
                 .then(() => "completed", (error: unknown) => String(error));
               await lateCall;
             });

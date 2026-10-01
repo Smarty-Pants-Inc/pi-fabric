@@ -24,6 +24,11 @@ export interface FabricTopLevelToolApprover {
 }
 
 const FABRIC_TOOL_NAME = "fabric_exec";
+// Pi 0.99+ native orchestrators compete with fabric_exec in exclusive mode.
+// Keep them registered, but never model-visible, even with capture disabled or
+// a keepVisible override. Native MCP/deferred tools can otherwise widen the
+// loadout or run a second sandbox outside Fabric's execution policy.
+const NATIVE_ORCHESTRATOR_NAMES: ReadonlySet<string> = new Set(["codemode", "tool_search"]);
 const TOP_LEVEL_SCHEMA_REF_PREFIX = "schema.top_level_tool.";
 
 export const ownsFabricToolSource = (
@@ -54,16 +59,27 @@ export class FabricToolLifecycle {
     readonly approver: () => FabricTopLevelToolApprover | undefined = () => undefined,
     // The worker's run-local reply tool, verified by its hook file (smarty-dev#967).
     readonly ownsReplyTool: () => boolean = () => false,
+    readonly exclusive: () => boolean = () => false,
   ) {}
 
   async toolCall(
     event: ToolCallEvent,
     context?: ExtensionContext,
   ): Promise<ToolCallEventResult | undefined> {
-    if (event.toolCallId.startsWith(NESTED_TOOL_CALL_ID_PREFIX)) {
+    // Native ctx.executeTool calls carry parentToolCallId. They have not gone
+    // through Fabric's registry/schema/approval pipeline, even when their id
+    // inherits our prefix from a captured caller. Do not grant them the
+    // already-authorized Fabric nested-call exemption.
+    const nativeNested = "parentToolCallId" in event && typeof event.parentToolCallId === "string";
+    if (event.toolCallId.startsWith(NESTED_TOOL_CALL_ID_PREFIX) && !nativeNested) {
       if (this.#outerCalls.size > 0) return undefined;
       await this.#authorizeTopLevel(event);
       return undefined;
+    }
+    if (this.exclusive() && NATIVE_ORCHESTRATOR_NAMES.has(event.toolName)) {
+      // Registry refresh/MCP auto-activation can race loadout construction.
+      // Fail closed at execution too, even if a stale declaration escaped.
+      return { block: true, reason: `Native ${event.toolName} is disabled while fabric_exec owns full-code or schema-enforce execution` };
     }
     if (event.toolName === FABRIC_TOOL_NAME && this.ownsFabricTool()) {
       this.#outerCalls.add(event.toolCallId);
@@ -156,7 +172,10 @@ export class FabricToolOwnership {
     this.#savedNativeCoreTools ??= active.flatMap((name, index) =>
       PI_CORE_TOOL_NAME_SET.has(name) ? [{ name, index }] : [],
     );
-    const hidden = hiddenExtensionTools ?? new Set<string>();
+    const hidden = new Set([
+      ...(hiddenExtensionTools ?? []),
+      ...NATIVE_ORCHESTRATOR_NAMES,
+    ]);
     const next: string[] = [];
     active.forEach((name, index) => {
       if (PI_CORE_TOOL_NAME_SET.has(name)) return;

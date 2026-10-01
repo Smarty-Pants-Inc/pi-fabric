@@ -1,9 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { classifyPiBashError, piBashExitMetadata, piBashResultError } from "../src/core/pi-bash-error.js";
+import { classifyPiBashError, classifyPiBashResult, piBashExitMetadata, piBashResultError } from "../src/core/pi-bash-error.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { NodeProcessRuntime } from "../src/runtime/node-process-runtime.js";
 
 describe("native bash exit classification", () => {
+  it("classifies Pi 1.0 structured failures before middleware without trusting stdout", () => {
+    const content = [{ type: "text", text: "out\n\nCommand exited with code 7" }];
+    expect(piBashExitMetadata(classifyPiBashResult({ content, isError: true, structuredContent: { exit_code: 7, output: "out" } })))
+      .toEqual({ exitCode: 7, output: "out" });
+    expect(classifyPiBashResult({ content, structuredContent: { exit_code: 7 } })).toBeUndefined();
+    expect(piBashExitMetadata(classifyPiBashResult({ content, isError: true }))).toBeUndefined();
+    expect(piBashExitMetadata(classifyPiBashResult({ content, isError: true, structuredContent: { exit_code: 0 } }))).toBeUndefined();
+    expect(piBashExitMetadata(classifyPiBashResult({ content, isError: true, structuredContent: { exit_code: "7" } }))).toBeUndefined();
+  });
+
+  it("never restores native structured output after a redacting result hook", () => {
+    const original = classifyPiBashResult({ content: [{ type: "text", text: "secret\n\nCommand exited with code 7" }],
+      isError: true, structuredContent: { exit_code: 7, output: "secret" } });
+    expect(piBashExitMetadata(piBashResultError(original, "[redacted]"))).toEqual({ exitCode: 7, output: "[redacted]" });
+  });
   it.each([
     "Command timed out after 1 seconds",
     "Command aborted",

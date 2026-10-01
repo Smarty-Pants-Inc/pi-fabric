@@ -157,6 +157,27 @@ describe("Fabric outer tool lifecycle", () => {
 });
 
 describe("Direct top-level tool approval gate", () => {
+  it.each(["codemode", "tool_search"])("blocks stale native %s calls at execution, independent of loadout visibility", async toolName => {
+    let exclusive = true;
+    const lifecycle = new FabricToolLifecycle(() => true, () => undefined, () => undefined, () => false, () => exclusive);
+    const event = { type: "tool_call" as const, toolCallId: "stale-native", toolName, input: {} };
+    await expect(lifecycle.toolCall(event)).resolves.toMatchObject({ block: true });
+    await lifecycle.toolCall({ type: "tool_call", toolCallId: "outer", toolName: "fabric_exec", input: {} });
+    await expect(lifecycle.toolCall({ ...event, toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`, parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured` })).resolves.toMatchObject({ block: true });
+    exclusive = false;
+    await expect(lifecycle.toolCall(event)).resolves.toBeUndefined();
+  });
+  it("approves native nested calls instead of inheriting Fabric's prefix exemption", async () => {
+    const approve = vi.fn(async () => {});
+    const authorize = vi.fn(async () => {});
+    const lifecycle = new FabricToolLifecycle(() => true, () => ({ authorize }), () => ({ approve }));
+    const context = {} as ExtensionContext;
+    await lifecycle.toolCall({ type: "tool_call", toolCallId: "outer", toolName: "fabric_exec", input: {} }, context);
+    await lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`,
+      parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured`, toolName: "write", input: {} }, context);
+    expect(authorize).toHaveBeenCalledWith("schema.top_level_tool.write", `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`);
+    expect(approve).toHaveBeenCalledOnce();
+  });
   it("approves native calls while preserving owned and nested Fabric boundaries", async () => {
     const approve = vi.fn(async () => {});
     const lifecycle = new FabricToolLifecycle(
@@ -270,6 +291,13 @@ describe("Schema top-level tool gate", () => {
       toolName,
       input: {},
     })).rejects.toThrow(`blocked schema.top_level_tool.${toolName}`);
+  });
+
+  it("does not allow native ctx.executeTool to bypass schema enforcement", async () => {
+    const state = gate("enforce");
+    await state.lifecycle.toolCall({ type: "tool_call", toolCallId: "outer", toolName: "fabric_exec", input: {} });
+    await expect(state.lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`,
+      parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured`, toolName: "write", input: {} })).rejects.toThrow("blocked schema.top_level_tool.write");
   });
 
   it("allows generated nested ids only during an owned outer invocation", async () => {

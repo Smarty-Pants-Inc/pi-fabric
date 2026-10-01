@@ -66,6 +66,13 @@ export class CapturedToolCatalog {
       const { definition, sourceInfo } = registeredTool;
       if (sourceInfo.path === ownSourcePath) continue;
       if (isRunReplyTool(definition.name, sourceInfo.path)) continue;     // host-owned (smarty-dev#967)
+      // Registration is not permission to call: Pi 0.99+ keeps hidden and
+      // model-only tools in the registry but excludes them from nested calls.
+      if (definition.exposure === "hidden" || definition.exposure === "model-only") continue;
+      // Never proxy the native orchestrators: they can recurse into fabric_exec
+      // or activate tools outside Fabric's authority. Other native MCP tools
+      // retain their exposure and remain discoverable when deferred.
+      if (sourceInfo.path === "builtin:codemode" || sourceInfo.path === "builtin:tool-search") continue;
       this.#tools.set(definition.name, {
         name: definition.name,
         definition,

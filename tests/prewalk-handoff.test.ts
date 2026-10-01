@@ -2272,7 +2272,7 @@ describe("prewalk plan checkpoint", () => {
       claimHandoff: async (run: FabricExecutionResult) => claimHandoff(controller, run, "session-1", "auto"),
     } as unknown as FabricState;
     const tool = createFabricExecTool(state, defaultCodePreviewSettings(), pending, (value) => value);
-    await tool.execute("outer", { code: "return 1" }, undefined, undefined, ctx.value);
+    await tool.execute("outer", { code: "return 1" }, undefined, undefined, ctx.value as Parameters<typeof tool.execute>[4]);
     if (kind === "unplanned") {
       expect(ctx.value.ui.notify).toHaveBeenCalledWith(expect.stringContaining("without a recorded plan after 2 reminders"), "warning");
     } else expect(ctx.value.ui.notify).not.toHaveBeenCalled();

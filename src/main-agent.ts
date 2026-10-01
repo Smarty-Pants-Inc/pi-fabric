@@ -58,6 +58,10 @@ export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDep
   messageId: string;
   routed: "local" | "main" | "mesh";
   acknowledged?: boolean;
+  /** Main requested a new turn at admission, not merely a triggering queue policy.
+   * False for busy, passive, halted, reload-held, and duplicate deliveries; absent for
+   * older owners or targets that cannot report Main's state. */
+  triggered?: boolean;
   /** Main had already admitted this deliveryId; nothing was sent again. */
   duplicate?: true;
   /** This followUp replaced a held one with the same sender and data.coalesceKey. */
@@ -370,7 +374,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       // opened) the sender keeps its record for a later drain (Astra round 3 finding 2, pi-fabric#160).
       if (!this.#journal) throw new Error("Main has no follow-up journal open; retry the durable delivery later");
       const admitted = this.#admitted(deliveryId);
-      if (admitted) return { queued: true, messageId: admitted, routed: "main", duplicate: true };
+      if (admitted) return { queued: true, messageId: admitted, routed: "main", duplicate: true, triggered: false };
     }
     const item: HeldAgentMessage = {
       id: randomUUID(),
@@ -391,8 +395,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#admit(item);
       this.#held.push(item);
       try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
-      return { queued: true, messageId: item.id, routed: "main", ...this.queueDepth(item.from.id) };
+      return { queued: true, messageId: item.id, routed: "main", triggered: false, ...this.queueDepth(item.from.id) };
     }
+    let triggered: boolean | undefined = false;
     let replaced: HeldAgentMessage | undefined;
     // Pi releases its own followUp queue only when Main has no more work, so a Main that
     // chains turns reads it an hour late (smarty-dev#1495). Fabric holds a triggering
@@ -443,7 +448,11 @@ export class MainAgentController implements FabricMainAgentTarget {
         if (replaced) { this.#consumedDirty = true; this.#trySave(); }
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
-      if (this.#context!.isIdle()) this.#release(true);
+      if (this.#context!.isIdle()) {
+        const canTrigger = !this.#halted && !this.#providerFailed && !this.#context?.signal?.aborted;
+        this.#release(true);
+        triggered = canTrigger && this.#sent.includes(item);
+      }
     } else if (deliveryId !== undefined) {
       // A sent message may wait in Pi's volatile queue (prompt preflight, a settle): it stays in
       // the journal until the session holds it, and a restart replays it (#confirm, #replay).
@@ -458,17 +467,18 @@ export class MainAgentController implements FabricMainAgentTarget {
         throw new Error(`Main could not record the message: ${error instanceof Error ? error.message : String(error)}`);
       }
       try {
-        this.#send([item], request.delivery, triggerTurn, false);
+        triggered = this.#send([item], request.delivery, triggerTurn, false);
       } catch (error) {
         this.#sent.splice(this.#sent.indexOf(item), 1);
         this.#trySave();
         throw error;
       }
     } else {
-      this.#send([item], request.delivery, triggerTurn, false);
+      triggered = this.#send([item], request.delivery, triggerTurn, false);
     }
     return {
       queued: true, messageId: item.id, routed: "main",
+      ...(triggered === undefined ? {} : { triggered }),
       ...(replaced ? { coalesced: true as const, replacedMessageId: replaced.id } : {}),
       // Only a followUp that waits in the held queue can be stalled; a non-triggering one went
       // straight to Pi (#123 review F1).
@@ -1136,7 +1146,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     deliverAs: FabricMainAgentDelivery,
     triggerTurn: boolean,
     flushed: boolean,
-  ): void {
+  ): boolean | undefined {
     triggerTurn &&= !this.#halted && !this.#providerFailed && !this.#context?.signal?.aborted;
     // Persist a downgraded explicit replay policy, including handoffs retried after a later reload.
     if (!triggerTurn) for (const item of items) if (item.deliverAs !== undefined) item.triggerTurn = false;
@@ -1157,6 +1167,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const first = items[0]!;
     const provenance = this.#provenance(first);
     const options = { deliverAs, triggerTurn };
+    const triggered = !triggerTurn || deliverAs === "nextTurn" ? false : this.#context?.isIdle();
     this.pi.sendMessage(
       {
         customType: "pi-fabric-agent-message",
@@ -1178,5 +1189,6 @@ export class MainAgentController implements FabricMainAgentTarget {
       },
       provenance ? fabricProvenanceOptions(this.pi, options, provenance) : options,
     );
+    return triggered;
   }
 }

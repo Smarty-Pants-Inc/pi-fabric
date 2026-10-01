@@ -1182,6 +1182,21 @@ describe("FabricControlPlane", () => {
     expect(observe).not.toHaveBeenCalled();
   });
 
+  it("round-trips boolean trigger receipts without inventing a legacy or malformed report", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-trigger-"));
+    roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender");
+    const receiver = plane(path.join(root, "mesh"), "host:receiver");
+    const reports = [true, false, undefined, "true", 1];
+    sender.start(() => ({ accepted: false }));
+    receiver.start(() => ({ accepted: true, triggered: reports.shift() } as never));
+    for (const report of [true, false, undefined, undefined, undefined]) {
+      const receipt = await sender.request("host:receiver", "session:main", "followUp", { message: "hello" });
+      if (report === undefined) expect(receipt).not.toHaveProperty("triggered");
+      else expect(receipt.triggered).toBe(report);
+    }
+  });
+
   // smarty-dev#1495: a followUp through the owner reports the target Main's queue, so the
   // sender can switch to steer; a malformed count from the owner is dropped, not passed on.
   it("passes the owner's followUp queue depth to the sender, and drops a malformed one", async () => {

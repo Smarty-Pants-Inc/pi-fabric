@@ -10,7 +10,7 @@ import { observeResidentOwner } from "./launcher-owner.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
 import {
-  HANDOVER_STARTUP_MS, residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec,
+  HANDOVER_STARTUP_MS, residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec, assertAutomaticReleaseRecovery,
   handoverPath, handoverActive, handoverCustodyPath, handoverOutcomePath,
   readHandoverJson, writeHandoverImmutable, writeHandoverState, writeLaunchSnapshot,
   ownHandoverPlan, mainGenerationCurrent, exactResidentProcess, decideHandover,
@@ -230,6 +230,15 @@ async function supervise(configPath: string): Promise<void> {
             if (exact.plan.previous.config.residencyRoot !== root || exact.plan.target.config.residencyRoot !== root) throw new Error("Resident custody root mismatch");
             writeLaunchSnapshot(root, exact.plan.previous); writeLaunchSnapshot(root, exact.plan.target);
             inode = fs.statSync(path.join(root, "host.lock"));
+            // No attempt-owned membership/complete exit receipts exist yet.
+            // Reject while A still owns its fence, never after spawning B.
+            try { assertAutomaticReleaseRecovery(); }
+            catch (error) {
+              if (decideHandover(root, { id: exact.plan.id, state: "cancelled" }).state === "cancelled") {
+                writeHandoverState(root, exact.plan, "cancelled", error instanceof Error ? error.message : String(error));
+              }
+              throw error;
+            }
             // Pin before the cancellation/custody CAS. A cancelled prepare
             // cannot later be consumed by a slow competing commit.
             plan = structuredClone(exact.plan);

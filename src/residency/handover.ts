@@ -11,6 +11,12 @@ import type { ResidentActorCaller, ResidentHostConfig, ResidentHostOwner } from 
 export const RESIDENT_HANDOVER_ABI = "fabric-resident-1" as const;
 export const HANDOVER_STARTUP_MS = 30_000;
 export const HANDOVER_DRAIN_MS = 120_000;
+/** Fail closed while A still serves. Sampling /proc and a free fence do not
+ * prove whole-attempt exit after B can reparent descendants. No runtime opt-in
+ * may bypass this gate; containment and complete exit receipts must land first. */
+export function assertAutomaticReleaseRecovery(): void {
+  throw new Error("Automatic resident release recovery is unavailable: attempt-owned membership and complete exit receipts are not implemented; keep A serving and use the explicit installer drain");
+}
 export interface ResidentProcessIdentity { pid: number; processStartTime: string; }
 export interface ResidentLauncherIdentity extends ResidentProcessIdentity {
   token: string;
@@ -83,8 +89,11 @@ function fixedFile(file: string): string {
   return absolute;
 }
 function pinBinary(binary: string, releaseRoot: string, required = false): string {
-  if (path.isAbsolute(binary) && !fs.existsSync(binary) && !required) return path.resolve(binary);
-  const found = path.isAbsolute(binary) ? binary : findExecutable(binary);
+  // Sealed absence must be idempotent when reconstructing an already-pinned
+  // specification. A new file here still changes the package JS closure hash.
+  if (!required && path.dirname(binary) === path.join(releaseRoot, "dist/residency") &&
+      /^unavailable-[0-9a-f]{64}\.js$/.test(path.basename(binary))) return binary;
+  const found = path.isAbsolute(binary) ? (fs.existsSync(binary) ? binary : undefined) : findExecutable(binary);
   if (!found) {
     if (required) throw new Error(`Resident handover cannot resolve binary: ${binary}`);
     // Freeze known absence too: a later PATH change/install must not silently

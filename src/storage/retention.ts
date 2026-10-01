@@ -100,6 +100,9 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   if (hasUnresolvedWorker(root, 0, expired)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
+  // A terminal external-pane record is not an exit receipt, even under a dead
+  // manager. Preserve it until a checked tmux/screen exit contract exists.
+  if (record?.transport === "tmux" || record?.transport === "screen") return false;
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
   if (pid !== undefined && processAlive(pid)) return false;

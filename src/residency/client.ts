@@ -10,7 +10,7 @@ import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, 
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
-import { executeFile, spawnDetached } from "../agents/transports/process-utils.js";
+import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import {
@@ -338,7 +338,10 @@ export class ResidencyClient {
       this.#deferRelease(new Error("Legacy resident host/launcher has no release custody protocol; installer drain required")); return;
     }
     this.#refreshPiModels();
-    const target = residentLaunchSpec(this.options.config, path.join(path.dirname(this.#hostPath), "pi-entry.js"));
+    // A bundled Main's execPath is Pi, not a JavaScript interpreter. Resolve
+    // on this initiating generation and freeze the same runtime workers use.
+    const runtime = await resolveScriptRuntime({ execPath: process.execPath });
+    const target = residentLaunchSpec(this.options.config, path.join(path.dirname(this.#hostPath), "pi-entry.js"), runtime);
     if (readHandoverJson(handoverOutcomePath(this.options.config.residencyRoot, target))) return;
     await this.#command({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "releaseChange",
       requestId: randomUUID(), rootId: main.rootId, createdAt: Date.now(), main, target,

@@ -3,7 +3,7 @@
 import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import {
-  RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess,
+  RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, exactResidentProcess, assertAutomaticReleaseRecovery,
   residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec,
   handoverPath, handoverCustodyPath, handoverOutcomePath, handoverActive,
   readHandoverJson, writeHandoverState, writeLaunchSnapshot, mainGenerationCurrent, decideHandover,
@@ -827,6 +827,10 @@ export class ResidentHost {
     commitResidentRequest(this.config.residencyRoot, command, plan.id, this.hostId);
     writeHandoverState(this.config.residencyRoot, plan, "preparing");
     this.#handover = plan;
+    // Cancel synchronously, before yielding to the launcher or gating A's
+    // backlog. A protocol ABI is not proof of safe failed-attempt recovery.
+    try { assertAutomaticReleaseRecovery(); }
+    catch (error) { this.#cancelRelease(plan, errorMessage(error)); return; }
     this.actors.pauseForRelease(); this.control.pause(); this.lifecycle.pause();
   }
 
@@ -867,6 +871,7 @@ export class ResidentHost {
       if (!plan || this.#pollingRequests) return;
       const custody = readHandoverJson<{ id: string; launcher: ResidentLauncherIdentity }>(handoverCustodyPath(this.config.residencyRoot, plan.id));
       if (custody) {
+        assertAutomaticReleaseRecovery();
         if (custody.id !== plan.id || JSON.stringify(custody.launcher) !== JSON.stringify(plan.launcher) ||
             !exactResidentProcess(plan.launcher)) throw new Error("Resident launcher custody is uncertain");
         // Receipt precedes release of A's stable flock. The Main is no longer the executor.
@@ -885,13 +890,15 @@ export class ResidentHost {
           this.agents.listForUi().some((agent) => agent.status === "queued" || agent.status === "running")) return;
       const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.config.residencyRoot));
       if (state?.plan.id !== plan.id) throw new Error("Resident release transaction changed");
+      if (state.phase === "cancelled") { this.#cancelRelease(plan, state.error ?? "Launcher deferred release before custody"); return; }
       if (state.phase === "custody") return;
       await this.control.checkpointForRelease();
       await this.lifecycle.checkpointForRelease();
       await Promise.all([...this.#publications]);
       if (this.#publicationFailed) throw new Error("Resident release has unconfirmed public results/deliveries");
       await this.actors.checkpointForRelease();
-      await this.agents.checkpointForRelease();
+      await this.agents.checkpointForRelease(plan.createdAt + HANDOVER_DRAIN_MS);
+      assertAutomaticReleaseRecovery();
       validateLaunchSpec(plan.previous); validateLaunchSpec(plan.target);
       writeHandoverState(this.config.residencyRoot, plan, "custody");
     } catch (error) {

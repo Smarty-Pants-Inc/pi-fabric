@@ -2,12 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as recoveryPolicy from "../src/residency/handover.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { TmuxTransport } from "../src/agents/transports/tmux-transport.js";
+import { ScreenTransport } from "../src/agents/transports/screen-transport.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import {
@@ -40,7 +43,11 @@ if(args.get('resident-startup-probe')==='true'){
 `);
   return dir;
 }
-async function fixture() {
+// The original protocol-only cases below mock ONLY the new recovery gate.
+// Production and all round-3 safety cases run the fail-closed policy unchanged.
+afterEach(() => vi.restoreAllMocks());
+async function fixture(protocolOnly = true) {
+  if (protocolOnly && "assertAutomaticReleaseRecovery" in recoveryPolicy) vi.spyOn(recoveryPolicy, "assertAutomaticReleaseRecovery").mockImplementation(() => {});
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-handover-"));
   const a = release(root, "A"), b = release(root, "B");
   const identity = { id: "session:release", name: "Main", kind: "main" as const, sessionId: "release" };
@@ -93,6 +100,104 @@ async function fixture() {
 }
 
 describe.skipIf(process.platform !== "linux")("resident release plan and idle-point custody", () => {
+  it.each(["broken-B", "disposed-Main"] as const)("defers %s before A exits and serves the same acknowledged queue on A", async kind => {
+    const f = await fixture(false);
+    try {
+      const actor = await f.host.actors.create({ name: "deferred-on-A", instructions: "Reply", residency: "durable", responseMode: "text", tools: [], delivery: "mailbox" });
+      f.host.actors.tell(actor.id, "LIVE_WITH_PROGRESS");
+      await until(() => !!f.host.actors.status(actor.id).inFlightRun);
+      const receipt = f.host.actors.tell(actor.id, "queued-before-deferral");
+      if (kind === "broken-B") fs.writeFileSync(f.target.config.workerPath, "throw Error('broken B startup');");
+      await f.client.reconcileRelease();
+      await until(() => ["custody", "cancelled"].includes(f.state()?.phase ?? ""));
+      expect(f.state()?.phase).toBe("cancelled");
+      expect(f.state()?.error).toMatch(/attempt.*exit|recovery.*unavailable/i);
+      if (kind === "disposed-Main") await f.client.close();
+      expect(f.idle).not.toHaveBeenCalled();
+      expect(fs.existsSync(handoverCustodyPath(f.config.residencyRoot, f.state()!.plan.id))).toBe(false);
+      expect(readHandoverJson<ResidentHostOwner>(path.join(f.config.residencyRoot, "owner.json"))?.releaseRoot).toBe(f.previous.releaseRoot);
+      await until(() => f.host.actors.messages(actor.id).filter(m => m.direction === "out").length === 2);
+      const messages = f.host.actors.messages(actor.id);
+      expect(messages.filter(m => m.direction === "in" && m.id === receipt.messageId)).toHaveLength(1);
+      expect(f.host.actors.status(actor.id).id).toBe(actor.id);
+      expect(f.host.mesh.read({ topic: "host.reloaded" })).toHaveLength(0);
+    } finally { await f.close(); }
+  }, 20_000);
+
+  it.each([["tmux", "failed"], ["tmux", "hung"], ["screen", "failed"], ["screen", "hung"]] as const)("cancels release for terminal live %s on %s observation and preserves its files", async (kind, observation) => {
+    const f = await fixture(false);
+    const adapter = kind === "tmux" ? TmuxTransport.prototype : ScreenTransport.prototype;
+    const available = vi.spyOn(adapter, "available").mockResolvedValue(true);
+    let handle: Awaited<ReturnType<ProcessTransport["launch"]>> | undefined;
+    let fault: "none" | "failed" | "hung" = "none";
+    let check: Promise<void> | undefined;
+    let releaseQuery!: () => void;
+    const query = new Promise<boolean>(resolve => { releaseQuery = () => resolve(false); });
+    const launch = vi.spyOn(adapter, "launch").mockImplementation(async request => {
+      handle = await new ProcessTransport().launch(request);
+      return { ...handle, kind, relaunchable: false, livenessPollIntervalMs: 10,
+        isAlive: async () => fault === "hung" ? query : fault === "failed" ? false : handle!.isAlive() };
+    });
+    try {
+      const info = await f.host.agents.spawn({ task: "HANG until stopped", transport: kind });
+      const run = path.join(f.config.residencyRoot, "runs", info.id);
+      const status = path.join(run, "status.json");
+      await until(() => fs.existsSync(status));
+      const record = JSON.parse(fs.readFileSync(status, "utf8"));
+      fs.writeFileSync(status, JSON.stringify({ ...record, status: "failed", error: "terminal UI does not prove exit", finishedAt: Date.now() }));
+      await f.host.agents.wait(info.id);
+      expect(await handle!.isAlive()).toBe(true);
+      {
+        fault = observation;
+        check = f.host.agents.checkpointForRelease();
+        const outcome = await Promise.race([check.then(() => "accepted", () => "vetoed"), sleep(400).then(() => "hung")]);
+        expect(outcome).toBe("vetoed");
+        await f.client.reconcileRelease();
+        await until(() => ["cancelled", "custody"].includes(f.state()?.phase ?? ""));
+        expect(f.state()?.phase).toBe("cancelled");
+        expect(f.idle).not.toHaveBeenCalled();
+        expect(fs.existsSync(run)).toBe(true);
+        expect(await handle!.isAlive()).toBe(true);
+        // A's ordinary actor admission is resumed, not destructively closed.
+        const actor = await f.host.actors.create({ name: `served-${observation}`, instructions: "Reply", residency: "durable", tools: [], responseMode: "text" });
+        f.host.actors.tell(actor.id, "after cancellation");
+        await until(() => f.host.actors.messages(actor.id).some(m => m.direction === "out"));
+      }
+      releaseQuery(); fault = "failed";
+      await f.host.close();
+      expect(fs.existsSync(run)).toBe(true);
+      expect(await handle!.isAlive()).toBe(true);
+    } finally { releaseQuery(); fault = "none"; await check?.catch(() => undefined); await handle?.stop(); launch.mockRestore(); available.mockRestore(); await f.close(); }
+  }, 20_000);
+
+  it("freezes a missing absolute optional binary even if it is later installed", async () => {
+    const f = await fixture(false);
+    try {
+      const missing = path.join(f.root, "optional-claude");
+      const spec = residentLaunchSpec({ ...f.previous.config, claudeBinary: missing }, f.previous.entry);
+      expect(spec.config.claudeBinary).not.toBe(missing);
+      expect(spec.config.claudeBinary.startsWith(f.previous.releaseRoot)).toBe(true);
+      fs.writeFileSync(missing, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      expect(() => validateLaunchSpec(spec)).not.toThrow();
+      expect(fs.existsSync(spec.config.claudeBinary)).toBe(false);
+    } finally { await f.close(); }
+  });
+
+  it("client pins the generic target runtime for a bundled Main and script Pi CLI", async () => {
+    const f = await fixture(false);
+    const exec = process.execPath;
+    const runtime = fs.realpathSync(exec);
+    const bundled = path.join(f.root, "pi"); fs.copyFileSync(runtime, bundled);
+    try {
+      f.client.options.config.piBinary = path.resolve("tests/fixtures/resident-probe-pi.mjs");
+      process.execPath = bundled; vi.stubEnv("PI_FABRIC_NODE_BINARY", runtime);
+      await f.client.reconcileRelease();
+      expect(f.state()!.plan.target.config.piBinary).toBe(path.resolve("tests/fixtures/resident-probe-pi.mjs"));
+      expect(f.state()!.plan.target.runtime).toBe(runtime);
+      expect(f.state()!.plan.target.runtime).not.toBe(bundled);
+    } finally { process.execPath = exec; vi.unstubAllEnvs(); await f.close(); }
+  });
+
   it("cancellation and custody share one immutable CAS; neither can overwrite the winner", async () => {
     const f = await fixture();
     try {

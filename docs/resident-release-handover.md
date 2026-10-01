@@ -1,89 +1,112 @@
-# Resident release following (#2615)
+# Resident release negotiation (#2615)
 
-A live Main chooses the release it actually loaded; the **existing detached
-launcher** owns the irreversible handover. This is not a new daemon, a fleet
-scanner or an installer migration.
+A live Main chooses the release it actually loaded; only its **existing detached
+launcher** may own an irreversible handover. This is not a new daemon, fleet
+scanner or installer migration.
 
-## Protocol
+## Current policy: defer before A exits
+
+Automatic release following is **disabled**, including on protocol-capable Linux
+hosts. The current launcher samples ancestry but has no attempt-owned membership
+boundary or complete exit receipts. Therefore it cannot safely promise A recovery
+after an ordinary failed B or Main loss during B startup. A protocol ABI and a
+free `host.lock` are not sufficient recovery capability.
+
+`assertAutomaticReleaseRecovery()` is an unconditional, non-configurable gate:
+
+- A records the authorized target intent and synchronously cancels it **before
+  pausing its backlog, yielding to the launcher, accepting custody or exiting**.
+  The original A owner, admitted runs, actor identities and acknowledged queued
+  inputs continue serving. Main shutdown/reload cannot turn deferral into outage.
+- The launcher independently cancels a custody request under its transaction
+  lock, before the positive custody CAS/receipt, target-attempt suppression or
+  B spawn. A observes that cancellation and resumes a reversible prepare.
+- There is no environment/configuration opt-in. Tests of the retained staged
+  transaction primitives explicitly mock the recovery assertion; these are not
+  evidence that automatic release following is enabled or accepted.
+
+This replaces round 2's post-B `blocked` scope cut. We do **not** accept loss of
+service on healthy storage with usable A, claim complete descendant cleanup, or
+claim the old failed-B recovery matrix applies to this head. B failure and Main
+loss *after B spawn* are unreachable on this policy: no B attempt is authorized.
+Use the existing explicit installer drain/exit-proof path to change releases.
+
+## Retained protocol primitives
 
 1. Each Main runtime publishes a birth-bound, nonce-qualified intent. Native
-   `/reload` activation reconciles an already-owned root, including while its
-   successor is staged; it never creates an empty host merely to follow a release.
-2. A captures its actual effective launch specification. A and B pin real release
-   paths, the whole package-local JS closure, resolved runtime/binaries and all
-   configuration fields. Bundled Pi cold-start attestation uses the birth-checked
-   launcher's generic runtime; successors use their custody-pinned runtime, not
-   Pi's own executable path. Selected live model/kernel overlays belong only to A.
-   Storage topology must remain identical and both releases advertise
-   `fabric-resident-1` (a compatibility promise, not a schema-migration engine).
-3. A reversibly gates file/control/lifecycle ingress and both actor scopes. Runs,
-   caller-bound continuations and finalizers finish naturally. Queues and registry
-   checkpoint before cursors; result publication, completion delivery and control
-   ACKs join before release. A non-destructive AgentManager receipt checks
-   pending/unregistered transports and tracked/preserved/nested run trees;
-   terminal UI failure never proves worker exit. Unknown identities or exit
-   cancel preparation without stopping work. Delivered lifecycle cursor/once
-   deletion obligations must have confirmed storage receipts, never replayed
-   operations. Untouched backlog retains its retry budget.
-4. Under the root transaction flock, A's existing launcher validates its own
-   child PID/birth/token and the exact plan, pins A/B in memory and writes an
-   immutable custody receipt **before A exits**. Cancellation and custody share
-   one hard-link CAS. An unrelated launcher cannot consume the plan.
-5. Only receipt-bound, drained A closes and releases the stable `host.lock`
-   inode. The launcher starts B once. B acquires that fence, restores actors but
-   gates business work, and runs an isolated real-worker startup probe. No prompt
-   or inference is sent; the worker requires B's nonce-bound loaded-extension
-   activation ACK and a correlated Pi RPC startup response.
-6. If Main is lost before B is attempted (or B validation fails before launch),
-   the launcher can start one supervised A fallback from its frozen specification,
-   never desired `config.json`. **Once B launch is attempted, a failed B blocks
-   automatic fallback.** Birth-validated cleanup stops only observed processes;
-   sampled ancestry, direct-child exit and a free host fence do not prove that
-   reparented helpers exited. No second generation may start on that evidence.
-   After success, B publishes one `host.reloaded` `{old, new, transaction}` event
-   and resumes the preserved backlog.
+   `/reload` activation reconciles an already-owned root, including while an
+   older transaction is staged; it never cold-starts an empty root merely to
+   follow a release. Disposal revokes the old nonce.
+2. A and B pin real release paths, the whole package-local JS closure, resolved
+   runtime/binaries and configuration snapshots. The initiating Main resolves
+   its generic JavaScript runtime via `resolveScriptRuntime` before constructing
+   B's spec. A bundled Pi executable is never substituted as a script interpreter.
+   Cold host attestation uses the birth/kernel-checked parent launcher runtime;
+   successors use their custody-pinned runtime. Live model/kernel overlays belong
+   to A; storage topology must remain identical.
+3. The staged transaction has reversible file/control/lifecycle and both-scope
+   actor gates. Runs, continuations and finalizers finish naturally. Queues and
+   registry checkpoint before cursors; result/delivery/ACK publication must have
+   checked receipts. A terminal UI status never proves worker exit. Delivered
+   lifecycle cursor/once-delete obligations repair storage receipts, not accepted
+   operation execution. Untouched backlog keeps its retry budget.
+4. The retained custody mechanism binds the exact child PID/birth/token and plan
+   under the root lock; cancellation/custody share one immutable hard-link CAS.
+   It cannot override the current unconditional recovery gate.
+5. Staged startup probes require the real worker's nonce-bound extension ACK and
+   correlated Pi RPC response, without inference. Terminal publication uncertainty
+   retains the owned generation rather than cutting possibly admitted business
+   work. `host.reloaded` publication uncertainty never ungates or replays business
+   work. None of these primitives supplies containment or enables automatic B.
 
-## Deliberate scope cuts / containment follow-up
+## External transport scope cut (security round 2 F1)
 
-Automatic fallback after an attempted B is deferred until a separate change
-provides an attempt-owned membership boundary established before any child can
-escape (for example, an appropriately delegated cgroup) and checked whole-
-attempt exit receipts. Tracking request for the repository owner: **file a
-containment follow-up under #2615 before re-enabling failed-B fallback**. This
-review task has no GitHub-write authority, so it does not invent an issue number.
-The blocked transaction retains its retry suppression; ordinary reload cannot
-reset it. Operators must use the existing explicit drain/exit-proof route.
-Preserved runs with unknown external transport identity also defer release.
-An indeterminate once-subscription deletion with no surviving confirmed receipt
-keeps A; a missing entry alone is not durable proof.
+The tmux/screen adapters still conflate a failed CLI/socket query with an absent
+session. They have no checked exit contract. Rather than treat `false` as a
+receipt, release quiescence rejects any tracked or unregistered tmux/screen
+transport **without issuing a liveness query**. Thus a failed or hung query cannot
+permit custody or defeat the reversible drain bound.
 
-## Bounds and safe failures
+Close, explicit cleanup, per-manager collection and resident/orphan/nested-tree
+retention preserve their worker directories. Requested stops do not prove exit;
+automatic relaunch is disabled for these adapters too. This intentionally retains
+completed external-pane runs as well until a checked exit contract exists.
+Operators must confirm external workers are gone before manual file removal.
+Other transport liveness calls during release/exit observation are raced against
+an explicit deadline; a failed/hung observation records an unresolved worker and
+vetoes custody. No destructive close is used as release proof.
 
-Prepare cancels after 120 seconds without cutting a run. Each staged startup has
-30 seconds; owned cleanup allows 5 seconds TERM then 5 seconds KILL. The retry
-record is persistent per root/target artifact, so reloads and config changes do
-not create loops. No manual retry-reset API is introduced in this change.
+## Frozen absence and assumptions
 
-Unproved capability, artifact, storage boundary, launcher custody or birth/fence
-identity means retain A. Unknown termination/fence or failed A recovery is an
-explicit blocked transaction, never permission to spawn a duplicate. An
-indeterminate `host.reloaded` publication is not retried or followed by business
-activation (exactly-once recovery needs a separate durable event outbox). Once a
-terminal write was attempted, an error may follow an already-visible rename: the
-launcher retains the owned generation (B or recovered A) rather than risking
-cutting newly admitted work for rollback or overwriting a visible terminal state.
-It reports terminal uncertainty; storage-fault recovery is not fabricated success.
+Missing optional binaries, including absolute paths, become a stable absent
+sentinel inside the sealed package JS closure. Reconstructing a pinned spec is
+idempotent. Installing a binary at the original missing absolute path cannot
+change the selected runner; creating a sentinel JS file invalidates the closure
+hash. External binary/dependency immutability remains an assumption, not binary
+content authentication by the package JS digest.
 
-The first transition **requires a capable A host and launcher**. Installed B71
-predates this protocol: loading B in Main cannot retrofit custody into that live
-launcher. It stays stale-but-served with an explicit deferred diagnostic; use the
-existing installer drain/exit proof for initial capability rollout and rollback.
-No automatic non-Linux or mixed-legacy takeover is added.
+The reversible drain bound remains 120 seconds; transport observations cannot
+extend it. Retained staged startup/observed-process cleanup bounds are 30 seconds
+and 5 seconds TERM + 5 seconds KILL; observed cleanup is never complete membership
+proof or fallback authorization. Storage/identity/publication uncertainty remains
+fail-closed. No retry-reset interface is added.
 
-Assumptions: trusted same-user private root and retained immutable artifacts,
-healthy compatible storage, a surviving launcher, and usable known-good A.
-Same-user malicious artifact rewrites, machine/storage/controller loss and fleet
-activation coverage are outside this transaction's recovery guarantee. A
-Sol-max process-relaunch security review and fleet activation audit are required
-before rollout. Native-Pi proof controllers and immutable release copies are
-retained in the task evidence, not in `.local/` or the package.
+## Follow-up issues for the repository owner (not filed by this task)
+
+**Contain resident release attempts and restore automatic Main release following
+(#2615 follow-up).** Establish membership before any child can escape (for example,
+a delegated cgroup), retain a supervisor until every member has a checked exit
+receipt, then prove one coherent A fallback after failed B and Main death during
+B startup, with the same actor IDs, acknowledged queued IDs and no overlapping
+service. Remove the unconditional gate only with independent security review and
+real native-Pi published A/B acceptance. Until then A remains stale-but-served.
+
+**Add checked tmux/screen worker exit receipts.** Distinguish definitive absence
+from CLI/socket failure; bound and cancel every query; persist enough identity
+for safe retention after manager death. Re-enable release, collection and retry
+only after failed-query/hung-query/live-terminal-pane regressions prove safety.
+
+Installed B71 still requires installer drain for initial capability rollout. This
+change does not authorize that install, fleet activation or a claim that #2615's
+published-pair/post-install audit is complete. Required Ubuntu/Windows CI,
+Astra review, independent security pass and owner hold/queue gates remain.

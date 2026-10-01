@@ -2,7 +2,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { pathToFileURL } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -27,7 +26,7 @@ const logs = (root: string): Array<Record<string, unknown>> => {
   try { return fs.readFileSync(path.join(root, "launcher.log"), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)); }
   catch { return []; }
 };
-async function fixture(mode: "ready" | "exit" | "hang" | "terminal-block" | "fast-exit" | "fallback-uncertain", killableMain = false) {
+async function fixture(mode: "ready" | "exit" | "hang" | "fast-exit", killableMain = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-launcher-handover-"));
   const ownership = launchLog(root);
   const a = path.join(root, "A"), b = path.join(root, "B");
@@ -40,7 +39,7 @@ async function fixture(mode: "ready" | "exit" | "hang" | "terminal-block" | "fas
   const residencyRoot = path.join(root, "resident"); fs.mkdirSync(residencyRoot);
   const config: ResidentHostConfig = { format: 1, rootId: "session:supervised", sessionId: "supervised", cwd: root, projectRoot: root,
     meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot, fullCodeMode: true,
-    agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
+    agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, nice: 19 }, mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: path.join(a, "dist/worker.js"), fabricExtensionPath: path.join(a, "dist/index.js"),
     piBinary: path.resolve("tests/fixtures/handover-pi.mjs"), claudeBinary: "fixture-claude", vedaBinary: "fixture-veda", kernel: "typescript", pythonRuntime: "monty",
     piModels: { available: [{ provider: "fixture", id: "A" }], aliases: {}, defaultModel: "fixture/A" } };
@@ -48,24 +47,7 @@ async function fixture(mode: "ready" | "exit" | "hang" | "terminal-block" | "fas
   const target = residentLaunchSpec({ ...config, workerPath: path.join(b, "dist/worker.js"), fabricExtensionPath: path.join(b, "dist/index.js"),
     kernel: "python", pythonRuntime: "cpython", piModels: { available: [{ provider: "fixture", id: "B" }], aliases: {}, defaultModel: "fixture/B" } }, path.join(b, "dist/residency/pi-entry.js"));
   const configPath = path.join(residencyRoot, "config.json"); fs.writeFileSync(configPath, JSON.stringify(previous.config));
-  const fault = path.join(root, "fallback-fsync-fault.mjs");
-  fs.writeFileSync(fault, `import fs from 'node:fs';
-const sync = fs.fsyncSync;
-let injected = false;
-fs.fsyncSync = function(fd) {
- const config = process.env.PI_FABRIC_TEST_FAULT_ROOT || ${JSON.stringify(residencyRoot)};
- let state; try { state = JSON.parse(fs.readFileSync(config + '/handover.json', 'utf8')); } catch {}
- if (!injected && !process.env.PI_FABRIC_RESIDENT_LAUNCHER && fs.fstatSync(fd).isDirectory() && state?.phase === 'fallback') {
-   injected = true;
-   const deadline = Date.now() + 5000;
-   while (!fs.existsSync(config + '/fixture-business.json') && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-   if (!fs.existsSync(config + '/fixture-business.json')) throw Error('business did not start before injected fault');
-   throw Error('injected fallback directory fsync after visible rename and admitted business');
- }
- return sync.call(fs, fd);
-};`);
-  const env = { ...process.env, ...ownership.env, ...(mode === "fallback-uncertain" ? { NODE_OPTIONS: `${ownership.env.NODE_OPTIONS} --import=${pathToFileURL(fault).href}` } : {}), PI_FABRIC_TEST_TARGET_MODE: mode,
-    ...(killableMain ? { PI_FABRIC_TEST_HANDOVER_AFTER_RELEASE_MS: "1500" } : {}) };
+  const env = { ...process.env, ...ownership.env, PI_FABRIC_TEST_TARGET_MODE: mode };
   const children: ChildProcess[] = [];
   const startLauncher = (release: string) => {
     const child = spawn(process.execPath, [path.join(release, "dist/residency/launcher.js"), "--config", configPath], { env, stdio: "ignore" });
@@ -74,6 +56,14 @@ fs.fsyncSync = function(fd) {
   let closed = false;
   const cleanup = async () => {
     if (closed) return;
+    // Stop/reap every direct controller before snapshotting the launch log.
+    // Otherwise a failing assertion at `starting` can race a just-spawned B's
+    // preload/helper registration, leaving it outside the cleanup snapshot.
+    await Promise.all(children.map(async child => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = new Promise<void>(resolve => child.once("close", () => resolve()));
+      child.kill("SIGTERM"); await exited;
+    }));
     // A killed orphan may be a zombie owned by init; it is exited and cannot
     // be signalled or reaped by this fixture. Only live launch-time identities.
     const live = ownership.owned().filter((owned) => {
@@ -103,130 +93,46 @@ fs.fsyncSync = function(fd) {
   writeHandoverImmutable(mainGenerationPath(residencyRoot), main);
   writeLaunchSnapshot(residencyRoot, previous); writeLaunchSnapshot(residencyRoot, target);
   const state = () => readHandoverJson<ResidentHandoverState>(handoverPath(residencyRoot));
-  const service = () => readHandoverJson<{ pid: number; config: ResidentHostConfig; attempt: { id: string; kind: string } }>(path.join(residencyRoot, "fixture-service.json"));
-  return { root, residencyRoot, owner, inode, previous, target, plan, mainChild, state, service,
+  return { root, residencyRoot, owner, inode, previous, target, plan, mainChild, state,
     commit: () => writeHandoverState(residencyRoot, plan, "custody"),
-    competingLauncher: () => startLauncher(b),
     close: cleanup, launcher,
   };
 }
 
-describe.skipIf(!available)("native launcher release custody and bounded recovery", () => {
-  it("blocks fallback when a fast-exiting B leaves an unobserved detached helper", async () => {
-    const f = await fixture("fast-exit");
+// Automatic release is currently unavailable: no attempt-owned containment
+// exists. Do not retain the old tests that required unsafe B attempts/outages.
+describe.skipIf(!available)("native launcher pre-exit release deferral", () => {
+  it.each(["ready", "exit", "hang", "fast-exit"] as const)("refuses %s B before custody and keeps the exact A generation alive", async mode => {
+    const f = await fixture(mode);
     try {
       f.commit();
-      await until(() => ["blocked", "fallback"].includes(f.state()?.phase ?? ""));
-      expect(f.state()?.phase).toBe("blocked");
-      expect(f.state()?.error).toMatch(/membership|unproven/i);
-      expect(logs(f.residencyRoot).filter(e => e.event === "child-spawned" && e.kind === "fallback")).toHaveLength(0);
-      const escaped = readHandoverJson<{ pid: number; birth: string }>(path.join(f.residencyRoot, "fixture-escaped.json"))!;
-      expect(residentProcessAlive(escaped.pid, escaped.birth)).toBe(true);
-    } finally { await f.close(); }
-  }, 30_000);
-
-  it("retains A and admitted business after fallback rename succeeds but directory fsync fails", async () => {
-    const f = await fixture("fallback-uncertain", true);
-    try {
-      f.commit();
-      await until(() => f.state()?.phase === "released" && !residentProcessAlive(f.owner.pid, f.owner.processStartTime));
-      const mainExited = new Promise<void>(resolve => f.mainChild!.once("close", () => resolve()));
-      f.mainChild!.kill("SIGKILL"); await mainExited;
-      await until(() => logs(f.residencyRoot).some(e => e.event === "handover-terminal-uncertain") || f.state()?.phase === "blocked");
-      expect(f.state()?.phase).toBe("fallback");
-      const a = readHandoverJson<ResidentHostOwner>(path.join(f.residencyRoot, "owner.json"))!;
-      const business = readHandoverJson<{ pid: number; birth: string; ticks: number }>(path.join(f.residencyRoot, "fixture-business.json"))!;
-      expect(residentProcessAlive(a.pid, a.processStartTime)).toBe(true);
-      expect(residentProcessAlive(business.pid, business.birth)).toBe(true);
-      await until(() => (readHandoverJson<{ ticks: number }>(path.join(f.residencyRoot, "fixture-business.json"))?.ticks ?? 0) > business.ticks);
+      await until(() => ["cancelled", "starting", "complete", "blocked"].includes(f.state()?.phase ?? ""));
+      expect(f.state()?.phase).toBe("cancelled");
+      expect(f.state()?.error).toMatch(/attempt.*exit|recovery.*unavailable/i);
+      expect(residentProcessAlive(f.owner.pid, f.owner.processStartTime)).toBe(true);
+      expect(readHandoverJson<ResidentHostOwner>(path.join(f.residencyRoot, "owner.json"))?.token).toBe(f.owner.token);
+      expect(fs.existsSync(handoverCustodyPath(f.residencyRoot, f.plan.id))).toBe(false);
+      expect(fs.existsSync(handoverOutcomePath(f.residencyRoot, f.target))).toBe(false);
+      expect(fs.existsSync(path.join(f.residencyRoot, "fixture-escaped.json"))).toBe(false);
+      expect(logs(f.residencyRoot).filter(e => e.event === "child-spawned" && (e.kind === "target" || e.kind === "fallback"))).toHaveLength(0);
+      expect(fs.statSync(path.join(f.residencyRoot, "host.lock")).ino).toBe(f.inode);
       expect(f.launcher.exitCode).toBeNull();
-      expect(logs(f.residencyRoot).filter(e => e.event === "child-spawned" && e.kind === "fallback")).toHaveLength(1);
-      expect(logs(f.residencyRoot).filter(e => e.event === "child-spawned" && e.kind === "target")).toHaveLength(0);
     } finally { await f.close(); }
-  }, 30_000);
+  }, 25_000);
 
-
-  it("keeps owned B alive when terminal publication is indeterminate instead of cutting possible work", async () => {
-    const f = await fixture("terminal-block");
-    try {
-      f.commit();
-      await until(() => logs(f.residencyRoot).some(e => e.event === "handover-terminal-uncertain"));
-      const b = readHandoverJson<ResidentHostOwner>(path.join(f.residencyRoot, "owner.json"))!;
-      expect(b.releaseRoot).toBe(f.target.releaseRoot);
-      expect(residentProcessAlive(b.pid, b.processStartTime)).toBe(true);
-      expect(f.launcher.exitCode).toBeNull();
-      expect(logs(f.residencyRoot).filter(e => e.event === "child-spawned" && e.kind === "target")).toHaveLength(1);
-      expect(logs(f.residencyRoot).filter(e => e.event === "child-spawned" && e.kind === "fallback")).toHaveLength(0);
-    } finally { await f.close(); }
-  }, 30_000);
-
-  it("takes exact A/B custody before A exits, and commits one B attempt without a competing launcher", async () => {
-    const f = await fixture("ready");
-    try {
-      f.commit();
-      await until(() => !!readHandoverJson(handoverCustodyPath(f.residencyRoot, f.plan.id)));
-      const rival = f.competingLauncher();
-      await new Promise<void>((resolve) => rival.once("close", () => resolve()));
-      await until(() => f.state()?.phase === "complete" && !!f.service());
-      const seen = readHandoverJson<{ owner: ResidentHostOwner; receipt: { id: string } }>(path.join(f.residencyRoot, "fixture-custody-seen.json"))!;
-      expect(seen.owner.token).toBe(f.owner.token);
-      expect(seen.receipt.id).toBe(f.plan.id);
-      expect(residentProcessAlive(f.owner.pid, f.owner.processStartTime)).toBe(false);
-      expect(f.service()!.config).toEqual(f.target.config);
-      expect(logs(f.residencyRoot).filter((e) => e.event === "child-spawned" && e.kind === "target")).toHaveLength(1);
-      expect(logs(f.residencyRoot).filter((e) => e.event === "child-spawned" && e.kind === "fallback")).toHaveLength(0);
-      expect(fs.statSync(path.join(f.residencyRoot, "host.lock")).ino).toBe(f.inode);
-    } finally { await f.close(); }
-  }, 30_000);
-
-  it("blocks failed B without fallback even when desired config is overwritten", async () => {
-    const f = await fixture("exit");
-    try {
-      fs.writeFileSync(path.join(f.residencyRoot, "config.json"), JSON.stringify({ ...f.target.config, kernel: "python", workerPath: "/unrelated/C/worker.js", piModels: { defaultModel: "fixture/C" } }));
-      f.commit();
-      await until(() => f.state()?.phase === "blocked");
-      expect(f.service()).toBeUndefined();
-      expect(f.state()?.error).toMatch(/membership.*unproven/);
-      const traces = logs(f.residencyRoot);
-      expect(traces.filter((e) => e.event === "child-spawned" && e.kind === "target")).toHaveLength(1);
-      expect(traces.filter((e) => e.event === "child-spawned" && e.kind === "fallback")).toHaveLength(0);
-      const targetPid = traces.find((e) => e.event === "child-spawned" && e.kind === "target")!.pid as number;
-      expect(residentProcessAlive(targetPid)).toBe(false);
-      expect(readHandoverJson(handoverOutcomePath(f.residencyRoot, f.target))).toMatchObject({ id: f.plan.id });
-      await delay(200);
-      expect(logs(f.residencyRoot).filter((e) => e.event === "child-spawned" && e.kind === "target")).toHaveLength(1);
-      expect(fs.statSync(path.join(f.residencyRoot, "host.lock")).ino).toBe(f.inode);
-    } finally { await f.close(); }
-  }, 30_000);
-
-  it("stops observed hung B processes but blocks fallback without complete membership proof", async () => {
-    const f = await fixture("hang");
-    try {
-      f.commit();
-      await until(() => f.state()?.phase === "blocked", 45_000);
-      const traces = logs(f.residencyRoot);
-      expect(traces.filter((e) => e.event === "child-spawned" && e.kind === "target")).toHaveLength(1);
-      expect(traces.filter((e) => e.event === "child-spawned" && e.kind === "fallback")).toHaveLength(0);
-      const targetExit = traces.findIndex((e) => e.event === "child-exit" && e.kind === "target");
-      expect(targetExit).toBeGreaterThanOrEqual(0);
-      expect(f.service()).toBeUndefined();
-      expect(f.state()?.error).toMatch(/membership.*unproven/);
-      expect(fs.statSync(path.join(f.residencyRoot, "host.lock")).ino).toBe(f.inode);
-    } finally { await f.close(); }
-  }, 60_000);
-
-  it("launcher restores A if Main dies after A released its fence and before B spawn", async () => {
+  it("keeps A supervised when Main dies during a deferred transaction", async () => {
     const f = await fixture("ready", true);
     try {
       f.commit();
-      await until(() => f.state()?.phase === "released" && !residentProcessAlive(f.owner.pid, f.owner.processStartTime));
-      const mainExited = new Promise<void>((resolve) => f.mainChild!.once("close", () => resolve()));
-      f.mainChild!.kill("SIGKILL");
-      await mainExited;
-      await until(() => f.state()?.phase === "fallback" && !!f.service());
-      expect(f.service()!.config).toEqual(f.previous.config);
-      expect(logs(f.residencyRoot).filter((e) => e.event === "child-spawned" && e.kind === "target")).toHaveLength(0);
-      expect(logs(f.residencyRoot).filter((e) => e.event === "child-spawned" && e.kind === "fallback")).toHaveLength(1);
+      await until(() => ["cancelled", "released"].includes(f.state()?.phase ?? ""));
+      expect(f.state()?.phase).toBe("cancelled");
+      const exited = new Promise<void>(resolve => f.mainChild!.once("close", () => resolve()));
+      f.mainChild!.kill("SIGKILL"); await exited;
+      await delay(150);
+      expect(residentProcessAlive(f.owner.pid, f.owner.processStartTime)).toBe(true);
+      expect(f.launcher.exitCode).toBeNull();
+      expect(logs(f.residencyRoot).filter(e => e.event === "child-spawned" && (e.kind === "target" || e.kind === "fallback"))).toHaveLength(0);
+      expect(fs.existsSync(handoverCustodyPath(f.residencyRoot, f.plan.id))).toBe(false);
     } finally { await f.close(); }
-  }, 30_000);
+  }, 25_000);
 });

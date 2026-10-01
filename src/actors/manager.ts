@@ -2590,6 +2590,7 @@ export class ActorManager {
         try {
           this.#mainAgent.deliverAgent({
             from: event.from,
+            ...(event.verification === undefined ? {} : { verification: event.verification }),
             message,
             delivery: kind,
             ...(event.data === undefined ? {} : { data: event.data }),

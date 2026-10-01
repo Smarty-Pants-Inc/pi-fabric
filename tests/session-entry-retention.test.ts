@@ -81,7 +81,7 @@ describe("session-entry consumers release canonical history (smarty-dev#2177)", 
     }
   });
 
-  it.each(["root"] as const)("preserves single-batch and lookback boundaries in the %s view", () => {
+  it.each(["root"] as const)("preserves collective split receipts and lookback boundaries in the %s view", () => {
     const customType = ROOT_INBOX_CUSTOM_TYPE;
     const batch = (ids: string[]) => ({ type: "custom_message", customType, details: { ids } });
     const entries = [batch(["old"]), ...Array<unknown>(500).fill({ type: "message" }), batch(["a"]), batch(["b"])];
@@ -89,7 +89,8 @@ describe("session-entry consumers release canonical history (smarty-dev#2177)", 
     expect(session.holdsBatch(["old"])).toBe(false);
     expect(session.holdsBatch(["a"])).toBe(true);
     expect(session.holdsBatch(["b"])).toBe(true);
-    expect(session.holdsBatch(["a", "b"])).toBe(false);
+    expect(session.holdsBatch(["a", "b"])).toBe(true);
+    expect(session.holdsBatch(["a", "missing"])).toBe(false);
     expect(session.holdsBatch([])).toBe(true);
     expect(rootInboxSession([]).holdsBatch([])).toBe(false);
   });

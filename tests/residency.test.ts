@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -597,6 +597,29 @@ describe("durable completion receipts", () => {
     };
     const settle = { outcome: "completed", context: { pendingMessages: [] } };
 
+    it.skipIf(process.platform === "win32").each(["held", "direct", "consumed"])("#180 S3 / #177 S1 refuses uncertain %s replay after a fresh Main/residency restart", { timeout: 20_000 }, async (mode) => {
+      const state = await rootHarness(`replay-post-rename-${mode}`);
+      const key = await actorReply(state, mode === "direct"
+        ? { delivery: "steer", triggerTurn: true }
+        : { delivery: "followUp", triggerTurn: true });
+      const configPath = path.join(state.root, "fixture-config.json");
+      fs.writeFileSync(configPath, JSON.stringify(state.config));
+      const run = (phase: string) => {
+        const child = spawnSync("bun", [path.resolve("tests/fixtures/main-residency-replay.ts"), configPath, key, mode, phase], { encoding: "utf8", timeout: 8_000 });
+        expect(child.error).toBeUndefined();
+        expect(child.status, child.stderr).toBe(0);
+        return JSON.parse(child.stdout) as { pid: number; refused: { sourceSurvives: boolean; acknowledgments: number; deletes: number }; recovered: { acknowledgments: number; deletes: number; delivered: number } };
+      };
+      try {
+        const before = run("prepare");
+        expect(state.mesh.get(key)).toBeDefined();
+        const after = run("recover");
+        expect(after.pid).not.toBe(before.pid); // No module/controller state survives.
+        expect(after.refused).toEqual({ sourceSurvives: true, acknowledgments: 0, deletes: 0 });
+        expect(after.recovered).toEqual({ acknowledgments: 1, deletes: 1, delivered: mode === "consumed" ? 0 : 1 });
+      } finally { await state.participants.close(); }
+    });
+
     it.each(process.platform === "win32" ? ["file"] : ["file", "directory"])("#169 round 3 keeps the resident source when Main's %s journal barrier fails", { timeout: 15_000 }, async (barrier) => {
       const state = await rootHarness(`delivery-barrier-${barrier}`);
       const key = await actorReply(state);
@@ -619,6 +642,58 @@ describe("durable completion receipts", () => {
         await waitFor(() => state.mesh.get(key) === undefined);
         expect(main.sent).toHaveLength(1);
       } finally { fail = false; synced.mockRestore(); await client.close(); main.main.closeFollowUpDrain(); await state.participants.close(); }
+    });
+
+    it.skipIf(process.platform === "win32")("#169 security S1 retains the source until a retry completes the containing-directory barrier", { timeout: 15_000 }, async () => {
+      const state = await rootHarness("delivery-owed-directory-barrier");
+      const key = await actorReply(state);
+      const main = await realMain(state, []);
+      const containingDirectory = state.config.meshRoot;
+      const leaf = path.join(containingDirectory, "main-followups");
+      const descriptors = new Map<number, string>();
+      const events: string[] = [];
+      const open = fs.openSync.bind(fs);
+      const sync = fs.fsyncSync.bind(fs);
+      let fail = true;
+      const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+        const fd = open(file, flags, mode);
+        descriptors.set(fd, String(file));
+        return fd;
+      });
+      const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+        if (descriptors.get(fd) === containingDirectory) {
+          events.push("containing-directory");
+          if (fail) throw new Error("directory link barrier unavailable");
+        }
+        sync(fd);
+      });
+      const deliver = vi.spyOn(main.main, "deliverAgent");
+      const removeSource = state.mesh.delete.bind(state.mesh);
+      const deleted = vi.spyOn(state.mesh, "delete").mockImplementation(async (request) => {
+        if (request.key === key) events.push("source-delete");
+        return removeSource(request);
+      });
+      const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: main.main });
+      try {
+        client.start();
+        await waitFor(() => deliver.mock.results.length >= 2);
+        expect(fs.statSync(leaf).isDirectory()).toBe(true); // Retry sees the failed attempt's existing leaf.
+        expect(deliver.mock.results.every((result) => result.type === "throw")).toBe(true);
+        expect(events.filter((event) => event === "containing-directory").length).toBeGreaterThanOrEqual(2);
+        expect(events).not.toContain("source-delete");
+        expect(state.mesh.get(key)).toBeDefined();
+        expect(main.sent).toHaveLength(0);
+        events.length = 0;
+        fail = false;
+        await waitFor(() => state.mesh.get(key) === undefined);
+        expect(events.indexOf("containing-directory")).toBeGreaterThanOrEqual(0);
+        expect(events.indexOf("source-delete")).toBeGreaterThan(events.indexOf("containing-directory"));
+        expect(main.sent).toHaveLength(1);
+      } finally {
+        fail = false;
+        deleted.mockRestore(); synced.mockRestore(); opened.mockRestore();
+        await client.close(); main.main.closeFollowUpDrain(); await state.participants.close();
+      }
     });
 
     it("#169 round 2 isolates a refused first source while delivering a steer and another sender, then retries after a boundary", { timeout: 15_000 }, async () => {

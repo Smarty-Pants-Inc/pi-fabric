@@ -109,6 +109,7 @@ export type FabricControlHandler = (
   command: FabricControlCommand,
   from: MeshIdentity,
   signal: AbortSignal,
+  verification?: MeshEvent["verification"],
 ) => Promise<FabricControlAcceptance> | FabricControlAcceptance;
 
 const controlSeenKey = (hostId: string, commandId: string): string =>
@@ -833,6 +834,7 @@ export class FabricControlPlane {
       claim.version,
       deadlineAt,
       event.sequence,
+      event.verification,
     );
     if (command.operation === "ask") {
       this.#activeHandlers.add(execution);
@@ -861,6 +863,7 @@ export class FabricControlPlane {
     claimVersion: number,
     deadlineAt: number,
     sequence: number,
+    verification: MeshEvent["verification"],
   ): Promise<void> {
     const controller = new AbortController();
     this.#activeCommands.set(command.commandId, {
@@ -881,7 +884,7 @@ export class FabricControlPlane {
         // this runtime holds the claim and the handler did not run.
         if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
         else acceptance = this.#handler
-          ? await this.#handler(command, from, controller.signal)
+          ? await this.#handler(command, from, controller.signal, verification)
           : { accepted: false, error: "Fabric owner has no control handler" };
       } catch (error) {
         acceptance = {

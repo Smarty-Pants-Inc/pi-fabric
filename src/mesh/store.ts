@@ -1,3 +1,4 @@
+import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -17,6 +18,8 @@ export interface MeshIdentity {
 }
 
 export interface MeshEvent {
+  /** Runtime-captured originating principal; not an event.data field. */
+  principal?: FabricPrincipal | undefined;
   /** Recorded at publication, never reconstructed from retained event payloads. */
   verification?: "mesh" | "bridge";
   id: string;
@@ -539,14 +542,20 @@ export class MeshStore {
     from: MeshIdentity;
     to?: string;
     text?: string;
+    /** Host-only cancellation fence, checked under the lock before admission. */
+    signal?: AbortSignal | undefined;
+    /** Host-only relay metadata. The public provider never forwards args.principal. */
+    principal?: FabricPrincipal | undefined;
     /** A function receives the commit time, under the lock (smarty-dev#816). */
     data?: unknown;
   }): Promise<MeshEvent> {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
+    const principal = copyFabricPrincipal(input.principal);
     const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
     const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
     return this.#withLock(() => {
+      input.signal?.throwIfAborted();
       this.#repairEventLog();
       const archive = MeshArchive.fromRoot(this.root);
       if (archive) this.#recoverArchive(archive);
@@ -559,6 +568,7 @@ export class MeshStore {
         topic: input.topic,
         kind: input.kind?.trim() || "message",
         from: jsonClone(input.from),
+        ...(principal ? { principal } : {}),
         // Old bridges only wrote data.bridge. It can veto a native attestation, but
         // arbitrary payload data cannot establish bridge verification or any authority.
         ...(input.from.verified === "bridge" ? { verification: "bridge" as const }

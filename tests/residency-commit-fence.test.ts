@@ -32,6 +32,7 @@ import { runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { abandonResidentRequest, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
+import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
@@ -1150,8 +1151,15 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
   }
   for (const engine of engines) for (const operation of ["spawn", "create"] as const)
     for (const ending of ["abort", "deadline"] as const) for (const before of [true, false]) {
-    it(`${engine} ${operation} ${ending} ${before ? "before" : "after"} commit`, async () => {
+    // Reproduce the Windows import/native-startup overrun on the failed row,
+    // as well as keeping its ordinary execution path. The budget stays 1500 ms.
+    for (const startupDelayMs of engine === "monty" && operation === "create" && ending === "deadline" && !before ? [0, 1_700] : [0])
+    it(`${engine} ${operation} ${ending} ${before ? "before" : "after"} commit${startupDelayMs ? " with slow startup" : ""}`, async () => {
       const state = await harness(before, undefined, 10_000); const main = mainProvider(state);
+      const execute = MontyRuntime.prototype.execute;
+      const startup = startupDelayMs ? vi.spyOn(MontyRuntime.prototype, "execute").mockImplementation(async function (this: MontyRuntime, ...args) {
+        await delay(startupDelayMs); return execute.apply(this, args);
+      }) : undefined;
       const controller = new AbortController();
       if (!before) {
         if (operation === "spawn") {
@@ -1168,11 +1176,18 @@ describe("round 2 public execution receipt contract", { timeout: 25_000 }, () =>
       }
       try {
         const run = publicExecution(state, main, engine);
-        const outcome = run(`return ${publicCall(engine, operation, requestArgs(state, operation))}`, controller.signal);
-        await state.entered.promise;
+        let admitted = false;
+        void state.entered.promise.then(() => { admitted = true; });
+        // This is a commit/cancellation contract, not a native-startup benchmark.
+        // Keep the 1500 ms deadline, but start its clock at the real resident
+        // gate; the helper independently bounds startup and observes early exits.
+        const result = await executeAfterAdmission(
+          signal => run(`return ${publicCall(engine, operation, requestArgs(state, operation))}`, AbortSignal.any([controller.signal, signal])),
+          () => admitted,
+          () => { if (ending === "abort") controller.abort(); },
+        );
+        startup?.mockRestore(); // Reconciliation is an ordinary, fresh invocation.
         const requestId = entries(state.residencyRoot, "processing")[0]!.slice(0, -5);
-        if (ending === "abort") controller.abort();
-        const result = await outcome;
         expect(result.success).toBe(false);
         const decisions = decisionsFor(state);
         expect(decisions).toHaveLength(1);

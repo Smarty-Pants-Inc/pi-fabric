@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { closeWithActors } from "../actors/close-order.js";
@@ -383,6 +384,7 @@ export class ResidentHost {
             this.participants.list({ scope: "project", kinds: ["root"] }),
             actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
           ),
+          message.source === "fabric-host" ? undefined : message.principal,
         ).catch(() => undefined);
       },
       {
@@ -450,8 +452,8 @@ export class ResidentHost {
       );
       this.agents.subscribeUi(() => this.participants.scheduleRefresh());
       this.actors.subscribe(() => this.participants.scheduleRefresh());
-      this.control.start((command, from, signal) =>
-        this.#acceptControl(command, from, signal));
+      this.control.start((command, from, signal, verification) =>
+        this.#acceptControl(command, from, signal, verification));
       await this.participants.start().catch(() => undefined);
       this.lifecycle.start();
       this.#requestTimer = setInterval(
@@ -506,16 +508,17 @@ export class ResidentHost {
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
+    verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
     if (this.#closed) {
       return { accepted: false, error: HOST_CLOSING_RETRY };
     }
     this.#admissions++;
-    try { return await this.#handleControl(command, from, signal); }
+    try { return await this.#handleControl(command, from, signal, verification); }
     finally { this.#admissions--; }
   }
 
-  async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal): Promise<FabricControlAcceptance> {
+  async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal, verification?: "mesh" | "bridge"): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
     }
@@ -541,6 +544,8 @@ export class ResidentHost {
         return { accepted: false, error: errorMessage(error) };
       }
     }
+    const provenance = from && (verification === "mesh" || verification === "bridge")
+      ? fabricTurnProvenance(from, command.operation === "steer" ? "steer" : "followUp", verification, command.principal) : undefined;
     const message = command.message?.trim();
     if (!message) return { accepted: false, error: "Fabric control message must not be empty" };
     if (command.operation === "ask") {
@@ -553,8 +558,8 @@ export class ResidentHost {
           message,
           command.data,
           signal,
-          controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-            this.participants.get(from.id)?.rootId),
+          { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+            this.participants.get(from.id)?.rootId) },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -564,8 +569,8 @@ export class ResidentHost {
     try {
       this.agents.status(command.targetId);
       const result = command.operation === "steer"
-        ? this.agents.steer(command.targetId, message, command.data)
-        : this.agents.followUp(command.targetId, message, command.data);
+        ? this.agents.steer(command.targetId, message, command.data, provenance)
+        : this.agents.followUp(command.targetId, message, command.data, provenance);
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
@@ -581,7 +586,7 @@ export class ResidentHost {
       // Validate now without turning the resolved owner defaults into per-call overrides.
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
-      const result = this.actors.tell(command.targetId, message, command.data, options);
+      const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       return { accepted: false, error: errorMessage(error) };
@@ -646,6 +651,7 @@ export class ResidentHost {
     data?: unknown,
     agentCompletionId?: string,
     rootId = this.config.rootId,
+    principal?: FabricPrincipal,
   ): Promise<void> {
     const id = randomUUID();
     const prefix = rootId === this.config.rootId ? this.#deliveryPrefix : residentDeliveryPrefix(rootId);
@@ -654,6 +660,7 @@ export class ResidentHost {
       id,
       rootId,
       from,
+      ...(principal ? { principal } : {}),
       delivery,
       triggerTurn,
       message,

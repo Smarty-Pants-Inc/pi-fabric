@@ -18,7 +18,7 @@ describe("PiRecoveryWatchdog", () => {
     expect(fail).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(fail).toHaveBeenCalledExactlyOnceWith(
-      "Error: Terminated; Pi made no recovery progress for 60000ms; terminating child",
+      "Error: Terminated; no model stream or tool event for 60000ms; terminating child",
     );
     watchdog.arm("another retry");
     watchdog.progress();
@@ -46,6 +46,87 @@ describe("PiRecoveryWatchdog", () => {
     vi.advanceTimersByTime(50_000);
     expect(fail).not.toHaveBeenCalled();
     vi.advanceTimersByTime(10_000);
+    expect(fail).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["assistantMessageEvent", "event"])("survives more than 60 seconds of stream activity in %s", (field) => {
+    for (const type of ["text_delta", "thinking_delta", "toolcall_delta"]) {
+      const { fail, watchdog } = setup();
+      watchdog.arm("cliproxyapi/gpt-6.1-sol: terminated");
+      for (let i = 0; i < 12; i++) {
+        vi.advanceTimersByTime(10_000);
+        watchdog.observe({ type: "message_update", [field]: { type, delta: "real output" } });
+      }
+      expect(fail).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(59_999);
+      expect(fail).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(fail).toHaveBeenCalledExactlyOnceWith(
+        "cliproxyapi/gpt-6.1-sol: terminated; no model stream or tool event for 60000ms; terminating child",
+      );
+    }
+  });
+
+  it.each(["assistantMessageEvent", "event"])("counts model stream block boundaries in %s", (field) => {
+    for (const type of ["text_start", "text_end", "thinking_start", "thinking_end", "toolcall_start", "toolcall_end"]) {
+      const { fail, watchdog } = setup();
+      watchdog.arm("Error: Terminated");
+      vi.advanceTimersByTime(50_000);
+      watchdog.observe({ type: "message_update", [field]: { type } });
+      vi.advanceTimersByTime(50_000);
+      expect(fail).not.toHaveBeenCalled();
+      watchdog.dispose();
+    }
+  });
+
+  it.each(["message_start", "message_update"])("counts assistant output in %s without a delta envelope", (type) => {
+    for (const content of ["working", [{ type: "text", text: "working" }],
+      [{ type: "thinking", thinking: "working" }], [{ type: "toolCall", name: "edit", arguments: {} }]]) {
+      const { fail, watchdog } = setup();
+      watchdog.arm("Error: Terminated");
+      for (let i = 0; i < 12; i++) {
+        vi.advanceTimersByTime(10_000);
+        watchdog.observe({ type, message: { role: "assistant", content } });
+      }
+      expect(fail).not.toHaveBeenCalled();
+      watchdog.dispose();
+    }
+  });
+
+  it.each(["tool_execution_start", "tool_execution_update", "tool_execution_end"])("counts a %s tool event as recovery progress", (type) => {
+    const { fail, watchdog } = setup();
+    watchdog.arm("Error: Terminated");
+    vi.advanceTimersByTime(50_000);
+    watchdog.observe({ type, toolCallId: "edit-1" });
+    vi.advanceTimersByTime(59_999);
+    expect(fail).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fail).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not extend recovery for errors, retry announcements or other chatter", () => {
+    const { fail, watchdog } = setup();
+    watchdog.arm("Error: Terminated");
+    for (let i = 0; i < 5; i++) {
+      vi.advanceTimersByTime(10_000);
+      watchdog.arm("Error: Terminated");
+      for (const event of [
+        { type: "agent_start" }, { type: "agent_end", willRetry: true },
+        { type: "auto_retry_start" }, { type: "auto_retry_end", success: false },
+        { type: "queue_update" }, { type: "extension_error" },
+        { type: "message_start", message: { role: "assistant", content: [] } },
+        { type: "message_update", assistantMessageEvent: { type: "error", error: "terminated" } },
+        { type: "message_update", event: { type: "error", error: "terminated" } },
+        { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "" }, message: { role: "assistant", content: "old output" } },
+        { type: "message_update", message: { role: "assistant", content: "old output", stopReason: "aborted" } },
+        { type: "message_update", message: { role: "user", content: "not model output" } },
+        { type: "message_update", message: { role: "assistant", content: "old output", stopReason: "error" } },
+        { type: "message_end", message: { role: "assistant", content: [], stopReason: "error" } },
+      ]) watchdog.observe(event);
+    }
+    vi.advanceTimersByTime(9_999);
+    expect(fail).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
     expect(fail).toHaveBeenCalledTimes(1);
   });
 

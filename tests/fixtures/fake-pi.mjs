@@ -112,6 +112,26 @@ switch (behavior) {
     emit({ type: "agent_start" });
     process.exit(0);
     break;
+  case "terminated-stream-recover": {
+    terminated();
+    emit({ type: "agent_end", willRetry: true });
+    emit({ type: "auto_retry_start", errorMessage: "Error: Terminated" });
+    emit({ type: "agent_start" });
+    let count = 0;
+    const timer = setInterval(() => {
+      const type = ["text_delta", "thinking_delta", "toolcall_delta"][count % 3];
+      // Native Pi harness uses `event`; legacy Pi uses `assistantMessageEvent`.
+      emit({ type: "message_update", event: { type, contentIndex: 0, delta: "working" },
+        message: { role: "assistant", content: [{ type: "text", text: "working" }] } });
+      if (++count < 9) return;
+      clearInterval(timer);
+      emit({ type: "message_end", message: { role: "assistant", content: "stream recovered", stopReason: "stop" } });
+      emit({ type: "agent_end", willRetry: false });
+      emit({ type: "auto_retry_end", success: true });
+      emit({ type: "agent_settled" });
+    }, 8_000);
+    break;
+  }
   case "terminated-recover":
     terminated();
     emit({ type: "agent_end", willRetry: true });

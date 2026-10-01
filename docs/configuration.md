@@ -542,10 +542,14 @@ Sessions that share one `mesh.root` share one participant directory, so each see
 
 `mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing
-store. Protocol 1 uses the B68 canonical-directory mkdir, three-line token/PID/time
-owner and token-prefix recursive canonical release. Protocol 2 uses fully initialized
-private-directory publication and detached release. Both retain immediate dead-holder
-recovery, recovery fences, bounded jitter/backoff and typed lock timeouts. There is no
+store. Protocol 1 keeps the B68 canonical-directory mkdir and three-line token/PID/time
+wire, but publishes its owner exclusively and verifies the canonical directory/record
+before entering the critical section. An unfinished initializer whose lock was reclaimed
+aborts with `FABRIC_MESH_LOCK_OWNERSHIP_LOST` rather than overwriting a successor.
+Protocol 2 uses fully initialized private-directory publication. Both require the complete
+owner record to match and detach the owned directory before recursive release, retaining
+immediate dead-holder recovery, recovery fences, bounded jitter/backoff and typed lock
+timeouts. These safeguards do not repair old B68 binaries still running on the root. There is no
 environment fallback, runtime marker, transition guard or hot reload for this selector.
 
 Keep `1` for compatibility with B68 writers. Protocol 2 activation is deferred to the

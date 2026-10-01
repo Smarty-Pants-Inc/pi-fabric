@@ -607,14 +607,14 @@ describe("MeshStore lock recovery", () => {
     return lockPath;
   };
 
-  it.each(["write", "rename"] as const)("a paused native %s publication cannot overwrite or enter a live successor", async (phase) => {
-    const store = createStore({ lockTimeoutMs: 1_000, lockProtocol: 2 });
+  it.each([["write", 1], ["opened", 1], ["write", 2], ["rename", 2]] as const)("a paused native %s publication (protocol %s) cannot overwrite or enter a live successor", async (phase, lockProtocol) => {
+    const store = createStore({ lockTimeoutMs: 1_000, ...(lockProtocol === 2 ? { lockProtocol } : {}) });
     const lock = path.join(store.root, ".lock");
     const ownerPath = path.join(lock, "owner");
     const ready = path.join(store.root, "paused.ready");
     const go = path.join(store.root, "paused.go");
     const resumed = path.join(store.root, "paused.resumed");
-    const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-paused-publication.mjs"), store.root, phase], {
+    const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-paused-publication.mjs"), store.root, phase, String(lockProtocol)], {
       cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";
@@ -624,8 +624,8 @@ describe("MeshStore lock recovery", () => {
     closed.catch(() => undefined);
     try {
       await vi.waitFor(() => expect(fs.existsSync(ready)).toBe(true), { timeout: 10_000, interval: 20 });
-      if (phase === "write") {
-        fs.mkdirSync(lock);
+      if (phase !== "rename") {
+        if (lockProtocol === 2) fs.mkdirSync(lock);
         fs.writeFileSync(path.join(lock, "legacy-leftover"), "orphan\n");
         const past = new Date(Date.now() - 30_001);
         fs.utimesSync(lock, past, past);
@@ -646,19 +646,21 @@ describe("MeshStore lock recovery", () => {
       fs.writeFileSync(go, "");
       expect(await closed, stderr).toBe(0); // real close, before root teardown
     }
-    expect(JSON.parse(stdout.trim())).toMatchObject(phase === "write"
-      ? { ran: true, refused: false, timeout: false }
-      : { ran: false, refused: true, timeout: true });
+    expect(JSON.parse(stdout.trim())).toMatchObject(lockProtocol === 1
+      ? { ran: false, refused: phase === "write", timeout: false, ownershipLost: true }
+      : phase === "write"
+        ? { ran: true, refused: false, timeout: false, ownershipLost: false }
+        : { ran: false, refused: true, timeout: true, ownershipLost: false });
     const fences = fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."));
-    expect(fences).toHaveLength(phase === "write" ? 1 : 0);
+    expect(fences).toHaveLength(phase !== "rename" ? 1 : 0);
     if (phase === "write") expect(fs.readdirSync(path.join(store.root, fences[0]!))).toContain(".recovery-fence");
     expect(fs.readdirSync(store.root).some(name => name.startsWith(".lock.pending."))).toBe(false);
   });
 
-  it("interrupted release never exposes an ownerless canonical or cleans a live successor on resume", async () => {
+  it.each([1, 2] as const)("interrupted release (protocol %s) never exposes an ownerless canonical or cleans a live successor on resume", async (lockProtocol) => {
     vi.useFakeTimers({ now: 1_000_000 });
-    const store = createStore({ lockTimeoutMs: 100, lockProtocol: 2 });
-    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100, lockProtocol: 2 });
+    const store = createStore({ lockTimeoutMs: 100, lockProtocol });
+    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100, lockProtocol });
     const lock = path.join(store.root, ".lock");
     const ownerPath = path.join(lock, "owner");
     const remove = fs.rmSync.bind(fs);

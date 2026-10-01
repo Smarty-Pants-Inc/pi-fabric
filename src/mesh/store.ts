@@ -1494,11 +1494,27 @@ export class MeshStore {
       lastAttemptAt = attemptAt;
       try {
         if (this.#lockProtocol === 1) {
-          // B68 wire: exclusive canonical mkdir, then a three-line owner at that name.
+          // Keep the B68 three-line wire, but never overwrite an owner published by a
+          // successor while this initializer was stopped after canonical mkdir.
           fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-          fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
-            encoding: "utf8", mode: 0o600,
+          const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
+            code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
           });
+          try {
+            const directory = fs.lstatSync(this.#lockPath);
+            fs.writeFileSync(ownerPath, ownerRecord, {
+              encoding: "utf8", flag: "wx", mode: 0o600,
+            });
+            // The exclusive create may itself have paused with an open descriptor to a
+            // recovered directory. Prove publication still belongs to the canonical lock
+            // before entering the critical section; never clean a successor on failure.
+            const current = fs.lstatSync(this.#lockPath);
+            if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
+              fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
+          } catch (error) {
+            if (errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT") throw ownershipLost();
+            throw error;
+          }
         } else {
           // Never expose an ownerless canonical directory: a stalled initializer must not
           // resume its owner write through a name that legacy recovery gave to a successor.
@@ -1554,11 +1570,7 @@ export class MeshStore {
     } finally {
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");
-        if (this.#lockProtocol === 1) {
-          if (owner.startsWith(`${token}\n`)) {
-            fs.rmSync(this.#lockPath, { recursive: true, force: true });
-          }
-        } else if (owner === ownerRecord) {
+        if (owner === ownerRecord) {
           // Detach the complete owned directory before unlinking anything inside it.
           // Interrupted/resumed recursive cleanup must never follow the canonical name.
           const released = `${this.#lockPath}.released.${token}`;

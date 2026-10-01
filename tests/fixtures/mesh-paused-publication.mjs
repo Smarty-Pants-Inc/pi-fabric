@@ -3,7 +3,8 @@ import path from "node:path";
 import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
 const { MeshStore } = await jiti.import("../../src/mesh/store.ts");
-const [root, phase] = process.argv.slice(2);
+const [root, phase, protocol = "2"] = process.argv.slice(2);
+const lockProtocol = Number(protocol);
 const lock = path.join(root, ".lock");
 const ownerPath = path.join(lock, "owner");
 const ready = path.join(root, "paused.ready");
@@ -29,15 +30,21 @@ const pause = (resume) => {
   try { resume(); }
   catch (error) { refused = true; throw error; }
   finally {
-    if (fs.readFileSync(ownerPath, "utf8") !== owner || fs.statSync(lock).ino !== inode || ran) {
-      throw new Error("Paused writer overwrote or entered a live successor");
-    }
+    const changed = fs.readFileSync(ownerPath, "utf8") !== owner || fs.statSync(lock).ino !== inode || ran;
     write(resumed, "");
+    if (changed) throw new Error("Paused writer overwrote or entered a live successor");
   }
 };
-if (phase === "write") {
+if (phase === "write" || phase === "opened") {
   fs.writeFileSync = (file, data, options) => {
     if (!armed || path.basename(String(file)) !== "owner") return write(file, data, options);
+    if (phase === "opened") {
+      // Pause with an empty owner already opened. Recovery detaches this directory;
+      // the resumed write lands through the original fd, not the successor's name.
+      const fd = fs.openSync(file, options?.flag ?? "w", options?.mode);
+      try { return pause(() => write(fd, data, options)); }
+      finally { fs.closeSync(fd); }
+    }
     return pause(() => write(file, data, options));
   };
 } else {
@@ -46,6 +53,7 @@ if (phase === "write") {
     return pause(() => rename(from, to));
   };
 }
-const store = new MeshStore(root, 65536, 100, { lockProtocol: 2, lockTimeoutMs: 5000 });
+const store = new MeshStore(root, 65536, 100, { lockTimeoutMs: 5000, ...(lockProtocol === 2 ? { lockProtocol } : {}) });
 const result = await store.exclusive(() => { ran = true; }).catch(error => error);
-console.log(JSON.stringify({ ran, refused, timeout: result?.code === "FABRIC_MESH_LOCK_TIMEOUT" }));
+console.log(JSON.stringify({ ran, refused, timeout: result?.code === "FABRIC_MESH_LOCK_TIMEOUT",
+  ownershipLost: result?.code === "FABRIC_MESH_LOCK_OWNERSHIP_LOST" }));

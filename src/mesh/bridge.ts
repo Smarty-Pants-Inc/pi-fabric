@@ -937,7 +937,12 @@ export class MeshBridge {
     while (true) {
       const start = cursor.after;
       const page = await source.read(start);
-      let rules = await authority();
+      // Even filtered/skip-only reads can carry this drain past the mirrors' lease.
+      // Renew only when due, independently of whether the page needs routing authority.
+      if (Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS)) await this.syncPresence();
+      // Authority reads are deliberately canonical (copied-marker ABA), so idle pages
+      // avoid them; every page with events retains the same fresh authority checks.
+      let rules = page.events.length ? await authority() : { recipients: new Set<string>() };
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);

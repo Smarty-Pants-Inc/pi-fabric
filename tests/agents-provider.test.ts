@@ -1559,7 +1559,7 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     await expect(provider.invoke(action, { id, message: "hello" }, context)).resolves.toMatchObject({ messageId: "fresh" });
     expect(request).toHaveBeenCalledExactlyOnceWith(id, id, action === "steer" ? "steer" : "followUp",
-      { message: "hello", data: undefined }, id, { routedRemoteHost: "forge" });
+      { message: "hello", data: undefined, ...(action === "steer" ? {} : { triggerTurn: true }) }, id, { routedRemoteHost: "forge" });
   });
 
   it.each(["followUp", "steer", "tell"])("%s names a peers-listed root whose mirror is not admissible", async (action) => {

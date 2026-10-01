@@ -58,6 +58,10 @@ export interface FabricControlCommand {
 export interface FabricControlAcceptance {
   accepted: boolean;
   messageId?: string;
+  /** Main requested a new turn at admission; absent on older owners or non-Main targets. */
+  triggered?: boolean;
+  /** Main held a requested wake; includes the provider retry deadline when applicable. */
+  reason?: string;
   /** The owner's followUp queue for a Main target (smarty-dev#1495). */
   pendingFollowUps?: number;
   oldestAgeS?: number;
@@ -84,6 +88,9 @@ export interface FabricControlResult {
   messageId: string;
   routed: "mesh";
   acknowledged: true;
+  triggered?: boolean;
+  /** Main held a requested wake; includes the provider retry deadline when applicable. */
+  reason?: string;
   pendingFollowUps?: number;
   oldestAgeS?: number;
   stalled?: true;
@@ -102,6 +109,14 @@ const queueDepthOf = (source: Record<string, unknown>): { pendingFollowUps: numb
     ? undefined
     : { pendingFollowUps, oldestAgeS, ...(source.stalled === true ? { stalled: true as const } : {}) };
 };
+
+/** Keep unknown/legacy receipts unknown; never coerce a malformed report to true. */
+const triggeredOf = (source: Record<string, unknown>): { triggered: boolean; reason?: string } | undefined =>
+  typeof source.triggered === "boolean" ? {
+    triggered: source.triggered,
+    ...(source.triggered === false && typeof source.reason === "string" && source.reason.length <= 200
+      ? { reason: source.reason } : {}),
+  } : undefined;
 
 /** The owner's coalesce report for a Main followUp (smarty-dev#1495), or nothing. */
 const coalescedOf = (source: Record<string, unknown>): { coalesced: true; replacedMessageId: string } | undefined =>
@@ -364,6 +379,7 @@ export class FabricControlPlane {
       acknowledged: true,
       ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
       ...coalescedOf(acceptance as unknown as Record<string, unknown>),
+      ...triggeredOf(acceptance as unknown as Record<string, unknown>),
     };
   }
 
@@ -710,6 +726,7 @@ export class FabricControlPlane {
       ...(typeof event.data.messageId === "string" ? { messageId: event.data.messageId } : {}),
       ...queueDepthOf(event.data),
       ...coalescedOf(event.data),
+      ...triggeredOf(event.data),
       ...(Object.prototype.hasOwnProperty.call(event.data, "result")
         ? { result: event.data.result }
         : {}),
@@ -1091,6 +1108,7 @@ export class FabricControlPlane {
           ...(acceptance.messageId ? { messageId: acceptance.messageId } : {}),
           ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
           ...coalescedOf(acceptance as unknown as Record<string, unknown>),
+          ...triggeredOf(acceptance as unknown as Record<string, unknown>),
           ...(Object.prototype.hasOwnProperty.call(acceptance, "result")
             ? { result: acceptance.result }
             : {}),

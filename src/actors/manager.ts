@@ -2105,7 +2105,7 @@ export class ActorManager {
       actor.queue.push(item);
     }
     this.#persistQueue(actor.id);
-    actor.status = "queued";
+    if (!this.#inFlight.has(actor.id)) actor.status = "queued";
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
       id: item.id,

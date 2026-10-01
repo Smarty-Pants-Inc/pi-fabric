@@ -147,6 +147,22 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(directory.list({ scope: "local" }).map((participant) => participant.id)).toEqual(["session:dev1"]);
   });
 
+  it.each(["steer", "followUp"] as const)("resolves a long-lived remote root from a fresh Main's negative cache within its first minute (%s)", async (kind) => {
+    const { mesh, directory, mirror, local, remote } = await setup({ heartbeatMs: 60_000, readCacheMs: 60_000 });
+    expect(directory.get(remote.id)).toBeUndefined(); // Main's first read, before presence arrived
+    await mirror(); // another process refreshes the already long-lived remote root
+    const { received } = await remoteOwner(mesh, local, remote);
+    const sender = senderOn(mesh, local, 5_000, directory);
+    const request = vi.spyOn(sender, "request");
+    const router = routerFor(directory, sender, local);
+    await expect(router.routeMessage(remote.id, "first-minute reply", undefined, kind))
+      .resolves.toMatchObject({ acknowledged: true, messageId: "m-1" });
+    expect(received).toEqual([[kind, remote.id, "first-minute reply", local.id]]);
+    expect(directory.peers()).toEqual([expect.objectContaining({ id: remote.id, host: "forge" })]);
+    expect(request).toHaveBeenCalledExactlyOnceWith(remote.id, remote.id, kind,
+      { message: "first-minute reply", data: undefined }, remote.id, { routedRemoteHost: "forge" });
+  });
+
   // The far side of the bridge: the owner runs on its own mesh; a relay carries commands there and
   // acknowledgements back, stamped data.bridge = { from: <side> } as the mesh bridge does.
   const remoteOwner = async (
@@ -377,6 +393,17 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it.each(["steer", "followUp"] as const)("refuses a non-interactive mirrored auditor with a named error (%s)", async (kind) => {
+    const { directory, mirror, local, remote } = await setup();
+    await mirror({ record: { interactive: false, capabilities: ["fabric"] } });
+    const request = vi.fn();
+    const router = routerFor(directory, { request } as unknown as FabricControlPlane, local);
+    await expect(router.routeMessage(remote.id, "do not interrupt audit", undefined, kind)).rejects.toMatchObject({
+      name: "FabricParticipantNonInteractiveError", code: "FABRIC_PARTICIPANT_NON_INTERACTIVE",
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("never takes a mirrored record as a local owner or as this host's own record", async () => {
     const { mesh, directory, local } = await setup();
     // A mirrored root claiming this host and identity as its owner, written as this host.
@@ -451,7 +478,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
   it("drops a mirror with malformed optional fields alone, logs it once, and peers still lists the healthy ones", async () => {
     const { mesh, directory, mirror, remote } = await setup();
     await mirror();
-    for (const [field, bad] of [["sessionId", 42], ["cwd", {}], ["label", 7], ["role", []], ["project", 1]] as const) {
+    for (const [field, bad] of [["sessionId", 42], ["cwd", {}], ["label", 7], ["role", []], ["project", 1], ["repository", 42], ["interactive", "yes"]] as const) {
       await mirror({ record: { id: `session:bad-${field}`, rootId: remote.id, [field]: bad, ...(field === "label" ? {} : { label: undefined }) } as never });
     }
     expect(() => directory.peers()).not.toThrow();
@@ -459,7 +486,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(directory.sessions().map((session) => session.id).sort()).toEqual(["session:dev1", remote.id].sort());
     const refused = await vi.waitFor(() => {
       const texts = mesh.tail(0, 1_000).events.filter((event) => event.topic === MIRROR_COLLISION_TOPIC).map((event) => event.text);
-      if (texts.length < 5) throw new Error("not yet");
+      if (texts.length < 7) throw new Error("not yet");
       return texts;
     });
     expect(refused.every((text) => text?.endsWith("it is malformed"))).toBe(true);

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { authenticateLegacyOwner, legacyProcessStopped, signalLegacyOwner } from "./legacy-retirement.js";
+import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,7 +22,18 @@ import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
+  ResidentActorAuthorizationError,
+  ResidentCommandUnsupportedError,
+  assertResidentCommandSupported,
+  assertResidentActorMain,
+  assertResidentActorToolCeiling,
+  type ResidentActorCaller,
+  ResidentOutcomeUnknownError,
+  readResidentRequestDecision,
+  registerResidentCancellation,
+  commitResidentRequest,
   RESIDENT_HOST_FORMAT,
+  RESIDENT_ACTOR_COMMAND_FORMAT,
   isResidentHostId,
   residentDeliveryPrefix,
   residentHostId,
@@ -31,6 +43,7 @@ import {
   type ResidentAgentMetadata,
   type ResidentCommand,
   type ResidentCommandResponse,
+  type ResidentActorMutation,
   type ResidentDeliveryRecord,
   type ResidentHostConfig,
   type ResidentHostOwner,
@@ -117,6 +130,8 @@ export interface ResidencyClientOptions {
   hostPath?: string;
   /** Start budget before load scaling; tests shorten it. */
   startupTimeoutMs?: number;
+  /** File-exchange deadline; tests shorten it without faking host execution. */
+  commandTimeoutMs?: number;
 }
 
 export class ResidencyClient {
@@ -393,7 +408,7 @@ export class ResidencyClient {
     await this.#waitForParticipant(id, "actor");
   }
 
-  async createActor(request: FabricActorRequest): Promise<FabricActorInfo> {
+  async createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     await this.ensureHost();
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
@@ -402,10 +417,55 @@ export class ResidencyClient {
       rootId: this.options.config.rootId,
       request,
       createdAt: Date.now(),
-    });
+    }, signal);
     if (!response.actor) throw new Error("Fabric resident host returned no actor");
-    await this.#waitForParticipant(response.actor.id, "actor");
+    await this.#waitForParticipant(response.actor.id, "actor", signal).catch((error) => {
+      throw new ResidentOutcomeUnknownError({
+        format: RESIDENT_HOST_FORMAT, operation: "createActor", requestId: response.requestId,
+        rootId: this.options.config.rootId, request, createdAt: Date.now(),
+      }, { requestId: response.requestId, state: "committed", id: response.actor!.id, ownerHostId: this.hostId }, error, signal);
+    });
     return response.actor;
+  }
+
+  /** Setters/status use only an existing owner, never create hidden residency. */
+  async setActor(mutation: ResidentActorMutation, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
+    const self = this.options.participants.self();
+    if (!this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId ||
+      self.kind !== "root" || self.id !== this.options.config.rootId || !self.sessionId) {
+      throw new ResidentActorAuthorizationError();
+    }
+    caller ??= { identity: { id: self.id, name: self.name, kind: "main", sessionId: self.sessionId }, hostId: self.ownerHostId };
+    assertResidentActorMain(caller, this.options.config.rootId);
+    if (this.#inheritedToolAllowlist !== undefined) caller = { ...caller, toolCeiling: [...this.#inheritedToolAllowlist] };
+    if (mutation.operation === "setTools") assertResidentActorToolCeiling(mutation.tools, caller.toolCeiling);
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      ...mutation, caller, format: RESIDENT_ACTOR_COMMAND_FORMAT, requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor from setter");
+    return response.actor;
+  }
+
+  async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actorStatus", id,
+      requestId: randomUUID(), rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actor) throw new Error("Resident host returned no actor status");
+    return response.actor;
+  }
+
+  async actors(signal?: AbortSignal): Promise<FabricActorInfo[]> {
+    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
+    const response = await this.#command({
+      format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actors", requestId: randomUUID(),
+      rootId: this.options.config.rootId, createdAt: Date.now(),
+    }, signal);
+    if (!response.actors) throw new Error("Resident host returned no actors");
+    return response.actors;
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {
@@ -429,7 +489,12 @@ export class ResidencyClient {
       signal,
     );
     if (!response.handle) throw new Error("Fabric resident host returned no agent handle");
-    await this.#waitForParticipant(response.handle.id, "agent");
+    await this.#waitForParticipant(response.handle.id, "agent", signal).catch((error) => {
+      throw new ResidentOutcomeUnknownError({
+        format: RESIDENT_HOST_FORMAT, operation: "spawn", requestId: response.requestId,
+        rootId: this.options.config.rootId, request, createdAt: Date.now(),
+      }, { requestId: response.requestId, state: "committed", id: response.handle!.id, ownerHostId: this.hostId }, error, signal);
+    });
     return response.handle;
   }
 
@@ -509,11 +574,11 @@ export class ResidencyClient {
     }
   }
 
-  readAgentLog(id: string, options: { lines?: number; before?: number } = {}): FabricAgentLog {
+  readAgentLog(id: string, options: { lines?: number; before?: number; beforeGeneration?: string } = {}): FabricAgentLog {
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
     const logFile = path.join(metadata.runDirectory, "events.jsonl");
-    const page = readJsonlPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before);
+    const page = readJsonlPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before, undefined, options.beforeGeneration);
     const status = this.#record(metadata);
     return {
       id,
@@ -523,10 +588,11 @@ export class ResidencyClient {
       events: page.lines,
       hasMore: page.hasMore,
       ...(page.before !== undefined ? { before: page.before } : {}),
+      ...(page.generation !== undefined ? { generation: page.generation } : {}),
     };
   }
 
-  async removeActor(id: string): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }> {
+  async removeActor(id: string, signal?: AbortSignal): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }> {
     await this.ensureHost();
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
@@ -535,7 +601,7 @@ export class ResidencyClient {
       rootId: this.options.config.rootId,
       id,
       createdAt: Date.now(),
-    });
+    }, signal);
     return { removed: true, ...(response.pending === undefined ? {} : { pending: response.pending }),
       ...(response.cleaned === undefined ? {} : { cleaned: response.cleaned }) };
   }
@@ -545,10 +611,11 @@ export class ResidencyClient {
     return residentHostStateNote(this.options.config.residencyRoot);
   }
 
-  async cleanupAgent(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
+  async cleanupAgent(id: string, deleteBranch = false, signal?: AbortSignal): Promise<{ cleaned: boolean }> {
+    throwIfAborted(signal);
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
-    if (!this.#liveOwner()) return this.#cleanupTerminalFiles(metadata, deleteBranch);
+    if (!this.#liveOwner()) return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
     let response: ResidentCommandResponse;
     try {
       response = await this.#command({
@@ -559,10 +626,10 @@ export class ResidencyClient {
         id,
         deleteBranch,
         createdAt: Date.now(),
-      });
+      }, signal);
     } catch (error) {
-      if (error instanceof Error && /Unknown Fabric agent/.test(error.message)) {
-        return this.#cleanupTerminalFiles(metadata, deleteBranch);
+      if (!(error instanceof ResidentOutcomeUnknownError) && error instanceof Error && /Unknown Fabric agent/.test(error.message)) {
+        return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
       }
       throw error;
     }
@@ -574,7 +641,9 @@ export class ResidencyClient {
   async #cleanupTerminalFiles(
     metadata: ResidentAgentMetadata,
     deleteBranch: boolean,
+    signal?: AbortSignal,
   ): Promise<{ cleaned: boolean }> {
+    throwIfAborted(signal);
     const status = this.statusAgent(metadata.id);
     if (!("startedAt" in status) || !terminal(status.status)) {
       throw new Error(`Cannot clean up running durable Fabric agent ${metadata.id}`);
@@ -585,42 +654,80 @@ export class ResidencyClient {
         `(see ${metadata.runDirectory}). Check the worker, then remove its files by hand.`,
       );
     }
-    if (metadata.handle.worktree) {
-      const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
-      const worktree = await registeredWorktree(gitRoot, metadata.handle.worktree);
-      await executeFile(
-        "git",
-        ["worktree", "remove", "--force", worktree],
-        { cwd: gitRoot, timeoutMs: 60_000 },
-      );
-      if (deleteBranch && metadata.handle.branch) {
+    const command: ResidentCommand = { format: RESIDENT_HOST_FORMAT, operation: "cleanup", requestId: randomUUID(),
+      rootId: this.options.config.rootId, id: metadata.id, deleteBranch, createdAt: Date.now() };
+    let commitAttempted = false;
+    const commit = (): void => {
+      throwIfAborted(signal);
+      registerResidentCancellation(signal, this.options.config.residencyRoot, command);
+      commitAttempted = true;
+      commitResidentRequest(this.options.config.residencyRoot, command, metadata.id, this.hostId);
+    };
+    try {
+      if (metadata.handle.worktree) {
+        const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
+        const worktree = await registeredWorktree(gitRoot, metadata.handle.worktree);
+        commit();
         await executeFile(
           "git",
-          ["branch", "-D", metadata.handle.branch],
-          { cwd: gitRoot, timeoutMs: 30_000 },
+          ["worktree", "remove", "--force", worktree],
+          { cwd: gitRoot, timeoutMs: 60_000 },
         );
+        if (deleteBranch && metadata.handle.branch) {
+          throwIfAborted(signal);
+          await executeFile(
+            "git",
+            ["branch", "-D", metadata.handle.branch],
+            { cwd: gitRoot, timeoutMs: 30_000 },
+          );
+        }
+      } else if (deleteBranch) {
+        throw new Error(`Durable Fabric agent ${metadata.id} has no worktree branch to delete`);
+      } else {
+        commit();
       }
-    } else if (deleteBranch) {
-      throw new Error(`Durable Fabric agent ${metadata.id} has no worktree branch to delete`);
+      throwIfAborted(signal);
+      fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
+      fs.rmSync(this.#metadataPath(metadata.id), { force: true });
+      fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
+      this.options.onResultConsumed?.(metadata.id);
+      return { cleaned: true };
+    } catch (error) {
+      if (!commitAttempted) throw error;
+      let decision;
+      try { decision = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unknown fence */ }
+      if (decision?.state === "abandoned") throw error;
+      // Partial cleanup or an unreadable fence is not a proved rejection either.
+      throw new ResidentOutcomeUnknownError(command, decision, error, signal);
     }
-    fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
-    fs.rmSync(this.#metadataPath(metadata.id), { force: true });
-    fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
-    this.options.onResultConsumed?.(metadata.id);
-    return { cleaned: true };
   }
 
   async #command(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    const owner = this.#liveOwner();
+    if (!owner) throw new Error("Root resident host is not live");
+    assertResidentCommandSupported(owner, command.operation);
+    if (owner.requestFence !== 1) {
+      throw new Error("Fabric resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
+    }
+    throwIfAborted(signal);
+    registerResidentCancellation(signal, this.options.config.residencyRoot, command);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
-    atomicWrite(path.join(this.#requestsPath, `${command.requestId}.json`), command);
-    const deadline = Date.now() + COMMAND_TIMEOUT_MS;
     try {
+      atomicWrite(path.join(this.#requestsPath, `${command.requestId}.json`), command);
+      const deadline = Date.now() + (this.options.commandTimeoutMs ?? COMMAND_TIMEOUT_MS);
       while (Date.now() < deadline) {
         if (signal?.aborted) throw new Error("Fabric residency request was aborted");
         const response = readJson<ResidentCommandResponse>(responsePath);
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           fs.rmSync(responsePath, { force: true });
-          if (!response.ok) throw new Error(response.error ?? "Fabric resident host rejected request");
+          if (!response.ok) {
+            if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
+            if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
+            throw new Error(response.error ?? "Fabric resident host rejected request");
+          }
+          if ((command.operation === "spawn" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
+            throw new Error("Fabric resident host returned no created entity");
+          }
           return response;
         }
         const owner = this.#liveOwner();
@@ -631,14 +738,24 @@ export class ResidencyClient {
       throw new Error(`Timed out waiting for Fabric residency request ${command.requestId}` +
         ` (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
-      abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
+      let decision;
+      try {
+        decision = abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
+      } catch (fenceError) {
+        // No proven abandonment: never report a safe-to-retry rejection.
+        let known;
+        try { known = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unreadable fence */ }
+        throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);
+      }
+      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
       throw error;
     }
   }
 
-  async #waitForParticipant(id: string, kind: "actor" | "agent"): Promise<void> {
+  async #waitForParticipant(id: string, kind: "actor" | "agent", signal?: AbortSignal): Promise<void> {
     const deadline = Date.now() + STARTUP_TIMEOUT_MS;
     while (Date.now() < deadline) {
+      if (signal?.aborted) throw new Error("Fabric residency publication wait was aborted");
       const participant = this.options.participants.get(id);
       if (
         participant?.kind === kind &&
@@ -648,7 +765,7 @@ export class ResidencyClient {
       ) {
         return;
       }
-      await delay(STATUS_POLL_MS);
+      await sleepUnlessAborted(STATUS_POLL_MS, signal);
     }
     throw new Error(`Timed out publishing durable Fabric ${kind} ${id} from ${this.hostId}`);
   }
@@ -833,6 +950,7 @@ export class ResidencyClient {
     // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
     this.options.mainAgent.deliverAgent({
       from: value.from,
+      verification: "mesh", // The authenticated resident-host record was checked above.
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,

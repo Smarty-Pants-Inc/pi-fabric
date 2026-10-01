@@ -80,8 +80,8 @@ const residencySchema = {
 
 const actorBindingScopeSchema = {
   type: "string",
-  enum: ["session", "project"],
-  description: "session (default) changes only this Pi session; project pins the shared actor default and requires ownership.",
+  enum: ["session", "project", "global"],
+  description: "session (default) changes this root's live session binding or a foreign caller's local overlay; project pins the shared default and requires ownership; global updates a non-live template.",
 };
 
 const actorInvocationProperties = {
@@ -838,7 +838,11 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         before: {
           type: "number",
           minimum: 0,
-          description: "Exclusive line cursor returned by a previous page to load older entries",
+          description: "Exclusive byte offset returned by a previous page. Requires beforeGeneration; an unbound cursor returns cursor-stale rather than silently reading wrong bytes.",
+        },
+        beforeGeneration: {
+          type: "string",
+          description: "Required with before: previous generation (agent generation, actor sessionGeneration or run.generation). Actor type must be session or run, not all. On cursor-stale, re-read from the start without the cursor pair.",
         },
         runId: { type: "string", description: "Specific retained run (default: actor's last run)" },
       },

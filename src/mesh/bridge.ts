@@ -150,7 +150,7 @@ const participantOf = (key: string, value: unknown): FabricParticipantRecord | u
   return value as unknown as FabricParticipantRecord;
 };
 
-/** Record fields that change on every renewal; a mirror rewrites the state only when others change. */
+/** Host lease fields that change on every renewal; participant updatedAt is source activity. */
 const settled = (value: Record<string, unknown>): string =>
   JSON.stringify({ ...value, updatedAt: undefined, expiresAt: undefined });
 
@@ -258,6 +258,7 @@ export class StoreBridgeSide implements BridgeSide {
     const data = { ...checked.data, bridge: { from: this.peer, id: checked.data.bridge.id } };
     const published = await this.store.publish({
       ...checked,
+      from: { ...checked.from, verified: "bridge" },
       // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
       // ownership at commit: a native takeover before it refuses the event (security review
       // round 3, F2). Every state writer takes the same lock. Under the participants-files policy a
@@ -410,8 +411,9 @@ export class StoreBridgeSide implements BridgeSide {
       if (key.startsWith(PARTICIPANT_PREFIX) && participantFilePresent(this.store.root, key)) continue;
       if (
         existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
-        (typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS ||
-          !key.startsWith(HOST_PREFIX))
+        (key.startsWith(HOST_PREFIX)
+          ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
+          : existing.value.updatedAt === value.updatedAt)
       ) continue;
       if (halted()) return;
       await this.#put(key, value, identity, existing?.version);

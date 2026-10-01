@@ -251,6 +251,17 @@ describe("agents provider message routing service boundaries", () => {
     expect(control.request).toHaveBeenCalledWith("host", root.id, "followUp", { message: "result", data: undefined }, "owner", { routedRemoteHost: null });
   });
 
+  it.each(["absent", "rootId", "ownerHostId", "ownerIdentityId", "remoteHost"] as const)("refuses a cached native root when fresh authority changes (%s)", async (change) => {
+    const { router, participants, control, actors } = routing();
+    const native = { ...participant(), id: "session:peer", rootId: "session:peer" };
+    const fresh = change === "absent" ? undefined : { ...native, [change]: "replacement" };
+    participants.get.mockImplementation((_id, _now, options) => options?.fresh ? fresh : native);
+    await expect(router.routeMessage(native.id, "private", { secret: true }, "followUp"))
+      .rejects.toMatchObject({ name: "FabricRouteAuthorityError", code: "FABRIC_ROUTE_AUTHORITY_CHANGED" });
+    expect(control.request).not.toHaveBeenCalled();
+    expect(actors.steerRemote).not.toHaveBeenCalled();
+  });
+
   it("names why a remote Main cannot be resolved", async () => {
     const { router, participants, control, main } = routing();
     main.local = false;
@@ -307,7 +318,7 @@ describe("agents provider message routing service boundaries", () => {
     const { router, main, actors } = routing();
     const from = { id: "source", name: "Source", kind: "main" as const };
     await router.routeMessage("main", "event", undefined, "followUp", undefined, { from, triggerTurn: false });
-    expect(main.deliverAgent).toHaveBeenCalledWith({ from, message: "event", delivery: "followUp", triggerTurn: false });
+    expect(main.deliverAgent).toHaveBeenCalledWith({ from, verification: "mesh", message: "event", delivery: "followUp", triggerTurn: false });
     expect(actors.validateDirectMessage).not.toHaveBeenCalled();
   });
 

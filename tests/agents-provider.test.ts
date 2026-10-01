@@ -45,6 +45,7 @@ import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentHostId, residentRoot, ResidentOutcomeUnknownError } from "../src/residency/protocol.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { resolvePiModel } from "../src/core/model-refresh.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
@@ -89,8 +90,54 @@ const visiblePiModels = [
 ];
 
 describe("fleet model policy (#2490)", () => {
+  it.each((["session", "durable"] as const).flatMap(residency => ([
+    ["veda", "backend-shortcut", "explicit"],
+    ["veda", "veda/gpt-6-astra", "configured"],
+    ["veda", "cliproxyapi/not-registered", "explicit"],
+    ["claude", "default", "explicit"],
+    ["claude", "anthropic/default", "configured"],
+    ["claude", "unknown-runtime-alias", "explicit"],
+  ] as const).map(entry => [...entry, residency] as const)))("round 5 F5 refuses %s %s (%s) before %s submission", async (runner, selector, source, residency) => {
+    const state = setup([], [], undefined, { agentsConfig: {
+      runner, deniedModels: ["cliproxyapi/gpt-6-astra", "anthropic/claude-sonnet-test"], budgetUsd: 0,
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", ...(runner === "veda" && source === "configured" ? { model: selector } : {}) },
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, ...(runner === "claude" && source === "configured" ? { model: selector } : {}) },
+    }, modelsConfig: { aliases: { "backend-shortcut": { targets: ["cliproxyapi/gpt-6-astra"] } } } });
+    const spawnAgent = vi.fn(async () => ({ id: "must-not-submit", name: "refused", runner, transport: "process", cwd: process.cwd(), status: "running" }));
+    (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("spawn", { task: "must not submit", residency, transport: "process", ...(source === "explicit" ? { model: selector } : {}) }, context)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      expect(state.agents.list()).toEqual([]); expect(fs.existsSync(path.join(state.root, "runs"))).toBe(false);
+      expect(launch).not.toHaveBeenCalled(); expect(spawnAgent).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each(["session", "durable"] as const)("round 5 F5 forwards allowed canonical alternate targets for %s admission", async residency => {
+    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { deniedModels: ["cliproxyapi/gpt-6-astra"], budgetUsd: 0, veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" } } });
+    const spawnAgent = vi.fn(async (request: { model?: string }) => ({ id: "allowed-durable", name: "allowed", runner: "veda", transport: "process", cwd: process.cwd(), status: "running", model: request.model }));
+    (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
+    for (const [runner, model, canonical] of [["veda", "veda/cliproxyapi/gpt-6.1-sol", "cliproxyapi/gpt-6.1-sol"], ["claude", "claude/haiku", "claude-haiku-test"]] as const) {
+      const handle = await state.provider.invoke("spawn", { task: "allowed alternate control", runner, model, residency, transport: "process" }, context) as AgentHandleInfo;
+      expect(handle.model).toBe(canonical);
+      if (residency === "session") expect((await state.agents.wait(handle.id)).status).toBe("completed");
+      else expect(spawnAgent).toHaveBeenLastCalledWith(expect.objectContaining({ runner, model: canonical }), undefined);
+    }
+  });
+
+  it.each(["veda", "claude"] as const)("round 5 F5 preserves no-policy %s aliases for durable submission", async runner => {
+    const state = setup([], [], undefined, { agentsConfig: { deniedModels: [], budgetUsd: 0 } });
+    const spawnAgent = vi.fn(async (request: { model?: string }) => ({ id: "legacy-durable", name: "legacy", runner, transport: "process", cwd: process.cwd(), status: "running", model: request.model }));
+    (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
+    const catalog = vi.spyOn(state.agents, "claudeModels");
+    try {
+      await expect(state.provider.invoke("spawn", { task: "legacy alias", runner, model: "backend-shortcut", residency: "durable" }, context)).resolves.toMatchObject({ model: "backend-shortcut" });
+      expect(spawnAgent).toHaveBeenCalledOnce(); expect(catalog).not.toHaveBeenCalled();
+    } finally { catalog.mockRestore(); }
+  });
+
   it.each(["session", "durable"] as const)("round 3 F3 refuses an unknown Veda backend default before %s admission", async residency => {
-    const state = setup([], [], undefined, { agentsConfig: { runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], veda: { binary: DEFAULT_FABRIC_CONFIG.agents.veda.binary, persona: DEFAULT_FABRIC_CONFIG.agents.veda.persona, backend: "pi" } } });
+    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], veda: { binary: DEFAULT_FABRIC_CONFIG.agents.veda.binary, persona: DEFAULT_FABRIC_CONFIG.agents.veda.persona, backend: "pi" } } });
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
       await expect(state.provider.invoke("spawn", { task: "review", residency }, context)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", message: expect.stringContaining("default") });
@@ -202,7 +249,7 @@ describe("fleet model policy (#2490)", () => {
   });
 
   it.each(["session", "durable"] as const)("review round F1 refuses explicit and default Veda backend selectors before %s submission", async (residency) => {
-    const { provider, agents, root } = setup([], [], undefined, { agentsConfig: { runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", model: "veda/cliproxyapi/gpt-6-astra" } } });
+    const { provider, agents, root } = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", model: "veda/cliproxyapi/gpt-6-astra" } } });
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
       for (const model of ["veda/cliproxyapi/gpt-6-astra", undefined]) {
@@ -299,6 +346,11 @@ const visibleModelRegistry = {
     visiblePiModels.find((model) => model.provider === provider && model.id === id),
 };
 
+const prepareVisiblePiModel = async (selector: string | undefined): Promise<string> => {
+  const model = await resolvePiModel({ selector, registry: visibleModelRegistry, aliases: {} });
+  return `${model.provider}/${model.id}`;
+};
+
 const context: FabricInvocationContext = {
   cwd: process.cwd(),
   signal: undefined,
@@ -321,6 +373,7 @@ const setup = (
     modelsConfig?: FabricModelsConfig;
     agentsConfig?: Partial<FabricAgentConfig>;
     workerPath?: string;
+    preparePiModel?: (model: string | undefined) => Promise<string | void>;
     writeStalled?: () => Error | undefined;
     onBackgroundComplete?: (result: import("../src/agents/types.js").AgentRunResult) => void;
     onResultConsumed?: (id: string) => void;
@@ -338,6 +391,7 @@ const setup = (
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
+      ...(options?.preparePiModel ? { preparePiModel: options.preparePiModel } : {}),
       ...(options?.onBackgroundComplete ? { onBackgroundComplete: options.onBackgroundComplete } : {}),
       ...(options?.onResultConsumed ? { onResultConsumed: options.onResultConsumed } : {}),
     },

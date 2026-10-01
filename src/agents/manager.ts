@@ -741,10 +741,50 @@ export class AgentManager {
     if (model && runner === "veda") assertFabricModelAllowed(normalizeVedaModel(model), this.config);
   }
 
-  /** Resolve the actual Pi/session fallback without committing a run or binding. */
-  async prepareModelForAdmission(model: string | undefined, runner: FabricAgentRunner): Promise<string | undefined> {
+  /** Resolve the actual backend target without committing a run or binding. */
+  async prepareModelForAdmission(
+    model: string | undefined,
+    runner: FabricAgentRunner,
+    resolvePi?: (model: string) => Promise<string>,
+  ): Promise<string | undefined> {
     this.assertModelAllowed(model, runner);
-    const prepared = runner === "pi" ? await this.#prepareModel(model) : model;
+    if (runner === "pi") {
+      const prepared = await this.#prepareModel(model);
+      this.assertModelAllowed(prepared, runner);
+      return prepared;
+    }
+    // Without host policy, preserve backend-owned aliases and defaults verbatim.
+    if (this.config.deniedModels.length === 0) return model;
+    const unresolved = (): never => {
+      const error = new FabricModelDeniedError(`${runner}/<unresolved-backend-model>`, this.config.deniedModelReplacement);
+      error.message = `Fabric cannot establish the ${runner} backend model under the active host policy; select a known concrete model. ` + error.message;
+      throw error;
+    };
+    let prepared: string;
+    try {
+      if (runner === "veda") {
+        const selector = model ? normalizeVedaModel(model) : "";
+        // Only Pi's registry can establish this backend's concrete provider/model.
+        // Do not reinterpret Veda aliases, bare IDs, other backends or fuzzy misses.
+        const prepare = resolvePi ?? this.#preparePiModel;
+        if (this.config.veda.backend !== "pi" || !/^[^\s/]+\/[^\s]+$/.test(selector) || !prepare) return unresolved();
+        const resolved = await prepare(selector);
+        if (typeof resolved !== "string" || resolved.trim().toLowerCase() !== selector.toLowerCase()) return unresolved();
+        prepared = resolved.trim();
+      } else {
+        const selector = model ? normalizeClaudeModel(model) : "default";
+        const catalog = await this.claudeModels();
+        const selected = catalog.find(entry => normalizeClaudeModel(entry.value) === selector || normalizeClaudeModel(entry.resolvedModel) === selector);
+        if (!selected?.resolvedModel || selected.resolvedModelKnown === false) return unresolved();
+        this.assertModelAllowed(selected.resolvedModel, runner);
+        prepared = normalizeClaudeModel(selected.resolvedModel);
+        // The native catalog names Claude IDs; host policies can name their Pi key.
+        assertFabricModelAllowed(`anthropic/${prepared}`, this.config);
+      }
+    } catch (error) {
+      if (error instanceof FabricModelDeniedError) throw error;
+      return unresolved();
+    }
     this.assertModelAllowed(prepared, runner);
     return prepared;
   }
@@ -903,6 +943,10 @@ export class AgentManager {
     if (runner === "veda") mapVedaTools(tools);
     let model = request.model?.trim() || this.defaultModel(runner);
     this.assertModelAllowed(model, runner);
+    // Alternate backend targets must be known before even accepting a queue receipt.
+    if (runner !== "pi" && this.config.deniedModels.length > 0) {
+      model = await this.prepareModelForAdmission(model, runner);
+    }
     if (this.#budget) {
       const spent = readBudgetLedger(this.#budget.file).cost;
       if (spent >= this.#budget.budget) {

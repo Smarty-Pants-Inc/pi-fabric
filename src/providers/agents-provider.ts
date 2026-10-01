@@ -498,8 +498,12 @@ export class AgentsProvider implements FabricProvider {
         : this.manager.config.runner);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     this.manager.assertModelAllowed(model || undefined, runner);
+    if (runner !== "pi") {
+      if (this.manager.config.deniedModels.length === 0) return args;
+      const prepared = await this.manager.prepareModelForAdmission(model || undefined, runner, selector => this.#resolvePiModel(selector, context));
+      return { ...args, model: prepared };
+    }
     if (!model) return args;
-    if (runner !== "pi") return args;
     const thinking = isFabricThinking(args.thinking) ? args.thinking
       : aliasThinking(this.modelsConfig().aliases, model);
     const resolved = await this.#resolvePiModel(model, context);
@@ -514,7 +518,7 @@ export class AgentsProvider implements FabricProvider {
 
   async #admitActorRequest(request: FabricActorRequest, context: FabricInvocationContext): Promise<FabricActorRequest> {
     const model = request.model ?? this.manager.defaultModel(request.runner);
-    if (!model) return request;
+    if (!model && (request.runner === "pi" || this.manager.config.deniedModels.length === 0)) return request;
     const resolved = await this.#resolvePiModelArgs({ model, thinking: request.thinking }, context, request.runner);
     // Templates and unbound live actors retain their dynamic defaults, after validation.
     return request.model ? { ...request, model: resolved.model as string, ...(isFabricThinking(resolved.thinking) ? { thinking: resolved.thinking } : {}) } : request;

@@ -24,12 +24,16 @@
 // `pattern` is `text` with each quoted or escaped glob character (* ? [ ]) masked (GLOB_MASK), a
 // double-quoted `$` as QUOTED and a single-quoted or escaped `$` as LITERAL, so the /tmp rule sees which
 // globs and expansions are live (smarty-dev#1998, round 1 on PR #148).
+import { GuardBudget, GuardBudgetExceeded } from "./guard-budget.js";
+export { GUARD_BUDGET_REASON } from "./guard-budget.js";
+
 type Word = { text: string; subs: string[]; names: string[]; dynamic: boolean; pattern: string };
 type Expansion = { subs: string[]; names: string[]; text?: string; dynamic?: boolean };
 
 let placeholders = 0;
 /** Records a substitution and returns the placeholder that stands for its output. */
-function substitute(into: Expansion, sub: string): string {
+function substitute(into: Expansion, sub: string, budget: GuardBudget): string {
+  budget.spend(sub.length + 64);
   const name = `__pk_sub_${++placeholders}`;
   into.subs.push(sub);
   into.names.push(name);
@@ -42,63 +46,87 @@ type Token = { op: string } | { word: Word } | Redirect | { heredoc: { body: str
 const OPERATORS = ["&&", "||", ";;", "|&", "|", "&", ";", "(", ")"];
 
 /** Reads to the character that closes `open` at `index` (just after the opener), nesting quotes. */
-function readBalanced(text: string, index: number, open: string, close: string): number {
+function readBalanced(text: string, index: number, open: string, close: string, budget: GuardBudget): number {
+  budget.enterReader();
+  try {
+  budget.spend(text.length - index + 1);
   let depth = 1;
   while (index < text.length) {
+    budget.spend();
     const c = text[index]!;
     if (c === "\\") { index += 2; continue; }
     if (c === "'" && close !== "`") { const end = text.indexOf("'", index + 1); index = end < 0 ? text.length : end + 1; continue; }
-    if (c === "\"" && close !== "`") { index = readDouble(text, index + 1, { subs: [], names: [] }); continue; }
+    if (c === "\"" && close !== "`") { index = readDouble(text, index + 1, { subs: [], names: [] }, budget); continue; }
     if (c === close) { depth -= 1; index += 1; if (depth === 0) return index; continue; }
     if (open !== close && c === open) depth += 1;
     index += 1;
   }
   return index;
+  } finally { budget.leaveReader(); }
 }
 
 /** Reads a double-quoted body from `index`; collects its `$(…)` and backtick substitutions. */
-function readDouble(text: string, index: number, word: Expansion): number {
+function readDouble(text: string, index: number, word: Expansion, budget: GuardBudget): number {
+  budget.enterReader();
+  try {
+  budget.spend(text.length - index + 1);
   while (index < text.length && text[index] !== "\"") {
+    budget.spend((word.text?.length ?? 0) + 1);
     const c = text[index]!;
     if (c === "\\") { word.text = (word.text ?? "") + (text[index + 1] ?? ""); index += 2; continue; }
     if ((c === "$" && text[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
-      const end = c === "`" ? readBalanced(text, start, "`", "`") : readBalanced(text, start, "(", ")");
-      word.text = (word.text ?? "") + substitute(word, text.slice(start, end - 1));
+      const end = c === "`" ? readBalanced(text, start, "`", "`", budget) : readBalanced(text, start, "(", ")", budget);
+      budget.spend(end - start + 1);
+      word.text = (word.text ?? "") + substitute(word, text.slice(start, end - 1), budget);
       index = end;
       continue;
     }
-    if (c === "$") word.dynamic = true;
-    word.text = (word.text ?? "") + c;
-    index += 1;
+    // Batch ordinary bytes so a 4096-byte value does not incur quadratic copies.
+    let end = index + 1;
+    while (end < text.length && !/["\\`]/.test(text[end]!) && !(text[end] === "$" && text[end + 1] === "(")) end += 1;
+    budget.spend(2 * (end - index) + 1);
+    const fragment = text.slice(index, end);
+    if (fragment.includes("$")) word.dynamic = true;
+    word.text = (word.text ?? "") + fragment;
+    index = end;
   }
   return index + 1;
+  } finally { budget.leaveReader(); }
 }
 
 /**
  * An unquoted heredoc body as the command that reads it receives it: each `$(…)` and backtick
  * substitution replaced by its placeholder. Quotes and `#` are literal there.
  */
-function expandHeredoc(body: string): Expansion & { text: string } {
+function expandHeredoc(body: string, budget: GuardBudget): Expansion & { text: string } {
+  budget.spend(4 * body.length + 1);
   const expansion: Expansion & { text: string } = { subs: [], names: [], text: "" };
   for (let index = 0; index < body.length;) {
+    budget.spend(expansion.text.length + 1);
     const c = body[index]!;
     // In a heredoc a backslash escapes only $, ` and \: the reader gets `\$(…)` as `$(…)`.
     if (c === "\\") { expansion.text += /[$`\\]/.test(body[index + 1] ?? "") ? body[index + 1] : body.slice(index, index + 2); index += 2; continue; }
     if ((c === "$" && body[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
-      const end = c === "`" ? readBalanced(body, start, "`", "`") : readBalanced(body, start, "(", ")");
-      expansion.text += substitute(expansion, body.slice(start, end - 1));
+      const end = c === "`" ? readBalanced(body, start, "`", "`", budget) : readBalanced(body, start, "(", ")", budget);
+      budget.spend(end - start + 1);
+      expansion.text += substitute(expansion, body.slice(start, end - 1), budget);
       index = end;
       continue;
     }
-    expansion.text += c;
-    index += 1;
+    let end = index + 1;
+    while (end < body.length && !/[\\`]/.test(body[end]!) && !(body[end] === "$" && body[end + 1] === "(")) end += 1;
+    budget.spend(2 * (end - index) + 1);
+    expansion.text += body.slice(index, end);
+    index = end;
   }
   return expansion;
 }
 
-function tokenize(source: string): Token[] {
+function tokenize(source: string, budget: GuardBudget): Token[] {
+  // Reserve linear walks, token entries, slices, masks and heredoc joins before lexing.
+  budget.spend(12 * source.length + 1);
   // As in comment-cut (#104): a backslash-newline continues the line.
   const text = source.replace(/\\\r?\n/g, " ");
   const tokens: Token[] = [];
@@ -114,6 +142,7 @@ function tokenize(source: string): Token[] {
   };
   const current = (): Word => (word ??= { text: "", subs: [], names: [], dynamic: false, pattern: "" });
   while (index < text.length) {
+    budget.spend((word?.text.length ?? 0) + 1);
     const c = text[index]!;
     if (c === " " || c === "\t" || c === "\r") { endWord(); index += 1; continue; }
     if (c === "\n") {
@@ -141,17 +170,19 @@ function tokenize(source: string): Token[] {
       const strip = text[index + 2] === "-";
       index += strip ? 3 : 2;
       while (text[index] === " " || text[index] === "\t") index += 1;
-      let raw = "";
-      while (index < text.length && !/[\s;&|()<>]/.test(text[index]!)) raw += text[index++];
+      const start = index;
+      while (index < text.length && !/[\s;&|()<>]/.test(text[index]!)) index += 1;
+      const raw = text.slice(start, index);
       const token = { heredoc: { body: "", quoted: /['"\\]/.test(raw) } };
       tokens.push(token);
       pending.push({ delimiter: raw.replace(/['"\\]/g, ""), strip, token });
       continue;
     }
     if ((c === "<" || c === ">") && text[index + 1] === "(") {
-      const end = readBalanced(text, index + 2, "(", ")");
+      const end = readBalanced(text, index + 2, "(", ")", budget);
       const w = current();
-      const placeholder = substitute(w, text.slice(index + 2, end - 1));
+      budget.spend(end - index + 1);
+      const placeholder = substitute(w, text.slice(index + 2, end - 1), budget);
       w.text += placeholder;
       w.pattern += placeholder;
       index = end;
@@ -192,19 +223,24 @@ function tokenize(source: string): Token[] {
       w.text += text.slice(index + 2, end < 0 ? text.length : end);
       index = end < 0 ? text.length : end + 1;
     } else if (c === "\"") {
-      index = readDouble(text, index + 1, w);
+      index = readDouble(text, index + 1, w, budget);
     } else if ((c === "$" && text[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
-      const end = c === "`" ? readBalanced(text, start, "`", "`") : readBalanced(text, start, "(", ")");
-      w.text += substitute(w, text.slice(start, end - 1));
+      const end = c === "`" ? readBalanced(text, start, "`", "`", budget) : readBalanced(text, start, "(", ")", budget);
+      budget.spend(end - start + 1);
+      w.text += substitute(w, text.slice(start, end - 1), budget);
       index = end;
     } else if (c === "\\") {
       w.text += text[index + 1] ?? "";
       index += 2;
     } else {
-      if (c === "$") w.dynamic = true;
-      w.text += c;
-      index += 1;
+      let end = index + 1;
+      while (end < text.length && !/[\s;&|()<>'"\\`]/.test(text[end]!) && !(text[end] === "$" && ["(", "'"].includes(text[end + 1] ?? ""))) end += 1;
+      budget.spend(2 * (end - index) + 1);
+      const fragment = text.slice(index, end);
+      if (fragment.includes("$")) w.dynamic = true;
+      w.text += fragment;
+      index = end;
       bare = true;
     }
     const added = w.text.slice(before);
@@ -261,7 +297,8 @@ type Context = { root: string; owned: Set<string>; cwd?: string | undefined; val
  * unquoted glob (or ..) in the component directly below it: `/tmp/tmp.*`, `/tmp/*`, `/tmp`. A glob below a
  * concrete component (`/tmp/tmp.AbC123/*.md`) stays inside one dir. A relative word counts only after a known `cd`.
  */
-function tmpGlob(pattern: string, cwd: string | undefined): boolean {
+function tmpGlob(pattern: string, cwd: string | undefined, budget: GuardBudget): boolean {
+  budget.spend(6 * (pattern.length + (cwd?.length ?? 0)) + 1);
   const path = pattern.startsWith("/") ? pattern : cwd && pattern && !/^[~$]/.test(pattern) ? `${cwd}/${pattern}` : undefined;
   if (!path) return false;
   const parts = path.split("/").filter((part) => part !== "" && part !== ".");
@@ -282,7 +319,8 @@ type SourceScopes = {
 };
 
 /** Match late stdin redirects to their loop/group, never to unrelated reads in the script. */
-function sourceScopes(tokens: Token[]): SourceScopes {
+function sourceScopes(tokens: Token[], budget: GuardBudget): SourceScopes {
+  budget.spend(12 * tokens.length + 1);
   const stack: Array<{ kind: string; start: number }> = [];
   const scopes = new Map<number, { end: number; source: InputScope }>();
   const compounds = new Map<number, number>();
@@ -298,6 +336,7 @@ function sourceScopes(tokens: Token[]): SourceScopes {
     if (parent) parents.set(scope.start, parent.start);
     let target: Word | undefined;
     for (let i = end + 1; i < tokens.length; i++) {
+      budget.spend();
       const token = tokens[i]!;
       if ("redirect" in token) { if (token.input) target = token.redirect; }
       else if (!("heredoc" in token)) break;
@@ -339,12 +378,16 @@ function sourceScopes(tokens: Token[]): SourceScopes {
 }
 
 /** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
-function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined } {
+function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>, budget: GuardBudget): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined } {
   let words = stageWords;
   let fedByXargs = false;
   let argFile: Word | undefined;
   for (;;) {
-    while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) words = words.slice(1);
+    budget.spend(4 * words.length + (words[0]?.text.length ?? 0) + 1);
+    while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) {
+      budget.spend(words.length + words[0].text.length + 1);
+      words = words.slice(1);
+    }
     const prefix = words[0]?.text.split("/").pop() ?? "";
     const options = PREFIXES[prefix];
     if (!options) return { words, fedByXargs, argFile };
@@ -353,6 +396,7 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
     if (prefix === "xargs") fedByXargs = true;
     words = words.slice(1);
     while (words[0]?.text.startsWith("-") && words[0].text.length > 1) {
+      budget.spend(words.length + 4 * words[0].text.length + 1);
       const flag = words[0].text;
       if (flag === "--") { words = words.slice(1); break; }
       let value: string | undefined;
@@ -391,7 +435,8 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
 }
 
 /** Bash read/mapfile option values are not destinations; omitted destinations use shell defaults. */
-function readDestinations(name: string, args: Word[]): string[] {
+function readDestinations(name: string, args: Word[], budget: GuardBudget): string[] {
+  budget.spend(4 * args.length + 1);
   const read = name === "read";
   const valueOptions = read ? "adinNptu" : "nOsuCcd";
   let array: string | undefined;
@@ -422,17 +467,18 @@ function readDestinations(name: string, args: Word[]): string[] {
  * Scans a shell script. `names` holds the variables and placeholders whose value comes from a name
  * lookup in the calling script (review/astra F8 on #105: per operand, never the whole script).
  */
-function scan(script: string, depth: number, names: ReadonlySet<string> = new Set(), tmpIn: ReadonlySet<string> = new Set(),
+function scan(script: string, depth: number, budget: GuardBudget, names: ReadonlySet<string> = new Set(), tmpIn: ReadonlySet<string> = new Set(),
   context: Context = { root: script, owned: new Set(), values: new Map(), unknown: new Set() }, stdin?: Feed): Verdict {
-  if (depth > 6) return { blocked: false, lookup: false, wipe: false, tmpList: false };
+  budget.spend(script.length + 1);
+  if (depth > 6) throw new GuardBudgetExceeded();
   // Security F4/F5: collect with the state at each command, then replay from the same entry state.
   // F6: retain fallback for unresolved feeds, but late redirects belong only to their own scope.
-  const tokens = tokenize(script);
-  const scopes = sourceScopes(tokens);
+  const tokens = tokenize(script, budget);
+  const scopes = sourceScopes(tokens, budget);
   const sources = new Map<Word, Feed | undefined>();
-  const first = scanPass(tokens, scopes, sources, depth, names, tmpIn, context, { lookup: false, tmp: false }, stdin);
+  const first = scanPass(tokens, scopes, sources, depth, budget, names, tmpIn, context, { lookup: false, tmp: false }, stdin);
   if (!first.lookup && !first.tmpList) return first;
-  const second = scanPass(tokens, scopes, sources, depth, names, tmpIn, context, { lookup: first.lookup, tmp: first.tmpList }, stdin);
+  const second = scanPass(tokens, scopes, sources, depth, budget, names, tmpIn, context, { lookup: first.lookup, tmp: first.tmpList }, stdin);
   return {
     blocked: first.blocked || second.blocked, lookup: first.lookup || second.lookup,
     wipe: first.wipe || second.wipe, tmpList: first.tmpList || second.tmpList,
@@ -441,7 +487,8 @@ function scan(script: string, depth: number, names: ReadonlySet<string> = new Se
 }
 
 function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed | undefined>,
-  depth: number, names: ReadonlySet<string>, tmpIn: ReadonlySet<string>, context: Context, fed: Feed, stdin?: Feed): Verdict {
+  depth: number, budget: GuardBudget, names: ReadonlySet<string>, tmpIn: ReadonlySet<string>, context: Context, fed: Feed, stdin?: Feed): Verdict {
+  budget.spend(4 * (names.size + tmpIn.size + context.values.size + context.unknown.size) + tokens.length + 1);
   const verdict: Verdict = { blocked: false, lookup: false, wipe: false, tmpList: false };
   // Variables whose value comes from a name lookup (`P=$(pgrep …)`, `for p in $(pgrep …)`,
   // `pgrep … | while read p`), and the placeholders of lookup substitutions. A `kill` of one is a
@@ -459,7 +506,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   let cwd = context.cwd;
 
   const nested = (text: string, extra: Iterable<string> = [], tmpExtra: Iterable<string> = [], local = true, input?: Feed): Verdict => {
-    const inner = scan(text, depth + 1, new Set([...tainted, ...extra]), new Set([...tmpNames, ...tmpExtra]),
+    budget.spend(2 * (tainted.size + tmpNames.size + values.size + unknown.size) + text.length + 1);
+    const inner = scan(text, depth + 1, budget, new Set([...tainted, ...extra]), new Set([...tmpNames, ...tmpExtra]),
       local ? { ...context, cwd, values, unknown } : { ...context, cwd: undefined, values: new Map(), unknown: new Set() },
       local ? input : undefined);
     verdict.blocked ||= inner.blocked;
@@ -467,23 +515,29 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     verdict.wipe ||= inner.wipe;
     return inner;
   };
-  const fromLookup = (text: string): boolean => [...text.matchAll(VARIABLE)].some((match) => tainted.has(match[1]!));
+  const fromLookup = (text: string): boolean => {
+    budget.spend(3 * text.length + 1);
+    return [...text.matchAll(VARIABLE)].some((match) => tainted.has(match[1]!));
+  };
   // An unquoted `$P` expands with its value's globs live; a quoted `"$P"` is one literal name.
-  const expand = (pattern: string): string =>
-    pattern.replace(REFERENCE, (whole, how: string, name: string) => {
-      const value = values.get(name);
-      return value === undefined ? whole : how === "$" ? value : mask(value);
-    });
-  const tmpOperand = (pattern: string): boolean =>
-    [...pattern.matchAll(REFERENCE)].some((match) => tmpNames.has(match[2]!)) || tmpGlob(expand(pattern), cwd);
+  const expand = (pattern: string): string => budget.replace(pattern, REFERENCE,
+    (match) => values.get(match[2]!) ?? match[0],
+    (value, match) => match[1] === "$" ? value : mask(value));
+  const tmpOperand = (pattern: string): boolean => {
+    budget.spend(3 * pattern.length + 1);
+    return [...pattern.matchAll(REFERENCE)].some((match) => tmpNames.has(match[2]!)) || tmpGlob(expand(pattern), cwd, budget);
+  };
   // Round 1 on PR #148: an unquoted expansion of an unknown value, in a command that names /tmp.
-  const unknownOperand = (pattern: string): boolean =>
-    [...pattern.matchAll(REFERENCE)].some((match) => match[1] === "$" && unknown.has(match[2]!)) && MENTIONS_TMP.test(context.root);
+  const unknownOperand = (pattern: string): boolean => {
+    budget.spend(3 * pattern.length + context.root.length + 1);
+    return [...pattern.matchAll(REFERENCE)].some((match) => match[1] === "$" && unknown.has(match[2]!)) && MENTIONS_TMP.test(context.root);
+  };
 
   // A known substitution output is a feed, not a known literal path for a later find root.
   const knownSubs = new Set<string>();
   const concrete = (word: Word): boolean => ![...expand(word.pattern).matchAll(REFERENCE)]
     .some((match) => !context.owned.has(match[2]!));
+  budget.spend(3 * scopes.inputs.size + 1);
   const lateTargets = new Set([...scopes.inputs.values()].map((scope) => scope.target));
   const compoundKnown = new Map<number, boolean>();
   const compoundFeeds = new Map<number, Feed>();
@@ -509,6 +563,10 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
     let pipeFeed = stdin?.lookup ?? fed.lookup;
     let pipeTmp = stdin?.tmp ?? fed.tmp;
     stages.forEach((stage, position) => {
+      // Preflight the stage's argv/redirect copies, joins and bounded linear walks.
+      budget.spend(16 * (stage.words.length + stage.redirects.length + stage.heredocs.length + 1));
+      for (const word of stage.words) budget.spend(12 * (word.text.length + word.pattern.length) + 1);
+      for (const redirect of stage.redirects) budget.spend(12 * (redirect.redirect.text.length + redirect.redirect.pattern.length) + 1);
       const piped = position < stages.length - 1;
       // An actual incoming pipe exists even when its unresolved producer is represented only
       // by replay fallback. Known owned/recorded output sets an explicit empty feed instead.
@@ -527,7 +585,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // Substitutions in words and redirection targets run; so do those of an unquoted heredoc
       // body, where quotes and `#` are literal (review/astra F2 on #105). A lookup's placeholder
       // is tainted, so a script that receives its output knows which operand holds it.
-      const heredocs = stage.heredocs.map((heredoc) => heredoc.quoted ? { text: heredoc.body, subs: [], names: [] } : expandHeredoc(heredoc.body));
+      const heredocs = stage.heredocs.map((heredoc) => heredoc.quoted ? { text: heredoc.body, subs: [], names: [] } : expandHeredoc(heredoc.body, budget));
       const expansions: Expansion[] = [...stage.words, ...stage.redirects.map((redirect) => redirect.redirect), ...heredocs];
       let captured = false;
       for (const expansion of expansions) expansion.subs.forEach((sub, k) => {
@@ -536,7 +594,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         const known = inner.sourceKnown && !inner.tmpList && !inner.lookup;
         if (known) knownSubs.add(expansion.names[k]!);
         // Security F3: unresolved captured output after `cd /tmp` may list /tmp; explicit sources do not.
-        if (inner.tmpList || (tmpGlob(".", cwd) && !known && !/^\s*mktemp(\s|$)/.test(sub))) {
+        if (inner.tmpList || (tmpGlob(".", cwd, budget) && !known && !/^\s*mktemp(\s|$)/.test(sub))) {
           tmpNames.add(expansion.names[k]!);
           // A redirect on `done` has no consumer in this pass; retain its feed for the replay.
           verdict.tmpList = true;
@@ -547,7 +605,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       });
       const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
-      const { words, fedByXargs, argFile } = unwrap(stage.words, envScripts);
+      const { words, fedByXargs, argFile } = unwrap(stage.words, envScripts, budget);
       // review/astra F6 on #105: an `env -S` script, with the placeholders of its word.
       for (const { text } of envScripts) scripts.push({ text });
       const name = words[0]?.text.split("/").pop() ?? "";
@@ -609,7 +667,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         pipeTmp = source.tmp;
       }
       const reads = name === "read" || name === "mapfile" || name === "readarray";
-      if (reads) for (const destination of readDestinations(name, args)) {
+      if (reads) for (const destination of readDestinations(name, args, budget)) {
         if (pipeFeed) tainted.add(destination);
         if (pipeTmp) tmpNames.add(destination);
       }
@@ -629,7 +687,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const independent = !fedByXargs && !captured && !args.some((arg) => arg.text === "-") && explicit.length > 0 && explicit.every((word) =>
         word.text !== "-" && concrete(word) && !fromLookup(word.text) && !tmpOperand(word.pattern));
       let listsTmp = name !== "mktemp" && (stage.words.some((word) => tmpOperand(word.pattern)) ||
-        (piped && !independent && tmpGlob(".", cwd)));
+        (piped && !independent && tmpGlob(".", cwd, budget)));
       // An explicit producer does not read stdin. Do not clear an earlier real pipeline stage.
       if (position === 0 && piped && independent && !listsTmp && !lookup) {
         pipeFeed = false; pipeTmp = false; actual = { lookup: false, tmp: false };
@@ -639,6 +697,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (name === "cd") {
         const target = args.find((arg) => !arg.text.startsWith("-"));
         const dir = target && expand(target.pattern);
+        budget.spend((dir?.length ?? 0) + (cwd?.length ?? 0) + 1);
         cwd = dir?.startsWith("/") ? dir : dir && cwd && !/^[~$]/.test(dir) ? `${cwd}/${dir}` : undefined;
       }
       // smarty-dev#1998: rm (and xargs rm) of a /tmp glob, or find over one with -delete or -exec rm.
@@ -648,9 +707,14 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         if (operands.some((arg) => tmpOperand(arg.pattern) || unknownOperand(arg.pattern)) || xargsTmp) verdict.wipe = true;
       }
       if (name === "find") {
-        const deletes = args.some((arg, i) => arg.text === "-delete" || (["-exec", "-execdir", "-ok", "-okdir"].includes(arg.text) &&
-          /(^|[\s/])(rm|unlink|shred)(\s|$)/.test(args.slice(i + 1).map((a) => a.text).join(" ").split(/\s[;+](\s|$)/)[0]!)));
-        if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern)) : tmpGlob(".", cwd))) verdict.wipe = true;
+        const deletes = args.some((arg, i) => {
+          if (arg.text === "-delete") return true;
+          if (!["-exec", "-execdir", "-ok", "-okdir"].includes(arg.text)) return false;
+          budget.spend(3 * (args.length - i) + 1);
+          for (let at = i + 1; at < args.length; at++) budget.spend(4 * args[at]!.text.length + 1);
+          return /(^|[\s/])(rm|unlink|shred)(\s|$)/.test(args.slice(i + 1).map((a) => a.text).join(" ").split(/\s[;+](\s|$)/)[0]!);
+        });
+        if (deletes && (roots.length ? roots.some((root) => tmpOperand(root.pattern)) : tmpGlob(".", cwd, budget))) verdict.wipe = true;
       }
       // xargs appends its input: from a lookup, `{}` and every positional parameter hold it.
       const xargsFeed = fedByXargs && pipeFeed;
@@ -753,15 +817,24 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
   return verdict;
 }
 
-/** True when the shell command kills processes by name pattern (smarty-dev#774). */
-export function killsByPattern(command: string): boolean {
-  return scan(command, 0).blocked;
+export type CommandGuardResult = { blocked: boolean; wipe: boolean; exhausted: boolean };
+
+/** One cumulative budget for both policies, collection/replay and nested readers. */
+export function scanCommand(command: string): CommandGuardResult {
+  try {
+    const verdict = scan(command, 0, new GuardBudget());
+    return { blocked: verdict.blocked, wipe: verdict.wipe, exhausted: false };
+  } catch (error) {
+    if (!(error instanceof GuardBudgetExceeded)) throw error;
+    return { blocked: true, wipe: true, exhausted: true };
+  }
 }
 
+/** True when the shell command kills processes by name pattern (smarty-dev#774). */
+export function killsByPattern(command: string): boolean { return scanCommand(command).blocked; }
+
 /** True when the shell command deletes by a glob over /tmp or /var/tmp, or deletes /tmp itself (smarty-dev#1998). */
-export function wipesTmp(command: string): boolean {
-  return scan(command, 0).wipe;
-}
+export function wipesTmp(command: string): boolean { return scanCommand(command).wipe; }
 
 export const TMP_WIPE_REASON =
   "Blocked (smarty-dev#1998): this deletes by a glob in /tmp or /var/tmp (or /tmp itself), which also " +

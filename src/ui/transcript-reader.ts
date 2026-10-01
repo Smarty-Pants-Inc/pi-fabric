@@ -16,26 +16,9 @@ const MAX_PAGE_BYTES = 512 * 1024;
 const MAX_CACHE_ENTRIES = 32;
 const FORWARD_READ_CHUNK_BYTES = 64 * 1024;
 
-// Windows file IDs can exceed Number.MAX_SAFE_INTEGER. Keep identity exact while
-// retaining safe numeric byte offsets and the reader's existing timestamp API.
-interface DescriptorStats {
-  dev: bigint;
-  ino: bigint;
-  size: number;
-  mtimeMs: number;
-  isFile(): boolean;
-}
-const descriptorStats = (descriptor: number): DescriptorStats => {
-  const stat = fs.fstatSync(descriptor, { bigint: true });
-  const size = Number(stat.size);
-  if (!Number.isSafeInteger(size)) throw new Error("file size exceeds safe byte offsets");
-  return { dev: stat.dev, ino: stat.ino, size, mtimeMs: Number(stat.mtimeNs) / 1_000_000,
-    isFile: () => stat.isFile() };
-};
-
 interface CachedTranscript {
-  device: bigint;
-  inode: bigint;
+  device: number;
+  inode: number;
   modifiedAt: number;
   offset: number;
   completeEnd: number;
@@ -125,7 +108,7 @@ export class AgentTranscriptReader {
     try {
       const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
       descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-      const stat = descriptorStats(descriptor);
+      const stat = fs.fstatSync(descriptor);
       if (!stat.isFile()) {
         return cached?.transcript ?? {
           entries: [],
@@ -190,7 +173,7 @@ export class AgentTranscriptReader {
     try {
       const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
       descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-      const stat = descriptorStats(descriptor);
+      const stat = fs.fstatSync(descriptor);
       if (!stat.isFile() || stat.dev !== cached.device || stat.ino !== cached.inode) return false;
       const completeEnd = completeLogEnd(descriptor, stat.size, cached.completeEnd);
       const pageEnd = Math.min(cached.pageStart, completeEnd);
@@ -233,7 +216,7 @@ export class AgentTranscriptReader {
     try {
       const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
       descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-      const stat = descriptorStats(descriptor);
+      const stat = fs.fstatSync(descriptor);
       if (!stat.isFile() || stat.dev !== cached.device || stat.ino !== cached.inode) return false;
       const completeEnd = completeLogEnd(descriptor, stat.size, cached.completeEnd);
       const page = readForwardPage(descriptor, cached.pageEnd, completeEnd);
@@ -267,7 +250,7 @@ export class AgentTranscriptReader {
     try {
       const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
       descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-      const stat = descriptorStats(descriptor);
+      const stat = fs.fstatSync(descriptor);
       if (!stat.isFile()) return false;
       if (cached && (stat.dev !== cached.device || stat.ino !== cached.inode)) return false;
       const completeEnd = completeLogEnd(descriptor, stat.size, cached?.completeEnd ?? 0);
@@ -289,7 +272,7 @@ export class AgentTranscriptReader {
 
   #latestState(
     descriptor: number,
-    stat: DescriptorStats,
+    stat: fs.Stats,
     knownCompleteEnd?: number,
   ): CachedTranscript {
     const completeEnd = knownCompleteEnd ?? completeLogEnd(descriptor, stat.size);
@@ -313,7 +296,7 @@ export class AgentTranscriptReader {
 
   #stateForPage(
     descriptor: number,
-    stat: DescriptorStats,
+    stat: fs.Stats,
     completeEnd: number,
     lines: FabricLogLine[],
     pageStart: number,

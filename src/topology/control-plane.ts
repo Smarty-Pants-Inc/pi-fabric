@@ -1,4 +1,5 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
+import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
@@ -56,6 +57,7 @@ export interface FabricControlCommand {
 }
 
 export interface FabricControlAcceptance {
+  warning?: AgentFollowUpRunningWarning;
   accepted: boolean;
   messageId?: string;
   /** The owner's followUp queue for a Main target (smarty-dev#1495). */
@@ -80,6 +82,7 @@ class FabricControlRejection extends Error {
 }
 
 export interface FabricControlResult {
+  warning?: AgentFollowUpRunningWarning;
   queued: true;
   messageId: string;
   routed: "mesh";
@@ -108,6 +111,19 @@ const coalescedOf = (source: Record<string, unknown>): { coalesced: true; replac
   source.coalesced === true && typeof source.replacedMessageId === "string" && source.replacedMessageId.length <= 200
     ? { coalesced: true, replacedMessageId: source.replacedMessageId }
     : undefined;
+
+/** Copy only the fixed, bounded owner advisory for this exact pending target. */
+const runningTaskWarningOf = (source: Record<string, unknown>, targetId: string): { warning: AgentFollowUpRunningWarning } | undefined => {
+  const warning = source.warning;
+  if (source.accepted !== true || !isObject(warning) ||
+    warning.code !== "FABRIC_FOLLOW_UP_RUNNING_TASK" || warning.kind !== "agent" || warning.status !== "running" ||
+    typeof warning.targetId !== "string" || !warning.targetId || warning.targetId.length > 200 || warning.targetId !== targetId ||
+    warning.message !== FOLLOW_UP_RUNNING_TASK_MESSAGE || warning.message.length > 256) return undefined;
+  return { warning: {
+    code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: warning.targetId, kind: "agent", status: "running",
+    message: FOLLOW_UP_RUNNING_TASK_MESSAGE,
+  } };
+};
 
 export type FabricControlHandler = (
   command: FabricControlCommand,
@@ -364,6 +380,7 @@ export class FabricControlPlane {
       acknowledged: true,
       ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
       ...coalescedOf(acceptance as unknown as Record<string, unknown>),
+      ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, targetId),
     };
   }
 
@@ -710,6 +727,7 @@ export class FabricControlPlane {
       ...(typeof event.data.messageId === "string" ? { messageId: event.data.messageId } : {}),
       ...queueDepthOf(event.data),
       ...coalescedOf(event.data),
+      ...runningTaskWarningOf(event.data, pending.targetId),
       ...(Object.prototype.hasOwnProperty.call(event.data, "result")
         ? { result: event.data.result }
         : {}),
@@ -1091,6 +1109,7 @@ export class FabricControlPlane {
           ...(acceptance.messageId ? { messageId: acceptance.messageId } : {}),
           ...queueDepthOf(acceptance as unknown as Record<string, unknown>),
           ...coalescedOf(acceptance as unknown as Record<string, unknown>),
+          ...runningTaskWarningOf(acceptance as unknown as Record<string, unknown>, command.targetId),
           ...(Object.prototype.hasOwnProperty.call(acceptance, "result")
             ? { result: acceptance.result }
             : {}),

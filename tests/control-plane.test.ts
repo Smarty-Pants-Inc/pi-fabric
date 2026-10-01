@@ -52,6 +52,44 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  it("followUp advisory A6 validates incoming ACKs without changing success or retrying", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-followup-ack-")); roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender");
+    sender.start(() => ({ accepted: false }));
+    const valid = {
+      code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: "agent:target", kind: "agent", status: "running",
+      message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.",
+    };
+    // Publish directly: exercise the sender's parser independently of owner-side serialization.
+    const variants = [undefined, null, "warning", [], {},
+      { ...valid, code: "other" }, { ...valid, kind: "main" }, { ...valid, status: "completed" },
+      { ...valid, message: "sender-supplied text" }, { ...valid, message: "x".repeat(257) },
+      { ...valid, targetId: "agent:other" }, { ...valid, targetId: "x".repeat(201) },
+      { ...valid, targetId: 42 }, valid, { ...valid, privateData: "must not leak" }];
+    for (const [index, warning] of variants.entries()) {
+      const outcome = sender.request("host:owner", "agent:target", "followUp", { message: "later" });
+      await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(index + 1));
+      const command = sender.mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.data as { commandId: string };
+      await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:owner"), to: "host:sender",
+        data: { version: 1, commandId: command.commandId, targetId: "agent:target", accepted: true, messageId: "accepted", ...(warning === undefined ? {} : { warning }) } });
+      expect(await outcome).toEqual({ queued: true, messageId: "accepted", routed: "mesh", acknowledged: true,
+        ...(index >= variants.length - 2 ? { warning: valid } : {}) });
+    }
+    expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(variants.length);
+    // A matching target still has to satisfy the bound; mismatch alone must not cover this check.
+    for (const length of [200, 201]) {
+      const targetId = "x".repeat(length);
+      const outcome = sender.request("host:owner", targetId, "followUp", { message: "later" });
+      await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(variants.length + length - 199));
+      const command = sender.mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.data as { commandId: string };
+      await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:owner"), to: "host:sender",
+        data: { version: 1, commandId: command.commandId, targetId, accepted: true, messageId: "bounded", warning: { ...valid, targetId } } });
+      expect(await outcome).toEqual({ queued: true, messageId: "bounded", routed: "mesh", acknowledged: true,
+        ...(length === 200 ? { warning: { ...valid, targetId } } : {}) });
+    }
+    expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(variants.length + 2);
+  });
+
   it.each(["Escape", "ordinary timeout", "forged ceiling", "cloned ceiling", "ceiling without policy"])("still cancels the owner for %s, never from guest ceiling text", async cause => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-ceiling-")); roots.push(root);
     const owner = plane(path.join(root, "mesh"), "session:owner0000");

@@ -298,7 +298,8 @@ export class AgentMessageRouter {
         kind === "steer"
           ? this.manager.steer(id, message, data, provenance)
           : this.manager.followUp(id, message, data, provenance);
-      return { queued: true, messageId: result.messageId, routed: "local" };
+      return { queued: true, messageId: result.messageId, routed: "local",
+        ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
     }
@@ -489,7 +490,8 @@ export class AgentMessageRouter {
         command.operation === "steer"
           ? this.manager.steer(command.targetId, message, command.data, provenance)
           : this.manager.followUp(command.targetId, message, command.data, provenance);
-      return { accepted: true, messageId: result.messageId };
+      return { accepted: true, messageId: result.messageId,
+        ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
         return { accepted: false, error: error instanceof Error ? error.message : String(error) };

@@ -295,8 +295,8 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       endWord();
       // Only an explicit stdin source overrides feed. Output and descriptor duplication do not.
       fd = descriptor === undefined ? c === "<" ? 0 : 1 : Number(descriptor);
-      both = c === "&";
-      write = c === ">" || both;
+      both = false; // Both-output forms already refuse above; here c is only '<' or '>'.
+      write = c === ">";
       duplicate = text[index + 1] === "&";
       here = c === "<" && text.startsWith("<<<", index);
       input = c === "<" && (descriptor === undefined || descriptor === "0") && !duplicate;

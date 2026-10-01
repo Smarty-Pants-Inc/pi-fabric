@@ -59,7 +59,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
   }, 30_000);
 
   /** A fresh `records` database (the name the install's hba admits), migrated as the owner. */
-  const freshService = async (overrides: Partial<RecordsServiceConfig> = {}) => {
+  const freshService = async (overrides: Partial<RecordsServiceConfig> = {}, now?: () => number) => {
     const admin = new pg.Client({ ...server.connection, user: "postgres" });
     await admin.connect();
     await admin.query("DROP DATABASE IF EXISTS records WITH (FORCE)");
@@ -77,7 +77,7 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     try { await migrate(client); } finally { client.release(); }
     const pool = new pg.Pool({ ...config.database, max: 6 });
     pool.on("error", () => undefined);
-    const service = await RecordsServer.open(config, { pool: pool as unknown as ClientPool });
+    const service = await RecordsServer.open(config, { pool: pool as unknown as ClientPool, ...(now ? { now } : {}) });
     await service.listen();
     cleanups.push(() => service.close(), () => owner.end());
     return { config, service, owner };
@@ -109,6 +109,121 @@ describe.skipIf(!canRun)("the records service (C10)", () => {
     cleanups.push(() => other.close());
     await expect(other.listen()).rejects.toThrow(`records service already listening on ${socket}`);
     expect((await alice.read({ id: ALICE }, {})).frontier).toBe(0);
+  });
+
+  it("exports anchors and refreshes the heartbeat at startup and on due idle ticks independently of admission, and stops at shutdown", async () => {
+    const directory = path.join(dir, "public-anchors");
+    const statusFile = path.join(dir, "export-status.json");
+    let now = 1_000_000;
+    const { config, service } = await freshService({ anchorExport: { directory, intervalMs: 300_000 }, statusFile }, () => now);
+    const file = path.join(directory, "anchors-000000000001.jsonl");
+    const anchors = () => fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(anchors()).toEqual([{ org: config.org, seq: 0, hash: null, at: expect.any(String) }]);
+    const heartbeatFile = path.join(directory, "HEARTBEAT.json");
+    const heartbeat = () => JSON.parse(fs.readFileSync(heartbeatFile, "utf8"));
+    expect(heartbeat()).toEqual({ org: config.org, lastSeq: 0, lastHash: null, checkedAt: expect.any(String) });
+    const initialHeartbeat = fs.statSync(heartbeatFile).ino;
+    expect(service.gate.enabled).toBe(false);
+    const alice = await connect(config, ALICE);
+    await alice.append({ id: ALICE }, { ref: REF, kind: "comment", key: "export-tick", text: "landed" });
+    now += 299_999;
+    await service.watchdog.tick();
+    expect(anchors()).toHaveLength(1);
+    expect(fs.statSync(heartbeatFile).ino).toBe(initialHeartbeat); // no check before export is due
+    now++;
+    await service.watchdog.tick();
+    const computed = await alice.anchor({ id: ALICE }, {});
+    expect(anchors()[1]).toEqual({ ...computed, at: expect.any(String) });
+    expect(heartbeat()).toEqual({ org: config.org, lastSeq: 1, lastHash: computed.hash, checkedAt: expect.any(String) });
+    expect(fs.statSync(heartbeatFile).ino).not.toBe(initialHeartbeat);
+    const changedHeartbeat = fs.statSync(heartbeatFile).ino;
+    const changedCheckedAt = Date.parse(heartbeat().checkedAt);
+    const changedBytes = fs.readFileSync(file, "utf8");
+    expect((await service.status()).anchorExport).toMatchObject({ directory, intervalMs: 300_000, last: { seq: 1, hash: computed.hash } });
+    now += 300_000;
+    await service.watchdog.tick();
+    expect(anchors()).toHaveLength(2); // unchanged database is not another anchor
+    expect(fs.readFileSync(file, "utf8")).toBe(changedBytes);
+    expect(fs.statSync(heartbeatFile).ino).not.toBe(changedHeartbeat); // idle check still atomically refreshes liveness
+    expect(heartbeat()).toEqual({ org: config.org, lastSeq: 1, lastHash: computed.hash, checkedAt: expect.any(String) });
+    expect(Date.parse(heartbeat().checkedAt)).toBeGreaterThanOrEqual(changedCheckedAt);
+    await service.close(); // also drains the readable status file
+    expect(JSON.parse(fs.readFileSync(statusFile, "utf8")).anchorExport).toMatchObject({ directory, last: { seq: 1 } });
+    const before = fs.readFileSync(file, "utf8");
+    const heartbeatBeforeClose = fs.readFileSync(heartbeatFile, "utf8");
+    await expect(service.watchdog.tick()).rejects.toThrow(/closed/);
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+    expect(fs.readFileSync(heartbeatFile, "utf8")).toBe(heartbeatBeforeClose);
+  });
+
+  it("the scheduled watchdog publishes a changed anchor without a caller triggering a tick", async () => {
+    const directory = path.join(dir, "scheduled-anchors");
+    const { config, service } = await freshService({ anchorExport: { directory, intervalMs: 1_000 } });
+    const alice = await connect(config, ALICE);
+    await alice.append({ id: ALICE }, { ref: REF, kind: "comment", key: "scheduled-export", text: "landed" });
+    const file = path.join(directory, "anchors-000000000001.jsonl");
+    await vi.waitFor(() => expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(2), { timeout: 5_000 });
+    expect((await service.status()).anchorExport).toMatchObject({ last: { seq: 1 } });
+  });
+
+  it("reports export failure and recovers on the next tick without changing prior bytes", async () => {
+    const directory = path.join(dir, "recovering-anchors");
+    let now = 1_000_000;
+    const { config, service } = await freshService({ anchorExport: { directory, intervalMs: 300_000 } }, () => now);
+    const alice = await connect(config, ALICE);
+    await alice.append({ id: ALICE }, { ref: REF, kind: "comment", key: "export-recover", text: "landed" });
+    const file = path.join(directory, "anchors-000000000001.jsonl");
+    const before = fs.readFileSync(file, "utf8");
+    fs.chmodSync(file, 0o600);
+    now += 300_000;
+    await service.watchdog.tick();
+    expect((await service.status()).anchorExport).toMatchObject({ error: expect.stringMatching(/0644/) });
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+    fs.chmodSync(file, 0o644);
+    await service.watchdog.tick();
+    expect((await service.status()).anchorExport).not.toHaveProperty("error");
+    expect(fs.readFileSync(file, "utf8").startsWith(before)).toBe(true);
+    expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  it("verifies every retained anchor across the 9,999 rollover and detects tampering in either segment", async () => {
+    const directory = path.join(dir, "verified-anchors");
+    let now = 1_000_000;
+    const { config, service } = await freshService({ anchorExport: { directory, intervalMs: 300_000 } }, () => now);
+    const alice = await connect(config, ALICE);
+    await alice.append({ id: ALICE }, { ref: REF, kind: "comment", key: "boundary-1", text: "first" });
+    const first = await alice.anchor({ id: ALICE }, {});
+    const file = path.join(directory, "anchors-000000000001.jsonl");
+    // Seed the boundary without thousands of database writes; preserve the startup line.
+    fs.appendFileSync(file, `${JSON.stringify(first)}\n`.repeat(9_997));
+    await alice.append({ id: ALICE }, { ref: REF, kind: "comment", key: "boundary-2", text: "second" });
+    now += 300_000;
+    await service.watchdog.tick();
+    const sealed = fs.readFileSync(file, "utf8");
+    const older = sealed.trim().split("\n").map((line) => JSON.parse(line));
+    expect(older).toHaveLength(9_999);
+    await alice.append({ id: ALICE }, { ref: REF, kind: "comment", key: "boundary-3", text: "third" });
+    now += 300_000;
+    await service.watchdog.tick();
+    expect(fs.readFileSync(file, "utf8")).toBe(sealed);
+    const newer = fs.readFileSync(path.join(directory, "anchors-000000000002.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(await alice.verify({ id: ALICE }, { anchors: older })).toMatchObject({ ok: true, clean: false, anchors: { checked: 9_998, passed: 9_998, failed: 0 } }); // seq 0 vouches for nothing
+    expect(await alice.verify({ id: ALICE }, { anchors: newer })).toMatchObject({ ok: true, clean: true, anchors: { checked: 1, passed: 1, failed: 0 } });
+    const tamperedOlder = older.map((item, n) => n === 5_000 ? { ...item, hash: "f".repeat(64) } : item);
+    expect(await alice.verify({ id: ALICE }, { anchors: tamperedOlder })).toMatchObject({ ok: false, anchors: { checked: 9_998, passed: 9_997, failed: 1 } });
+    expect(await alice.verify({ id: ALICE }, { anchors: [{ ...newer[0], hash: "f".repeat(64) }] })).toMatchObject({ ok: false, clean: false, anchors: { failed: 1 } });
+  });
+
+  it("keeps anchor and verify socket methods authenticated while the export is public", async () => {
+    const { config } = await freshService({ anchorExport: { directory: path.join(dir, "auth-anchors"), intervalMs: 300_000 } });
+    const raw = await rawClient(config.socket);
+    raw.send({ id: 1, method: "anchor", args: { args: {} } });
+    raw.send({ id: 2, method: "verify", args: { args: {} } });
+    expect((await raw.response(1))?.error?.code).toBe("RECORD_UNAUTHENTICATED");
+    expect((await raw.response(2))?.error?.code).toBe("RECORD_UNAUTHENTICATED");
+    const alice = await connect(config, ALICE);
+    expect(await alice.anchor({ id: ALICE }, {})).toMatchObject({ org: config.org, seq: 0, hash: null });
+    expect(await alice.verify({ id: ALICE }, {})).toMatchObject({ ok: true, clean: true });
   });
 
   it("appends and reads over the socket, with a same-key retry returning the same receipt", async () => {

@@ -48,7 +48,7 @@ import {
   DEFAULT_FABRIC_CONFIG,
   effectiveToolCaptureConfig,
 } from "./config.js";
-import { registerCompactionHook } from "./compaction/hook.js";
+import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
 import {
   createToolOwnershipReassertion,
@@ -967,7 +967,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // Deterministic, LLM-free compaction is registered unconditionally and is
   // active by default. The documented "pi" escape hatch returns early so
   // pi-core's own summarization proceeds normally.
-  registerCompactionHook(pi, {
+  registerLazyCompactionHook(pi, {
     getEngine: () =>
       state.cwd
         ? state.config.compaction.engine

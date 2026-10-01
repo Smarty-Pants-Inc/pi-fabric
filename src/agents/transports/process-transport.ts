@@ -17,6 +17,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       request.workerPath,
       request.workerArguments,
       request.cwd,
+      request,
     );
     return {
       kind: this.kind,

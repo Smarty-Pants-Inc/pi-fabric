@@ -866,8 +866,11 @@ const notifyInstructionError = (
   context.ui.notify(clipUtf8(`Fabric compaction rejected: ${error.code}: ${error.message}`, 512), "error");
 };
 
-export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHookOptions): void => {
-  pi.on("session_before_compact", (event: SessionBeforeCompactEvent, context: ExtensionContext) => {
+export const handleFabricBeforeCompact = (
+  event: SessionBeforeCompactEvent,
+  context: ExtensionContext,
+  options: CompactionHookOptions,
+) => {
     if (event.customInstructions === "__pi_vcc__") return;
     const { preparation, branchEntries } = event;
     const contextWindow = context?.model?.contextWindow;
@@ -938,9 +941,13 @@ export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHook
     }
     (event as SessionBeforeCompactEvent & { _fabricCompaction?: boolean })._fabricCompaction = true;
     return { compaction: result.compaction };
-  });
+};
 
-  pi.on("session_before_tree", (event: SessionBeforeTreeEvent, context: ExtensionContext) => {
+export const handleFabricBeforeTree = (
+  event: SessionBeforeTreeEvent,
+  context: ExtensionContext,
+  options: CompactionHookOptions,
+) => {
     if (options.getEngine() !== "fabric") return;
     const { preparation } = event;
     if (!preparation.userWantsSummary) return;
@@ -961,5 +968,10 @@ export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHook
     );
     if (!compiled) return;
     return { summary: compiled };
-  });
+};
+
+// Keep the synchronous entrypoint for callers that already use the compaction engine.
+export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHookOptions): void => {
+  pi.on("session_before_compact", (event, context) => handleFabricBeforeCompact(event, context, options));
+  pi.on("session_before_tree", (event, context) => handleFabricBeforeTree(event, context, options));
 };

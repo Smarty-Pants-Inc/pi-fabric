@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crossSpawn from "cross-spawn";
 import { observeResidentOwner } from "./launcher-owner.js";
+import { residentProcessAlive } from "./process-identity.js";
 
 // Same pattern as worker.ts: on Windows, `pi` resolves to a node_modules/.bin
 // .cmd shim that a raw spawn cannot execute, and a .js pi entry must run under
@@ -41,10 +42,9 @@ const readConfig = (configPath: string): { cwd: string; piBinary: string } => {
 
 const liveOwnerPid = (ownerPath: string): number | undefined => {
   try {
-    const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as { pid?: unknown };
+    const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as { pid?: unknown; processStartTime?: string };
     if (typeof owner.pid !== "number") return undefined;
-    process.kill(owner.pid, 0);
-    return owner.pid;
+    return residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
   } catch {
     return undefined;
   }

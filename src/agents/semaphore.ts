@@ -13,12 +13,18 @@ export class Semaphore {
     if (!Number.isInteger(limit) || limit < 1) throw new Error("Semaphore limit must be positive");
   }
 
+  /** Reserve an available permit synchronously, without joining the FIFO queue. */
+  tryAcquire(signal?: AbortSignal): (() => void) | undefined {
+    if (signal?.aborted) throw new Error("Operation aborted");
+    if (this.#active >= this.limit || this.#waiters.length > 0) return undefined;
+    this.#active++;
+    return this.#releaseFunction();
+  }
+
   acquire(signal?: AbortSignal): Promise<() => void> {
     if (signal?.aborted) return Promise.reject(new Error("Operation aborted"));
-    if (this.#active < this.limit) {
-      this.#active++;
-      return Promise.resolve(this.#releaseFunction());
-    }
+    const release = this.tryAcquire(signal);
+    if (release) return Promise.resolve(release);
     return new Promise((resolve, reject) => {
       const waiter: SemaphoreWaiter = {
         resolve,

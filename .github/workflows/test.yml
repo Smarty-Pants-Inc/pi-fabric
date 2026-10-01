@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   check:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: ${{ matrix.name }}
     # Forge disposable VMs have 2 vCPU / 8 GB; the shared pool caps at 7 VMs.
     timeout-minutes: 30

@@ -156,6 +156,18 @@ describe("Fabric outer tool lifecycle", () => {
   });
 });
 
+describe("Exclusive native orchestrator prefix gate", () => {
+  it.each(["codemode", "tool_search"])("blocks prefixed top-level %s with and without an outer call in schema off", async toolName => {
+    for (const tracked of [false, true]) {
+      const authorize = vi.fn(async () => {}); // schema.mode=off
+      const lifecycle = new FabricToolLifecycle(() => true, () => ({ authorize }), () => undefined, () => false, () => true);
+      if (tracked) await lifecycle.toolCall({ type: "tool_call", toolCallId: "outer", toolName: "fabric_exec", input: {} });
+      expect(await lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}stale-top-level`, toolName, input: {} })).toMatchObject({ block: true });
+      expect(authorize).not.toHaveBeenCalled();
+      lifecycle.clear();
+    }
+  });
+});
 describe("Direct top-level tool approval gate", () => {
   it.each(["codemode", "tool_search"])("blocks stale native %s calls at execution, independent of loadout visibility", async toolName => {
     let exclusive = true;
@@ -323,6 +335,123 @@ describe("Schema top-level tool gate", () => {
       input: {},
     })).resolves.toBeUndefined();
     expect(nested.decisions).toEqual([]);
+  });
+
+  it.each(["child-first", "outer-first"])("revokes native prefixed child grants in %s result order", async order => {
+    const { lifecycle } = gate("enforce");
+    const childId = `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`;
+    const call = (id: string) => ({ type: "tool_call" as const, toolCallId: id, toolName: "fabric_exec", input: {} });
+    const result = (id: string): ToolResultEvent => ({ type: "tool_result", toolCallId: id, toolName: "fabric_exec", input: {}, content: [], details: undefined, isError: false });
+    await lifecycle.toolCall(call("outer"));
+    await lifecycle.runOwned("outer", undefined, async () => {
+      await lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured`, toolName: "captured_fixture", input: {} });
+      expect(await lifecycle.toolCall({ ...call(childId), parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured` })).toBeUndefined();
+      const ids = order === "outer-first" ? ["outer", childId] : [childId, "outer"];
+      lifecycle.toolResult(result(ids[0]!));
+      if (order === "outer-first") {
+        await expect(lifecycle.runOwned(childId, undefined, async () => 1)).rejects.toThrow("authorization has ended");
+      }
+      lifecycle.toolResult(result(ids[1]!));
+    });
+    await expect(lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}later`, toolName: "write", input: {} })).rejects.toThrow("blocked schema.top_level_tool.write");
+  });
+
+  it.each(["settle", "error", "abort", "result", "clear"])("revokes a near-end nested execution on outer %s, without an unrelated root resurrecting it", async end => {
+    const { lifecycle } = gate("enforce");
+    const controller = new AbortController();
+    const childId = `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`;
+    const call = (id: string) => ({ type: "tool_call" as const, toolCallId: id, toolName: "fabric_exec", input: {} });
+    let release!: () => void;
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    let nested!: Promise<void>;
+    let late!: () => Promise<unknown>;
+    await lifecycle.toolCall(call("outer"));
+    const owned = lifecycle.runOwned("outer", controller.signal, async () => {
+      await lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured`, toolName: "captured_fixture", input: {} });
+      expect(await lifecycle.toolCall({ ...call(childId), parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured` })).toBeUndefined();
+      late = () => lifecycle.toolCall({ ...call(`${NESTED_TOOL_CALL_ID_PREFIX}captured/2`), parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured` });
+      // Start just before the outer returns; the child does not settle first.
+      nested = lifecycle.runOwned(childId, undefined, async () => {
+        await wait;
+        expect(await late()).toMatchObject({ block: true });
+        expect(await lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}child-write`, toolName: "write", input: {} })).toMatchObject({ block: true });
+      });
+      if (end === "abort") controller.abort();
+      if (end === "clear") lifecycle.clear();
+      if (end === "result") lifecycle.toolResult({ type: "tool_result", toolCallId: "outer", toolName: "fabric_exec", input: {}, content: [], details: undefined, isError: false });
+      if (end === "error") throw new Error("outer failed");
+    });
+    if (end === "error") await expect(owned).rejects.toThrow("outer failed");
+    else await owned;
+    // No result is required for execute-time revocation; prefix-only probes fail now.
+    await expect(lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}later-write`, toolName: "write", input: {} })).rejects.toThrow("blocked schema.top_level_tool.write");
+    expect(await late()).toMatchObject({ block: true });
+    await lifecycle.toolCall(call("unrelated-outer"));
+    release();
+    await nested;
+    await expect(lifecycle.runOwned(childId, undefined, async () => 1)).rejects.toThrow("authorization has ended");
+    lifecycle.clear();
+  });
+
+  it.each(["authorize", "approve"])("refuses native nested work whose outer settles during awaited %s", async stage => {
+    let release!: () => void;
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    const authorize = vi.fn(async () => { if (stage === "authorize") await wait; });
+    const approve = vi.fn(async () => { if (stage === "approve") await wait; });
+    const lifecycle = new FabricToolLifecycle(() => true, () => ({ authorize }), () => ({ approve }));
+    await lifecycle.toolCall({ type: "tool_call", toolCallId: "outer", toolName: "fabric_exec", input: {} });
+    let native!: Promise<unknown>;
+    await lifecycle.runOwned("outer", undefined, async () => {
+      native = lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`, parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured`, toolName: "write", input: {} }, {} as ExtensionContext);
+      // Allow the hook to reach its asynchronous approval/authorization wait.
+      await Promise.resolve();
+    });
+    release();
+    expect(await native).toMatchObject({ block: true });
+    if (stage === "authorize") expect(approve).not.toHaveBeenCalled();
+    lifecycle.clear();
+  });
+
+  it("does not let a retained native parent borrow a different executing outer grant", async () => {
+    const { lifecycle } = gate("enforce");
+    const call = (id: string) => ({ type: "tool_call" as const, toolCallId: id, toolName: "fabric_exec", input: {} });
+    const parentId = `${NESTED_TOOL_CALL_ID_PREFIX}old-captured`;
+    const child = { ...call(`${parentId}/1`), parentToolCallId: parentId };
+    await lifecycle.toolCall(call("old-outer"));
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const old = lifecycle.runOwned("old-outer", undefined, async () => {
+      await lifecycle.toolCall({ type: "tool_call", toolCallId: parentId, toolName: "captured_fixture", input: {} });
+      entered(); await hold;
+    });
+    await ready;
+    await lifecycle.toolCall(call("new-outer"));
+    await lifecycle.runOwned("new-outer", undefined, async () => {
+      expect(await lifecycle.toolCall(child)).toMatchObject({ block: true }); // old parent is still live, but not ours
+      release(); await old;
+      expect(await lifecycle.toolCall(child)).toMatchObject({ block: true }); // old parent has settled
+    });
+    lifecycle.clear();
+  });
+
+  it("keeps outer failure-status repair after bound execute settles and repairs tracked native prefixed results", async () => {
+    const { lifecycle } = gate("enforce");
+    const call = { type: "tool_call" as const, toolCallId: "outer", toolName: "fabric_exec", input: {} };
+    const childId = `${NESTED_TOOL_CALL_ID_PREFIX}captured/1`;
+    await lifecycle.toolCall(call);
+    const execute = vi.fn(async () => {
+      await lifecycle.toolCall({ type: "tool_call", toolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured`, toolName: "captured_fixture", input: {} });
+      await lifecycle.toolCall({ ...call, toolCallId: childId, parentToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}captured` });
+      return { content: [], details: { success: false } };
+    });
+    const tool = lifecycle.bindExecution({ name: "fabric_exec", execute } as unknown as import("@earendil-works/pi-coding-agent").ToolDefinition<any, any, any>);
+    await tool.execute("outer", {}, undefined, undefined, {} as Parameters<typeof tool.execute>[4]);
+    for (const id of [childId, "outer"]) {
+      expect(lifecycle.toolResult({ type: "tool_result", toolCallId: id, toolName: "fabric_exec", input: {}, content: [], details: { success: false }, isError: false })).toEqual({ isError: true });
+    }
+    expect(execute).toHaveBeenCalledOnce();
   });
 
   it("records would-block in audit mode and leaves off mode unchanged", async () => {

@@ -748,7 +748,7 @@ export class PiToolsProvider implements FabricProvider {
         throw piBashResultError(thrown, textContent(result.content));
       }
       const text = textContent(result.content).trim();
-      throw new Error(text || (thrown instanceof Error ? thrown.message : `Pi tool ${name} failed`));
+      throw new Error(text || `Pi tool ${name} failed`);
     }
     this.#attachPreview(name, result, args, context);
     return this.#normalizeResult(name, result, args);

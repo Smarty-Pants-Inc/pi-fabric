@@ -248,7 +248,7 @@ export class CapturedToolsProvider implements FabricProvider {
       }
       const text = textFromContent(result.content).trim();
       throw new Error(
-        text || (thrown instanceof Error ? thrown.message : `Captured tool ${entry.name} failed`),
+        text || `Captured tool ${entry.name} failed`,
       );
     }
     return asInvocationResult(entry, result, false);

@@ -309,20 +309,6 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     return { skillPaths: fabricSkillPaths(FABRIC_SKILLS_DIR, state.config.executor.kernel) };
   });
 
-  const fabricTool = createFabricExecTool(
-    state,
-    codePreviewSettings,
-    pendingHandoffs,
-    decorateShell,
-    toolDisplay,
-  );
-  const refreshCodePreviewSettings = (): void => {
-    Object.assign(codePreviewSettings, state.config.codePreview);
-    configureHighlighting(
-      codePreviewSettings.shikiTheme,
-      codePreviewSettings.syntaxHighlighting,
-    );
-  };
   const fabricToolLifecycle = new FabricToolLifecycle(
     () => ownsFabricToolSource(pi.getAllTools(), FABRIC_EXTENSION_ENTRY_PATH),
     () => state.initialized ? state.execution.authorizer : undefined,
@@ -330,7 +316,20 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     () => ownsRunReplyTool(pi.getAllTools()),
     fabricOwnsModelTools,
   );
-
+  const fabricTool = fabricToolLifecycle.bindExecution(createFabricExecTool(
+    state,
+    codePreviewSettings,
+    pendingHandoffs,
+    decorateShell,
+    toolDisplay,
+  ));
+  const refreshCodePreviewSettings = (): void => {
+    Object.assign(codePreviewSettings, state.config.codePreview);
+    configureHighlighting(
+      codePreviewSettings.shikiTheme,
+      codePreviewSettings.syntaxHighlighting,
+    );
+  };
   const inactiveCapturePolicy = {
     ...structuredClone(DEFAULT_FABRIC_CONFIG.capture),
     enabled: false,
@@ -355,7 +354,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     toolCapture.setPolicy(capturePolicy());
     Object.assign(
       fabricTool,
-      createFabricExecTool(state, codePreviewSettings, pendingHandoffs, decorateShell, toolDisplay),
+      fabricToolLifecycle.bindExecution(createFabricExecTool(state, codePreviewSettings, pendingHandoffs, decorateShell, toolDisplay)),
     );
     pi.registerTool(fabricTool);
     toolOwnership.apply(
@@ -740,6 +739,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   });
 
   pi.on("agent_settled", async (event, context) => {
+    fabricToolLifecycle.clear();
     inboxWake.settling = true;
     try {
       await settle(event, context);

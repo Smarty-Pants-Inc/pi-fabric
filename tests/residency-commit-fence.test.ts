@@ -560,7 +560,8 @@ const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, m
   const registered = new Map<string, ToolDefinition<any, any, any>>();
   const api = {
     events: { emit: vi.fn(), on: vi.fn(() => () => {}) },
-    getActiveTools: vi.fn(() => ["fabric_exec"]), getAllTools: vi.fn(() => []), on: vi.fn(),
+    getActiveTools: vi.fn(() => ["fabric_exec"]),
+    getAllTools: vi.fn(() => [{ name: "fabric_exec", sourceInfo: { path: path.resolve("src/index.ts") } }]), on: vi.fn(),
     registerCommand: vi.fn(), registerMessageRenderer: vi.fn(), setActiveTools: vi.fn(),
     registerTool: vi.fn((tool: ToolDefinition<any, any, any>) => registered.set(tool.name, tool)),
   };
@@ -574,7 +575,14 @@ const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, m
   } as unknown as FabricInvocationContext["extensionContext"];
   let sequence = 0;
   return async (code: string, signal?: AbortSignal) => {
-    const result = await tool.execute(`round4-${++sequence}`, { code }, signal, undefined, context as Parameters<typeof tool.execute>[4]);
+    const toolCallId = `round4-${++sequence}`;
+    // Registered execution now binds its grant to the real host tool_call
+    // admission. Do not bypass that boundary in this direct-execute fixture.
+    for (const [name, handler] of api.on.mock.calls as unknown as Array<[string, (event: unknown, context: unknown) => Promise<{ block?: boolean } | undefined>]>) {
+      if (name !== "tool_call") continue;
+      expect((await handler({ type: "tool_call", toolName: "fabric_exec", toolCallId, input: { code } }, context))?.block).not.toBe(true);
+    }
+    const result = await tool.execute(toolCallId, { code }, signal, undefined, context as Parameters<typeof tool.execute>[4]);
     // Pi's ToolDefinition return type omits the runtime-supported isError flag.
     return result as typeof result & { isError?: boolean };
   };

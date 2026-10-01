@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   createBashToolDefinition,
+  createReadToolDefinition,
   createSyntheticSourceInfo,
   ExtensionRunner,
   type ExtensionContext,
@@ -21,6 +22,12 @@ import { MeshStore } from "../src/mesh/store.js";
 import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { TranscriptAccumulator } from "../src/ui/transcript-parser.js";
+import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+
+vi.mock("@earendil-works/pi-coding-agent", async importOriginal => {
+  const host = await importOriginal<typeof import("@earendil-works/pi-coding-agent")>();
+  return { ...host, createReadToolDefinition: vi.fn(host.createReadToolDefinition) };
+});
 
 const cwd = process.cwd();
 // Deliberately not a credential-shaped token: downstream generic sanitizers
@@ -87,6 +94,50 @@ async function assertConsumers(event: Record<string, any>) {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 
+describe("thrown non-shell error blank redaction", () => {
+  it.each(["native", "captured", "outputSchema"])("%s guest rejection, outer audit/final result and nested consumers never restore the exception", async kind => {
+    for (const content of [[], [{ type: "text" as const, text: "" }], [{ type: "text" as const, text: " \t\n " }]]) {
+      const name = kind === "native" ? "read" : "throwing_fixture";
+      if (kind === "native") {
+        // Throw from a real native definition's execute, not a captured override
+        // or a hook. Input arguments deliberately do not contain the marker.
+        const native = createReadToolDefinition(cwd);
+        vi.mocked(createReadToolDefinition).mockReturnValueOnce({ ...native, async execute() { throw new Error(secret); } });
+      }
+      const definition = registered({
+        name, label: "Thrown fixture", description: "Private error fixture", parameters: Type.Object({}),
+        ...(kind === "outputSchema" ? { outputSchema: Type.Object({ output: Type.String() }) } : {}),
+        async execute() { throw new Error(secret); },
+      });
+      const s = setup(kind === "native" ? [] : [definition], () => ({ content }));
+      const provider = kind === "native"
+        ? new PiToolsProvider(cwd, s.catalog, new CapturedToolsProvider(s.catalog))
+        : new CapturedToolsProvider(s.catalog);
+      const registry = new ActionRegistry(); registry.register(provider);
+      const ref = kind === "native" ? "pi.read" : "extensions.throwing_fixture";
+      const args = kind === "native" ? { path: "README.md" } : {};
+      const audits: FabricCallAudit[] = [];
+      const observations: unknown[] = [];
+      const final = await new QuickJsRuntime().execute(
+        `return await tools.call({ ref: ${JSON.stringify(ref)}, args: ${JSON.stringify(args)} });`,
+        (action, input) => registry.invoke(action === "fabric.$call" ? input.ref as string : action, action === "fabric.$call" ? input.args as Record<string, unknown> : input, { ...context, audits, observeInvocation: event => { observations.push(event); } }),
+        { timeoutMs: 10_000, memoryLimitBytes: 32 * 1024 * 1024 },
+      );
+      const generic = kind === "native" ? "Pi tool read failed" : "Captured tool throwing_fixture failed";
+      expect(final.terminationReason).toBe("runtime_error");
+      expect(final.error).toContain(generic);
+      expect(audits).toHaveLength(1);
+      expect(audits[0]?.error).toBe(generic);
+      expect(vi.mocked(s.runner.emitToolResult).mock.calls[0]?.[0].content).toEqual([{ type: "text", text: secret }]);
+      const end = s.events.find(event => event.type === "tool_execution_end")!;
+      expect(end.isError).toBe(true);
+      expect(end.result.content).toEqual(content);
+      for (const publicValue of [final, audits, observations, s.postHook]) expect(JSON.stringify(publicValue)).not.toContain(secret);
+      await assertConsumers(end);
+      if (provider instanceof PiToolsProvider) await provider.close();
+    }
+  }, 30_000);
+});
 describe("nested tool_result structured redaction", () => {
   it.each([false, true])("native/captured=%s shell output never survives content-only redaction", async (captured) => {
     for (const exitCode of [0, 7]) {

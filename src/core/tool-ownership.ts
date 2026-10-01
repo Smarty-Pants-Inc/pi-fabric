@@ -1,9 +1,11 @@
 import path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   ToolCallEvent,
   ToolCallEventResult,
   ToolResultEvent,
   ExtensionContext,
+  ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { readFabricExecutionTraceV1 } from "../audit/index.js";
 import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX as NESTED_TOOL_CALL_ID_PREFIX } from "../protocol.js";
@@ -50,8 +52,17 @@ const finalFabricDetailsFailed = (details: unknown): boolean => {
   return trace !== undefined && trace.outcome !== "succeeded";
 };
 
+interface OwnedInvocation {
+  active: boolean;
+  parent?: OwnedInvocation;
+}
+
 export class FabricToolLifecycle {
-  readonly #outerCalls = new Set<string>();
+  readonly #ownedCalls = new Map<string, OwnedInvocation>();
+  readonly #nestedCalls = new Map<string, OwnedInvocation>();
+  // Failure-status repair must survive execute-time authorization revocation.
+  readonly #resultCalls = new Set<string>();
+  readonly #execution = new AsyncLocalStorage<OwnedInvocation>();
 
   constructor(
     readonly ownsFabricTool: () => boolean,
@@ -66,50 +77,113 @@ export class FabricToolLifecycle {
     event: ToolCallEvent,
     context?: ExtensionContext,
   ): Promise<ToolCallEventResult | undefined> {
-    // Native ctx.executeTool calls carry parentToolCallId. They have not gone
-    // through Fabric's registry/schema/approval pipeline, even when their id
-    // inherits our prefix from a captured caller. Do not grant them the
-    // already-authorized Fabric nested-call exemption.
-    const nativeNested = "parentToolCallId" in event && typeof event.parentToolCallId === "string";
-    if (event.toolCallId.startsWith(NESTED_TOOL_CALL_ID_PREFIX) && !nativeNested) {
-      if (this.#outerCalls.size > 0) return undefined;
-      await this.#authorizeTopLevel(event);
-      return undefined;
-    }
+    // A call id is never permission to enter a competing native orchestrator.
+    // Apply this backstop before *every* prefix/ownership shortcut, even off-schema.
     if (this.exclusive() && NATIVE_ORCHESTRATOR_NAMES.has(event.toolName)) {
-      // Registry refresh/MCP auto-activation can race loadout construction.
-      // Fail closed at execution too, even if a stale declaration escaped.
       return { block: true, reason: `Native ${event.toolName} is disabled while fabric_exec owns full-code or schema-enforce execution` };
     }
+    const nativeNested = "parentToolCallId" in event && typeof event.parentToolCallId === "string";
+    const owner = this.#execution.getStore();
+    // Async descendants retain their owner token, not a fresh ambient grant.
+    // An unrelated live outer call must not resurrect a settled owner's window.
+    if (owner && !this.#isLive(owner)) {
+      return { block: true, reason: "Fabric invocation authorization has ended" };
+    }
     if (event.toolName === FABRIC_TOOL_NAME && this.ownsFabricTool()) {
-      this.#outerCalls.add(event.toolCallId);
+      if (nativeNested) {
+        const parentId = event.parentToolCallId as string;
+        const parent = this.#ownedCalls.get(parentId) ?? this.#nestedCalls.get(parentId);
+        if (!owner || parent !== owner || !this.#isLive(parent)) {
+          return { block: true, reason: "Native nested fabric_exec requires a live owned Fabric invocation" };
+        }
+      }
+      this.#ownedCalls.set(event.toolCallId, { active: true, ...(owner ? { parent: owner } : {}) });
+      this.#resultCalls.add(event.toolCallId);
+      return undefined;
+    }
+    // Native ctx.executeTool calls have not passed Fabric's schema/approval
+    // pipeline, even when their id inherits the captured caller's prefix.
+    if (event.toolCallId.startsWith(NESTED_TOOL_CALL_ID_PREFIX) && !nativeNested) {
+      if (owner ? this.#isLive(owner) : this.#ownedCalls.size > 0) {
+        if (owner) this.#nestedCalls.set(event.toolCallId, owner);
+        return undefined;
+      }
+      await this.#authorizeTopLevel(event);
       return undefined;
     }
     if (event.toolName === REPLY_TOOL_NAME && this.ownsReplyTool()) return undefined;
     await this.#authorizeTopLevel(event);
+    if (owner && !this.#isLive(owner)) return { block: true, reason: "Fabric invocation authorization has ended" };
     const approver = this.approver();
     if (approver) {
       if (!context) throw new Error("Fabric direct tool approval needs an extension context");
       await approver.approve(event, context);
     }
+    if (owner) {
+      if (!this.#isLive(owner)) return { block: true, reason: "Fabric invocation authorization has ended" };
+      this.#nestedCalls.set(event.toolCallId, owner);
+    }
     return undefined;
   }
 
-  toolResult(event: ToolResultEvent): { isError: true } | undefined {
-    if (
-      event.toolName !== FABRIC_TOOL_NAME ||
-      event.toolCallId.startsWith(NESTED_TOOL_CALL_ID_PREFIX) ||
-      !this.#outerCalls.delete(event.toolCallId)
-    ) {
-      return undefined;
+  /** Bind the registered execute path, including re-created definitions after reload. */
+  bindExecution<T extends ToolDefinition<any, any, any>>(tool: T): T {
+    return {
+      ...tool,
+      execute: (id, args, signal, update, context) =>
+        this.runOwned(id, signal, () => tool.execute(id, args, signal, update, context)),
+    };
+  }
+
+  async runOwned<T>(id: string, signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
+    const invocation = this.#ownedCalls.get(id);
+    if (!invocation || !this.#isLive(invocation) || signal?.aborted) {
+      this.#revoke(id);
+      throw new Error("Fabric invocation authorization has ended");
     }
+    const abort = (): void => this.#revoke(id);
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      return await this.#execution.run(invocation, run);
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      this.#revoke(id);
+    }
+  }
+
+  toolResult(event: ToolResultEvent): { isError: true } | undefined {
+    this.#nestedCalls.delete(event.toolCallId);
+    if (event.toolName !== FABRIC_TOOL_NAME || !this.#resultCalls.delete(event.toolCallId)) return undefined;
+    // Native prefixed children were admitted too: insertion/cleanup is symmetric.
+    this.#revoke(event.toolCallId);
     return !event.isError && finalFabricDetailsFailed(event.details)
       ? { isError: true }
       : undefined;
   }
 
   clear(): void {
-    this.#outerCalls.clear();
+    for (const invocation of this.#ownedCalls.values()) invocation.active = false;
+    this.#ownedCalls.clear();
+    this.#nestedCalls.clear();
+    this.#resultCalls.clear();
+  }
+
+  #isLive(invocation: OwnedInvocation): boolean {
+    return invocation.active && (!invocation.parent || this.#isLive(invocation.parent));
+  }
+
+  #revoke(id: string): void {
+    const invocation = this.#ownedCalls.get(id);
+    if (!invocation) return;
+    invocation.active = false;
+    // Revocation cascades immediately; a child that has not returned cannot
+    // keep the root alive or authorize later calls from a retained context.
+    for (const [callId, grant] of this.#ownedCalls) {
+      if (!this.#isLive(grant)) this.#ownedCalls.delete(callId);
+    }
+    for (const [callId, grant] of this.#nestedCalls) {
+      if (!this.#isLive(grant)) this.#nestedCalls.delete(callId);
+    }
   }
 
   async #authorizeTopLevel(event: ToolCallEvent): Promise<void> {

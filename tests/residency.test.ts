@@ -1485,6 +1485,10 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh,
       participants: state.participants, mainAgent: state.mainAgent, hostPath });
     fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    // This is corruption/reuse within the new protocol, not permission to adopt
+    // an unproven legacy inode (which requires a verified drain).
+    const prior = new ResidentHost(state.config);
+    await prior.start(); await prior.close();
     const stale = { format: RESIDENT_HOST_FORMAT, hostId: client.hostId, pid: process.pid,
       processStartTime: "0", token: "stale", startedAt: 0, readyAt: 0 };
     for (const file of ["owner.json", "host.lock"]) fs.writeFileSync(path.join(state.config.residencyRoot, file), JSON.stringify(stale));

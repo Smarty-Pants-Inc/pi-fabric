@@ -223,6 +223,27 @@ export const workerCommand = async (
 ): Promise<string> =>
   (await scriptSpawnArgs(workerPath, workerArguments)).map(shellQuote).join(" ");
 
+type LinuxGroupMember = { pid: number; group: number; started: string; state: string };
+const linuxGroupMember = (pid: number): LinuxGroupMember | undefined => {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    return { pid, group: Number(fields[2]), started: fields[19]!, state: fields[0]! };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") return undefined;
+    throw error; // Unknown identity is not permission to signal or to report exit.
+  }
+};
+const linuxGroupMembers = (group: number): LinuxGroupMember[] =>
+  fs.readdirSync("/proc").flatMap((entry) => {
+    if (!/^\d+$/.test(entry)) return [];
+    const member = linuxGroupMember(Number(entry));
+    return member?.group === group && member.state !== "Z" && member.state !== "X" ? [member] : [];
+  });
+const STOP_TERM_MS = 2_000;
+const STOP_KILL_MS = 2_000;
+const stopDelay = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
+
 export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
@@ -238,24 +259,76 @@ export const spawnDetached = async (
   });
   if (!child.pid) throw new Error("Failed to launch Fabric worker process");
   const pid = child.pid;
-  // Once the worker exited, its numeric id is no identity: after its group empties, the id
-  // can name an unrelated process (group). So nothing is signalled or probed by number then.
-  // ponytail: descendants an exited worker left in its group are not signalled; liveness
-  // (and so relaunch) is about the worker itself.
+  // Exit is latched: after the worker/group empties its numeric id is not identity.
   let exited = false;
   child.once("exit", () => { exited = true; });
   child.unref();
+  let birth: LinuxGroupMember | undefined;
+  try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { /* stop fails closed on unknown identity */ }
+  let stopping: Promise<void> | undefined;
+  const owned = new Map<number, string>();
+  if (birth) owned.set(pid, birth.started);
+  let stopped = false;
+  const members = (): LinuxGroupMember[] => {
+    // A gone leader can no longer anchor group ownership (even if its PID is reused).
+    const current = linuxGroupMembers(pid).filter((member) => !exited || member.pid !== pid);
+    if (current.length && !current.some((member) => owned.get(member.pid) === member.started)) {
+      throw new Error(`Cannot confirm ownership/exit of Fabric process group ${pid}`);
+    }
+    for (const member of current) owned.set(member.pid, member.started);
+    return current;
+  };
+  const stop = async (): Promise<void> => {
+    if (stopped) return;
+    // Capture group identities BEFORE TERM, while the owned leader still pins it.
+    // A leader can exit before its refusing child. Retain that child's birth, not
+    // just a group number, and never adopt a recycled group with no owned member.
+    if (process.platform === "linux") members();
+    const settled = async (): Promise<boolean> => {
+      if (process.platform === "linux") return members().length === 0 && exited;
+      if (!exited) return false;
+      if (process.platform === "win32") return true;
+      // No birth identities off Linux: inspect, but never signal a group after
+      // its leader exits. A remaining/unknown group must not count as cleanup.
+      // Ignore the latched-dead leader number: it may now name someone unrelated.
+      const { stdout } = await executeFile("ps", ["-axo", "pid=,pgid=,stat="], { timeoutMs: 1_000 });
+      return !stdout.split("\n").some((line) => {
+        const [member, group, state] = line.trim().split(/\s+/);
+        return Number(group) === pid && Number(member) !== pid && !state?.startsWith("Z") && !state?.startsWith("X");
+      });
+    };
+    const signal = (value: NodeJS.Signals): void => {
+      if (process.platform === "linux") {
+        if (members().length === 0) return;
+      } else if (exited) return;
+      try { process.kill(process.platform === "win32" ? pid : -pid, value); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    };
+    const wait = async (ms: number): Promise<boolean> => {
+      const deadline = Date.now() + ms;
+      do { if (await settled()) return true; await stopDelay(); } while (Date.now() < deadline);
+      return settled();
+    };
+    signal("SIGTERM");
+    if (await wait(STOP_TERM_MS)) return;
+    signal("SIGKILL");
+    if (!(await wait(STOP_KILL_MS))) throw new Error(`Fabric worker ${pid} did not exit after bounded SIGTERM/SIGKILL cleanup`);
+  };
   return {
     pid,
     async stop() {
-      if (exited) return;
-      try {
-        process.kill(process.platform === "win32" ? pid : -pid, "SIGTERM");
-      } catch { /* process group already exited */ }
+      if (stopping) return stopping;
+      const pending = stop();
+      stopping = pending;
+      try { await pending; stopped = true; } finally { stopping = undefined; }
     },
     async isAlive() {
       if (exited) return false;
-      if (processIsAlive(pid)) return true;
+      if (processIsAlive(pid)) {
+        // Retain observed descendants before a launcher can exit ahead of its Pi child.
+        if (process.platform === "linux") { try { members(); } catch { /* stop must fail closed */ } }
+        return true;
+      }
       // Gone once is gone for good: the probe can see the exit before the "exit" event
       // (Windows), and any later answer for this number is another process.
       exited = true;

@@ -80,6 +80,10 @@ async def _responses(reader):
                 continue
             if message.get("ok") is True:
                 future.set_result(message.get("value"))
+                # Resolution admits this response. Send the correlated receipt
+                # before a resumed guest call or terminal result can overtake it.
+                if "responseId" in message:
+                    await _send({"type": "response_ack", "id": message["id"], "responseId": message["responseId"]})
             else:
                 future.set_exception(_HostError(message.get("error", "Host call failed"), message.get("bashExit")))
     except Exception as error:
@@ -193,8 +197,15 @@ def _error_text(error, source):
         if isinstance(original, SyntaxError) and original.filename == "fabric-exec.py":
             frames = []
         current.stack = traceback.StackSummary.from_list(frames)
-        if current.exc_type is _HostError:
-            current.exc_type = RuntimeError
+        if type(original) is _HostError:
+            # Python 3.14 derives read-only exc_type_str from these name fields.
+            if hasattr(current, "exc_type_qualname"):
+                current.exc_type_qualname = "RuntimeError"
+                current.exc_type_module = "builtins"
+            elif hasattr(current, "exc_type_str"):
+                current.exc_type_str = "RuntimeError"
+            else:
+                current.exc_type = RuntimeError
         if len(seen) >= 8:
             current.__cause__ = None
             current.__context__ = None

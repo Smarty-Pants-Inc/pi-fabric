@@ -9,7 +9,8 @@ describe("handoff completion message", () => {
     const sendMessage = vi.fn();
     queueHandoffCompletion({ sendMessage } as unknown as ExtensionAPI,
       { model: "provider/executor" },
-      { completed: true, status: "completed", implementation });
+      { completed: true, status: "completed", implementation },
+      { id: "session:test", name: "main", kind: "main" });
     return sendMessage.mock.calls[0]![0];
   };
 

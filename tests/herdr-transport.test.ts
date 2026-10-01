@@ -323,6 +323,29 @@ describe.skipIf(process.platform === "win32")("HerdrTransport", () => {
       expect(time.state.monotonic).toBeLessThanOrEqual(120_000);
     });
 
+    it("rechecks generation after a delayed spawn slot opens before creating a pane", async () => {
+      const { socketPath, requests } = await startServer();
+      const time = clock(3_000 * 60_000);
+      fs.mkdirSync(ledger(socketPath), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(ledger(socketPath), "3000-0"), "");
+      let authorized = true;
+      const transport = herdr(socketPath, {
+        spawnsPerMinute: 1, now: time.now, monotonicNow: time.monotonicNow, random: () => 0,
+        sleep: async (ms, signal) => { authorized = false; await time.sleep(ms, signal); },
+      });
+      await expect(transport.launch({ ...launchRequest, authorize: () => authorized })).rejects.toThrow("no longer authorized");
+      expect(time.state.sleeps).toHaveLength(1);
+      expect(applies(requests)).toBe(0);
+    });
+
+    it("rechecks authority at dispatch after asynchronous connection establishment", async () => {
+      const { socketPath, requests } = await startServer();
+      let checks = 0;
+      await expect(herdr(socketPath).launch({ ...launchRequest, authorize: () => ++checks < 2 })).rejects.toThrow("no longer authorized");
+      expect(checks).toBe(2);
+      expect(applies(requests)).toBe(0);
+    });
+
     it("stops waiting when the manager closes", async () => {
       const { socketPath, requests } = await startServer();
       const time = clock(3_000 * 60_000);

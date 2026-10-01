@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { fabricHostIdentity, sendFabricMessage } from "../fabric-provenance.js";
 import type { FabricPrewalkMode } from "../config.js";
 import { MAX_PREWALK_PLAN_PROMPTS } from "./controller.js";
 import type {
@@ -41,7 +42,7 @@ export const deliverPrewalkPlanCheckpoint = (
       )
     : [];
   try {
-    pi.sendMessage(
+    sendFabricMessage(pi,
       {
         customType: PREWALK_PLAN_MESSAGE_TYPE,
         content: prewalkPlanPrompt(arm.model),
@@ -54,7 +55,7 @@ export const deliverPrewalkPlanCheckpoint = (
           ...(files.length > 0 ? { files } : {}),
         },
       },
-      { deliverAs: "steer", triggerTurn: true },
+      { deliverAs: "steer", triggerTurn: true }, fabricHostIdentity(arm.sessionId), "steer", "mesh",
     );
     return true;
   } catch {

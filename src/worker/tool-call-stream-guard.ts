@@ -90,19 +90,29 @@ export class ToolCallStreamGuard {
     }
     call.bytes += Buffer.byteLength(text, "utf8");
     if (call.startedAt === undefined) {
-      call.startedAt = Date.now();
-      call.timer = setTimeout(() => this.#abort(index, call), TOOL_CALL_WHITESPACE_TIMEOUT_MS);
-      call.timer.unref?.();
+      call.startedAt = performance.now();
+      this.#armTimer(index, call, TOOL_CALL_WHITESPACE_TIMEOUT_MS);
     }
+    const elapsedMs = performance.now() - call.startedAt;
     if (call.bytes >= TOOL_CALL_WHITESPACE_MAX_BYTES ||
-        Date.now() - call.startedAt >= TOOL_CALL_WHITESPACE_TIMEOUT_MS) this.#abort(index, call);
+        elapsedMs >= TOOL_CALL_WHITESPACE_TIMEOUT_MS) this.#abort(index, call, elapsedMs);
   }
 
-  #abort(index: number, call: CallStream): void {
+  #armTimer(index: number, call: CallStream, delayMs: number): void {
+    call.timer = setTimeout(() => {
+      const elapsedMs = performance.now() - call.startedAt!;
+      // Timers can wake early: only the monotonic elapsed time authorizes a timeout.
+      if (elapsedMs >= TOOL_CALL_WHITESPACE_TIMEOUT_MS) this.#abort(index, call, elapsedMs);
+      else this.#armTimer(index, call, TOOL_CALL_WHITESPACE_TIMEOUT_MS - elapsedMs);
+    }, delayMs);
+    call.timer.unref?.();
+  }
+
+  #abort(index: number, call: CallStream, elapsedMs: number): void {
     if (this.#disposed) return;
     const { model, effort } = this.attribution();
     const error = new RunawayToolCallStreamError(
-      Date.now() - (call.startedAt ?? Date.now()), call.bytes, index, model ?? "unknown", effort ?? "unknown",
+      elapsedMs, call.bytes, index, model ?? "unknown", effort ?? "unknown",
     );
     this.dispose();
     this.fail(error);

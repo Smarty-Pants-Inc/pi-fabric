@@ -2,10 +2,8 @@
 
 Fabric supplies structured admission metadata with user-message injections and custom-message deliveries whose sender has a recorded verification method or is an explicitly registered in-process producer. Deliveries without that admission evidence carry no claim. Message text, names quoted in a report, and payload fields cannot select a human channel or principal.
 
-This is host extension metadata, not a `fabric_exec` guest binding:
-
 ```ts host
-const provenance = {
+provenance: {
   v: 1,
   channel: "fabric",
   sender: {
@@ -15,7 +13,7 @@ const provenance = {
     verified: "mesh"
   },
   via: "followUp"
-};
+}
 ```
 
 The sender comes from the mesh command/event envelope or the registered local producer. Mesh events record their admission method in `event.verification`; control and legacy relay delivery carry that record through to Main and its durable journal. A recorded `bridge` method yields `kind: "remote"`, even without an identity marker. An absent record (including commands from pre-change bridge processes) yields no claim: neither `from.verified` nor `data.bridge` grants verification. In-process producers explicitly supply `mesh`; it is never the default. Host-generated summaries, reload requests, shell notices, and prewalk directives identify the emitting Fabric runtime; reporting an actor failure does not impersonate the failing actor.

@@ -60,12 +60,20 @@ describe("checked agent release observations", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-query-deadline-"));
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, notifyOnComplete: false, retainRuns: false, nice: 19 },
       { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"), piBinary: process.execPath });
-    const launch = ProcessTransport.prototype.launch;
-    let handle: Awaited<ReturnType<typeof launch>> | undefined;
+    let worker: ChildProcess | undefined; let exited: Promise<void> | undefined;
+    let handle: Awaited<ReturnType<ProcessTransport["launch"]>> | undefined;
     let hung = false; let finishQuery!: () => void;
     const query = new Promise<boolean>(resolve => { finishQuery = () => resolve(false); });
-    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function(this: ProcessTransport, request) {
-      handle = await launch.call(this, request);
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      // This test mocks liveness, so own the fixture child and its close receipt too.
+      // fake-worker's HANG branch launches no descendants (piBinary is unused).
+      worker = spawn(process.execPath, [request.workerPath, ...request.workerArguments], { cwd: request.cwd, stdio: "ignore" });
+      exited = new Promise<void>((resolve, reject) => { worker!.once("error", reject); worker!.once("close", () => resolve()); });
+      handle = {
+        kind: "process", sessionId: String(worker.pid),
+        stop: async () => { worker!.kill("SIGTERM"); },
+        isAlive: async () => worker!.exitCode === null && worker!.signalCode === null,
+      };
       return { ...handle, relaunchable: false, isAlive: () => hung ? query : handle!.isAlive() };
     });
     let check: Promise<void> | undefined;
@@ -87,10 +95,10 @@ describe("checked agent release observations", () => {
     } finally {
       finishQuery(); hung = false; await check?.catch(() => undefined);
       await handle?.stop();
-      // stop() sends a signal; wait for the owned child's exit before removing its
-      // cwd. Windows keeps it locked until exit/handle release has completed.
-      const deadline = Date.now() + 5_000;
-      while (handle && await handle.isAlive() && Date.now() < deadline) await sleep(20);
+      // A PID liveness probe can report gone before Node has reaped/released its
+      // native ChildProcess handle on Windows. Await close, not just isAlive(),
+      // before removing the fixture cwd; synchronous rm retries block that callback.
+      await exited;
       if (handle) expect(await handle.isAlive()).toBe(false);
       spy.mockRestore(); await manager.close();
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });

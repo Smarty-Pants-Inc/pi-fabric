@@ -1,5 +1,5 @@
 import { ExecutionDeadline } from "./execution-deadline.js";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mainExecutionCeilingAbortReason, runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
@@ -25,14 +25,15 @@ interface ChildResultMessage {
   result: FabricSandboxResult;
 }
 
-type ChildMessage = ChildCallMessage | ChildResultMessage;
+interface ChildResponseAckMessage {
+  type: "response_ack";
+  id: number;
+  responseId: number;
+}
+
+type ChildMessage = ChildCallMessage | ChildResultMessage | ChildResponseAckMessage;
 
 const HOST_TASK_SETTLE_GRACE_MS = 250;
-
-const send = (child: ChildProcess, message: any): void => {
-  if (!child.connected) return;
-  child.send(message, () => undefined);
-};
 
 export class NodeProcessRuntime {
   readonly #interpreter: "node" | "bun";
@@ -109,6 +110,8 @@ export class NodeProcessRuntime {
     let settled = false;
     let finishing = false;
     const hostTasks = new Set<Promise<void>>();
+    let nextResponseId = 0;
+    const pendingReceipts = new Map<number, { id: number; commit: () => void }>();
 
     const guestBundle = options.transpiledCode === undefined
       ? transpileFabricCodeWithSourceMap(code)
@@ -124,6 +127,7 @@ export class NodeProcessRuntime {
           result = executionDeadline.timeoutResult([]);
         }
         settled = true;
+        pendingReceipts.clear();
         executionDeadline.clear();
         if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
         if (!hostAbortController.signal.aborted && hostTasks.size > 0) {
@@ -140,6 +144,28 @@ export class NodeProcessRuntime {
         finish(executionDeadline.timeoutResult([]));
       };
       const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
+      const send = (message: any, delivered?: () => void): void => {
+        if (settled || finishing || !child.connected) return;
+        if (executionDeadline.reached) { expireDeadline(); return; }
+        const failSend = (error: Error): void => finish({
+          value: undefined, logs: [], terminationReason: "runtime_error",
+          error: `Process IPC failed: ${error.message}`,
+        });
+        try {
+          if (delivered) {
+            const responseId = ++nextResponseId;
+            message = { ...message, responseId };
+            pendingReceipts.set(responseId, { id: message.id, commit: delivered });
+          }
+          child.send(message, (error) => {
+            if (settled || finishing) return;
+            if (error) { failSend(error); return; }
+            if (!child.connected) return;
+            if (executionDeadline.reached) { expireDeadline(); return; }
+            // Write completion is not admission; wait for the guest ack.
+          });
+        } catch (error) { failSend(error instanceof Error ? error : new Error(String(error))); }
+      };
       const extendDeadline = (ref: string, args: Record<string, unknown>): void => {
         const requested = options.minimumTimeoutMsForHostCall?.(ref, args);
         if (executionDeadline.extend(requested)) scheduleDeadline();
@@ -162,6 +188,14 @@ export class NodeProcessRuntime {
         if (settled || finishing || typeof raw !== "object" || raw === null) return;
         const message = raw as ChildMessage;
         if (executionDeadline.reached) { expireDeadline(); return; }
+        if (message.type === "response_ack") {
+          if (!child.connected) return;
+          const receipt = pendingReceipts.get(message.responseId);
+          if (!receipt || receipt.id !== message.id) return;
+          pendingReceipts.delete(message.responseId);
+          receipt.commit();
+          return;
+        }
         if (message.type === "result") {
           finishing = true;
           executionDeadline.clear();
@@ -197,7 +231,7 @@ export class NodeProcessRuntime {
             timer = setTimeout(() => {
               if (!settled && !finishing && executionDeadline.reached) expireDeadline();
               if (!settled && !finishing) {
-                send(child, { type: "response", id: message.id, ok: true, value: undefined });
+                send({ type: "response", id: message.id, ok: true, value: undefined });
               }
               resolveTask();
             }, ms);
@@ -220,12 +254,11 @@ export class NodeProcessRuntime {
             // budget, and must not acknowledge an undelivered observation.
             const response = JSON.parse(JSON.stringify({ type: "response", id: message.id, ok: true, value }));
             if (executionDeadline.reached) { expireDeadline(); return; }
-            send(child, response);
-            options.onHostResultDelivered?.(message.args);
+            send(response, () => options.onHostResultDelivered?.(message.args));
           },
         ).catch((error) => {
           if (executionDeadline.reached) { expireDeadline(); return; }
-          send(child, {
+          send({
               type: "response",
               id: message.id,
               ok: false,
@@ -256,7 +289,7 @@ export class NodeProcessRuntime {
       });
 
       scheduleDeadline();
-      send(child, {
+      send({
         type: "execute",
         setup: guestSetupSource(options.piToolCanonicalFields, options.piTools !== false),
         code: guestBundle.code,

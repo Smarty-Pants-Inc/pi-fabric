@@ -10,8 +10,13 @@ existing events and mirrors root presence. There is no new store or protocol.
   `pr.wake`, when the recipient (`to`) is a live root or host native to the other side.
 - Presence: each side's live native hosts and root participants go into the other side's state at
   the same keys, with `remoteHost: <side name>` and the source identity as `updatedBy`. A mirrored
-  lease is `min(source expiry, now + 15 s)` and is renewed every 5 s. When the bridge stops, its
-  mirrors lapse within 15 s. On a clean stop or a transport failure it deletes them at once.
+  lease lasts one source TTL from the local observation, capped at 15 s. The source's absolute
+  expiry does not set the mirrored lease's end. File-only heartbeats carry their effective renewal time. Presence
+  is normally refreshed every 5 s; a lapsed mirror is refreshed and revalidated once before an
+  event is refused. A source that stops renewing can remain mirrored for at most twice its TTL
+  from its last renewal (at most one extra capped TTL after the last live observation). When the
+  bridge stops, its mirrors lapse within 15 s. On a clean stop or transport failure it deletes
+  them at once.
 - Nothing else. This excludes `github.*`, actor output, state and cache keys, and agent and actor
   participants.
 
@@ -42,7 +47,9 @@ existing events and mirrors root presence. There is no new store or protocol.
   published only if, under the mesh lock that commits it, its sender (and an ack's target) is
   still a live mirror of this link. An outbound event is sent only while this link still holds its
   recipient. While a backlog is forwarded, presence and leases are renewed when due. A remote event whose sender, or an ack whose `targetId`, is
-  not bound to this link is dropped.
+  not bound to this link is dropped. Before refusing a lapsed mirror (including expiry while
+  waiting for publication), one bounded, single-flight presence pass refreshes and revalidates
+  authority. It never substitutes peer claims for ownership or changes a captured destination.
 - The hub routes to the remote only by canonical ids: host id, identity id, participant id and root
   id. Labels, session ids and names are never addresses across.
 - A mirror never replaces a native record or another bridge's mirror. It writes by

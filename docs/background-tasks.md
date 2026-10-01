@@ -133,8 +133,8 @@ return {receipt,batch};
 ## Durable tasks through jev-fabric
 
 `pi.bash({cmd, durable: true})` hands the process to an external
-[jev-fabric](https://github.com/monotykamary/jev-fabric) store instead of this Pi
-process. It is for dev servers, watchers and long builds that must outlive the
+[jev-fabric](https://github.com/monotykamary/jev-fabric) store. This Pi process does
+not own the durable child. It is for dev servers, watchers and long builds that must outlive the
 session. macOS and Linux only. Fabric uses your own compatible `jev-fabric`
 outside the workspace, else the bundled npm package (see
 [which jev-fabric](shell-composition.md#which-jev-fabric)). It never downloads

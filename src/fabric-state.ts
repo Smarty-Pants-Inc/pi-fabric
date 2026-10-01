@@ -33,11 +33,11 @@ import type {
   FabricParticipantListOptions,
   FabricPeerInfo,
 } from "./topology/types.js";
-import {
-  resolveFabricIdentity,
-  type FabricAgentMessageDelivery,
-  type FabricAgentMessageResult,
-  type FabricMainAgentInfo,
+import { resolveFabricIdentity } from "./fabric-provenance.js";
+import type {
+  FabricAgentMessageDelivery,
+  FabricAgentMessageResult,
+  FabricMainAgentInfo,
 } from "./main-agent.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";

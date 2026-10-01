@@ -108,6 +108,8 @@ import {
   type FabricMainAgentInfo,
 } from "./main-agent.js";
 import { followUpDrainSupported } from "./host-compatibility.js";
+import { deliverActorToMain } from "./actors/main-delivery.js";
+import { sendFabricMessage } from "./fabric-provenance.js";
 import { AgentsProvider } from "./providers/agents-provider.js";
 import { CompactProvider } from "./providers/compact-provider.js";
 import { CacheProvider } from "./providers/cache-provider.js";
@@ -800,29 +802,7 @@ export class FabricRuntimeState {
       this.#mesh,
       enforceSchema ? { ...this.#config.mesh, enabled: false } : this.#config.mesh,
       this.#agents,
-      ({ actor, message, delivery, triggerTurn }) => {
-        const text = message.text ?? "";
-        if (!text) return;
-        const deliveryNotice = actorDeliveryNotice(delivery, triggerTurn);
-        this.pi.sendMessage(
-          {
-            customType: "pi-fabric-actor",
-            content: [
-              `<fabric-actor name=${JSON.stringify(actor.name)} id=${JSON.stringify(actor.id)}>\n${escapeXmlText(text)}\n</fabric-actor>`,
-              deliveryNotice,
-            ]
-              .filter((line): line is string => Boolean(line))
-              .join("\n"),
-            display: true,
-            details: {
-              actor,
-              message,
-              delivery: { mode: delivery, triggerTurn, passive: Boolean(deliveryNotice) },
-            },
-          },
-          { deliverAs: delivery, triggerTurn },
-        );
-      },
+      request => deliverActorToMain(this.pi, identity, request),
       ownsPersistentActorRegistry
         ? {
             persistent: true,
@@ -957,8 +937,8 @@ export class FabricRuntimeState {
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
     );
     this.#agentsProvider = agentsProvider;
-    this.#control.start((command, from, signal) =>
-      agentsProvider.acceptControl(command, from, signal));
+    this.#control.start((command, from, signal, verification) =>
+      agentsProvider.acceptControl(command, from, signal, verification));
     try {
       await this.#participants.start();
     } catch (error) {
@@ -988,12 +968,12 @@ export class FabricRuntimeState {
         description: "Shell orchestration and explicit typed Jev decisions",
         create: (component) => {
           const observationHost = identity.kind === "main" ? new JevObservationHost(context.sessionManager.getSessionId(), advice => {
-            this.pi.sendMessage({
+            sendFabricMessage(this.pi, {
               customType: "pi-fabric-jev",
               content: [`<fabric-jev name=${JSON.stringify(escapeXmlText(advice.name))} id=${JSON.stringify(advice.runId)}>\n${escapeXmlText(advice.message)}\n</fabric-jev>`, actorDeliveryNotice(advice.delivery, advice.triggerTurn)].filter(Boolean).join("\n"),
               display: true,
               details: { runId: advice.runId, eventId: advice.eventId, delivery: { mode: advice.delivery, triggerTurn: advice.triggerTurn } },
-            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn });
+            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn }, identity, "actor", "mesh");
           }) : undefined;
           this.#jevObservationHost = observationHost;
           // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.

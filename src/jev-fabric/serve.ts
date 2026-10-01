@@ -14,10 +14,20 @@ export interface JevFabricBanner {
 }
 
 export class JevFabricServeError extends Error {
-  constructor(message: string, readonly code: number | null) { super(message); this.name = "JevFabricServeError"; }
+  constructor(message: string, readonly code: number | null, options?: ErrorOptions) { super(message, options); this.name = "JevFabricServeError"; }
 }
 
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void };
+
+const stdinFailure = (error: Error): JevFabricServeError =>
+  new JevFabricServeError(`jev-fabric stdin failed: ${error.message.slice(0, 500)}`, null, { cause: error });
+
+const killBackend = (child: ChildProcessWithoutNullStreams): void => {
+  try {
+    if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+    else child.kill("SIGKILL");
+  } catch { /* an exit raced the owner-isolated termination */ }
+};
 
 /**
  * One `jev-fabric -- serve` connection (protocol 2): JSONL requests with
@@ -30,6 +40,7 @@ export class JevFabricServe {
   readonly #pending = new Map<number, Pending>();
   #next = 1;
   #closed: Error | undefined;
+  #closing: Promise<void> | undefined;
   readonly exited: Promise<void>;
 
   private constructor(child: ChildProcessWithoutNullStreams, readonly banner: JevFabricBanner) {
@@ -52,6 +63,18 @@ export class JevFabricServe {
       });
       let stderr = "";
       let serve: JevFabricServe | undefined;
+      let openingFailure: JevFabricServeError | undefined;
+      // ChildProcess errors do NOT contain errors emitted by its stdin Socket.
+      // Keep this listener for the whole stream lifetime, including owner EOF.
+      child.stdin.on("error", error => {
+        clearTimeout(timer);
+        if (serve) serve.#stdinFailed(error);
+        else {
+          openingFailure ??= stdinFailure(error);
+          killBackend(child);
+          // The close handler rejects the banner after confirmed backend exit.
+        }
+      });
       const decoder = new StringDecoder("utf8");
       let buffer = "";
       const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new JevFabricServeError("jev-fabric serve did not send its banner", null)); }, BANNER_TIMEOUT_MS);
@@ -59,6 +82,7 @@ export class JevFabricServe {
       child.stderr.on("data", (chunk: Buffer) => { if (stderr.length < 4096) stderr += chunk.toString("utf8"); });
       child.once("error", error => { clearTimeout(timer); reject(error); });
       child.stdout.on("data", (chunk: Buffer) => {
+        if (openingFailure) return;
         buffer += decoder.write(chunk);
         let index: number;
         while ((index = buffer.indexOf("\n")) >= 0) {
@@ -88,7 +112,7 @@ export class JevFabricServe {
       child.once("close", code => {
         clearTimeout(timer);
         const message = stderr.trim().split("\n").at(-1)?.slice(0, 500);
-        const error = new JevFabricServeError(`jev-fabric serve ended${code === null ? "" : ` (exit ${code})`}${message ? `: ${message}` : ""}`, code);
+        const error = openingFailure ?? new JevFabricServeError(`jev-fabric serve ended${code === null ? "" : ` (exit ${code})`}${message ? `: ${message}` : ""}`, code);
         if (!serve) reject(error); else serve.#fail(error);
       });
     });
@@ -107,8 +131,15 @@ export class JevFabricServe {
 
   #fail(error: Error): void {
     this.#closed ??= error;
-    for (const pending of this.#pending.values()) pending.reject(error);
+    for (const pending of this.#pending.values()) pending.reject(this.#closed);
     this.#pending.clear();
+  }
+
+  #stdinFailed(error: Error): void {
+    this.#fail(stdinFailure(error));
+    // Reject only this connection's work, then bound/confirm its teardown even
+    // if the peer closed stdin but kept its process or descendants running.
+    void this.close();
   }
 
   get closed(): boolean { return this.#closed !== undefined; }
@@ -122,6 +153,9 @@ export class JevFabricServe {
     signal?.throwIfAborted();
     const id = this.#next++;
     return new Promise<T>((resolve, reject) => {
+      // Serialize before recording a pending request: local argument errors
+      // must not leave a waiter/abort listener behind.
+      const line = `${JSON.stringify({ id, op, ...fields })}\n`;
       const abort = (): void => {
         this.#pending.delete(id);
         reject(signal?.reason instanceof Error ? signal.reason : new Error("aborted"));
@@ -131,24 +165,28 @@ export class JevFabricServe {
         reject: error => { signal?.removeEventListener("abort", abort); reject(error); },
       });
       signal?.addEventListener("abort", abort, { once: true });
-      this.#child.stdin.write(`${JSON.stringify({ id, op, ...fields })}\n`);
+      try {
+        this.#child.stdin.write(line, error => { if (error) this.#stdinFailed(error); });
+      } catch (error) {
+        this.#stdinFailed(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
   /** Ends the connection: jev-fabric stops its session children; durable jobs are untouched. */
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    return this.#closing ??= this.#close();
+  }
+
+  async #close(): Promise<void> {
     if (!this.#closed) {
-      this.#child.stdin.end();
+      try { this.#child.stdin.end(); }
+      catch (error) { this.#fail(stdinFailure(error instanceof Error ? error : new Error(String(error)))); }
       this.#fail(new JevFabricServeError("jev-fabric connection closed by owner", null));
     }
     // A delayed wire receipt cannot postpone EOF. If the backend does not
     // confirm exit promptly, terminate only its recorded, isolated group.
-    const timer = setTimeout(() => {
-      try {
-        if (process.platform !== "win32" && this.#child.pid) process.kill(-this.#child.pid, "SIGKILL");
-        else this.#child.kill("SIGKILL");
-      } catch { /* an exit raced the grace timer */ }
-    }, CLOSE_GRACE_MS);
+    const timer = setTimeout(() => killBackend(this.#child), CLOSE_GRACE_MS);
     timer.unref?.();
     await this.exited;
     clearTimeout(timer);

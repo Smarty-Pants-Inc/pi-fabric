@@ -1899,6 +1899,7 @@ export class ActorManager {
       holdWhenFull?: boolean;
     } = {},
   ): ActorQueueItem {
+    if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
     const canManage = options.ownershipChecked
       ? this.#canManageCached(actor.id)
       : this.#canManage(actor.id);
@@ -2587,6 +2588,7 @@ export class ActorManager {
         try {
           this.#mainAgent.deliverAgent({
             from: event.from,
+            ...(event.verification === undefined ? {} : { verification: event.verification }),
             message,
             delivery: kind,
             ...(event.data === undefined ? {} : { data: event.data }),

@@ -1,5 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
+import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
+import { fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { registerJevAuth } from "./jev/auth.js";
@@ -37,7 +39,7 @@ import {
   DEFAULT_FABRIC_CONFIG,
   effectiveToolCaptureConfig,
 } from "./config.js";
-import { registerCompactionHook } from "./compaction/hook.js";
+import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
 import { compactAtConfiguredThreshold } from "./compaction/threshold.js";
 import {
   createToolOwnershipReassertion,
@@ -647,13 +649,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       const inbox = await state.nextRootInbox(inboxHeldBy(context), idle);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
-        pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+        deliverRootInbox(pi, inbox.events);
         return;
       }
       // Records: the same gate, re-checked after the read (F21).
       if (!idle()) return;
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
-      if (records && idle()) pi.sendMessage(records, { deliverAs: "followUp", triggerTurn: true });
+      if (records && idle()) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
     } catch {
       // A stale context (reload, session replacement) or a mesh error: the next tick or turn retries.
     } finally {
@@ -810,10 +812,10 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // (smarty-dev#754). An aborted or failed run starts nothing: the batch waits for a turn.
     if (settledCompleted(event, context)) {
       const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
-      if (inbox?.events.length) pi.sendMessage(rootInboxMessage(inbox.events), { deliverAs: "followUp", triggerTurn: true });
+      if (inbox?.events.length) deliverRootInbox(pi, inbox.events);
       // Records addressed to this root past its processing cursor (smarty-dev#754 C4), same hook.
       const records = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
-      if (records) pi.sendMessage(records, { deliverAs: "followUp", triggerTurn: true });
+      if (records) sendFabricMessage(pi, records, { deliverAs: "followUp", triggerTurn: true });
     }
   };
 
@@ -987,7 +989,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   // Deterministic, LLM-free compaction is registered unconditionally and is
   // active by default. The documented "pi" escape hatch returns early so
   // pi-core's own summarization proceeds normally.
-  registerCompactionHook(pi, {
+  registerLazyCompactionHook(pi, {
     getEngine: () =>
       state.cwd
         ? state.config.compaction.engine
@@ -1104,21 +1106,22 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (!skillReferenceGuidance) return {
       systemPrompt: `${systemPrompt}\n\n${guidance}`,
     };
-    return {
-      systemPrompt: `${systemPrompt}\n\n${guidance}`,
-      message: {
-        customType: SKILL_REFERENCE_CUSTOM_TYPE,
-        content: skillReferenceGuidance,
-        display: false,
-        details: {},
-      },
+    const message = {
+      customType: SKILL_REFERENCE_CUSTOM_TYPE,
+      content: skillReferenceGuidance,
+      display: false,
+      details: {},
     };
+    if (!fabricProvenanceSupported(pi)) return { message, systemPrompt: `${systemPrompt}\n\n${guidance}` };
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
+    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    return { systemPrompt: `${systemPrompt}\n\n${guidance}` };
   });
 
   // Ambient skill prose that names hidden captured tools is not user intent,
   // so the furnace strips it. This sidecar retargets the call site without
   // spending hint budget, echoing tokens, or burning ash.
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, context) => {
     if (!pi.getActiveTools().includes("fabric_exec")) return;
     const captureSnapshot = state.cwd ? capturePolicy() : undefined;
     if (
@@ -1137,14 +1140,15 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     );
     const fresh = proxyContract.take(mentioned);
     if (fresh.length === 0) return;
-    return {
-      message: {
-        customType: PROXY_CONTRACT_CUSTOM_TYPE,
-        content: formatProxyContractReminder(fresh),
-        display: false,
-        details: { names: fresh, origin: "skill" },
-      },
+    const message = {
+      customType: PROXY_CONTRACT_CUSTOM_TYPE,
+      content: formatProxyContractReminder(fresh),
+      display: false,
+      details: { names: fresh, origin: "skill" },
     };
+    if (!fabricProvenanceSupported(pi)) return { message };
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
+    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
   });
 
   // Work events a steer missed reach the Main with its next turn (smarty-dev#754).
@@ -1154,7 +1158,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (!state.initialized) return;
     const inbox = await state.nextRootInbox(inboxHeldBy(context)).catch(() => undefined);
     if (!inbox?.events.length) return;
-    return { message: rootInboxMessage(inbox.events) };
+    // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
+    if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(inbox.events) };
+    deliverRootInbox(pi, inbox.events, { deliverAs: "nextTurn", triggerTurn: false });
   });
 
   // Records addressed to this root reach it with its next turn (smarty-dev#754 C4).
@@ -1162,7 +1168,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (!state.initialized) return;
     const message = await state.nextRecordsInboxMessage(context.sessionManager.getEntries()).catch(() => undefined);
     if (!message) return;
-    return { message };
+    // Records have authors, not authenticated admission envelopes. Never claim this Main.
+    if (!fabricProvenanceSupported(pi)) return { message };
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
   });
 
   registerFabricActorHostEventObservers(pi, (eventName, event, context) => {

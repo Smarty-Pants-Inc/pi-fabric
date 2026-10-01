@@ -11,7 +11,7 @@ standalone jev-fabric without being rewritten.
 
 | Lifetime | Owner | Batch (no stdin) | Interactive (stdin open) |
 | --- | --- | --- | --- |
-| `foreground` | the calling `fabric_exec` | `pi.bash({cmd})` | — |
+| `foreground` | the calling `fabric_exec` | `pi.bash({cmd})` | n/a |
 | `session` | this Pi session, or the Jev program that opened it | `pi.bash({cmd, background:true})` | `sessions.open({argv \| cmd})` |
 | `durable` | the jev-fabric store; outlives Pi | `pi.bash({cmd, durable:true})` | `sessions.open({…, durable:true})` |
 
@@ -21,9 +21,9 @@ standalone jev-fabric without being rewritten.
 - **Durable** and **interactive** children are owned by jev-fabric (macOS and
   Linux). Durable batch tasks still run through `pi.bash` and its middleware;
   interactive children run outside `pi.bash`, so they are unavailable while an
-  extension overrides `bash`, rather than bypassing its gate.
-- A Jev program's interactive `session` children end with the program, however
-  it ends. `fabric_exec` children stay with the Pi session, like background tasks.
+  extension overrides `bash`. This preserves its gate.
+- A Jev program's interactive `session` children end with the program on every
+  exit path. `fabric_exec` children stay with the Pi session, like background tasks.
 
 ## One set of verbs
 
@@ -34,7 +34,7 @@ standalone jev-fabric without being rewritten.
 | bytes by offset | `tasks.read` (combined `output`) | `sessions.read` (`stdout`/`stderr`) | `read` |
 | literal line filter | `tasks.watch({match})` | read + filter in code | `watch <id> <literal>` |
 | retained events | monitor replay (`tasks.watch`, no match) | `sessions.events` | `events` / `follow` |
-| input | — | `sessions.write`, `sessions.closeInput` | `write`, `closeInput` |
+| input | n/a | `sessions.write`, `sessions.closeInput` | `write`, `closeInput` |
 | stop by ID | `tasks.stop` | `sessions.stop` | `stop` |
 | discovery | `tasks.list`, `tasks.external`, `tasks.adopt` | `sessions.list` | `list` |
 

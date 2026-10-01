@@ -79,8 +79,17 @@ export class TasksProvider implements FabricProvider {
     const before = job.info();
     const output = await job.outputText();
     const after = job.info();
-    // A new event during the async read was not necessarily consumed.
-    if (!waited?.timedOut && before.eventCount === after.eventCount && before.finishedAt === after.finishedAt) this.jobs.acknowledge(id);
+    // A new event during the async read was not necessarily consumed. Recheck
+    // again at delivery: publication/encoding/transport can reject this result,
+    // or a newer event/finish can arrive while its response is queued.
+    if (!waited?.timedOut && before.eventCount === after.eventCount && before.finishedAt === after.finishedAt) {
+      const acknowledge = (): void => {
+        const current = job.info();
+        if (current.unread && current.eventCount === after.eventCount && current.finishedAt === after.finishedAt) this.jobs.acknowledge(id);
+      };
+      if (context.deferResultConsumption) context.deferResultConsumption(acknowledge);
+      else acknowledge();
+    }
     return { task: job.info(), output, ...(waited ? { timedOut: waited.timedOut } : {}) };
   }
 

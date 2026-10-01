@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricState } from "../fabric-state.js";
-import { resolveFabricIdentity } from "../main-agent.js";
+import { fabricHostIdentity, resolveFabricIdentity, sendFabricMessage } from "../fabric-provenance.js";
 import {
   PREWALK_ARMED_MESSAGE_TYPE,
   hasPrewalkArmedPrompt,
@@ -38,14 +38,14 @@ export const armFabricPrewalkSession = async (
   // custom messages never fire `input`, so observeTask ignores it.
   const armedPrompt = prewalkArmedPrompt(prewalk.mode, input.model, prewalk.requirePlan);
   if (!hasPrewalkArmedPrompt(context.sessionManager.getBranch(), armedPrompt)) {
-    pi.sendMessage(
+    sendFabricMessage(pi,
       {
         customType: PREWALK_ARMED_MESSAGE_TYPE,
         content: armedPrompt,
         display: false,
         details: { mode: prewalk.mode, model: input.model, requirePlan: prewalk.requirePlan },
       },
-      { deliverAs: "nextTurn" },
+      { deliverAs: "nextTurn" }, fabricHostIdentity(sessionId), "actor", "mesh",
     );
   }
   context.ui.setStatus("fabric-prewalk", `armed (${prewalk.mode}) → ${input.model}`);

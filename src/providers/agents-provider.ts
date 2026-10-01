@@ -401,6 +401,7 @@ export class AgentsProvider implements FabricProvider {
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
       (binding, runner, context) => this.#resolvePiRunBinding(binding, runner, context),
+      residency,
     );
     this.#lifecycleScheduler = new LifecycleDeliveryScheduler(
       DEFAULT_LIFECYCLE_COALESCE_MS,
@@ -426,6 +427,17 @@ export class AgentsProvider implements FabricProvider {
     target: string,
     batch: PendingLifecycleDelivery[],
   ): Promise<void> {
+    // A local capable Pi records one sender per turn. Partition only contiguous runs, so FIFO
+    // order survives and legacy hosts retain their existing coalesced wake behavior.
+    if (this.mainAgent.supportsProvenance?.() && this.#router.isLocalMainTarget(target)) {
+      const firstId = batch[0]!.event.source.id;
+      const split = batch.findIndex(item => item.event.source.id !== firstId);
+      if (split > 0) {
+        await this.#routeLifecycleBatch(target, batch.slice(0, split));
+        await this.#routeLifecycleBatch(target, batch.slice(split));
+        return;
+      }
+    }
     const first = batch[0]!;
     const single = batch.length === 1;
     const message = single
@@ -1027,7 +1039,7 @@ export class AgentsProvider implements FabricProvider {
         const id = String(args.id);
         const message = String(args.message);
         this.actorManager.validateDirectMessage(message, args.data);
-        const { actor, participant } = this.#resolveActorTarget(id);
+        const { actor, participant } = await this.#router.resolveActorMessageTarget(id);
         const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
         const requestedOverrides = actorRunBinding(args);
         const overrides = ownsActor
@@ -1394,8 +1406,9 @@ export class AgentsProvider implements FabricProvider {
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
+    verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
-    return this.#router.acceptControl(command, from, signal);
+    return this.#router.acceptControl(command, from, signal, verification);
   }
 
   #resolveActorTarget(id: string): {

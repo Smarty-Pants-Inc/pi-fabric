@@ -92,7 +92,7 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
     }
   });
 
-  it.each(["LF", "CRLF"])("drains delayed loopback startup stderr through guest close (%s)", async (newline) => {
+  it.each(["LF", "CRLF"])("drains delayed loopback stdout and stderr through guest close (%s)", async (newline) => {
     // Windows delivers TCP and anonymous stderr pipes independently. Model a
     // flushed startup record reaching the host after result/exit, before close.
     vi.stubGlobal("process", new Proxy(process, {
@@ -108,8 +108,9 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
       kill: vi.fn(() => {
         child.emit("exit", 0, null);
         setTimeout(() => {
-          child.stderr.end(marker + (newline === "CRLF" ? "\r\n" : "\n"));
-          child.stdout.end();
+          const eol = newline === "CRLF" ? "\r\n" : "\n";
+          child.stderr.end(marker + eol + "err one" + eol + "err two" + eol);
+          child.stdout.end("out one" + eol + "out two" + eol);
           child.emit("close", 0, null);
           close();
         }, 30);
@@ -134,7 +135,9 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
     try {
       const result = await run("return 1");
       expect(result).toMatchObject({ terminationReason: "completed", value: 1 });
-      expect(result.logs).toEqual([marker]);
+      expect(result.logs).toEqual(expect.arrayContaining([marker, "out one", "out two", "err one", "err two"]));
+      expect(result.logs).toHaveLength(5);
+      expect(result.logs.every(line => !line.endsWith("\r"))).toBe(true);
       expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
     } finally {
       await closed;

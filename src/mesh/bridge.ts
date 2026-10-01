@@ -1,3 +1,4 @@
+import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -98,6 +99,7 @@ export interface BridgeRead {
 }
 
 export interface BridgePublish {
+  principal?: FabricPrincipal | undefined;
   topic: string;
   kind: string;
   from: MeshIdentity;
@@ -150,7 +152,7 @@ const participantOf = (key: string, value: unknown): FabricParticipantRecord | u
   return value as unknown as FabricParticipantRecord;
 };
 
-/** Record fields that change on every renewal; a mirror rewrites the state only when others change. */
+/** Host lease fields that change on every renewal; participant updatedAt is source activity. */
 const settled = (value: Record<string, unknown>): string =>
   JSON.stringify({ ...value, updatedAt: undefined, expiresAt: undefined });
 
@@ -411,8 +413,9 @@ export class StoreBridgeSide implements BridgeSide {
       if (key.startsWith(PARTICIPANT_PREFIX) && participantFilePresent(this.store.root, key)) continue;
       if (
         existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
-        (typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS ||
-          !key.startsWith(HOST_PREFIX))
+        (key.startsWith(HOST_PREFIX)
+          ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
+          : existing.value.updatedAt === value.updatedAt)
       ) continue;
       if (halted()) return;
       await this.#put(key, value, identity, existing?.version);
@@ -480,6 +483,7 @@ const ignoreConflict = (error: unknown): void => {
 export const checkBridgePublish = (input: unknown): BridgePublish => {
   if (!isObject(input)) throw new Error("Bridge publish is not an object");
   const { topic, kind, from, to, text, data } = input;
+  const principal = copyFabricPrincipal(input.principal);
   if (typeof topic !== "string" || typeof kind !== "string" || !isBridgedTopic({ topic, kind })) {
     throw new Error(`Bridge topic is not allowed: ${String(topic)}`);
   }
@@ -489,6 +493,7 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
   if (!isObject(data) || !bridgeStampOf({ data })) throw new Error("Bridge publish has no bridge stamp");
   return {
     topic, kind, to,
+    ...(principal ? { principal } : {}),
     from: { id: from.id, name: from.name, kind: from.kind, ...(typeof from.sessionId === "string" ? { sessionId: from.sessionId } : {}) },
     ...(text !== undefined ? { text } : {}),
     data: data as BridgePublish["data"],
@@ -936,7 +941,12 @@ export class MeshBridge {
     while (true) {
       const start = cursor.after;
       const page = await source.read(start);
-      let rules = await authority();
+      // Even filtered/skip-only reads can carry this drain past the mirrors' lease.
+      // Renew only when due, independently of whether the page needs routing authority.
+      if (Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS)) await this.syncPresence();
+      // Authority reads are deliberately canonical (copied-marker ABA), so idle pages
+      // avoid them; every page with events retains the same fresh authority checks.
+      let rules = page.events.length ? await authority() : { recipients: new Set<string>() };
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
@@ -986,6 +996,7 @@ export class MeshBridge {
               if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
               return target.publish({
                 topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
+                ...(event.verification === "mesh" || event.verification === "bridge" ? { principal: event.principal } : {}),
                 ...(event.text !== undefined ? { text: event.text } : {}),
                 data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
               }, held);

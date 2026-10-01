@@ -914,6 +914,7 @@ export class ResidencyClient {
     this.options.mainAgent.deliverAgent({
       from: value.from,
       verification: "mesh", // The authenticated resident-host record was checked above.
+      principal: value.principal,
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,

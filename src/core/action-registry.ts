@@ -1,4 +1,5 @@
 import type { ProviderOperations, ProviderOperation } from "./provider-operations.js";
+import { snapshotFabricInvocation } from "../fabric-provenance.js";
 import { CapabilityAuthority } from "../verified/authority.js";
 import { randomUUID } from "node:crypto";
 import { effectConflictsBetween, registrationEffect, summarizeEffects } from "../components/effect-policy.js";
@@ -1563,7 +1564,7 @@ export class ActionRegistry {
     const view = context.capabilityView ? this.#requireView(context.capabilityView) : undefined;
     throwIfAborted(context.signal);
     if (this.#shutdown.signal.aborted) throw new FabricResolutionError("Fabric registry is closed");
-    return { ...context, signal: shareCancellationEffects(AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]), context.signal) };
+    return snapshotFabricInvocation({ ...context, signal: shareCancellationEffects(AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]), context.signal) });
   }
 
   #bindingContext<T extends FabricInvocationContext>(binding: FabricProviderBinding, context: T): T {

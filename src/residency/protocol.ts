@@ -1,3 +1,4 @@
+import type { FabricPrincipal } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover.js";
 import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
@@ -42,6 +43,8 @@ export interface ResidentRequestDecision {
   id?: string;
   operation?: ResidentCommand["operation"];
   ownerHostId?: string;
+  /** Originating requester metadata; never grants mutation authority. */
+  principal?: FabricPrincipal | undefined;
 }
 
 const residentDecisionPath = (residencyRoot: string, requestId: string): string =>
@@ -101,6 +104,7 @@ export const commitResidentRequest = (
 ): void => {
   if (decideResidentRequest(residencyRoot, {
     requestId: command.requestId, state: "committed", operation: command.operation, id, ownerHostId,
+    ...(("caller" in command && command.caller?.principal) ? { principal: command.caller.principal } : {}),
   })) return;
   const decision = readResidentRequestDecision(residencyRoot, command.requestId);
   throw new Error(decision?.state === "abandoned"
@@ -374,6 +378,8 @@ interface ResidentCreateActorCommand {
 export interface ResidentActorCaller {
   identity: MeshIdentity;
   hostId: string;
+  /** Captured host turn provenance, independent of owning-Main authorization. */
+  principal?: FabricPrincipal | undefined;
   /** Frozen optional-tool authority; absence means an unrestricted Main. */
   toolCeiling?: string[];
 }
@@ -493,6 +499,7 @@ export interface ResidentAgentMetadata {
 }
 
 export interface ResidentDeliveryRecord {
+  principal?: FabricPrincipal | undefined;
   format: typeof RESIDENT_HOST_FORMAT;
   /** Survives payload truncation; lets Main read the authoritative terminal result. */
   agentCompletionId?: string;

@@ -26,6 +26,7 @@ const surface = {
   capabilityRequirements: JSON.parse(process.env.PI_FABRIC_CAPABILITY_REQUIREMENTS ?? "[]"),
   extensions: !argv.includes("--no-extensions"),
   extensionPath: flag("-e"),
+  extensionPaths: argv.flatMap((arg, index) => arg === "-e" ? [argv[index + 1]] : []),
   tools: flag("--tools")?.split(",") ?? [],
   fullCodeModeEnv: process.env.PI_FABRIC_FULL_CODE_MODE,
   toolAllowlistEnv: process.env.PI_FABRIC_TOOL_ALLOWLIST

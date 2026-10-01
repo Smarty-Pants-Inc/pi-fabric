@@ -136,6 +136,38 @@ describe("round-two invocation and activation fencing (#821)", () => {
 });
 
 describe("originating principal relay (#821)", () => {
+  const nonObjects: Array<[string, unknown]> = [
+    ["missing", undefined], ["null", null], ["false", false], ["true", true],
+    ["zero", 0], ["number", 42], ["empty string", ""], ["string", "legacy"],
+    ["symbol", Symbol("legacy")], ["bigint", 1n], ["function", () => {}],
+  ];
+  it.each([
+    ...nonObjects.map(([name, value]) => [`${name} context`, value] as const),
+    ["partial context", {}] as const,
+    ...nonObjects.map(([name, value]) => [`${name} session manager`, { sessionManager: value }] as const),
+  ])("ignores %s in all principal observers without throwing or claiming a requester", (_name, context) => {
+    const h = host("partial-host");
+    h.input(receipt({ v: 1, channel: "voice", principal }));
+    const handlers = new Map<string, (event: any, context: any) => unknown>();
+    registerFabricPrincipalCapture({ on: (name: string, handler: any) => { handlers.set(name, handler); } } as any);
+    const message = { role: "user", provenance: receipt({ v: 1, channel: "voice", principal }) };
+    for (const [name, event] of [
+      ["before_agent_start", {}], ["message_start", { message }], ["context", { messages: [message] }],
+    ] as const) {
+      expect(() => handlers.get(name)!(event, context)).not.toThrow();
+      expect(currentFabricPrincipal(context as any)).toBeUndefined();
+    }
+    // Invalid host paths cannot overwrite a different, valid session's scope either.
+    expect(currentFabricPrincipal(h.context)).toEqual(principal);
+  });
+  it("does not borrow principal across session-manager objects", () => {
+    const first = host("isolated"), second = host("isolated");
+    first.input(receipt({ v: 1, channel: "voice", principal }));
+    expect(currentFabricPrincipal(first.context)).toEqual(principal);
+    expect(currentFabricPrincipal(second.context)).toBeUndefined();
+    first.emit("before_agent_start");
+    expect(currentFabricPrincipal(first.context)).toBeUndefined();
+  });
   it.each(["steer", "followUp"] as const)("principal -> org -> lead -> task via %s keeps the principal unchanged", async delivery => {
     const mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100);
     const org = host("org"), lead = host("lead"), task = host("task");

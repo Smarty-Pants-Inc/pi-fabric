@@ -141,26 +141,41 @@ export const principalFromReceipt = (value: unknown): FabricPrincipal | undefine
 };
 
 const turnPrincipals = new WeakMap<object, FabricPrincipal | undefined>();
+// Partial/legacy host contexts need not expose an object session manager.
+// Without that host-owned key there is no scope, never a process-wide fallback.
+const principalSessionKey = (context: unknown): object | undefined => {
+  if (typeof context !== "object" || context === null) return undefined;
+  const session = (context as { sessionManager?: unknown }).sessionManager;
+  return typeof session === "object" && session !== null ? session : undefined;
+};
 const requestMessage = (message: { role?: unknown; customType?: unknown }): boolean =>
   message.role === "user" || (message.role === "custom" &&
     !["pi-fabric-skill-reference", "pi-fabric-proxy", "pi-fabric-shell-awareness"].includes(String(message.customType)));
 
 /** Cheap observers only: no engine imports, identity mapping or filesystem work. */
 export const registerFabricPrincipalCapture = (pi: ExtensionAPI): void => {
-  pi.on("before_agent_start", (_event, context) => { turnPrincipals.set(context.sessionManager, undefined); });
+  pi.on("before_agent_start", (_event, context) => {
+    const session = principalSessionKey(context);
+    if (session) turnPrincipals.set(session, undefined);
+  });
   pi.on("message_start", (event, context) => {
-    if (requestMessage(event.message)) turnPrincipals.set(context.sessionManager, principalFromReceipt((event.message as { provenance?: unknown }).provenance));
+    const session = principalSessionKey(context);
+    if (session && requestMessage(event.message)) turnPrincipals.set(session, principalFromReceipt((event.message as { provenance?: unknown }).provenance));
   });
   pi.on("context", (event, context) => {
+    const session = principalSessionKey(context);
+    if (!session) return;
     // Actual inference input includes queued deliveries and survives live reload.
     // Passive skill/proxy/shell-awareness notices do not replace the requester.
     const message = [...event.messages].reverse().find(requestMessage);
-    if (message) turnPrincipals.set(context.sessionManager, principalFromReceipt((message as { provenance?: unknown }).provenance));
+    if (message) turnPrincipals.set(session, principalFromReceipt((message as { provenance?: unknown }).provenance));
   });
 };
 
-export const currentFabricPrincipal = (context?: { sessionManager?: object }): FabricPrincipal | undefined =>
-  context?.sessionManager ? copyFabricPrincipal(turnPrincipals.get(context.sessionManager)) : undefined;
+export const currentFabricPrincipal = (context?: { sessionManager?: object }): FabricPrincipal | undefined => {
+  const session = principalSessionKey(context);
+  return session ? copyFabricPrincipal(turnPrincipals.get(session)) : undefined;
+};
 
 // A private host-owned token survives invocation-context spreads. Presence with an
 // undefined principal is an immutable UNKNOWN snapshot, not permission to re-sample.

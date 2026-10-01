@@ -223,10 +223,10 @@ const inboxWakeMs = (): number => {
 };
 
 export default async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
-  registerFabricPrincipalCapture(pi);
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
+  registerFabricPrincipalCapture(pi);
   if (!options.managedHost) registerJevAuth(pi);
   const codePreviewSettings = defaultCodePreviewSettings();
   const decorateShell: FabricToolShellDecorator = withCodePreviewShell;

@@ -40,7 +40,7 @@ Only Pi assigns `keyboard`, `terminal`, and `voice`. Unattested pane writes are 
 
 A verified Pi receipt may name an originating requester:
 
-```ts
+```ts host
 principal: { id: "paul", binding: "voice-call" }
 ```
 

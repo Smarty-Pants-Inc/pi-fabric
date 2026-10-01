@@ -475,7 +475,7 @@ export class FabricConversationTranscriptRenderer {
     const key = `${this.currentTargetId}\u0000${id}`;
     const args = tool?.args ?? callArgs;
     const value = result ?? tool?.result ?? tool?.partial;
-    const isPartial = !result && !tool?.result && !error;
+    const isPartial = !result && !tool?.result && !error && (!tool || tool.status === "running");
     const isError = result?.isError ?? tool?.isError ?? !!error;
     const started = tool ? tool.executionStarted ?? true : false;
     const argsComplete = !!result || !!tool?.result || !!tool?.argsComplete;
@@ -547,7 +547,9 @@ export class FabricConversationTranscriptRenderer {
     if (record.result !== value || record.isPartial !== isPartial || record.isError !== isError || record.error !== error) {
       // Details can contain opaque extension state; serialization is not an equality test.
       const resultKey = String(Number(record.resultKey ?? 0) + 1);
-      if (value !== undefined || error !== undefined) {
+      // A compact terminal end can precede canonical output (parallel tools),
+      // even without a partial. Finalize native status without inventing output.
+      if (value !== undefined || error !== undefined || !isPartial) {
         component.updateResult({
           content: error && !value ? [{ type: "text", text: error }] : (value?.content ?? []) as NativeToolResultContent[],
           ...(value?.details !== undefined ? { details: value.details } : {}),

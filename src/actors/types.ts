@@ -324,6 +324,8 @@ export interface FabricActorLog {
   session: FabricLogLine[];
   sessionHasMore: boolean;
   sessionBefore?: number;
+  /** Bind sessionBefore using beforeGeneration with type: "session". */
+  sessionGeneration?: string;
   run?: {
     runId: string;
     eventsFile: string;
@@ -331,6 +333,8 @@ export interface FabricActorLog {
     events: FabricLogLine[];
     hasMore: boolean;
     before?: number;
+    /** Bind before using beforeGeneration with type: "run". */
+    generation?: string;
   };
   retainedRuns: string[];
 }

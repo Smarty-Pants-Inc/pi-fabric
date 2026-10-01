@@ -17,10 +17,29 @@ import { processAlive } from "../storage/scratch.js";
 // MeshStore's default stale window; recovery waits, never weakens mesh locking.
 export const RESIDENT_MESH_STALE_WINDOW_MS = 30_000;
 
+export class FabricParticipantNotYetMirroredError extends Error {
+  override readonly name = "FabricParticipantNotYetMirroredError";
+  readonly code = "FABRIC_PARTICIPANT_NOT_YET_MIRRORED";
+  readonly retryable = true;
+  constructor(id: string, host?: string) {
+    super(`Fabric participant ${id} is listed by peers but not yet mirrored for control${host ? ` from ${host}` : ""}. Retry after the next mesh bridge presence refresh.`);
+  }
+}
+
+export class FabricParticipantNonInteractiveError extends Error {
+  override readonly name = "FabricParticipantNonInteractiveError";
+  readonly code = "FABRIC_PARTICIPANT_NON_INTERACTIVE";
+  constructor(id: string) {
+    super(`Fabric participant ${id} is non-interactive (print/JSON); it cannot receive followUp or steer messages.`);
+  }
+}
+
 // A quiesced root keeps heartbeating with no capabilities while it shuts down; "does not support"
 // read as a broken session (smarty-dev#1113).
-const unsupported = (participant: { id: string; status?: string }, kind: string): Error =>
-  participant.status === "stopping"
+const unsupported = (participant: { id: string; status?: string; interactive?: boolean }, kind: string): Error =>
+  participant.interactive === false
+    ? new FabricParticipantNonInteractiveError(participant.id)
+    : participant.status === "stopping"
     ? new Error(`Fabric participant ${participant.id} is shutting down; its session will relaunch or end. Retry after it restarts.`)
     : new Error(`Fabric participant ${participant.id} does not support ${kind}`);
 
@@ -32,13 +51,15 @@ const LAPSED_ROOT_REPLY_WINDOW_MS = 5 * 60_000;
 // A Pi session id (8-4-4-4-12). Actor and agent ids are 32 hex with no dashes, so they never match.
 const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Route messages using only the ownership, delivery, and binding ports needed here.
-// Says why a target cannot be resolved; the prefix stays "Unknown <label>: <id>".
+// Unknown ids retain the old prefix; discovery-only targets get a named retryable error.
 export const unknownParticipant = (
-  participants: Pick<FabricParticipantSource, "lastKnown">,
+  participants: Pick<FabricParticipantSource, "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers">>,
   id: string,
   label = "Fabric participant",
 ): Error => {
   const known = participants.lastKnown?.(id);
+  const peer = participants.peers?.().find((candidate) => candidate.id === id);
+  if (peer) return new FabricParticipantNotYetMirroredError(id, peer.host);
   if (!known) {
     const hint = SESSION_UUID.test(id.trim()) ? `; use 'session:${id.trim()}' for a Main session` : "";
     return new Error(
@@ -73,12 +94,19 @@ export class AgentMessageRouter {
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding"> & { owns?: (id: string) => boolean },
-    readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown">,
+    readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
   ) {}
+  #get(id: string): FabricParticipantInfo | undefined {
+    // Discovery and admission share this directory/root. A cached negative may predate the
+    // bridge's first presence refresh: re-read its files + state before declaring it unknown.
+    // lastKnown also reads fresh, but deliberately discards newly live records (smarty-dev#2377).
+    return this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true });
+  }
+
   #recentlyLapsedRoot(id: string): FabricParticipantInfo | undefined {
     // A write-stalled mesh explains the lapse, and delivery needs the mesh: report the stall.
     if (this.participants.writeStalled?.()) return undefined;
@@ -112,9 +140,9 @@ export class AgentMessageRouter {
   // that id (smarty-dev#1729). Only the same UUID is tried: never a guess across ids.
   #sessionTarget(id: string): string {
     const bare = id.trim();
-    if (!SESSION_UUID.test(bare) || this.participants.get(bare)) return id;
+    if (!SESSION_UUID.test(bare) || this.#get(bare)) return id;
     const session = `session:${bare}`;
-    return this.mainAgent.matches(session) || this.participants.get(session) || this.#recentlyLapsedRoot(session)
+    return this.mainAgent.matches(session) || this.#get(session) || this.#recentlyLapsedRoot(session)
       ? session
       : id;
   }
@@ -204,7 +232,12 @@ export class AgentMessageRouter {
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.
     if (isMain || remoteRoot?.kind === "root") {
+      if (remoteRoot?.interactive === false) throw new FabricParticipantNonInteractiveError(remoteRoot.id);
       if (isMain && this.mainAgent.local) {
+        // Local delivery needs no remote authority snapshot, but print/JSON Main is never interactive.
+        if (this.mainAgent.interactive === false || this.#get(this.mainAgent.id)?.interactive === false) {
+          throw new FabricParticipantNonInteractiveError(this.mainAgent.id);
+        }
         context?.activity?.({
           type: "entity",
           id: this.mainAgent.id,
@@ -227,6 +260,7 @@ export class AgentMessageRouter {
       if (!participant) {
         throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");
       }
+      if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       if (!this.control || participant.controlProtocol === "legacy") {
         return context?.signal || options.principal
@@ -271,7 +305,7 @@ export class AgentMessageRouter {
 
     // An agent another host owns (a durable child in its spawner's resident host, or a peer's
     // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
-    const remoteAgent = this.participants.get(id);
+    const remoteAgent = this.#get(id);
     if (remoteAgent?.kind === "agent" && !remoteAgent.local) {
       if (!remoteAgent.capabilities.includes(kind)) throw new Error(`Fabric participant ${remoteAgent.id} does not support ${kind}`);
       if (!this.control) throw new Error("Fabric control plane is unavailable");
@@ -374,7 +408,7 @@ export class AgentMessageRouter {
       }
       try {
         const actor = this.actorManager.status(command.targetId);
-        const ownership = this.participants.get(actor.id);
+        const ownership = this.#get(actor.id);
         if (ownership && !ownership.local) {
           return { accepted: false, error: `Participant ${actor.id} is owned by ${ownership.ownerHostId}` };
         }
@@ -396,7 +430,7 @@ export class AgentMessageRouter {
     if (command.operation === "ask") {
       try {
         const actor = this.actorManager.status(command.targetId);
-        const ownership = this.participants.get(actor.id);
+        const ownership = this.#get(actor.id);
         if (ownership && !ownership.local) {
           return {
             accepted: false,
@@ -419,6 +453,9 @@ export class AgentMessageRouter {
       }
     }
     if (this.mainAgent.local && this.mainAgent.matches(command.targetId)) {
+      if (this.mainAgent.interactive === false || this.#get(this.mainAgent.id)?.interactive === false) {
+        return { accepted: false, error: new FabricParticipantNonInteractiveError(this.mainAgent.id).message };
+      }
       let result: FabricAgentMessageResult;
       try {
         result = this.mainAgent.deliverAgent({
@@ -460,7 +497,7 @@ export class AgentMessageRouter {
     }
     try {
       const actor = this.actorManager.status(command.targetId);
-      const ownership = this.participants.get(actor.id);
+      const ownership = this.#get(actor.id);
       if (ownership && !ownership.local) {
         return { accepted: false, error: `Participant ${actor.id} is owned by ${ownership.ownerHostId}` };
       }
@@ -507,7 +544,7 @@ export class AgentMessageRouter {
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
     }
-    const participant = this.participants.get(actor?.id ?? id);
+    const participant = this.#get(actor?.id ?? id);
     if (!actor && (!participant || participant.kind !== "actor")) {
       throw new Error(`Unknown Fabric actor: ${id}`);
     }

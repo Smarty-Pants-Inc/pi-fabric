@@ -169,6 +169,8 @@ export interface AgentRunRecord {
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
   compaction?: AgentCompactionStatus;
+  /** Terminal event-log optimization was skipped; the full original log remains. */
+  compactionSkipped?: string;
 }
 
 export interface AgentRunResult extends AgentRunRecord {
@@ -176,6 +178,8 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** Present on terminal status snapshots when the full log was retained. */
+  compactionSkipped?: string;
   id: string;
   name: string;
   status: AgentRunStatus;
@@ -325,7 +329,9 @@ export interface FabricAgentLog {
   status?: AgentRunRecord;
   events: FabricLogLine[];
   hasMore: boolean;
+  /** Exclusive byte offset; pair with generation as beforeGeneration on the next request. */
   before?: number;
+  generation?: string;
 }
 
 export type FabricSteeringMode = "all" | "one-at-a-time";

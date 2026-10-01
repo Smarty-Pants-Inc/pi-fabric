@@ -78,6 +78,8 @@ export interface FabricMainModelSwitchResult {
 export interface FabricMainAgentTarget {
   readonly id: string;
   readonly local: boolean;
+  /** Local session mode, available even when its first mesh publication fails. */
+  readonly interactive?: boolean;
   matches(id: string): boolean;
   info(context?: ExtensionContext): FabricMainAgentInfo;
   deliverAgent(request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult;
@@ -282,6 +284,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     readonly local: boolean,
     readonly cwd: string,
     readonly sessionId?: string,
+    readonly interactive = true,
   ) {}
 
   matches(id: string): boolean {

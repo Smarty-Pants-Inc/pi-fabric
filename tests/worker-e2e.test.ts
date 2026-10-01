@@ -352,8 +352,20 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(log.length).toBeLessThan(10_000);
     const events = log.trim().split("\n").map((line) => JSON.parse(line));
     const stub = { type: "image", elided: true, bytes: ((5 * 1024 * 1024 + 4) * 3) / 4, mimeType: "image/png" };
-    expect(events.find((event) => event.type === "tool_execution_end")?.result.content[1]).toEqual(stub);
-    expect(events.find((event) => event.message?.role === "toolResult")?.message.content[1]).toEqual(stub);
+    const ends = events.filter((event) => event.type === "tool_execution_end");
+    const canonicals = events.filter((event) => event.type === "message_end" && event.message?.role === "toolResult");
+    expect(ends).toHaveLength(1);
+    expect(canonicals).toHaveLength(1);
+    const end = ends[0];
+    const content = [{ type: "text", text: "Read image file [image/png]" }, stub];
+    expect(end).toMatchObject({ toolCallId: "read-1", toolName: "read", isError: false });
+    expect(canonicals[0].message).toEqual({ role: "toolResult", toolCallId: "read-1", toolName: "read", content });
+    // This ordinary, uniquely paired log is well within every work bound.
+    // A platform-wide durability failure must not masquerade as an accepted fallback.
+    expect(result.compactionSkipped).toBeUndefined();
+    // The projected result (image data stubbed) is small, so it stays inline (B72 small-result contract).
+    expect(Buffer.byteLength(JSON.stringify({ content }), "utf8")).toBeLessThanOrEqual(8192);
+    expect(end.result).toEqual({ content });
   }, 30_000);
 
   it.each(["oversized-final", "oversized-error"])(

@@ -9,6 +9,7 @@ const FORBIDDEN = new Set(["constructor", "prototype", "__proto__", "arguments",
 export function montyBindings(
   native: typeof MontyNative,
   call: (ref: string, args: Record<string, unknown>) => Promise<unknown>,
+  responseAck: (id: unknown, responseId: unknown) => void,
 ): Record<string, unknown> {
   const wrappers = new Map<string, MontyNative.ClassType>();
   class Capability {}
@@ -46,5 +47,16 @@ export function montyBindings(
     }
     return value;
   };
-  return Object.fromEntries(ROOTS.map((name) => [name, wrapper(name)]));
+  class Transport {}
+  class TransportWrapper extends native.ClassType {
+    constructor() { super(Transport, { id: randomUUID(), name: "FabricTransport" }); }
+    override callMethod(name: string, positional: unknown[], kwargs: Record<string, unknown>): unknown {
+      if (name !== "response_ack" || positional.length || Object.keys(kwargs).some(key => !["id", "responseId"].includes(key))) {
+        throw new TypeError("Invalid Monty transport confirmation");
+      }
+      responseAck(kwargs.id, kwargs.responseId);
+      return null;
+    }
+  }
+  return { ...Object.fromEntries(ROOTS.map((name) => [name, wrapper(name)])), __fabric_transport: new TransportWrapper() };
 }

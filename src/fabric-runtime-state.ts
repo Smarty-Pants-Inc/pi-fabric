@@ -107,6 +107,8 @@ import {
   type FabricMainAgentInfo,
 } from "./main-agent.js";
 import { followUpDrainSupported } from "./host-compatibility.js";
+import { deliverActorToMain } from "./actors/main-delivery.js";
+import { sendFabricMessage } from "./fabric-provenance.js";
 import { AgentsProvider } from "./providers/agents-provider.js";
 import { CompactProvider } from "./providers/compact-provider.js";
 import { CacheProvider } from "./providers/cache-provider.js";
@@ -777,29 +779,7 @@ export class FabricRuntimeState {
       this.#mesh,
       enforceSchema ? { ...this.#config.mesh, enabled: false } : this.#config.mesh,
       this.#agents,
-      ({ actor, message, delivery, triggerTurn }) => {
-        const text = message.text ?? "";
-        if (!text) return;
-        const deliveryNotice = actorDeliveryNotice(delivery, triggerTurn);
-        this.pi.sendMessage(
-          {
-            customType: "pi-fabric-actor",
-            content: [
-              `<fabric-actor name=${JSON.stringify(actor.name)} id=${JSON.stringify(actor.id)}>\n${escapeXmlText(text)}\n</fabric-actor>`,
-              deliveryNotice,
-            ]
-              .filter((line): line is string => Boolean(line))
-              .join("\n"),
-            display: true,
-            details: {
-              actor,
-              message,
-              delivery: { mode: delivery, triggerTurn, passive: Boolean(deliveryNotice) },
-            },
-          },
-          { deliverAs: delivery, triggerTurn },
-        );
-      },
+      request => deliverActorToMain(this.pi, identity, request),
       ownsPersistentActorRegistry
         ? {
             persistent: true,
@@ -934,8 +914,8 @@ export class FabricRuntimeState {
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
     );
     this.#agentsProvider = agentsProvider;
-    this.#control.start((command, from, signal) =>
-      agentsProvider.acceptControl(command, from, signal));
+    this.#control.start((command, from, signal, verification) =>
+      agentsProvider.acceptControl(command, from, signal, verification));
     try {
       await this.#participants.start();
     } catch (error) {
@@ -969,12 +949,12 @@ export class FabricRuntimeState {
             content: "Jev supplies typed Choice, Noul, and Score judgments, not generated text. Prefer shell-first orchestration: granted pi.bash runs existing CLIs; tasks.wait/watch await bounded receipts/monitor batches without polling or inference. Use UI-only monitors to avoid Main wakeups. Browser/macOS tools need no Fabric bridge. Code owns commands; never execute a model answer as shell source. Omit jev.evaluate and set maxEvaluations:0 for deterministic programs (host auto approvals remain independent). Use jev.evaluate only for explicit authorized batched questions; jev.run/spawn for isolated TypeScript programs that may loop using input, program.sleep, program.emit, and exact requires capabilities. run/wait return terminal envelopes (join aliases wait for both agents and Jev); inspect state and result/error. Programs and detached tasks are session-owned, not restart-durable. jev.status/stop control programs; tasks.stop separately stops their detached tasks. Observation timeout/cancellation never cancels the task; keep task IDs and finite process deadlines. For Main-turn advisors, spawn with observe, await program.nextEvent without polling, and opt into bounded context fields. program.advise requires jev.advise and explicit delivery; default is record-only. Return the observer ID without waiting in Main; Escape/Main abort cancels observers. Use /login jev, TYPESAFE_API_KEY, /login openrouter, OPENROUTER_API_KEY, /login vercel-ai-gateway, AI_GATEWAY_API_KEY, or a trusted credentialCommand. Credentials stay host-side; status never retrieves a key. See docs/jev.md for schemas, budgets, and shell/CLI composition.",
           });
           const observationHost = identity.kind === "main" ? new JevObservationHost(context.sessionManager.getSessionId(), advice => {
-            this.pi.sendMessage({
+            sendFabricMessage(this.pi, {
               customType: "pi-fabric-jev",
               content: [`<fabric-jev name=${JSON.stringify(escapeXmlText(advice.name))} id=${JSON.stringify(advice.runId)}>\n${escapeXmlText(advice.message)}\n</fabric-jev>`, actorDeliveryNotice(advice.delivery, advice.triggerTurn)].filter(Boolean).join("\n"),
               display: true,
               details: { runId: advice.runId, eventId: advice.eventId, delivery: { mode: advice.delivery, triggerTurn: advice.triggerTurn } },
-            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn });
+            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn }, identity, "actor", "mesh");
           }) : undefined;
           this.#jevObservationHost = observationHost;
           // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.
@@ -1306,6 +1286,8 @@ export class FabricRuntimeState {
     return Boolean(this.#actors?.halted) || Boolean(this.#jevObservationHost?.halted);
   }
 
+  haltMain(): void { this.#mainAgent?.halt(); }
+
   haltAdvisors(): number {
     const actors = this.#config?.mesh.enabled ? this.#actors?.haltAll().halted ?? 0 : 0;
     return actors + (this.#jevObservationHost?.halt() ?? 0);
@@ -1471,7 +1453,13 @@ export class FabricRuntimeState {
     await this.#componentLoader?.settle();
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(reason?: string): Promise<void> {
+    if (reason === "reload") {
+      // Stop admission synchronously, before the first await. In-flight handlers may only journal.
+      this.#mainAgent?.prepareReload();
+      this.#control?.pause();
+      await this.#participants?.quiesce("reload").catch(() => undefined);
+    }
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
     this.#shellInbox?.close();
@@ -1479,11 +1467,11 @@ export class FabricRuntimeState {
     // Stop the resident drainer (and await its drain) before the Main journal closes: a delivery
     // must never reach a Main that can no longer journal it (review round 3 on pi-fabric#160).
     await this.#residency?.close().catch(() => undefined);
-    this.#mainAgent?.closeFollowUpDrain();
+    if (reason !== "reload") this.#mainAgent?.closeFollowUpDrain();
     this.#suppressResidentGuidanceSync = true;
     await this.#deactivateRepairs();
     clearActiveCompiledSurface();
-    await this.#participants?.quiesce().catch(() => undefined);
+    if (reason !== "reload") await this.#participants?.quiesce().catch(() => undefined);
     this.#stopComponentWatch?.();
     this.#stopComponentWatch = undefined;
     await this.#componentControl?.close();
@@ -1495,6 +1483,9 @@ export class FabricRuntimeState {
     this.#sessionCapabilityLease = undefined;
     await this.#lifecycle?.close();
     await closeWithActors(this.#actors, () => this.#control?.close(), () => this.#residency?.close());
+    // Actor shutdown starts before control drains (an in-flight ask may await an actor).
+    // Only now can admitted Main handlers no longer write the reload journal.
+    if (reason === "reload") this.#mainAgent?.closeFollowUpDrain();
     await this.#closeRecords();
     await this.#agents?.close();
     await this.shellJobs.close();

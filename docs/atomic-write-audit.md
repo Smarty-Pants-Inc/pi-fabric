@@ -102,53 +102,107 @@ Ordinary **event publication without an archive is intentionally volatile**; ena
 
 Authoritative mesh state writes and ordinary actor registry writes are **not harmless hot caches**: they now pay fsync cost. There is no blanket change to the general helper default, graph budget, startup lifecycle, expiring presence, read signals, sequence hints or ordinary mesh publication. Review state/registry write latency on deployed storage before rollout; do not restore unsafe clock/lineage rollback merely to recover a benchmark number.
 
-## Mesh state commit barrier budget (#2479 cost follow-up)
+## Mesh state group-commit barrier (#2479)
 
-The six fsyncs observed at `77168bf4` are **one state temporary-file barrier plus
-five directory barriers through `/`** at the benchmark path, not sibling-state
-or read-signal fsyncs. Directory depth made the cost path-dependent.
+State mutations now do **write temporary bytes -> atomic rename** under the mesh
+mutation lock, with **zero fsyncs in that critical section**. Optional read signals
+remain hints. Receipts, grants, schema outcomes and public put/delete/batch CAS
+results retain their default durable acknowledgment: after releasing the mutation
+lock, the caller waits for a completed barrier whose generation covers the
+observed/committed `highWater`. No-op deletes and all-skipped CAS batches also wait
+for the head they observed. A host-only `durable: false` opt-out returns a
+**speculative** version, never a durable receipt; the public provider does not
+expose or forward this option. Ordinary volatile events/reservations stay unchanged.
 
-Mesh state writers now lazily prepare an identity-bound `DurableDirectory`
-receipt at the first actual state mutation, **before acquiring the mesh lock**.
-Preparation uses the same complete physical/lexical ancestry and symlink walk as
-`syncPathNamespace`, and records a receipt only after every barrier and the second
-namespace walk succeed. A failed setup is retried, including in fresh processes;
-existence alone is never accepted. No receipt preparation runs in constructor,
-idle lifecycle, or ordinary event publication.
+The allocation clock is the monotone commit-generation counter, serialized just
+after `readGeneration` in the bounded canonical header. A lazily loaded engine
+coalesces same-turn requests and elects a single cross-process barrier on
+`.state-durability-lock`, using the existing dead-owner/PID-start lock protocol.
+This is **not** the mutation lock: successors can continue writing while a file
+fsync is in flight. A continuously queued/busy writer batches on a 250 ms cadence;
+a newly idle queue flushes immediately (after microtask coalescing), without a
+250 ms penalty for sequential operations. Peers join an already completed
+covering generation rather than performing duplicate barriers.
 
-An unchanged receipt lets each steady-state state commit use exactly:
+Each steady-state elected barrier uses at most two fsync calls:
 
-1. fsync the complete temporary state file once;
-2. rename it to `state.json`;
-3. fsync the containing directory once (POSIX only).
+1. Hard-link the latest complete state inode to a private checkpoint temporary
+   name, open it, and **asynchronously fsync the file once**.
+2. Rename that pinned inode to `state.durable.json`, then **fsync the parent once**
+   on POSIX. Publish a volatile completion hint only after both barriers succeed;
+   resolve only receipts whose generation is covered.
 
-Every commit rechecks the directory/link identities before and after its parent
-barrier. Observed replacement/retargeting invalidates the receipt and requires a
-new full setup outside the lock. First mutation in each store/process therefore
-pays additional setup fsyncs; **two is the steady-state/locked-commit budget, not a
-claim that process initialization or namespace recovery costs only two calls**.
-Ancestor directory change times also invalidate a same-inode detach/reattach;
-only the leaf change time is excluded because normal state/lock writes change
-its entries. Unrelated ancestor entry changes conservatively require fresh setup.
-The mesh lock still does not make external namespace mutation transactional.
+Pinning retries a bounded transient ENOENT lookup race with concurrent atomic
+replacement, before any fsync or receipt. Windows file barriers use a writable,
+noncreating/nontruncating `r+` handle.
 
-The final commit-directory barrier remains **inside the lock**, before optional
-read signal/cache publication, lock handoff, and returned CAS token. This retains
-the existing durable-before-handoff ordering: no successor reads an unconfirmed
-head as the basis for a dependent commit. Moving it after handoff would need a
-separate review of successor/failure semantics, rather than silently redefining
-that ordering as part of this syscall reduction. The optional read signal already
-identifies its generation in the synced canonical payload and remains volatile;
-no extra marker or second full-file barrier is introduced. Ordinary publication,
-sequence hints, and other durable atomic callers keep their existing behavior.
+The hard link writes no second state payload. It is necessary: simply syncing
+`state.json` and its parent after handoff is not enough when a later unsynced
+rename can replace the acknowledged inode before a power failure. The checkpoint
+retains the last synced snapshot independently of those speculative replacements.
+It is itself replaced only **after** its successor's data fsync, with barrier
+owners serialized, so a crash during checkpoint publication can recover either
+complete synced snapshot, never an unsynced replacement of the last receipt.
 
-The new regression suite covers <=2 fsyncs per steady-state put/delete/batch,
-file -> rename -> directory -> signal order, first-use setup outside the lock,
-failed setup retries, failed commit barriers, namespace/root replacement and
-same-target symlink replacement. Existing full-chain crash-ordering tests remain
-unchanged. These are barrier-contract tests, not power-cut certification.
+**Recovery:** on a missing, torn/unreadable, or lower-clock canonical file, readers
+and the next mutation recover the newer valid checkpoint. The next allocation
+therefore exceeds every **ACKED** commit's clock. An unacknowledged speculative
+commit may survive or be lost and its revision may be reissued; callers must not
+promote speculative reads/versions into durable external receipts. Failed file or
+parent barriers reject queued receipts, do not advance successful coverage, and
+publish a failed-attempt hint for already queued peers. A subsequent request
+retries the owed barrier. Failure is not rollback: a rejected mutation may remain
+visible, and callers must re-read before retrying a CAS. A checkpoint published by
+a failed parent barrier is not an acknowledgment; a later barrier must complete.
 
-### Final cost gate on ryzen2
+Namespace receipts still require a successful full physical/lexical ancestry and
+symlink barrier, lazily prepared/revalidated **outside** the mutation lock. Setup
+and namespace recovery may owe additional fsyncs; the <=2 budget is per prepared
+steady-state barrier, not per new process or changed namespace. All other audited
+durable classes and the general atomic-write defaults are unchanged. Directory
+fsync is unsupported/skipped on Windows as before; physical power-cut guarantees
+still require platform/filesystem certification. Checkpoint files are immutable
+rename-only snapshots: external in-place modification is outside this contract.
+Recovery requires group-commit-aware hosts; older installed builds do not know
+about the checkpoint, so mixed-version reboot is not covered by this guarantee.
+
+Hard links change the canonical inode's ctime. The barrier restamps a read signal
+only when its exact pre-link stamp, canonical UUID, pinned inode, size and mtime
+still match. A concurrent successor or legacy copied-marker replacement forces
+ordinary canonical fallback; no signal can hide a changed authoritative payload.
+The engine has a stable package-local lazy entry, loads only at actual first
+state use, and does not increase the eager graph budget.
+
+Regression evidence covers generation/ack ordering, no acknowledgment before a
+covering barrier, shared coalescing/250 ms busy cadence and immediate idle flush,
+file/parent failure propagation and retry (including a peer/no-op receipt), fast
+non-durable writes, zero mutation-lock fsyncs, <=2 prepared barrier calls,
+namespace/symlink recovery, and unchanged read-generation/ABA/idle behavior.
+Owned-child SIGKILL probes combine actual process crash with deterministic loss
+of the volatile canonical namespace (missing/torn/older). They are contract tests,
+**not physical power-cut certification**.
+
+### Fresh group-commit performance gate on ryzen2
+
+Three fresh 300-second runs, same 2,301,068-byte fixture and SHA256, five nice-0
+writers, 300 mutations/min, 24 volatile publications/min. Each completed 1,500
+mutations with zero errors and exact highWater/entry/sequence checks.
+
+| Build | Held % | Hold p90 / max ms | Durable ACK p90 ms | In-lock fsyncs |
+|---|---:|---:|---:|---:|
+| main 3f6a2963 | 16.04 | 42.5 / 162.5 | N/A (volatile API 64.9) | 0 |
+| 06b8df10 | 25.24 | 110.4 / 274.0 | 152.8 | 3000 |
+| Group commit (this change) | 15.66 | 40.6 / 129.2 | 160.7 | 0 |
+
+Gate PASS: -0.37 pp versus main (limit +7), max 129.2 ms (<1000), 0 locked fsyncs, 2874 / 1437 barriers (<=2 each). Durable ACK p90 160.7 ms; post-lock barrier wait p90 122.4 ms.
+
+Namespace preparation/reconfirmation is additional outside-lock work, separately
+reported in the retained harness results. A rare source-pin lookup race found in
+an intermediate run was fixed with bounded pre-barrier retries; the final run
+above is a new complete run of the hardened compiled artifact. Physical power-cut
+and mixed-version recovery remain explicitly outside this certification.
+
+### Historical in-lock barrier cost gate (`06b8df10`, before group commit)
 
 Same 2,301,068-byte synthetic fixture, five independent Node v24.19.0 writers at
 nice 0, 300-second runs, 300 state mutations/min and 24 volatile publications/min.

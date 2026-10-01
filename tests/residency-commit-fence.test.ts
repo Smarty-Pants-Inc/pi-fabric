@@ -1448,7 +1448,9 @@ describe("round 1 public cancellation contract", () => {
   });
 
   it("durable create never enters activation compensation when committed removal would be unknown", async () => {
-    const state = await harness(false, undefined, 200); const main = mainProvider(state);
+    // This success-path deadline must cover the mesh's 250 ms busy group cadence.
+    // A 200 ms request may correctly report a committed-but-unknown outcome now.
+    const state = await harness(false, undefined, 1_000); const main = mainProvider(state);
     const activationFailure = new Error("injected activation failure");
     const ensure = vi.spyOn(state.client, "ensureActor").mockImplementation(async (id) => {
       await waitFor(() => state.participants.get(id)?.ownerHostId === residentHostId(state.config.rootId));

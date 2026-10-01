@@ -30,6 +30,7 @@ const stable = [
   "providers/memory-provider.js",
 ];
 const lazy = [
+  "mesh/state-durability.js",
   "lifecycle/reload-target-profile.js",
   "coordination/unverified-ids.js",
   "agents/claude-cli.js",

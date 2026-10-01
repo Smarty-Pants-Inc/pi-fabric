@@ -10,8 +10,10 @@ import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, 
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
-import { executeFile, processIsAlive, spawnDetached } from "../agents/transports/process-utils.js";
+import { executeFile, spawnDetached } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
+import { residentProcessAlive } from "./process-identity.js";
+import { kernelFenceAvailable } from "./file-lock.js";
 import { hasUnresolvedWorker } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
@@ -49,6 +51,8 @@ const startupBudgetMs = (base: number): number => {
 };
 const COMMAND_TIMEOUT_MS = 30_000;
 const STATUS_POLL_MS = 100;
+const WATCHDOG_INTERVAL_MS = 5_000;
+const WATCHDOG_MAX_BACKOFF_MS = 60_000;
 const AGENT_ID_PATTERN = /^[a-f0-9]{32}$/;
 
 const delay = (ms: number): Promise<void> =>
@@ -133,6 +137,10 @@ export class ResidencyClient {
   #ensuringHost: Promise<ResidentHostOwner> | undefined;
   #retiringLegacyToken: string | undefined;
   #closed = false;
+  #startingHost: Promise<ResidentHostOwner> | undefined;
+  #nextWatchdogAt = 0;
+  #watchdogFailures = 0;
+  #watchdogWork: string | undefined;
 
   constructor(readonly options: ResidencyClientOptions) {
     this.hostId = residentHostId(options.config.rootId);
@@ -157,6 +165,7 @@ export class ResidencyClient {
       () => {
         this.#recoverHost();
         void this.#drainDeliveries().catch(() => undefined);
+        void this.#watchdog().catch(() => undefined);
       },
       Math.max(20, this.options.config.mesh.actorPollMs),
     );
@@ -170,6 +179,7 @@ export class ResidencyClient {
     this.#deliveryTimer = undefined;
     await this.#ensuringHost?.catch(() => undefined);
     while (this.#drainingDeliveries) await delay(10);
+    await this.#startingHost?.catch(() => undefined);
   }
 
   /** Direct actor control must not bypass the release gate used by create/spawn. */
@@ -202,6 +212,14 @@ export class ResidencyClient {
   }
 
   async ensureHost(): Promise<ResidentHostOwner> {
+    if (this.#startingHost) return this.#startingHost;
+    const starting = this.#startHost();
+    this.#startingHost = starting;
+    try { return await starting; }
+    finally { this.#startingHost = undefined; }
+  }
+
+  async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
     if (this.#ensuringHost) return this.#ensuringHost;
     const attempt = this.#ensureHost();
@@ -714,11 +732,46 @@ export class ResidencyClient {
       owner?.format !== RESIDENT_HOST_FORMAT ||
       owner.hostId !== this.hostId ||
       !Number.isSafeInteger(owner.pid) ||
-      !processIsAlive(owner.pid)
+      !residentProcessAlive(owner.pid, owner.processStartTime)
     ) {
       return undefined;
     }
     return owner;
+  }
+
+  async #watchdog(): Promise<void> {
+    const now = Date.now();
+    if (this.#closed || this.#startingHost || now < this.#nextWatchdogAt || !kernelFenceAvailable()) return;
+    this.#nextWatchdogAt = now + WATCHDOG_INTERVAL_MS;
+    if (this.#liveOwner()) return;
+    const work = this.#durableWork();
+    if (!work) { this.#watchdogWork = undefined; this.#watchdogFailures = 0; return; }
+    const noProgress = work === this.#watchdogWork;
+    this.#watchdogWork = work;
+    try {
+      await this.ensureHost();
+      // A ready owner is not progress: it may exit idle with the same disk work.
+      this.#watchdogFailures = noProgress ? this.#watchdogFailures + 1 : 0;
+      this.#nextWatchdogAt = Date.now() + Math.min(WATCHDOG_MAX_BACKOFF_MS, WATCHDOG_INTERVAL_MS * 2 ** this.#watchdogFailures);
+    } catch {
+      this.#nextWatchdogAt = Date.now() + Math.min(WATCHDOG_MAX_BACKOFF_MS, WATCHDOG_INTERVAL_MS * 2 ** ++this.#watchdogFailures);
+    }
+  }
+
+  #durableWork(): string | undefined {
+    const work: string[] = [];
+    const config = this.options.config;
+    const actorRoots = [config.actorRoot, config.sessionActorRoot ??
+      (config.mesh.actorScope === "session" ? path.dirname(config.actorRoot) : path.join(config.actorRoot, config.sessionId))];
+    for (const root of actorRoots) {
+      const registry = readJson<{ actors?: Array<{ id?: string; rootId?: string; residency?: string; status?: string }> }>(path.join(root, "actors.json"));
+      for (const actor of registry?.actors ?? []) {
+        if (actor.rootId === config.rootId && actor.residency === "durable" && actor.status !== "stopped") {
+          work.push(`actor:${root}:${actor.id}:${actor.status}`);
+        }
+      }
+    }
+    return work.length ? JSON.stringify(work.sort()) : undefined;
   }
 
   async #drainDeliveries(): Promise<void> {

@@ -152,6 +152,15 @@ describe("actor retirement admission fence", () => {
   });
 });
 
+describe("ActorManager closing ingress", () => {
+  it("P2-1 rejects tell while closing rather than accepting memory-only work", async () => {
+    const { actors } = setup(true);
+    const actor = await actors.create({ name: "Closing", instructions: "Wait", runner: "pi" });
+    await actors.close();
+    expect(() => actors.tell(actor.id, "must survive")).toThrow(/closing; retry/);
+  });
+});
+
 describe("queued actor activation revocation (#181 F1)", () => {
   it.each(["stop", "remove", "halt"] as const)("never launches after %s behind a full permit pool", async (operation) => {
     const { actors, agents } = setup(false, undefined, undefined, undefined, {}, { maxConcurrent: 1 });

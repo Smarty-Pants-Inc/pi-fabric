@@ -4,8 +4,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { RpcClient, type RpcAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { RpcClient } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+
+// Derive the event from the public callback API; older Pi versions do not export its name.
+type RpcAgentSessionEvent = Parameters<Parameters<RpcClient["onEvent"]>[0]>[0];
 
 const repo = fileURLToPath(new URL("../", import.meta.url));
 const entry = path.join(repo, "dist/index.js");

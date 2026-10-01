@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type AssistantMessage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 export default function (pi: ExtensionAPI) {
@@ -49,7 +49,9 @@ export default function (pi: ExtensionAPI) {
         ...(mode === "success" ? [fauxAssistantMessage(fauxToolCall("work_754", {}), { stopReason: "toolUse" })] : []),
         fauxAssistantMessage("received"), fauxAssistantMessage("finished"),
       ]);
-      mark("preflight-state", { idle: ctx.isIdle(), pending: ctx.isPromptPending?.() });
+      // Optional host capability; Pi 0.87.0 does not declare it.
+      const host = ctx as ExtensionContext & { isPromptPending?: () => boolean };
+      mark("preflight-state", { idle: ctx.isIdle(), pending: host.isPromptPending?.() });
       await gate("preflight");
       if (mode === "handled") return { action: "handled" as const };
     }

@@ -70,11 +70,13 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
       expect(rows[1]).toMatchObject({ status: "completed", admittedModel: pin.model, admittedEffort: pin.effort });
     } finally { if (id) await manager.cleanup(id, true); }
   }, 45000);
-  it("loads attribution hook even when extensions are disabled and records verified admission", async () => {
+  it.each(["native", "win32"])("loads attribution hook even when extensions are disabled and records verified admission (%s paths)", async pathStyle => {
     const { result, rows, launch, pin } = await run("success");
+    // Exercise Windows argv separators on every host, using the real worker's hook path.
+    const argv: string[] = pathStyle === "win32" ? launch.argv.map((arg: string) => path.win32.normalize(arg)) : launch.argv;
     expect(result).toMatchObject({ status: "completed", model: pin.model, thinking: pin.effort, admittedModel: pin.model, admittedThinking: pin.effort });
     expect(launch.argv).toContain("--no-extensions");
-    expect(launch.argv.some((arg: string) => arg.endsWith("/guards/model-route-hook.js"))).toBe(true);
+    expect(argv.some(arg => arg.replaceAll("\\", "/").endsWith("/guards/model-route-hook.js"))).toBe(true);
     expect(launch.header).toContain("bounded-lookup/test%2Fluna-medium/shadow-choice:");
     expect(rows[1]).toMatchObject({ admittedModel: pin.model, admittedEffort: pin.effort, status: "completed", tokens: { input: 2, output: 3 } });
   });
@@ -101,6 +103,6 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     const { result, launch } = await run("success", false);
     expect(result.status).toBe("completed");
     expect(launch.header).toBeNull();
-    expect(launch.argv.some((arg: string) => arg.endsWith("/guards/model-route-hook.js"))).toBe(false);
+    expect(launch.argv.some((arg: string) => arg.replaceAll("\\", "/").endsWith("/guards/model-route-hook.js"))).toBe(false);
   });
 });

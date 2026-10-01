@@ -1656,12 +1656,12 @@ export class AgentManager {
     return { cleaned: cleaned || !fs.existsSync(managed.runDirectory) };
   }
 
-  readLog(id: string, opts: { lines?: number; before?: number } = {}): FabricAgentLog {
+  readLog(id: string, opts: { lines?: number; before?: number; beforeGeneration?: string } = {}): FabricAgentLog {
     const managed = this.#requireRun(id);
     const runDirectory = managed.runDirectory;
     const logFile = path.join(runDirectory, "events.jsonl");
     const lines = Math.max(1, Math.min(opts.lines ?? 200, 5000));
-    const page = readJsonlPage(logFile, lines, opts.before);
+    const page = readJsonlPage(logFile, lines, opts.before, undefined, opts.beforeGeneration);
     const statusRecord = readRecord(path.join(runDirectory, "status.json"));
     return {
       id,
@@ -1670,6 +1670,7 @@ export class AgentManager {
       events: page.lines,
       hasMore: page.hasMore,
       ...(page.before !== undefined ? { before: page.before } : {}),
+      ...(page.generation !== undefined ? { generation: page.generation } : {}),
       ...(statusRecord ? { status: { ...statusRecord, cwd: managed.cwd } } : {}),
     };
   }

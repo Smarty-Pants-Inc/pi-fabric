@@ -162,10 +162,12 @@ export class CPythonRuntime implements FabricKernelRuntime {
       }
       let channel: Duplex | net.Socket | undefined;
       let expectedToken: string | undefined = ipc?.token;
-      let childExited = child.pid === undefined;
-      child.once("exit", () => { childExited = true; });
+      let childClosed = child.pid === undefined;
+      child.once("close", () => { childClosed = true; });
+      let logsFinalized = false;
       const appendLog = (index: number, text: string): void => {
-        if (settled || truncated) return;
+        // Settlement ends IPC admission, not the drain of already-written logs.
+        if (logsFinalized || truncated) return;
         const available = Math.max(0, maxLogChars - logChars);
         const retained = text.slice(0, available);
         logChars += retained.length;
@@ -176,7 +178,6 @@ export class CPythonRuntime implements FabricKernelRuntime {
       };
       const finish = async (result: Omit<FabricSandboxResult, "logs">, unawaitedHostCalls = false): Promise<void> => {
         if (settled) return;
-        for (let index = 0; index < decoders.length; index++) appendLog(index, decoders[index]!.end());
         if (result.terminationReason === "completed" && executionDeadline.reached) {
           hostAbort.abort(executionDeadline.reason);
           result = executionDeadline.timeoutResult([]);
@@ -190,21 +191,30 @@ export class CPythonRuntime implements FabricKernelRuntime {
         preserveCancellationOutcome(result, hostAbort.signal, interrupted);
         channel?.destroy();
         ipc?.server.close();
-        child.stdout?.destroy();
-        child.stderr?.destroy();
         if (child.pid && process.platform !== "win32") {
           try { process.kill(-child.pid, "SIGKILL"); } catch { /* The process group may already have exited. */ }
         }
         child.kill("SIGKILL");
-        // Let the terminated child release its working directory before the
-        // caller observes the result; Windows rmdir fails with EBUSY while held.
-        if (!childExited) {
-          await new Promise<void>((done) => {
+        // TCP results and Windows stderr pipes arrive independently. "exit" is
+        // not a drain barrier: keep the readers until "close" (all stdio closed),
+        // or the existing bounded reap grace if a descendant holds a pipe open.
+        // IPC and host authority have already ended; this waits only for logs/cwd.
+        if (!childClosed) {
+          await new Promise<void>((resolveClose) => {
+            const done = (): void => {
+              clearTimeout(timer);
+              child.removeListener("close", done);
+              resolveClose();
+            };
             const timer = setTimeout(done, 250);
             timer.unref?.();
-            child.once("exit", () => { clearTimeout(timer); done(); });
+            child.once("close", done);
           });
         }
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        for (let index = 0; index < decoders.length; index++) appendLog(index, decoders[index]!.end());
+        logsFinalized = true;
         for (const text of partialLogs) if (text) logs.push(text);
         if (truncated) logs.push("[Pi Fabric log output truncated]");
         if (result.terminationReason === "completed" && executionDeadline.reached) {
@@ -368,8 +378,8 @@ export class CPythonRuntime implements FabricKernelRuntime {
         socket.on("data", onData);
         socket.on("error", (error) => failPipe(`CPython IPC failed: ${error.message}`));
       };
-      child.stdout?.on("data", (chunk: Buffer) => appendLog(0, decoders[0]!.write(chunk)));
-      child.stderr?.on("data", (chunk: Buffer) => appendLog(1, decoders[1]!.write(chunk)));
+      child.stdout?.on("data", (chunk: Buffer) => { if (!logsFinalized) appendLog(0, decoders[0]!.write(chunk)); });
+      child.stderr?.on("data", (chunk: Buffer) => { if (!logsFinalized) appendLog(1, decoders[1]!.write(chunk)); });
       child.on("error", (error) => fail(`CPython process failed: ${error.message}${this.enforce ? "; OS sandbox is required (no native fallback)" : ""}`));
       child.on("close", (exitCode, signal) => {
         if (settled || (finishing && !pipeError)) return;

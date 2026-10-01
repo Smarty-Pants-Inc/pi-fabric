@@ -1361,25 +1361,32 @@ export class AgentsProvider implements FabricProvider {
         const lines = typeof args.lines === "number" ? args.lines : 200;
         const runId = typeof args.runId === "string" ? args.runId : undefined;
         const before = typeof args.before === "number" ? args.before : undefined;
+        const beforeGeneration = typeof args.beforeGeneration === "string" ? args.beforeGeneration : undefined;
+        if (before !== undefined && beforeGeneration === undefined) {
+          const error = new Error("cursor-stale: Unbound log cursor; re-read from start or pass the returned generation as beforeGeneration");
+          error.name = "cursor-stale";
+          throw error;
+        }
+        const cursor = {
+          ...(before !== undefined ? { before } : {}),
+          ...(beforeGeneration !== undefined ? { beforeGeneration } : {}),
+        };
         try {
           const actor = this.actorManager.status(id);
           return this.actorManager.readLog(actor.id, {
             type,
             lines,
-            ...(runId ? { runId } : {}),
-            ...(before !== undefined ? { before } : {}),
+            ...(runId !== undefined ? { runId } : {}),
+            ...cursor,
           });
         } catch (error) {
           if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
           /* not an actor — fall through to agent */
         }
         if (this.residency?.hasAgent(id)) {
-          return this.residency.readAgentLog(id, {
-            lines,
-            ...(before !== undefined ? { before } : {}),
-          });
+          return this.residency.readAgentLog(id, { lines, ...cursor });
         }
-        return this.manager.readLog(id, { lines, ...(before !== undefined ? { before } : {}) });
+        return this.manager.readLog(id, { lines, ...cursor });
       }
       default:
         throw new Error(`Unknown agents action: ${actionName}`);

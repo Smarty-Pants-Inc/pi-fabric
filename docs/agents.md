@@ -720,19 +720,23 @@ Fabric also resets a session automatically. Before a run starts, it checks the s
 
 ## Paged agent logs
 
-`agents.log()` reads bounded pages from JSONL logs. It does not load the full file. The first call returns the newest entries. If `hasMore` is true, pass the returned `before` cursor to load the next older page. For an actor session, use `sessionHasMore` and `sessionBefore`:
+`agents.log()` reads bounded pages from JSONL logs. The first call returns the newest entries. A next-page call must pair its `before` byte offset with the returned `generation`, passed as `beforeGeneration`. For an actor run these fields are inside `run`; for an actor session use `sessionBefore` and `sessionGeneration` with `type: "session"`. An initial `type: "all"` returns both streams, but a bound next page must select one stream.
 
 ```ts
 const { id } = await agents.actorStatus({ id: "release-reviewer" });
 const newest = await agents.log({ id, type: "run", lines: 100 });
-if ("before" in newest && newest.hasMore) {
-  const older = await agents.log({ id, type: "run", lines: 100, before: newest.before });
-  return older;
+const page = "run" in newest ? newest.run : "events" in newest ? newest : undefined;
+if (page?.hasMore) {
+  return await agents.log({
+    id, type: "run", lines: 100,
+    before: page.before, beforeGeneration: page.generation,
+    ...("runId" in page ? { runId: page.runId } : {}),
+  });
 }
 return newest;
 ```
 
-The `offset` values on log lines and all page cursors are byte offsets in the JSONL file.
+Terminal run-log compaction can replace the file atomically. A stale generation, or a public call with a bare `before` and no generation, returns the named `cursor-stale` error instead of reading wrong bytes. Re-read from the start without the cursor pair, or supply the generation returned with that cursor. This deliberately tightens the old numeric-only paging contract. Same-file appends do not invalidate a bound cursor; internal descriptor readers remain compatible.
 
 ## Global actor templates
 

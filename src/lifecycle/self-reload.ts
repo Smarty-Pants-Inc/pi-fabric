@@ -37,7 +37,7 @@ export interface ReloadTargetResult {
   reason: string;
   target: string | null;
 }
-/** A reload held this long by background work is reported once per target (smarty-dev#2216). */
+/** A reload held this long by background work is reported once per continuous hold (smarty-dev#2216). */
 export const RELOAD_HELD_NOTICE_MS = 10 * 60_000;
 const PACKAGE_NAME = "pi-fabric";
 const RETRY_MS = 5_000;
@@ -349,7 +349,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     if (context.isIdle() && !userHalted()) armRetry(context);
   };
   let unsubscribe: (() => void) | undefined = pi.events?.on(RELOAD_TARGET_TOPIC, receive);
-  /** An unbounded job can hold reload forever: report it once per target. */
+  /** An unbounded job can hold reload forever: report it once per continuous hold. */
   const noteHeld = (context: ExtensionContext, target: string, busy: number): void => {
     const now = Date.now();
     if (held?.target !== target) held = { target, since: now, reported: false };
@@ -372,9 +372,11 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
   /** One scheduler and one native command for Fabric changes and bound resource changes. */
   const request = (context: ExtensionContext): boolean => {
     const candidate = candidateNow();
-    if (!candidate || autoReloadOptedOut(deps.autoReloadConfigured())) return true;
-    if (attempted(context.sessionManager.getSessionId(), candidate)) return true;
-    if (userHalted()) return true;
+    if (!candidate || autoReloadOptedOut(deps.autoReloadConfigured())
+      || attempted(context.sessionManager.getSessionId(), candidate) || userHalted()) {
+      held = undefined;
+      return true;
+    }
     if (candidate.kind === "resource") {
       const hold = resourceHold(context);
       if (hold?.startsWith("unsupported-host:")) { invalidate(candidate, hold, candidate.target); return false; }
@@ -382,6 +384,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     }
     const busy = deps.busy();
     if (busy > 0) noteHeld(context, candidate.target, busy);
+    else held = undefined;
     if (busy > 0 || context.hasPendingMessages()) return false;
     if (scheduled) return false; // keep the shared idle retry until the queued command executes
     const globals = globalThis as Record<symbol, unknown>;

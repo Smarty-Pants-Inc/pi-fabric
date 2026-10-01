@@ -327,6 +327,31 @@ describe("agent transcript projection", () => {
     expect(returnedTail.hasNewer).toBe(false);
   });
 
+  it("does not borrow pending compact metadata after an explicit reused start in a real file", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-transcript-"));
+    temporaryDirectories.push(directory);
+    const logFile = path.join(directory, "events.jsonl");
+    const content = [{ type: "text", text: "new-body" }];
+    const events = [
+      { type: "tool_execution_start", toolCallId: "same", toolName: "bash", args: { command: "old" } },
+      { type: "tool_execution_end", toolCallId: "same", result: { elided: true, bytes: 100 }, resultMetadata: { terminate: true, opaque: { owner: "prior-call" } } },
+      { type: "tool_execution_start", toolCallId: "same", toolName: "bash", args: { command: "new" } },
+      { type: "message_end", message: { role: "toolResult", toolCallId: "same", toolName: "bash", content, isError: false } },
+    ];
+    fs.writeFileSync(logFile, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+    const reader = new AgentTranscriptReader();
+    const source = { id: "same", status: "completed", logFile };
+    const check = () => {
+      const entries = reader.read(source, false).entries;
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({ args: { command: "new" }, status: "completed" });
+      expect(entries[0]?.result).toEqual({ content });
+    };
+    check();
+    expect(reader.loadLatest(source)).toBe(true);
+    check();
+  });
+
   it("hydrates tool metadata when a lifecycle crosses the bounded page boundary", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-transcript-"));
     temporaryDirectories.push(directory);
@@ -367,6 +392,81 @@ describe("agent transcript projection", () => {
       result: { output: "split body" },
       status: "completed",
     });
+  });
+
+  it.each([false, true])("recovers compact-end metadata in a real 42-line canonical-only page (isError=%s)", (isError) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-transcript-"));
+    temporaryDirectories.push(directory);
+    const logFile = path.join(directory, "events.jsonl");
+    const metadata = { terminate: true, customFlag: 0, opaque: { retained: [false, null] } };
+    const result = { content: [{ type: "text", text: "canonical" }], details: { exitCode: isError ? 1 : 0 } };
+    const events = [
+      { type: "tool_execution_start", toolCallId: "split", toolName: "bash", args: { command: "run" } },
+      { type: "tool_execution_end", toolCallId: "split", result: { elided: true, bytes: 120 }, resultMetadata: { ...metadata, content: "stale", details: "stale" }, isError: !isError },
+      { type: "message_end", message: { role: "toolResult", toolCallId: "split", toolName: "bash", ...result, isError } },
+      ...Array.from({ length: 39 }, (_, index) => ({ type: "message_end", message: { role: "assistant", content: `after-${index}` } })),
+    ];
+    fs.writeFileSync(logFile, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+    const reader = new AgentTranscriptReader();
+    const source = { id: "split", status: "completed", logFile };
+    const check = () => {
+      const transcript = reader.read(source, false);
+      expect(transcript.entries).toHaveLength(40);
+      expect(transcript.entries[0]).toMatchObject({
+        id: "split", args: { command: "run" }, result: { ...result, ...metadata }, status: isError ? "failed" : "completed",
+      });
+    };
+    check();
+    expect(reader.loadOlder(source)).toBe(true);
+    expect(reader.read(source, false).entries[0]).toMatchObject({ id: "split", status: "running" });
+    expect(reader.loadNewer(source)).toBe(true);
+    check();
+    expect(reader.loadLatest(source)).toBe(true);
+    check();
+  });
+
+  it("preserves full legacy execution-end results and args across a canonical-only page", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-transcript-"));
+    temporaryDirectories.push(directory);
+    const logFile = path.join(directory, "events.jsonl");
+    const result = { content: [{ type: "text", text: "legacy" }], details: { exitCode: 1 }, elided: true, customFlag: 0 };
+    const events = [
+      { type: "tool_execution_start", toolCallId: "legacy", toolName: "bash", args: { command: "false" } },
+      { type: "tool_execution_end", toolCallId: "legacy", result, isError: true },
+      { type: "message_end", message: { role: "toolResult", toolCallId: "legacy", toolName: "bash", content: result.content, details: result.details, isError: true } },
+      ...Array.from({ length: 39 }, () => ({ type: "agent_start" })),
+    ];
+    fs.writeFileSync(logFile, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+    const reader = new AgentTranscriptReader();
+    const source = { id: "legacy", status: "completed", logFile };
+    const check = () => expect(reader.read(source, false).entries[0]).toMatchObject({ args: { command: "false" }, result, status: "failed" });
+    check();
+    expect(reader.loadOlder(source)).toBe(true);
+    expect(reader.loadNewer(source)).toBe(true);
+    check();
+  });
+
+  it.each(["new-start", "prior-completion", "line-bound", "byte-bound", "absent"])("does not fabricate compact metadata from unavailable/older lifecycles: %s", (boundary) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-transcript-"));
+    temporaryDirectories.push(directory);
+    const logFile = path.join(directory, "events.jsonl");
+    const start = { type: "tool_execution_start", toolCallId: "reused", toolName: "bash", args: { command: "old" } };
+    const canonical = { type: "message_end", message: { role: "toolResult", toolCallId: "reused", toolName: "bash", content: [{ type: "text", text: "new" }], isError: false } };
+    const old = [start, { type: "tool_execution_end", toolCallId: "reused", result: { elided: true, bytes: 100 }, resultMetadata: { terminate: true } }, canonical];
+    const prefix = boundary === "absent" ? [] : boundary === "new-start" ? [...old, { ...start, args: { command: "new" } }]
+      : boundary === "prior-completion" ? old
+      : boundary === "line-bound" ? [...old, ...Array.from({ length: 160 }, () => ({ type: "agent_start" }))]
+      : [...old, { type: "ignored", text: "x".repeat(512 * 1024) }];
+    const events = [...prefix, canonical, ...Array.from({ length: 39 }, () => ({ type: "agent_start" }))];
+    fs.writeFileSync(logFile, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+    const reader = new AgentTranscriptReader();
+    const source = { id: "reused", status: "completed", logFile };
+    const tool = reader.read(source).entries.find((entry) => entry.kind === "tool");
+    expect(tool?.result).toEqual({ content: canonical.message.content });
+    if (boundary === "new-start") expect(tool?.args).toEqual({ command: "new" });
+    else expect(tool?.args).toBeUndefined();
+    expect(reader.loadLatest(source)).toBe(true);
+    expect(reader.read(source).entries.find((entry) => entry.kind === "tool")?.result).toEqual(tool?.result);
   });
 
   it("tails a live JSONL file and refreshes when it grows", () => {

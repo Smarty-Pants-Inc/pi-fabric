@@ -249,6 +249,39 @@ describe("installSelfReload", () => {
     expect(sent).toEqual([]);
   });
 
+  it("reports once per continuous background hold, not once per target (smarty-dev#2216)", async () => {
+    vi.useFakeTimers();
+    const old = release("aaa"), next = release("bbb");
+    activate(old);
+    const { pi, emit, sent } = fakePi();
+    let busy = 1;
+    const published: unknown[] = [];
+    const selfReload = installSelfReload(pi as never, {
+      busy: () => busy, autoReloadConfigured: () => true,
+      moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href,
+      settingsPath: settingsPath(), heldNoticeMs: 60_000,
+      publishHeld: data => { published.push(data); },
+    });
+    const state = { idle: true, pending: false };
+    const context = fakeContext("s-continuous-held", state);
+    selfReload.sessionStart("startup", context as never);
+    activate(next); emit("agent_settled", context);
+    await vi.advanceTimersByTimeAsync(65_000);
+    expect(context.notices).toHaveLength(1); expect(published).toHaveLength(1);
+    busy = 0; state.pending = true; // input holds the target while background work clears
+    await vi.advanceTimersByTimeAsync(5_000);
+    busy = 1;
+    await vi.advanceTimersByTimeAsync(55_000);
+    expect(context.notices).toHaveLength(1); expect(published).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(context.notices).toHaveLength(2); expect(published).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(context.notices).toHaveLength(2); expect(published).toHaveLength(2);
+    expect(context.notices.every(line => !line.includes("\n"))).toBe(true);
+    expect(sent).toEqual([]);
+    emit("session_shutdown", context);
+  });
+
   it("never reloads under a prompt in preflight or during settle handlers (review/astra on #158)", async () => {
     vi.useFakeTimers();
     let busy = 1;

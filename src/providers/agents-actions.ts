@@ -844,7 +844,11 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         before: {
           type: "number",
           minimum: 0,
-          description: "Exclusive line cursor returned by a previous page to load older entries",
+          description: "Exclusive byte offset returned by a previous page. Requires beforeGeneration; an unbound cursor returns cursor-stale rather than silently reading wrong bytes.",
+        },
+        beforeGeneration: {
+          type: "string",
+          description: "Required with before: previous generation (agent generation, actor sessionGeneration or run.generation). Actor type must be session or run, not all. On cursor-stale, re-read from the start without the cursor pair.",
         },
         runId: { type: "string", description: "Specific retained run (default: actor's last run)" },
       },

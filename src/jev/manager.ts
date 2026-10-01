@@ -256,8 +256,9 @@ export class JevProgramManager {
           clearTimeout(timer);
           observation?.close();
           context.signal?.removeEventListener("abort", abort);
-          await runLease.release();
+          // Bound the unread-result hold from termination, not asynchronous lease cleanup.
           info.endedAt = Date.now();
+          await runLease.release();
           this.#prune();
         }
         return info;

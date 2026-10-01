@@ -1285,27 +1285,55 @@ export class ActorManager {
 
   readLog(
     id: string,
-    opts: { type?: "session" | "run" | "all"; lines?: number; runId?: string; before?: number } = {},
+    opts: { type?: "session" | "run" | "all"; lines?: number; runId?: string; before?: number; beforeGeneration?: string } = {},
   ): FabricActorLog {
     this.#syncActorsFromRegistry();
     const actor = this.#requireActor(id);
     const type = opts.type ?? "session";
+    if (type === "all" && opts.beforeGeneration !== undefined) {
+      throw new Error("Generation-bound actor paging requires type session or run; re-read all without a cursor");
+    }
     const lines = Math.max(1, Math.min(opts.lines ?? 200, 5000));
     const sessionFile = actor.sessionFile;
     const logDir = path.join(path.dirname(sessionFile), "runs");
+    const retainedRuns = this.#logs.retainedRunIds(actor);
     const sessionPage = type === "run"
       ? { lines: [], hasMore: false }
-      : readJsonlPage(sessionFile, lines, opts.before);
+      : readJsonlPage(sessionFile, lines, opts.before, undefined, opts.beforeGeneration);
     const session = sessionPage.lines;
     let run: FabricActorLog["run"];
     if (type !== "session") {
       const targetRunId = opts.runId ?? actor.lastRunId;
-      if (targetRunId) {
-        const runPath = path.join(logDir, targetRunId);
-        if (fs.existsSync(runPath)) {
-          const statusRecord = readRunRecord(path.join(runPath, "status.json"));
+      if (targetRunId !== undefined) {
+        // Run IDs are produced by AgentManager, not caller-selected paths.
+        if (targetRunId.length !== 32 || !/^[0-9a-f]{32}$/.test(targetRunId)) {
+          throw new Error("Invalid retained run ID: expected 32 lowercase hexadecimal characters");
+        }
+        if (!retainedRuns.includes(targetRunId)) {
+          if (opts.runId !== undefined) {
+            throw new Error(`Run ${targetRunId} is not retained by actor ${actor.id}`);
+          }
+        } else {
+          const runPath = path.join(logDir, targetRunId);
+          const realRunPath = fs.realpathSync(runPath);
+          if (path.dirname(realRunPath) !== fs.realpathSync(logDir)) {
+            throw new Error(`Run ${targetRunId} is outside actor log directory`);
+          }
+          const statusFile = path.join(runPath, "status.json");
           const eventsFile = path.join(runPath, "events.jsonl");
-          const page = readJsonlPage(eventsFile, lines, opts.before);
+          for (const file of [statusFile, eventsFile]) {
+            if (fs.existsSync(file) && path.dirname(fs.realpathSync(file)) !== realRunPath) {
+              throw new Error(`Run ${targetRunId} log file is outside retained run directory`);
+            }
+          }
+          const statusRecord = readRunRecord(statusFile);
+          // Older archives and synthetic workers may omit actor attribution;
+          // their direct archive membership still binds them to this actor.
+          if (!statusRecord || statusRecord.id !== targetRunId ||
+            (statusRecord.actorId !== undefined && statusRecord.actorId !== actor.id)) {
+            throw new Error(`Run ${targetRunId} does not belong to actor ${actor.id}`);
+          }
+          const page = readJsonlPage(eventsFile, lines, opts.before, undefined, opts.beforeGeneration);
           run = {
             runId: targetRunId,
             eventsFile,
@@ -1313,6 +1341,7 @@ export class ActorManager {
             events: page.lines,
             hasMore: page.hasMore,
             ...(page.before !== undefined ? { before: page.before } : {}),
+            ...(page.generation !== undefined ? { generation: page.generation } : {}),
           };
         }
       }
@@ -1325,8 +1354,9 @@ export class ActorManager {
       session,
       sessionHasMore: sessionPage.hasMore,
       ...(sessionPage.before !== undefined ? { sessionBefore: sessionPage.before } : {}),
+      ...(sessionPage.generation !== undefined ? { sessionGeneration: sessionPage.generation } : {}),
       ...(run ? { run } : {}),
-      retainedRuns: this.#logs.retainedRunIds(actor),
+      retainedRuns,
     };
   }
 

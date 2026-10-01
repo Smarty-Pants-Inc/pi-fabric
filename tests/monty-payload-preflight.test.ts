@@ -80,6 +80,16 @@ describe("Monty lexical payload preflight", () => {
     expect(prepared.source).toBe('async def __fabric_program():\n    text = rf"""first\n  {{π.missing}}\n{π.body}\nlast"""\n    return text\n    pass\n\n__fabric_validate(await __fabric_program(), [], 0)');
   });
 
+  it("wraps call results without changing argument syntax, literals or source lines", () => {
+    const code = 'def total(values):\n    return sum(values)\nreturn total(n for n in range(3)) # schema.status()';
+    const prepared = prepareMontySource(code, {});
+    expect(prepared.lines).toEqual(code.split("\n"));
+    expect(prepared.source).toContain('return __fabric_result(total(n for n in __fabric_result(range(3)))) # schema.status()');
+    expect(prepared.source.split("\n")).toHaveLength(code.split("\n").length + 4);
+    expect(prepareMontySource('return f"{await schema.status()}"', {}).source).toContain('f"{await __fabric_result(schema.status())}"');
+    expect(prepareMontySource('return await factory()()', {}).source).toContain('await __fabric_result(__fabric_result(factory())())');
+  });
+
   it("bounds recursive f-string lexing instead of skipping deeper checks", () => {
     let expression = "π.missing";
     for (let depth = 0; depth < 1000; depth++) expression = `f"{${expression}}"`;

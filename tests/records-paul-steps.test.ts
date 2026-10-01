@@ -116,6 +116,7 @@ describe.skipIf(process.platform === "win32")("records-paul-steps.sh", { timeout
 			roles: { importer: [], mirror: [] },
 			mirror: { enabled: false },
 			admission: { targets: [] },
+			anchorExport: { directory: "/var/lib/test-org-records/anchors", intervalMs: 300000 },
 			statusFile: "/var/lib/test-org-records/status/test-org.status.json",
 		});
 	});

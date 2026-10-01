@@ -294,6 +294,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   nestedSnapshotAt?: number;
   latestRecord?: AgentRunRecord;
   latestUiRecord?: AgentRunRecord;
+  /** Keep the full completion only while its terminal-result save needs retrying. */
+  settlementSaveFailure?: { result: AgentRunResult; warning: string };
   background: boolean;
   completionNotified?: boolean;
   lastLivenessCheckAt: number;
@@ -788,10 +790,12 @@ export class AgentManager {
     return runtime;
   }
 
-  /** authorize is host-only activation authority; unlike a guest deadline it survives queuing. */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): Promise<AgentHandleInfo> {
+  /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
+   * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
+   */
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal, authorize);
+    const pending = this.#spawn(request, signal, authorize, beforeCommit);
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -812,7 +816,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -902,6 +906,9 @@ export class AgentManager {
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
+        // Internal resident-host fence: preparation may outlive the caller's deadline.
+        // Activation authority and durable request commit are independent obligations.
+        beforeCommit?.(id);
       } catch (error) {
         release();
         throw error;
@@ -1282,6 +1289,16 @@ export class AgentManager {
     return this.wait(handle.id);
   }
 
+  /** Side-effect-free settlement join for preparation before a durable mutation fence. */
+  async join(id: string): Promise<void> {
+    if (this.#previousRun(id)) return;
+    const managed = this.#requireRun(id);
+    if (!managed.settled) {
+      if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
+      await managed.result;
+    }
+  }
+
   /**
    * Waits for a run's result and consumes it. With timeoutMs, a run still going at the bound is
    * detached instead (smarty-dev#854): it continues, nothing is consumed, and its result arrives
@@ -1599,6 +1616,9 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
+    if (!this.#canCollect(managed)) {
+      throw new Error(`Cannot clean up agent ${id}: ${managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
+    }
     this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
@@ -1733,7 +1753,16 @@ export class AgentManager {
       const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
       if (!this.config.retainRuns) {
         if (storageSafe) {
-          await removeTree(this.#runRoot).catch(() => undefined);
+          // A recovered manager does not own workers left by an earlier host.
+          // All tracked transports are confirmed exited above; untracked runs stay put.
+          await Promise.all(all.filter((managed) => this.#canCollect(managed))
+            .map((managed) => removeTree(managed.runDirectory).catch(() => undefined)));
+          try {
+            if (this.#managedTempRoot && fs.readdirSync(this.#runRoot).every((name) => name === ".fabric-owner.json")) {
+              fs.unlinkSync(path.join(this.#runRoot, ".fabric-owner.json"));
+            }
+            fs.rmdirSync(this.#runRoot); // Never recursively remove an untracked directory.
+          } catch { /* nonempty, missing, or unsafe roots are retained */ }
         }
       } else if (this.#managedTempRoot) {
         try { markRunRootClosed(this.#runRoot, Date.now(), true); } catch {}
@@ -1798,6 +1827,7 @@ export class AgentManager {
       return typeof finishedAt === "number" && now - finishedAt >= this.#retention.oneShotRunMs;
     });
     for (const managed of expired) {
+      if (!this.#canCollect(managed)) continue;
       await removeTree(managed.runDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) this.#runs.delete(managed.id);
     }
@@ -2210,12 +2240,36 @@ export class AgentManager {
         compactUiRecord(record),
       );
     }
+    this.#saveSettledResult(managed, result);
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
-    finishAgentSettlement(managed, result);
+    const reported = this.#withTransportMetadata(result, managed) as AgentRunResult;
+    finishAgentSettlement(managed, reported);
     managed.task = "";
-    try { this.#onSettled?.(result); } catch { /* must not break the manager */ }
-    this.#notifyBackgroundComplete(managed, result);
+    this.#notifyBackgroundComplete(managed, reported);
+  }
+
+  #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
+    try {
+      this.#onSettled?.(result);
+      delete managed.settlementSaveFailure;
+      return true;
+    } catch (error) {
+      managed.settlementSaveFailure = {
+        result: structuredClone(result),
+        warning: `Terminal result save failed; run retained: ${error instanceof Error ? error.message : String(error)}`,
+      };
+      return false;
+    } finally {
+      this.#invalidateUiList();
+    }
+  }
+
+  #canCollect(managed: ManagedAgent): boolean {
+    // Settlement compacts UI caches. Retry only the original full result, never those caches.
+    if (managed.settlementSaveFailure &&
+        !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;
+    return true;
   }
 
   #notifyBackgroundComplete(managed: ManagedAgent, result: AgentRunResult): void {
@@ -2409,7 +2463,9 @@ export class AgentManager {
   #pruneRetainedUiRecords(): void {
     const settled = [...this.#runs.values()].filter((managed) => managed.settled);
     const evicted = settled.slice(0, -MAX_RETAINED_RUN_HANDLES);
-    for (const managed of evicted) this.#runs.delete(managed.id);
+    for (const managed of evicted) {
+      if (!managed.settlementSaveFailure) this.#runs.delete(managed.id);
+    }
     const retained = evicted.length > 0 ? settled.slice(evicted.length) : settled;
     if (retained.length <= MAX_RETAINED_UI_RUNS) return;
     for (const managed of retained.slice(0, -MAX_RETAINED_UI_RUNS)) {
@@ -2511,6 +2567,9 @@ export class AgentManager {
     const thinking = record.thinking ?? managed.thinking;
     return {
       ...safeRecord,
+      ...(managed.settlementSaveFailure
+        ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
+        : {}),
       cwd: managed.cwd,
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),

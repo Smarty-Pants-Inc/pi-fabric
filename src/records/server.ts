@@ -1,9 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import { lockFile } from "../residency/file-lock.js";
 import net from "node:net";
 import path from "node:path";
 import type { RecordsAnchor, RecordsVerifyResult } from "./chain.js";
 import { AdmissionGate, WalGFrontierProvider, type AdmissionStatus } from "./admission.js";
+import { AnchorExport } from "./anchor-export.js";
 import { RecordsArgumentError } from "./kinds.js";
 import { LineReader, RecordsServiceError, wireError, type WireRequest, type WireResponse } from "./protocol.js";
 import { migrate } from "./schema.js";
@@ -34,6 +36,8 @@ export interface RecordsServiceConfig {
   mirror: { enabled: boolean; repos?: string[] };
   admission: { targets: { name: string; command: string[]; env?: Record<string, string>; timeoutMs?: number }[]; alarmSeconds: number; refuseSeconds: number; refreshMs: number; segmentSize?: number };
   statusFile?: string;
+  /** Public append-only anchors; only the service's protected config chooses this path/cadence. */
+  anchorExport?: { directory: string; intervalMs: number };
   consumerLagSeconds: number;
 }
 
@@ -71,6 +75,11 @@ export const normalizeServiceConfig = (input: unknown): RecordsServiceConfig => 
   const alarmSeconds = integer(admission.alarmSeconds, 120, 1, 86_400);
   const roles = object(raw.roles);
   const mirror = object(raw.mirror);
+  const statusFile = text(raw.statusFile);
+  const anchorExport = object(raw.anchorExport);
+  // Existing installations already configure a public status directory: publish beneath it
+  // without requiring a new principal or an installer to overwrite their protected config.
+  const exportDirectory = text(anchorExport.directory) ?? (statusFile ? path.join(path.dirname(statusFile), "anchors") : undefined);
   return {
     org, origin, socket,
     database: connection(raw.database),
@@ -83,7 +92,8 @@ export const normalizeServiceConfig = (input: unknown): RecordsServiceConfig => 
       refreshMs: integer(admission.refreshMs, 30_000, 1_000, 3_600_000),
       ...(typeof admission.segmentSize === "number" ? { segmentSize: integer(admission.segmentSize, 16 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024) } : {}),
     },
-    ...(text(raw.statusFile) ? { statusFile: text(raw.statusFile)! } : {}),
+    ...(statusFile ? { statusFile } : {}),
+    ...(exportDirectory ? { anchorExport: { directory: path.resolve(exportDirectory), intervalMs: integer(anchorExport.intervalMs, 300_000, 1_000, 86_400_000) } } : {}),
     consumerLagSeconds: integer(raw.consumerLagSeconds, 120, 1, 86_400),
   };
 };
@@ -160,41 +170,7 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, r
   }
 };
 
-/**
- * Take an exclusive flock(2) on `file` (created 0600, never followed, owned by this user) and return its fd;
- * closing the fd, or the process's death, releases it.
- */
-// ponytail: util-linux flock(1) locks the open file description it inherits as fd 3, which this process keeps
-// open after the child exits; no native addon, and the wait does not block the event loop.
-// #1720: the wait is bounded (`flock -w`), and on Linux `setpriv --pdeathsig KILL` kills the helper when this
-// process dies, so a killed issuer never leaves a waiter behind. Without setpriv only the deadline bounds it.
-export const lockFile = async (file: string, waitSeconds = 120): Promise<number> => {
-  const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
-  try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.uid !== process.getuid?.()) throw new Error(`${file} is not a regular file owned by this user`);
-    const { spawn } = await import("node:child_process");
-    const flock = ["flock", "-x", "-w", String(waitSeconds), "3"];
-    const run = (argv: string[]) => new Promise<number | null>((resolve, reject) => {
-      const child = spawn(argv[0]!, argv.slice(1), { stdio: ["ignore", "ignore", "inherit", fd] });
-      child.on("error", reject);
-      child.on("exit", (status) => resolve(status));
-    });
-    const code = process.platform === "linux"
-      ? await run(["setpriv", "--pdeathsig", "KILL", ...flock]).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return run(flock);
-        throw error;
-      })
-      : await run(flock);
-    // flock(1) exits 1 when -w expires.
-    if (code === 1) throw new Error(`timed out after ${waitSeconds}s waiting for lock ${file}`);
-    if (code !== 0) throw new Error(`cannot lock ${file} (flock exited ${code})`);
-    return fd;
-  } catch (error) {
-    fs.closeSync(fd);
-    throw error;
-  }
-};
+export { lockFile } from "../residency/file-lock.js";
 
 /**
  * Issue (or, with reissue, rotate) an operator credential into `out`, never publishing a revoked
@@ -352,9 +328,14 @@ export class RecordsServer {
   readonly #seen = new Map<string, Map<number, { at: number; cmdline?: string }>>();
   readonly #alerts: TokenReuseAlert[] = [];
   #verifying = false;
+  readonly #anchorExport: AnchorExport | undefined;
+  #anchorCheckedAt: number | undefined;
+  #lastAnchor: RecordsAnchor | undefined;
+  #anchorError: string | undefined;
 
   private constructor(readonly config: RecordsServiceConfig, pool: ClientPool, readonly options: { now?: () => number } = {}) {
     this.statusFile = config.statusFile;
+    this.#anchorExport = config.anchorExport ? new AnchorExport(config.anchorExport.directory, (file) => lockFile(file, 5)) : undefined;
     this.gate = new AdmissionGate({
       providers: config.admission.targets.map((target) => new SharedFrontierProvider(new WalGFrontierProvider(target.name, target.command, {
         ...(target.env ? { env: target.env } : {}), ...(target.timeoutMs ? { timeoutMs: target.timeoutMs } : {}),
@@ -369,12 +350,15 @@ export class RecordsServer {
     this.watchdog = new RecordsWatchdog({
       store: this.store,
       check: async (signal) => {
+        // Publication is independent of archive admission and needs no socket principal.
+        await this.#publishAnchor(signal).catch(() => undefined); // failure is exposed in status
+        signal?.throwIfAborted();
         if (!this.gate.enabled) return;
         await this.gate.refresh(signal);
         signal?.throwIfAborted();
         this.gate.evaluate(await this.store.transaction((client) => this.store.admissionInput(client, this.gate.frontier()), "", signal));
       },
-      intervalMs: config.admission.refreshMs,
+      intervalMs: Math.min(config.admission.refreshMs, config.anchorExport?.intervalMs ?? config.admission.refreshMs),
       signal: this.#life.signal,
       ...(options.now ? { now: options.now } : {}),
     });
@@ -420,13 +404,47 @@ export class RecordsServer {
   static async open(config: RecordsServiceConfig, options: { pool?: ClientPool; now?: () => number } = {}): Promise<RecordsServer> {
     const pool = options.pool ?? await openPool(config.database);
     const server = new RecordsServer(config, pool, options.now ? { now: options.now } : {});
-    // A crash between a commit and its recovery bound leaves one unbounded record: bound it now.
-    await server.store.transaction((client) => server.store.fillBounds(client, "all"));
-    server.watchdog.start();
-    return server;
+    try {
+      // A crash between a commit and its recovery bound leaves one unbounded record: bound it now.
+      await server.store.transaction((client) => server.store.fillBounds(client, "all"));
+      await server.#publishAnchor(server.signal);
+      server.watchdog.start();
+      return server;
+    } catch (error) {
+      await server.close();
+      throw error;
+    }
   }
 
   #now(): number { return this.options.now?.() ?? Date.now(); }
+
+  #exportStatus(): { anchorExport?: { directory: string; intervalMs: number; last?: RecordsAnchor; error?: string } } {
+    return this.config.anchorExport ? { anchorExport: {
+      ...this.config.anchorExport,
+      ...(this.#lastAnchor ? { last: this.#lastAnchor } : {}),
+      ...(this.#anchorError ? { error: this.#anchorError } : {}),
+    } } : {};
+  }
+
+  async #publishAnchor(signal?: AbortSignal): Promise<void> {
+    if (!this.#anchorExport || !this.config.anchorExport) return;
+    signal?.throwIfAborted();
+    const now = this.#now();
+    if (this.#anchorCheckedAt !== undefined && now - this.#anchorCheckedAt < this.config.anchorExport.intervalMs) return;
+    try {
+      const anchor = await this.store.anchor(OPERATOR, {}, { ...(signal ? { signal } : {}) });
+      signal?.throwIfAborted();
+      this.#lastAnchor = await this.#anchorExport.publish(anchor);
+      this.#anchorCheckedAt = now;
+      this.#anchorError = undefined;
+      this.#flushStatus();
+    } catch (error) {
+      this.#anchorError = error instanceof Error ? error.message : String(error);
+      this.#flushStatus();
+      if (!signal?.aborted) process.stderr.write(`records service: anchor export failed: ${this.#anchorError}\n`);
+      throw error;
+    }
+  }
 
   /**
    * An alarm claim is honored only while its condition holds (a consumer lags now; the archive
@@ -458,6 +476,7 @@ export class RecordsServer {
       org: this.store.org, origin: this.store.origin, frontier: frontier.frontier, unpublished: await this.store.unpublished(signal),
       admission: this.gate.status() ?? { state: this.gate.enabled ? "unknown" : "disabled" },
       ...(this.statusFile ? { statusFile: this.statusFile } : {}),
+      ...this.#exportStatus(),
     };
   }
 
@@ -601,6 +620,7 @@ export class RecordsServer {
     const alarms = this.#alerts.map((alert) => `token of ${alert.principal} used by live processes ${alert.pids.join(", ")} at ${alert.at}`);
     const record = {
       org: this.store.org, origin: this.store.origin, updatedAt: new Date(this.#now()).toISOString(),
+      ...this.#exportStatus(),
       ...(this.#admission ? { admission: this.#admission } : {}),
       ...(alarms.length ? { alarm: alarms.at(-1), tokenReuse: this.#alerts } : {}),
     };

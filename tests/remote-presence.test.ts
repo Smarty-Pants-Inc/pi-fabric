@@ -237,7 +237,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
       { message: "native", data, triggerTurn: false }, remote.id, { routedRemoteHost: null });
     expect(received).toHaveBeenCalledWith(expect.objectContaining({
       destinationRemoteHost: null, message: "native", data, triggerTurn: false,
-    }), expect.objectContaining({ id: local.id }), expect.any(AbortSignal));
+    }), expect.objectContaining({ id: local.id }), expect.any(AbortSignal), "mesh");
   });
 
   // Lane A's security pass on pi-fabric#135 (F2): a faulty bridge must not answer for another

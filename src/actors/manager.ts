@@ -508,7 +508,7 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false }: { asRegistryOwner?: boolean } = {},
+    { asRegistryOwner = false, beforeCommit }: { asRegistryOwner?: boolean; beforeCommit?: (id: string) => void | Promise<void> } = {},
   ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
@@ -528,8 +528,6 @@ export class ActorManager {
     if (sameName && sameName.status !== "stopped") {
       throw new Error(`A Fabric actor named ${name} is already active (${sameName.id})`);
     }
-    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
-    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
     if (!request.instructions.trim()) throw new Error("Actor instructions must not be empty");
     if (Buffer.byteLength(request.instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
@@ -570,6 +568,10 @@ export class ActorManager {
       throw new Error("This Fabric host cannot commit actor capability requirements");
     }
     const id = randomUUID().replaceAll("-", "");
+    // Fence after async validation/model preparation, before even predecessor removal.
+    await beforeCommit?.(id);
+    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
+    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
     const actorDirectory = path.join(this.#actorRoot, id);
     fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     const actor: ManagedActor = {
@@ -899,7 +901,9 @@ export class ActorManager {
   async resetSession(id: string): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#draining.get(actor.id);
-    if (actor.abortController || running?.abortController) {
+    // A drain owns admission before it installs its abort controller, including
+    // while a boundary presence write or launch preparation is awaiting.
+    if (actor.draining || running || this.#inFlight.has(actor.id) || actor.abortController) {
       return new Promise((resolve, reject) => {
         const waiters = this.#pendingResets.get(actor.id) ?? [];
         waiters.push({ resolve, reject });
@@ -915,6 +919,9 @@ export class ActorManager {
   // run never starts that would compact it. The archive is synchronous, so no run starts
   // between the check and the move.
   #resetAtBoundary(actor: ManagedActor): Promise<void> | undefined {
+    // Do not consume the waiters until the admitted activation has fully settled.
+    const running = this.#runningActor(actor.id);
+    if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) return undefined;
     const live = this.#liveActor(actor);
     const waiters = this.#pendingResets.get(actor.id);
     this.#pendingResets.delete(actor.id);
@@ -945,7 +952,13 @@ export class ActorManager {
 
   // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the 2 newest backups and logs it.
   #archiveSession(actor: ManagedActor, trigger: "requested" | "size"): void {
+    const running = this.#runningActor(actor.id);
+    if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) {
+      throw new Error(`Cannot rotate actor ${actor.name} while an activation is in flight`);
+    }
     const file = actor.sessionFile;
+    // Preserve malformed content separately from the bounded rotation history.
+    if (actor.runner === "pi" && fs.existsSync(file) && !this.#hasSessionHeader(file)) this.#ensurePiSession(actor);
     const dir = path.dirname(file);
     // Oldest first: by stamp, then by the -n suffix a same-millisecond archive gets.
     const prefix = `${path.basename(file)}.`;
@@ -954,7 +967,7 @@ export class ActorManager {
       return [stamp, Number(n) || 0];
     };
     const listBackups = (): string[] => fs.readdirSync(dir)
-      .filter((name) => name.startsWith(prefix) && name.endsWith(".bak"));
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".bak") && !name.includes(".orphan-noheader"));
     let bytes = 0;
     let archived: string | null = null;
     try {
@@ -976,6 +989,8 @@ export class ActorManager {
         return a < b ? -1 : a > b ? 1 : m - n;
       });
     for (const name of backups.slice(0, -2)) fs.rmSync(path.join(dir, name), { force: true });
+    // Publish a complete header by temp + rename before a future writer can append.
+    this.#ensurePiSession(actor);
     // A Claude-runner actor resumes by runner session id: drop it, too.
     delete actor.runnerSessionId;
     actor.updatedAt = Date.now();
@@ -991,6 +1006,60 @@ export class ActorManager {
         : "session reset (requested)",
       data: { sessionReset: { trigger, bytes, archived } },
     });
+  }
+
+  // A native Pi header is tiny; never read the multi-megabyte transcript just to validate it.
+  #hasSessionHeader(file: string): boolean {
+    const fd = fs.openSync(file, "r");
+    try {
+      const buffer = Buffer.alloc(64 * 1024);
+      const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+      const first = buffer.subarray(0, bytes).toString("utf8").split("\n", 1)[0]!;
+      try {
+        const header = JSON.parse(first);
+        return header?.type === "session" && typeof header.id === "string" && header.id.length > 0 &&
+          typeof header.cwd === "string" && typeof header.timestamp === "string" &&
+          Number.isFinite(Date.parse(header.timestamp)) &&
+          (header.version === undefined || [1, 2, 3].includes(header.version));
+      } catch { return false; }
+    } finally { fs.closeSync(fd); }
+  }
+
+  #ensurePiSession(actor: ManagedActor): void {
+    if (actor.runner !== "pi") return;
+    let archived: string | undefined;
+    try {
+      if (fs.existsSync(actor.sessionFile)) {
+        if (this.#hasSessionHeader(actor.sessionFile)) return;
+        const stamp = new Date().toISOString().replace(/[-:.]/g, "");
+        archived = `${actor.sessionFile}.${stamp}.${randomUUID()}.orphan-noheader.bak`;
+        fs.renameSync(actor.sessionFile, archived);
+      }
+      writeJsonAtomic(actor.sessionFile, {
+        type: "session", version: 3, id: randomUUID(),
+        timestamp: new Date().toISOString(), cwd: this.agents.cwd,
+      }, { newline: true, durable: this.#persistent });
+    } catch (error) {
+      this.#sessionAlarm(actor, "error", archived, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+    if (archived) this.#sessionAlarm(actor, "repaired", archived);
+  }
+
+  #sessionAlarm(actor: ManagedActor, outcome: "repaired" | "error", archived?: string, error?: string): void {
+    const text = `Fabric host notice: actor ${actor.name} session ${outcome === "repaired" ? "repaired (no valid header)" : "repair failed"}; ` +
+      `${archived ? `orphan preserved at ${archived}` : "no orphan archive"}${error ? `; ${error.split("\n")[0]}` : ""}.`;
+    const data = { actorId: actor.id, sessionFile: actor.sessionFile, archived, ...(error ? { error } : {}) };
+    const message: FabricActorMessage = {
+      id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
+      source: "fabric-host", createdAt: Date.now(), action: "message", text, data,
+    };
+    this.#recordMessage(this.#liveActor(actor), message);
+    void this.mesh.publish({ topic: "ops.owner", kind: `actor.session.${outcome}`, from: this.identity, to: actor.rootId, text, data }).catch(() => undefined);
+    // Preserve the alarm above, but ESC/shutdown must not restart Main with a followUp.
+    if (this.#halted || this.#closing) return;
+    // Host alarms are visible even when the actor's own delivery policy is silent/mailbox.
+    try { this.onDeliver({ actor: this.#publicInfo(actor), message, delivery: "followUp", triggerTurn: true }); } catch { /* alarm remains in the mesh/message log */ }
   }
 
   /**
@@ -1929,6 +1998,7 @@ export class ActorManager {
       holdWhenFull?: boolean;
     } = {},
   ): ActorQueueItem {
+    if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
     const canManage = options.ownershipChecked
       ? this.#canManageCached(actor.id)
       : this.#canManage(actor.id);
@@ -2136,6 +2206,9 @@ export class ActorManager {
           }
           // A miss fails this activation with the resolver's error (ask rejects, lastError set).
           item.binding = await this.#resolvedRunBinding(actor, item.binding);
+          // Admission is held, but no child writer has launched yet. Repair/create
+          // the native session before handing its path to the process.
+          this.#ensurePiSession(actor);
           const result = await this.agents.run(
             this.#runRequest(actor, item, inferenceContext, committedRefs, actor.capabilityDigest),
             abortController.signal,
@@ -2317,7 +2390,11 @@ export class ActorManager {
       // A reset requested during the last run is applied before a new drain can start one.
       // Its caller may queue work at once, which the drain after this one runs.
       const resetAtExit = this.#pendingResets.has(actor.id);
-      if (resetAtExit) await this.#resetAtBoundary(actor)?.catch(() => undefined);
+      // A reset caller can enqueue another reset from its resolved promise while
+      // the boundary presence write is settling. Consume it before releasing admission.
+      while (this.#pendingResets.has(actor.id) && !this.#inFlight.has(actor.id) && !actor.abortController) {
+        await this.#resetAtBoundary(actor)?.catch(() => undefined);
+      }
       actor.draining = false;
       if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
       // A reload may have moved this actor's queue to a new object while this drain ran.
@@ -2617,6 +2694,7 @@ export class ActorManager {
         try {
           this.#mainAgent.deliverAgent({
             from: event.from,
+            ...(event.verification === undefined ? {} : { verification: event.verification }),
             message,
             delivery: kind,
             ...(event.data === undefined ? {} : { data: event.data }),

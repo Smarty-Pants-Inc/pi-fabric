@@ -618,7 +618,7 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
     const options = PREFIXES[prefix];
     // Reserved words are grammar only when unquoted/unescaped, not executable-name argv.
     const quotedControl = ["!", "{", "then", "do", "else", "if", "elif", "while", "until"].includes(prefix) &&
-      (words[0]?.quoted || words[0]?.assignment === false);
+      (words[0]?.text !== prefix || words[0]?.quoted || words[0]?.assignment === false);
     if (!options || quotedControl) {
       // Absence AFTER executable-wrapper removal is not lexical standalone
       // assignment syntax. Refuse before either pass can bind wrapper argv in
@@ -1872,9 +1872,14 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const xargsTmp = fedByXargs && (pipeTmp || stage.words.some((word) => tmpOperand(word.pattern)));
       // Only a direct parent-shell builtin proves a cwd effect. Executable
       // wrappers (including command/builtin) do not confer parent-state credit.
-      const directCwd = !wrapped && ["cd", "pushd", "popd"].includes(name);
+      const directCwd = !wrapped && words[0]?.text === name && ["cd", "pushd", "popd"].includes(name);
+      const cdArgs = directCwd && name === "cd" ? positionalFields(args, 0).words : [];
+      // Plain absolute cd ignores CDPATH and cannot print a directory. Other
+      // cd forms and all stack emitters have unproved stdout, not zero bytes.
+      const silentCd = directCwd && name === "cd" && cdArgs.length === 1 &&
+        concrete(cdArgs[0]!) && !cdArgs[0]!.unprovedLiteral && unmask(expand(cdArgs[0]!.pattern)).startsWith("/");
       if (directCwd && name === "cd") {
-        changeDir(positionalFields(args, 0).words.find((arg) => !arg.text.startsWith("-")));
+        changeDir(cdArgs.find((arg) => !arg.text.startsWith("-")));
         directoryStack[0] = cwd;
       }
       if (directCwd && (name === "pushd" || name === "popd")) {
@@ -1995,7 +2000,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // file (including one written earlier here) supplies its own independent contents.
       let output: Feed = { lookup, tmp: listsTmp };
       let known = independent || lookup || listsTmp;
-      const silent = reads || directCwd || DELETERS.has(name) || ["kill", "set", ":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
+      const silent = reads || silentCd || DELETERS.has(name) || ["kill", "set", ":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
         (name === "printf" && args[0]?.text === "-v") || (stage.words[0] && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(stage.words[0].text) && words.length === 0);
       if (scripts.length) { output = scriptOutput; known = scriptKnown; }
       else if (silent) { output = NO_OUTPUT; known = true; }

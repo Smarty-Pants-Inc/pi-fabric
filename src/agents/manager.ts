@@ -827,7 +827,12 @@ export class AgentManager {
     if (this.#closing) throw new Error("Fabric agent manager is closing");
     this.#releaseGuard.check(); // Includes worker resume/startup retries, not just public spawns.
     const signal = request.signal ? AbortSignal.any([request.signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
-    const pending = adapter.launch({ ...request, signal });
+    const pending = adapter.launch({ ...request, signal, authorize: () => {
+      // Transports recheck synchronously after their own async waits, at dispatch.
+      if (request.authorize && !request.authorize()) return false;
+      this.#releaseGuard.check();
+      return true;
+    } });
     this.#launches.add(pending);
     try {
       const transport = await pending;

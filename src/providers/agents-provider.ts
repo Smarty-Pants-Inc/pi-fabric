@@ -504,6 +504,17 @@ export class AgentsProvider implements FabricProvider {
     const pin = { model: resolved.model as string, effort: pinThinking };
     const candidates = config?.shadowCandidates ?? [];
     const available = context.extensionContext.modelRegistry.getAvailable();
+    const pinnedModel = available.find(model => `${model.provider}/${model.id}` === pin.model);
+    // Known capabilities can refuse before any judgment/worker starts. Unknown metadata
+    // still requires exact effective-effort readback at the worker admission boundary.
+    if (pinnedModel && typeof pinnedModel.reasoning === "boolean") {
+      const { getSupportedThinkingLevels } = await import("@earendil-works/pi-ai");
+      if (!getSupportedThinkingLevels(pinnedModel).includes(pinThinking)) {
+        throw Object.assign(new Error(`MODEL_ROUTE_EFFORT_UNSUPPORTED: ${pin.model} cannot honor required effort ${pinThinking}; task was not sent`), {
+          name: "ModelRouteEffortPinError", code: "MODEL_ROUTE_EFFORT_UNSUPPORTED",
+        });
+      }
+    }
     const candidatesValid = candidates.length <= 16 && candidates.every(candidate =>
       isFabricThinking(candidate.effort) && available.some(model => `${model.provider}/${model.id}` === candidate.model));
     const { decideModelRoute } = await import("../agents/model-route.js");

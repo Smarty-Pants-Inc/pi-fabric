@@ -134,18 +134,25 @@ export function appendRouteRecord(file: string, record: object): void {
   }
 }
 
-export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string, runDirectory: string, childId: string): {
-  header: string; sessionFile?: string; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
+export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string | undefined, runDirectory: string, childId: string): {
+  header: string; sessionFile?: string; bindSession: (cwd: string) => string; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
 } {
   const file = path.join(resolveAgentDir(), "fabric", "model-routing.jsonl");
   let sessionFile: string | undefined;
-  try {
-    // Seed a real native Pi session so the decision's child ID is not a guessed transport ID.
+  // Record before admission; seed only once the run's final worktree is known.
+  // A seed write failure must never fall back to a different working directory.
+  const bindSession = (finalCwd: string): string => {
     fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
-    const childSessionFile = path.join(runDirectory, "route-session.jsonl");
-    fs.writeFileSync(childSessionFile, `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION,
-      id: childId, timestamp: new Date().toISOString(), cwd })}\n`, { mode: 0o600 });
-    sessionFile = childSessionFile;
+    const file = path.join(runDirectory, "route-session.jsonl");
+    fs.writeFileSync(file, `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION,
+      id: childId, timestamp: new Date().toISOString(), cwd: finalCwd })}\n`, { mode: 0o600 });
+    sessionFile = file;
+    return file;
+  };
+  try {
+    // Direct callers may already know the final cwd; manager binds after worktree creation.
+    fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
+    if (cwd !== undefined) bindSession(cwd);
     appendRouteRecord(file, { type: "decision", ...decision, childSessionId: childId, childAgentId: childId, at: Date.now() });
   } catch {
     decision.reasonCode = "record-failed";
@@ -156,7 +163,7 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string, 
   let pendingRecord: object | undefined;
   const pendingFile = path.join(runDirectory, "pending-route-outcome.json");
   return {
-    header: routeHeader(decision), ...(sessionFile ? { sessionFile } : {}),
+    header: routeHeader(decision), ...(sessionFile ? { sessionFile } : {}), bindSession,
     outcome(result) {
       if (appended) return;
       pendingRecord ??= { type: "outcome", decisionId: decision.decisionId, childSessionId: childId,

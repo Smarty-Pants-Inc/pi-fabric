@@ -265,6 +265,18 @@ describe('model: "auto" spawn routing (#2890)', () => {
     await expect(provider.invoke("spawn", { ...request, pinModel }, context)).rejects.toMatchObject({ name: "ModelRoutePinError", code: "MODEL_ROUTE_PIN_UNAVAILABLE" });
     expect(launch).not.toHaveBeenCalled(); expect(evaluate).not.toHaveBeenCalled();
   });
+  it.each([
+    { reasoning: false, effort: "high" },
+    { reasoning: true, effort: "max" },
+    { reasoning: true, thinkingLevelMap: { high: null }, effort: "high" },
+  ])("R3 refuses known unsupported pin effort before Jev or spawn: %j", async ({ effort, ...capabilities }) => {
+    const evaluate = vi.fn(async () => { throw new Error("must not infer"); });
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const owner = { ...context, extensionContext: { ...context.extensionContext, modelRegistry: { getAvailable: () => [{ provider: "provider", id: "model-a", ...capabilities }] } } as unknown as ExtensionContext };
+    const launch = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke("spawn", { ...request, pinThinking: effort }, owner)).rejects.toMatchObject({ name: "ModelRouteEffortPinError", code: "MODEL_ROUTE_EFFORT_UNSUPPORTED" });
+    expect(launch).not.toHaveBeenCalled(); expect(evaluate).not.toHaveBeenCalled();
+  });
   it("records shadow choice yet launches the pin and appends actual outcome", async () => {
     const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
     const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,

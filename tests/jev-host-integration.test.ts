@@ -39,7 +39,14 @@ describe("Main lifecycle to Jev observer integration", () => {
     let pending: Promise<unknown> | undefined;
     try {
       await runtime.initialize(context, config); pending = spawn(); await entered;
-      await runtime.registry.invoke("components.reload", { id: "fabric.provider.jev" }, invocation);
+      let retired = false;
+      const retirement = runtime.registry.invoke("components.reload", { id: "fabric.provider.jev" }, invocation).then(() => { retired = true; });
+      await vi.waitFor(() => expect(captured.aborted).toBe(true));
+      if (phase === "credential") {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        try { expect(retired, "retirement must join the actual uncancellable credential lookup").toBe(false); }
+        finally { release(); await retirement; }
+      } else await retirement;
       expect(captured.aborted).toBe(true);
       expect(await pending).toMatchObject({ routeDecision: { reasonCode: "jev-error", model: "test/sol" } });
       release(); await new Promise(resolve => setTimeout(resolve, 5));

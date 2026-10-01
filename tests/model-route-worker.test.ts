@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -36,6 +37,39 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     const rows = route ? fs.readFileSync(path.join(root,"agent/fabric/model-routing.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
     return { result, rows, launch, events, pin };
   };
+  it("R3 real-Pi routed worktree uses native tool cwd and committed worktree contents, not parent edits", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-real-cwd-")); roots.push(root);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" });
+    git("init");
+    fs.writeFileSync(path.join(root, "route-cwd.txt"), "worktree-only-content");
+    git("add", "route-cwd.txt");
+    git("-c", "user.name=Offline Test", "-c", "user.email=offline@example.invalid", "commit", "-m", "fixture");
+    fs.writeFileSync(path.join(root, "route-cwd.txt"), "parent-only-content");
+    const agentDir = path.join(root, "agent"); fs.mkdirSync(agentDir, { mode: 0o700 });
+    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ enableInstallTelemetry: false, extensions: [path.resolve("tests/fixtures/route-cwd-extension.ts")] }));
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir); vi.stubEnv("PI_OFFLINE", "1");
+    vi.stubEnv("PI_FABRIC_EXTENSION_PATH", path.resolve("tests/fixtures/route-cwd-extension.ts"));
+    const pin = { model: "route-cwd-probe/pinned", effort: "high" as const };
+    const decision = await decideModelRoute({ routeClass: "bounded-lookup", protected: true, pin, candidates: [], parentSessionId: "parent" }, async () => { throw new Error("excluded"); });
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, timeoutMs: 30000 }, {
+      workerPath, piBinary: path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
+      fabricExtensionPath: path.resolve("tests/fixtures/route-cwd-extension.ts"), fullCodeMode: false, runRoot: path.join(root, "runs"),
+    }); managers.push(manager);
+    let id: string | undefined;
+    try {
+      const handle = await manager.spawn({ task: "Run the bounded cwd probe", worktree: true, routeDecision: decision, extensions: true, tools: ["bash"] }); id = handle.id;
+      const result = await manager.wait(handle.id);
+      expect(result, `${result.error}\n${result.stderr}`).toMatchObject({ status: "completed", model: pin.model, admittedThinking: pin.effort, toolCalls: 1 });
+      const toolOutput = JSON.parse(result.text) as Array<{ type: string; text: string }>;
+      expect(toolOutput.map(part => part.text).join("\n")).toContain(result.cwd);
+      expect(result.text).toContain("worktree-only-content");
+      expect(result.text).not.toContain("parent-only-content");
+      expect(fs.readFileSync(path.join(root, "route-cwd.txt"), "utf8")).toBe("parent-only-content");
+      const rows = fs.readFileSync(path.join(agentDir, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(rows[0].childSessionId).toBe(handle.id);
+      expect(rows[1]).toMatchObject({ status: "completed", admittedModel: pin.model, admittedEffort: pin.effort });
+    } finally { if (id) await manager.cleanup(id, true); }
+  }, 45000);
   it("loads attribution hook even when extensions are disabled and records verified admission", async () => {
     const { result, rows, launch, pin } = await run("success");
     expect(result).toMatchObject({ status: "completed", model: pin.model, thinking: pin.effort, admittedModel: pin.model, admittedThinking: pin.effort });
@@ -49,6 +83,19 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     expect(result.status).toBe("failed");
     expect(events.filter(event => event.type === "fake_received").some(event => event.frame.type === "prompt")).toBe(false);
     expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null });
+  });
+  it.each(["effort-lower", "effort-off", "effort-missing", "effort-malformed"])("R3 rejects %s readback before prompt without claiming admission", async scenario => {
+    const { result, rows, events } = await run(scenario);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("MODEL_ROUTE_PIN_MISMATCH");
+    expect(result.admittedModel).toBeUndefined();
+    expect(result.admittedThinking).toBeUndefined();
+    expect(events.filter(event => event.type === "fake_received").some(event => event.frame.type === "prompt")).toBe(false);
+    expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null });
+  });
+  it("R3 preserves ordinary non-auto effort clamping", async () => {
+    const { result } = await run("effort-lower", false);
+    expect(result).toMatchObject({ status: "completed", thinking: "low" });
   });
   it("clears parent route metadata for unrelated explicit-model tasks", async () => {
     const { result, launch } = await run("success", false);

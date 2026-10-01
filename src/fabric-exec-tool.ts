@@ -917,6 +917,14 @@ export const createFabricExecTool = (
         toolCallId,
       );
       if (pendingHandoff) {
+        // Final Pi message_end rewrites all content for every handoff kind.
+        // Keep execution failure and immutable host fence facts separately from
+        // guest prose / render details, so that rewrite cannot erase a writer.
+        pendingHandoff.executionOutcome = Object.freeze({
+          success: result.success,
+          ...(result.error !== undefined ? { error: result.error } : {}),
+          residentOutcomes: Object.freeze((result.residentOutcomes ?? []).map(receipt => Object.freeze({ ...receipt }))),
+        });
         pendingHandoffs.set(toolCallId, pendingHandoff);
         context.ui.setStatus(
           "fabric-prewalk",

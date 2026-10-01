@@ -169,7 +169,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         const available = Math.max(0, maxLogChars - logChars);
         const retained = text.slice(0, available);
         logChars += retained.length;
-        const lines = ((partialLogs[index] ?? "") + retained).split("\n");
+        const lines = ((partialLogs[index] ?? "") + retained).split(/\r?\n/);
         partialLogs[index] = lines.pop() ?? "";
         for (const line of lines) logs.push(line.replace(/\r$/, ""));
         if (retained.length !== text.length) truncated = true;

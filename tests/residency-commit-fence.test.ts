@@ -31,6 +31,10 @@ import { runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { abandonResidentRequest, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 import { captureDurableExecutionTrace } from "./helpers/durable-execution-trace.js";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
+import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
+import { claimFabricHandoff, runFabricHandoffAtBoundary } from "../src/prewalk/handoff.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -541,6 +545,124 @@ const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, m
 };
 const visibleText = (result: Awaited<ReturnType<Awaited<ReturnType<typeof registeredExecution>>>>) =>
   result.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+
+describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000 }, () => {
+  const cases = [
+    ["handled uncertainty", "in-place", true], ["handled uncertainty", "in-place", false],
+    ["terminal failure", "in-place", true], ["terminal failure", "in-place", false],
+    ["terminal failure", "trajectory", true], ["terminal failure", "explicit", true],
+    ["terminal failure", "none", true], ["ordinary success", "in-place", true],
+  ] as const;
+  it.each(cases)("preserves %s through %s boundary (switch=%s) in persisted and next model context", async (ending, mode, switchSucceeds) => {
+    const state = await harness(false, undefined, ending === "handled uncertainty" ? 250 : 10_000);
+    const main = mainProvider(state);
+    main.registry.register(new PiToolsProvider(state.root));
+    const config = normalizeFabricConfig({ fullCodeMode: true,
+      executor: { resultFormat: "json", timeoutMs: 8_000, maxOutputChars: 1_400, memoryLimitBytes: 256 * 1024 * 1024 },
+      prewalk: { compactOnReturn: false }, entropy: { compile: false } });
+    const execution = new FabricExecutionService(main.registry, config);
+    const faux = fauxProvider({ provider: "test", models: [{ id: "visible" }, { id: "executor" }] });
+    const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(state.root, "unused-auth.json") });
+    runtime.registerNativeProvider(faux.provider);
+    const manager = SessionManager.create(state.root, path.join(state.root, "sessions"));
+    let session: AgentSession | undefined;
+    let originalToolText = "";
+    let nextModelText = "";
+    let pendingCount = 0;
+    const claimed = vi.spyOn(FabricState.prototype, "claimHandoff").mockImplementation(async function (this: FabricState, result, sessionId, format) {
+      if (mode === "none") return undefined;
+      const pending = claimFabricHandoff(this.prewalk, result, sessionId, format);
+      if (pending?.kind === "prewalk-plan") throw new Error("Plan was not ready");
+      if (pending) { pendingCount++; originalToolText = result.error ?? ""; }
+      return pending;
+    });
+    vi.spyOn(FabricState.prototype, "bootstrapped", "get").mockReturnValue(true);
+    vi.spyOn(FabricState.prototype, "config", "get").mockReturnValue(config);
+    vi.spyOn(FabricState.prototype, "execution", "get").mockReturnValue(execution);
+    vi.spyOn(FabricState.prototype, "bootstrap").mockResolvedValue(undefined);
+    vi.spyOn(FabricState.prototype, "ensure").mockImplementation(async function (this: FabricState, ctx) {
+      if (mode !== "none" && this.prewalk.status().state === "idle") {
+        this.prewalk.arm({ model: `${faux.getModel().provider}/executor`, mode: mode === "trajectory" ? "trajectory" : "in-place",
+          sessionId: ctx.sessionManager.getSessionId(), requirePlan: true, task: "Reconcile the committed writer; never replace it" });
+        expect(this.prewalk.submitPlan(ctx.sessionManager.getSessionId(), {
+          outcome: "Keep one committed writer", steps: ["mutate once", "reconcile IDs"], verification: ["status and stop"], risks: "no replacement writer",
+        })).toBe(true);
+      }
+    });
+    let boundaryApi: ExtensionAPI;
+    vi.spyOn(FabricState.prototype, "runHandoffAtBoundary").mockImplementation(async function (this: FabricState, pending, result, ctx) {
+      return runFabricHandoffAtBoundary(this.prewalk, { executeHandoff: async () => ({ completed: switchSucceeds, status: switchSucceeds ? "completed" : "failed", implementation: "boundary prose ".repeat(200) }) },
+        { ...boundaryApi, setModel: async model => switchSucceeds && await boundaryApi.setModel(model) }, pending, result, ctx);
+    });
+    if (ending === "handled uncertainty") {
+      const create = ActorDirectory.prototype.create;
+      vi.spyOn(ActorDirectory.prototype, "create").mockImplementation(async function (this: ActorDirectory, ...args) {
+        const actor = await create.apply(this, args); // Commit REAL host ownership, then delay its response beyond the client wait.
+        await delay(900); return actor;
+      });
+    }
+    const args = requestArgs(state, "create");
+    const mutation = `await pi.write({path:${JSON.stringify(path.join(state.root, "trigger.txt"))},text:"triggered"});`;
+    const requests = `await agents.create(${JSON.stringify({ ...args, name: "boundary-one" })});` +
+      (ending === "terminal failure" ? `await agents.create(${JSON.stringify({ ...args, name: "boundary-two" })});` : "");
+    const body = mutation + (ending === "handled uncertainty" ? `try { ${requests} } catch {} return "guest handled uncertainty";` : requests +
+      (mode === "explicit" ? `await agents.handoff({model:${JSON.stringify(`${faux.getModel().provider}/executor`)},task:"reconcile"});` : "") +
+      (ending === "terminal failure" ? `throw new Error("terminal boundary cause");` : `return "ordinary handle delivered";`));
+    const loader = new DefaultResourceLoader({ cwd: state.root, agentDir: path.join(state.root, "agent"),
+      noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [{ name: path.resolve("src/index.ts"), factory: async api => {
+        boundaryApi = api;
+        await piFabric(api);
+        api.on("context", event => {
+          const result = event.messages.find(message => message.role === "toolResult" && message.toolName === "fabric_exec");
+          if (result?.role === "toolResult") nextModelText = result.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+        });
+      } }],
+    });
+    try {
+      await loader.reload();
+      // Inline factories get a synthetic path; give this registered source its
+      // real identity so production tool_result ownership repair also runs.
+      loader.getExtensions().extensions[0]!.sourceInfo.path = path.resolve("src/index.ts");
+      ({ session } = await createAgentSession({ cwd: state.root, agentDir: path.join(state.root, "agent"), modelRuntime: runtime,
+        model: faux.getModel(), resourceLoader: loader, sessionManager: manager, tools: ["fabric_exec"] }));
+      await session.bindExtensions({});
+      faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: body }), { stopReason: "toolUse" }),
+        fauxAssistantMessage("reconcile only, no replacement"), fauxAssistantMessage("boundary follow-up acknowledged")]);
+      await session.prompt("Run the bounded committed writer test");
+      const result = session.messages.find(message => message.role === "toolResult" && message.toolName === "fabric_exec");
+      expect(result?.role).toBe("toolResult");
+      if (result?.role !== "toolResult") throw new Error("Missing native result");
+      const text = result.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+      const decisions = decisionsFor(state);
+      if (!decisions.length) throw new Error(`No real commitment: ${text}`);
+      const persisted = SessionManager.open(manager.getSessionFile()!).getBranch().find(entry => entry.type === "message" && entry.message.role === "toolResult");
+      expect(persisted?.type === "message" && persisted.message).toEqual(result);
+      // Reconcile live entities before assertions that deliberately fail on the old head.
+      for (const decision of decisions) {
+        await waitFor(() => state.participants.get(decision.id)?.ownerHostId === residentHostId(state.config.rootId));
+        expect((await main.invoke("agents.actorStatus", { id: decision.id })) as object).toMatchObject({ id: decision.id });
+        expect(await main.invoke("agents.stop", { id: decision.id })).toMatchObject({ acknowledged: true });
+      }
+      expect(decisions).toHaveLength(ending === "terminal failure" ? 2 : 1);
+      expect(fs.readFileSync(path.join(state.root, "trigger.txt"), "utf8")).toBe("triggered");
+      expect(pendingCount).toBe(mode === "none" ? 0 : 1);
+      expect(claimed).toHaveBeenCalled();
+      if (ending === "ordinary success") {
+        expect(result.isError).toBe(false); expect(text).not.toContain("ResidentOutcomeUnknownError"); expect(text).toContain('"continued": true');
+      } else {
+        expect(result.isError).toBe(true);
+        expect(result.details).toMatchObject({ success: false });
+        assertReceipts(text, decisions);
+        expect(text.startsWith("ResidentOutcomeUnknownError")).toBe(true);
+        if (ending === "terminal failure" && mode !== "none") expect(text).toContain("terminal boundary cause");
+        if (nextModelText) assertReceipts(nextModelText, decisions);
+        if (mode === "in-place" && switchSucceeds) expect(nextModelText).toBe(text);
+      }
+      if (process.env.PI_FABRIC_BOUNDARY_EVIDENCE) fs.writeFileSync(`${process.env.PI_FABRIC_BOUNDARY_EVIDENCE}-${ending.replaceAll(" ", "-")}-${mode}-${switchSucceeds}.json`, JSON.stringify({ ending, mode, switchSucceeds, result, decisions, nextModelText, originalToolText }, null, 2));
+    } finally { await session?.abort(); session?.dispose(); await main.close(); await state.close(); }
+  });
+});
 
 describe("round 4 registered fabric_exec committed-output priority", { timeout: 25_000 }, () => {
   it("keeps every committed receipt FIRST despite large guest logs and a long terminal error; reconciles through the registered tool", async () => {

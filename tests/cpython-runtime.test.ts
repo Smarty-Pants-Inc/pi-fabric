@@ -49,13 +49,20 @@ afterEach(() => {
 });
 
 describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 }, () => {
+  it("normalizes CRLF guest stdout and stderr in product logs", async () => {
+    const result = await run('import sys\nsys.stdout.write("out one\\r\\nout two\\r\\n")\nsys.stdout.flush()\nsys.stderr.write("err one\\r\\nerr two\\r\\n")\nsys.stderr.flush()\nawait schema.status()\nreturn "delivered"');
+    expect(result).toMatchObject({ terminationReason: "completed", value: "delivered" });
+    expect(result.logs).toEqual(expect.arrayContaining(["out one", "out two", "err one", "err two"]));
+    expect(result.logs.every(line => !line.endsWith("\r"))).toBe(true);
+  });
+
   it("keeps guest startup diagnostics opt-in", async () => {
     expect(await run("return await schema.status()")).toMatchObject({ terminationReason: "completed", logs: [] });
   });
 
-  it.each(["native", "loopback"] as const)("captures guest startup timestamps and reaps its exit over %s IPC", async transport => {
+  it.each([["native", "LF"], ["loopback", "LF"], ["native", "CRLF"], ["loopback", "CRLF"]] as const)("captures guest startup timestamps and reaps its exit over %s IPC (%s)", async (transport, newline) => {
     const output = vi.spyOn(console, "error").mockImplementation(() => {});
-    const trace = await captureDurableExecutionTrace();
+    const trace = await captureDurableExecutionTrace(newline === "CRLF");
     if (transport === "loopback") vi.stubGlobal("process", new Proxy(process, {
       get(target, key) { return key === "platform" ? "win32" : Reflect.get(target, key); },
     }));
@@ -69,7 +76,7 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
       const guest = report.guests[0];
       expect(guest).toMatchObject({ exited: true, closed: true });
       expect(guest.exitCode !== null || guest.signal !== null).toBe(true);
-      const stages = guest.stderrTail.split("\n").filter(Boolean);
+      const stages = guest.stderrTail.split(/\r?\n/).filter(Boolean);
       for (const stage of stages) expect(stage).toMatch(/^\[fabric-cpython-startup\] at=\d+\.\d+ elapsedMs=\d+\.\d+ /);
       expect(stages.map((stage: string) => stage.replace(/^.*elapsedMs=\S+ /, ""))).toEqual([
         "interpreter start", "imports done", "event loop starting", "event loop running",

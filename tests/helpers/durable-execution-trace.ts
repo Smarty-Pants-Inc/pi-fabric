@@ -9,7 +9,7 @@ import { ResidencyClient } from "../../src/residency/client.js";
 import { CPythonRuntime } from "../../src/runtime/cpython-runtime.js";
 
 /** Test-only observation and teardown reaping; no execution deadline changes. */
-export const captureDurableExecutionTrace = async () => {
+export const captureDurableExecutionTrace = async (startupCrLf = false) => {
   const startedAt = performance.now();
   const events: { step: string; at: string; elapsedMs: number; details?: Record<string, unknown> }[] = [];
   const guests: { closed: Promise<void>; diagnostics: {
@@ -38,7 +38,16 @@ export const captureDurableExecutionTrace = async () => {
     const python = Array.isArray(args[1]) && args[1].includes("-I") && args[1].includes("-c");
     const label = python ? "CPython guest" : "worker";
     record(`${label} spawn requested`, { command: args[0] });
-    if (python) args[1] = [...args[1] as string[], "--fabric-startup-trace"];
+    if (python) {
+      const argv = [...args[1] as string[], "--fabric-startup-trace"];
+      if (startupCrLf) {
+        // Exercise Windows text-stream newlines even on Linux, without mocking
+        // the guest's startup trace or weakening the successful-handle checks.
+        const source = argv.indexOf("-c") + 1;
+        argv[source] = 'import sys; sys.stderr.reconfigure(newline="\\r\\n")\n' + argv[source];
+      }
+      args[1] = argv;
+    }
     const child = actual.spawn(...args);
     if (python) {
       const diagnostics = { pid: child.pid ?? null, stderrTail: "", exited: false, closed: false,

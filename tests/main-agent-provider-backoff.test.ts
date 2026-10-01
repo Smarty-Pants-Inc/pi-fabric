@@ -138,6 +138,69 @@ describe.each([0, 120_000])("Main provider backoff (flushMs=%s)", flushMs => {
     expect(f.released).toHaveBeenLastCalledWith({ until: "2026-10-01T08:37:16.663Z", messageIds: [second.messageId] });
   });
 
+  it.each(["bytes", "provenance"])("keeps split %s batches behind the retry outcome after successful manual compaction", split => {
+    const f = setup(flushMs);
+    if (split === "provenance") vi.spyOn(f.main, "supportsProvenance").mockReturnValue(true);
+    f.fail();
+    const first = f.main.deliverAgent({ from, message: split === "bytes" ? "a".repeat(40_000) : "first", delivery: "followUp", verification: "mesh" });
+    const second = f.main.deliverAgent({ from: split === "provenance" ? { ...from, id: "session:other" } : from, message: split === "bytes" ? "b".repeat(40_000) : "second", delivery: "followUp", verification: "mesh" });
+    vi.advanceTimersByTime(10_000);
+    f.state.idle = false;
+    const operation = new AbortController();
+    f.emit("session_before_compact", { reason: "manual", signal: operation.signal });
+    f.emit("session_compact", { reason: "manual" });
+    vi.advanceTimersByTime(100);
+    expect(f.sent).toHaveLength(0);
+    f.state.idle = true;
+    vi.advanceTimersByTime(25);
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]!.message.details.id).toBe(first.messageId);
+    expect(f.sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(f.main.queueDepth().pendingFollowUps).toBe(1);
+    expect(f.released).toHaveBeenCalledExactlyOnceWith({ until: "2026-10-01T08:35:16.663Z", messageIds: [first.messageId] });
+    // Compaction made no provider call: neither queued batches nor fresh peers may
+    // enter Pi's native continuation queue until this retry's outcome is known.
+    const fresh = f.deliver("steer");
+    expect(fresh).toMatchObject({ triggered: false, reason: "provider-retry in flight" });
+    expect(f.main.queueDepth().pendingFollowUps).toBe(2);
+    f.fail();
+    const retryAt = Date.now() + 120_000;
+    vi.advanceTimersByTime(119_999);
+    expect(f.sent).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(f.sent).toHaveLength(2);
+    expect(f.sent[1]!.message.details.id).toBe(second.messageId);
+    expect(f.main.queueDepth().pendingFollowUps).toBe(1);
+    expect(f.released).toHaveBeenLastCalledWith({ until: new Date(retryAt).toISOString(), messageIds: [second.messageId] });
+    // Only a real successful provider turn removes the guard for the remaining peer.
+    f.emit("agent_start");
+    f.emit("turn_end", { message: { stopReason: "stop" } });
+    f.emit("agent_before_settle", { outcome: "completed" });
+    f.emit("agent_settled", { outcome: "completed" });
+    expect(f.sent).toHaveLength(3);
+    expect(f.sent[2]!.message.details.id).toBe(fresh.messageId);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["aborted operation", "missing signal", "owner halt"])("does not release split batches after compaction with %s", control => {
+    const f = setup(flushMs);
+    f.fail();
+    for (const message of ["a", "b"]) f.main.deliverAgent({ from, message: message.repeat(40_000), delivery: "followUp" });
+    f.state.idle = false;
+    const operation = new AbortController();
+    if (control !== "missing signal") f.emit("session_before_compact", { reason: "manual", signal: operation.signal });
+    f.emit("session_compact", { reason: "manual" });
+    // Owner cancellation can arrive while a later completion handler is still running.
+    if (control === "aborted operation") operation.abort();
+    if (control === "owner halt") f.main.halt();
+    f.state.idle = true;
+    vi.advanceTimersByTime(180_000);
+    expect(f.sent).toHaveLength(0);
+    expect(f.main.queueDepth().pendingFollowUps).toBe(2);
+    expect(f.released).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each(["steer", "followUp"] as const)("releases held %s after successful manual compaction even with drain disabled", delivery => {
     const f = setup(flushMs);
     f.fail(); const wake = f.deliver(delivery);

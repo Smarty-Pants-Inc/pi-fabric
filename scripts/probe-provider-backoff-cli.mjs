@@ -1,14 +1,16 @@
 // Opt-in real CLI regression: build first, then run at nice 19 with an isolated scratch/output root.
-// Usage: node scripts/probe-provider-backoff-cli.mjs PI_CLI SCRATCH OUTPUT [FABRIC_ROOT]
+// Usage: node scripts/probe-provider-backoff-cli.mjs PI_CLI SCRATCH OUTPUT [FABRIC_ROOT] [--compact-before-retry]
+// The compaction variant inserts a real LLM-free manual compaction before the retry followUp.
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-const [cli, scratch, out, candidate = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), diagnostic] = process.argv.slice(2);
+const [cli, scratch, out, candidate = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), ...modes] = process.argv.slice(2);
+const compactBeforeRetry = modes.includes('--compact-before-retry');
 // Baseline-only diagnostic bypasses missing guest fields to reach the original native queue bug.
-const receiptAnnotation = diagnostic === '--untyped-receipts' ? ': any' : '';
+const receiptAnnotation = modes.includes('--untyped-receipts') ? ': any' : '';
 assert(cli && scratch && out, 'PI_CLI SCRATCH OUTPUT required');
 fs.mkdirSync(out, { recursive: true });
 const piVersion = execFileSync(process.execPath, [cli, '--version'], { encoding: 'utf8' }).trim();
@@ -78,7 +80,7 @@ function launch(lane) {
   fs.mkdirSync(agentDir, { recursive: true });
   const mesh = path.join(cwd, 'mesh');
   fs.writeFileSync(path.join(agentDir, 'fabric.json'), JSON.stringify({ autoReload: false, mcp: { enabled: false }, memory: { enabled: false }, records: { enabled: false }, ui: { enabled: false }, mesh: { root: mesh, followUpFlushMs: 0 } }));
-  fs.writeFileSync(path.join(agentDir, 'settings.json'), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false } }));
+  fs.writeFileSync(path.join(agentDir, 'settings.json'), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false, ...(compactBeforeRetry ? { keepRecentTokens: 1 } : {}) } }));
   const ready = path.join(cwd, 'ready.json');
   const args = [cli, '--mode', 'rpc', '--offline', '--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes', '--approve', '-e', path.join(candidate, 'dist/index.js'), '-e', extension, '--provider', 'r2-loopback', '--model', 'deterministic', '--thinking', 'off', '--tools', 'fabric_exec', '--session-dir', path.join(cwd, 'sessions')];
   // No inherited profile, mesh identity, credentials, providers, or startup hooks.
@@ -121,18 +123,31 @@ try {
   const receiverCalls = () => calls.filter(c => c.lane === 'receiver').slice(receiverCallBase);
   // Initial provider failure and two permitted 40 KiB followUps force distinct release batches.
   scripts.receiver.push({ error: 'deterministic loopback provider failure 1' }, { error: 'deterministic loopback provider failure 2' }, { text: 'recovered after consecutive backoffs' });
-  await b.request({ type: 'prompt', message: 'initial failure' });
+  await b.request({ type: 'prompt', message: compactBeforeRetry ? 'initial failure ' + 'compaction seed '.repeat(3000) : 'initial failure' });
   await wait(() => b.events.some(e => e.type === 'agent_settled' && e.outcome === 'error'));
   const held = await guest(`const receipts = []; for (const text of ["A", "B"]) { const r${receiptAnnotation} = await agents.followUp({ id: ${JSON.stringify(bid)}, message: text.repeat(40000) }); const triggered: boolean | undefined = r.triggered; const reason: string | undefined = r.reason; receipts.push({ ...r, triggered, reason }); } return receipts;`);
   assert.match(JSON.stringify(held), /provider-backoff until/);
   assert.match(JSON.stringify(held), /triggered[^\n]{0,5}false/);
   assert.equal(receiverCalls().length, 1);
+  let manualCompaction;
+  if (compactBeforeRetry) {
+    const before = receiverCalls().length;
+    const result = await b.request({ type: 'compact' });
+    const end = b.events.findLast(e => e.type === 'compaction_end' && e.reason === 'manual');
+    assert(end && !end.aborted && end.result, 'manual compaction did not succeed');
+    assert.equal(result.details?.compactor, 'fabric', 'probe must use the built deterministic Fabric compactor');
+    assert.equal(result.usage, undefined, 'deterministic compaction unexpectedly reported LLM usage');
+    assert.equal(receiverCalls().length, before, 'manual compaction called the failed provider');
+    manualCompaction = { at: end.observedAt, result, newProviderCalls: receiverCalls().length - before };
+    fs.writeFileSync(path.join(out, 'manual-compaction.json'), JSON.stringify(manualCompaction, null, 2));
+  }
   await wait(() => receiverCalls().length >= 2, 70_000);
   await sleep(150);
   assert.equal(receiverCalls().length, 2, 'second batch escaped into native immediate continuation');
   await wait(() => b.events.filter(e => e.type === 'agent_settled' && e.outcome === 'error').length === 2);
   const errors = b.events.filter(e => e.type === 'turn_end' && e.message.stopReason === 'error');
-  assert(receiverCalls()[1].at - errors[0].observedAt >= 59_990, 'first deadline bypassed');
+  if (manualCompaction) assert(receiverCalls()[1].at >= manualCompaction.at, 'retry preceded successful compaction');
+  else assert(receiverCalls()[1].at - errors[0].observedAt >= 59_990, 'first deadline bypassed');
   const messagesAfterFailure = (await b.request({ type: 'get_messages' })).messages;
   assert.equal(messagesAfterFailure.filter(m => m.role === 'custom' && m.customType === 'pi-fabric-agent-message').length, 1);
   await sleep(Math.max(0, errors[1].observedAt + 119_700 - Date.now()));
@@ -146,7 +161,7 @@ try {
   const receiverMesh = new MeshStore(b.mesh, 256 * 1024, 500);
   const releases = receiverMesh.read({ topic: 'fabric.main.wake', limit: 30 });
   assert.equal(releases.length, 2); assert.deepEqual(releases.map(e => e.data.messageIds.length), [1, 1]);
-  report.push({ case: 'consecutive errors and split released batches', providerCalls: receiverCalls(), firstDelayMs: receiverCalls()[1].at - errors[0].observedAt, secondDelayMs: receiverCalls()[2].at - errors[1].observedAt, deliveredExactlyOnce: deliveries.map(m => m.details.id), releaseEvents: releases, publicReceipts: held });
+  report.push({ case: compactBeforeRetry ? 'LLM-free manual compaction and split released batches' : 'consecutive errors and split released batches', manualCompaction, providerCalls: receiverCalls(), firstDelayMs: receiverCalls()[1].at - errors[0].observedAt, secondDelayMs: receiverCalls()[2].at - errors[1].observedAt, deliveredExactlyOnce: deliveries.map(m => m.details.id), releaseEvents: releases, publicReceipts: held });
   // Public lifecycle subscription produces a peer followUp with triggerTurn=false across the bridge.
   const count = receiverCalls().length;
   await guest(`return await agents.subscribe({ from: (await agents.self()).id, to: ${JSON.stringify(bid)}, events: ["pi.agent_settled"], delivery: "followUp", triggerTurn: false, once: true });`);

@@ -925,7 +925,10 @@ export class MainAgentController implements FabricMainAgentTarget {
     });
     on("session_compact", (event: { reason?: string }, ctx) => {
       this.#context = ctx;
-      this.#recoverProvider(false); // Only a successful turn resets consecutive failures.
+      // Compaction can unblock one retry, but its LLM-free success is not provider recovery.
+      // Retain the failure/in-flight guard so later batches wait for that retry's outcome.
+      this.#providerRetryAt = 0;
+      this.#stopProviderWake();
       this.#compactionDecline = undefined;
       if (event.reason === "manual") this.#wakeWhenIdle();
       else this.#operation = undefined;

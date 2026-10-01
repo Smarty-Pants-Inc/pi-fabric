@@ -1,5 +1,9 @@
 import { execFileSync } from "node:child_process";
+import * as childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
+import { Duplex, PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
+
 import fs from "node:fs";
 import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
@@ -37,12 +41,20 @@ import { AgentsProvider, collectAgentToolPreviewNodes } from "../src/providers/a
 import type { ResidencyClient } from "../src/residency/client.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
-import type { AgentRunRecord } from "../src/agents/types.js";
-import { ActionRegistry } from "../src/core/action-registry.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { FabricExecutionService } from "../src/execution-service.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import type { AgentHandleInfo } from "../src/agents/types.js";
+import type { AgentRunRecord } from "../src/agents/types.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
+import { captureMontyTransport } from "./helpers/monty-transport.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
 
 const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
@@ -95,6 +107,7 @@ const setup = (
     switchModel?: FabricMainAgentTarget["switchModel"];
     modelsConfig?: FabricModelsConfig;
     agentsConfig?: Partial<FabricAgentConfig>;
+    workerPath?: string;
     writeStalled?: () => Error | undefined;
     onBackgroundComplete?: (result: import("../src/agents/types.js").AgentRunResult) => void;
     onResultConsumed?: (id: string) => void;
@@ -107,7 +120,7 @@ const setup = (
     options?.cwd ?? process.cwd(),
     { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig },
     {
-      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      workerPath: options?.workerPath ?? path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
@@ -233,6 +246,153 @@ const setup = (
     actorDeliveries,
   };
 };
+
+describe("queued spawn handles (#2576)", () => {
+  const fixture = (maxConcurrent = 2, maxPerExecution = 10) => {
+    const state = setup([], [], undefined, {
+      agentsConfig: { maxConcurrent, maxPerExecution, transport: "process", budgetUsd: 0 },
+      workerPath: path.resolve("tests/fixtures/queued-worker.mjs"),
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = state.agents.config;
+    config.approvals.agent = "allow";
+    config.approvals.read = "allow";
+    config.executor.timeoutMs = 2_000;
+    const registry = new ActionRegistry();
+    registry.register(state.provider);
+    registry.register({
+      name: "probe", description: "Hold a calling program until its deadline",
+      async list() { return [{ name: "hold", description: "Wait for caller abort", risk: "read" as const, inputSchema: { type: "object", properties: {} } }]; },
+      async describe() { return (await this.list({}, context))[0]; },
+      async invoke(_name, _args, invocation) {
+        return new Promise((_resolve, reject) => {
+          const abort = () => reject(new Error("calling program aborted"));
+          invocation.signal?.addEventListener("abort", abort, { once: true });
+          if (invocation.signal?.aborted) abort();
+        });
+      },
+    });
+    const service = new FabricExecutionService(registry, config);
+    const run = (code: string) => service.execute({ code, signal: undefined,
+      parentToolCallId: "queued-spawn-program", context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false } as ExtensionContext,
+      onPartial() {},
+    });
+    const gate = (index: number) => path.join(state.root, `release-${index}`);
+    const request = (index: number) => ({ task: JSON.stringify({ gate: gate(index) }), name: `queued-${index}`, transport: "process", nice: 7 });
+    const spawn = (index: number) => state.provider.invoke("spawn", request(index), context) as Promise<AgentHandleInfo>;
+    const receipt = async (pending: Promise<AgentHandleInfo>) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([pending, new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("spawn blocked on admission")), 1_000);
+        })]);
+      } finally { clearTimeout(timer); }
+    };
+    const release = (index: number) => fs.writeFileSync(gate(index), "go");
+    return { ...state, run, spawn, receipt, release, request };
+  };
+
+  it("returns five handles from one program with two running and three queued, then completes all five", async () => {
+    const state = fixture();
+    const requests = Array.from({ length: 5 }, (_, i) => state.request(i));
+    const result = await state.run(`return await Promise.all(${JSON.stringify(requests)}.map(request => agents.spawn(request)));`);
+    expect(result.success, result.error).toBe(true);
+    const handles = result.value as AgentHandleInfo[];
+    expect(handles.map((handle) => handle.status)).toEqual(["running", "running", "queued", "queued", "queued"]);
+    const listed = await state.provider.invoke("list", { scope: "local" }, context) as AgentHandleInfo[];
+    expect(listed.map((handle) => handle.status)).toEqual(["running", "running", "queued", "queued", "queued"]);
+    expect((await Promise.all(handles.slice(2).map((handle) => state.provider.invoke("status", { id: handle.id }, context))) as AgentHandleInfo[]).map((handle) => handle.queuePosition)).toEqual([1, 2, 3]);
+    let finished = false;
+    const waiting = (state.provider.invoke("join", { id: handles[4]!.id, timeoutMs: 5_000 }, context) as Promise<AgentRunRecord>).then((value) => { finished = true; return value; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(finished).toBe(false);
+    for (let i = 0; i < 5; i++) state.release(i);
+    expect((await waiting).status).toBe("completed");
+    expect((await Promise.all(handles.map((handle) => state.agents.wait(handle.id)))).map((value) => value.status)).toEqual(Array(5).fill("completed"));
+  });
+
+  it("preserves queued spawns after the calling program's short deadline", async () => {
+    const state = fixture(1);
+    const requests = Array.from({ length: 3 }, (_, i) => state.request(i));
+    const result = await state.run(`await Promise.all(${JSON.stringify(requests)}.map(request => agents.spawn(request))); return await tools.call({ref: "probe.hold", args: {}});`);
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/timed out/);
+    const handles = state.agents.list();
+    expect(handles).toHaveLength(3);
+    expect(handles.map((handle) => handle.status)).toEqual(["running", "queued", "queued"]);
+    for (let i = 0; i < 3; i++) state.release(i);
+    expect((await Promise.all(handles.map((handle) => state.agents.wait(handle.id)))).map((value) => value.status)).toEqual(Array(3).fill("completed"));
+  });
+
+  it("cancels a queued agent without ever creating its process and updates queue positions", async () => {
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const state = fixture(1);
+    const first = await state.spawn(0);
+    const cancelled = await state.receipt(state.spawn(1));
+    const third = await state.receipt(state.spawn(2));
+    expect(await state.provider.invoke("stop", { id: cancelled.id }, context)).toMatchObject({ status: "stopped" });
+    expect(state.agents.status(third.id)).toMatchObject({ status: "queued", queuePosition: 1 });
+    state.release(0); state.release(2);
+    await Promise.all([state.agents.wait(first.id), state.agents.wait(third.id)]);
+    expect(await state.agents.wait(cancelled.id)).toMatchObject({ status: "stopped" });
+    expect(launch.mock.calls.map(([request]) => request.id)).toEqual([first.id, third.id]);
+  });
+
+  it("session shutdown cancels returned queued handles without launching them", async () => {
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const state = fixture(1);
+    await state.spawn(0);
+    const queued = await state.receipt(state.spawn(1));
+    await state.agents.close();
+    expect(await state.agents.wait(queued.id)).toMatchObject({ status: "stopped" });
+    expect(launch).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts queued receipts against the per-execution budget and resets accounting for the next program", async () => {
+    const state = fixture(1, 2);
+    const requests = Array.from({ length: 3 }, (_, i) => state.request(i));
+    const result = await state.run(`for (const request of ${JSON.stringify(requests)}) await agents.spawn(request);`);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("agent budget exhausted");
+    expect(state.agents.list().map((handle) => handle.status)).toEqual(["running", "queued"]);
+    const next = await state.run(`return await agents.spawn(${JSON.stringify(state.request(2))});`);
+    expect(next.success, next.error).toBe(true);
+    expect(next.value).toMatchObject({ status: "queued", queuePosition: 2 });
+    const handles = state.agents.list();
+    for (let i = 0; i < 3; i++) state.release(i);
+    expect((await Promise.all(handles.map((handle) => state.agents.wait(handle.id)))).map((value) => value.status)).toEqual(Array(3).fill("completed"));
+  });
+
+  it("does not refund a cancelled queued receipt's execution budget", async () => {
+    const state = fixture(1, 2);
+    const result = await state.run(`
+      await agents.spawn(${JSON.stringify(state.request(0))});
+      const queued = await agents.spawn(${JSON.stringify(state.request(1))});
+      await tools.call({ref: "agents.cancel", args: {id: queued.id}});
+      return await agents.spawn(${JSON.stringify(state.request(2))});
+    `);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("agent budget exhausted");
+    expect(state.agents.list().map((handle) => handle.status)).toEqual(["running", "stopped"]);
+  });
+
+  it("admits queued workers in FIFO order while preserving concurrency and nice", async () => {
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const state = fixture(1);
+    const handles = [await state.spawn(0), await state.receipt(state.spawn(1)), await state.receipt(state.spawn(2))];
+    for (let i = 0; i < 3; i++) {
+      await vi.waitFor(() => expect(launch).toHaveBeenCalledTimes(i + 1), { timeout: 10_000 });
+      expect(state.agents.list().filter((handle) => handle.status === "running")).toHaveLength(1);
+      state.release(i);
+      expect((await state.agents.wait(handles[i]!.id)).status).toBe("completed");
+    }
+    expect(launch.mock.calls.map(([request]) => request.id)).toEqual(handles.map((handle) => handle.id));
+    for (const [request] of launch.mock.calls) {
+      const index = request.workerArguments.indexOf("--nice");
+      expect(request.workerArguments[index + 1]).toBe("7");
+    }
+  });
+});
 
 describe("#169 round 1 agents.remove cleanup routing", () => {
   it("discovers a resident cleanup-only marker without restart and routes its exact id using retained ownership", async () => {
@@ -433,6 +593,301 @@ describe("terminal result observation receipts", () => {
   });
 });
 
+describe("queued terminal observation receipts", () => {
+  describe.each(["cpython", "node-process"] as const)("%s", backend => {
+    it.skipIf(backend === "cpython" && process.platform === "win32").each(
+      (["wait", "join", "status"] as const).flatMap(action =>
+        (["write failure", "transport closure", "ceiling cancellation", "written then expired", "written then closed", "confirmed delivery"] as const).map(outcome => [action, outcome] as const)),
+    )("keeps exactly one completion for terminal agents.%s after %s until confirmed delivery", async (action, outcome) => {
+          vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+          const { AgentCompletionInbox } = await import("../src/agents/completion-inbox.js");
+          const handlers = new Map<string, (...args: any[]) => unknown>();
+          const sendMessage = vi.fn();
+          const inboxContext = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+          const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, inboxContext);
+          const consumed = vi.fn((id: string) => inbox.acknowledge(id));
+          const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => inbox.enqueue(result));
+          const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
+          const registry = new ActionRegistry(); registry.register(h.provider);
+          const handle = await h.agents.spawn({ task: "queued receipt", transport: "process" });
+          h.agents.detachSignal(handle.id);
+          await waitFor(() => completed.mock.calls.length === 1, 5_000);
+          let deadlineAt = 0;
+          const invoke = registry.invoke.bind(registry);
+          const invocation = vi.spyOn(registry, "invoke").mockImplementation((ref, args, ctx) => {
+            deadlineAt = ctx.mainDeadlineAt!;
+            return invoke(ref, args, ctx);
+          });
+          const call = { type: "call", id: 1, ref: `agents.${action}`, args: { id: handle.id } };
+          let confirm!: (error?: Error) => void;
+          let queued!: (message: any) => void;
+          const response = new Promise<any>(resolve => { queued = resolve; });
+          const channel = new Duplex({
+            read() {},
+            write(chunk, _encoding, callback) {
+              const message = JSON.parse(chunk.toString());
+              if (message.type === "execute") {
+                callback();
+                queueMicrotask(() => channel.push(`${JSON.stringify(call)}\n`));
+              } else {
+                confirm = callback;
+                queued(message);
+              }
+            },
+          });
+          const child = Object.assign(new EventEmitter(), {
+            pid: undefined, stdout: new PassThrough(), stderr: new PassThrough(),
+            stdio: [null, null, null, channel], connected: true, exitCode: null, signalCode: null,
+            send: vi.fn((message: any, callback: (error?: Error) => void) => {
+              if (message.type === "execute") {
+                callback(); queueMicrotask(() => child.emit("message", call));
+              } else { confirm = callback; queued(message); }
+              return true;
+            }),
+            disconnect: vi.fn(() => { child.connected = false; }),
+            kill: vi.fn(() => { queueMicrotask(() => child.emit("close", 1, null)); return true; }),
+          });
+          const spawn = vi.mocked(childProcess.spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof childProcess.spawn>);
+          const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+          if (backend === "cpython") { config.executor.kernel = "python"; config.executor.pythonRuntime = backend; }
+          else config.executor.runtime = backend;
+          config.executor.mainMaxTimeoutMs = 60_000;
+          const timer = captureRuntimeDeadline(backend);
+          const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+          const execution = new FabricExecutionService(registry, config).execute({
+            code: backend === "cpython" ? `return await agents.${action}(id=${JSON.stringify(handle.id)})` : `return await agents.${action}({id:${JSON.stringify(handle.id)}});`,
+            context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "transport-main" } } as unknown as ExtensionContext,
+            signal: undefined, parentToolCallId: `queued-${backend}-${action}`, onPartial() {},
+          });
+          try {
+            const message = await Promise.race([response, execution.then(result => { throw new Error(`Ended before response queued: ${result.error}`); })]);
+            expect(message.ok, JSON.stringify(message)).toBe(true);
+            // Neither submission nor a successful native write is admission.
+            expect(consumed, "queued receipt").not.toHaveBeenCalled();
+            const admit = (ack: unknown) => {
+              if (backend === "cpython") channel.push(`${JSON.stringify(ack)}\n`);
+              else child.emit("message", ack);
+            };
+            const ack = { type: "response_ack", id: message.id, responseId: message.responseId };
+            if (outcome === "write failure") {
+              confirm(new Error("queued IPC write failed"));
+              child.emit("exit", 1, null); child.emit("close", 1, null);
+            } else if (outcome === "transport closure") {
+              channel.destroy(); child.connected = false;
+              child.emit("exit", 1, null); child.emit("close", 1, null);
+              confirm(); // A stale successful callback must not revive delivery.
+            } else if (outcome === "ceiling cancellation") {
+              timer.fireAt(deadlineAt);
+              confirm();
+            } else if (outcome === "written then expired") {
+              confirm();
+              expect(consumed, "write is not admission").not.toHaveBeenCalled();
+              timer.fireAt(deadlineAt);
+              admit(ack); // The ack after the ceiling cannot revive the receipt.
+            } else if (outcome === "written then closed") {
+              confirm();
+              expect(consumed, "write is not admission").not.toHaveBeenCalled();
+              channel.destroy(); child.connected = false;
+              child.emit("exit", 1, null); child.emit("close", 1, null);
+              if (backend === "node-process") admit(ack);
+            } else {
+              confirm();
+              expect(consumed, "write is not admission").not.toHaveBeenCalled();
+              admit({ ...ack, id: message.id + 1 });
+              admit({ ...ack, responseId: message.responseId + 1 });
+              expect(consumed, "uncorrelated ack").not.toHaveBeenCalled();
+              admit(ack);
+              // CPython frames use a stream; let its data event run first.
+              await new Promise<void>(resolve => setImmediate(resolve));
+              admit(ack);
+              expect(consumed).toHaveBeenCalledExactlyOnceWith(handle.id);
+              const result = { type: "result", result: { terminationReason: "completed", value: message.value, logs: [] } };
+              if (backend === "cpython") channel.push(`${JSON.stringify(result)}\n`);
+              else child.emit("message", result);
+            }
+            const result = await execution;
+            expect(result.success).toBe(outcome === "confirmed delivery");
+            if (outcome === "ceiling cancellation" || outcome === "written then expired") expect(result.error).toMatch(/MainExecutionCeilingError/);
+            const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
+            boundary(); boundary();
+            expect(sendMessage).toHaveBeenCalledTimes(outcome === "confirmed delivery" ? 0 : 1);
+            if (outcome !== "confirmed delivery") {
+              expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([handle.id]);
+              expect(consumed).not.toHaveBeenCalled();
+            }
+          } finally {
+            // Always settle a started execution, including a failing red assertion.
+            child.emit("exit", 1, null); child.emit("close", 1, null);
+            await execution;
+            clock.mockRestore(); timer.restore(); invocation.mockRestore(); spawn.mockReset();
+            const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+            spawn.mockImplementation(actual.spawn);
+            channel.destroy(); child.stdout.destroy(); child.stderr.destroy();
+            inbox.close(); await registry.close(); vi.unstubAllEnvs();
+          }
+      }, 45_000,
+    );
+  });
+});
+
+// Real transports: stop the receiver after it issued the observation, then let
+// its native write succeed. A write callback while SIGSTOPped proves nothing
+// about admission. These signal controls are Linux-only, not Windows mocks.
+describe.skipIf(process.platform !== "linux")("native written-but-unadmitted observations", () => {
+  it.each((["cpython", "node-process"] as const).flatMap(backend =>
+    (["deadline", "transport close"] as const).map(outcome => [backend, outcome] as const)),
+  )("retains exactly one completion after %s write success before guest admission and %s", async (backend, outcome) => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const { AgentCompletionInbox } = await import("../src/agents/completion-inbox.js");
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const sendMessage = vi.fn();
+    const inboxContext = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, inboxContext);
+    const consumed = vi.fn((id: string) => inbox.acknowledge(id));
+    const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => inbox.enqueue(result));
+    const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
+    const registry = new ActionRegistry(); registry.register(h.provider);
+    const handle = await h.agents.spawn({ task: "native admission receipt", transport: "process" });
+    h.agents.detachSignal(handle.id);
+    await waitFor(() => completed.mock.calls.length === 1, 5_000);
+    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    let guest!: ReturnType<typeof childProcess.spawn>;
+    let wrote!: () => void;
+    const written = new Promise<void>(resolve => { wrote = resolve; });
+    const spawn = vi.mocked(childProcess.spawn).mockImplementationOnce((...args: Parameters<typeof childProcess.spawn>) => {
+      guest = actual.spawn(...args);
+      if (backend === "node-process") {
+        const send = guest.send.bind(guest);
+        guest.send = ((message: any, callback: (error: Error | null) => void) => send(message, (error) => {
+          callback(error);
+          if (message.type === "response" && !error) wrote();
+        })) as typeof guest.send;
+      } else {
+        const channel = guest.stdio[3] as Duplex;
+        const write = channel.write.bind(channel);
+        channel.write = ((frame: string, callback: (error?: Error | null) => void) => write(frame, (error) => {
+          callback(error);
+          if (JSON.parse(frame).type === "response" && !error) wrote();
+        })) as typeof channel.write;
+      }
+      return guest;
+    });
+    let deadlineAt = 0;
+    const invoke = registry.invoke.bind(registry);
+    const invocation = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, ctx) => {
+      deadlineAt = ctx.mainDeadlineAt!;
+      process.kill(guest.pid!, "SIGSTOP");
+      await waitFor(() => /\) T /.test(fs.readFileSync(`/proc/${guest.pid}/stat`, "utf8")), 5_000);
+      return invoke(ref, args, ctx);
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    if (backend === "cpython") { config.executor.kernel = "python"; config.executor.pythonRuntime = backend; }
+    else config.executor.runtime = backend;
+    config.executor.mainMaxTimeoutMs = 60_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const timer = captureRuntimeDeadline(backend);
+    const controller = new AbortController();
+    const execution = new FabricExecutionService(registry, config).execute({
+      code: backend === "cpython" ? `return await agents.wait(id=${JSON.stringify(handle.id)})` : `return await agents.wait({id:${JSON.stringify(handle.id)}});`,
+      context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "native-admission-main" } } as unknown as ExtensionContext,
+      signal: controller.signal, parentToolCallId: `native-${backend}-${outcome}`, onPartial() {},
+    });
+    try {
+      await Promise.race([written, execution.then(result => { throw new Error(`Ended before native write: ${result.error}`); })]);
+      expect(/\) T /.test(fs.readFileSync(`/proc/${guest.pid}/stat`, "utf8"))).toBe(true);
+      expect(consumed, "successful write to a stopped receiver is not admission").not.toHaveBeenCalled();
+      if (outcome === "deadline") timer.fireAt(deadlineAt);
+      else {
+        if (backend === "cpython") (guest.stdio[3] as Duplex).destroy();
+        else guest.disconnect();
+        guest.kill("SIGKILL");
+      }
+      const result = await execution;
+      expect(result.success).toBe(false);
+      if (outcome === "deadline") expect(result.error).toMatch(/MainExecutionCeilingError/);
+      expect(consumed).not.toHaveBeenCalled();
+      const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
+      boundary(); boundary();
+      expect(sendMessage).toHaveBeenCalledOnce();
+      expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([handle.id]);
+    } finally {
+      controller.abort();
+      guest?.kill("SIGKILL");
+      await execution;
+      if (guest && guest.exitCode === null && guest.signalCode === null) await new Promise<void>(resolve => guest.once("exit", () => resolve()));
+      clock.mockRestore(); timer.restore(); invocation.mockRestore(); spawn.mockImplementation(actual.spawn);
+      inbox.close(); await registry.close(); vi.unstubAllEnvs();
+    }
+  }, 45_000);
+});
+
+describe.skipIf(process.platform !== "linux")("Monty returned-but-unadmitted agent observations", () => {
+  it.each((["wait", "join", "status"] as const).flatMap(action =>
+    (["expiry", "closure", "normal ack", "ack then expiry"] as const).map(outcome => [action, outcome] as const)),
+  )("terminal agents.%s after Monty return before admission: %s", async (action, outcome) => {
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    const { AgentCompletionInbox } = await import("../src/agents/completion-inbox.js");
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const sendMessage = vi.fn();
+    const inboxContext = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, inboxContext);
+    const consumed = vi.fn((id: string) => inbox.acknowledge(id));
+    const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => inbox.enqueue(result));
+    const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
+    const registry = new ActionRegistry(); registry.register(h.provider);
+    const handle = await h.agents.spawn({ task: "Monty admission receipt", transport: "process" });
+    h.agents.detachSignal(handle.id);
+    await waitFor(() => completed.mock.calls.length === 1, 5_000);
+    let countAtReturn = -1;
+    let deadlineAt = 0;
+    let ackCount = 0;
+    const timer = captureRuntimeDeadline("monty");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const control = await captureMontyTransport(() => { countAtReturn = consumed.mock.calls.length; }, ack => {
+      ackCount++;
+      ack(1, 0); ack(0, 1);
+      expect(consumed, "uncorrelated confirmations").not.toHaveBeenCalled();
+      ack(); ack();
+      expect(consumed).toHaveBeenCalledExactlyOnceWith(handle.id);
+      if (outcome === "ack then expiry") timer.fireAt(deadlineAt);
+    }, outcome === "expiry" || outcome === "closure");
+    const invoke = registry.invoke.bind(registry);
+    const invocation = vi.spyOn(registry, "invoke").mockImplementation(async (ref, args, ctx) => {
+      deadlineAt = ctx.mainDeadlineAt!;
+      return invoke(ref, args, ctx);
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.kernel = "python"; config.executor.pythonRuntime = "monty"; config.executor.mainMaxTimeoutMs = 60_000;
+    const controller = new AbortController();
+    const execution = new FabricExecutionService(registry, config).execute({
+      code: `return await agents.${action}(id=${JSON.stringify(handle.id)})`,
+      context: { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "monty-admission-main" } } as unknown as ExtensionContext,
+      signal: controller.signal, parentToolCallId: `monty-${action}-${outcome}`, onPartial() {},
+    });
+    try {
+      await Promise.race([control.responseReturned, execution.then(result => { throw new Error(`Ended before callback returned: ${result.error}`); })]);
+      expect(countAtReturn, "callback return is not guest admission").toBe(0);
+      if (outcome === "expiry") timer.fireAt(deadlineAt);
+      if (outcome === "closure") control.closeReceiver();
+      const result = await execution;
+      expect(result.success).toBe(outcome === "normal ack");
+      if (outcome === "expiry" || outcome === "ack then expiry") expect(result.error).toMatch(/MainExecutionCeilingError/);
+      control.staleAck();
+      const admitted = outcome === "normal ack" || outcome === "ack then expiry";
+      expect(consumed).toHaveBeenCalledTimes(admitted ? 1 : 0);
+      expect(ackCount).toBe(admitted ? 1 : 0);
+      const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
+      boundary(); boundary();
+      expect(sendMessage).toHaveBeenCalledTimes(admitted ? 0 : 1);
+      if (!admitted) expect(sendMessage.mock.calls[0]![0].details.ids).toEqual([handle.id]);
+    } finally {
+      controller.abort(); control.closeReceiver(); await execution;
+      invocation.mockRestore(); control.restore(); clock.mockRestore(); timer.restore();
+      inbox.close(); await registry.close(); vi.unstubAllEnvs();
+    }
+  }, 45_000);
+});
+
 describe("runtime observation receipts", () => {
   it.each(["quickjs", "node-process", "monty", "cpython"] as const)("keeps an unread completion after %s rejects result encoding, but not after delivered guest continuation", async backend => {
     vi.stubEnv("PI_FABRIC_PARENT_RUN", ""); vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
@@ -450,6 +905,13 @@ describe("runtime observation receipts", () => {
     const completed = vi.fn((result: import("../src/agents/types.js").AgentRunResult) => { record("background completion", { id: result.id, status: result.status }); inbox.enqueue(result); });
     const h = setup([], [], undefined, { onBackgroundComplete: completed, onResultConsumed: consumed });
     const registry = new ActionRegistry(); registry.register(h.provider);
+    let admitGuest: (() => void) | undefined;
+    registry.register({
+      name: "receipt_probe", description: "Receipt regression guest readiness",
+      async list() { return [{ name: "ready", description: "Mark guest admission", risk: "read" as const, inputSchema: { type: "object", properties: {} } }]; },
+      async describe() { return (await this.list({}, context))[0]; },
+      async invoke() { admitGuest?.(); return null; },
+    });
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.executor.memoryLimitBytes = 128 * 1024 * 1024;
     const python = backend === "monty" || backend === "cpython";
@@ -458,20 +920,35 @@ describe("runtime observation receipts", () => {
     config.executor.mainMaxTimeoutMs = 5_000;
     const service = new FabricExecutionService(registry, config);
     const mainContext = { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "receipt-main" } } as unknown as ExtensionContext;
+    // Bound even a broken startup handshake, independently of the mocked budget
+    // clock, and leave time for cancellation/cleanup before Vitest's 45s limit.
+    const lifetime = new AbortController();
+    const lifetimeGuard = setTimeout(() => {
+      record("receipt test: startup/cleanup hang guard");
+      lifetime.abort(new Error("Receipt regression exceeded its 35-second lifetime guard"));
+    }, 35_000);
     const execute = async (parentToolCallId: string, code: string) => {
       record(`${parentToolCallId}: start`);
       const controller = new AbortController();
-      // Keep a real hang guard separate from the controlled Main budget, so a
-      // broken Windows IPC handshake still settles and emits diagnostics.
-      const guard = setTimeout(() => {
-        record(`${parentToolCallId}: hang guard`);
-        controller.abort(new Error("Receipt regression execution exceeded its 12-second hang guard"));
-      }, 12_000);
+      let guard: ReturnType<typeof setTimeout> | undefined;
+      // As with the admission-clock regressions, startup is not the tested
+      // boundary. CPython starts a fresh interpreter/Windows IPC for every call;
+      // a warmup cannot make later starts cheap. Arm the active-work guard only
+      // when a real guest host call proves admission, not before cold startup.
+      admitGuest = () => {
+        if (guard !== undefined) return;
+        record(`${parentToolCallId}: guest admitted`);
+        guard = setTimeout(() => {
+          record(`${parentToolCallId}: hang guard`);
+          controller.abort(new Error("Receipt regression execution exceeded its 12-second admitted hang guard"));
+        }, 12_000);
+      };
       try {
-        const result = await service.execute({ code, context: mainContext, signal: controller.signal, parentToolCallId, onPartial() {} });
+        const ready = python ? 'await tools.call(ref="receipt_probe.ready", args={})\n' : 'await tools.call({ ref: "receipt_probe.ready", args: {} });\n';
+        const result = await service.execute({ code: ready + code, context: mainContext, signal: AbortSignal.any([controller.signal, lifetime.signal]), parentToolCallId, onPartial() {} });
         record(`${parentToolCallId}: end`, { success: result.success, error: result.error, logs: result.logs, phases: result.phases, audits: result.audits });
         return result;
-      } finally { clearTimeout(guard); }
+      } finally { clearTimeout(guard); admitGuest = undefined; }
     };
     const boundary = () => handlers.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, inboxContext);
     try {
@@ -498,6 +975,7 @@ describe("runtime observation receipts", () => {
         record("encoding host call", { ref });
         const value = await invoke(ref, args, callContext);
         record("encoding host result", { ref });
+        if (ref !== "agents.wait") return value;
         // Registry admission precedes guest promise/frame publication.
         Object.defineProperty(value, "text", { enumerable: true, get: () => encode(callContext.mainDeadlineAt!) });
         return value;
@@ -556,7 +1034,7 @@ describe("runtime observation receipts", () => {
         steps, consumptionCalls: consumed.mock.calls, completionIds: completed.mock.calls.map(([result]) => result.id),
       }, null, 2));
       throw error;
-    } finally { inbox.close(); await registry.close(); vi.unstubAllEnvs(); }
+    } finally { clearTimeout(lifetimeGuard); lifetime.abort(); inbox.close(); await registry.close(); vi.unstubAllEnvs(); }
   }, 45_000);
 });
 

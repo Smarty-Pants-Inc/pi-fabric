@@ -7,6 +7,14 @@ import type { FabricInvocationContext } from "../protocol.js";
 import type { FabricControlPlane, FabricControlCommand, FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { FabricAgentRunner } from "../config.js";
+import type { ResidencyClient } from "../residency/client.js";
+import fs from "node:fs";
+import path from "node:path";
+import { kernelFenceAvailable } from "../residency/file-lock.js";
+import { processAlive } from "../storage/scratch.js";
+
+// MeshStore's default stale window; recovery waits, never weakens mesh locking.
+export const RESIDENT_MESH_STALE_WINDOW_MS = 30_000;
 
 export class FabricParticipantNotYetMirroredError extends Error {
   override readonly name = "FabricParticipantNotYetMirroredError";
@@ -75,11 +83,12 @@ export const unknownParticipant = (
 export class AgentMessageRouter {
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
-    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding">,
+    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding"> & { owns?: (id: string) => boolean },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
+    readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
   ) {}
   #get(id: string): FabricParticipantInfo | undefined {
     // Discovery and admission share this directory/root. A cached negative may predate the
@@ -110,6 +119,11 @@ export class AgentMessageRouter {
       : id;
   }
 
+  /** Use the same exact session-UUID alias resolution as delivery when grouping lifecycle sources. */
+  isLocalMainTarget(id: string): boolean {
+    return this.mainAgent.local && this.mainAgent.matches(this.#sessionTarget(id));
+  }
+
   async routeMessage(
     id: string,
     message: string,
@@ -122,7 +136,7 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
-    const result = await this.#route(id, message, data, kind, context, options);
+    const result = await this.#withDurableRecovery(id, () => this.#route(id, message, data, kind, context, options));
     // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
     // Older owners never report `stalled`, so their results pass unchanged.
     if (kind === "followUp" && result?.stalled) {
@@ -133,6 +147,36 @@ export class AgentMessageRouter {
       );
     }
     return result;
+  }
+
+  /** Only this root's non-owned durable actors can wait out a dead local holder.
+   * Unknown/live holders and unrelated routing errors retain the ordinary failure path. */
+  async #withDurableRecovery<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    let deadline = Date.now() + RESIDENT_MESH_STALE_WINDOW_MS + 10_000;
+    for (;;) {
+      try { return await operation(); }
+      catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "FABRIC_MESH_LOCK_TIMEOUT") ||
+            !this.residency || !kernelFenceAvailable()) throw error;
+        const { actor, participant } = this.resolveActorTarget(id);
+        if ((actor?.residency ?? participant?.residency) !== "durable" ||
+            (actor && (this.actorManager.owns?.(actor.id) ?? participant?.local)) ||
+            !(actor?.rootId === this.residency.options.config.rootId || participant?.ownerHostId === this.residency.hostId)) throw error;
+        let owner: string;
+        try { owner = fs.readFileSync(path.join(this.residency.options.config.meshRoot, ".lock", "owner"), "utf8"); }
+        catch { throw error; }
+        const [, pidText, createdText] = owner.trim().split("\n");
+        const pid = Number(pidText), createdAt = Number(createdText);
+        if (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid) ||
+            !Number.isFinite(createdAt) || createdAt < 0 || createdAt > Date.now()) throw error;
+        deadline = Math.min(deadline, createdAt + RESIDENT_MESH_STALE_WINDOW_MS + 10_000);
+        const now = Date.now();
+        const waitMs = Math.max(100, createdAt + RESIDENT_MESH_STALE_WINDOW_MS - now);
+        // Leave a full mesh write-timeout budget for the final attempt. Never extend for a new holder.
+        if (now + waitMs + 10_000 > deadline) throw error;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+    }
   }
 
   async #route(
@@ -164,6 +208,7 @@ export class AgentMessageRouter {
         });
         return this.mainAgent.deliverAgent({
           from: options.from ?? this.actorManager.identity,
+          verification: "mesh", // In-process registered producer, not a received command.
           message,
           delivery: kind,
           ...(typeof options.triggerTurn === "boolean"
@@ -233,7 +278,7 @@ export class AgentMessageRouter {
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
     try {
-      target = this.resolveActorTarget(id);
+      target = await this.resolveActorMessageTarget(id);
     } catch (error) {
       if (error instanceof Error && /Unknown Fabric actor/.test(error.message)) {
         throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, id);
@@ -241,7 +286,7 @@ export class AgentMessageRouter {
       throw error;
     }
     const { actor, participant } = target;
-    const localActor = Boolean(actor && (!participant || participant.local));
+    const localActor = Boolean(actor && (this.actorManager.owns?.(actor.id) ?? (!participant || participant.local)));
     const binding = options.binding && context && localActor
       ? await this.resolvePiRunBinding(options.binding, actor!.runner, context)
       : options.binding;
@@ -294,6 +339,7 @@ export class AgentMessageRouter {
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
+    verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
@@ -360,6 +406,7 @@ export class AgentMessageRouter {
       try {
         result = this.mainAgent.deliverAgent({
         from,
+        ...(verification === undefined ? {} : { verification }),
         message,
         delivery: command.operation,
         ...(typeof command.triggerTurn === "boolean"
@@ -411,6 +458,24 @@ export class AgentMessageRouter {
       }
     }
     return { accepted: false, error: `Owner does not control Fabric participant ${command.targetId}` };
+  }
+
+  /** A lease can still look fresh after SIGKILL. For this root's non-owned durable
+   * actors, check the real owner before delivery, not just participant freshness. */
+  async resolveActorMessageTarget(id: string): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
+    const target = this.resolveActorTarget(id);
+    const { actor, participant } = target;
+    if (this.residency && (actor?.residency ?? participant?.residency) === "durable" &&
+        !(actor && (this.actorManager.owns?.(actor.id) ?? participant?.local)) &&
+        (actor?.rootId === this.residency.options.config.rootId || participant?.ownerHostId === this.residency.hostId)) {
+      if (!kernelFenceAvailable()) {
+        if (!participant) throw new Error(`Fabric actor ${actor!.id} is owned by another host`);
+        return target;
+      }
+      await this.#withDurableRecovery(id, () => this.residency!.ensureActor(actor?.id ?? participant!.id));
+      return this.resolveActorTarget(actor?.id ?? participant!.id);
+    }
+    return target;
   }
 
   resolveActorTarget(id: string): {

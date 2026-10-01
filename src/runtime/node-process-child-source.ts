@@ -114,8 +114,14 @@ process.on("message", (message) => {
   const operation = pending.get(message.id);
   if (!operation) return;
   pending.delete(message.id);
-  if (message.ok) operation.resolve(message.value);
-  else {
+  if (message.ok) {
+    operation.resolve(message.value);
+    // Promise continuation runs after this handler; ack is ordered before any
+    // subsequent call/result, and only for a decoded, pending response.
+    if (message.responseId !== undefined) {
+      send({ type: "response_ack", id: message.id, responseId: message.responseId });
+    }
+  } else {
     const error = new Error(message.error ?? "Host call failed");
     if (message.bashExit) error.__fabricBashExit = message.bashExit;
     operation.reject(error);

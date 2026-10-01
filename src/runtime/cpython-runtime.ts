@@ -129,6 +129,10 @@ export class CPythonRuntime implements FabricKernelRuntime {
       const hostAbort = new AbortController();
       const hostTasks = new Set<Promise<void>>();
       const callIds = new Set<number>();
+      // Host-owned response ids are unique within this fresh execution. Native
+      // write callbacks cannot prove that the guest admitted an observation.
+      let nextResponseId = 0;
+      const pendingReceipts = new Map<number, { id: number; commit: () => void }>();
       const logs: string[] = [];
       const partialLogs = ["", ""];
       const decoders = [new StringDecoder("utf8"), new StringDecoder("utf8")];
@@ -175,6 +179,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
           result = executionDeadline.timeoutResult([]);
         }
         settled = true;
+        pendingReceipts.clear();
         executionDeadline.clear();
         options.signal?.removeEventListener("abort", abort);
         if (!hostAbort.signal.aborted) hostAbort.abort(new Error(result.error ?? "CPython execution ended"));
@@ -220,6 +225,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         if (settled || finishing) return;
         pipeError = message;
         finishing = true;
+        pendingReceipts.clear();
         hostAbort.abort(new Error(message));
         if (child.pid && process.platform !== "win32") {
           try { process.kill(-child.pid, "SIGKILL"); } catch { /* The process group may already have exited. */ }
@@ -235,12 +241,17 @@ export class CPythonRuntime implements FabricKernelRuntime {
         void finish(executionDeadline.timeoutResult([]));
       };
       const scheduleDeadline = (): void => executionDeadline.scheduleDeadline(expireDeadline, true);
-      const send = (message: unknown, delivered?: () => void): void => {
+      const send = (message: any, delivered?: () => void): void => {
         // A terminal guest result closes its reply channel while issued host
         // work may still be settling. Its late replies are no longer consumed.
         if (settled || finishing || !channel || channel.destroyed) return;
         if (executionDeadline.reached) { expireDeadline(); return; }
         try {
+          if (delivered) {
+            const responseId = ++nextResponseId;
+            message = { ...message, responseId };
+            pendingReceipts.set(responseId, { id: message.id, commit: delivered });
+          }
           const frame = JSON.stringify(message) + "\n";
           const bytes = Buffer.byteLength(frame);
           if (bytes > MAX_FRAME_BYTES || channel.writableLength + bytes > MAX_FRAME_BYTES * 2) {
@@ -248,14 +259,28 @@ export class CPythonRuntime implements FabricKernelRuntime {
             return;
           }
           if (executionDeadline.reached) { expireDeadline(); return; }
-          channel.write(frame, (error) => { if (error) failPipe(`CPython IPC failed: ${error.message}`); });
-          delivered?.();
+          channel.write(frame, (error) => {
+            if (settled || finishing) return;
+            if (error) { failPipe(`CPython IPC failed: ${error.message}`); return; }
+            // A native write is not guest admission. Only a correlated ack
+            // from the receiver may commit the pending consumption receipt.
+            if (!channel || channel.destroyed || !channel.writable) return;
+            if (executionDeadline.reached) { expireDeadline(); return; }
+          });
         } catch (error) { fail(`CPython IPC serialization failed: ${errorText(error)}`); }
       };
       const handleMessage = (message: unknown): void => {
         if (settled || finishing) return;
         if (!record(message)) { fail("Invalid CPython IPC message"); return; }
         if (executionDeadline.reached) { expireDeadline(); return; }
+        if (message.type === "response_ack") {
+          if (!channel || channel.destroyed || !channel.writable) return;
+          const receipt = pendingReceipts.get(message.responseId as number);
+          if (!receipt || receipt.id !== message.id) return;
+          pendingReceipts.delete(message.responseId as number);
+          receipt.commit();
+          return;
+        }
         if (message.type === "result") {
           const result = message.result;
           if (!record(result) || !["completed", "runtime_error"].includes(String(result.terminationReason)) ||

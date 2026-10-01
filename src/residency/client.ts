@@ -651,6 +651,20 @@ export class ResidencyClient {
         }
       }
     }
+    // A terminal task can leave its producer outbox behind at idle exit. The live
+    // client owns recovery even with no durable actors; the fenced host replays
+    // the stable envelope id, not the completed agent.
+    const outbox = path.join(config.residencyRoot, "delivery-outbox");
+    let entries: string[];
+    try { entries = fs.readdirSync(outbox); } catch { entries = []; }
+    for (const entry of entries.filter(entry => entry.endsWith(".json"))) {
+      const record = readJson<ResidentDeliveryRecord>(path.join(outbox, entry));
+      if (record?.format === RESIDENT_HOST_FORMAT && typeof record.id === "string" && `${record.id}.json` === entry &&
+        typeof record.rootId === "string" && typeof record.message === "string" && typeof record.triggerTurn === "boolean" &&
+        (record.delivery === "steer" || record.delivery === "followUp") && record.from && typeof record.from.id === "string") {
+        work.push(`delivery:${record.rootId}:${record.id}`);
+      }
+    }
     return work.length ? JSON.stringify(work.sort()) : undefined;
   }
 

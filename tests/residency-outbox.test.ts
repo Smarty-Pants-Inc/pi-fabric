@@ -1,10 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { runResidentHostFromConfigPath } from "../src/residency/host.js";
+import { ResidencyClient } from "../src/residency/client.js";
+import { kernelFenceAvailable } from "../src/residency/file-lock.js";
+import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { launchLog, same, stopAllOwned } from "./helpers/owned-processes.js";
 import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, residentHostId, residentResultPath, type ResidentDeliveryRecord, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -31,6 +36,85 @@ const setup = () => {
 };
 
 describe("resident producer durable outbox", () => {
+  it.skipIf(process.platform !== "linux")("F6 live watchdog recovers a sole completed task after locked idle exit exactly once without explicit restart", { timeout: 120_000 }, async () => {
+    const f = setup();
+    const launches = launchLog(f.root);
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    const completions = vi.fn();
+    const participants = new ParticipantDirectory(f.mesh, { enabled: true, hostId: f.config.rootId, rootId: f.config.rootId,
+      identity: { id: f.config.rootId, name: "live Main", kind: "main" }, reapDeadHosts: false });
+    const client = new ResidencyClient({
+      config: f.config, mesh: f.mesh, participants,
+      mainAgent: { local: true } as FabricMainAgentTarget,
+      hostPath: path.resolve("dist/residency/launcher.js"),
+      onBackgroundComplete: (result, delivered) => { completions(result); delivered(); },
+    });
+    // Both the original and recovered hosts use the real compiled launcher -> Pi.
+    // An in-process host would leave a live Vitest PID in the legacy-owner fence.
+    const ensure = vi.spyOn(client, "ensureHost");
+    const lock = path.join(f.config.meshRoot, ".lock");
+    try {
+      await participants.start();
+      const handle = await client.spawnAgent({ task: "LIVE_WITH_PROGRESS", transport: "process", residency: "durable" });
+      const id = handle.id;
+      const owner = JSON.parse(fs.readFileSync(path.join(f.config.residencyRoot, "owner.json"), "utf8"));
+      const originalHost = launches.owned().find(({ pid }) => pid === owner.pid)!;
+      expect(originalHost).toBeDefined();
+      expect(originalHost.argv).toContain(path.resolve("dist/residency/pi-entry.js"));
+      ensure.mockClear();
+      client.start();
+      await f.mesh.exclusive(() => undefined);
+      fs.mkdirSync(lock);
+      fs.writeFileSync(path.join(lock, "owner"), `resident-test\n${process.pid}\n${Date.now()}\n`);
+      await wait(() => fs.existsSync(residentResultPath(f.config.residencyRoot, id)));
+      await wait(() => fs.existsSync(f.outbox) && fs.readdirSync(f.outbox).length === 1);
+      const entry = fs.readdirSync(f.outbox)[0]!;
+      const pending = JSON.parse(fs.readFileSync(path.join(f.outbox, entry), "utf8"));
+      expect(pending.agentCompletionId).toBe(id);
+      expect(completions).not.toHaveBeenCalled();
+      await wait(() => !same(originalHost), 75_000); // actual idle shutdown and process exit
+      expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json"))).toBe(false);
+      expect(fs.existsSync(path.join(f.outbox, entry))).toBe(true);
+      for (const root of [f.config.actorRoot, f.config.sessionActorRoot!]) {
+        const registry = path.join(root, "actors.json");
+        expect(fs.existsSync(registry) ? JSON.parse(fs.readFileSync(registry, "utf8")).actors : []).toEqual([]);
+      }
+      expect(ensure).not.toHaveBeenCalled();
+      fs.rmSync(lock, { recursive: true });
+      // No explicit restart, ensureHost, or new spawn after the idle exit.
+      try {
+        await wait(() => completions.mock.calls.length > 0, 45_000);
+      } catch (error) {
+        const diagnostics: Record<string, unknown> = { kernelFence: kernelFenceAvailable(), watchdogStarts: ensure.mock.calls.length, pending };
+        for (const file of ["owner.json", "error.json", "launcher.log", "child-stderr.log"]) {
+          try { diagnostics[file] = fs.readFileSync(path.join(f.config.residencyRoot, file), "utf8"); } catch { /* absent */ }
+        }
+        throw new Error(`${String(error)}; recovery diagnostics: ${JSON.stringify(diagnostics)}`);
+      }
+      await wait(() => fs.readdirSync(f.outbox).length === 0 &&
+        f.mesh.listAll(residentDeliveryPrefix(f.config.rootId), { fresh: true }).length === 0);
+      expect(completions).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id, status: "completed", text: "live attempt 1 complete" }));
+      expect(ensure).toHaveBeenCalledOnce();
+      const metadata = JSON.parse(fs.readFileSync(path.join(f.config.residencyRoot, "agents", `${id}.json`), "utf8"));
+      expect(metadata.completionConsumedAt).toEqual(expect.any(Number));
+      // Multiple watchdog/poll cycles must neither redeliver nor relaunch the completed task.
+      await sleep(5_100);
+      expect(completions).toHaveBeenCalledOnce();
+      expect(ensure).toHaveBeenCalledOnce();
+      const workers = launches.owned().filter(({ argv }) => argv[0] === f.config.workerPath);
+      expect(workers).toHaveLength(1);
+      expect(workers[0]!.argv).toContain(id);
+      expect(launches.owned().filter(({ argv }) => argv[0] === client.options.hostPath)).toHaveLength(2);
+    } finally {
+      fs.rmSync(lock, { recursive: true, force: true });
+      await client.close();
+      await stopAllOwned(launches.owned());
+      await participants.close();
+      ensure.mockRestore(); vi.unstubAllEnvs();
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("retains a completed durable task beyond idle exit and delivers once after host restart", { timeout: 100_000 }, async () => {
     const f = setup();
     const controller = new AbortController();

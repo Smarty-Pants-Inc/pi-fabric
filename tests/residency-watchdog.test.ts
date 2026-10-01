@@ -12,7 +12,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
 import { ResidencyClient } from "../src/residency/client.js";
-import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { RESIDENT_HOST_FORMAT, type ResidentDeliveryRecord, type ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
 
@@ -32,6 +32,53 @@ const fixture = () => {
 };
 
 describe("resident watchdog", () => {
+  it("F6 pending completion outbox alone owns automatic recovery with unchanged-work backoff", async () => {
+    const { root, config, client } = fixture();
+    const outbox = path.join(config.residencyRoot, "delivery-outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const record: ResidentDeliveryRecord = { format: RESIDENT_HOST_FORMAT, id: "completion-envelope", rootId: config.rootId,
+      agentCompletionId: "a".repeat(32), from: { id: "a".repeat(32), name: "sole completed task", kind: "agent" },
+      message: "completed", delivery: "followUp", triggerTurn: true, createdAt: Date.now() };
+    const file = path.join(outbox, `${record.id}.json`);
+    fs.writeFileSync(file, JSON.stringify(record));
+    const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
+    vi.useFakeTimers();
+    try {
+      client.start();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(start).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(start).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(start).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(start).toHaveBeenCalledTimes(3);
+      fs.rmSync(file);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(start).toHaveBeenCalledTimes(3);
+    } finally { await client.close(); vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("ignores malformed, mismatched and temporary outbox files as recovery work", async () => {
+    const { root, config, client } = fixture();
+    const outbox = path.join(config.residencyRoot, "delivery-outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const valid = { format: RESIDENT_HOST_FORMAT, id: "pending", rootId: config.rootId,
+      from: { id: "a", kind: "agent" }, message: "completed", delivery: "followUp", triggerTurn: true };
+    for (const [file, content] of Object.entries({
+      "invalid.json": "{", "null.json": "null", "array.json": "[]",
+      "mismatch.json": JSON.stringify(valid), "pending.tmp": JSON.stringify(valid),
+      "format.json": JSON.stringify({ ...valid, id: "format", format: 999 }),
+      "message.json": JSON.stringify({ ...valid, id: "message", message: null }),
+    })) fs.writeFileSync(path.join(outbox, file), content);
+    const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
+    vi.useFakeTimers();
+    try {
+      client.start(); await vi.advanceTimersByTimeAsync(180_000);
+      expect(start).not.toHaveBeenCalled();
+    } finally { await client.close(); vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("keeps watchdog restart independent of mesh delivery outage backoff", async () => {
     const { root, config, client } = fixture();
     fs.mkdirSync(config.actorRoot, { recursive: true });
@@ -64,12 +111,19 @@ describe("resident watchdog", () => {
       vi.useRealTimers(); fs.rmSync(root, { recursive: true, force: true });
     }
   });
-  it("F4 never relaunches durable work without a kernel fence", async () => {
+  it.each(["actor", "outbox"])("F4 never relaunches durable %s work without a kernel fence", async (kind) => {
     const { root, config, client } = fixture();
     fs.mkdirSync(config.actorRoot, { recursive: true });
     fs.writeFileSync(path.join(config.actorRoot, "actors.json"), JSON.stringify({ actors: [
       { id: "a", rootId: config.rootId, residency: "durable", status: "idle" },
     ] }));
+    if (kind === "outbox") {
+      fs.rmSync(path.join(config.actorRoot, "actors.json"));
+      const outbox = path.join(config.residencyRoot, "delivery-outbox");
+      fs.mkdirSync(outbox, { recursive: true });
+      fs.writeFileSync(path.join(outbox, "pending.json"), JSON.stringify({ format: RESIDENT_HOST_FORMAT, id: "pending",
+        rootId: config.rootId, from: { id: "a", kind: "agent" }, message: "completed", delivery: "followUp", triggerTurn: true }));
+    }
     vi.mocked(kernelFenceAvailable).mockReturnValue(false);
     const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
     vi.useFakeTimers();

@@ -21,8 +21,9 @@ jobs:
           - name: check (ubuntu-latest)
             runner: smarty-linux-x64
           - name: check (windows-latest)
-            # hosted-exception: pending Paul's decision on smarty-dev#1246
-            runner: windows-latest
+            # Dev3's native i9 runner (group "Smarty Windows CI"), not a hosted image (Paul, smarty-dev#1246).
+            # The check name stays `check (windows-latest)` because the merge rules require it.
+            runner: [self-hosted, Windows, X64, smarty-ci-windows-x64]
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Install Forge base prerequisites
@@ -50,7 +51,8 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            choco install ripgrep -y --no-progress
+            # The Dev3 runner is non-admin (no choco installs): rg must be provisioned on the host.
+            command -v rg || { echo "ripgrep is not provisioned on this Windows runner" >&2; exit 1; }
           else
             sudo apt-get update
             sudo apt-get install -y ripgrep bubblewrap python3

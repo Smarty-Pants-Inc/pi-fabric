@@ -148,10 +148,85 @@ describe("ActorRegistryStore", () => {
   it("recovers a stale lock only when its owning process is gone", async () => {
     const { store, lockPath } = setup();
     installLock(lockPath, 123456, Date.now() - 30_001);
-    vi.spyOn(process, "kill").mockImplementation(() => { throw new Error("ESRCH"); });
+    vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
     await expect(store.withLock(() => "recovered")).resolves.toBe("recovered");
     expect(process.kill).toHaveBeenCalledWith(123456, 0);
     expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it.each([false, true])("recovers a fresh dead holder (incarnation=%s) without waiting for lock age", async (incarnation) => {
+    const { store, actorRoot, lockPath } = setup();
+    installLock(lockPath, 123456, Date.now());
+    if (incarnation) fs.appendFileSync(path.join(lockPath, "owner"), "123\n");
+    vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
+    await expect(store.withLock(() => "recovered")).resolves.toBe("recovered");
+    expect(fs.existsSync(lockPath)).toBe(false);
+    const fences = fs.readdirSync(actorRoot).filter(name => name.startsWith("actors.json.lock.dead."));
+    expect(fences).toHaveLength(1);
+    expect(fs.readFileSync(path.join(actorRoot, fences[0]!, "owner"), "utf8")).toContain("123456\n");
+  });
+
+  it.skipIf(process.platform !== "linux")("reclaims a fresh lock only after proving a different PID incarnation", async () => {
+    const { store, lockPath } = setup();
+    installLock(lockPath, process.pid, Date.now());
+    fs.appendFileSync(path.join(lockPath, "owner"), "0\n");
+    await expect(store.withLock(() => "recovered")).resolves.toBe("recovered");
+  });
+
+  it.each(["EPERM", "EIO", "torn identity", "unreadable incarnation", "malformed owner"])("protects a live or unknown holder with %s", async (failure) => {
+    vi.useFakeTimers();
+    const { store, lockPath } = setup();
+    installLock(lockPath, process.pid, Date.now() - 30_001);
+    if (failure === "EPERM" || failure === "EIO") {
+      vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error(failure), { code: failure }); });
+    } else if (failure === "torn identity") {
+      fs.appendFileSync(path.join(lockPath, "owner"), "0");
+    } else if (failure === "unreadable incarnation") {
+      fs.appendFileSync(path.join(lockPath, "owner"), "0\n");
+      const read = fs.readFileSync.bind(fs);
+      vi.spyOn(fs, "readFileSync").mockImplementation((file, options) => {
+        if (String(file) === `/proc/${process.pid}/stat`) throw Object.assign(new Error("unreadable"), { code: "EIO" });
+        return read(file, options);
+      });
+    } else fs.writeFileSync(path.join(lockPath, "owner"), `holder\n${process.pid}\ninvalid\n0\n`);
+    const operation = vi.fn();
+    const result = expect(store.withLock(operation)).rejects.toThrow("Timed out waiting for the Fabric actor registry lock");
+    await vi.advanceTimersByTimeAsync(5_000);
+    await result;
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
+  it("a paused dead-holder reaper cannot rename over a successor", async () => {
+    vi.useFakeTimers();
+    const { store, lockPath } = setup();
+    installLock(lockPath, 123456, Date.now());
+    const kill = process.kill.bind(process);
+    vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid === 123456) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      return kill(pid, signal);
+    });
+    const rename = fs.renameSync.bind(fs);
+    let fence: string | undefined;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(from) === lockPath && !fence) {
+        fence = String(to);
+        // A faster reaper moved the old identity; a live writer owns the canonical name.
+        rename(from, to);
+        installLock(lockPath, process.pid, Date.now());
+      }
+      rename(from, to); // Must fail: the retained fence is nonempty.
+    });
+    const operation = vi.fn(() => "acquired");
+    const pending = store.withLock(operation);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toContain(`\n${process.pid}\n`);
+    expect(fs.existsSync(fence!)).toBe(true);
+    fs.rmSync(lockPath, { recursive: true });
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(pending).resolves.toBe("acquired");
+    expect(operation).toHaveBeenCalledTimes(1);
   });
 
   it("waits for a live owner without stealing its stale lock", async () => {

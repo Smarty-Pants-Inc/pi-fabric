@@ -405,6 +405,7 @@ render_service_json() {
   "roles": { "importer": [], "mirror": [] },
   "mirror": { "enabled": false },
   "admission": { "targets": [] },
+  "anchorExport": { "directory": "${HOME_DIR}/anchors", "intervalMs": 300000 },
   "statusFile": "${STATUS_DIR}/${ORG}.status.json"
 }
 EOF

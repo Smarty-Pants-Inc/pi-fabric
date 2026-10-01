@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +13,8 @@ import {
 } from "../src/agents/manager.js";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import { readProcessIdentity } from "../src/core/process-identity.js";
+import * as retentionStorage from "../src/storage/retention.js";
+import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import {
   clearOwnedBudgetEnv,
   readBudgetLedgerDetailed,
@@ -119,6 +121,131 @@ afterEach(async () => {
 });
 
 describe("AgentManager", () => {
+  it("F1 tracked retention retries the full failed save before collection, without pinning session or actor runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-save-fault-"));
+    roots.push(root);
+    let sweep: (() => void) | undefined;
+    const interval = globalThis.setInterval;
+    const timer = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+      if (ms === 15 * 60 * 1_000) sweep = callback;
+      return interval(callback, ms, ...args);
+    }) as typeof setInterval);
+    // This probe owns one manager, not the host-global detached temp-directory sweep.
+    const detachedSweep = vi.spyOn(retentionStorage, "claimTempRunSweep").mockReturnValue(false);
+    let unblocked = false;
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    const save = vi.fn((result: AgentRunResult) => {
+      if (result.task !== "LARGE_RESULT") return; // only the public durable task uses this result store
+      const file = path.join(root, `${result.id}.json`);
+      if (!unblocked) fs.mkdirSync(file, { recursive: true });
+      writeJsonAtomic(file, result);
+    });
+    const inheritedRunRoot = process.env.PI_FABRIC_RUN_ROOT;
+    delete process.env.PI_FABRIC_RUN_ROOT; // task-agent nesting must not disable the managed-root timer
+    let manager: AgentManager;
+    try {
+      manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0 }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        retention: { ...DEFAULT_FABRIC_CONFIG.retention, oneShotRunMs: 1_000 }, onSettled: save,
+      });
+    } finally {
+      if (inheritedRunRoot !== undefined) process.env.PI_FABRIC_RUN_ROOT = inheritedRunRoot;
+    }
+    managers.push(manager);
+    try {
+      const result = await manager.run({ task: "LARGE_RESULT", residency: "durable", transport: "process" });
+      const run = manager.runDirectory(result.id)!;
+      roots.push(path.dirname(run));
+      const worker = fs.readFileSync(path.join(run, "status.json"), "utf8");
+      expect(result).toMatchObject({ status: "completed", text: "x".repeat(100_000), value: { output: "x".repeat(100_000) } });
+      const ordinary = await manager.run({ task: "ordinary session", transport: "process" });
+      const ordinaryRun = manager.runDirectory(ordinary.id)!;
+      const actor = await manager.run({ task: "actor activation", residency: "durable", actorId: "actor:fixture", transport: "process" });
+      const actorRun = manager.runDirectory(actor.id)!;
+      expect(sweep).toBeTypeOf("function");
+      // Advance only the manager's clock after real subprocess completion; do not fabricate status.
+      clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
+      const attempts = save.mock.calls.length;
+      sweep!();
+      await vi.waitFor(() => expect(fs.existsSync(ordinaryRun)).toBe(false), { timeout: 2_000 });
+      expect(fs.existsSync(run), "unsaved completion stays tracked").toBe(true);
+      expect(save.mock.calls.length).toBeGreaterThan(attempts);
+      expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/Cannot clean up agent.*Terminal result save failed/);
+      expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
+      expect(result.warnings).toEqual(expect.arrayContaining([expect.stringMatching(/save failed.*retained/i)]));
+      expect(result.warnings!.join(" ")).toContain(`${result.id}.json`);
+      expect(fs.existsSync(actorRun), "retention still leaves activation cleanup to its actor").toBe(true);
+      expect((await manager.wait(result.id)).text).toHaveLength(100_000);
+      // Fix the native obstruction. The next sweep must retry the original, non-UI-truncated result.
+      fs.rmSync(path.join(root, `${result.id}.json`), { recursive: true });
+      unblocked = true;
+      sweep!();
+      await vi.waitFor(() => expect(fs.existsSync(run)).toBe(false), { timeout: 2_000 });
+      const saved = JSON.parse(fs.readFileSync(path.join(root, `${result.id}.json`), "utf8"));
+      expect(saved).toMatchObject({ id: result.id, status: "completed", text: "x".repeat(100_000), value: { output: "x".repeat(100_000) } });
+      expect(saved.warnings).toBeUndefined(); // a failed save must not corrupt the original completion
+      await manager.close();
+      expect(fs.existsSync(actorRun), "ordinary close can still collect a finished actor activation").toBe(false);
+    } finally {
+      clock?.mockRestore();
+      await manager.close(); // keep the host-global sweep disabled even on an assertion failure
+      timer.mockRestore();
+      detachedSweep.mockRestore();
+    }
+  }, 15_000);
+
+  it.each([["cleanup", "durable"], ["close", "session"]] as const)("F1 %s retries a thrown save with the original full completion before collection (%s request)", async (collection, residency) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-save-throw-"));
+    roots.push(root);
+    let blocked = true;
+    const savedPath = path.join(root, "result.json");
+    const save = vi.fn((result: AgentRunResult) => {
+      if (result.task !== "LARGE_RESULT") return;
+      if (blocked) throw new Error(`EIO writing ${savedPath}`);
+      writeJsonAtomic(savedPath, result);
+    });
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"), onSettled: save,
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "LARGE_RESULT", residency, transport: "process" });
+    const run = manager.runDirectory(result.id)!;
+    const worker = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
+    expect(result).toMatchObject({ status: worker.status, text: worker.text, value: worker.value });
+    expect(result.text).toHaveLength(100_000);
+    expect(result.error).toBe(worker.error);
+    expect(result.warnings).toEqual(expect.arrayContaining([expect.stringContaining(savedPath)]));
+    expect(fs.existsSync(savedPath)).toBe(false);
+    if (collection === "cleanup") {
+      await expect(manager.cleanup(result.id)).rejects.toThrow(/EIO writing/);
+      expect(fs.existsSync(run), "throwing callback must veto explicit cleanup").toBe(true);
+    }
+    // Ordinary nonresident manager: no callback and no persistence obligation.
+    const ordinary = new AgentManager(process.cwd(), manager.config, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "ordinary"),
+    });
+    managers.push(ordinary);
+    const session = await ordinary.run({ task: "ordinary session", transport: "process" });
+    const sessionRun = ordinary.runDirectory(session.id)!;
+    await ordinary.cleanup(session.id);
+    expect(fs.existsSync(sessionRun)).toBe(false);
+    // Actor callback returns normally; it must not inherit the unrelated public task's pin.
+    const actor = await manager.run({ task: "actor activation", actorId: "actor:fixture", residency: "durable", transport: "process" });
+    const actorRun = manager.runDirectory(actor.id)!;
+    await manager.cleanup(actor.id);
+    expect(fs.existsSync(actorRun)).toBe(false);
+    blocked = false;
+    if (collection === "cleanup") await manager.cleanup(result.id);
+    else await manager.close();
+    expect(fs.existsSync(run), "successful preservation authorizes collection").toBe(false);
+    const saved = JSON.parse(fs.readFileSync(savedPath, "utf8"));
+    expect(saved).toMatchObject(worker); // manager may add transport metadata, never truncate the completion
+    expect(saved.error).toBe(worker.error);
+    expect(saved.warnings).toBeUndefined();
+    expect(save.mock.calls.filter(([record]) => record.id === result.id).length).toBeGreaterThan(1);
+  }, 15_000);
+
   it("notifies and releases UI subscribers", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1065,6 +1192,32 @@ describe("AgentManager", () => {
       await first?.stop();
     }
   }, 45_000);
+
+  it.skipIf(process.platform === "win32")("R3 close preserves an untracked surviving worker directory and removes tracked terminal runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-orphan-"));
+    roots.push(root);
+    const runRoot = path.join(root, "runs");
+    const untracked = path.join(runRoot, "previous-host-worker");
+    fs.mkdirSync(untracked, { recursive: true });
+    fs.writeFileSync(path.join(untracked, "evidence"), "still in use");
+    const child = spawn("sleep", ["60"], { stdio: "ignore" });
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "complete quickly", transport: "process" });
+      expect(result.status).toBe("completed");
+      const tracked = manager.runDirectory(result.id)!;
+      await manager.close();
+      expect(child.exitCode).toBeNull();
+      expect(fs.existsSync(tracked)).toBe(false);
+      expect(fs.existsSync(untracked)).toBe(true);
+      expect(fs.readFileSync(path.join(untracked, "evidence"), "utf8")).toBe("still in use");
+    } finally { child.kill(); await exited; }
+  }, 30_000);
 
   // review/astra on e170d9e: a marked nested child keeps its completed parent's files too.
   it("keeps a completed parent run whose nested child is marked unresolved", async () => {

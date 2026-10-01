@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { lockFile } from "./file-lock.js";
 import { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { processIdentityState, processStartIdentityState, readProcessStartIdentity, validProcessIdentity, validProcessStartIdentity, type ProcessIdentity } from "../core/process-identity.js";
@@ -100,6 +101,7 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
       caller.processIdentity.kernelId !== currentProcess.kernelId) throw new Error("Successor removal requires the native Main root");
   const selected = await removalRegistry(client, manager, id);
   const actor = selected.actor;
+  let stoppedFence: number | undefined;
   try {
     if (canonical(actor.project) === canonical(caller.project) && selected.manager.owns(actor.id)) {
       return await selected.manager.remove(actor.id);
@@ -177,8 +179,10 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
     };
     const recordedHost = (): (ProcessIdentity & { token: string }) | undefined => {
       const owner = readRecord<ResidentHostOwner>(path.join(dir, "owner.json"));
-      const lock = readRecord<{ pid: number; token: string; processIdentity?: ProcessIdentity }>(path.join(dir, "host.lock"));
-      if (!owner && !lock) return undefined; // a clean host shutdown removed both records
+      const lock = readRecord<{ pid: number; token: string; processIdentity?: ProcessIdentity; released?: boolean }>(path.join(dir, "host.lock"));
+      if (!owner && (!lock || lock.released === true)) return undefined;
+      // A released diagnostic is not proof of death: before accepting removal we
+      // acquire the stable kernel inode below, even when no signal is needed.
       const record = owner ?? lock!;
       if (!validProcessIdentity(record.processIdentity) || record.pid !== record.processIdentity.pid ||
           typeof record.token !== "string" || !record.token || record.pid === process.pid || record.pid === mainIdentity.pid ||
@@ -259,6 +263,13 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
         if (recordedHost()) throw new Error("Resident host ownership changed; no signal sent");
       } catch (error) { undoRetirement(); throw error; }
     }
+    // Diagnostic absence/release is not ownership authority. Hold main's stable
+    // kernel fence through settlement checks and registry cleanup so an active or
+    // concurrent host cannot be mistaken for an inactive diagnostic generation.
+    stoppedFence = await lockFile(path.join(dir, "host.lock"), 0, true);
+    // A legacy clean close may have removed the diagnostics entirely. If flock
+    // created an empty inode, retain an explicit inactive record for later retries.
+    if (fs.fstatSync(stoppedFence).size === 0) fs.writeFileSync(stoppedFence, JSON.stringify({ released: true }));
     assertRootDead();
     assertHostStopped();
     const assertWorkersSettled = (): void => {
@@ -306,5 +317,8 @@ export const removeDeadPredecessor = async (client: ResidencyClient, manager: Ac
       presenceKey: `actors/${predecessor.sessionId}/${actor.id}`,
       assertSafe: () => { assertRootDead(); assertHostStopped(); assertWorkersSettled(); },
     });
-  } finally { await selected.temporary?.close(); }
+  } finally {
+    try { await selected.temporary?.close(); }
+    finally { if (stoppedFence !== undefined) fs.closeSync(stoppedFence); }
+  }
 };

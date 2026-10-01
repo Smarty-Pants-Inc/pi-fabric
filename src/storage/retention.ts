@@ -129,6 +129,15 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
     return true;
   } catch { return false; }
 };
+/** Explicit resident roots have no managed-temp owner. No birth identity is recorded for
+ * their process workers (only status.json's transport/sessionId), so require terminal status,
+ * and still veto live/unknown workers, nested survivors and unresolved markers. */
+export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
+  const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
+  if (record?.transport === "process" && record.sessionId !== undefined &&
+      (typeof record.sessionId !== "string" || !/^\d+$/.test(record.sessionId) || Number(record.sessionId) <= 0)) return false;
+  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired);
+};
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
   try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
   catch { return false; }

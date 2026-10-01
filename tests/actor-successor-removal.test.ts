@@ -21,6 +21,7 @@ import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
+import { lockFile } from "../src/residency/file-lock.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 import { startTime, stopOwned, type Owned } from "./helpers/owned-processes.js";
@@ -441,6 +442,21 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
     } finally { signal.mockRestore(); readSpy.mockRestore(); renameSpy.mockRestore(); }
     expect(startTime(f.host.identity.pid)).toBe(f.host.identity.startTime);
   });
+  it("a released diagnostic never authorizes successor cleanup while the kernel fence is held", async () => {
+    const f = await fixture();
+    await dead(f.host);
+    fs.rmSync(path.join(f.oldDir, "owner.json"));
+    fs.writeFileSync(path.join(f.oldDir, "host.lock"), JSON.stringify({ released: true }));
+    const fd = await lockFile(path.join(f.oldDir, "host.lock"), 0, true);
+    const signal = vi.spyOn(process, "kill");
+    try {
+      await expect(f.remove()).rejects.toThrow("timed out");
+      expect(signal).not.toHaveBeenCalled();
+      expect(new ActorRegistryStore(f.actorRoot).records()[0]?.rootId).toBe(f.oldId);
+      expect(f.mesh.get(`actor-removals/${f.actor.id}`)).toBeUndefined();
+    } finally { signal.mockRestore(); fs.closeSync(fd); }
+    await expect(f.remove()).resolves.toEqual({ removed: true });
+  });
   it("removes after Main rotation, stops the verified host, and records the successor", async () => {
     const f = await fixture();
     await expect(f.remove()).resolves.toEqual({ removed: true });
@@ -478,13 +494,15 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
     }
     expect(startTime(f.realOwner!.pid)).not.toBe(f.realOwner!.processIdentity!.startTime);
     expect(fs.existsSync(path.join(f.oldDir, "retired.json"))).toBe(true);
+    const lockInode = fs.statSync(path.join(f.oldDir, "host.lock")).ino;
     const oldConfig = JSON.parse(fs.readFileSync(path.join(f.oldDir, "config.json"), "utf8")) as ResidentHostConfig;
     const retry = new ResidencyClient({ config: oldConfig, mesh: f.mesh, participants: f.residency.options.participants,
       mainAgent: { id: f.oldId, local: true } as FabricMainAgentTarget, hostPath: path.resolve("dist/residency/launcher.js") });
     if (identity === "missing") delete oldConfig.rootOwner!.processIdentity;
     try {
       await expect(retry.ensureHost()).rejects.toThrow("retired by a successor Main");
-      expect(fs.existsSync(path.join(f.oldDir, "host.lock"))).toBe(false);
+      expect(fs.statSync(path.join(f.oldDir, "host.lock")).ino).toBe(lockInode);
+      expect(JSON.parse(fs.readFileSync(path.join(f.oldDir, "host.lock"), "utf8"))).toMatchObject({ released: true });
     } finally { await retry.close(); }
     expect(new ActorRegistryStore(f.actorRoot).records()).toEqual([]);
   });

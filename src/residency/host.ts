@@ -465,6 +465,7 @@ export class ResidentHost {
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
         token: this.#token,
+        ...(process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ? { launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN } : {}),
         startedAt: now,
         readyAt: now,
         commands: RESIDENT_COMMANDS,

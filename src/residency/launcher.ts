@@ -98,7 +98,11 @@ try {
     detached: false,
     // RPC ends on stdin EOF. Keep it open only while this child owns residency.
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, PI_FABRIC_RESIDENT_CONFIG: configPath },
+    env: { ...process.env, PI_FABRIC_RESIDENT_CONFIG: configPath,
+      // Per-attempt argument, never the shared config another client may rewrite.
+      PI_FABRIC_RESIDENT_LAUNCH_TOKEN: process.argv.includes("--launch-token")
+        ? process.argv[process.argv.indexOf("--launch-token") + 1] ?? "" : "",
+    },
   });
   let seenOwner = false;
   let claimedOwner = false;

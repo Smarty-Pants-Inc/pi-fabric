@@ -218,7 +218,7 @@ describe("spawnDetached", () => {
       await vi.waitFor(() => expect(child.exitCode).toBe(0));
       const ps = vi.spyOn(childProcess, "execFile").mockImplementation(((...args: unknown[]) => {
         const callback = args.at(-1) as (error: null, stdout: string, stderr: string) => void;
-        callback(null, `${handle.pid + 1} ${handle.pid} S\n`, "");
+        callback(null, `${handle.pid + 1} 0 ${handle.pid} S\n`, "");
         return child;
       }) as typeof childProcess.execFile);
       const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
@@ -231,6 +231,53 @@ describe("spawnDetached", () => {
         expect(ps).toHaveBeenCalled();
         expect(kill).not.toHaveBeenCalled();
       } finally { vi.useRealTimers(); ps.mockRestore(); kill.mockRestore(); }
+    });
+  });
+
+  it.skipIf(process.platform !== "linux")("F1 keeps liveness custody of an observed detached execution after its custodian exits", async () => {
+    await withOwnedWorker(`import { spawn } from "node:child_process"; import fs from "node:fs";
+      const child = spawn(process.execPath, ["-e", 'const fs=require("node:fs"); process.on("SIGTERM",()=>{}); fs.writeFileSync("detached-ready","ready"); setInterval(()=>{},1000);'], { detached: true, stdio: "ignore" });
+      fs.writeFileSync("detached.pid", String(child.pid));
+      setInterval(() => { if (fs.existsSync("exit-now")) process.exit(0); }, 20);`, async (handle, root, custodian) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "detached-ready"))).toBe(true));
+      const pid = Number(fs.readFileSync(path.join(root, "detached.pid"), "utf8"));
+      const owned = { pid, started: startTime(pid) };
+      const live = () => same(owned) && !["Z", "X"].includes(fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]!.split(" ")[0]!);
+      try {
+        expect(await handle.isAlive()).toBe(true); // birth anchored before reparenting
+        fs.writeFileSync(path.join(root, "exit-now"), "exit");
+        await vi.waitFor(() => expect(custodian.exitCode).toBe(0));
+        expect(await handle.isAlive(), "dead worker alone must not authorize relaunch").toBe(true);
+        await handle.stop();
+        expect(live()).toBe(false);
+        expect(await handle.isAlive()).toBe(false);
+      } finally {
+        if (live() && same(owned)) process.kill(pid, "SIGKILL");
+        await vi.waitFor(() => expect(live()).toBe(false));
+      }
+    });
+  });
+
+  it.skipIf(process.platform !== "linux")("F1 injected non-Linux detached execution prevents killing its custodian without birth identity", async () => {
+    await withOwnedWorker(`import { spawn } from "node:child_process"; import fs from "node:fs";
+      process.on("SIGTERM", () => {});
+      const child = spawn(process.execPath, ["-e", 'const fs=require("node:fs"); process.on("SIGTERM",()=>{}); fs.writeFileSync("portable-ready","ready"); setInterval(()=>{},1000);'], { detached: true, stdio: "ignore" });
+      fs.writeFileSync("portable.pid", String(child.pid)); setInterval(()=>{},1000);`, async (handle, root, custodian) => {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(root, "portable-ready"))).toBe(true));
+      const pid = Number(fs.readFileSync(path.join(root, "portable.pid"), "utf8"));
+      const owned = { pid, started: startTime(pid) };
+      const platform = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+      const kill = vi.spyOn(process, "kill");
+      try {
+        await expect(handle.stop()).rejects.toThrow(/execution exit unconfirmed/);
+        expect(kill.mock.calls.filter(call => call[1] === "SIGKILL")).toEqual([]);
+        expect(custodian.exitCode).toBeNull();
+        expect(custodian.signalCode).toBeNull();
+      } finally {
+        platform.mockRestore(); kill.mockRestore();
+        if (same(owned)) process.kill(pid, "SIGKILL");
+        custodian.kill("SIGKILL");
+      }
     });
   });
 

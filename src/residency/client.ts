@@ -233,9 +233,10 @@ export class ResidencyClient {
     const existing = this.#liveOwner();
     if (existing) return existing;
     fs.rmSync(this.#errorPath, { force: true });
+    const launchToken = randomUUID();
     const launcher = await spawnDetached(
       this.#hostPath,
-      ["--config", this.#configPath],
+      ["--config", this.#configPath, "--launch-token", launchToken],
       this.options.config.cwd,
     );
     this.#startupLauncher = launcher;
@@ -252,9 +253,10 @@ export class ResidencyClient {
       }
       const owner = this.#liveOwner();
       if (owner) {
-        // Ready ownership transfers to durable residency: client close must not
-        // terminate a successfully started host. Only failed starts remain ours.
-        this.#startupLauncher = undefined;
+        // Only our attempt may transfer custody to durable residency. Another
+        // winner does not prove our losing launcher (or restored work) exited.
+        if (owner.launchToken !== launchToken) await this.#stopStartingLauncher();
+        else this.#startupLauncher = undefined;
         return owner;
       }
       const failure = readJson<{ error?: unknown }>(this.#errorPath);

@@ -13,6 +13,29 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { processStartTime } from "./residency/process-identity.js";
+
+// ProcessTransport's native channel transfers the execution cleanup obligation
+// before spawning. Other transports have no channel and retain normal signals.
+let externalStopRequested = false;
+let externalStop = () => { externalStopRequested = true; };
+let ownedExecutionStarted = false;
+const custodyReady = new Promise<void>((resolve) => {
+  if (!process.send) { resolve(); return; }
+  process.on("message", (message: unknown) => {
+    if (!message || typeof message !== "object" || !("type" in message)) return;
+    if (message.type === "fabric-execution-custody-ack") { process.channel?.unref(); resolve(); }
+    else if (message.type === "fabric-stop") { externalStopRequested = true; externalStop(); }
+  });
+  process.send({ type: "fabric-execution-custody" }, () => undefined);
+});
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+  process.once(signal, () => { externalStopRequested = true; externalStop(); });
+}
+const executionSettled = (): Promise<void> => new Promise(resolve => {
+  if (process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
+  else resolve();
+});
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -213,10 +236,17 @@ const assistantError = (message: Record<string, unknown>): string => {
 const runnerLabel = (runner: string): string =>
   runner === "claude" ? "Claude" : runner === "veda" ? "Veda" : "Pi";
 
+const executionBirths = new WeakMap<ChildProcess, string | undefined>();
 const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
-  if (!child.pid) return;
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === "linux") {
+    const birth = executionBirths.get(child);
+    if (birth === undefined || processStartTime(child.pid) !== birth) return;
+  }
+  // Native Windows ChildProcess retains the OS handle, unlike a recycled PID.
+  if (process.platform === "win32") { child.kill(signal); return; }
   try {
-    process.kill(process.platform === "win32" ? child.pid : -child.pid, signal);
+    process.kill(-child.pid, signal);
   } catch { /* child process group already exited */ }
 };
 
@@ -248,6 +278,7 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
+  await custodyReady;
   const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
@@ -440,6 +471,15 @@ const main = async (): Promise<void> => {
   }
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
+  if (externalStopRequested) {
+    record.status = "stopped"; record.error = "Agent stopped before execution launch";
+    record.finishedAt = Date.now(); record.updatedAt = record.finishedAt;
+    writeRunRecord(options.statusFile, record); terminalWritten = true;
+    await executionSettled();
+    await new Promise<void>(resolve => sessionStream ? sessionStream.end(resolve) : resolve());
+    process.exitCode = 1;
+    return;
+  }
   const child = spawnCli(childBinary, childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
@@ -491,6 +531,12 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  ownedExecutionStarted = true;
+  const executionBirth = child.pid === undefined ? undefined : processStartTime(child.pid);
+  executionBirths.set(child, executionBirth);
+  // Transfer exact execution identity immediately; even an instant custodian
+  // SIGKILL cannot turn a still-running child into permission for replacement.
+  process.send?.({ type: "fabric-execution-started", pid: child.pid, started: executionBirth }, () => undefined);
   let stderr = "";
   let outputBuffer = "";
   // Veda emits a single JSON document on stdout (progress goes to stderr, and
@@ -1401,17 +1447,15 @@ const main = async (): Promise<void> => {
     terminalError = "Agent stopped";
     killChild();
   };
-  process.once("SIGTERM", stop);
-  process.once("SIGINT", stop);
-  process.once("SIGHUP", stop);
+  externalStop = stop;
+  if (externalStopRequested) stop();
 
   const exitCode = await new Promise<number | null>((resolve) => {
     child.once("error", (error) => {
       terminalStatus = "failed";
       terminalError = error.message;
-      resolve(null);
     });
-    child.once("close", (code) => resolve(code));
+    child.once("close", (code) => { void executionSettled().then(() => resolve(code)); });
   });
 
   if (steerTimer) clearInterval(steerTimer);
@@ -1578,8 +1622,9 @@ const main = async (): Promise<void> => {
   process.exitCode = record.status === "completed" ? 0 : 1;
 };
 
-main().catch((error) => {
+main().catch(async (error) => {
   console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
   writeCrashStatus(error);
+  if (!ownedExecutionStarted) await executionSettled();
   process.exit(1);
 });

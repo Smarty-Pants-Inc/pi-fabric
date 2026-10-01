@@ -1,5 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
+import { beforeEach } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -47,6 +49,8 @@ const hostPath = path.resolve("dist/residency/launcher.js");
 const fakeWorker = path.resolve("tests/fixtures/fake-worker.mjs");
 const hasResidentHost = fs.existsSync(hostPath);
 const roots: string[] = [];
+
+beforeEach(() => installInProcessResidentFence());
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));

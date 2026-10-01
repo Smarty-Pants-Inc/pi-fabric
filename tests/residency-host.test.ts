@@ -1,3 +1,5 @@
+import { beforeEach } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +17,8 @@ import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { launchLog, same } from "./helpers/owned-processes.js";
+
+beforeEach(() => installInProcessResidentFence());
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 

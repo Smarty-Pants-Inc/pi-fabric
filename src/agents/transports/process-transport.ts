@@ -18,6 +18,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       request.workerArguments,
       request.cwd,
       request,
+      7_000, // worker owns a separately detached child with a five-second KILL grace
+      true, // optional worker custody handshake + cooperative Windows stop
     );
     return {
       kind: this.kind,

@@ -1197,6 +1197,24 @@ describe("FabricControlPlane", () => {
     }
   });
 
+  it("round-trips held wake reasons through control ACKs and validates malformed reports", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-backoff-")); roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender");
+    const receiver = plane(path.join(root, "mesh"), "host:receiver");
+    const reason = "provider-backoff until 2026-10-01T08:35:16.663Z";
+    const reports = [
+      { triggered: false, reason }, { triggered: true, reason },
+      { reason }, { triggered: false, reason: 123 }, { triggered: false, reason: "x".repeat(201) },
+    ];
+    sender.start(() => ({ accepted: false }));
+    receiver.start(() => ({ accepted: true, ...reports.shift() } as never));
+    for (const expectedReason of [reason, undefined, undefined, undefined, undefined]) {
+      const receipt = await sender.request("host:receiver", "session:main", "followUp", { message: "held" });
+      if (expectedReason) expect(receipt).toMatchObject({ triggered: false, reason: expectedReason });
+      else expect(receipt).not.toHaveProperty("reason");
+    }
+  });
+
   // smarty-dev#1495: a followUp through the owner reports the target Main's queue, so the
   // sender can switch to steer; a malformed count from the owner is dropped, not passed on.
   it("passes the owner's followUp queue depth to the sender, and drops a malformed one", async () => {

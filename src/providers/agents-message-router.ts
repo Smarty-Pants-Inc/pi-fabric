@@ -458,6 +458,7 @@ export class AgentMessageRouter {
         accepted: true,
         messageId: result.messageId,
         ...(typeof result.triggered === "boolean" ? { triggered: result.triggered } : {}),
+        ...(typeof result.reason === "string" ? { reason: result.reason } : {}),
         ...(result.pendingFollowUps === undefined ? {} : { pendingFollowUps: result.pendingFollowUps }),
         ...(result.oldestAgeS === undefined ? {} : { oldestAgeS: result.oldestAgeS }),
         ...(result.stalled ? { stalled: true as const } : {}),

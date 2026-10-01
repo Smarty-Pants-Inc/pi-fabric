@@ -92,6 +92,13 @@ describe("Main followUp drain (unit)", () => {
     const receipt = main.deliverAgent({ from: from("a"), message: "context", delivery: mode === "nextTurn" ? "nextTurn" : "followUp",
       ...(mode === "passive" ? { triggerTurn: false } : {}) });
     expect(receipt.triggered).toBe(false);
+    if (mode === "provider-error") {
+      expect(receipt.reason).toBe("provider-backoff until 2026-09-27T20:01:00.000Z");
+      expect(sent).toHaveLength(0);
+      vi.advanceTimersByTime(60_000);
+      expect(sent[0]!.options.triggerTurn).toBe(true);
+      return;
+    }
     expect(sent).toHaveLength(1);
     if (mode !== "nextTurn") expect(sent[0]!.options.triggerTurn).toBe(false);
   });
@@ -479,7 +486,11 @@ describe("Main followUp drain (unit)", () => {
       emit(event === "session_tree" ? "session_before_tree" : "session_before_compact", { reason: "manual", signal: new AbortController().signal }, ctx);
       emit(event, payload, ctx);
       vi.advanceTimersByTime(25);
-      expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
+      if ("errorMessage" in payload) {
+        expect(sent).toHaveLength(0);
+        vi.advanceTimersByTime(59_975);
+        expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+      } else expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
     }
   });
 
@@ -606,7 +617,11 @@ describe("Main followUp drain (unit)", () => {
       emit("turn_end", { message: { role: "assistant", stopReason: "stop" } }, ctx);
       state.idle = true;
       emit("agent_settled", outcome === undefined ? {} : { outcome }, ctx);
-      expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
+      if (outcome === "error") {
+        expect(sent).toHaveLength(0);
+        vi.advanceTimersByTime(60_000);
+        expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn: true }]);
+      } else expect(sent.map((entry) => entry.options)).toEqual([{ deliverAs: "followUp", triggerTurn }]);
     }
   });
 

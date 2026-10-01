@@ -556,6 +556,7 @@ export class FabricRuntimeState {
       context.cwd,
       identity.kind === "main" ? sessionId : undefined,
       context.mode !== "print" && context.mode !== "json",
+      (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
     );
     this.#mainAgent = mainAgent;
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;

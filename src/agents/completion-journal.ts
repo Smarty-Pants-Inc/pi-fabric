@@ -68,10 +68,29 @@ const read = <T>(file: string): T | undefined => {
 const files = (dir: string): string[] => {
   try { return fs.readdirSync(dir).filter(file => /^[a-f0-9]{64}\.json$/.test(file)); } catch { return []; }
 };
-export const completionConsumed = (meshRoot: string, id: string): boolean => {
-  const receipt = read<{ id?: string }>(receiptPath(meshRoot, id));
-  return receipt?.id === id;
+interface CompletionReceipt { id: string; sessionId: string; consumedAt: number }
+/** Only proven absence authorizes delivery. An unknown replay fence is a storage fault. */
+const readReceipt = (file: string, id?: string): CompletionReceipt | undefined => {
+  let value: CompletionReceipt;
+  try { value = JSON.parse(fs.readFileSync(file, "utf8")) as CompletionReceipt; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      // A dangling receipt symlink exists but cannot be read: ENOENT alone is not absence.
+      try { fs.lstatSync(file); } catch (absence) {
+        if ((absence as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      }
+    }
+    throw new Error(`Completion replay fence is unreadable at ${file}: ${String(error)}`);
+  }
+  if (!value || typeof value.id !== "string" || (id !== undefined && value.id !== id) ||
+    path.basename(file) !== `${key(value.id)}.json` || typeof value.sessionId !== "string" || !value.sessionId ||
+    typeof value.consumedAt !== "number" || !Number.isFinite(value.consumedAt) || value.consumedAt <= 0) {
+    throw new Error(`Completion replay fence is invalid at ${file}; retain the outcome for repair`);
+  }
+  return value;
 };
+export const completionConsumed = (meshRoot: string, id: string): boolean =>
+  readReceipt(receiptPath(meshRoot, id), id) !== undefined;
 export const consumeCompletion = (meshRoot: string, id: string, sessionId: string): void => {
   if (!completionConsumed(meshRoot, id)) {
     writeJsonAtomic(receiptPath(meshRoot, id), { id, sessionId, consumedAt: Date.now() }, { durable: true });
@@ -146,8 +165,7 @@ export const pendingCompletions = (meshRoot: string, projectRoot: string): Compl
   promoteOrphans(meshRoot, projectRoot);
   return files(directory(meshRoot)).flatMap(file => {
     // Completed payloads can be large. Read only their small receipt during idle scans.
-    const receipt = read<{ id?: string }>(path.join(directory(meshRoot), "receipts", file));
-    if (typeof receipt?.id === "string" && `${key(receipt.id)}.json` === file) return [];
+    if (readReceipt(path.join(directory(meshRoot), "receipts", file))) return [];
     const value = read<CompletionEnvelope>(path.join(directory(meshRoot), file));
     if (value?.format !== 1 || !value.recipient || !value.result ||
       typeof value.recipient.rootId !== "string" || typeof value.recipient.sessionId !== "string" ||
@@ -198,11 +216,11 @@ export class CompletionJournal {
     const { completionDelivery: _delivery, ...result } = envelope.result;
     return consumed ? result : pendingCompletionResult(envelope);
   }
-  acknowledge(id: string, localRunOwned = false): boolean {
+  acknowledge(id: string, localRunSettled = false): boolean {
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);
-    // Without an envelope, only the owning manager's result-consumption callback can fence a
+    // Without an envelope, only the settled owning manager's result-consumption callback can fence a
     // failed/delayed journal publication. Observer status/wait cannot forge an early receipt.
-    if (envelope ? !this.#canRead(envelope) : !localRunOwned) return false;
+    if (envelope ? !this.#canRead(envelope) : !localRunSettled) return false;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
     this.#enqueued.delete(id);
     void this.#retireClaim(id).catch(() => undefined);
@@ -211,7 +229,7 @@ export class CompletionJournal {
   async drain(deliver = true): Promise<void> {
     // Receipts are the durable replay fence. Retire crash-left claims even with no pending body.
     for (const claim of this.mesh.listAll(claimPrefix)) {
-      const receipt = read<{ id?: string }>(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
+      const receipt = readReceipt(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
       if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) await this.#retireClaim(receipt.id, claim);
     }
     if (!deliver) return;
@@ -257,7 +275,7 @@ export class CompletionJournal {
   #canRead(envelope: CompletionEnvelope): boolean {
     if (envelope.recipient.rootId === this.recipient.rootId && envelope.recipient.sessionId === this.recipient.sessionId) return true;
     if (!sameRecipientLane(envelope.recipient, this.recipient) || this.recipient.startedAt <= envelope.recipient.startedAt) return false;
-    const receipt = read<{ sessionId?: string }>(receiptPath(this.meshRoot, envelope.result.id));
+    const receipt = readReceipt(receiptPath(this.meshRoot, envelope.result.id), envelope.result.id);
     if (receipt?.sessionId === this.recipient.sessionId) return true;
     const claim = this.mesh.get(claimKey(envelope.result.id), { fresh: true });
     const owner = claim?.value as { rootId?: string; sessionId?: string } | undefined;

@@ -37,7 +37,13 @@ const root = () => {
 const recording = (turnProvenance: unknown = 1) => {
   const entries: any[] = [];
   const queued: any[] = [];
-  const append = (message: any) => entries.push({ type: "custom_message", ...message });
+  const sessionFile = path.join(root(), "session.jsonl");
+  fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "receiver" }) + "\n");
+  const append = (message: any) => {
+    const entry = { type: "custom_message", ...message };
+    entries.push(entry);
+    fs.appendFileSync(sessionFile, JSON.stringify(entry) + "\n");
+  };
   const handlers = new Map<string, Array<(event: any, ctx: ExtensionContext) => unknown>>();
   const fake = {
     hostCapabilities: turnProvenance === null ? undefined : { turnProvenance }, sendMessage: vi.fn((message: any, options: any) => {
@@ -54,7 +60,7 @@ const recording = (turnProvenance: unknown = 1) => {
   };
   const context = { cwd: process.cwd(), hasUI: false, isIdle: () => false, hasPendingMessages: () => false,
     getContextUsage: () => undefined,
-    sessionManager: { getSessionId: () => "receiver", getEntries: () => entries, getBranch: () => entries },
+    sessionManager: { getSessionId: () => "receiver", getSessionFile: () => sessionFile, getEntries: () => entries, getBranch: () => entries },
     ui: { notify: vi.fn(), setStatus: vi.fn() },
   } as unknown as ExtensionContext;
   const emit = async (name: string, event: any = {}) => {

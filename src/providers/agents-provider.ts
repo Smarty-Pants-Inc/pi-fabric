@@ -771,7 +771,7 @@ export class AgentsProvider implements FabricProvider {
         try {
           const result = this.manager.status(id);
           // Model-facing terminal status returns the result; UI polling must not acknowledge it.
-          if (terminalAgentStatuses.has(result.status)) {
+          if (terminalAgentStatuses.has(result.status) && this.manager.isSettled(id)) {
             if (context.deferResultConsumption) context.deferResultConsumption(() => this.manager.markForeground(id), () => this.manager.detachSignal(id));
             else this.manager.markForeground(id);
           }
@@ -781,7 +781,7 @@ export class AgentsProvider implements FabricProvider {
         }
         if (this.residency?.hasAgent(id)) {
           const result = this.residency.statusAgent(id);
-          if (terminalAgentStatuses.has(result.status)) {
+          if (terminalAgentStatuses.has(result.status) && this.residency.completionSettled(id)) {
             if (context.deferResultConsumption) context.deferResultConsumption(() => this.residency!.acknowledgeCompletion(id));
             else this.residency.acknowledgeCompletion(id);
           }

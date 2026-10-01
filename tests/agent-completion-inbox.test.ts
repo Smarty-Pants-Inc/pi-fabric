@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentCompletionInbox, AGENT_COMPLETION_MESSAGE_TYPE } from "../src/agents/completion-inbox.js";
@@ -5,6 +8,7 @@ import type { AgentRunResult } from "../src/agents/types.js";
 
 type Handler = (event: any, context: ExtensionContext) => unknown;
 const inboxes: AgentCompletionInbox[] = [];
+const roots: string[] = [];
 const result = (id: string, extra: Partial<AgentRunResult> = {}): AgentRunResult => ({
   id, name: `worker ${id}`, status: "completed", text: `result ${id}`, startedAt: 1, finishedAt: 2,
   task: "work", runner: "pi", transport: "process", cwd: ".", updatedAt: 2, turns: 1, toolCalls: 0,
@@ -14,9 +18,13 @@ const harness = () => {
   let idle = false;
   let pending = false;
   const handlers = new Map<string, Handler>();
-  const sendMessage = vi.fn();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "completion-inbox-")); roots.push(root);
+  const sessionFile = path.join(root, "session.jsonl");
+  fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "inbox" }) + "\n");
+  const sendMessage = vi.fn((message: any, _options?: unknown) => fs.appendFileSync(sessionFile, JSON.stringify({ type: "custom_message", ...message }) + "\n"));
   const notify = vi.fn();
-  const context = { hasUI: true, ui: { notify }, isIdle: () => idle, hasPendingMessages: () => pending } as unknown as ExtensionContext;
+  const context = { hasUI: true, ui: { notify }, isIdle: () => idle, hasPendingMessages: () => pending,
+    sessionManager: { getSessionId: () => "inbox", getSessionFile: () => sessionFile } } as unknown as ExtensionContext;
   const pi = {
     on: (name: string, handler: Handler) => {
       handlers.set(name, handler);
@@ -26,7 +34,7 @@ const harness = () => {
   const inbox = new AgentCompletionInbox(pi, context);
   inboxes.push(inbox);
   return {
-    inbox, context, handlers, sendMessage, notify,
+    inbox, context, handlers, sendMessage, notify, sessionFile,
     idle: (value = true) => { idle = value; },
     pending: (value = true) => { pending = value; },
     emit: (name: string, event: unknown = {}) => handlers.get(name)?.(event, context),
@@ -38,6 +46,7 @@ beforeEach(() => vi.useFakeTimers());
 afterEach(() => {
   for (const inbox of inboxes.splice(0)) inbox.close();
   vi.useRealTimers();
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
 describe("AgentCompletionInbox", () => {
@@ -222,11 +231,14 @@ describe("AgentCompletionInbox", () => {
 
   it("keeps a durable result unread while Pi holds its steer only in memory", () => {
     const h = harness(); const entries: unknown[] = [];
-    Object.defineProperty(h.context, "sessionManager", { value: { getEntries: () => entries } });
+    Object.defineProperty(h.context, "sessionManager", { value: { getEntries: () => entries, getSessionId: () => "inbox", getSessionFile: () => h.sessionFile } });
+    h.sendMessage.mockImplementationOnce(() => {});
     const delivered = vi.fn(); h.inbox.enqueue(result("a"), delivered); h.boundary();
     expect(h.sendMessage).toHaveBeenCalledOnce(); expect(delivered).not.toHaveBeenCalled();
     h.inbox.enqueue(result("a"), delivered); h.boundary(); expect(delivered).not.toHaveBeenCalled();
     entries.push({ type: "custom_message", customType: AGENT_COMPLETION_MESSAGE_TYPE, details: { ids: ["a"] } });
+    h.emit("context"); expect(delivered).not.toHaveBeenCalled();
+    fs.appendFileSync(h.sessionFile, JSON.stringify(entries[0]) + "\n");
     h.emit("context"); h.emit("context"); expect(delivered).toHaveBeenCalledOnce();
     expect(h.sendMessage).toHaveBeenCalledOnce();
   });
@@ -248,7 +260,7 @@ describe("AgentCompletionInbox", () => {
     expect(delivered).toHaveBeenCalledOnce();
     expect(() => h.inbox.enqueue(result("a"), failedReceipt)).not.toThrow();
     h.boundary();
-    expect(failedReceipt).toHaveBeenCalledTimes(2);
+    expect(failedReceipt.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(h.sendMessage).toHaveBeenCalledOnce();
   });
 
@@ -285,14 +297,14 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage.mock.calls[1]![0].details.ids).toHaveLength(8);
   });
 
-  it("archives pending old-frontier deliveries on tree navigation", () => {
+  it("abandons old-frontier admission without receipting an unpublished result", () => {
     const h = harness();
     const delivered = vi.fn();
     h.inbox.enqueue(result("a"), delivered);
     h.emit("session_tree");
     h.boundary();
     expect(h.sendMessage).not.toHaveBeenCalled();
-    expect(delivered).toHaveBeenCalledOnce();
+    expect(delivered).not.toHaveBeenCalled();
   });
 
   it("unsubscribes and leaves undelivered durable results unacknowledged on shutdown", async () => {

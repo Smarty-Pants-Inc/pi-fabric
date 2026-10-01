@@ -1393,7 +1393,15 @@ export class AgentManager {
     });
   }
 
+  /** A terminal worker status is provisional until its retry supervisor settles the run. */
+  isSettled(id: string): boolean {
+    if (this.#previousRun(id)) return true;
+    const queued = this.#queued.get(id);
+    return queued ? queued.terminal !== undefined : this.#requireRun(id).settled;
+  }
+
   markForeground(id: string): void {
+    if (!this.isSettled(id)) return;
     if (!this.#previousRun(id)) {
       const queued = this.#queued.get(id);
       if (queued) queued.background = false;

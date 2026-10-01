@@ -58,9 +58,11 @@ const harness = (small = false) => {
     name: "main", role: "lane-main", startedAt: 100 };
   const client = (session: string, startedAt: number, extra = {}) => {
     const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
-    const sendMessage = vi.fn();
+    const sessionFile = path.join(root, `${session}-${clients.length}.jsonl`);
+    fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: session }) + "\n");
+    const sendMessage = vi.fn(message => fs.appendFileSync(sessionFile, JSON.stringify({ type: "custom_message", ...message }) + "\n"));
     const context = { hasUI: false, isIdle: () => false, hasPendingMessages: () => false,
-      sessionManager: { getSessionId: () => session } } as unknown as ExtensionContext;
+      sessionManager: { getSessionId: () => session, getSessionFile: () => sessionFile } } as unknown as ExtensionContext;
     const inbox = new AgentCompletionInbox({ on: (name: string, handler: any) => handlers.set(name, handler), sendMessage } as any, context); inboxes.push(inbox);
     const completed = vi.fn((value: AgentRunResult, delivered: () => void) => inbox.enqueue(value, delivered));
     const cfg = { ...config(session, startedAt), ...extra };
@@ -97,6 +99,143 @@ const providerFor = (h: ReturnType<typeof harness>, client: ResidencyClient, man
     status: () => { throw new Error("Unknown Fabric actor"); } } as any, {} as any,
   { local: true, matches: () => false } as any, h.participants, undefined, {} as any, () => false, client, false,
 );
+
+describe("round 3 completion fences", () => {
+  it.each([
+    { mode: "credential startup", scope: "session" }, { mode: "recoverable stop", scope: "session" },
+    { mode: "credential startup", scope: "durable" }, { mode: "recoverable stop", scope: "durable" },
+  ] as const)("F2/provider $scope: $mode status cannot consume an attempt", async ({ mode, scope }) => {
+    const h = harness(); const a = h.client("A", 100);
+    const consumed = vi.fn((id: string) => a.client.acknowledgeCompletion(id, true));
+    const manager = new AgentManager(h.root, { ...DEFAULT_FABRIC_CONFIG.agents, nice: 19, sessionExport: false }, {
+      workerPath: "unused", runRoot: path.join(scope === "durable" ? a.client.options.config.residencyRoot : h.root, "runs"),
+      meshRoot: h.meshRoot, completionRecipient: h.recipient,
+      onSettled: result => {
+        if (scope === "durable") {
+          const file = residentResultPath(a.client.options.config.residencyRoot, result.id);
+          fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(result));
+        }
+        a.client.enqueueCompletion(result);
+      }, onResultConsumed: consumed,
+    }); managers.push(manager);
+    // A separate Main manager forces the real residency-first status path for durable runs.
+    const provider = providerFor(h, a.client, scope === "durable" ? managerFor(h) : manager);
+    let launches = 0; let statusFile = ""; let final: AgentRunResult | undefined;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      launches++;
+      const args = new Map<string, string>();
+      for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
+      statusFile = args.get("--status-file")!;
+      final = { ...h.result, id: request.id, startedAt: Date.now(), updatedAt: Date.now(), text: "FINAL_SUCCESS_R3" };
+      fs.writeFileSync(statusFile, JSON.stringify({ ...final, status: "running", finishedAt: undefined }));
+      return { kind: "process", isAlive: async () => launches > 1, stop: async () => {} };
+    });
+    const handle = await manager.spawn({ task: "retry me", transport: "process", residency: scope, nice: 19 });
+    let metadataFile: string | undefined;
+    if (scope === "durable") {
+      const dir = path.join(a.client.options.config.residencyRoot, "agents"); fs.mkdirSync(dir, { recursive: true });
+      metadataFile = path.join(dir, `${handle.id}.json`);
+      fs.writeFileSync(metadataFile, JSON.stringify({ format: 1, rootId: h.recipient.rootId, id: handle.id,
+        runDirectory: manager.runDirectory(handle.id), handle, createdAt: 1, updatedAt: 2 }));
+    }
+    const attempt = { ...final!, status: mode === "credential startup" ? "failed" as const : "stopped" as const,
+      turns: mode === "credential startup" ? 0 : 2, text: "PROVISIONAL_R3",
+      error: mode === "credential startup" ? "No API key found for openai-codex" : "Agent stopped" };
+    fs.writeFileSync(statusFile, JSON.stringify(attempt)); saveWorkerCompletion(statusFile, attempt);
+    await waitFor(() => manager.status(handle.id).status === attempt.status);
+    expect(await provider.invoke("status", { id: handle.id }, invocation)).toMatchObject({ status: attempt.status });
+    // Also enforce the owning-manager boundary, not just this provider's caller-side guard.
+    manager.markForeground(handle.id);
+    expect(consumed).not.toHaveBeenCalled(); expect(completionConsumed(h.meshRoot, handle.id)).toBe(false);
+    if (metadataFile) expect(JSON.parse(fs.readFileSync(metadataFile, "utf8"))).not.toHaveProperty("completionConsumedAt");
+    await waitFor(() => launches === 2);
+    fs.writeFileSync(statusFile, JSON.stringify(final)); saveWorkerCompletion(statusFile, final!);
+    await manager.join(handle.id);
+    expect(pendingCompletions(h.meshRoot, h.root)).toHaveLength(1);
+    h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
+    await waitFor(() => b.completed.mock.calls.length === 1); b.turn();
+    expect(b.sendMessage.mock.calls[0]![0].content).toContain("FINAL_SUCCESS_R3");
+    expect(completionConsumed(h.meshRoot, handle.id)).toBe(true);
+    await b.client.close(); h.setLive([h.participant("C", 300)]); const c = h.client("C", 300); c.client.start();
+    await new Promise(resolve => setTimeout(resolve, 60)); expect(c.completed).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it.each(["failed", "stopped"] as const)("F2/provider durable: %s status cannot receipt a live supervisor's attempt", async status => {
+    const h = harness(); const a = h.client("A", 100); const cfg = a.client.options.config;
+    const runDirectory = path.join(cfg.residencyRoot, "runs", h.result.id);
+    fs.mkdirSync(runDirectory, { recursive: true }); fs.mkdirSync(path.join(cfg.residencyRoot, "agents"), { recursive: true });
+    const metadataFile = path.join(cfg.residencyRoot, "agents", `${h.result.id}.json`);
+    fs.writeFileSync(metadataFile, JSON.stringify({ format: 1, rootId: cfg.rootId, id: h.result.id, runDirectory,
+      handle: { ...h.result, status: "running", residency: "durable" }, createdAt: 1, updatedAt: 2 }));
+    fs.writeFileSync(path.join(runDirectory, "completion-recipient.json"), JSON.stringify({ meshRoot: h.meshRoot, recipient: h.recipient, supervisor: { pid: process.pid } }));
+    const attempt = { ...h.result, status, text: "PROVISIONAL_R3" };
+    const statusFile = path.join(runDirectory, "status.json"); fs.writeFileSync(statusFile, JSON.stringify(attempt)); saveWorkerCompletion(statusFile, attempt);
+    const provider = providerFor(h, a.client);
+    expect(await provider.invoke("status", { id: h.result.id }, invocation)).toMatchObject({ status });
+    a.client.acknowledgeCompletion(h.result.id);
+    a.client.acknowledgeCompletion(h.result.id, true); // ordinary-owner fallback cannot certify a resident attempt
+    expect(JSON.parse(fs.readFileSync(metadataFile, "utf8"))).not.toHaveProperty("completionConsumedAt");
+    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
+    fs.writeFileSync(statusFile, JSON.stringify(h.result)); a.client.enqueueCompletion(h.result);
+    h.setLive([h.participant("B", 200)]); const b = h.client("B", 200); b.client.start();
+    await waitFor(() => b.completed.mock.calls.length === 1); b.turn();
+    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
+    await b.client.close(); h.setLive([h.participant("C", 300)]); const c = h.client("C", 300); c.client.start();
+    await new Promise(resolve => setTimeout(resolve, 60)); expect(c.completed).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === "win32")("F4: ENOENT through a dangling existing receipt is not proven absence", async () => {
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "B");
+    const dir = path.join(h.meshRoot, "agent-completions", "receipts"); const file = path.join(dir, fs.readdirSync(dir)[0]!);
+    fs.unlinkSync(file); fs.symlinkSync(path.join(h.root, "missing-receipt"), file);
+    h.setLive([h.participant("C", 300)]); const delivered = vi.fn();
+    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:C", sessionId: "C", startedAt: 300 }, h.participants, h.mesh, delivered);
+    await expect(journal.drain()).rejects.toThrow(/replay fence/);
+    expect(() => consumeCompletion(h.meshRoot, h.result.id, "C")).toThrow(/replay fence/);
+    expect(() => journal.result(h.result.id)).toThrow(/replay fence/);
+    expect(fs.lstatSync(file).isSymbolicLink()).toBe(true); expect(delivered).not.toHaveBeenCalled();
+  });
+
+  it("F4/client: a blocked replay stays pending and surfaces a deduplicated storage diagnostic", async () => {
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "B");
+    const dir = path.join(h.meshRoot, "agent-completions", "receipts"); const file = path.join(dir, fs.readdirSync(dir)[0]!);
+    fs.writeFileSync(file, "not a receipt"); const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.setLive([h.participant("C", 300)]); const c = h.client("C", 300); c.client.start();
+    await waitFor(() => warning.mock.calls.length > 0); await new Promise(resolve => setTimeout(resolve, 80));
+    expect(warning).toHaveBeenCalledOnce(); expect(String(warning.mock.calls[0]![0])).toMatch(/remains pending.*replay fence/);
+    expect(c.completed).not.toHaveBeenCalled(); expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+    expect(fs.readFileSync(file, "utf8")).toBe("not a receipt");
+    expect(fs.readdirSync(path.join(h.meshRoot, "agent-completions")).filter(name => name.endsWith(".json"))).toHaveLength(1);
+  });
+
+  it.each(["malformed", "identity mismatch", "unreadable"] as const)("F4: an existing %s fence fails closed repeatedly and is never overwritten", async fault => {
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result); consumeCompletion(h.meshRoot, h.result.id, "B");
+    const dir = path.join(h.meshRoot, "agent-completions", "receipts"); const file = path.join(dir, fs.readdirSync(dir)[0]!);
+    if (fault === "malformed") fs.writeFileSync(file, "{torn");
+    if (fault === "identity mismatch") fs.writeFileSync(file, JSON.stringify({ id: "c".repeat(32), sessionId: "B", consumedAt: 3 }));
+    const original = fs.readFileSync(file, "utf8");
+    if (fault === "unreadable") {
+      const read = fs.readFileSync;
+      vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: any[]) => {
+        if (String(target) === file) throw Object.assign(new Error("receipt inaccessible"), { code: "EACCES" });
+        return (read as any)(target, ...args);
+      }) as typeof fs.readFileSync);
+    }
+    h.setLive([h.participant("C", 300)]); const delivered = vi.fn();
+    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:C", sessionId: "C", startedAt: 300 }, h.participants, h.mesh, delivered);
+    for (let i = 0; i < 3; i++) {
+      await expect(journal.drain()).rejects.toThrow(/replay fence/i);
+      expect(() => consumeCompletion(h.meshRoot, h.result.id, "C")).toThrow(/replay fence/i);
+      expect(() => journal.result(h.result.id)).toThrow(/replay fence/i);
+    }
+    expect(delivered).not.toHaveBeenCalled(); expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+    vi.restoreAllMocks(); expect(fs.readFileSync(file, "utf8")).toBe(original);
+    expect(fs.readdirSync(path.join(h.meshRoot, "agent-completions")).filter(name => name.endsWith(".json"))).toHaveLength(1);
+    // Repairing the consumed fence restores certainty, not replay permission.
+    fs.writeFileSync(file, JSON.stringify({ id: h.result.id, sessionId: "B", consumedAt: 3 }));
+    await journal.drain(); expect(delivered).not.toHaveBeenCalled();
+  });
+});
 
 describe("round 2 completion security", () => {
   it.each(["cwd", "role"] as const)("F1: unrelated %s gets bounded list/status/wait, original live or dead", async lane => {

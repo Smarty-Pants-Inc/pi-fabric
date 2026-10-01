@@ -150,6 +150,7 @@ export class ResidencyClient {
   #deliveryTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
+  #completionFault: string | undefined;
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
   #nextWatchdogAt = 0;
@@ -462,10 +463,19 @@ export class ResidencyClient {
       .flatMap(value => { const result = this.#completions.result(value.result.id); return result ? [result] : []; })];
   }
 
-  /** localRunOwned is supplied only by the owning manager's consumption callback. */
-  acknowledgeCompletion(id: string, localRunOwned = false): void {
-    const journalConsumed = this.#completions.acknowledge(id, localRunOwned);
+  /** Status may be observed during retry backoff; only logical settlement permits consumption. */
+  completionSettled(id: string): boolean {
+    if (!this.hasAgent(id) || this.#attemptMayRetry(id)) return false;
+    const status = this.statusAgent(id);
+    return terminal(status.status) && "startedAt" in status;
+  }
+
+  /** localRunSettled is certified by the owning manager, including a failed journal save. */
+  acknowledgeCompletion(id: string, localRunSettled = false): void {
     const metadata = this.#metadata(id);
+    // The local-manager fallback is for its ordinary runs, never a resident worker attempt.
+    if ((metadata || !localRunSettled) && !this.completionSettled(id)) return;
+    const journalConsumed = this.#completions.acknowledge(id, localRunSettled);
     if (metadata && !metadata.completionConsumedAt) {
       atomicWrite(this.#metadataPath(id), { ...metadata, completionConsumedAt: Date.now() });
     }
@@ -695,7 +705,10 @@ export class ResidencyClient {
     if (committed && "text" in committed) return false;
     const manifest = readJson<{ supervisor?: { pid: number; processStartedAt?: string } }>(
       path.join(metadata.runDirectory, "completion-recipient.json"));
-    return manifest?.supervisor !== undefined && residentProcessAlive(manifest.supervisor.pid, manifest.supervisor.processStartedAt);
+    // Legacy/missing pins do not prove settlement while a resident supervisor still owns work.
+    return manifest?.supervisor !== undefined
+      ? residentProcessAlive(manifest.supervisor.pid, manifest.supervisor.processStartedAt)
+      : this.#liveOwner() !== undefined;
   }
 
   /**
@@ -869,6 +882,11 @@ export class ResidencyClient {
         } catch { /* Retain the durable source for retry; other senders still drain. */ }
       }
       await this.#completions.drain(this.options.config.agents.notifyOnComplete);
+      this.#completionFault = undefined;
+    } catch (error) {
+      const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
+      if (diagnostic !== this.#completionFault) console.warn(diagnostic);
+      this.#completionFault = diagnostic;
     } finally {
       this.#drainingDeliveries = false;
     }

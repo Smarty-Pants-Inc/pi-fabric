@@ -3039,7 +3039,8 @@ return { first, second, tail: "continued" };`,
     const initial = await provider.invoke("status", { id: handle.id }, context) as AgentRunRecord;
     if (initial.status === "running") expect(acknowledge).not.toHaveBeenCalled();
     acknowledge.mockClear();
-    await waitFor(() => agents.status(handle.id).status === "completed");
+    await agents.join(handle.id); // worker status alone can still precede supervisor settlement
+    expect(agents.status(handle.id).status).toBe("completed");
     agents.listForUi();
     expect(acknowledge).not.toHaveBeenCalled();
     await provider.invoke("status", { id: handle.id }, context);

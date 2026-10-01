@@ -579,8 +579,11 @@ describe("durable completion receipts", () => {
     const state = await rootHarness(`rejected-durable-${action}`);
     const seeded = await seedCompletion(state);
     const handlers = new Map<string, (...args: any[]) => unknown>();
-    const sendMessage = vi.fn();
-    const context = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false } as ExtensionContext;
+    const sessionFile = path.join(state.root, "main-session.jsonl");
+    fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: state.config.sessionId }) + "\n");
+    const sendMessage = vi.fn(message => fs.appendFileSync(sessionFile, JSON.stringify({ type: "custom_message", ...message }) + "\n"));
+    const context = { isIdle: () => false, hasPendingMessages: () => false, hasUI: false,
+      sessionManager: { getSessionId: () => state.config.sessionId, getSessionFile: () => sessionFile } } as unknown as ExtensionContext;
     const inbox = new AgentCompletionInbox({ on: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler); }, sendMessage } as any, context);
     const consumed = vi.fn((id: string) => inbox.acknowledge(id));
     const completed = vi.fn((result, delivered) => inbox.enqueue(result, delivered));
@@ -1223,6 +1226,8 @@ describe("durable completion receipts", () => {
     const state = await rootHarness("f1-recovery-completion");
     const seeded = await seedCompletion(state);
     const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8"));
+    // Pin the exited predecessor: a replacement host cannot resume/retry this old run.
+    fs.writeFileSync(path.join(seeded.runDirectory, "completion-recipient.json"), JSON.stringify({ supervisor: { pid: 2147483647 } }));
     // The host died while the spawn handle still said running; only the worker's record advanced.
     fs.writeFileSync(seeded.metadataPath, JSON.stringify({ ...metadata, handle: { ...metadata.handle, status: "running", text: "", residency: "durable" } }));
     await state.mesh.delete({ key: seeded.key });

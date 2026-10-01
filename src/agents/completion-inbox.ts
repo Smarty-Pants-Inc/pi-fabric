@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import { syncPathNamespace } from "../core/atomic-write.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRunResult } from "./types.js";
 import { fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "../fabric-provenance.js";
@@ -25,6 +27,10 @@ export class AgentCompletionInbox {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #suspended = false;
   #closed = false;
+  #receiptSource = "";
+  #receiptOffset = 0;
+  #persistedIds = new Set<string>();
+  #receiptFault: string | undefined;
 
   constructor(readonly pi: ExtensionAPI, context: ExtensionContext) {
     this.#context = context;
@@ -81,10 +87,7 @@ export class AgentCompletionInbox {
     subscribe("session_tree", (_event, ctx) => {
         this.#context = ctx;
         // Navigation abandons this frontier, not the visible run history.
-        for (const { result, delivered } of this.#pending.values()) {
-          this.#acknowledged.add(result.id);
-          this.#confirmDelivery(delivered);
-        }
+        // Navigation is not durable publication. Leave these outcomes unread in the journal.
         this.#pending.clear();
       });
   }
@@ -135,32 +138,83 @@ export class AgentCompletionInbox {
 
   #confirmHeld(): void {
     if (!this.#handed.size) return;
-    const getEntries = this.#context.sessionManager?.getEntries;
-    if (typeof getEntries !== "function") {
-      // Compatibility for hosts without session inspection; modern Pi requires its persisted carrier.
-      for (const delivered of this.#handed.values()) this.#confirmDelivery(delivered);
-      this.#handed.clear();
-      return;
-    }
-    const entries = getEntries.call(this.#context.sessionManager);
-    // A completion carrier is newly appended. Keep this observation bounded even on huge sessions.
-    for (let index = entries.length - 1; index >= Math.max(0, entries.length - 512); index--) {
-      const entry = entries[index];
-      if (entry?.type !== "custom_message" || entry.customType !== AGENT_COMPLETION_MESSAGE_TYPE) continue;
-      const ids = (entry.details as { ids?: unknown } | undefined)?.ids;
-      if (!Array.isArray(ids)) continue;
-      for (const id of ids) {
-        if (typeof id !== "string" || !this.#handed.has(id)) continue;
-        const delivered = this.#handed.get(id);
-        this.#handed.delete(id);
-        this.#confirmDelivery(delivered);
+    try {
+      // Pi inserts entries in memory before I/O, and defers a fresh file until the first
+      // assistant message. Neither getEntries nor an uninspectable host is a durable receipt.
+      const ids = this.#sessionReceipt();
+      for (const [id, delivered] of this.#handed) {
+        if (ids.has(id) && this.#confirmDelivery(delivered)) this.#handed.delete(id);
       }
+      this.#receiptFault = undefined;
+    } catch (error) {
+      const diagnostic = `Fabric completion carrier remains unconfirmed: ${String(error).slice(0, 1000)}`;
+      if (diagnostic !== this.#receiptFault) console.warn(diagnostic);
+      this.#receiptFault = diagnostic;
     }
   }
 
-  #confirmDelivery(delivered: (() => void) | undefined): void {
-    try { delivered?.(); } catch {
-      // The durable envelope remains queued and retries its receipt on the next poll.
+  /** Index only complete JSONL lines after syncing the opened file and its reopenable namespace. */
+  #sessionReceipt(): ReadonlySet<string> {
+    const manager = this.#context.sessionManager;
+    const file = manager?.getSessionFile?.();
+    if (!file) return new Set(); // In-memory sessions cannot consume a durable source.
+    let fd: number;
+    try { fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      this.#receiptSource = "";
+      this.#receiptOffset = 0;
+      this.#persistedIds.clear();
+      return this.#persistedIds;
+    }
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) throw new Error("Session receipt is not a regular file");
+      fs.fsyncSync(fd);
+      syncPathNamespace(file, stat);
+      const sessionId = manager.getSessionId();
+      const source = JSON.stringify([file, stat.dev, stat.ino, sessionId]);
+      if (source !== this.#receiptSource || stat.size < this.#receiptOffset) {
+        this.#receiptSource = source;
+        this.#receiptOffset = 0;
+        this.#persistedIds.clear();
+      }
+      const buffer = Buffer.allocUnsafe(1 << 20);
+      let position = this.#receiptOffset;
+      let lineStart = position;
+      let carry: Buffer[] = [];
+      while (position < stat.size) {
+        const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - position), position);
+        if (count <= 0) throw new Error("Session receipt shortened while reading");
+        const view = buffer.subarray(0, count);
+        let start = 0;
+        for (let newline = view.indexOf(10); newline !== -1; newline = view.indexOf(10, start)) {
+          const line = Buffer.concat([...carry, view.subarray(start, newline)]).toString("utf8");
+          carry = [];
+          if (lineStart === 0) {
+            const header = JSON.parse(line) as { type?: string; id?: string };
+            if (header.type !== "session" || header.id !== sessionId) throw new Error("Session receipt identity mismatch");
+          } else if (line.includes(AGENT_COMPLETION_MESSAGE_TYPE)) {
+            const entry = JSON.parse(line) as { type?: string; customType?: string; details?: { ids?: unknown } };
+            if (entry.type === "custom_message" && entry.customType === AGENT_COMPLETION_MESSAGE_TYPE && Array.isArray(entry.details?.ids)) {
+              for (const id of entry.details.ids) if (typeof id === "string") this.#persistedIds.add(id);
+            }
+          }
+          start = newline + 1;
+          lineStart = position + start;
+          this.#receiptOffset = lineStart;
+        }
+        position += count;
+        if (start < count) carry.push(Buffer.from(view.subarray(start)));
+      }
+      return this.#persistedIds;
+    } finally { fs.closeSync(fd); }
+  }
+
+  #confirmDelivery(delivered: (() => void) | undefined): boolean {
+    try { delivered?.(); return true; } catch {
+      // Keep the callback held: a failed receipt is retried at the next confirmed boundary.
+      return false;
     }
   }
 

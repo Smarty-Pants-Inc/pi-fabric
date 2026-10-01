@@ -421,6 +421,41 @@ describe("participant files", () => {
       });
     }
 
+    it.each(["EPERM", "EBUSY"])("holder release retries transient %s without touching a successor", async (code) => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const key = keyOf("session:a");
+      const lock = lockOf(root, "session:a");
+      const rename = fs.renameSync.bind(fs);
+      const rm = fs.rmSync.bind(fs);
+      const targets: string[] = [];
+      const successor = `${process.pid}\n\nsuccessor\n`;
+      vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+        if (String(source) === lock && String(target).endsWith(".dead")) {
+          targets.push(String(target));
+          if (targets.length <= 2) throw Object.assign(new Error("Windows sharing violation"), { code });
+        }
+        rename(source, target);
+      });
+      vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+        if (String(file).startsWith(`${lock}.`) && String(file).endsWith(".dead")) {
+          // Once detached, the canonical name belongs to a successor. Retries and
+          // recursive cleanup must target only this holder's unique tombstone.
+          fs.mkdirSync(lock);
+          fs.writeFileSync(path.join(lock, "owner"), successor);
+        }
+        rm(file, options);
+      });
+      await expect(participantFiles.writeParticipantFileIf(mesh, key, () => ({
+        key, value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a"),
+      }))).resolves.toBe(true);
+      expect(targets).toHaveLength(3);
+      expect(new Set(targets).size).toBe(1);
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(successor);
+      expect(fs.readdirSync(path.dirname(lock))).toEqual([path.basename(lock)]);
+      expect(readParticipantFiles(root, { maxAgeMs: 0 })[0]).toMatchObject({ key, version: 1 });
+    });
+
     it("holder release cleans its detached lock after success and a failed decision", async () => {
       const root = meshRoot();
       const mesh = new MeshStore(root, 64 * 1024, 1_000);

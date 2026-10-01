@@ -80,8 +80,8 @@ const residencySchema = {
 
 const actorBindingScopeSchema = {
   type: "string",
-  enum: ["session", "project"],
-  description: "session (default) changes only this Pi session; project pins the shared actor default and requires ownership.",
+  enum: ["session", "project", "global"],
+  description: "session (default) changes this root's live session binding or a foreign caller's local overlay; project pins the shared default and requires ownership; global updates a non-live template.",
 };
 
 const actorInvocationProperties = {

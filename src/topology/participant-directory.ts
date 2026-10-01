@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { participantProject, participantRole } from "./project-identity.js";
+import { participantProject, participantRole, repositoryOf } from "./project-identity.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type {
@@ -161,10 +161,11 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
   const kind = participantKind(value.kind);
   if (
     !kind ||
+    (value.interactive !== undefined && typeof value.interactive !== "boolean") ||
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "model", "thinking", "parentId"]) ||
+    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "repository", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -235,6 +236,8 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
     ...(label ? { label } : {}),
     ...(typeof participant.role === "string" ? { role: participant.role } : {}),
     ...(typeof participant.project === "string" ? { project: participant.project } : {}),
+    ...(participant.repository ? { repository: participant.repository } : {}),
+    ...(participant.interactive !== undefined ? { interactive: participant.interactive } : {}),
     kind: "peer",
     // A shutting-down root stays listed as a peer (its steer fails with a clear error).
     status: participant.status === "running" ? "running" : "idle",
@@ -891,8 +894,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo): FabricParticipantRecord {
+  root(main: FabricMainAgentInfo, interactive = true): FabricParticipantRecord {
     const role = participantRole();
+    const project = main.cwd ? participantProject(main.cwd) : undefined;
+    const repository = project ? repositoryOf(project) : undefined;
     return {
       format: 1,
       id: main.id,
@@ -904,8 +909,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
-      capabilities: ["steer", "followUp", "fabric"],
-      ...(main.cwd ? { cwd: main.cwd, project: participantProject(main.cwd) } : {}),
+      capabilities: interactive ? ["steer", "followUp", "fabric"] : ["fabric"],
+      interactive,
+      ...(main.cwd ? { cwd: main.cwd } : {}),
+      ...(project ? { project } : {}),
+      ...(repository ? { repository } : {}),
       ...(role ? { role } : {}),
       ...(main.sessionId ? { sessionId: main.sessionId } : {}),
       ...(main.model ? { model: main.model } : {}),

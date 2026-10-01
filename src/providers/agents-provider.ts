@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { formatAge, residentHostId, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
-import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
+import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
@@ -384,6 +384,7 @@ export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
   readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
+  readonly #projectLeadId: string | undefined;
   readonly name = "agents";
   readonly description =
     "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, tmux, screen, LocalTerm, or Herdr";
@@ -403,6 +404,7 @@ export class AgentsProvider implements FabricProvider {
     /** Current host effort, including child processes where the Main target is remote. */
     readonly callerThinking: () => string | undefined = () => undefined,
   ) {
+    this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
       (binding, runner, context) => this.#resolvePiRunBinding(binding, runner, context),
@@ -867,7 +869,12 @@ export class AgentsProvider implements FabricProvider {
         if (stalled) throw stalled;
         const roots = this.participants.sessions?.() ??
           this.participants.list({ scope: "project", kinds: ["root"] });
-        return resolveProjectAgent(roots, participantProject(context.cwd));
+        const project = participantProject(context.cwd);
+        const repository = repositoryOf(project);
+        return resolveProjectAgent(roots, project, {
+          ...(repository ? { repository } : {}),
+          ...(this.#projectLeadId ? { leadId: this.#projectLeadId } : {}),
+        });
       }
       case "subscribe": {
         const events = Array.isArray(args.events)

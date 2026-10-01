@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, type FabricSchemaMode } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
@@ -90,6 +91,33 @@ afterEach(() => {
 });
 
 describe("Schema transactions", () => {
+  it.each([true, false])("#2479 persists journal and workspace effects before committed/rollback receipt (commit: %s)", async (commit) => {
+    const setup = fixture(), file = path.join(setup.cwd, "a.txt");
+    fs.writeFileSync(file, "alpha\n");
+    const artifacts = await hypothesisAndCertificate(setup, [{ kind: "file_contains", path: "a.txt", literal: "alpha" }]);
+    const events: string[] = [], descriptors = new Map<number, string>();
+    const originalWrite = atomic.writeJsonAtomic, open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs);
+    const writer = vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((target, value, options) => {
+      if (target.includes("schema-transactions")) events.push(`journal:${(value as { status: string }).status}`);
+      originalWrite(target, value, options);
+    });
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => { const fd = open(target, flags, mode); descriptors.set(fd, String(target)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { if (descriptors.get(fd) === file) events.push("effect"); sync(fd); });
+    try {
+      const result = setup.controller.commit({ hypothesisId: artifacts.hypothesisId, certificate: artifacts.certificate,
+        operations: [{ kind: "edit", path: "a.txt", oldText: "alpha", newText: "beta", expectedSha256: sha("alpha\n") }],
+        postconditions: [{ kind: "file_contains", path: "a.txt", literal: commit ? "beta" : "missing" }],
+      }, artifacts.context);
+      if (commit) await expect(result).resolves.toMatchObject({ outcome: "committed" });
+      else await expect(result).resolves.toMatchObject({ outcome: "rolled_back" });
+      const calls = writer.mock.calls.filter(([target]) => target.includes("schema-transactions"));
+      expect(calls.length).toBeGreaterThan(1);
+      for (const [, , options] of calls) expect(options?.durable).toBe(true);
+      expect(events.indexOf("effect")).toBeGreaterThan(events.indexOf("journal:applying"));
+      expect(events.lastIndexOf("effect")).toBeLessThan(events.indexOf(`journal:${commit ? "committed" : "rolled_back"}`));
+      expect(events).toContain("effect");
+    } finally { writer.mockRestore(); opened.mockRestore(); synced.mockRestore(); }
+  });
   it("publishes exact action schemas and rejects model-provided trusted-command fields", async () => {
     const setup = fixture();
     const provider = new SchemaProvider(setup.controller);

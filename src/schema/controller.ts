@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { FabricTraceSafeError } from "../audit/trace.js";
 import { schemaRefAllowedInEnforce } from "./policy.js";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricSchemaConfig, FabricSchemaTrustedCommand } from "../config.js";
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
@@ -59,7 +59,7 @@ const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
 const atomicJsonWrite = (filePath: string, value: unknown): void => {
-  writeJsonAtomic(filePath, value, { newline: true });
+  writeJsonAtomic(filePath, value, { newline: true, durable: true });
 };
 
 
@@ -385,6 +385,8 @@ export class SchemaController {
       }
 
       for (const operation of input.operations) this.#applyOperation(operation);
+      // Before a committed journal/workspace record may survive, persist its effects.
+      for (const operation of input.operations) this.#syncWorkspacePath(operation.path);
       const applied = snapshotWorkspace(this.cwd, [this.mesh.root]);
       this.#assertNoOutsideDrift(baseline, applied, new Set(declared.keys()));
       const postconditionResults = await this.#verifyEvidence(input.postconditions, context);
@@ -742,6 +744,15 @@ export class SchemaController {
     }
   }
 
+  #syncWorkspacePath(file: string): void {
+    const resolved = resolveWorkspaceFile(this.cwd, file, { allowAbsent: true });
+    if (resolved.exists) {
+      const fd = fs.openSync(resolved.absolute, "r");
+      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      syncPathNamespace(resolved.absolute);
+    } else syncPathNamespace(path.dirname(resolved.absolute));
+  }
+
   #restoreBeforeImages(images: BeforeImage[]): string | undefined {
     const errors: string[] = [];
     for (const image of [...images].reverse()) {
@@ -753,6 +764,7 @@ export class SchemaController {
           fs.writeFileSync(resolved.absolute, Buffer.from(image.content ?? "", "base64"));
           if (image.mode !== undefined) fs.chmodSync(resolved.absolute, image.mode);
         }
+        this.#syncWorkspacePath(image.path);
       } catch (error) {
         errors.push(`${image.path}: ${errorMessage(error)}`);
       }

@@ -260,6 +260,7 @@ export class StoreBridgeSide implements BridgeSide {
     const data = { ...checked.data, bridge: { from: this.peer, id: checked.data.bridge.id } };
     const published = await this.store.publish({
       ...checked,
+      durable: true, // The destination must survive before the bridge checkpoints its source.
       from: { ...checked.from, verified: "bridge" },
       // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
       // ownership at commit: a native takeover before it refuses the event (security review
@@ -868,7 +869,7 @@ export class MeshBridge {
 
   #save(): void {
     fs.mkdirSync(path.dirname(this.options.cursorPath), { recursive: true, mode: 0o700 });
-    writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600 });
+    writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600, durable: true });
   }
 
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */

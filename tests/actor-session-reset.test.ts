@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -95,6 +96,25 @@ afterEach(async () => {
 });
 
 describe("actor session rotation safety (smarty-dev#2847)", () => {
+  it("#2479 syncs the archived namespace before publishing a replacement session header", async () => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "archive audit", instructions: "Work.", residency: "durable" });
+    await actors.ask(actor.id, "first");
+    const events: string[] = [], descriptors = new Map<number, string>();
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs);
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { events.push(`sync:${descriptors.get(fd)}`); sync(fd); });
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { events.push(`rename:${to}`); rename(from, to); });
+    const writer = vi.spyOn(atomic, "writeJsonAtomic");
+    try {
+      await actors.resetSession(actor.id);
+      const archive = events.findIndex(event => event.startsWith(`rename:${actor.sessionFile}.`) && event.endsWith(".bak"));
+      const header = events.indexOf(`rename:${actor.sessionFile}`);
+      expect(archive).toBeGreaterThanOrEqual(0);
+      if (process.platform !== "win32") expect(events.slice(archive + 1, header)).toContain(`sync:${path.dirname(actor.sessionFile!)}`);
+      expect(writer.mock.calls.find(([file]) => file === actor.sessionFile)?.[2]?.durable).toBe(true);
+    } finally { opened.mockRestore(); synced.mockRestore(); renamed.mockRestore(); writer.mockRestore(); }
+  });
   it("defers rotation during an in-flight run, preserves its appends, and atomically seeds the next session", async () => {
     const { actors, runs, hold } = setup();
     const actor = await actors.create({ name: "durable", instructions: "Work.", residency: "durable", transport: "process" });

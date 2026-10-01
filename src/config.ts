@@ -5,7 +5,7 @@ import { normalizeJevApprovalModel } from "./jev/model-key.js";
 export type { FabricJevConfig } from "./jev/config.js";
 import os from "node:os";
 import path from "node:path";
-import { renameAtomic } from "./core/atomic-write.js";
+import { renameAtomic, syncPathNamespace } from "./core/atomic-write.js";
 import { quarantineDamagedFile } from "./core/damaged-file.js";
 import { normalizeModelAliases, type FabricModelAliases } from "./core/model-resolution.js";
 import { PI_CORE_TOOL_NAME_SET } from "./core/pi-tools.js";
@@ -1464,17 +1464,9 @@ export const writeJsonAtomic = (
       }
     }
     renameAtomic(temporaryPath, resolvedPath);
-    try {
-      const directoryDescriptor = fs.openSync(directory, "r");
-      try {
-        fs.fsyncSync(directoryDescriptor);
-      } finally {
-        fs.closeSync(directoryDescriptor);
-      }
-    } catch (error) {
-      const code = error instanceof Error && "code" in error ? error.code : undefined;
-      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EISDIR" && code !== "EPERM") throw error;
-    }
+    // Persist newly created ancestors and symlink parents too; POSIX barrier errors
+    // must not be mistaken for an accepted durable configuration update.
+    syncPathNamespace(filePath);
   } catch (error) {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     fs.rmSync(temporaryPath, { force: true });

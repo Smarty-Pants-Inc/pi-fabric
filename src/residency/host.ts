@@ -7,7 +7,7 @@ import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
 import { resolvePiModel, type PiModelRegistryView } from "../core/model-refresh.js";
 import {
@@ -136,8 +136,8 @@ const testResidentRequestDelay = async (stage: "before_commit" | "after_commit")
   if (Number.isInteger(ms) && ms > 0 && ms <= 10_000) await delay(ms);
 };
 
-const atomicWrite = (filePath: string, value: unknown): void => {
-  writeJsonAtomic(filePath, value, { space: 2 });
+const atomicWrite = (filePath: string, value: unknown, durable = true): void => {
+  writeJsonAtomic(filePath, value, { space: 2, durable });
 };
 
 const readJson = <T>(filePath: string): T | undefined => {
@@ -473,7 +473,7 @@ export class ResidentHost {
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
       };
-      atomicWrite(this.#ownerPath, owner);
+      atomicWrite(this.#ownerPath, owner, false); // Live-host identity; never an authority after reboot.
       fs.rmSync(this.#errorPath, { force: true });
       // Removals a previous host accepted: their runs ended with it.
       void this.actors.finishPendingRemovals().finally(() => this.#writeRemovals());
@@ -704,6 +704,8 @@ export class ResidentHost {
         const processing = path.join(this.#processingPath, entry);
         try {
           fs.renameSync(source, processing);
+          syncPathNamespace(processing);
+          syncPathNamespace(path.dirname(source));
         } catch {
           continue;
         }
@@ -927,7 +929,7 @@ export class ResidentHost {
   #writeRemovals(): void {
     const removals = this.actors.pendingRemovals();
     if (removals.length === 0) fs.rmSync(this.#removalsPath, { force: true });
-    else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals });
+    else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals }, false); // Registry is authoritative.
   }
 
   #recoverInterruptedRequests(): void {
@@ -1050,7 +1052,7 @@ export const runResidentHostFromConfigPath = async (
       atomicWrite(path.join(residencyRoot, "error.json"), {
         error: errorMessage(error),
         occurredAt: Date.now(),
-      });
+      }, false);
     } catch {
       // Startup diagnostics are best-effort.
     }

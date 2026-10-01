@@ -3,7 +3,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeFileAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, syncPathNamespace, writeFileAtomic } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
@@ -340,14 +340,14 @@ export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STA
   readState(path.join(root, "state.json"), maxBytes, false);
 };
 
-const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY): void => {
+const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY, durable = false): void => {
   // Compact: the file is rewritten under the mesh lock on every write, and indenting made it 22%
   // larger and slower to serialize (smarty-dev#2004).
   const serialized = JSON.stringify(value);
   if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
     throw new Error(`Fabric mesh state exceeds ${maxBytes} bytes`);
   }
-  writeFileAtomic(filePath, serialized);
+  writeFileAtomic(filePath, serialized, { durable });
 };
 
 // Host invariant for the proved reducer: the persisted clock covers every
@@ -546,6 +546,8 @@ export class MeshStore {
     signal?: AbortSignal | undefined;
     /** Host-only relay metadata. The public provider never forwards args.principal. */
     principal?: FabricPrincipal | undefined;
+    /** Sync a live publication before a dependent external receipt/cursor. */
+    durable?: boolean;
     /** A function receives the commit time, under the lock (smarty-dev#816). */
     data?: unknown;
   }): Promise<MeshEvent> {
@@ -593,6 +595,11 @@ export class MeshStore {
       const pending = archive?.begin({ event, line });
       try {
         fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+        if (input.durable) {
+          const fd = fs.openSync(this.#eventsPath, "r+");
+          try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+          syncPathNamespace(this.#eventsPath);
+        }
       } catch (error) {
         if (pending) archive!.rollback(pending);
         throw error;
@@ -682,6 +689,7 @@ export class MeshStore {
         } finally {
           fs.closeSync(descriptor);
         }
+        syncPathNamespace(this.#eventsPath); // Recovered live names precede the durable BOOT marker.
         atomicWrite(this.#counterPath, Math.max(this.#readSequence(), last.event.sequence));
       }
       archive.recovered(last);
@@ -1176,7 +1184,8 @@ export class MeshStore {
     delete payload.readGeneration;
     const generation = randomUUID();
     const stamped: MeshStateFile = { readGeneration: generation, ...payload };
-    atomicWrite(this.#statePath, stamped, this.#maxStateBytes);
+    // The revision clock must durably cover every issued CAS token, including evicted keys.
+    atomicWrite(this.#statePath, stamped, this.#maxStateBytes, true);
     const stamp = statStamp(this.#statePath);
     if (stamp !== undefined) this.#writeSignal(stamped, stamp, generation);
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
@@ -1680,12 +1689,14 @@ export class MeshStore {
       const temporaryPath =
         this.#eventsPath + "." + process.pid + "." + randomUUID() + ".tmp";
       try {
-        fs.writeFileSync(temporaryPath, retained, { mode: 0o600 });
+        const fd = fs.openSync(temporaryPath, "w", 0o600);
+        try { fs.writeFileSync(fd, retained); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
         fs.renameSync(temporaryPath, this.#eventsPath);
+        syncPathNamespace(this.#eventsPath); // The new log precedes its published generation.
       } finally {
         try { fs.rmSync(temporaryPath, { force: true }); } catch {}
       }
-      atomicWrite(this.#generationPath, this.#readGeneration() + 1);
+      atomicWrite(this.#generationPath, this.#readGeneration() + 1, Number.POSITIVE_INFINITY, true);
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
     } finally {

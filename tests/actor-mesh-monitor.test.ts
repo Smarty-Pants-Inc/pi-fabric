@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -38,6 +39,14 @@ function setup(cursor?: string) {
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
+  it("#2479 durably checkpoints replay progress", async () => {
+    const s = setup();
+    const write = vi.spyOn(atomic, "writeJsonAtomic");
+    s.monitor.start(); await flush(); s.monitor.close();
+    const calls = write.mock.calls.filter(([file]) => file === s.cursorPath);
+    expect(calls.length).toBeGreaterThan(0);
+    for (const [, , options] of calls) expect(options?.durable).toBe(true);
+  });
   it("does not persist a cursor when disabled or never started", () => {
     const disabled = setup();
     disabled.monitor.config.enabled = false;

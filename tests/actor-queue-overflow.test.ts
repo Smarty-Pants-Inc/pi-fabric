@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -68,6 +69,20 @@ const world = (actorQueueLimit: number) => {
 // full queue rejected held the cursor for every actor of the manager: one slow supervisor with a
 // full queue left all of dev-lead's reviewers 29 minutes behind the mesh.
 describe("actor queue overflow", () => {
+  it("#2479 persists activation queues before advancing replay or deleting predecessor work", async () => {
+    const w = world(2), actors = w.manager();
+    const actor = await actors.create({ name: "durable queue", instructions: "Work.", topics: ["team.events"], responseMode: "text", coalesce: false });
+    const write = vi.spyOn(atomic, "writeJsonAtomic");
+    try {
+      await w.mesh.publish({ topic: "team.direct", to: actor.id, from, text: "BLOCK work" });
+      await waitFor(() => actors.status(actor.id).status === "running");
+      await w.mesh.publish({ topic: "team.events", from, text: "ev-1" });
+      await waitFor(() => actors.status(actor.id).queued === 1);
+      const calls = write.mock.calls.filter(([file]) => file.includes("queue"));
+      expect(calls.length).toBeGreaterThan(0);
+      for (const [, , options] of calls) expect(options?.durable).toBe(true);
+    } finally { w.release(); await actors.close(); }
+  }, 15_000);
   it("keeps delivering to other actors while one actor's queue is full during catch-up", async () => {
     const w = world(2);
     const first = w.manager();

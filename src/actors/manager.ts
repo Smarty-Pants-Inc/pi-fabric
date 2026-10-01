@@ -47,7 +47,7 @@ import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, writeJsonAtomic } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 
@@ -994,6 +994,7 @@ export class ActorManager {
       const taken = listBackups().map(order).filter(([other]) => other === stamp).map(([, n]) => n);
       archived = taken.length === 0 ? `${file}.${stamp}.bak` : `${file}.${stamp}-${Math.max(...taken) + 1}.bak`;
       fs.renameSync(file, archived);
+      if (this.#persistent) syncPathNamespace(archived);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       archived = null;
@@ -1050,6 +1051,7 @@ export class ActorManager {
         const stamp = new Date().toISOString().replace(/[-:.]/g, "");
         archived = `${actor.sessionFile}.${stamp}.${randomUUID()}.orphan-noheader.bak`;
         fs.renameSync(actor.sessionFile, archived);
+        if (this.#persistent) syncPathNamespace(archived);
       }
       writeJsonAtomic(actor.sessionFile, {
         type: "session", version: 3, id: randomUUID(),
@@ -3304,7 +3306,7 @@ export class ActorManager {
 
   // Returns whether this lineage's file now holds the actor's work. Only then are the predecessor
   // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
-  #persistQueue(actorId: string, durable = false): boolean {
+  #persistQueue(actorId: string, durable = true): boolean {
     if (!this.#persistent || this.#closing) return false;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
@@ -3315,7 +3317,10 @@ export class ActorManager {
       .filter((item) => !item.resolve && !item.reject);
     const file = this.#ownQueueFile(actor);
     try {
-      if (items.length === 0) fs.rmSync(file, { force: true });
+      if (items.length === 0) {
+        fs.rmSync(file, { force: true });
+        if (fs.existsSync(path.dirname(file))) syncPathNamespace(path.dirname(file));
+      }
       else {
       const records = items.flatMap((item) => {
         try {
@@ -3343,7 +3348,12 @@ export class ActorManager {
     } catch {
       return false;                                         // best-effort; memory still runs the work
     }
-    for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) fs.rmSync(source, { force: true });
+    try {
+      for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) {
+        fs.rmSync(source, { force: true });
+        syncPathNamespace(path.dirname(source)); // Retired predecessor work must not resurrect.
+      }
+    } catch { return false; } // Retain the takeover obligation for a retry.
     this.#takenOver.delete(actorId);
     return true;
   }

@@ -2,15 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import * as atomic from "../src/core/atomic-write.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { spawn } from "node:child_process";
 import { lockFile } from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
-import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { RESIDENT_HOST_FORMAT, residentRoot, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -35,6 +37,32 @@ const fixture = () => {
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
 describe("resident tracked result preservation", () => {
+  it("#2479 requests durable config, requests, metadata, responses, saved results and consumption receipts", async () => {
+    const { root, config } = fixture();
+    config.residencyRoot = residentRoot(config.meshRoot, config.rootId);
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.agents = { ...config.agents, budgetUsd: 0 };
+    config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" };
+    const host = new ResidentHost(config, vi.fn());
+    let client: ResidencyClient | undefined;
+    const write = vi.spyOn(atomic, "writeJsonAtomic");
+    try {
+      await host.start();
+      client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants, mainAgent: { local: false } as FabricMainAgentTarget });
+      await new ResidentActorClient(config.meshRoot, config.rootId).actors(AbortSignal.timeout(5_000));
+      const handle = await client.spawnAgent({ task: "audit", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
+      await host.agents.wait(handle.id, { timeoutMs: 5_000 });
+      await client.waitAgent(handle.id, AbortSignal.timeout(5_000));
+      for (const name of ["config.json", "requests", "agents", "responses", "results"]) {
+        const calls = write.mock.calls.filter(([file]) => file.startsWith(config.residencyRoot) && (name.endsWith(".json") ? file.endsWith(name) : file.includes(`${path.sep}${name}${path.sep}`)));
+        expect(calls.length, name).toBeGreaterThan(0);
+        for (const [, , options] of calls) expect(options?.durable, name).toBe(true);
+      }
+      const receipts = write.mock.calls.filter(([, value]) => typeof value === "object" && value !== null && "completionConsumedAt" in value);
+      expect(receipts.length).toBeGreaterThan(0);
+    } finally { await client?.close(); await host.close(); write.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 15_000);
   it.each(["LARGE_RESULT", "FAIL_DIRECTIVE"])("F1 save failure keeps the worker's %s completion through close and two host/client restarts", async (task) => {
     const { root, config, host: first } = fixture();
     config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");

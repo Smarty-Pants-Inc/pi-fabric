@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { validateToolArguments } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { directiveSchema } from "../src/actors/manager.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
@@ -14,6 +14,7 @@ import replyTool, { REPLY_TOOL } from "../src/worker/reply-tool.js";
 describe("fabric_reply worker hook", () => {
   const roots: string[] = [];
   afterEach(() => {
+    vi.restoreAllMocks();
     delete process.env.PI_FABRIC_REPLY_SCHEMA_FILE;
     delete process.env.PI_FABRIC_REPLY_FILE;
     delete process.env.PI_FABRIC_REPLY_HOOK;
@@ -36,6 +37,19 @@ describe("fabric_reply worker hook", () => {
     } as never);
     return { tool: tools[0]!, count: tools.length, replyFile, handlers };
   };
+
+  it("#2479 persists structured reply before reporting delivery", async () => {
+    const { tool, replyFile } = load();
+    const descriptors = new Map<number, string>(), events: string[] = [];
+    const open = fs.openSync.bind(fs), sync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { const fd = open(file, flags, mode); descriptors.set(fd, String(file)); return fd; });
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { events.push(`sync:${descriptors.get(fd)}`); sync(fd); });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { events.push(`rename:${to}`); rename(from, to); });
+    await tool.execute("durable-reply", { action: "message", message: "Audit." });
+    const published = events.indexOf(`rename:${replyFile}`);
+    expect(events.slice(0, published)).toContain(`sync:${replyFile}.${process.pid}.tmp`);
+    if (process.platform !== "win32") expect(events.slice(published + 1)).toContain(`sync:${path.dirname(replyFile)}`);
+  });
 
   // smarty-dev#1469: Mains and task agents never load this hook with its env, so they get no guard.
   it("adds nothing outside a reply run", () => {

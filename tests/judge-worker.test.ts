@@ -39,13 +39,14 @@ const events = () => {
   return fs.readFileSync(path.join(runs, id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
 };
 describe.skipIf(!fs.existsSync("dist/worker.js"))("built judgment worker isolation", () => {
-  it("has only reply/route hooks, no ambient authority, no full-code and no schema-free text result", async () => {
+  it("has only delivery/reply/route hooks, no ambient authority, no full-code and no schema-free text result", async () => {
     const result = await judge(input(), deps);
     expect(result).toMatchObject({ verdict: "unknown", reasonCode: "invalid_schema" });
     const launch = events().find(e => e.type === "fake_route_launch");
     for (const flag of ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction", "--system-prompt"]) expect(launch.argv).toContain(flag);
     expect(launch.argv[launch.argv.indexOf("--tools") + 1]).toBe("fabric_reply");
-    expect(launch.argv.filter((_: string, i: number) => launch.argv[i - 1] === "-e").map((p: string) => path.basename(p))).toEqual(["reply-tool.js", "model-route-hook.js"]);
+    // Delivery is a host command consuming private worker metadata, not a model tool.
+    expect(launch.argv.filter((_: string, i: number) => launch.argv[i - 1] === "-e").map((p: string) => path.basename(p))).toEqual(["principal-delivery.js", "reply-tool.js", "model-route-hook.js"]);
     expect(launch.header).toContain(`judgment-agent:${result.decisionId}`);
   });
   it("refuses an effort downgrade before sending any task prompt", async () => {

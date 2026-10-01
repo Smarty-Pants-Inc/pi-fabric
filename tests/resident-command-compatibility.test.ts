@@ -129,7 +129,7 @@ describe("rollback-safe resident actor command envelopes", () => {
       fs.mkdirSync(path.join(config.residencyRoot, "requests"), { recursive: true });
       fs.writeFileSync(path.join(config.residencyRoot, "owner.json"), JSON.stringify({
         format: 1, rootId: config.rootId, hostId: residentHostId(config.rootId), pid: process.pid,
-        startedAt: Date.now(), readyAt: Date.now(), commands: RESIDENT_COMMANDS,
+        startedAt: Date.now(), readyAt: Date.now(), commands: RESIDENT_COMMANDS, requestFence: 1,
       }));
       const id = "actor-wire-format";
       const caller = { identity, hostId: identity.id };

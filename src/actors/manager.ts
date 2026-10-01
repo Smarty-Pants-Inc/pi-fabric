@@ -512,7 +512,7 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false }: { asRegistryOwner?: boolean } = {},
+    { asRegistryOwner = false, beforeCommit }: { asRegistryOwner?: boolean; beforeCommit?: (id: string) => void | Promise<void> } = {},
   ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
@@ -532,8 +532,6 @@ export class ActorManager {
     if (sameName && sameName.status !== "stopped") {
       throw new Error(`A Fabric actor named ${name} is already active (${sameName.id})`);
     }
-    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
-    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
     if (!request.instructions.trim()) throw new Error("Actor instructions must not be empty");
     if (Buffer.byteLength(request.instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
@@ -574,6 +572,10 @@ export class ActorManager {
       throw new Error("This Fabric host cannot commit actor capability requirements");
     }
     const id = randomUUID().replaceAll("-", "");
+    // Fence after async validation/model preparation, before even predecessor removal.
+    await beforeCommit?.(id);
+    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
+    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
     const actorDirectory = path.join(this.#actorRoot, id);
     fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     const actor: ManagedActor = {
@@ -726,6 +728,7 @@ export class ActorManager {
     id: string,
     model: string | undefined,
     scope: FabricActorBindingScope = "session",
+    beforeCommit?: (id: string) => void,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -738,11 +741,13 @@ export class ActorManager {
         ? await this.#resolvedModel(actor.runner, next)
         : next
       : undefined;
+    // Fence after model refresh and (for session scope) binding-lock acquisition.
     if (scope === "session") {
-      await this.#bindings.setModel(actor.id, resolved);
+      await this.#bindings.setModel(actor.id, resolved, beforeCommit);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
+    beforeCommit?.(actor.id);
     if (resolved) actor.model = resolved;
     else delete actor.model;
     actor.updatedAt = Date.now();
@@ -758,6 +763,7 @@ export class ActorManager {
     id: string,
     thinking: string | undefined,
     scope: FabricActorBindingScope = "session",
+    beforeCommit?: (id: string) => void,
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -770,11 +776,12 @@ export class ActorManager {
     if (scope === "session") {
       this.#syncActorsFromRegistry();
       const actor = this.#requireActor(id);
-      await this.#bindings.setThinking(actor.id, next);
+      await this.#bindings.setThinking(actor.id, next, beforeCommit);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
     const actor = this.#requireOwnedActor(id);
+    beforeCommit?.(actor.id);
     if (next) actor.thinking = next;
     else delete actor.thinking;
     actor.updatedAt = Date.now();
@@ -789,9 +796,11 @@ export class ActorManager {
    * and a Claude actor with no tools — unless the Pi actor was created with
    * `extensions: false`, in which case an empty list leaves it with no tools.
    */
-  async setTools(id: string, tools: string[]): Promise<FabricActorInfo> {
+  async setTools(id: string, tools: string[], beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
-    actor.tools = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
+    const next = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
+    beforeCommit?.(actor.id);
+    actor.tools = next;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -835,9 +844,10 @@ export class ActorManager {
    * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
    * queued work from the next item on; the filtered count is kept.
    */
-  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null): Promise<FabricActorInfo> {
+  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
+    beforeCommit?.(actor.id);
     if (filter.length > 0) actor.activationFilter = filter;
     else delete actor.activationFilter;
     delete actor.invalidActivationFilter;
@@ -1004,12 +1014,13 @@ export class ActorManager {
    * keeps the instructions it was launched with. Lets a steering user refine an
    * actor's role from the dashboard without recreating it.
    */
-  async setInstructions(id: string, instructions: string): Promise<FabricActorInfo> {
+  async setInstructions(id: string, instructions: string, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     if (!instructions.trim()) throw new Error("Actor instructions must not be empty");
     if (Buffer.byteLength(instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
     }
+    beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
@@ -2599,6 +2610,7 @@ export class ActorManager {
         try {
           this.#mainAgent.deliverAgent({
             from: event.from,
+            ...(event.verification === undefined ? {} : { verification: event.verification }),
             message,
             delivery: kind,
             ...(event.data === undefined ? {} : { data: event.data }),

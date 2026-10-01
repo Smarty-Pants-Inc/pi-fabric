@@ -510,6 +510,7 @@ const main = async (): Promise<void> => {
   let sawAgentError = false;
   let retryPending = false;
   let piSettled = false;
+  let hasFinalText = false;
   let hasFinalResult = false;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
@@ -554,6 +555,9 @@ const main = async (): Promise<void> => {
     // RPC EOF requests disposal, but a stuck extension can prevent process exit.
     closeTimer = setTimeout(() => {
       const error = `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`;
+      // fabric_reply writes after assistant message_end; inspect the durable
+      // reply now too. Post-drain reply/schema validation remains authoritative.
+      hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
       if (piSettled && hasFinalResult && modelControl.ready && !terminalStatus &&
           !terminalError && !sawAgentError && !lostResult) {
         const warning = `${error}; preserving final result and terminating child`;
@@ -1031,6 +1035,7 @@ const main = async (): Promise<void> => {
       emitLifecycle("pi.agent_start");
       retryPending = false;
       piSettled = false;
+      hasFinalText = false;
       hasFinalResult = false;
       // Starting a retry is not proof of recovery: preserve the error and timer
       // until the model actually produces output.
@@ -1114,7 +1119,7 @@ const main = async (): Promise<void> => {
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
       const text = extractText(messageRecord);
-      hasFinalResult = Boolean(text || (replyFile && fs.existsSync(replyFile)));
+      hasFinalText = Boolean(text);
       if (text) {
         record.text = latestRunText(text);
         process.stdout.write(`\n${text}\n`);
@@ -1152,6 +1157,8 @@ const main = async (): Promise<void> => {
       emitLifecycle("pi.agent_settled");
       if (!retryPending) {
         piSettled = true;
+        // Tool-only assistant events precede the tool's durable reply write.
+        hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
         // Pull controls that landed with the final stream events before deciding
         // whether this one-shot child can close. A queued compact keeps stdin
         // open until its correlated response and compaction_end are observed.

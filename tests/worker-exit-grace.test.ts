@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { directiveSchema } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
@@ -14,7 +15,7 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
-const run = async (behavior: string, schema?: Record<string, unknown>) => {
+const run = async (behavior: string, schema?: Record<string, unknown>, replyTool = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-exit-grace-"));
   roots.push(root);
   const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 60_000 }, {
@@ -22,7 +23,7 @@ const run = async (behavior: string, schema?: Record<string, unknown>) => {
   });
   managers.push(manager);
   // The fake child's signal handler reads the durable record in its cwd.
-  const result = await manager.run({ task: behavior, cwd: root, transport: "process", ...(schema ? { schema } : {}) });
+  const result = await manager.run({ task: behavior, cwd: root, transport: "process", ...(schema ? { schema } : {}), ...(replyTool ? { replyTool } : {}) });
   return { manager, result, root };
 };
 const readEvents = (logFile: string) => fs.readFileSync(logFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
@@ -76,6 +77,41 @@ describe("settled Pi exit grace", () => {
     expect(result.status).toBe("failed");
     expect(result.error).toMatch(/^Structured agent output was invalid:/);
     expect(result.text).toBe("durable final result");
+    expect(result.warnings).toHaveLength(1);
+  }, 45_000);
+
+  it.each(["reply-slow-exit", "reply-after-settle"])("preserves a tool-only reply written after assistant consumption for %s", async behavior => {
+    const { result } = await run(behavior, directiveSchema, true);
+    expect(result).toMatchObject({ status: "completed", value: { action: "silent" }, replyVia: "tool", text: "" });
+    expect(result.error).toBeUndefined();
+    expect(result.warnings).toEqual([expect.stringContaining("did not exit after stdin closed for 5000ms")]);
+    const events = readEvents(result.logFile!);
+    expect(events.filter(event => event.type === "fake_assistant_consumed")).toEqual([
+      { type: "fake_assistant_consumed", replyExists: false },
+    ]);
+    expect(events.filter(event => event.type === "worker_warning")).toHaveLength(1);
+    expect(events.some(event => event.type === "fabric_recovery_error")).toBe(false);
+    expect(events.some(event => event.type === "fake_stdin_eof")).toBe(true);
+    const durable = JSON.parse(fs.readFileSync(path.join(path.dirname(result.logFile!), "status.json"), "utf8"));
+    expect(durable).toMatchObject({ status: "completed", value: result.value, warnings: result.warnings });
+    for (const event of events.filter(event => event.type === "fake_child_pid")) expect(isRunning(event.pid)).toBe(false);
+  }, 45_000);
+
+  it("keeps a missing tool-only reply failed after slow exit", async () => {
+    const { result } = await run("reply-missing", directiveSchema, true);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("did not exit after stdin closed");
+    expect(result.value).toBeUndefined();
+    expect(result.warnings ?? []).toEqual([]);
+  }, 45_000);
+
+  it.each([
+    ["reply-invalid", /^Structured agent output was invalid:/],
+    ["reply-malformed", /^Directive reply missing:/],
+  ] as const)("keeps %s failed during post-drain reply validation", async (behavior, error) => {
+    const { result } = await run(behavior, directiveSchema, true);
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(error);
     expect(result.warnings).toHaveLength(1);
   }, 45_000);
 

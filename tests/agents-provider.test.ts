@@ -86,6 +86,39 @@ const visiblePiModels = [
 ];
 
 describe("fleet model policy (#2490)", () => {
+  it.each(["session", "durable"] as const)("review round F1 refuses explicit and default Veda backend selectors before %s submission", async (residency) => {
+    const { provider, agents, root } = setup([], [], undefined, { agentsConfig: { runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", model: "veda/cliproxyapi/gpt-6-astra" } } });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      for (const model of ["veda/cliproxyapi/gpt-6-astra", undefined]) {
+        await expect(provider.invoke("spawn", { task: "review", residency, ...(model ? { model } : {}) }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      }
+      expect(agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(root, "runs"))).toBe(false);
+      if (residency === "session") {
+        const control = await provider.invoke("spawn", { task: "review", runner: "veda", model: "veda/cliproxyapi/gpt-6.1-sol", transport: "process" }, context) as AgentHandleInfo;
+        expect((await agents.wait(control.id)).status).toBe("completed");
+      }
+    } finally { launch.mockRestore(); }
+  });
+  it.each(["spawn", "create"] as const)("review round A3 exposes policy code to the public TypeScript guest for %s", async (action) => {
+    const { provider, agents, actors } = setup([], [], undefined, { agentsConfig: { deniedModels: ["cliproxyapi/gpt-6-astra"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" } });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = agents.config;
+    config.approvals.agent = "allow";
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const service = new FabricExecutionService(registry, config);
+    const args = action === "spawn" ? { task: "Review.", model: "cliproxyapi/gpt-6-astra" } : { name: "refused", instructions: "Review.", model: "cliproxyapi/gpt-6-astra" };
+    const result = await service.execute({ code: `try { await agents.${action}(${JSON.stringify(args)}); return { admitted: true }; } catch (error) { return { name: error.name, code: error.code, message: error.message }; }`,
+      signal: undefined, parentToolCallId: "review-round-guest", context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false } as ExtensionContext, onPartial() {},
+    });
+    expect(result.success).toBe(true);
+    expect(result.value).toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", message: expect.stringContaining("#2236") });
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
+  });
   const policy = { model: "cliproxyapi/gpt-6-astra", thinking: "low" as const, deniedModels: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" };
   it.each(["actor", "agent"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
     const { provider, agents, actors } = setup([], [], undefined, {

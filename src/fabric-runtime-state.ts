@@ -1262,6 +1262,7 @@ export class FabricRuntimeState {
       outerToolResult,
       context,
       (update) => this.activity.updateCall(runId, callId, update),
+      this.#config?.agents,
     );
     const succeeded = result.completed === true || result.continued === true;
     const error = typeof result.error === "string" ? result.error : undefined;

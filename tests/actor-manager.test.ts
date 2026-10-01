@@ -93,6 +93,29 @@ afterEach(async () => {
 });
 
 describe("ActorManager fleet model policy (#2490)", () => {
+  it.each(["session", "project"] as const)("review round A2 refuses %s clear against the owning Pi fallback and preserves both layers", async (scope) => {
+    const denied = "cliproxyapi/gpt-6-astra";
+    const allowed = "cliproxyapi/gpt-6.1-sol";
+    const preparePiModel = vi.fn(async (model: string | undefined) => model ?? denied);
+    const { actors } = setup(false, undefined, undefined, { preparePiModel }, {}, { deniedModels: [denied] });
+    const actor = await actors.create({ name: "fallback", instructions: "Review.", ...(scope === "project" ? { model: allowed } : {}) });
+    if (scope === "session") await actors.setModel(actor.id, allowed, scope);
+    const definition = actors.definition(actor.id);
+    const binding = actors.status(actor.id).binding;
+    await expect(actors.setModel(actor.id, undefined, scope)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(preparePiModel).toHaveBeenCalledWith(undefined);
+    expect(actors.definition(actor.id)).toEqual(definition);
+    expect(actors.status(actor.id).binding).toEqual(binding);
+    expect(actors.status(actor.id).model).toBe(allowed);
+  });
+  it("review round A2 admits a project clear when an allowed session overlay remains", async () => {
+    const { actors } = setup(false, undefined, undefined, { preparePiModel: async () => "cliproxyapi/gpt-6-astra" }, {}, { deniedModels: ["cliproxyapi/gpt-6-astra"] });
+    const actor = await actors.create({ name: "overlay", instructions: "Review.", model: "cliproxyapi/gpt-6.1-sol" });
+    await actors.setModel(actor.id, "provider/session", "session");
+    await actors.setModel(actor.id, undefined, "project");
+    expect(actors.definition(actor.id).model).toBeUndefined();
+    expect(actors.status(actor.id).model).toBe("provider/session");
+  });
   it("refuses denied aliases in a foreign actor's caller-local session setter", async () => {
     let owns = true;
     const { actors } = setup(false, () => owns, undefined, {

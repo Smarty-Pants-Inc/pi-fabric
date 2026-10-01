@@ -492,7 +492,7 @@ export class AgentsProvider implements FabricProvider {
         : this.manager.config.runner);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) return args;
-    this.manager.assertModelAllowed(model);
+    this.manager.assertModelAllowed(model, runner);
     if (runner !== "pi") return args;
     const thinking = isFabricThinking(args.thinking) ? args.thinking
       : aliasThinking(this.modelsConfig().aliases, model);

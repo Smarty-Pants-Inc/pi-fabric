@@ -120,6 +120,31 @@ afterEach(async () => {
 });
 
 describe("AgentManager fleet model admission (#2490)", () => {
+  it.each([
+    ["veda", "veda/cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-astra"],
+    ["claude", "claude/denied-backend", "denied-backend"],
+    ["claude", "anthropic/denied-backend", "denied-backend"],
+  ] as const)("review round F1 denies normalized %s selector %s before queue admission", async (runner, selector, denied) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-policy-runner-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner, deniedModels: [denied], budgetUsd: 0, maxConcurrent: 1,
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, ...(runner === "claude" ? { model: selector } : {}) },
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", ...(runner === "veda" ? { model: selector } : {}) },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root });
+    managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      for (const model of [selector, undefined]) {
+        await expect(manager.spawn({ task: "HANG", ...(model ? { model } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      }
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+      const allowed = await manager.run({ task: "allowed control", model: runner === "veda" ? "veda/cliproxyapi/gpt-6.1-sol" : "claude/allowed-backend", transport: "process" });
+      expect(allowed.status).toBe("completed");
+      expect(launch).toHaveBeenCalledTimes(1);
+    } finally { launch.mockRestore(); }
+  });
   it.each(["explicit", "default", "resolved"])("refuses a denied %s before creating a child", async (source) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-policy-"));
     roots.push(root);

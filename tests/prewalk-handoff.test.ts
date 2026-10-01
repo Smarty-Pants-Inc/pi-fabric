@@ -546,6 +546,21 @@ describe("persisted in-place Prewalk recovery", () => {
 });
 
 describe("outer-boundary Prewalk", () => {
+  it.each(["raw", "canonical"] as const)("review round A1 refuses %s in-place executor without switching Main or continuing", async (selection) => {
+    const controller = new PrewalkController();
+    const selector = selection === "raw" ? "cliproxyapi/gpt-6-astra" : "provider/alias";
+    controller.arm({ model: selector, sessionId: "session-1", task: "Implement the guard" });
+    const pending = claimHandoff(controller, execution(), "session-1", "json")!;
+    const ctx = context();
+    ctx.value.modelRegistry = { find: () => ({ provider: "cliproxyapi", id: "gpt-6-astra" }) } as unknown as ExtensionContext["modelRegistry"];
+    const ext = extension();
+    const result = await runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, pending, outerResult(), ctx.value, undefined, { deniedModels: ["cliproxyapi/gpt-6-astra"] });
+    expect(result).toMatchObject({ status: "failed", continued: false, error: expect.stringContaining("#2236") });
+    expect(ext.setModel).not.toHaveBeenCalled();
+    expect(ctx.value.model).toBe(ctx.sourceModel);
+    expect(ext.sendMessage).not.toHaveBeenCalled();
+    expect(controller.borrowedReturn()).toBeUndefined();
+  });
   it("switches Main in place and queues a hidden follow-up by default", async () => {
     const controller = new PrewalkController();
     controller.arm({

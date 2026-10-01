@@ -747,8 +747,9 @@ export class ActorManager {
     this.agents.assertModelAllowed(resolved);
     if (!resolved) {
       const fallback = scope === "session" ? actor.model ?? this.agents.defaultModel(actor.runner)
-        : this.agents.defaultModel(actor.runner);
+        : this.#bindings.get(actor.id)?.model ?? this.agents.defaultModel(actor.runner);
       if (fallback) await this.#resolvedModel(actor.runner, fallback);
+      else await this.agents.prepareModelForAdmission(undefined, actor.runner);
     }
     // Fence after model refresh and (for session scope) binding-lock acquisition.
     if (scope === "session") {
@@ -3436,9 +3437,9 @@ export class ActorManager {
   }
 
   #resolvedModel(runner: FabricAgentRunner, model: string): string | Promise<string> {
-    this.agents.assertModelAllowed(model);
+    this.agents.assertModelAllowed(model, runner);
     const resolved = runner === "pi" && this.#resolvePiModel ? this.#resolvePiModel(model) : model;
-    const admit = (key: string): string => { this.agents.assertModelAllowed(key); return key; };
+    const admit = (key: string): string => { this.agents.assertModelAllowed(key, runner); return key; };
     return resolved instanceof Promise ? resolved.then(admit) : admit(resolved);
   }
 

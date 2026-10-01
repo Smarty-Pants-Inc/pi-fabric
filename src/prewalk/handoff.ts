@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { assertFabricModelAllowed, type FabricModelPolicy } from "../core/model-policy.js";
 import { fabricHostIdentity, sendFabricMessage } from "../fabric-provenance.js";
 import type {
   ExtensionAPI,
@@ -256,10 +257,13 @@ const runInPlacePrewalk = async (
   extension: ExtensionAPI,
   pending: PendingFabricHandoff,
   context: ExtensionContext,
+  policy?: FabricModelPolicy,
 ): Promise<Record<string, unknown>> => {
   const modelKey = String(pending.args.model ?? "");
+  assertFabricModelAllowed(modelKey, policy);
   context.ui.setStatus("fabric-prewalk", `switching Main → ${modelKey}`);
   const model = modelForKey(modelKey, context);
+  assertFabricModelAllowed(`${model.provider}/${model.id}`, policy);
   // Snapshot the pre-switch reasoning channel and branch. In-place handoff
   // cannot rewrite Pi's ground-truth log, so foreign thinking stays
   // unreplayable for the new model; bridge continuity with the bounded digest.
@@ -388,6 +392,7 @@ export const runFabricHandoffAtBoundary = async (
   outerToolResult: AgentToolResultMessage,
   context: ExtensionContext,
   activity?: (update: FabricInvocationActivityUpdate) => void,
+  policy?: FabricModelPolicy,
 ): Promise<Record<string, unknown>> => {
   const model = String(pending.args.model ?? "");
   const inPlace = pending.kind === "prewalk-in-place";
@@ -397,7 +402,7 @@ export const runFabricHandoffAtBoundary = async (
   );
   try {
     if (inPlace) {
-      const result = await runInPlacePrewalk(controller, extension, pending, context);
+      const result = await runInPlacePrewalk(controller, extension, pending, context, policy);
       pending.audit.success = true;
       pending.audit.result = result;
       pending.audit.endedAt = Date.now();

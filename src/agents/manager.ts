@@ -722,8 +722,19 @@ export class AgentManager {
       : runner === "veda" ? this.config.veda.model : this.config.model;
   }
 
-  assertModelAllowed(model: string | undefined): void {
+  assertModelAllowed(model: string | undefined, runner?: FabricAgentRunner): void {
     assertFabricModelAllowed(model, this.config);
+    // Admit the exact backend selector sent by each runner's argv builder too.
+    if (model && runner === "claude") assertFabricModelAllowed(normalizeClaudeModel(model), this.config);
+    if (model && runner === "veda") assertFabricModelAllowed(normalizeVedaModel(model), this.config);
+  }
+
+  /** Resolve the actual Pi/session fallback without committing a run or binding. */
+  async prepareModelForAdmission(model: string | undefined, runner: FabricAgentRunner): Promise<string | undefined> {
+    this.assertModelAllowed(model, runner);
+    const prepared = runner === "pi" ? await this.#prepareModel(model) : model;
+    this.assertModelAllowed(prepared, runner);
+    return prepared;
   }
 
   async #prepareModel(model: string | undefined): Promise<string | undefined> {
@@ -879,9 +890,7 @@ export class AgentManager {
     if (runner === "claude") mapClaudeTools(tools);
     if (runner === "veda") mapVedaTools(tools);
     let model = request.model?.trim() || this.defaultModel(runner);
-    this.assertModelAllowed(model);
-    if (runner === "claude" && model) normalizeClaudeModel(model);
-    if (runner === "veda" && model) normalizeVedaModel(model);
+    this.assertModelAllowed(model, runner);
     if (this.#budget) {
       const spent = readBudgetLedger(this.#budget.file).cost;
       if (spent >= this.#budget.budget) {
@@ -907,8 +916,7 @@ export class AgentManager {
     };
     const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
       try {
-        if (runner === "pi") model = await this.#prepareModel(model);
-        this.assertModelAllowed(model);
+        model = await this.prepareModelForAdmission(model, runner);
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();

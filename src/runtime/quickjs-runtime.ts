@@ -4,6 +4,7 @@ import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
+import { FabricModelDeniedError } from "../core/model-policy.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
 import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
@@ -1079,6 +1080,13 @@ export class QuickJsRuntime {
                   } finally {
                     nameHandle.dispose();
                   }
+                }
+                // Only this fixed host policy classification crosses the bridge;
+                // do not serialize arbitrary Error properties into the guest.
+                if (error instanceof FabricModelDeniedError) {
+                  const codeHandle = context.newString("FABRIC_MODEL_DENIED");
+                  try { context.setProp(errorHandle, "code", codeHandle); }
+                  finally { codeHandle.dispose(); }
                 }
                 const exit = reference === "pi.bash" || reference === "pi.powershell"
                   ? piBashExitMetadata(error)

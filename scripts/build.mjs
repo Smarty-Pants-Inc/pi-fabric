@@ -37,6 +37,7 @@ const lazyEntryPoints = [
   "src/lifecycle/reload-target-profile.ts",
   "src/coordination/unverified-ids.ts",
   "src/core/provider-operations.ts",
+  "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",

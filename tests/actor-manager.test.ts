@@ -1736,6 +1736,7 @@ describe("ActorManager", () => {
       expect.any(AbortSignal),
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function), // durable activation-lineage downgrade fence
     );
   });
 

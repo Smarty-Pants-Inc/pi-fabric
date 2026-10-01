@@ -248,6 +248,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   task: string;
   /** Conservative activation lineage: foreign/UNKNOWN admitted input clears it forever. */
   outputPrincipal: FabricPrincipal | undefined;
+  /** Host-only activation persistence fence, invoked before conflicting input is admitted. */
+  onOutputPrincipalDowngrade: (() => void) | undefined;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
   recursive: boolean;
@@ -796,9 +798,9 @@ export class AgentManager {
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal, authorize, beforeCommit);
+    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade);
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -819,7 +821,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -1130,6 +1132,7 @@ export class AgentManager {
           name,
           task: request.task,
           outputPrincipal: copyFabricPrincipal(request.provenance?.principal),
+          onOutputPrincipalDowngrade,
           runner,
           ...(kernel ? { kernel } : {}),
           recursive,
@@ -1288,8 +1291,9 @@ export class AgentManager {
     signal?: AbortSignal,
     onSpawned?: (handle: AgentHandleInfo) => void,
     authorize?: () => boolean,
+    onOutputPrincipalDowngrade?: () => void,
   ): Promise<AgentRunResult> {
-    const handle = await this.spawn(request, signal, authorize);
+    const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade);
     onSpawned?.(handle);
     return this.wait(handle.id);
   }
@@ -1717,13 +1721,16 @@ export class AgentManager {
     const steerFile = path.join(managed.runDirectory, "steer.jsonl");
     const messageId = randomUUID();
     const line = JSON.stringify({ ...entry, id: messageId, ts: Date.now() }) + "\n";
-    fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
     if (entry.type === "steer" || entry.type === "follow_up") {
       const incoming = copyFabricPrincipal(entry.provenance?.principal);
       if (!incoming || incoming.id !== managed.outputPrincipal?.id || incoming.binding !== managed.outputPrincipal?.binding) {
         managed.outputPrincipal = undefined;
+        // A failed fence rejects ingress. Retry it even after an in-memory downgrade:
+        // an earlier persistence failure must not let the next input bypass the fence.
+        managed.onOutputPrincipalDowngrade?.();
       }
     }
+    fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
     return { queued: true, messageId };
   }
 

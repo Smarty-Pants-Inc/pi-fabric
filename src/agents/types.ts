@@ -1,3 +1,4 @@
+import type { FabricTurnProvenance } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
   SessionEntry,
@@ -48,6 +49,8 @@ export interface AgentSpawner {
 }
 
 export interface AgentRunRequest {
+  /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
+  provenance?: FabricTurnProvenance | undefined;
   task: string;
   images?: ImageContent[];
   name?: string;
@@ -347,6 +350,7 @@ export interface FabricAgentLog {
 export type FabricSteeringMode = "all" | "one-at-a-time";
 
 export interface AgentSteerEntry {
+  provenance?: FabricTurnProvenance | undefined;
   type: "steer" | "follow_up" | "set_steering_mode" | "set_follow_up_mode" | "compact";
   id: string;
   message?: string;

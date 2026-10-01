@@ -17,6 +17,10 @@ const reviewed = [
   '{"type":"tool_execution_end","toolCallId":"reused","toolName":"bash","result":{"content":[{"type":"text","text":"new result"}],"details":{"exitCode":0},"terminate":true},"isError":false}',
   '{"type":"message_end","message":{"role":"toolResult","toolCallId":"reused","toolName":"bash","content":[{"type":"text","text":"new result"}],"details":{"exitCode":0},"isError":false,"timestamp":2}}',
 ];
+// Preserve the reviewed bytes above; large variants must still exercise the
+// canonical ambiguity guards rather than only the small-result exemption.
+const largeResult = "new result" + "x".repeat(8192);
+const largeReviewed = reviewed.map((line) => line.replaceAll("new result", largeResult));
 const lines = (text: string): Array<Record<string, unknown>> => text.trimEnd().split("\n").map((line) => JSON.parse(line));
 const transcript = (text: string) => {
   const accumulator = new TranscriptAccumulator();
@@ -54,10 +58,10 @@ const expectCompacted = (text: string, entries: number) => {
   const after = fs.readFileSync(file, "utf8");
   expect(lines(after).find((event) => event.type === "tool_execution_end")).toMatchObject({ result: { elided: true }, resultMetadata: { terminate: true } });
   // Only the execution-end line changes; original canonical byte/key order stays.
-  expect(after.trimEnd().split("\n").at(-1)).toBe(reviewed[2]);
+  expect(after.trimEnd().split("\n").at(-1)).toBe(largeReviewed[2]);
   expect(transcript(after)).toEqual(transcript(text));
   expect(transcript(after)).toHaveLength(entries);
-  expect(transcript(after).at(-1)).toMatchObject({ kind: "tool", status: "completed", result: { content: [{ type: "text", text: "new result" }], details: { exitCode: 0 }, terminate: true } });
+  expect(transcript(after).at(-1)).toMatchObject({ kind: "tool", status: "completed", result: { content: [{ type: "text", text: largeResult }], details: { exitCode: 0 }, terminate: true } });
 };
 
 describe("terminal run log mixed-format completion reuse", () => {
@@ -69,38 +73,42 @@ describe("terminal run log mixed-format completion reuse", () => {
     expect(JSON.stringify(entries[0]?.result)).toContain("prior result");
     expect(entries[1]).toMatchObject({ kind: "tool", status: "completed", result: { content: [{ type: "text", text: "new result" }], details: { exitCode: 0 }, terminate: true } });
     expectRetained(text);
+    expectRetained([line, ...largeReviewed.slice(1)].join("\n") + "\n");
   });
 
   it.each(completions)("conservatively retains same-ID completion after the canonical ($name)", ({ line }) => {
     expectRetained([...reviewed.slice(1), line].join("\n") + "\n");
+    expectRetained([...largeReviewed.slice(1), line].join("\n") + "\n");
   });
 
   it("still compacts the unique missing-start pair when only the prior completion is deleted", () => {
-    expectCompacted(reviewed.slice(1).join("\n") + "\n", 1);
+    expectCompacted(largeReviewed.slice(1).join("\n") + "\n", 1);
   });
 
   it("still compacts an ordinary unique start/end/canonical lifecycle", () => {
     const start = JSON.stringify({ type: "tool_execution_start", toolCallId: "reused", toolName: "bash", args: {} });
-    expectCompacted([start, ...reviewed.slice(1)].join("\n") + "\n", 1);
+    expectCompacted([start, ...largeReviewed.slice(1)].join("\n") + "\n", 1);
   });
 
   it.each(completions)("does not disqualify a unique pair for an unrelated ID ($name)", ({ line }) => {
-    expectCompacted([line.replaceAll("reused", "unrelated"), ...reviewed.slice(1)].join("\n") + "\n", 2);
+    expectCompacted([line.replaceAll("reused", "unrelated"), ...largeReviewed.slice(1)].join("\n") + "\n", 2);
   });
 
   it("does not treat a legacy completion alone as a canonical substitute", () => {
     expectRetained([reviewed[1], reviewed[2]!.replace('"message_end"', '"message"')].join("\n") + "\n");
+    expectRetained([largeReviewed[1], largeReviewed[2]!.replace('"message_end"', '"message"')].join("\n") + "\n");
   });
 
   it("does not treat a Claude completion alone as a canonical substitute", () => {
     expectRetained([reviewed[1], completions[1]!.line].join("\n") + "\n");
+    expectRetained([largeReviewed[1], completions[1]!.line].join("\n") + "\n");
   });
 
   it("keeps two scans plus disjoint canonical rereads with unrelated Claude completions", () => {
     const count = 32;
     const text = Array.from({ length: count }, (_, index) => {
       const toolCallId = `unique-${index}`;
-      const content = [{ type: "text", text: "x".repeat(2048) }];
+      const content = [{ type: "text", text: "x".repeat(8192) }];
       return [
         { type: "user", message: { content: [{ type: "tool_result", tool_use_id: `unrelated-${index}`, content: "prior" }] } },
         { type: "tool_execution_start", toolCallId, toolName: "bash", args: {} },
@@ -150,9 +158,9 @@ describe("terminal run log mixed-format completion reuse", () => {
   });
 
   it("retains a unique pair whose canonical details have different key order", () => {
-    const end = JSON.parse(reviewed[1]!);
+    const end = JSON.parse(largeReviewed[1]!);
     end.result.details = { exitCode: 0, signal: null };
-    const canonical = JSON.parse(reviewed[2]!);
+    const canonical = JSON.parse(largeReviewed[2]!);
     canonical.message.details = { signal: null, exitCode: 0 };
     expectRetained([end, canonical].map((event) => JSON.stringify(event)).join("\n") + "\n");
   });

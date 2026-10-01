@@ -15,8 +15,19 @@ const round5IntentionalState = new Set<string>([
   "pids=(4242); pids+=($(cat .local/server.pid)); kill \"${pids[@]}\"",
   "PID=$!; pids=(4242); pids+=(\"$PID\"); kill \"${pids[@]}\""
 ]);
+// R9 owner grammar allowlist: exact old allowances intentionally become STATE.
+// Their original IDs/command bytes stay unchanged; no unsafe R becomes A.
+const round9IntentionalState = new Set<string>([
+  'env -S "kill 4242"',
+  'env -S "kill $(cat run.pid)"',
+  "env -iS 'kill 4242'",
+  'xargs -a run.pids sh -c \'kill "$@"\' _',
+  'cat run.pids | xargs sh -c \'kill "$@"\' _',
+  'command -v pkill',
+  'set -- 4242 4243; kill "$@"',
+]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
-  const intentional = round5IntentionalState.has(command);
+  const intentional = round5IntentionalState.has(command) || round9IntentionalState.has(command);
   const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
   if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);
   if (intentional || (originallyRefused && result.shellState === true)) {

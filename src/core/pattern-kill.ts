@@ -64,7 +64,8 @@ function readBalanced(text: string, index: number, open: string, close: string, 
     if (open !== close && c === open) depth += 1;
     index += 1;
   }
-  return index;
+  // End-of-source is not a proved closing substitution/group delimiter.
+  throw new ShellStateRefused();
   } finally { budget.leaveReader(); }
 }
 
@@ -104,11 +105,15 @@ function readDouble(text: string, index: number, word: Expansion, budget: GuardB
     while (end < text.length && !/["\\`]/.test(text[end]!) && !(text[end] === "$" && ["(", "["].includes(text[end + 1] ?? ""))) { budget.spend(); end += 1; }
     budget.spend(end - index + 1);
     const fragment = text.slice(index, end);
+    // Aggregate argv boundaries are not scalar bytes. Inspect only live quoted
+    // lexer runs: escaped dollars were consumed above, and single quotes are DATA.
+    checkParameterSyntax(fragment, budget);
     if (fragment.includes("$")) word.dynamic = true;
     word.text = (word.text ?? "") + fragment;
     index = end;
   }
   budget.spend();
+  if (text[index] !== "\"") throw new ShellStateRefused();
   return index + 1;
   } finally { budget.leaveReader(); }
 }
@@ -162,9 +167,32 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
   let fd = 0;
   let both = false;
   let write = false;
+  // A lexical projection only: quoted/escaped brace punctuation is inert, and
+  // expanded values never enter it. No brace expansion or generated argv interpreter.
+  let braceSyntax = "";
   const endWord = (): void => {
+    if (target && !word) throw new ShellStateRefused();
+    budget.spend(4 * braceSyntax.length + 1);
+    const braces: boolean[] = [];
+    const syntax = braceSyntax.replace(REFERENCE, "");
+    for (let at = 0; at < syntax.length; at += 1) {
+      budget.spend();
+      const char = syntax[at];
+      if (char === "{") braces.push(false);
+      else if (char === "}" && braces.length) {
+        if (braces.pop()) throw new ShellStateRefused();
+      } else if (braces.length && (char === "," || (char === "." && syntax[at + 1] === "."))) braces[braces.length - 1] = true;
+    }
+    if (word && target) {
+      // Admit only ordinary file targets and plain descriptor duplication. These
+      // are the ORIGINAL lexer patterns, never expanded executable/target text.
+      budget.spend(3 * word.pattern.length + 1);
+      if (/^\/dev\/(?:fd(?:\/|$)|(?:stdin|stdout|stderr)$|(?:tcp|udp)\/)/.test(word.pattern) ||
+        (duplicate && (!/^(?:[0-9]+|-)$/.test(word.pattern) || (write && word.pattern === "-")))) throw new ShellStateRefused();
+    }
     if (word) tokens.push(target ? { redirect: word, input, append, here, duplicate, fd, both, write } : { word });
     word = undefined;
+    braceSyntax = "";
     target = false;
   };
   const current = (): Word => (word ??= { text: "", subs: [], names: [], dynamic: false, pattern: "" });
@@ -203,7 +231,10 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
           lines.push(line);
         }
         if (!closed) throw new ShellStateRefused();
-        heredoc.token.heredoc.body = lines.join("\n");
+        // Every retained physical body line ends before a real delimiter line.
+        // Preserve that record separator before stdout concatenation; only command
+        // substitution removes trailing newlines. No records means no body bytes.
+        heredoc.token.heredoc.body = lines.length ? `${lines.join("\n")}\n` : "";
       }
       // A newline after `|`, `&&` or `||` continues the same list (as comment-cut reads `|`-newline).
       const last = tokens.at(-1);
@@ -219,6 +250,13 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       continue;
     }
     if (c === "<" && text[index + 1] === "<" && text[index + 2] !== "<") {
+      if (pending.length) throw new ShellStateRefused();
+      // Only fd0 heredoc routing is represented by the existing body token.
+      if (word && !word.quoted && word.assignment !== false && /^\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(word.pattern)) throw new ShellStateRefused();
+      if (word && !target && !word.quoted && word.assignment !== false && /^\d+$/.test(word.pattern)) {
+        if (word.pattern !== "0") throw new ShellStateRefused();
+        word = undefined; braceSyntax = "";
+      }
       endWord();
       const strip = text[index + 2] === "-";
       index += strip ? 3 : 2;
@@ -238,6 +276,7 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       continue;
     }
     if ((c === "<" || c === ">") && text[index + 1] === "(") {
+      if (c === ">") throw new ShellStateRefused();
       const end = readBalanced(text, index + 2, "(", ")", budget);
       const w = current();
       w.process = true;
@@ -248,7 +287,8 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       index = end;
       continue;
     }
-    if (c === "<" || c === ">" || (c === "&" && !word && text[index + 1] === ">")) {
+    if (c === "<" || c === ">" || (c === "&" && text[index + 1] === ">")) {
+      if (text.startsWith("<>", index) || text.startsWith("<<<", index) || text.startsWith(">|", index) || c === "&" || (word && !word.quoted && word.assignment !== false && /^\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(word.pattern))) throw new ShellStateRefused();
       // review/astra F3 on #105: the `2` of `2>/dev/null pkill …` is a descriptor, not a word.
       const descriptor = word && !target && /^\d+$/.test(word.text) ? word.text : undefined;
       if (descriptor !== undefined) word = undefined;
@@ -267,6 +307,10 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       target = true;
       continue;
     }
+    // Lexer-live unsupported grammar, not source-wide searches through DATA.
+    // Plain case ;; and ordinary groups keep the existing conservative paths.
+    if ((c === "|" && text[index + 1] === "&") || (c === ";" && (text.startsWith(";&", index) || text.startsWith(";;&", index))) ||
+      (c === "(" && /[@?+!*]$/.test(braceSyntax))) throw new ShellStateRefused();
     const operator = !word || c === ";" || c === "|" || c === "&" || c === ")" || c === "("
       ? OPERATORS.find((op) => text.startsWith(op, index))
       : undefined;
@@ -280,6 +324,7 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
     }
     const w = current();
     const before = w.text.length;
+    if (c === "$" && text[index + 1] === "\"") throw new ShellStateRefused();
     if (c === "\"" || c === "'" || (c === "$" && text[index + 1] === "'")) w.quoted = true;
     // Assignment syntax is lexical: quoting/escaping the name or '=' makes argv DATA.
     if (!w.text.includes("=") && (w.quoted || c === "\\")) w.assignment = false;
@@ -287,8 +332,9 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
     const kind = c === "\"" ? QUOTED : (c === "$" && text[index + 1] === "(") || c === "`" ? "$" : LITERAL;
     if (c === "'") {
       const end = text.indexOf("'", index + 1);
-      w.text += text.slice(index + 1, end < 0 ? text.length : end);
-      index = end < 0 ? text.length : end + 1;
+      if (end < 0) throw new ShellStateRefused();
+      w.text += text.slice(index + 1, end);
+      index = end + 1;
     } else if (c === "$" && text[index + 1] === "'") {
       // Lexer membership, not a search through quoted DATA. No ANSI-C decoder or
       // raw escape bytes may attest a value, executable name or option boundary.
@@ -302,13 +348,14 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       w.text += substitute(w, text.slice(start, end - 1), budget);
       index = end;
     } else if (c === "\\") {
-      w.text += text[index + 1] ?? "";
+      if (index + 1 >= text.length) throw new ShellStateRefused();
+      w.text += text[index + 1]!;
       index += 2;
     } else {
       if (c === "(" && /^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(w.text)) arrayDepth += 1;
       let end = index + 1;
       while (end < text.length && !/[\s'"\\`;|&()<>]/.test(text[end]!) &&
-        !(text[end] === "$" && ["(", "'", "["].includes(text[end + 1] ?? ""))) end += 1;
+        !(text[end] === "$" && ["(", "'", "\"", "["].includes(text[end + 1] ?? ""))) end += 1;
       budget.spend(end - index + 1);
       const fragment = text.slice(index, end);
       // No tilde interpreter: only lexer-live candidate bytes refuse. Quoted or
@@ -321,6 +368,8 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       bare = true;
     }
     const added = w.text.slice(before);
+    budget.spend(2 * braceSyntax.length + added.length + 1);
+    braceSyntax += bare ? added : "\0";
     w.pattern += bare ? added : mask(added).replaceAll("$", kind);
   }
   endWord();
@@ -462,8 +511,14 @@ function sourceScopes(tokens: Token[], budget: GuardBudget): SourceScopes {
   const parents = new Map<number, number>();
   const outputs = new Map<number, Redirect[]>();
   let head = true;
+  let cases = 0;
   const close = (kind: string, end: number): void => {
-    if (stack.at(-1)?.kind !== kind) return;
+    if (stack.at(-1)?.kind !== kind) {
+      // A case pattern's ')' is not a group closer. Preserve plain case ;;,
+      // but never attest an unmatched/misnested actual group boundary.
+      if (kind === "group" && cases && !stack.some((scope) => scope.kind === "group")) return;
+      throw new ShellStateRefused();
+    }
     const scope = stack.pop()!;
     compounds.set(scope.start, end);
     ends.set(tokens[end]!, scope.start);
@@ -492,12 +547,15 @@ function sourceScopes(tokens: Token[], budget: GuardBudget): SourceScopes {
       if (["for", "while", "until", "select"].includes(name)) stack.push({ kind: "loop", start: i });
       if (name === "{") stack.push({ kind: "brace", start: i });
       if (name === "if") stack.push({ kind: "if", start: i });
+      if (name === "case") cases += 1;
+      if (name === "esac") { if (!cases) throw new ShellStateRefused(); cases -= 1; }
       if (name === "done") close("loop", i);
       if (name === "}") close("brace", i);
       if (name === "fi") close("if", i);
       head = ["{", "do", "then", "else", "if", "elif", "!"].includes(name);
     }
   });
+  if (stack.length || cases) throw new ShellStateRefused();
   // Only annotate unsupported child binding boundaries; do not interpret job execution.
   const children = new Set<number>();
   for (const [start, end] of compounds) {
@@ -536,6 +594,7 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
   const chdirs: Word[] = [];
   const assignments: Word[] = [];
   let environment = false;
+  let wrapped = false;
   for (;;) {
     budget.spend(4 * words.length + 1);
     while (words[0] && (words[0].assignment || (environment && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(words[0].text)))) {
@@ -549,13 +608,21 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
     // Reserved words are grammar only when unquoted/unescaped, not executable-name argv.
     const quotedControl = ["!", "{", "then", "do", "else", "if", "elif", "while", "until"].includes(prefix) &&
       (words[0]?.quoted || words[0]?.assignment === false);
-    if (!options || quotedControl) return { words, fedByXargs, argFile, chdirs, assignments };
+    if (!options || quotedControl) {
+      // Absence AFTER executable-wrapper removal is not lexical standalone
+      // assignment syntax. Refuse before either pass can bind wrapper argv in
+      // the parent; genuine leading assignment-only commands remain supported.
+      if (wrapped && !words.length) throw new ShellStateRefused();
+      return { words, fedByXargs, argFile, chdirs, assignments };
+    }
     // Wrapper option values are actual argv: unquoted empty fields disappear before
     // deciding which word -C/-D consumes, and quoted values remain one field.
     if (options.length) words = argv(words);
-    // `command -v pkill` names the command; it does not run it.
-    if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) return { words: [], fedByXargs, argFile, chdirs, assignments };
+    // Owner admission cut: diagnostic command -v/-V is not a proved child
+    // receiver either. Never return its empty words as parent assignment proof.
+    if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) throw new ShellStateRefused();
     if (prefix === "xargs") fedByXargs = true;
+    if (!["!", "{", "then", "do", "else", "if", "elif", "while", "until"].includes(prefix)) wrapped = true;
     words = words.slice(1);
     while (words[0]?.text.startsWith("-") && words[0].text.length > 1) {
       budget.spend(words.length + words[0].text.length + 1);
@@ -645,7 +712,12 @@ class ShellStateRefused extends Error {}
  * caller supplies lexer-live bytes, never raw single-quoted/escaped dollar DATA. */
 function checkParameterSyntax(pattern: string, budget: GuardBudget): void {
   budget.spend(4 * pattern.length + 1);
-  if (/[$\u0002]\{/.test(pattern.replace(REFERENCE, ""))) throw new ShellStateRefused();
+  for (const match of pattern.matchAll(REFERENCE)) {
+    // Only scalar/numeric refs have proved argv boundaries. Aggregate and array
+    // spellings are live syntax here, never quote-masked or expanded DATA.
+    if (["@", "*"].includes(match[2]!) || match[0].includes("[")) throw new ShellStateRefused();
+  }
+  if (/[$\u0002](?:\{|[?$#-])/.test(pattern.replace(REFERENCE, ""))) throw new ShellStateRefused();
 }
 const SHELL_STATE_BUILTINS = new Set(["declare", "typeset", "export", "read", "mapfile", "readarray", "eval", "source", ".", "local", "let", "getopts", "trap", "enable", "alias", "unalias", "shopt", "function", "select", "unset", "shift", "hash", "bind", "[["]);
 
@@ -671,10 +743,8 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
     for (const redirect of stage.redirects) checkParameterSyntax(redirect.redirect.pattern, budget);
     if (!stage.words.length) return;
     const { words, assignments } = receiver ?? unwrap(stage.words, [], budget, (words) => words);
-    if (receiver) {
-      for (const word of words) checkParameterSyntax(word.pattern, budget);
-      for (const word of assignments) checkParameterSyntax(word.pattern, budget);
-    }
+    // Syntax membership belongs to original stage words/redirects above, not
+    // caller-expanded receiver argv: ordinary expansion output is never re-lexed.
     for (const assignment of assignments) if (!scalar(assignment)) throw new ShellStateRefused();
     // A live executable/option boundary cannot be treated as an unrelated literal
     // command. No command-name interpreter: decline its entire command instead.
@@ -684,6 +754,9 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
     // A for/select destination writes shell state too; quote removal already
     // resolved its name. Refuse IFS without interpreting iterations or values.
     if (["for", "select"].includes(words[0]?.text ?? "") && !words[0]?.quoted && words[0]?.assignment !== false && words[1]?.text === "IFS") throw new ShellStateRefused();
+    // Only explicit lexical for NAME in LIST belongs to the existing subset.
+    if (name === "for" && !words[0]?.quoted && words[0]?.assignment !== false &&
+      (words[2]?.pattern !== "in" || words[2]?.quoted || words[2]?.assignment === false)) throw new ShellStateRefused();
     if (!["readonly", "set", "printf"].includes(name)) return;
     const args = words.slice(1);
     if (name === "printf") {
@@ -692,6 +765,10 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
       // dollars are data; unprovedLiteral still makes the renderer decline.
       if (format) budget.spend(4 * format.pattern.length + 1);
       if (!format || format.dynamic || format.subs.length || format.process || /\$/.test(format.pattern) || format.text.startsWith("-")) throw new ShellStateRefused();
+      // The literal-format exception is string-only, not every printf builtin
+      // conversion: %n can write a parent cell even when stdout is UNKNOWN.
+      budget.spend(3 * format.text.length + 1);
+      if (format.text.replace(/%%|%s/g, "").includes("%")) throw new ShellStateRefused();
       return;
     }
     let unproved = context.unprovedRedirect === true || stage.conditional === true || stage.redirects.length > 0 || stage.heredocs.length > 0 || piped || ["|", "|&", "&"].includes(after ?? "");
@@ -721,6 +798,12 @@ function checkShellState(tokens: Token[], scopes: SourceScopes, context: Context
     budget.spend();
     const token = tokens[index]!;
     if ("word" in token) {
+      // Unsupported child grammar anywhere in the original live lexer tokens,
+      // before parent binding/readonly/cwd/file/output proofs in either pass.
+      if (token.word.pattern === "coproc" && !token.word.quoted && token.word.assignment !== false) throw new ShellStateRefused();
+      const head = stage.words.at(-1);
+      const grammarHead = !head || stage.words.every((word) => word.assignment) || (!head.quoted && head.assignment !== false && ["{", "then", "do", "if", "while", "until"].includes(head.pattern));
+      if (grammarHead && !token.word.quoted && token.word.assignment !== false && ["!", "time", "elif", "else"].includes(token.word.pattern)) throw new ShellStateRefused();
       // NAME() is definition syntax, not an empty group followed by an executed
       // body. Inspect lexer operators only; quoted parentheses remain word DATA.
       let next = index + 1;
@@ -1034,7 +1117,11 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (part === ".." && parts.length && parts.at(-1) !== "..") parts.pop();
       else parts.push(part);
     }
-    return `${full.startsWith("/") ? "/" : ""}${parts.join("/")}`;
+    const key = `${full.startsWith("/") ? "/" : ""}${parts.join("/")}`;
+    // Actual resolved file identity, not syntax re-lexing: expanded scalar paths
+    // and cwd-relative spellings must not attest these as ordinary saved files.
+    if (/^\/dev\/(?:fd(?:\/|$)|(?:stdin|stdout|stderr)$|(?:tcp|udp)\/)/.test(key)) throw new ShellStateRefused();
+    return key;
   };
   const changeDir = (target?: Word): void => {
     const expanded = target && expand(target.pattern);

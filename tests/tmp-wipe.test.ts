@@ -28,8 +28,13 @@ const round7IntentionalState = new Set<string>([
   "rm -rf ~/.cache/wt-*",
   "cd ~/w && sh -c 'cd /tmp' && rm -rf tmp.*",
 ]);
+// R9 owner grammar allowlist: aggregate argv is not a scalar byte proof.
+// Preserve the exact old allowance ID/command as an intentional STATE refusal.
+const round9IntentionalState = new Set<string>([
+  'set -- /tmp/tmp.AbC123 /var/tmp/tmp.Def456; rm -rf "$@"',
+]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
-  const intentional = round5IntentionalState.has(command) || round7IntentionalState.has(command);
+  const intentional = round5IntentionalState.has(command) || round7IntentionalState.has(command) || round9IntentionalState.has(command);
   const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
   if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);
   if (intentional || (originallyRefused && result.shellState === true)) {

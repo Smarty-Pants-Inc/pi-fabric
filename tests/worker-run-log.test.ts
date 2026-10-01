@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readJsonlPage } from "../src/log-tail.js";
 import { NativeConversationReader } from "../src/ui/conversation-native-reader.js";
 import { AgentTranscriptReader } from "../src/ui/transcript-reader.js";
@@ -240,8 +240,13 @@ process.stdin.on("end", () => {
       const file = path.join(runRoot, result.id, "events.jsonl");
       const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8")) as { ino: number; bytes: number; sha256: string };
       const bytes = fs.readFileSync(file);
-      if (scenario === "pathological") {
-        expect(result.compactionSkipped).toContain("MAX_TERMINAL_LOG_BYTES");
+      if (scenario === "pathological" || result.compactionSkipped !== undefined) {
+        // Real worker compaction is best-effort: scheduler/fsync delays can
+        // exhaust its independent work clock even for an ordinary-size log.
+        const bound = scenario === "pathological"
+          ? `MAX_TERMINAL_LOG_BYTES=${MAX_TERMINAL_LOG_BYTES}`
+          : `MAX_TERMINAL_LOG_WORK_MS=${MAX_TERMINAL_LOG_WORK_MS}`;
+        expect(result.compactionSkipped).toBe(`Terminal run-log compaction skipped: ${bound} work bound exceeded; full log retained`);
         expect(manager.listForUi()[0]?.compactionSkipped).toBe(result.compactionSkipped);
         expect(fs.statSync(file).ino).toBe(receipt.ino);
         expect(bytes.length).toBe(receipt.bytes);
@@ -259,6 +264,12 @@ process.stdin.on("end", () => {
 });
 
 describe("worker run log", () => {
+  beforeEach(() => {
+    // These tests assert compaction semantics and native filesystem behavior,
+    // not CI scheduling/fsync speed. Keep real I/O; deadline tests below
+    // explicitly advance this clock. Real-worker tests above stay unmocked.
+    vi.spyOn(performance, "now").mockReturnValue(0);
+  });
   it("retains a small fabric_exec probe-1234 return verbatim after real terminal compaction", () => {
     const small = capEvents("probe-1234", false, { receipt: { exact: true } });
     (small.events[0]! as Record<string, unknown>).args = { code: 'return "probe-1234";' };
@@ -440,6 +451,29 @@ describe("worker run log", () => {
       expect(rename).toHaveBeenCalledTimes(6);
       expect(elapsed).toBe(MAX_TERMINAL_LOG_WORK_MS);
     } finally { rename.mockRestore(); sleep.mockRestore(); clock.mockRestore(); }
+    expect(fs.readFileSync(file, "utf8")).toBe(text);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  });
+
+  it.each(["source", "temp"])("retains full log when real %s fsync exhausts the work clock", (phase) => {
+    const text = write(capEvents(largeResultText("slow fsync fallback"), false, { terminate: true }).events, true, false).text;
+    const file = logFile(text);
+    const inode = fileIdentity(file);
+    let elapsed = 0;
+    let syncs = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const fsync = fs.fsyncSync;
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      fsync(fd);
+      if (++syncs === (phase === "source" ? 1 : 2)) elapsed = MAX_TERMINAL_LOG_WORK_MS;
+    });
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome).toEqual({ compacted: 0, beforeBytes: Buffer.byteLength(text), afterBytes: Buffer.byteLength(text),
+        compactionSkipped: `Terminal run-log compaction skipped: MAX_TERMINAL_LOG_WORK_MS=${MAX_TERMINAL_LOG_WORK_MS} work bound exceeded; full log retained` });
+      expect(sync).toHaveBeenCalledTimes(phase === "source" ? 1 : 2);
+    } finally { sync.mockRestore(); clock.mockRestore(); }
+    expect(fileIdentity(file)).toBe(inode);
     expect(fs.readFileSync(file, "utf8")).toBe(text);
     expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
   });

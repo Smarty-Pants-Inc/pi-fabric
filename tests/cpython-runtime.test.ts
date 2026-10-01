@@ -92,6 +92,60 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
     }
   });
 
+  it.each(["LF", "CRLF"])("drains delayed loopback startup stderr through guest close (%s)", async (newline) => {
+    // Windows delivers TCP and anonymous stderr pipes independently. Model a
+    // flushed startup record reaching the host after result/exit, before close.
+    vi.stubGlobal("process", new Proxy(process, {
+      get(target, key) { return key === "platform" ? "win32" : Reflect.get(target, key); },
+    }));
+    const marker = "[fabric-cpython-startup] at=1.000000 elapsedMs=1.000 first request written";
+    let socket: net.Socket | undefined;
+    let close!: () => void;
+    const closed = new Promise<void>(resolve => { close = resolve; });
+    const child = Object.assign(new EventEmitter(), {
+      pid: 999_999_999,
+      stdout: new PassThrough(), stderr: new PassThrough(), stdio: [],
+      kill: vi.fn(() => {
+        child.emit("exit", 0, null);
+        setTimeout(() => {
+          child.stderr.end(marker + (newline === "CRLF" ? "\r\n" : "\n"));
+          child.stdout.end();
+          child.emit("close", 0, null);
+          close();
+        }, 30);
+        return true;
+      }),
+    });
+    vi.mocked(childProcess.spawn).mockImplementationOnce(((...args: Parameters<typeof childProcess.spawn>) => {
+      const env = args[2]!.env!;
+      socket = net.createConnection({ host: "127.0.0.1", port: Number(env.FABRIC_IPC_PORT) });
+      socket.on("error", () => {});
+      socket.once("connect", () => socket!.write(JSON.stringify({ type: "hello", token: env.FABRIC_IPC_TOKEN }) + "\n"));
+      let pending = "";
+      socket.on("data", chunk => {
+        pending += chunk.toString();
+        if (!pending.includes("\n")) return;
+        const request = JSON.parse(pending.slice(0, pending.indexOf("\n")));
+        expect(request.type).toBe("execute");
+        socket!.write(JSON.stringify({ type: "result", result: { terminationReason: "completed", value: 1 } }) + "\n");
+      });
+      return child as unknown as ReturnType<typeof childProcess.spawn>;
+    }) as typeof childProcess.spawn);
+    try {
+      const result = await run("return 1");
+      expect(result).toMatchObject({ terminationReason: "completed", value: 1 });
+      expect(result.logs).toEqual([marker]);
+      expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+    } finally {
+      await closed;
+      if (socket && !socket.closed) {
+        const socketClosed = new Promise<void>(resolve => socket!.once("close", () => resolve()));
+        socket.destroy(); await socketClosed;
+      }
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("waits for guest close before cwd removal and retains only the stderr tail with exit status", async () => {
     const output = vi.spyOn(console, "error").mockImplementation(() => {});
     const trace = await captureDurableExecutionTrace();

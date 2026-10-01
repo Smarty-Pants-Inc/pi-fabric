@@ -1089,24 +1089,50 @@ export class QuickJsRuntime {
               const errorHandle = context.newError(
                 error instanceof Error ? error.message : String(error),
               );
-              const safeMetadata = guestFabricErrorMetadata(error);
-              if (safeMetadata) {
-                for (const [key, value] of Object.entries(safeMetadata)) {
-                  const metadata = typeof value === "boolean" ? (value ? context.true : context.false) : context.newString(value);
-                  context.setProp(errorHandle, key, metadata);
-                  if (typeof value === "string") metadata.dispose();
+              try {
+                const safeMetadata = guestFabricErrorMetadata(error);
+                // Fabric metadata includes its vetted name. Otherwise transfer only
+                // a host Error's string classification, never arbitrary properties
+                // or a caller-selected property key. Each key is assigned once.
+                const name = safeMetadata?.name ?? (error instanceof Error ? error.name : undefined);
+                if (!safeMetadata && typeof name === "string") {
+                  const nameHandle = context.newString(name);
+                  try {
+                    context.setProp(errorHandle, "name", nameHandle);
+                  } finally {
+                    nameHandle.dispose();
+                  }
                 }
+                if (safeMetadata) {
+                  for (const [key, value] of Object.entries(safeMetadata)) {
+                    if (typeof value === "boolean") {
+                      // Boolean handles are borrowed context constants, not owned.
+                      context.setProp(errorHandle, key, value ? context.true : context.false);
+                    } else {
+                      const metadata = context.newString(value);
+                      try {
+                        context.setProp(errorHandle, key, metadata);
+                      } finally {
+                        metadata.dispose();
+                      }
+                    }
+                  }
+                }
+                const exit = reference === "pi.bash" || reference === "pi.powershell"
+                  ? piBashExitMetadata(error)
+                  : undefined;
+                if (exit) {
+                  const metadata = jsonHandle(context, jsonObject, jsonParse, exit);
+                  try {
+                    context.setProp(errorHandle, "__fabricBashExit", metadata);
+                  } finally {
+                    metadata.dispose();
+                  }
+                }
+                promise.reject(errorHandle);
+              } finally {
+                errorHandle.dispose();
               }
-              const exit = reference === "pi.bash" || reference === "pi.powershell"
-                ? piBashExitMetadata(error)
-                : undefined;
-              if (exit) {
-                const metadata = jsonHandle(context, jsonObject, jsonParse, exit);
-                context.setProp(errorHandle, "__fabricBashExit", metadata);
-                metadata.dispose();
-              }
-              promise.reject(errorHandle);
-              errorHandle.dispose();
             })
             .finally(() => {
               if (!closing) pumpJobs();

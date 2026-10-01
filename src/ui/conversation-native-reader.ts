@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { NativeReaderEventReplay } from "./conversation-native-reader-replay.js";
 import { NativeReaderCheckpoint } from "./conversation-native-reader-checkpoint.js";
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
@@ -41,6 +42,17 @@ import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 // is ever dropped. Repeated loadOlder() calls walk the user through all of
 // history. Files that cannot be read are reported through the bounded
 // `unavailable`/`error` snapshot fields instead of throwing.
+
+// ponytail: duplicate this tiny wire guard to avoid a new static shared chunk
+// in the eager native-reader graph; keep identical to transcript-sanitization.
+const isCompactToolResult = (value: unknown): boolean => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  const keys = Object.keys(result);
+  return keys.length === 2 && keys.includes("elided") && keys.includes("bytes") &&
+    result.elided === true && typeof result.bytes === "number" &&
+    Number.isInteger(result.bytes) && result.bytes >= 0;
+};
 
 export type NativeAgentMessage = SessionMessageEntry["message"];
 
@@ -186,6 +198,7 @@ interface RecordPage {
   /** Byte offset just past the last record included. */
   end: number;
   records: string[];
+  offsets: Array<[number, number]>;
 }
 
 /**
@@ -209,7 +222,7 @@ const readBackwardPage = (
     const buffer = Buffer.allocUnsafe(end - candidate);
     const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, candidate);
     const data = buffer.subarray(0, Math.max(0, bytesRead));
-    if (data.length === 0) return { start: candidate, end: candidate, records: [] };
+    if (data.length === 0) return { start: candidate, end: candidate, records: [], offsets: [] };
     const firstNewline = data.indexOf(0x0a);
     if (firstNewline === -1) {
       if (candidate === 0) {
@@ -217,8 +230,8 @@ const readBackwardPage = (
         // can complete it, just like a trailing partial line in a larger file.
         const raw = data.toString("utf8").replace(/\r$/, "");
         return includeFinalPartialLine && raw && parseRecord(raw)
-          ? { start: 0, end, records: [raw] }
-          : { start: 0, end: 0, records: [] };
+          ? { start: 0, end, records: [raw], offsets: [[0, end]] }
+          : { start: 0, end: 0, records: [], offsets: [] };
       }
       // One record larger than the budget: grow and retry so it loads whole.
       windowBudget = Math.min(windowBudget * 2, end);
@@ -228,12 +241,17 @@ const readBackwardPage = (
     // otherwise align forward past a possibly partial head line.
     const alignStart = candidate > 0 ? firstNewline + 1 : 0;
     const records: string[] = [];
+    const offsets: Array<[number, number]> = [];
+    const baseOffset = candidate;
     let lineStart = alignStart;
     let lastComplete = alignStart;
     for (let index = alignStart; index < data.length; index++) {
       if (data[index] !== 0x0a) continue;
       const raw = data.subarray(lineStart, index).toString("utf8").replace(/\r$/, "");
-      if (raw) records.push(raw);
+      if (raw) {
+        records.push(raw);
+        offsets.push([baseOffset + lineStart, baseOffset + index + 1]);
+      }
       lineStart = index + 1;
       lastComplete = lineStart;
     }
@@ -248,11 +266,12 @@ const readBackwardPage = (
       const tail = data.subarray(lastComplete).toString("utf8").replace(/\r$/, "");
       if (includeFinalPartialLine && tail && parseRecord(tail)) {
         records.push(tail);
+        offsets.push([candidate + lastComplete, end]);
       } else {
         endOffset = candidate + lastComplete;
       }
     }
-    return { start: candidate + alignStart, end: endOffset, records };
+    return { start: candidate + alignStart, end: endOffset, records, offsets };
   }
 };
 
@@ -271,18 +290,23 @@ const readForwardPage = (
   let windowBudget = Math.max(budget, 1);
   for (;;) {
     const limit = Math.min(size, start + windowBudget);
-    if (limit <= start) return { start, end: start, records: [] };
+    if (limit <= start) return { start, end: start, records: [], offsets: [] };
     const buffer = Buffer.allocUnsafe(limit - start);
     const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, start);
     const data = buffer.subarray(0, Math.max(0, bytesRead));
-    if (data.length === 0) return { start, end: start, records: [] };
+    if (data.length === 0) return { start, end: start, records: [], offsets: [] };
     const records: string[] = [];
+    const offsets: Array<[number, number]> = [];
+    const baseOffset = start;
     let lineStart = 0;
     let lastComplete = 0;
     for (let index = 0; index < data.length; index++) {
       if (data[index] !== 0x0a) continue;
       const raw = data.subarray(lineStart, index).toString("utf8").replace(/\r$/, "");
-      if (raw) records.push(raw);
+      if (raw) {
+        records.push(raw);
+        offsets.push([baseOffset + lineStart, baseOffset + index + 1]);
+      }
       lineStart = index + 1;
       lastComplete = lineStart;
     }
@@ -290,6 +314,7 @@ const readForwardPage = (
       const tail = data.subarray(lastComplete).toString("utf8").replace(/\r$/, "");
       if (limit >= size && tail && parseRecord(tail)) {
         records.push(tail);
+        offsets.push([start + lastComplete, start + data.length]);
         lastComplete = data.length;
       }
     }
@@ -298,7 +323,7 @@ const readForwardPage = (
       windowBudget = Math.min(windowBudget * 2, size - start);
       continue;
     }
-    return { start, end: start + lastComplete, records };
+    return { start, end: start + lastComplete, records, offsets };
   }
 };
 
@@ -316,7 +341,19 @@ interface NativeReaderState {
 
 type NativeReaderMetadata = Omit<NativeConversationTranscript, "messages" | "entries" | "streaming" | "pendingMessages">;
 
-interface FileWindow {
+interface DescriptorGeneration {
+  device: bigint;
+  inode: bigint;
+  birthtime: bigint;
+  mtime: bigint;
+}
+
+interface OpenedDescriptor extends DescriptorGeneration {
+  descriptor: number;
+  size: number;
+}
+
+interface FileWindow extends Partial<DescriptorGeneration> {
   /** Oldest byte loaded so far (record-aligned); 0 once history start is reached. */
   head: number;
   /** Newest byte consumed so far. */
@@ -324,8 +361,12 @@ interface FileWindow {
   /** Size observed at the last read; tail === size means followed to EOF. */
   size: number;
   hasOlder: boolean;
+  /** Whole records loaded, independent of byte offsets or replay pruning. */
+  loadedRecords?: number;
   /** Set when the file exists but could not be read. */
   unavailable: boolean;
+  /** A rejected replacement must reparse even if the original bytes return. */
+  replacementPending?: boolean;
 }
 
 type FileKind = "session" | "events";
@@ -354,17 +395,23 @@ const classifyFile = (filePath: string): FileKind | "unreadable" => {
 
 const openDescriptor = (
   filePath: string,
-): { descriptor: number; size: number } | { error: string } | undefined => {
+): OpenedDescriptor | { error: string } | undefined => {
+  let descriptor: number | undefined;
   try {
     const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-    const descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-    const stat = fs.fstatSync(descriptor);
+    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    // Windows file IDs exceed Number.MAX_SAFE_INTEGER. Preserve the exact ID
+    // AND creation/modification metadata from the descriptor we actually read.
+    const stat = fs.fstatSync(descriptor, { bigint: true });
     if (!stat.isFile()) {
       closeQuietly(descriptor);
       return { error: "not a regular file" };
     }
-    return { descriptor, size: stat.size };
+    const size = Number(stat.size);
+    if (!Number.isSafeInteger(size)) throw new Error("file size exceeds safe byte offsets");
+    return { descriptor, size, device: stat.dev, inode: stat.ino, birthtime: stat.birthtimeNs, mtime: stat.mtimeNs };
   } catch (error) {
+    if (descriptor !== undefined) closeQuietly(descriptor);
     return { error: clipError(error) };
   }
 };
@@ -416,10 +463,12 @@ export class NativeConversationReader {
   #persisted = new Set<string>();
   #messageKeys = new WeakMap<NativeAgentMessage, string>();
   #entryProjections = new WeakMap<SessionEntry, { entry: NativeTranscriptEntry; messages: NativeAgentMessage[] }>();
-  #logClassification: { path: string; kind: FileKind; dev: number; ino: number; size: number; mtimeMs: number } | undefined;
+  #logClassification: { path: string; kind: FileKind; dev: bigint; ino: bigint; size: bigint; birthtime: bigint; mtime: bigint } | undefined;
   #checkpoint: NativeReaderCheckpoint<NativeReaderState> | undefined;
   #suspendedMetadata: NativeReaderMetadata | undefined;
   readonly #loadedRanges = new Map<FileKind, Array<[number, number]>>();
+  // Compact identity evidence survives suspension without retaining payloads.
+  readonly #loadedPages = new Map<FileKind, Map<string, { start: number; end: number; digest: string | null; first: string; last: string }>>();
 
   /** Last transcript produced; undefined before the first successful read. */
   get last(): NativeConversationTranscript | undefined {
@@ -595,8 +644,57 @@ export class NativeConversationReader {
     this.#eventReplay = new NativeReaderEventReplay(state.eventRecords);
   }
 
-  #rememberRange(kind: FileKind, page: RecordPage): void {
+  #rememberRange(kind: FileKind, page: RecordPage, rereadTail = false): void {
     if (page.end <= page.start) return;
+    const pages = this.#loadedPages.get(kind) ?? new Map();
+    const key = `${page.start}:${page.end}`;
+    let digest: string | undefined;
+    let invalid = pages.has("invalid");
+    if (!invalid) {
+      for (const previous of pages.values()) {
+        // Validate overlapping immutable bytes using the records already read.
+        // A former endpoint inside a record is evidence of a size-changing
+        // rewrite, not an appended record with a new identity.
+        if ((rereadTail && previous.end > page.end) ||
+          page.offsets.some(([start, end]) =>
+            (start < previous.start && previous.start < end) ||
+            (start < previous.end && previous.end < end))) {
+          invalid = true;
+          break;
+        }
+        if (previous.start < page.start || previous.end > page.end) continue;
+        const first = page.offsets.findIndex(([start]) => start === previous.start);
+        const last = page.offsets.findIndex(([, end]) => end === previous.end);
+        if (first < 0 || last < first) { invalid = true; break; }
+        const current = previous.start === page.start && previous.end === page.end
+          ? (digest ??= this.#pageDigest(page.records))
+          : this.#pageDigest(page.records.slice(first, last + 1));
+        if (current !== previous.digest) { invalid = true; break; }
+      }
+    }
+    if (invalid) {
+      // Once contradictory, fingerprints of obsolete versions add no proof.
+      // Retain only logical coverage fences and an irreversible invalid latch.
+      const evidence = [...pages.values()];
+      const first = evidence.reduce((oldest, item) => item.start < oldest.start ? item : oldest);
+      const last = evidence.reduce((newest, item) => item.end > newest.end ? item : newest);
+      pages.clear();
+      pages.set("invalid", {
+        start: Math.min(first.start, page.start),
+        end: rereadTail ? page.end : Math.max(last.end, page.end),
+        digest: null,
+        first: page.start <= first.start ? this.#recordBoundary(page.records[0] ?? "") : first.first,
+        last: rereadTail || page.end >= last.end ? this.#recordBoundary(page.records.at(-1) ?? "") : last.last,
+      });
+    } else {
+      if (pages.has(key)) return;
+      pages.set(key, {
+        start: page.start, end: page.end, digest: digest ?? this.#pageDigest(page.records),
+        first: this.#recordBoundary(page.records[0] ?? ""),
+        last: this.#recordBoundary(page.records.at(-1) ?? ""),
+      });
+    }
+    this.#loadedPages.set(kind, pages);
     const ranges = [...(this.#loadedRanges.get(kind) ?? []), [page.start, page.end] as [number, number]];
     ranges.sort((a, b) => a[0] - b[0]);
     const merged: Array<[number, number]> = [];
@@ -616,8 +714,12 @@ export class NativeConversationReader {
       const opened = openDescriptor(filePath);
       if (!opened || "error" in opened) throw new Error(`${filePath}: ${opened?.error ?? "unavailable"}`);
       try {
+        // Inode reuse is possible after unlink: identity alone cannot prove
+        // a damaged checkpoint's byte ranges still contain the loaded history.
+        if (!this.#matchesLoadedPages(kind, opened.descriptor, opened.size)) {
+          throw new Error(`${filePath}: loaded range no longer available`);
+        }
         for (const [head, tail] of ranges) {
-          if (opened.size < tail) throw new Error(`${filePath}: loaded range no longer available`);
           let offset = head;
           while (offset < tail) {
             const page = readForwardPage(opened.descriptor, offset, tail, GROWTH_PAGE_BYTES);
@@ -691,6 +793,7 @@ export class NativeConversationReader {
     this.#checkpoint = undefined;
     this.#suspendedMetadata = undefined;
     this.#loadedRanges.clear();
+    this.#loadedPages.clear();
     this.#sourceId = sourceId;
     this.#status = status;
     this.#sessionFile = sessionFile;
@@ -731,7 +834,7 @@ export class NativeConversationReader {
     this.#tools.clear();
   }
 
-  #resetEventsState(): void {
+  #resetEventsState(initialize = true): void {
     this.#treeDirty = true;
     this.#eventReplay = new NativeReaderEventReplay();
     this.#resetStreamingState();
@@ -747,44 +850,46 @@ export class NativeConversationReader {
       }
     }
     this.#eventEntryIds.clear();
-    this.#windows.delete("events");
-    this.#loadedRanges.delete("events");
+    if (initialize) {
+      this.#windows.delete("events");
+      this.#loadedRanges.delete("events");
+      this.#loadedPages.delete("events");
+    }
     this.#error = undefined;
-    if (this.#eventsFile) this.#initWindow("events", this.#eventsFile);
+    if (initialize && this.#eventsFile) this.#initWindow("events", this.#eventsFile);
   }
 
   #initWindow(kind: FileKind, filePath: string): void {
+    // A failed loadLatest must not detach already consumed records/evidence
+    // from their generation. Only a genuinely new window starts at zero.
+    const previous = this.#windows.get(kind);
+    const unavailable: FileWindow = previous
+      ? { ...previous, unavailable: true }
+      : { head: 0, tail: 0, size: 0, hasOlder: false, unavailable: true };
     const opened = openDescriptor(filePath);
     if (!opened || "error" in opened) {
-      this.#windows.set(kind, {
-        head: 0,
-        tail: 0,
-        size: 0,
-        hasOlder: false,
-        unavailable: true,
-      });
+      this.#windows.set(kind, unavailable);
       if (opened && "error" in opened) this.#setError(`${filePath}: ${opened.error}`);
       return;
     }
     try {
       const page = readBackwardPage(opened.descriptor, opened.size, INITIAL_PAGE_BYTES, kind === "events");
       this.#applyRecords(kind, page.records, true);
-      this.#rememberRange(kind, page);
+      this.#rememberRange(kind, page, true);
       this.#windows.set(kind, {
         head: page.start,
         tail: page.end,
         size: opened.size,
+        device: opened.device,
+        inode: opened.inode,
+        birthtime: opened.birthtime,
+        mtime: opened.mtime,
         hasOlder: page.start > 0,
+        loadedRecords: page.records.length,
         unavailable: false,
       });
     } catch (error) {
-      this.#windows.set(kind, {
-        head: 0,
-        tail: 0,
-        size: 0,
-        hasOlder: false,
-        unavailable: true,
-      });
+      this.#windows.set(kind, unavailable);
       this.#setError(`${filePath}: ${clipError(error)}`);
     } finally {
       closeQuietly(opened.descriptor);
@@ -793,7 +898,7 @@ export class NativeConversationReader {
 
   #loadOlderFile(kind: FileKind, filePath: string): boolean {
     const window = this.#windows.get(kind);
-    if (!window || !window.hasOlder || window.head <= 0) return false;
+    if (!window) return false;
     const opened = openDescriptor(filePath);
     if (!opened) return false;
     if ("error" in opened) {
@@ -802,12 +907,26 @@ export class NativeConversationReader {
       return false;
     }
     try {
-      const page = readBackwardPage(opened.descriptor, window.head, OLDER_PAGE_BYTES, false);
+      if (this.#replaceWindowIfNeeded(kind, opened)) return true;
+      window.size = opened.size;
+      window.mtime = opened.mtime;
+      if (!window.hasOlder || window.head <= 0) return false;
+      let page: RecordPage;
+      try {
+        page = readBackwardPage(opened.descriptor, window.head, OLDER_PAGE_BYTES, false);
+      } catch {
+        // No replacement: previously loaded payload/bookmarks remain valid;
+        // this backward read failed before any new records were applied.
+        window.unavailable = true;
+        this.#setError("Unable to read older history");
+        return false;
+      }
       if (page.start >= window.head) return false;
       // Older records join the index without moving the authoritative leaf.
       this.#applyRecords(kind, page.records, false);
       this.#rememberRange(kind, page);
       window.head = page.start;
+      window.loadedRecords = (window.loadedRecords ?? 0) + page.records.length;
       window.hasOlder = page.start > 0;
       window.unavailable = false;
       return true;
@@ -827,7 +946,11 @@ export class NativeConversationReader {
       return false;
     }
     try {
+      // Check identity even when pinned or size grew: terminal compaction can
+      // shorten the file OR grow a near-empty end into the compact marker.
+      if (this.#replaceWindowIfNeeded(kind, opened, followLatest)) return true;
       window.size = opened.size;
+      window.mtime = opened.mtime;
       window.unavailable = false;
       if (!followLatest || opened.size <= window.tail) return false;
       const page = readForwardPage(opened.descriptor, window.tail, opened.size, GROWTH_PAGE_BYTES);
@@ -835,10 +958,215 @@ export class NativeConversationReader {
       this.#applyRecords(kind, page.records, true);
       this.#rememberRange(kind, page);
       window.tail = Math.max(window.tail, page.end);
+      window.loadedRecords = (window.loadedRecords ?? 0) + page.records.length;
       return true;
     } finally {
       closeQuietly(opened.descriptor);
     }
+  }
+
+  #pageDigest(records: string[]): string {
+    return createHash("sha256").update(JSON.stringify(records)).digest("hex");
+  }
+
+  #matchesLoadedPages(kind: FileKind, descriptor: number, size: number): boolean {
+    const pages = this.#loadedPages.get(kind);
+    if (!pages?.size) return false;
+    // Contradictory evidence can never validate, including after suspension.
+    if ([...pages.values()].some((page) => page.digest === null)) return false;
+    for (const previous of pages.values()) {
+      if (size < previous.end) return false;
+      const page = readForwardPage(descriptor, previous.start, previous.end, previous.end - previous.start);
+      if (page.end !== previous.end || this.#pageDigest(page.records) !== previous.digest) return false;
+    }
+    return true;
+  }
+
+  #replaceWindowIfNeeded(
+    kind: FileKind,
+    opened: OpenedDescriptor,
+    followLatest?: boolean,
+  ): boolean {
+    const { device, inode, birthtime, mtime } = opened;
+    const window = this.#windows.get(kind);
+    if (!window) return false;
+    if (!window.replacementPending && window.head === 0 && window.tail === 0 &&
+      (window.loadedRecords ?? 0) === 0 && !this.#loadedPages.get(kind)?.size &&
+      !this.#loadedRanges.get(kind)?.length) {
+      // Initial failure, an empty file, or pinned metadata-only recovery has
+      // consumed nothing: no history boundary needs relocation. Bind to the
+      // SAME descriptor used by grow/loadOlder before admitting any offsets,
+      // including replacement of that still-unconsumed generation.
+      window.device = device;
+      window.inode = inode;
+      window.birthtime = birthtime;
+      window.mtime = mtime;
+      return false;
+    }
+    // Exact IDs prevent rounding collisions, not genuine inode reuse. Creation
+    // time distinguishes reused IDs, including replacements larger than the
+    // consumed generation. Shrink or a same-size modification still requires
+    // content proof even if creation time is unchanged. Within an unchanged,
+    // known creation generation the writer is append-only: do not reread loaded
+    // history on every append, or any bytes at all on settled metadata reads.
+    // If the filesystem supplies no creation time, changed metadata cannot
+    // establish that cheap append-only path and must take content verification.
+    if (!window.replacementPending && window.device === device && window.inode === inode &&
+      window.birthtime === birthtime && opened.size >= window.size &&
+      (window.mtime === mtime || (birthtime !== 0n && opened.size > window.size))) return false;
+    // Only primitive bookmarks/evidence are retained across failure. Decoded
+    // payloads from the replaced generation must never be rolled back as truth.
+    const originalWindow = { ...window };
+    const originalPages = this.#loadedPages.get(kind);
+    const savedPages = originalPages && new Map([...originalPages].map(([key, page]) => [key, { ...page }]));
+    const originalRanges = this.#loadedRanges.get(kind);
+    const savedRanges = originalRanges?.map(([start, end]): [number, number] => [start, end]);
+    try {
+      // Recreating an unchanged source is not compaction: the pinned tail must
+      // stay before unseen appends. Only reuse byte bookmarks after proving all
+      // loaded pages identical; changed payloads still take the reread path below.
+      if (!window.replacementPending && this.#matchesLoadedPages(kind, opened.descriptor, opened.size)) {
+        window.device = device;
+        window.inode = inode;
+        window.birthtime = birthtime;
+        window.mtime = mtime;
+        window.size = opened.size;
+        window.unavailable = false;
+        // Growth must consume its one unread page inside this transaction:
+        // adopting the inode cannot let suffix IO escape the rollback fence.
+        if (followLatest && opened.size > window.tail) {
+          const page = readForwardPage(opened.descriptor, window.tail, opened.size, GROWTH_PAGE_BYTES);
+          if (page.end > window.tail) {
+            this.#applyRecords(kind, page.records, true);
+            this.#rememberRange(kind, page);
+            window.tail = page.end;
+            window.loadedRecords = (window.loadedRecords ?? 0) + page.records.length;
+          }
+        }
+        // loadOlder still needs its backward page in this same click. Growth
+        // is handled even when pinned/at EOF, avoiding a second unread read.
+        return followLatest !== undefined;
+      }
+      // Relocate logical coverage, not a count backwards from the new EOF:
+      // unread arrivals must not displace either loaded history or a pinned leaf.
+      const evidence = [...(this.#loadedPages.get(kind)?.values() ?? [])];
+      const first = evidence.reduce<typeof evidence[number] | undefined>((oldest, page) => !oldest || page.start < oldest.start ? page : oldest, undefined);
+      const last = evidence.reduce<typeof evidence[number] | undefined>((newest, page) => !newest || page.end > newest.end ? page : newest, undefined);
+      const bounds = first && last ? this.#relocateBounds(opened, first.start === 0 ? undefined : first.first, last.last) : undefined;
+      if (!bounds) {
+        // Missing/reused identities are not permission to guess at the new tail.
+        // Discard replaced payloads and leave evidence for a later retry.
+        this.#clearFileState(kind);
+        window.unavailable = true;
+        window.replacementPending = true;
+        this.#setError("Replacement history boundaries are missing or ambiguous");
+        return true;
+      }
+      const pages: RecordPage[] = [];
+      let end = bounds.tail;
+      do {
+        const page = readBackwardPage(opened.descriptor, end, INITIAL_PAGE_BYTES, kind === "events");
+        pages.push(page);
+        if (page.start >= end) break;
+        end = page.start;
+      } while (end > bounds.head);
+      const invalid = this.#loadedPages.get(kind)?.has("invalid");
+      this.#clearFileState(kind);
+      this.#loadedPages.delete(kind);
+      this.#loadedRanges.delete(kind);
+      for (let index = 0; index < pages.length; index++) {
+        const page = pages[index]!;
+        this.#applyRecords(kind, page.records, index === 0);
+        if (index === 0 && invalid) {
+          // Relocation refreshes coverage, not the failed checkpoint proof.
+          this.#loadedPages.set(kind, new Map([["invalid", {
+            start: page.start, end: page.end, digest: null,
+            first: this.#recordBoundary(page.records[0] ?? ""),
+            last: this.#recordBoundary(page.records.at(-1) ?? ""),
+          }]]));
+        }
+        this.#rememberRange(kind, page);
+      }
+      this.#windows.set(kind, {
+        head: pages.at(-1)!.start, tail: bounds.tail, size: opened.size,
+        device, inode, birthtime, mtime, hasOlder: pages.at(-1)!.start > 0,
+        loadedRecords: pages.reduce((count, page) => count + page.records.length, 0), unavailable: false,
+      });
+      if (this.#followed) {
+        const page = readForwardPage(opened.descriptor, bounds.tail, opened.size, GROWTH_PAGE_BYTES);
+        if (page.end > bounds.tail) {
+          this.#applyRecords(kind, page.records, true);
+          this.#rememberRange(kind, page);
+          this.#windows.get(kind)!.tail = page.end;
+        }
+      }
+      return true;
+    } catch {
+      // Verification, relocation, history reread and followed unread-tail IO
+      // form one transaction. Even after apply/clear, retry the ORIGINAL logical
+      // boundary on this same inode; never count backwards from a guessed EOF.
+      this.#clearFileState(kind);
+      if (savedPages) this.#loadedPages.set(kind, savedPages);
+      else this.#loadedPages.delete(kind);
+      if (savedRanges) this.#loadedRanges.set(kind, savedRanges);
+      else this.#loadedRanges.delete(kind);
+      this.#windows.set(kind, { ...originalWindow, unavailable: true, replacementPending: true });
+      this.#setError("Unable to read replacement history");
+      return true;
+    }
+  }
+
+  #recordBoundary(raw: string): string {
+    const record = parseRecord(raw);
+    if (record && isSessionEntry(record)) return JSON.stringify([record.type, record.id, record.parentId, record.timestamp]);
+    const message = record?.message as Record<string, unknown> | undefined;
+    const entry = record?.entry;
+    if (record?.type === "entry_appended" && isSessionEntry(entry)) return JSON.stringify([record.type, entry.type, entry.id, entry.parentId, entry.timestamp]);
+    if (record?.type === "message_end" && message && typeof message.role === "string" && typeof message.timestamp === "number") {
+      return JSON.stringify([record.type, message.role, message.timestamp, message.toolCallId]);
+    }
+    if (record && typeof record.toolCallId === "string" && typeof record.type === "string") {
+      return JSON.stringify([record.type, record.toolCallId, record.toolName]);
+    }
+    // Partial/noncanonical records have no invented durable identity. They
+    // must match bytes; repeated matches still fail closed.
+    return this.#pageDigest([raw]);
+  }
+
+  #relocateBounds(opened: { descriptor: number; size: number }, headKey: string | undefined, tailKey: string): { head: number; tail: number } | undefined {
+    let head = headKey === undefined ? 0 : undefined;
+    let tail: number | undefined;
+    let headMatches = 0;
+    let tailMatches = 0;
+    let offset = 0;
+    while (offset < opened.size) {
+      const page = readForwardPage(opened.descriptor, offset, opened.size, GROWTH_PAGE_BYTES);
+      if (page.end <= offset) break;
+      for (let index = 0; index < page.records.length; index++) {
+        const key = this.#recordBoundary(page.records[index]!);
+        if (key === headKey) { headMatches++; head = page.offsets[index]![0]; }
+        if (key === tailKey) { tailMatches++; tail = page.offsets[index]![1]; }
+      }
+      offset = page.end;
+    }
+    return head !== undefined && tail !== undefined && head < tail &&
+      (headKey === undefined || headMatches === 1) && tailMatches === 1 ? { head, tail } : undefined;
+  }
+
+  #clearFileState(kind: FileKind): void {
+    if (kind === "events") { this.#resetEventsState(false); return; }
+    for (const id of this.#sessionEntryIds) {
+      if (this.#eventEntryIds.has(id)) continue;
+      this.#entryIds.delete(id);
+      this.#byId.delete(id);
+    }
+    this.#entries = this.#entries.filter((entry) => this.#byId.has(entry.id));
+    this.#sessionEntryIds.clear();
+    this.#sessionLeafId = undefined;
+    this.#sessionId = undefined;
+    this.#treeDirty = true;
+    this.#messagesDirty = true;
+    this.#entryProjections = new WeakMap();
   }
 
   #ingest(followLatest: boolean): void {
@@ -942,6 +1270,23 @@ export class NativeConversationReader {
           this.#partial = undefined;
           this.#partialArgsRaw.clear();
         }
+        if (message.role === "toolResult") {
+          const previous = this.#tools.get(message.toolCallId);
+          const tool = previous && previous.result === undefined
+            ? this.#toolFor({ toolCallId: message.toolCallId })
+            : undefined;
+          if (tool) {
+            this.#streamingDirty = true;
+            tool.result = {
+              content: message.content,
+              ...(message.details !== undefined ? { details: message.details } : {}),
+            };
+            tool.isError = message.isError === true;
+            tool.status = tool.isError ? "failed" : "completed";
+            tool.executionStarted = true;
+            tool.argsComplete = true;
+          }
+        }
         this.#foldMessage(message);
         return;
       }
@@ -977,7 +1322,9 @@ export class NativeConversationReader {
         if (!tool) return;
         this.#streamingDirty = true;
         const result = event.result as { content?: unknown[]; details?: unknown } | undefined;
-        if (result && typeof result === "object") {
+        // Leave the partial visible until the canonical message arrives. An
+        // empty result here would replace it with an empty final card for a frame.
+        if (result && typeof result === "object" && !isCompactToolResult(result)) {
           tool.result = {
             ...(Array.isArray(result.content) ? { content: result.content } : {}),
             ...(result.details !== undefined ? { details: result.details } : {}),
@@ -1134,14 +1481,15 @@ export class NativeConversationReader {
   #classifyLog(filePath: string): FileKind | "unreadable" {
     const cached = this.#logClassification;
     try {
-      const stat = fs.lstatSync(filePath);
+      const stat = fs.lstatSync(filePath, { bigint: true });
       if (cached?.path === filePath && stat.isFile() && cached.dev === stat.dev && cached.ino === stat.ino &&
-        cached.size > 0 && (stat.size > cached.size || (stat.size === cached.size && stat.mtimeMs === cached.mtimeMs))) {
+        cached.birthtime === stat.birthtimeNs && cached.size > 0n &&
+        (stat.size > cached.size || (stat.size === cached.size && stat.mtimeNs === cached.mtime))) {
         return cached.kind;
       }
       const kind = classifyFile(filePath);
       if (kind !== "unreadable") {
-        this.#logClassification = { path: filePath, kind, dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+        this.#logClassification = { path: filePath, kind, dev: stat.dev, ino: stat.ino, size: stat.size, birthtime: stat.birthtimeNs, mtime: stat.mtimeNs };
         return kind;
       }
     } catch {

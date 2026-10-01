@@ -329,6 +329,7 @@ interface FabricAgentLog {
   events: FabricLogLine[];
   hasMore: boolean;
   before?: number;
+  generation?: string;
 }
 interface FabricActorLog {
   actorId: string;
@@ -338,6 +339,7 @@ interface FabricActorLog {
   session: FabricLogLine[];
   sessionHasMore: boolean;
   sessionBefore?: number;
+  sessionGeneration?: string;
   run?: {
     runId: string;
     eventsFile: string;
@@ -345,6 +347,7 @@ interface FabricActorLog {
     events: FabricLogLine[];
     hasMore: boolean;
     before?: number;
+    generation?: string;
   };
   retainedRuns: string[];
 }
@@ -913,6 +916,8 @@ interface FabricAgentsApi {
     type?: "session" | "run" | "all";
     lines?: number;
     before?: number;
+    /** Required with before. Pair the previous page's generation; cursor-stale means restart without either. */
+    beforeGeneration?: string;
     runId?: string;
   }): Promise<FabricActorLog | FabricAgentLog>;
 }

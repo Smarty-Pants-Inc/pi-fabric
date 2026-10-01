@@ -25,5 +25,5 @@ export const deliverActorToMain = (
     ].filter((line): line is string => Boolean(line)).join("\n"),
     display: true,
     details: { actor, message, delivery: { mode: delivery, triggerTurn, passive: Boolean(deliveryNotice) } },
-  }, { deliverAs: delivery, triggerTurn }, from, "actor", "mesh");
+  }, { deliverAs: delivery, triggerTurn }, from, "actor", "mesh", message.source === "fabric-host" ? undefined : message.principal);
 };

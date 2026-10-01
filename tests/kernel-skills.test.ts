@@ -8,6 +8,7 @@ import { normalizeFabricConfig } from "../src/config.js";
 import { fabricSkillPaths } from "../src/core/kernel-skills.js";
 import { restoreSkillsForFullCodePrompt } from "../src/core/skill-prompt.js";
 import { expandSkillDirMarkersInSkillBlock } from "../src/core/skill-dir.js";
+import { emitBeforeAgentStart } from "./helpers/emit-before-agent-start.js";
 
 const root = path.resolve("skillsets");
 const bundled = (kernel: "typescript" | "python") => loadSkillsFromDir({ dir: fabricSkillPaths(root, kernel)[0]!, source: "test" });
@@ -91,9 +92,9 @@ describe("physical kernel skill trees", () => {
       const discovery = await handlers.get("resources_discover")![0]!({}, {});
       expect(discovery).toEqual({ skillPaths: [path.join(root, kernel)] });
       const event = { systemPrompt: "Base", prompt: "inspect", systemPromptOptions: { skills: bundled(kernel).skills } };
-      const prompt = await handlers.get("before_agent_start")![0]!(event, {});
+      const prompt = await emitBeforeAgentStart(handlers, event, {});
       expect(prompt.systemPrompt).toContain(path.join(root, kernel, "fabric-exec", "SKILL.md"));
-      expect((await handlers.get("before_agent_start")![0]!(event, {})).systemPrompt).toBe(prompt.systemPrompt);
+      expect((await emitBeforeAgentStart(handlers, event, {})).systemPrompt).toBe(prompt.systemPrompt);
       expect(prompt.systemPrompt).not.toContain("fabric-exec-python");
     } finally { ready.mockRestore(); config.mockRestore(); }
   });

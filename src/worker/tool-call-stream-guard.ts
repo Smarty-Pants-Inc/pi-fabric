@@ -1,3 +1,5 @@
+import { assistantStreamEvent } from "./assistant-stream-event.js";
+
 export const TOOL_CALL_WHITESPACE_TIMEOUT_MS = 60_000;
 export const TOOL_CALL_WHITESPACE_MAX_BYTES = 64 * 1024;
 
@@ -46,8 +48,9 @@ export class ToolCallStreamGuard {
       this.#incomplete = false;
       return;
     }
-    if (this.#incomplete || event.type !== "message_update" || !isRecord(event.assistantMessageEvent)) return;
-    const delta = event.assistantMessageEvent;
+    if (this.#incomplete) return;
+    const delta = assistantStreamEvent(event);
+    if (!delta) return;
     if (typeof delta.contentIndex !== "number") return;
     const index = delta.contentIndex;
     if (delta.type === "toolcall_end") {

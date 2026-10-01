@@ -118,6 +118,52 @@ describe("automatic per-host reload admission", () => {
     expect(second.context.reload).toHaveBeenCalledOnce();
   });
 
+  it.each(["acquisition exception", "transient busy hold"])("re-arms scheduler delivery after %s during asynchronous admission", async failure => {
+    const agent = main({ reloadJitterMs: () => 5_000 });
+    if (failure === "acquisition exception") fs.writeFileSync(slots, "blocked");
+    activate(next);
+    let delivered!: Promise<void>;
+    // Deliver inside the sending timer, before its stopRetry() runs. Change the hold
+    // only after the command reaches its first-use import's asynchronous boundary.
+    agent.pi.sendUserMessage = (text: string) => {
+      agent.sent.push(text); delivered = agent.queue();
+      if (failure === "transient busy hold" && agent.sent.length === 1) agent.state.busy = 1;
+    };
+    agent.emit("agent_settled"); expect(agent.sent).toEqual([]);
+    await vi.advanceTimersByTimeAsync(5_000); await delivered;
+    expect(agent.sent).toHaveLength(1);
+    expect(agent.context.reload).not.toHaveBeenCalled();
+    expect(attemptedSelfReload(agent.id, next)).toBe(false);
+    if (failure === "acquisition exception") fs.unlinkSync(slots);
+    agent.state.busy = 0;
+    // No manual execute() and no second settlement: the scheduler must recover.
+    await vi.advanceTimersByTimeAsync(5_000); await delivered;
+    expect(agent.sent).toHaveLength(2);
+    expect(agent.context.reload).toHaveBeenCalledOnce();
+  });
+
+  it.each(["halted", "switch", "shutdown", "disabled", "target changed"])("does not re-arm stale or explicitly held admission after %s", async change => {
+    let configured = true;
+    const agent = main({ reloadJitterMs: () => 5_000, autoReloadConfigured: () => configured });
+    activate(next);
+    let delivered!: Promise<void>;
+    agent.pi.sendUserMessage = (text: string) => {
+      agent.sent.push(text); delivered = agent.queue();
+      if (change === "halted") agent.state.halted = true;
+      else if (change === "switch") agent.controller.sessionStart("switch", agent.context as never);
+      else if (change === "shutdown") agent.emit("session_shutdown");
+      else if (change === "disabled") configured = false;
+      else activate(old);
+    };
+    agent.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(5_000); await delivered;
+    expect(agent.context.reload).not.toHaveBeenCalled();
+    expect(attemptedSelfReload(agent.id, next)).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(agent.sent).toHaveLength(1);
+  });
+
   it("defaults to six slots without an explicit config dependency", async () => {
     const fleet = Array.from({ length: 7 }, () => main());
     fleet.forEach(agent => hold(agent.context)); activate(next);

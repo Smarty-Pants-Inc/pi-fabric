@@ -497,12 +497,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
             || autoReloadOptedOut(deps.autoReloadConfigured()) || !safe(context, candidate) || !recheck(candidate)) return;
           try { releaseSlot = slots.tryAcquireReloadSlot(concurrency(), deps.reloadSlotsDirectory); }
           catch { return; } // inaccessible host state fails closed, without consuming the target
-          if (!releaseSlot) {
-            // Scheduling the delivered command stopped the idle timer. A full host must
-            // re-arm it here so this pending target can run once activation frees capacity.
-            armRetry(context);
-            return;
-          }
+          if (!releaseSlot) return; // leave pending; finally restores idle retry
         }
         // No await between final profile/safety checks, lease acquisition and native reload.
         if (!safe(context, candidate) || !recheck(candidate)) return;
@@ -523,6 +518,13 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
           releaseSlot?.();
         }
         admitting = false;
+        // A synchronous timer delivery stops the handler's pre-await retry. Restore it
+        // after EVERY unsuccessful async admission exit (import/acquisition failure,
+        // full capacity or a transient safety hold), but never revive a stale or halted
+        // session, a changed target, or an attempt already handed to native reload.
+        if (auto && !handoff && generation === commandGeneration && id === sessionId && contextNow
+          && !userHalted() && !autoReloadOptedOut(deps.autoReloadConfigured())
+          && !attempted(id, candidate) && recheck(candidate)) armRetry(context);
       }
     },
   });

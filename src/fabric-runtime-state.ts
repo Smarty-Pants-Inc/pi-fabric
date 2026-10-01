@@ -688,6 +688,10 @@ export class FabricRuntimeState {
       projectRoot,
       hostId,
       identityId: identity.id,
+      ...(ownsPersistentActorRegistry ? { completionRecipient: {
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: "main", role: participantRole(),
+        startedAt: mainAgent.info(context).startedAt ?? Date.now(),
+      } } : {}),
       retention: this.#config.retention,
       ...(this.#paths
         ? {
@@ -733,9 +737,15 @@ export class FabricRuntimeState {
         const lifecycle = this.#lifecycle;
         if (lifecycle) void lifecycle.publish(event).catch(() => undefined);
       },
-      onBackgroundComplete: (result) => completionInbox.enqueue(result),
+      // Foreground handoffs are retained too, until their finalized result publication consumes them.
+      onSettled: (result) => this.#residency?.enqueueCompletion(result),
+      onBackgroundComplete: (result) => {
+        if (this.#residency) this.#residency.enqueueCompletion(result);
+        else completionInbox.enqueue(result);
+      },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);
+        this.#residency?.acknowledgeCompletion(id);
         markStoppedDelivered(id);
       },
       onStoppedAtClose: (results) => {
@@ -846,6 +856,8 @@ export class FabricRuntimeState {
             sessionId,
             cwd: context.cwd,
             projectRoot,
+            mainName: "main",
+            mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
             ...(participantRole() ? { role: participantRole()! } : {}),
             project: participantProject(context.cwd),
             meshRoot,

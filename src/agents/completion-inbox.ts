@@ -7,7 +7,7 @@ const SUMMARY_CHARS = 4_000;
 const BATCH_CHARS = 16_000;
 const IDLE_BATCH_MS = 40;
 
-type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt">;
+type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt" | "completionDelivery">;
 type PendingCompletion = { result: Completion; delivered: (() => void) | undefined };
 type CompletionMessage = { customType: string; content: string; display: boolean; details: { ids: string[] } };
 
@@ -19,6 +19,7 @@ const clip = (text: string, limit: number): string =>
 export class AgentCompletionInbox {
   readonly #pending = new Map<string, PendingCompletion>();
   readonly #acknowledged = new Set<string>();
+  readonly #handed = new Map<string, (() => void) | undefined>();
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -34,6 +35,7 @@ export class AgentCompletionInbox {
     };
     subscribe("turn_end", (event, ctx) => {
         this.#context = ctx;
+        this.#confirmHeld();
         const stopReason = event.message?.role === "assistant" ? event.message.stopReason : undefined;
         if (ctx.signal?.aborted || stopReason === "aborted" || stopReason === "error") {
           this.#suspended = true;
@@ -64,9 +66,12 @@ export class AgentCompletionInbox {
         });
         return message ? { message } : undefined;
       });
+    subscribe("context", (_event, ctx) => { this.#context = ctx; this.#confirmHeld(); });
+    subscribe("turn_start", (_event, ctx) => { this.#context = ctx; this.#confirmHeld(); });
     subscribe("agent_settled", (_event, ctx) => {
         if (this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
         this.#context = ctx;
+        this.#confirmHeld();
         this.#schedule();
       });
     subscribe("input", (_event, ctx) => {
@@ -87,7 +92,10 @@ export class AgentCompletionInbox {
   enqueue(result: Completion, delivered?: () => void): void {
     if (this.#closed) return;
     if (this.#acknowledged.has(result.id)) {
-      this.#confirmDelivery(delivered);
+      if (this.#handed.has(result.id)) {
+        this.#handed.set(result.id, delivered ?? this.#handed.get(result.id));
+        this.#confirmHeld();
+      } else this.#confirmDelivery(delivered);
       return;
     }
     if (this.#pending.has(result.id)) return;
@@ -96,6 +104,7 @@ export class AgentCompletionInbox {
         id: result.id, name: result.name, status: result.status, startedAt: result.startedAt,
         ...(result.finishedAt !== undefined ? { finishedAt: result.finishedAt } : {}),
         text: clip(result.text, SUMMARY_CHARS),
+        ...(result.completionDelivery ? { completionDelivery: result.completionDelivery } : {}),
         ...(result.error !== undefined ? { error: clip(result.error, SUMMARY_CHARS) } : {}),
       },
       delivered,
@@ -111,6 +120,7 @@ export class AgentCompletionInbox {
   acknowledge(id: string): void {
     this.#acknowledged.add(id);
     this.#pending.delete(id);
+    this.#handed.delete(id);
   }
 
   close(): void {
@@ -120,6 +130,32 @@ export class AgentCompletionInbox {
     for (const unsubscribe of this.#unsubscribe) unsubscribe();
     this.#pending.clear();
     this.#acknowledged.clear();
+    this.#handed.clear();
+  }
+
+  #confirmHeld(): void {
+    if (!this.#handed.size) return;
+    const getEntries = this.#context.sessionManager?.getEntries;
+    if (typeof getEntries !== "function") {
+      // Compatibility for hosts without session inspection; modern Pi requires its persisted carrier.
+      for (const delivered of this.#handed.values()) this.#confirmDelivery(delivered);
+      this.#handed.clear();
+      return;
+    }
+    const entries = getEntries.call(this.#context.sessionManager);
+    // A completion carrier is newly appended. Keep this observation bounded even on huge sessions.
+    for (let index = entries.length - 1; index >= Math.max(0, entries.length - 512); index--) {
+      const entry = entries[index];
+      if (entry?.type !== "custom_message" || entry.customType !== AGENT_COMPLETION_MESSAGE_TYPE) continue;
+      const ids = (entry.details as { ids?: unknown } | undefined)?.ids;
+      if (!Array.isArray(ids)) continue;
+      for (const id of ids) {
+        if (typeof id !== "string" || !this.#handed.has(id)) continue;
+        const delivered = this.#handed.get(id);
+        this.#handed.delete(id);
+        this.#confirmDelivery(delivered);
+      }
+    }
   }
 
   #confirmDelivery(delivered: (() => void) | undefined): void {
@@ -148,7 +184,9 @@ export class AgentCompletionInbox {
       ...batch.map(({ result }) => {
         const seconds = Math.round(Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt) / 1_000);
         const summary = [result.error, result.text].filter(Boolean).join("\n");
-        return `Agent ${oneLine(result.name).slice(0, 80)} (${result.id}) ${result.status} after ${seconds}s:\n${clip(summary || "no result", perResult)}`;
+        const redelivery = result.completionDelivery?.redeliveredFrom;
+        const provenance = redelivery ? ` [re-delivered from dead Main session ${oneLine(redelivery)}]` : "";
+        return `Agent ${oneLine(result.name).slice(0, 80)} (${result.id}) ${result.status} after ${seconds}s${provenance}:\n${clip(summary || "no result", perResult)}`;
       }),
     ].join("\n\n");
     deliver({
@@ -160,7 +198,8 @@ export class AgentCompletionInbox {
     for (const { result, delivered } of batch) {
       this.#pending.delete(result.id);
       this.#acknowledged.add(result.id);
-      this.#confirmDelivery(delivered);
+      this.#handed.set(result.id, delivered);
     }
+    this.#confirmHeld();
   }
 }

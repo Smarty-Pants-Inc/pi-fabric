@@ -165,7 +165,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "repository", "model", "thinking", "parentId"]) ||
+    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -911,7 +911,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       transport: "host",
       capabilities: interactive ? ["steer", "followUp", "fabric"] : ["fabric"],
       interactive,
-      ...(main.cwd ? { cwd: main.cwd } : {}),
+      ...(main.cwd ? { cwd: main.cwd, projectRoot: process.env.PI_FABRIC_PROJECT_ROOT ?? main.cwd } : {}),
       ...(project ? { project } : {}),
       ...(repository ? { repository } : {}),
       ...(role ? { role } : {}),

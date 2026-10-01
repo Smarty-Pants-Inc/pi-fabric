@@ -13,6 +13,7 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { saveWorkerCompletion } from "./agents/completion-journal.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -1581,6 +1582,8 @@ const main = async (): Promise<void> => {
     record.compactionSkipped = logCompaction.compactionSkipped ??
       `Terminal run-log compaction failed; full log retained: ${logCompaction.error}`;
   }
+  // The owning Main may already be dead. Publish through its immutable launch return address.
+  saveWorkerCompletion(options.statusFile, record);
   writeRunRecord(options.statusFile, record);
   terminalWritten = true;
   process.stdout.write(`\n[pi-fabric] ${record.status}\n`);

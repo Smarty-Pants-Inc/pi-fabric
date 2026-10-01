@@ -1200,15 +1200,17 @@ describe("durable completion receipts", () => {
     }
   });
 
-  it("honors disabled completion notifications for envelopes from an older resident host", async () => {
+  it("retains unread older-host envelopes when completion notifications are disabled", async () => {
     const state = await rootHarness("disabled-completion-resume");
-    await seedCompletion(state);
+    const seeded = await seedCompletion(state);
     state.config.agents.notifyOnComplete = false;
     const onBackgroundComplete = vi.fn();
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, onBackgroundComplete });
     try {
       client.start();
-      await waitFor(() => state.mesh.listAll(residentDeliveryPrefix(state.identity.id)).length === 0);
+      await delay(100);
+      expect(state.mesh.get(seeded.key)).toBeDefined();
+      expect(client.statusAgent(seeded.id)).toMatchObject({ completionDelivery: { status: "undelivered" } });
       expect(onBackgroundComplete).not.toHaveBeenCalled();
       expect(state.deliveries).toHaveLength(0);
     } finally {

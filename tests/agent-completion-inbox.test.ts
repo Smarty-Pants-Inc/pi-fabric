@@ -220,6 +220,24 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage).toHaveBeenCalledOnce();
   });
 
+  it("keeps a durable result unread while Pi holds its steer only in memory", () => {
+    const h = harness(); const entries: unknown[] = [];
+    Object.defineProperty(h.context, "sessionManager", { value: { getEntries: () => entries } });
+    const delivered = vi.fn(); h.inbox.enqueue(result("a"), delivered); h.boundary();
+    expect(h.sendMessage).toHaveBeenCalledOnce(); expect(delivered).not.toHaveBeenCalled();
+    h.inbox.enqueue(result("a"), delivered); h.boundary(); expect(delivered).not.toHaveBeenCalled();
+    entries.push({ type: "custom_message", customType: AGENT_COMPLETION_MESSAGE_TYPE, details: { ids: ["a"] } });
+    h.emit("context"); h.emit("context"); expect(delivered).toHaveBeenCalledOnce();
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("does not receipt a carrier lost when its Main closes before Pi persists it", () => {
+    const h = harness();
+    Object.defineProperty(h.context, "sessionManager", { value: { getEntries: () => [] } });
+    const delivered = vi.fn(); h.inbox.enqueue(result("a"), delivered); h.boundary(); h.inbox.close();
+    expect(delivered).not.toHaveBeenCalled();
+  });
+
   it("keeps a receipt failure from replaying the batch or dropping sibling acknowledgments", () => {
     const h = harness();
     const failedReceipt = vi.fn(() => { throw new Error("disk busy"); });

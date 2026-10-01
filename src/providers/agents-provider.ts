@@ -1560,7 +1560,11 @@ export class AgentsProvider implements FabricProvider {
     // An actor's activation run is the actor at work, not an agent: listed, it read as a new
     // root-less agent named after the actor with its run id (smarty-dev#2184). agents.actors lists
     // the actor; the shared directory already omits these runs (agentParticipantRecords).
-    if (scope === "local") return this.manager.list().filter((record) => !record.actorId);
+    if (scope === "local") {
+      const local = this.manager.list().filter((record) => !record.actorId);
+      const seen = new Set(local.map(record => record.id));
+      return [...local, ...(this.residency?.listAgents() ?? []).filter(record => !seen.has(record.id))];
+    }
     // Like agents.members: a mesh-dependent listing (project or lineage) during a write
     // stall is unknown, not short.
     const stalled = this.participants.writeStalled?.();

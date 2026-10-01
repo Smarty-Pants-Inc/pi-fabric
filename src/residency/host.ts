@@ -47,6 +47,7 @@ import {
   type ResidentHostConfig,
   type ResidentHostOwner,
 } from "./protocol.js";
+import { saveCompletion } from "../agents/completion-journal.js";
 import { deliveryRoot, projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { canRemoveTerminalRun } from "../storage/retention.js";
@@ -316,6 +317,9 @@ export class ResidentHost {
       fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,
+      completionRecipient: { rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd,
+        projectRoot: config.projectRoot, name: config.mainName ?? "main", role: config.role,
+        startedAt: config.mainStartedAt ?? this.participants.lastKnown?.(config.rootId)?.participant.startedAt ?? 0 },
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: config.retention,
@@ -338,6 +342,12 @@ export class ResidentHost {
       },
       onBackgroundComplete: (result) => {
         if (!config.agents.notifyOnComplete) return;
+        const original = this.participants.lastKnown?.(config.rootId)?.participant;
+        try {
+          saveCompletion(config.meshRoot, { rootId: config.rootId, sessionId: config.sessionId,
+            cwd: config.cwd, projectRoot: config.projectRoot, name: config.mainName ?? original?.name ?? "main",
+            role: config.role, startedAt: config.mainStartedAt ?? original?.startedAt ?? 0 }, result);
+        } catch { /* The authenticated mesh envelope below remains the retryable source. */ }
         const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
         const summary = (result.text || result.error || "no result").slice(0, COMPLETION_MAX_CHARS);
         void this.#queueDelivery(

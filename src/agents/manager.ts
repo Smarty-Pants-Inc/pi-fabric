@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import type { CompletionRecipient } from "./completion-journal.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -586,6 +587,7 @@ export class AgentManager {
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   readonly #projectRoot: string;
+  readonly #completionRecipient: CompletionRecipient | undefined;
   readonly #hostId: string | undefined;
   readonly #identityId: string | undefined;
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
@@ -642,6 +644,8 @@ export class AgentManager {
       fabricSessionId?: string;
       meshRoot?: string;
       projectRoot?: string;
+      /** Root-owned return address; never inferred from a child request or inherited by nested agents. */
+      completionRecipient?: CompletionRecipient;
       hostId?: string;
       identityId?: string;
       retention?: FabricRetentionConfig;
@@ -692,6 +696,7 @@ export class AgentManager {
     this.#meshRoot = options.meshRoot ?? process.env.PI_FABRIC_MESH_ROOT;
     this.#projectRoot =
       options.projectRoot ?? process.env.PI_FABRIC_PROJECT_ROOT ?? cwd;
+    this.#completionRecipient = options.completionRecipient;
     this.#hostId = options.hostId ?? process.env.PI_FABRIC_HOST_ID;
     this.#identityId = options.identityId ?? process.env.PI_FABRIC_IDENTITY_ID;
     const inheritedBudget = activeBudgetState();
@@ -919,6 +924,10 @@ export class AgentManager {
         this.#retentionTimer = setInterval(() => this.#scheduleRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
         this.#retentionTimer.unref();
         this.#scheduleRetentionSweep();
+      }
+      if (this.#completionRecipient && this.#meshRoot && !request.actorId) {
+        writeJsonAtomic(path.join(runDirectory, "completion-recipient.json"),
+          { meshRoot: this.#meshRoot, recipient: this.#completionRecipient }, { durable: true });
       }
       const taskFile = path.join(runDirectory, "task.txt");
       const statusFile = path.join(runDirectory, "status.json");

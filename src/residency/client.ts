@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletionResult, saveCompletion, type CompletionRecipient } from "../agents/completion-journal.js";
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -38,6 +39,7 @@ import {
   residentHostId,
   residentHostStateNote,
   residentResultPath,
+  residentRoot,
   sleepUnlessAborted,
   type ResidentAgentMetadata,
   type ResidentCommand,
@@ -144,6 +146,7 @@ export class ResidencyClient {
   readonly #inheritedToolAllowlist = readChildToolAllowlist();
   readonly #deliveryPrefix: string;
   readonly #hostPath: string;
+  readonly #completions: CompletionJournal;
   #deliveryTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
@@ -163,6 +166,19 @@ export class ResidencyClient {
     this.#agentsPath = path.join(options.config.residencyRoot, "agents");
     this.#deliveryPrefix = residentDeliveryPrefix(options.config.rootId);
     this.#hostPath = options.hostPath ?? fileURLToPath(new URL("./launcher.js", import.meta.url));
+    this.#completions = new CompletionJournal(options.config.meshRoot, this.#recipient(options.config),
+      options.participants, options.mesh, (result, delivered) => {
+        const acknowledge = () => { delivered(); this.acknowledgeCompletion(result.id); };
+        if (options.onBackgroundComplete) options.onBackgroundComplete(result, acknowledge);
+        else {
+          options.mainAgent.deliverAgent({ from: { id: result.id, name: result.name, kind: "agent" },
+            verification: "mesh", message: `Fabric agent ${result.name} ${result.status}` +
+              (result.completionDelivery?.redeliveredFrom ? ` [re-delivered from dead Main session ${result.completionDelivery.redeliveredFrom}]` : "") +
+              `: ${result.error ?? result.text}`, delivery: "followUp", triggerTurn: true, data: result,
+            deliveryId: `agent-completion:${result.id}` });
+          acknowledge();
+        }
+      });
   }
 
   start(): void {
@@ -375,17 +391,26 @@ export class ResidencyClient {
     return response.handle;
   }
 
+  /** Persist session-scoped background outcomes before their retractable inbox admission. */
+  enqueueCompletion(result: AgentRunResult): void { this.#completions.save(result); }
+
   hasAgent(id: string): boolean {
-    return AGENT_ID_PATTERN.test(id) && fs.existsSync(this.#metadataPath(id));
+    return AGENT_ID_PATTERN.test(id) && (fs.existsSync(this.#metadataPath(id)) || this.#completions.result(id) !== undefined);
   }
 
   statusAgent(id: string): AgentRunRecord | AgentHandleInfo {
     const metadata = this.#metadata(id);
-    if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
+    if (!metadata) {
+      const completion = this.#completions.result(id);
+      if (completion) return completion;
+      throw new Error(`Unknown durable Fabric agent: ${id}`);
+    }
     const record = this.#record(metadata);
     if (!record) return structuredClone(metadata.handle);
     return {
       ...record,
+      ...(terminal(record.status) && !metadata.completionConsumedAt && !completionConsumed(this.options.config.meshRoot, id)
+        ? { completionDelivery: { status: "undelivered" as const, addressedTo: this.options.config.sessionId } } : {}),
       cwd: metadata.handle.cwd,
       ...(metadata.handle.kernel ? { kernel: metadata.handle.kernel } : {}),
       ...(metadata.handle.recursive ? { recursive: true } : {}),
@@ -416,9 +441,9 @@ export class ResidencyClient {
     try {
       entries = fs.readdirSync(this.#agentsPath);
     } catch {
-      return [];
+      entries = [];
     }
-    return entries
+    const records = entries
       .filter((entry) => entry.endsWith(".json"))
       .flatMap((entry) => {
         try {
@@ -427,9 +452,12 @@ export class ResidencyClient {
           return [];
         }
       });
+    const seen = new Set(records.map(record => record.id));
+    return [...records, ...this.#completions.pending().filter(value => !seen.has(value.result.id)).map(pendingCompletionResult)];
   }
 
   acknowledgeCompletion(id: string): void {
+    this.#completions.acknowledge(id);
     const metadata = this.#metadata(id);
     if (!metadata) return;
     if (!metadata.completionConsumedAt) {
@@ -511,6 +539,7 @@ export class ResidencyClient {
       throw error;
     }
     if (!response.ok) throw new Error(response.error ?? `Failed to clean durable Fabric agent ${id}`);
+    this.#completions.forget(id);
     this.options.onResultConsumed?.(id);
     return { cleaned: true };
   }
@@ -567,6 +596,7 @@ export class ResidencyClient {
       fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
       fs.rmSync(this.#metadataPath(metadata.id), { force: true });
       fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
+      this.#completions.forget(metadata.id);
       this.options.onResultConsumed?.(metadata.id);
       return { cleaned: true };
     } catch (error) {
@@ -768,14 +798,56 @@ export class ResidencyClient {
     return work.length ? JSON.stringify(work.sort()) : undefined;
   }
 
+  #recipient(config: ResidentHostConfig): CompletionRecipient {
+    const original = this.options.participants.lastKnown?.(config.rootId)?.participant;
+    return { rootId: config.rootId, sessionId: config.sessionId, cwd: config.cwd, projectRoot: config.projectRoot,
+      name: config.mainName ?? original?.name ?? "main", role: config.role,
+      startedAt: config.mainStartedAt ?? original?.startedAt ??
+        (/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-/.test(config.sessionId)
+          ? Number.parseInt(config.sessionId.replaceAll("-", "").slice(0, 12), 16) : 0) };
+  }
+
+  /** Import authenticated legacy resident envelopes too: upgrading must not strand B72 work. */
+  async #adoptCompletion(entry: MeshStateEntry): Promise<void> {
+    const value = entry.value as Partial<ResidentDeliveryRecord> | undefined;
+    if (!value || value.format !== RESIDENT_HOST_FORMAT || typeof value.rootId !== "string" ||
+      !value.from || value.from.kind !== "agent" || !AGENT_ID_PATTERN.test(value.from.id) ||
+      entry.updatedBy.id !== residentHostId(value.rootId) ||
+      !entry.key.startsWith(residentDeliveryPrefix(value.rootId))) return;
+    const id = value.agentCompletionId ?? value.from.id;
+    if (id !== value.from.id) return;
+    if (completionConsumed(this.options.config.meshRoot, id)) {
+      await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
+      return;
+    }
+    const root = residentRoot(this.options.config.meshRoot, value.rootId);
+    const config = readJson<ResidentHostConfig>(path.join(root, "config.json"));
+    if (!config || config.rootId !== value.rootId || path.resolve(config.residencyRoot) !== root ||
+      typeof config.projectRoot !== "string" || typeof config.cwd !== "string" ||
+      !samePath(config.projectRoot, this.options.config.projectRoot)) return;
+    const metadata = readJson<ResidentAgentMetadata>(path.join(root, "agents", `${id}.json`));
+    if (metadata?.completionConsumedAt) {
+      consumeCompletion(this.options.config.meshRoot, id, config.sessionId);
+      return;
+    }
+    const result = readJson<AgentRunResult>(residentResultPath(root, id)) ??
+      readJson<AgentRunResult>(path.join(root, "runs", id, "status.json"));
+    if (!result || result.id !== id || !terminal(result.status)) return;
+    saveCompletion(this.options.config.meshRoot, this.#recipient(config), result);
+  }
+
   async #drainDeliveries(): Promise<void> {
     if (this.#drainingDeliveries || this.#closed || !this.options.mainAgent.local) return;
     this.#drainingDeliveries = true;
     try {
-      const entries = this.options.mesh.listAll(this.#deliveryPrefix);
+      const entries = this.options.mesh.listAll("residency/deliveries/");
       for (const entry of entries) {
-        try { await this.#deliver(entry); } catch { /* Retain this source for retry; other senders and steers still drain. */ }
+        try {
+          if (entry.key.startsWith(this.#deliveryPrefix)) await this.#deliver(entry);
+          else await this.#adoptCompletion(entry);
+        } catch { /* Retain the durable source for retry; other senders still drain. */ }
       }
+      if (this.options.config.agents.notifyOnComplete) await this.#completions.drain();
     } finally {
       this.#drainingDeliveries = false;
     }
@@ -806,19 +878,18 @@ export class ResidencyClient {
       terminal(data.status) && typeof data.startedAt === "number" ? data.id : undefined);
     if (value.from.kind === "agent" && typeof completionId === "string" && completionId === value.from.id) {
       const metadata = this.#metadata(completionId);
-      if (!metadata || metadata.completionConsumedAt || !this.options.config.agents.notifyOnComplete) {
+      if (metadata?.completionConsumedAt) this.#completions.acknowledge(completionId);
+      if (metadata?.completionConsumedAt || completionConsumed(this.options.config.meshRoot, completionId)) {
         await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
         return;
       }
-      if (this.options.onBackgroundComplete) {
-        // Keep the durable envelope until Main actually consumes it, not merely
-        // until the TUI copies it into its retractable in-memory inbox.
-        const result = this.statusAgent(completionId);
-        if (terminal(result.status) && "startedAt" in result) {
-          this.options.onBackgroundComplete(result as AgentRunResult, () => this.acknowledgeCompletion(completionId));
-        }
-        return;
-      }
+      // No result/notifications disabled is not a receipt. Keep the source pending, never drop it.
+      if (!metadata || !this.options.config.agents.notifyOnComplete) return;
+      // One logical completion key across resident envelopes and the session inbox. Keep
+      // the source until Main consumes it, not just until its in-memory inbox accepts it.
+      const result = this.statusAgent(completionId);
+      if (terminal(result.status) && "startedAt" in result) this.#completions.save(result as AgentRunResult);
+      return;
     }
     // smarty-dev#2236: one record reached Main twice (a failed delete, or a second drainer that
     // listed it through the 2 s read cache before the delete). The record stays the durable copy

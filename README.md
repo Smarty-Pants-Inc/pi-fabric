@@ -138,6 +138,10 @@ Fabric includes a live activity surface in Pi:
 
 See the [interface & commands reference](docs/interface.md) for every view, keybinding, and slash command.
 
+## Environment
+
+`PI_FABRIC_TMPDIR`: absolute directory for Fabric temporary file data (created with mode `0700`); defaults to the OS temp directory; socket/pipe paths stay unchanged.
+
 ## Reference
 
 - [Configuration](docs/configuration.md): `fabric.json`, code modes, tool capture, approvals, and budgets.

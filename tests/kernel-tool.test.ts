@@ -217,6 +217,31 @@ describe("exclusive kernel tool surface", () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
+  it("keeps the original session artifact writer when shutdown removes the runtime during execute", async () => {
+    const closedWriter = vi.fn(async (_content: string): Promise<string> => { throw new Error("session closed"); });
+    let writer: typeof closedWriter | undefined = closedWriter;
+    const state = {
+      bootstrapped: true,
+      config: normalizeFabricConfig({ executor: { kernel: "typescript", maxOutputChars: 1000 }, ui: { toolDisplay: "full" } }),
+      ensure: vi.fn(async () => {}),
+      get outputArtifactWriter() { return writer; },
+      execution: { execute: vi.fn(async () => {
+        writer = undefined;
+        return { success: true, value: "long output with spaces ".repeat(2000), logs: [], audits: [], phases: [], kernel: "typescript",
+          trace: { kind: "pi-fabric.execution", version: 1, outcome: "succeeded", phases: [], operations: [],
+            counts: { droppedValues: 0, truncatedValues: 0, redactedValues: 0, droppedOperations: 0 } } };
+      }) },
+      claimHandoff: vi.fn(async () => undefined),
+      prewalk: { planRequired: () => false },
+    } as unknown as FabricState;
+    const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), value => value);
+    const result = await tool.execute("late-output", { code: "return data" } as never, undefined, undefined, {
+      sessionManager: { getSessionId: () => "session" },
+    } as never);
+    expect(closedWriter).toHaveBeenCalledOnce();
+    expect(result.content).not.toEqual([]);
+  });
+
   it.each(["typescript", "python"] as const)("tells %s programs that payloads are literal", (kernel) => {
     for (const fullCodeMode of [true, false]) {
       const line = "payloads are literal: read files with native tools first";

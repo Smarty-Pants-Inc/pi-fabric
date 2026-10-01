@@ -890,6 +890,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     pendingHandoffs.delete(event.message.toolCallId);
 
     const outerToolResult = event.message as AgentToolResultMessage;
+    const outputArtifactWriter = state.outputArtifactWriter;
     const handoff = await state.runHandoffAtBoundary(
       pending,
       outerToolResult,
@@ -923,7 +924,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       fullOutput,
       modelOutputBudget(state.config.executor.maxOutputChars, boundarySucceeded),
       fullOutput,
-      undefined,
+      outputArtifactWriter,
       residentPriority ? { text: residentPriority, sections } : undefined,
     );
     const details =

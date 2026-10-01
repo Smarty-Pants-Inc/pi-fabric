@@ -1,3 +1,4 @@
+import { currentFabricPrincipal, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
 import { formatAge } from "../residency/protocol.js";
 import { ActorManager, parseBashTimeoutSeconds } from "../actors/manager.js";
@@ -180,7 +181,10 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
   throw new Error(`Invalid Fabric agent kernel: ${String(value)}`);
 };
 
-const runRequest = (args: Record<string, unknown>, context: FabricInvocationContext, manager: AgentManager, options: {allowCwd?: boolean} = {}): AgentRunRequest => normalizeAgentRunRequest({...args, timeoutMs: longerTimeoutOverride(args.timeoutMs, manager)}, { ...manager.config, ...(context.extensionContext.model ? {inheritedModel: context.extensionContext.model} : {}) }, options);
+const runRequest = (args: Record<string, unknown>, context: FabricInvocationContext, manager: AgentManager, options: {allowCwd?: boolean} = {}): AgentRunRequest => ({
+  ...normalizeAgentRunRequest({...args, timeoutMs: longerTimeoutOverride(args.timeoutMs, manager)}, { ...manager.config, ...(context.extensionContext.model ? {inheritedModel: context.extensionContext.model} : {}) }, options),
+  ...(context.extensionContext.sessionManager ? { provenance: fabricTurnProvenance(fabricHostIdentity(context.extensionContext.sessionManager.getSessionId()), "actor", "mesh", currentFabricPrincipal(context.extensionContext)) } : {}),
+});
 
 const handoffTask = (args: Record<string, unknown>): string => {
   const task = typeof args.task === "string" ? args.task.trim() : "";
@@ -1036,6 +1040,7 @@ export class AgentsProvider implements FabricProvider {
             actor.name,
             this.actorManager.ask(actor.id, message, args.data, context.signal, {
               overrides,
+              provenance: fabricTurnProvenance(this.actorManager.identity, "actor", "mesh", currentFabricPrincipal(context.extensionContext)),
               detachOnMainCeiling: isInteractiveMain(context.extensionContext),
             }),
             context,
@@ -1059,6 +1064,7 @@ export class AgentsProvider implements FabricProvider {
           participant.id,
           "ask",
           {
+            principal: currentFabricPrincipal(context.extensionContext),
             message,
             ...(args.data === undefined ? {} : { data: args.data }),
             ...(needsBinding ? { binding } : {}),

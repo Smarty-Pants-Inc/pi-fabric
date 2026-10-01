@@ -1,3 +1,4 @@
+import type { FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
@@ -930,6 +931,7 @@ export class AgentManager {
         ? path.join(runDirectory, "images.json")
         : undefined;
       fs.writeFileSync(taskFile, request.task, { encoding: "utf8", mode: 0o600 });
+      if (request.provenance) fs.writeFileSync(taskFile + ".provenance.json", JSON.stringify(request.provenance), { mode: 0o600 });
       if (imagesFile) {
         fs.writeFileSync(imagesFile, JSON.stringify(request.images), {
           encoding: "utf8",
@@ -1648,14 +1650,14 @@ export class AgentManager {
     };
   }
 
-  steer(id: string, message: string, data?: unknown): AgentSteerResult {
+  steer(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance): AgentSteerResult {
     this.#requireSteerable(id);
-    return this.#appendSteer(id, { type: "steer", message, data });
+    return this.#appendSteer(id, { type: "steer", message, data, provenance });
   }
 
-  followUp(id: string, message: string, data?: unknown): AgentSteerResult {
+  followUp(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance): AgentSteerResult {
     this.#requireSteerable(id);
-    return this.#appendSteer(id, { type: "follow_up", message, data });
+    return this.#appendSteer(id, { type: "follow_up", message, data, provenance });
   }
 
   // Veda children run one headless prompt per invocation; there is no stdin

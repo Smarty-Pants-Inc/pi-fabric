@@ -4,6 +4,7 @@ import type {
   FabricProvider,
   FabricProviderListRequest,
 } from "../protocol.js";
+import { currentFabricPrincipal } from "../fabric-provenance.js";
 import { MeshStore, type MeshIdentity } from "../mesh/store.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../lifecycle/types.js";
@@ -212,6 +213,7 @@ export class MeshProvider implements FabricProvider {
         const publish = (text?: string) => this.store.publish({
           topic,
           from: this.identity,
+          principal: currentFabricPrincipal(context.extensionContext),
           ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
           ...(typeof args.to === "string" ? { to: args.to } : {}),
           ...(text === undefined ? {} : { text }),

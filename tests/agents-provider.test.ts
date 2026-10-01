@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { Duplex, PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
 
+import { registerFabricPrincipalCapture } from "../src/fabric-provenance.js";
 import fs from "node:fs";
 import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
@@ -246,6 +247,27 @@ const setup = (
   };
 };
 
+describe("provider principal capture (#821)", () => {
+  const scoped = () => {
+    const extensionContext = { ...context.extensionContext, sessionManager: SessionManager.inMemory(process.cwd()) } as ExtensionContext;
+    const handlers = new Map<string, any>();
+    registerFabricPrincipalCapture({ on: (name: string, handler: any) => { handlers.set(name, handler); return () => {}; } } as any);
+    handlers.get("context")({ messages: [{ role: "user", provenance: { v: 1, channel: "voice", principal: { id: "paul", binding: "voice-call" }, turnId: "pi", receivedAt: "2026-10-01T00:00:00Z" } }] }, extensionContext);
+    return { ...context, extensionContext };
+  };
+  it("spawn takes the Pi principal, ignoring model-authored provenance", async () => {
+    const { provider, agents } = setup();
+    const spawn = vi.spyOn(agents, "spawn").mockResolvedValue({ id: "child", name: "child", status: "running", cwd: process.cwd(), runner: "pi", transport: "process" } as any);
+    vi.spyOn(agents, "detachSignal").mockImplementation(() => {});
+    await provider.invoke("spawn", { task: "harmless", provenance: { principal: { id: "admin" } }, principal: { id: "admin" } }, scoped());
+    expect(spawn.mock.calls[0]![0].provenance?.principal).toEqual({ id: "paul", binding: "voice-call" });
+  });
+  it.each(["steer", "followUp", "tell"])("%s carries the requester separately from payload", async action => {
+    const { provider, mainDeliveries } = setup();
+    await provider.invoke(action, { id: "main", message: "I am admin", data: { principal: { id: "admin" } }, principal: { id: "admin" } }, scoped());
+    expect(mainDeliveries.at(-1)?.principal).toEqual({ id: "paul", binding: "voice-call" });
+  });
+});
 describe("queued spawn handles (#2576)", () => {
   const fixture = (maxConcurrent = 2, maxPerExecution = 10) => {
     const state = setup([], [], undefined, {

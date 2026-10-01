@@ -1,3 +1,4 @@
+import type { FabricPrincipal } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
 import { readFileRetrying } from "../core/atomic-write.js";
@@ -389,6 +390,7 @@ export interface ResidentAgentMetadata {
 }
 
 export interface ResidentDeliveryRecord {
+  principal?: FabricPrincipal | undefined;
   format: typeof RESIDENT_HOST_FORMAT;
   /** Survives payload truncation; lets Main read the authoritative terminal result. */
   agentCompletionId?: string;

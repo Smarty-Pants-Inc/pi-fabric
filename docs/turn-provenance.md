@@ -34,7 +34,29 @@ Pi writes `turnId` and `receivedAt` at the first receipt. Fabric never creates e
 
 After restart or reload, an unreceived journal item goes to Pi with the original verified sender and `via: "replay"`. Fabric sends no `turnId` or `receivedAt`, including stamps found in an older journal. Pi creates a new authoritative receipt and ignores any receipt fields supplied in extension claims. Its admission record and Fabric send time remain unchanged. An item already held by any persisted session branch is never re-injected. During a live reload, a handed-over item still in Pi's queue or in-memory session is also left alone. Compaction, fork, export, and session-entry stamping remain Pi responsibilities.
 
-Only Pi assigns `keyboard`, `terminal`, and `voice`. Unattested pane writes are terminal input, with no human principal. Fabric never claims `keyboard` or `voice`, never supplies a principal, and does not bind voice from global settings or message text. Consumers treat absent provenance and unknown versions as UNKNOWN.
+Only Pi assigns `keyboard`, `terminal`, and `voice`. Unattested pane writes are terminal input, with no human principal. Fabric never claims `keyboard` or `voice`, never creates a human principal, and does not bind voice from global settings or message text. A relay may carry the original host-admitted principal unchanged, as described below. Consumers treat absent provenance and unknown versions as UNKNOWN.
+
+## Originating principal on relays (#821)
+
+A verified Pi receipt may name an originating requester:
+
+```ts
+principal: { id: "paul", binding: "voice-call" }
+```
+
+`FabricPrincipal` records attribution, **not authority**. Its bindings are `herdr-client`, `voice-call`, and the reserved `org-agent` binding. Fabric accepts a human origin only from a Pi-stamped v1 `keyboard`/`herdr-client` or `voice`/`voice-call` receipt. A Fabric receipt must have an admitted `mesh`/`bridge` sender. All origins require Pi's `turnId` and `receivedAt`; an unstamped extension claim is not a receipt. An `org-agent` origin must already be explicitly enrolled in trusted receipt metadata; there is no lookup by agent name, text, environment role, or payload, and no default org identity mapping in this PR.
+
+Cheap `message_start` and `context` observers capture the requester from actual input metadata. `before_agent_start` clears the previous scope; unattributed user/custom deliveries clear it too. Only Fabric's passive skill/proxy/shell-awareness notices are excluded as non-request inputs. The inference input reconstructs scope after a live extension reload. No journal engine or optional engine is imported at registration.
+
+Model-authored `principal`, `provenance`, `sender`, and nested `data` fields cannot create or upgrade this scope. Agent send/spawn and mesh publish providers snapshot it separately from payload data before constructing outgoing host-owned deliveries. The immediate sender changes at each hop; `principal` does not. No scope means no principal claim. Mesh/control events put principal in the event envelope, not command data; receiving control hydrates the command only from that admitted envelope. The bridge forwards only recorded admissions. Host-originated lifecycle/alarm routing does not borrow an ambient principal.
+
+Task launch stores its admission in a private sidecar next to `task.txt`; steering records keep it separately from message/data. A stable `worker/principal-delivery.js` extension consumes one private, worker-generated delivery id through `/fabric-delivery` and injects through Pi's trusted API. RPC prompts cannot claim provenance: arbitrary RPC/prompt fields and command arguments never provide admission metadata. The extension strips old receipt stamps. Hosts without the explicit capability retain legacy unattributed behavior, including worker prompts. Global installation trust must include the stable worker hook's release path as well as the main extension.
+
+Main's follow-up journal and private actor queues persist the principal with the verified admission before acknowledging it. Replay preserves that snapshot and send time, changes only `via` to `replay`, and lets Pi stamp first receipt. Same-sender deliveries with different principals are separate capable-host batches. Actor activations pass the queued admission into their task launch; automatic actor replies retain the original principal, while host failure alarms carry none. Resident owners preserve the same admission through their private records and controls.
+
+`FabricPrincipalAuthorityCheck` is a typed integration port exported with `FabricPrincipal` from `pi-fabric/mesh`. It describes a principal/action/target check and an `allow`/`refuse`/`unknown` result; **no policy or default refusal rule is installed here**. Knowledge-lead's #808 authority mapping and dev-lead's role/AGENTS rules are prerequisites for the unauthorized-write counterexample (issue acceptance 3b). Attribution alone never authorizes a write.
+
+Positive host-side proof requires a Pi build advertising `hostCapabilities.turnProvenance === 1` that accepts relayed Fabric principals and exposes its stamped receipts. A bare version string (including `0.87.1`) is not evidence of that capability. The pinned legacy SDK and a stock installed host may lack it; a real-process probe must report that blocker rather than fabricate receipts or force a capability flag.
 
 ## Trust boundary
 

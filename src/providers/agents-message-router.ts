@@ -1,3 +1,4 @@
+import { currentFabricPrincipal, fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
 import type { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js";
@@ -130,11 +131,14 @@ export class AgentMessageRouter {
     kind: "steer" | "followUp",
     context?: FabricInvocationContext,
     options: {
+      principal?: FabricPrincipal | undefined;
       from?: MeshIdentity;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    // Capture before routing yields; a queued incoming turn cannot change this send.
+    options = { ...options, principal: context ? currentFabricPrincipal(context.extensionContext) : undefined };
     const result = await this.#withDurableRecovery(id, () => this.#route(id, message, data, kind, context, options));
     // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
     // Older owners never report `stalled`, so their results pass unchanged.
@@ -185,11 +189,13 @@ export class AgentMessageRouter {
     kind: "steer" | "followUp",
     context?: FabricInvocationContext,
     options: {
+      principal?: FabricPrincipal | undefined;
       from?: MeshIdentity;
       triggerTurn?: boolean;
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
     id = this.#sessionTarget(id);
     const isMain = this.mainAgent.matches(id);
     const remoteRoot = isMain ? undefined : this.#rootRouteSnapshot(id);
@@ -206,6 +212,7 @@ export class AgentMessageRouter {
         return this.mainAgent.deliverAgent({
           from: options.from ?? this.actorManager.identity,
           verification: "mesh", // In-process registered producer, not a received command.
+          principal: options.principal,
           message,
           delivery: kind,
           ...(typeof options.triggerTurn === "boolean"
@@ -220,13 +227,16 @@ export class AgentMessageRouter {
       }
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       if (!this.control || participant.controlProtocol === "legacy") {
-        return this.actorManager.steerRemote(participant.id, message, kind, data);
+        return options.principal
+          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal)
+          : this.actorManager.steerRemote(participant.id, message, kind, data);
       }
       return this.control.request(
         participant.ownerHostId,
         participant.id,
         kind,
         {
+          principal: options.principal,
           message,
           data,
           ...(typeof options.triggerTurn === "boolean"
@@ -249,8 +259,8 @@ export class AgentMessageRouter {
       context?.activity?.({ type: "entity", id, kind: "agent", name: status.name });
       const result =
         kind === "steer"
-          ? this.manager.steer(id, message, data)
-          : this.manager.followUp(id, message, data);
+          ? this.manager.steer(id, message, data, provenance)
+          : this.manager.followUp(id, message, data, provenance);
       return { queued: true, messageId: result.messageId, routed: "local" };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
@@ -267,7 +277,7 @@ export class AgentMessageRouter {
         remoteAgent.ownerHostId,
         remoteAgent.id,
         kind,
-        { message, data },
+        { message, data, principal: options.principal },
         remoteAgent.ownerIdentityId,
         { routedRemoteHost: remoteAgent.remoteHost ?? null },
       );
@@ -292,6 +302,7 @@ export class AgentMessageRouter {
     if (actor && localActor) {
       context?.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
       const result = this.actorManager.tell(actor.id, message, data, {
+        provenance,
         ...(binding ? { overrides: binding } : {}),
       });
       return { queued: true, messageId: result.messageId, routed: "local" };
@@ -315,13 +326,16 @@ export class AgentMessageRouter {
       if (needsBinding) {
         throw new Error(`Fabric actor owner ${participant.ownerHostId} has no binding control channel`);
       }
-      return this.actorManager.steerRemote(participant.id, message, kind, data);
+      return options.principal
+          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal)
+          : this.actorManager.steerRemote(participant.id, message, kind, data);
     }
     return this.control.request(
       participant.ownerHostId,
       participant.id,
       kind,
       {
+        principal: options.principal,
         message,
         data,
         ...(typeof options.triggerTurn === "boolean"
@@ -370,6 +384,8 @@ export class AgentMessageRouter {
       return { accepted: false, error: `Owner does not control Fabric participant ${command.targetId}` };
     }
 
+    const provenance = verification === "mesh" || verification === "bridge"
+      ? fabricTurnProvenance(from, command.operation === "steer" ? "steer" : "followUp", verification, command.principal) : undefined;
     const message = command.message?.trim();
     if (!message) return { accepted: false, error: "Fabric control message must not be empty" };
     if (command.operation === "ask") {
@@ -387,7 +403,7 @@ export class AgentMessageRouter {
           message,
           command.data,
           signal,
-          command.binding !== undefined ? { binding: command.binding } : {},
+          { provenance, ...(command.binding !== undefined ? { binding: command.binding } : {}) },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -403,6 +419,7 @@ export class AgentMessageRouter {
         result = this.mainAgent.deliverAgent({
         from,
         ...(verification === undefined ? {} : { verification }),
+        principal: provenance?.principal,
         message,
         delivery: command.operation,
         deliveryId: command.commandId,
@@ -428,8 +445,8 @@ export class AgentMessageRouter {
       this.manager.status(command.targetId);
       const result =
         command.operation === "steer"
-          ? this.manager.steer(command.targetId, message, command.data)
-          : this.manager.followUp(command.targetId, message, command.data);
+          ? this.manager.steer(command.targetId, message, command.data, provenance)
+          : this.manager.followUp(command.targetId, message, command.data, provenance);
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
@@ -446,7 +463,7 @@ export class AgentMessageRouter {
         actor.id,
         message,
         command.data,
-        command.binding !== undefined ? { binding: command.binding } : {},
+        { provenance, ...(command.binding !== undefined ? { binding: command.binding } : {}) },
       );
       return { accepted: true, messageId: result.messageId };
     } catch (error) {

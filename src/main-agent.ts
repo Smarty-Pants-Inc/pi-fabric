@@ -4,7 +4,7 @@ import { readFileRetrying, syncPathNamespace, writeFileAtomic } from "./core/ato
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
-import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
+import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 
 const MAIN_AGENT_ALIAS = "main";
 export type FabricAgentMessageDelivery = "steer" | "followUp";
@@ -33,6 +33,8 @@ export interface FabricMainAgentDeliveryRequest {
   from: MeshIdentity;
   /** Recorded admission only; absence (including old bridges) makes no sender claim. */
   verification?: "mesh" | "bridge";
+  /** Host-owned envelope metadata, never request.data. */
+  principal?: FabricPrincipal | undefined;
   message: string;
   delivery: FabricMainAgentDelivery;
   triggerTurn?: boolean;
@@ -150,7 +152,7 @@ interface HeldAgentMessage {
   id: string;
   from: MeshIdentity;
   /** Original verified admission, journalled before acknowledgement; never a Pi receipt stamp. */
-  provenance?: FabricTurnProvenance;
+  provenance?: FabricTurnProvenance | undefined;
   message: string;
   /** The first send of a coalesced chain: it keeps the queue position and the flush wait. */
   sentAt: number;
@@ -373,7 +375,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       id: randomUUID(),
       from: sender,
       ...(request.verification === "mesh" || request.verification === "bridge" ? {
-        provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification),
+        provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification, request.principal),
       } : {}),
       message,
       sentAt: Date.now(),
@@ -770,7 +772,7 @@ export class MainAgentController implements FabricMainAgentTarget {
             // bridged) are UNKNOWN; payload fields and a missing bridge marker prove nothing.
             ...(verified === "mesh" || verified === "bridge" ? {
               provenance: fabricTurnProvenance(sender, via === "steer" || via === "followUp" || via === "actor" || via === "replay"
-                ? via : deliverAs === "steer" ? "steer" : "followUp", verified),
+                ? via : deliverAs === "steer" ? "steer" : "followUp", verified, provenance?.principal),
             } : {}),
             ...(Array.isArray(supersedes) ? { supersedes: supersedes.filter((id) => typeof id === "string") } : {}),
             ...(DIRECT_DELIVERIES.has(deliverAs) && typeof triggerTurn === "boolean" ? { deliverAs, triggerTurn } : {}),

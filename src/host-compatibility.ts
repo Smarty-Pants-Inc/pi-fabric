@@ -98,6 +98,7 @@ export const followUpDrainSupported = (version: string | undefined = detectPiHos
 export interface FabricTurnProvenance {
   v: 1;
   channel: "fabric";
+  principal?: FabricPrincipal | undefined;
   sender: {
     id: string;
     kind: "main" | "actor" | "agent" | "remote";
@@ -106,6 +107,60 @@ export interface FabricTurnProvenance {
   };
   via: "steer" | "followUp" | "actor" | "replay";
 }
+
+/** Attribution only. org-agent is a reserved binding, never inferred from a name/role. */
+export interface FabricPrincipal {
+  readonly id: string;
+  readonly binding: "herdr-client" | "voice-call" | "org-agent";
+}
+
+/** Integration port for #808's authority mapping. No default allow/refuse policy. */
+export type FabricPrincipalAuthorityCheck = (request: {
+  readonly principal: FabricPrincipal | undefined;
+  readonly action: string;
+  readonly target: string;
+}) => { decision: "allow" | "refuse" | "unknown"; reason?: string } | Promise<{ decision: "allow" | "refuse" | "unknown"; reason?: string }>;
+
+/** Snapshot a host/envelope field; never call on message text or model payload data. */
+export const copyFabricPrincipal = (value: unknown): FabricPrincipal | undefined => {
+  const p = value as Partial<FabricPrincipal> | null | undefined;
+  return typeof p?.id === "string" && p.id.trim() && p.id.length <= 256 &&
+    (p.binding === "herdr-client" || p.binding === "voice-call" || p.binding === "org-agent")
+    ? Object.freeze({ id: p.id, binding: p.binding }) : undefined;
+};
+
+/** Only Pi-stamped v1 receipts can start a scope; claims are not receipts. */
+export const principalFromReceipt = (value: unknown): FabricPrincipal | undefined => {
+  const p = value as { v?: unknown; channel?: unknown; turnId?: unknown; receivedAt?: unknown; principal?: unknown; sender?: { verified?: unknown } } | undefined;
+  if (p?.v !== 1 || typeof p.turnId !== "string" || !p.turnId || typeof p.receivedAt !== "string" || !p.receivedAt) return undefined;
+  const principal = copyFabricPrincipal(p.principal);
+  if (p.channel === "keyboard" && principal?.binding === "herdr-client") return principal;
+  if (p.channel === "voice" && principal?.binding === "voice-call") return principal;
+  if (p.channel === "fabric" && (p.sender?.verified === "mesh" || p.sender?.verified === "bridge")) return principal;
+  return undefined;
+};
+
+const turnPrincipals = new WeakMap<object, FabricPrincipal | undefined>();
+const requestMessage = (message: { role?: unknown; customType?: unknown }): boolean =>
+  message.role === "user" || (message.role === "custom" &&
+    !["pi-fabric-skill-reference", "pi-fabric-proxy", "pi-fabric-shell-awareness"].includes(String(message.customType)));
+
+/** Cheap observers only: no engine imports, identity mapping or filesystem work. */
+export const registerFabricPrincipalCapture = (pi: ExtensionAPI): void => {
+  pi.on("before_agent_start", (_event, context) => { turnPrincipals.set(context.sessionManager, undefined); });
+  pi.on("message_start", (event, context) => {
+    if (requestMessage(event.message)) turnPrincipals.set(context.sessionManager, principalFromReceipt((event.message as { provenance?: unknown }).provenance));
+  });
+  pi.on("context", (event, context) => {
+    // Actual inference input includes queued deliveries and survives live reload.
+    // Passive skill/proxy/shell-awareness notices do not replace the requester.
+    const message = [...event.messages].reverse().find(requestMessage);
+    if (message) turnPrincipals.set(context.sessionManager, principalFromReceipt((message as { provenance?: unknown }).provenance));
+  });
+};
+
+export const currentFabricPrincipal = (context?: { sessionManager?: object }): FabricPrincipal | undefined =>
+  context?.sessionManager ? copyFabricPrincipal(turnPrincipals.get(context.sessionManager)) : undefined;
 
 export interface FabricIdentityResolution {
   identity: MeshIdentity;
@@ -154,9 +209,11 @@ export const fabricTurnProvenance = (
   from: MeshIdentity,
   via: FabricTurnProvenance["via"],
   verified: FabricTurnProvenance["sender"]["verified"],
+  principal?: FabricPrincipal,
 ): FabricTurnProvenance => ({
   v: 1,
   channel: "fabric",
+  ...(copyFabricPrincipal(principal) ? { principal: copyFabricPrincipal(principal) } : {}),
   sender: {
     id: from.id,
     kind: verified === "bridge" ? "remote" : from.kind,
@@ -166,6 +223,21 @@ export const fabricTurnProvenance = (
   via,
 });
 
+/** Rehydrate only host-owned queue/envelope metadata; strip foreign fields and receipt stamps. */
+export const copyFabricProvenance = (value: unknown): FabricTurnProvenance | undefined => {
+  const p = value as Partial<FabricTurnProvenance> | null | undefined;
+  const s = p?.sender;
+  if (p?.v !== 1 || p.channel !== "fabric" || typeof s?.id !== "string" || !s.id ||
+    !["main", "actor", "agent", "remote"].includes(s.kind) ||
+    (s.verified !== "mesh" && s.verified !== "bridge") ||
+    !["steer", "followUp", "actor", "replay"].includes(String(p.via))) return undefined;
+  return {
+    v: 1, channel: "fabric", via: p.via!,
+    sender: { id: s.id, kind: s.verified === "bridge" ? "remote" : s.kind,
+      ...(typeof s.name === "string" ? { name: s.name } : {}), verified: s.verified },
+    ...(copyFabricPrincipal(p.principal) ? { principal: copyFabricPrincipal(p.principal) } : {}),
+  };
+};
 /** Only a recorded admission or an explicit in-process producer may supply verification. */
 export const sendFabricMessage = (
   pi: ExtensionAPI,
@@ -174,10 +246,11 @@ export const sendFabricMessage = (
   from?: MeshIdentity | (() => MeshIdentity),
   via: FabricTurnProvenance["via"] = "actor",
   verification?: "mesh" | "bridge",
+  principal?: FabricPrincipal,
 ): void => {
   const deliveryOptions = from && (verification === "mesh" || verification === "bridge")
     ? fabricProvenanceOptions(pi, options, () =>
-      fabricTurnProvenance(typeof from === "function" ? from() : from, via, verification))
+      fabricTurnProvenance(typeof from === "function" ? from() : from, via, verification, principal))
     : options;
   pi.sendMessage(message, deliveryOptions);
 };

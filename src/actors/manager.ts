@@ -1,3 +1,4 @@
+import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -51,6 +52,8 @@ import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 
 export interface ActorMessageBindingOptions {
+  /** Host-only admitted requester snapshot, separate from payload and bindings. */
+  provenance?: FabricTurnProvenance | undefined;
   /** Per-call values layered over this session binding. */
   overrides?: FabricActorRunBinding;
   /** Already-resolved caller view received through the owner control plane. */
@@ -60,6 +63,7 @@ export interface ActorMessageBindingOptions {
 }
 
 interface ActorQueueItem {
+  provenance?: FabricTurnProvenance | undefined;
   id: string;
   source: string;
   payload: unknown;
@@ -1117,6 +1121,7 @@ export class ActorManager {
     message: string,
     kind: "steer" | "followUp",
     data?: unknown,
+    principal?: FabricPrincipal,
   ): Promise<{ queued: true; messageId: string; routed: "mesh" }> {
     if (!this.meshConfig.enabled) {
       throw new Error("Fabric mesh is disabled; cannot steer a remote agent");
@@ -1124,6 +1129,7 @@ export class ActorManager {
     if (!message.trim()) throw new Error("Steering message must not be empty");
     const event = await this.mesh.publish({
       topic: "fabric.steer",
+      principal,
       kind,
       from: this.identity,
       to: targetId,
@@ -1998,6 +2004,7 @@ export class ActorManager {
         .find((item) => item.coalesceKey === options.coalesceKey);
       if (existing) {
         existing.payload = structuredClone(payload);
+        existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
         if (options.images && options.images.length > 0) {
           existing.images = options.images.map((image) => ({ ...image }));
         } else {
@@ -2020,6 +2027,7 @@ export class ActorManager {
     const itemId = randomUUID();
     const item: ActorQueueItem = {
       id: itemId,
+      ...(options.provenance ? { provenance: structuredClone(options.provenance) } : {}),
       source,
       payload: structuredClone(payload),
       ...(options.images && options.images.length > 0
@@ -2248,6 +2256,7 @@ export class ActorManager {
             throw new Error(result.error || `Actor run ${result.status}`);
           }
           const message = this.#outgoingMessage(actor, item, result);
+          if (item.provenance?.principal) message.principal = item.provenance.principal;
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
           this.#failureStreaks.delete(actor.id);
@@ -2263,6 +2272,7 @@ export class ActorManager {
           await this.mesh
             .publish({
               topic: "fabric.actor.output",
+              principal: message.principal,
               kind: message.action ?? "message",
               from: { id: actor.id, name: actor.name, kind: "actor", sessionId: this.sessionId },
               ...(message.text ? { text: message.text } : {}),
@@ -2419,6 +2429,7 @@ export class ActorManager {
     capabilityDigest?: string,
   ): AgentRunRequest {
     return {
+      ...(item.provenance ? { provenance: structuredClone(item.provenance) } : {}),
       task: [
         `Fabric actor message from ${item.source}:`,
         JSON.stringify({ source: item.source, payload: item.payload, id: item.id }, null, 2),
@@ -2657,6 +2668,8 @@ export class ActorManager {
     const target = event.to;
     if (!target) return;
     const kind = event.kind === "followUp" ? "followUp" : "steer";
+    const provenance = event.verification === "mesh" || event.verification === "bridge"
+      ? fabricTurnProvenance(event.from, kind, event.verification, event.principal) : undefined;
     const message = typeof event.text === "string" ? event.text : "";
     if (!message) return;
     if (this.#relayParticipantSteering) {
@@ -2665,6 +2678,7 @@ export class ActorManager {
           this.#mainAgent.deliverAgent({
             from: event.from,
             ...(event.verification === undefined ? {} : { verification: event.verification }),
+            principal: event.principal,
             message,
             delivery: kind,
             ...(event.data === undefined ? {} : { data: event.data }),
@@ -2676,8 +2690,8 @@ export class ActorManager {
       }
       try {
         this.agents.status(target);
-        if (kind === "steer") this.agents.steer(target, message);
-        else this.agents.followUp(target, message);
+        if (kind === "steer") this.agents.steer(target, message, undefined, provenance);
+        else this.agents.followUp(target, message, undefined, provenance);
         return;
       } catch (error) {
         if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
@@ -2687,7 +2701,7 @@ export class ActorManager {
     }
     try {
       const actor = this.#requireActor(target);
-      this.tell(actor.id, message, event.data);
+      this.tell(actor.id, message, event.data, { provenance });
     } catch {
       /* target lives in another process or is unknown — best-effort drop */
     }
@@ -2730,6 +2744,8 @@ export class ActorManager {
           // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
           // so a joined key could merge two topics' subjects. Keeps the value's type.
           this.#enqueue(actor, `mesh:${event.topic}`, event, {
+            ...(event.verification === "mesh" || event.verification === "bridge"
+              ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
             ownershipChecked: true,
             // Work waits for room; the monitor offers it again (smarty-dev#754).
             ...(event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
@@ -3242,6 +3258,7 @@ export class ActorManager {
           return [JSON.parse(JSON.stringify({
             id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
             activation: item.activation, binding: item.binding,
+            ...(item.provenance ? { provenance: item.provenance } : {}),
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
@@ -3343,6 +3360,7 @@ export class ActorManager {
         source: value.source,
         payload: value.payload,
         createdAt: value.createdAt,
+        ...(copyFabricProvenance(value.provenance) ? { provenance: copyFabricProvenance(value.provenance) } : {}),
         activation: shift(value.activation as FabricActorActivation),
         binding: typeof value.binding === "object" && value.binding !== null ? value.binding : {},
         ...(Array.isArray(value.images) ? { images: value.images } : {}),

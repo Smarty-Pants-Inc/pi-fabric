@@ -272,6 +272,9 @@ interface FabricAgentHandle {
   actorName?: string;
   sessionId?: string;
   runnerSessionId?: string;
+  runnerSessionIds?: string[];
+  mainAgentId?: string;
+  fabricSessionId?: string;
   attachCommand?: string;
   branch?: string;
   worktree?: string;

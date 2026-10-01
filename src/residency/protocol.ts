@@ -490,8 +490,9 @@ export interface ResidentAgentMetadata {
 }
 
 export interface ResidentDeliveryRecord {
-  /** Host alarms name an actor for routing/display only, never as a provenance sender. */
-  source?: "fabric-host";
+  /** Producer-owned classification. Only actor-output admits an actor sender; absent or
+   * unknown classifications (including older/retained records) keep the label but no claim. */
+  source?: "actor-output" | "fabric-host";
   principal?: FabricPrincipal | undefined;
   format: typeof RESIDENT_HOST_FORMAT;
   /** Survives payload truncation; lets Main read the authoritative terminal result. */

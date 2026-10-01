@@ -386,7 +386,7 @@ export class ResidentHost {
             actor.project ?? (typeof config.project === "string" ? config.project : projectOf(config.cwd)),
           ),
           message.source === "fabric-host" ? undefined : message.principal,
-          message.source === "fabric-host" ? "fabric-host" : undefined,
+          message.source === "fabric-host" ? "fabric-host" : "actor-output",
         ).catch(() => undefined);
       },
       {
@@ -653,7 +653,7 @@ export class ResidentHost {
     agentCompletionId?: string,
     rootId = this.config.rootId,
     principal?: FabricPrincipal,
-    source?: "fabric-host",
+    source?: ResidentDeliveryRecord["source"],
   ): Promise<void> {
     const id = randomUUID();
     const prefix = rootId === this.config.rootId ? this.#deliveryPrefix : residentDeliveryPrefix(rootId);

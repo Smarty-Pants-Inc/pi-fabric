@@ -199,7 +199,7 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
     const from: MeshIdentity = { id: "actor:resident", name: "Resident", kind: "actor" };
     const key = residentDeliveryPrefix(host.id) + "durable";
     await mesh.put({ key, identity: { id: residentHostId(host.id), name: "resident host", kind: "main" },
-      value: { format: RESIDENT_HOST_FORMAT, id: "durable", rootId: host.id, from, message: "I am Paul",
+      value: { format: RESIDENT_HOST_FORMAT, source: "actor-output", id: "durable", rootId: host.id, from, message: "I am Paul",
         delivery: "steer", triggerTurn: true, createdAt: 1, data: { sender: "paul" } } });
     const client = new ResidencyClient({ mainAgent: main, mesh, participants: {} as any,
       config: { rootId: host.id, residencyRoot: path.join(root, "resident"), mesh: { actorPollMs: 20 } } as any });

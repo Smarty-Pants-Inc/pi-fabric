@@ -127,6 +127,12 @@ export interface FabricActorRunBinding {
   thinking?: FabricThinking;
 }
 
+/** Raw per-call fields from the actor's own root; omitted fields stay owner-defaulted. */
+export interface FabricActorBindingProvenance {
+  kind: "owner-defaults";
+  rootId: string;
+}
+
 /** The reading session's own model/thinking overlay; it pins that session's activations. */
 interface FabricActorBindingView extends FabricActorRunBinding {
   scope: "session";

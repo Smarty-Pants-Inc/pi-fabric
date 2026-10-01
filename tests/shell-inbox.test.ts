@@ -179,9 +179,9 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.pending(false);
-    const result = h.emit("before_agent_start");
-    expect(result.message.details.ids).toHaveLength(5);
-    expect(result.message.content).toContain("exit 7");
+    const returned = h.emit("before_agent_start");
+    expect(returned.message.details.ids).toHaveLength(5);
+    expect(returned.message.content).toContain("exit 7");
     expect(h.sendMessage).not.toHaveBeenCalled();
     const job = h.begin(); await job.finish(0);
     await vi.advanceTimersByTimeAsync(100);
@@ -246,7 +246,8 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.emit("input");
-    expect(h.emit("before_agent_start").message.details.ids).toEqual([build.id]);
+    expect(h.emit("before_agent_start")).toMatchObject({ message: { details: { ids: [build.id] } } });
+    expect(h.sendMessage).not.toHaveBeenCalled();
   });
   it("discards future events from an abandoned branch and removes hooks on close", async () => {
     const h = harness(); const job = h.begin(); h.emit("session_tree"); await job.finish(0);

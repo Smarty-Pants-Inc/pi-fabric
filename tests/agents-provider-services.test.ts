@@ -318,7 +318,7 @@ describe("agents provider message routing service boundaries", () => {
     const { router, main, actors } = routing();
     const from = { id: "source", name: "Source", kind: "main" as const };
     await router.routeMessage("main", "event", undefined, "followUp", undefined, { from, triggerTurn: false });
-    expect(main.deliverAgent).toHaveBeenCalledWith({ from, message: "event", delivery: "followUp", triggerTurn: false });
+    expect(main.deliverAgent).toHaveBeenCalledWith({ from, verification: "mesh", message: "event", delivery: "followUp", triggerTurn: false });
     expect(actors.validateDirectMessage).not.toHaveBeenCalled();
   });
 

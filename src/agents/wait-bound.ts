@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { FOREGROUND_WAIT_LIMIT_S } from "../guards/foreground-wait.js";
-import { resolveFabricIdentity } from "../main-agent-identity.js";
+import { resolveFabricIdentity } from "../fabric-provenance.js";
 
 // smarty-dev#854: a wait without a bound blocked its session for over an hour. agents.wait and
 // agents.join (native, durable and hosted) take timeoutMs, 5 minutes by default. Every wait runs

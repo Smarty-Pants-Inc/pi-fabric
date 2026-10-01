@@ -43,6 +43,80 @@ describe("ActorRegistryStore", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
+  it("#169 security S2 durably preserves a foreign pending decision through an ordinary replacement", async () => {
+    const { store, actorRoot, registryPath } = setup();
+    const pending = { id: "foreign", rootId: "remote", removal: { requestedAt: 1, runId: "pending" } };
+    await store.withLock(() => store.write([{ id: "local" }]));
+    await store.withLock(() => store.write([pending, { id: "local" }], { durable: true }));
+    const descriptors = new Map<number, string>();
+    const events: string[] = [];
+    const open = fs.openSync.bind(fs);
+    const sync = fs.fsyncSync.bind(fs);
+    const rename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode);
+      descriptors.set(fd, String(file));
+      return fd;
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const file = descriptors.get(fd)!;
+      events.push(file.startsWith(`${registryPath}.`) ? "file" : file);
+      sync(fd);
+    });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === registryPath) events.push("rename");
+      rename(from, to);
+    });
+    await store.withLock(() => store.write([pending, { id: "local", nice: 7 }], { durable: false }));
+    expect(events.slice(0, 2)).toEqual(["file", "rename"]);
+    if (process.platform !== "win32") {
+      expect(events[2]).toBe(actorRoot);
+      expect(events.at(-1)).toBe(path.parse(actorRoot).root);
+    }
+    expect(store.records()).toEqual([pending, { id: "local", nice: 7 }]);
+  });
+
+  it.each(process.platform === "win32" ? ["file"] : ["file", "directory"])("#169 security S2 durably rolls back an accepted decision after a failed %s barrier", async (barrier) => {
+    const { store, actorRoot, registryPath } = setup();
+    const pending = { id: "pending", removal: { requestedAt: 1 } };
+    await store.withLock(() => store.write([{ id: "pending" }]));
+    await store.withLock(() => store.write([pending], { durable: true }));
+    const descriptors = new Map<number, string>();
+    const events: string[] = [];
+    const open = fs.openSync.bind(fs);
+    const sync = fs.fsyncSync.bind(fs);
+    const rename = fs.renameSync.bind(fs);
+    let fail = true;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode);
+      descriptors.set(fd, String(file));
+      return fd;
+    });
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const file = descriptors.get(fd)!;
+      const event = file.startsWith(`${registryPath}.`) ? "file" : file;
+      if (fail && event === (barrier === "file" ? "file" : actorRoot)) {
+        fail = false;
+        events.push("failed");
+        throw new Error("replacement barrier unavailable");
+      }
+      events.push(event);
+      sync(fd);
+    });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === registryPath) events.push("rename");
+      rename(from, to);
+    });
+    await expect(store.withLock(() => store.write([pending, { id: "new" }]))).rejects.toThrow("replacement barrier unavailable");
+    expect(store.records()).toEqual([pending]);
+    const rollback = events.slice(events.indexOf("failed") + 1);
+    expect(rollback.slice(0, 2)).toEqual(["file", "rename"]);
+    if (process.platform !== "win32") {
+      expect(rollback[2]).toBe(actorRoot);
+      expect(rollback.at(-1)).toBe(path.parse(actorRoot).root);
+    }
+  });
+
   it("preserves unknown record fields and filters only invalid record identities", () => {
     const { store, actorRoot, registryPath } = setup();
     fs.mkdirSync(actorRoot);

@@ -118,6 +118,11 @@ export class AgentMessageRouter {
       : id;
   }
 
+  /** Use the same exact session-UUID alias resolution as delivery when grouping lifecycle sources. */
+  isLocalMainTarget(id: string): boolean {
+    return this.mainAgent.local && this.mainAgent.matches(this.#sessionTarget(id));
+  }
+
   async routeMessage(
     id: string,
     message: string,
@@ -200,6 +205,7 @@ export class AgentMessageRouter {
         });
         return this.mainAgent.deliverAgent({
           from: options.from ?? this.actorManager.identity,
+          verification: "mesh", // In-process registered producer, not a received command.
           message,
           delivery: kind,
           ...(typeof options.triggerTurn === "boolean"
@@ -332,6 +338,7 @@ export class AgentMessageRouter {
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
+    verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
@@ -395,6 +402,7 @@ export class AgentMessageRouter {
       try {
         result = this.mainAgent.deliverAgent({
         from,
+        ...(verification === undefined ? {} : { verification }),
         message,
         delivery: command.operation,
         deliveryId: command.commandId,

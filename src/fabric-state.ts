@@ -32,7 +32,7 @@ import type {
   FabricParticipantListOptions,
   FabricPeerInfo,
 } from "./topology/types.js";
-import { resolveFabricIdentity } from "./main-agent-identity.js";
+import { resolveFabricIdentity } from "./fabric-provenance.js";
 import type {
   FabricAgentMessageDelivery,
   FabricAgentMessageResult,

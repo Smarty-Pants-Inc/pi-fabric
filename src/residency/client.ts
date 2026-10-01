@@ -827,8 +827,9 @@ export class ResidencyClient {
     // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
     this.options.mainAgent.deliverAgent({
       from: value.from,
-      verification: "mesh", // The authenticated resident-host record was checked above.
-      principal: value.principal,
+      // The resident writer is authenticated above, but a host alarm has no sending
+      // participant. Keep its actor label for routing/display without admitting a claim.
+      ...(value.source === "fabric-host" ? {} : { verification: "mesh" as const, principal: value.principal }),
       message: value.message,
       delivery: value.delivery,
       triggerTurn: value.triggerTurn,

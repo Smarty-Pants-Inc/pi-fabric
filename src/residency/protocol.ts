@@ -490,6 +490,8 @@ export interface ResidentAgentMetadata {
 }
 
 export interface ResidentDeliveryRecord {
+  /** Host alarms name an actor for routing/display only, never as a provenance sender. */
+  source?: "fabric-host";
   principal?: FabricPrincipal | undefined;
   format: typeof RESIDENT_HOST_FORMAT;
   /** Survives payload truncation; lets Main read the authoritative terminal result. */

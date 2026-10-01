@@ -84,7 +84,7 @@ Use the real Pi CLI/session with the installed releases and read the persisted s
 
 - Exercise background completion from two different children and confirm separate FIFO entries with each originating child's id, `kind: "agent"`, `verified: "mesh"`, and `channel: "fabric"`, never the receiving Main or the other child. Cover prompt-start, turn-boundary, and idle completion delivery.
 - Exercise an explicit handoff and confirm its returned child id in the persisted Fabric sender; an unknown child identity or launch failure must make no claim.
-- Exercise participant-free notices (skill/proxy, shell, reload/resource reload, generated prewalk, and host actor-failure alarms) and confirm no Fabric claim; distinguish genuine actor output, which retains the actor identity. An unclaimed delivery may still have Pi's `terminal` receipt.
+- Exercise participant-free notices (skill/proxy, shell, reload/resource reload, generated prewalk, and host actor-failure alarms) and confirm no Fabric claim. For durable actors, exercise consecutive-failure, session-repaired, and session-repair-failed alarms through the resident producer → durable envelope → client → Main route, not only the local actor callback. On that same route, distinguish genuine actor output, which retains the actor identity. An unclaimed delivery may still have Pi's `terminal` receipt.
 
 Post the recorded completion, handoff, and participant-free-notice evidence and the pass/fail decision on [smarty-dev #2775](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/2775). Any missing or unreadable evidence keeps the gate open; do not substitute legacy or mocked evidence.
 

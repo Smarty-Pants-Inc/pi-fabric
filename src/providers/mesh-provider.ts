@@ -4,6 +4,7 @@ import type {
   FabricProvider,
   FabricProviderListRequest,
 } from "../protocol.js";
+import { invocationFabricPrincipal, snapshotFabricInvocation } from "../fabric-provenance.js";
 import { MeshStore, type MeshIdentity } from "../mesh/store.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../lifecycle/types.js";
@@ -196,6 +197,7 @@ export class MeshProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<unknown> {
+    context = snapshotFabricInvocation(context);
     switch (actionName) {
       case "self":
         return this.identity;
@@ -209,14 +211,19 @@ export class MeshProvider implements FabricProvider {
           throw new Error(`Fabric mesh topic is reserved for host coordination: ${topic}`);
         }
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
-        const publish = (text?: string) => this.store.publish({
-          topic,
-          from: this.identity,
-          ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
-          ...(typeof args.to === "string" ? { to: args.to } : {}),
-          ...(text === undefined ? {} : { text }),
-          ...(args.data !== undefined ? { data: args.data } : {}),
-        });
+        const publish = (text?: string) => {
+          context.signal?.throwIfAborted();
+          return this.store.publish({
+            topic,
+            from: this.identity,
+            principal: invocationFabricPrincipal(context),
+            signal: context.signal,
+            ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
+            ...(typeof args.to === "string" ? { to: args.to } : {}),
+            ...(text === undefined ? {} : { text }),
+            ...(args.data !== undefined ? { data: args.data } : {}),
+          });
+        };
         const event = checked
           ? await deliverWithMessageNotice(args.text as string, checked, publish, "mesh.publish")
           : await publish();

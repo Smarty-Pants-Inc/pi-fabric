@@ -1,3 +1,4 @@
+import type { FabricPrincipal } from "../fabric-provenance.js";
 import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
 import type { FabricAgentRunner, FabricAgentTransport, FabricPythonRuntime } from "../config.js";
 import type { FabricThinking } from "../thinking.js";
@@ -339,6 +340,7 @@ export interface FabricActorLog {
 }
 
 export interface FabricActorMessage {
+  principal?: FabricPrincipal | undefined;
   id: string;
   actorId: string;
   actorName: string;

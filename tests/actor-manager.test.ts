@@ -1,3 +1,4 @@
+import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 import os from "node:os";
@@ -499,6 +500,35 @@ describe("ActorManager across a session reload", () => {
     return manager;
   };
 
+  it.each(["owner-defaults", "resolved"] as const)("keeps originating principal and %s binding mode through an actor queue reload and task launch", async (bindingMode) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-principal-actor-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    }); agentManagers.push(agents);
+    const principal = { id: "paul", binding: "voice-call" as const };
+    const before = reloadable(root, mesh, agents);
+    const actor = await before.create({ name: "relay", instructions: "Harmless.", responseMode: "text" });
+    await before.setModel(actor.id, "provider/private");
+    // Pin a real private queue before its asynchronous drain gets the next event-loop slice.
+    before.tell(actor.id, "harmless relay", { principal: { id: "admin" } }, {
+      provenance: fabricTurnProvenance({ id: "lead", name: "lead", kind: "agent" }, "actor", "mesh", principal),
+      ...(bindingMode === "resolved" ? { binding: {} } : {}),
+    });
+    const saved = queueFiles(root, actor.id).flatMap(({ text }) => JSON.parse(text).items ?? []);
+    expect(saved[0].provenance.principal).toEqual(principal);
+    expect(saved[0]).toMatchObject({ bindingMode, bindingVersion: 2 });
+    // Shut down before the scheduled activation, retaining the private queued admission.
+    await before.close();
+    const spawned = vi.spyOn(agents, "spawn");
+    const after = reloadable(root, mesh, agents);
+    await waitFor(() => after.messages(actor.id).some(m => m.direction === "out" && !m.error), 15_000);
+    expect(spawned.mock.calls.some(([request]) => request.provenance?.principal?.id === "paul")).toBe(true);
+    const request = spawned.mock.calls.find(([request]) => request.provenance?.principal?.id === "paul")![0];
+    expect(request.provenance?.principal).toEqual(principal);
+    expect(request.model).toBe(bindingMode === "resolved" ? undefined : "provider/private");
+    expect(after.messages(actor.id).find(m => m.direction === "out" && !m.error)?.principal).toEqual(principal);
+  }, 30_000);
   it("delivers an event published while the session reloaded, after the reload", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reload-"));
     roots.push(root);
@@ -1789,6 +1819,7 @@ describe("ActorManager", () => {
       expect.any(AbortSignal),
       expect.any(Function),
       expect.any(Function),
+      expect.any(Function), // durable activation-lineage downgrade fence
     );
   });
 

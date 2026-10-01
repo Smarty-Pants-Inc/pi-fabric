@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   boundModelOutput,
+  formatResidentOutcomePriority,
   MAX_FAILURE_MODEL_OUTPUT_CHARS,
   modelOutputBudget,
 } from "../src/output-budget.js";
@@ -14,6 +15,66 @@ describe("modelOutputBudget", () => {
     expect(modelOutputBudget(50_000, true)).toBe(50_000);
     expect(modelOutputBudget(50_000, false)).toBe(MAX_FAILURE_MODEL_OUTPUT_CHARS);
     expect(modelOutputBudget(10_000, false)).toBe(10_000);
+  });
+});
+
+describe("priority model output", () => {
+  const receipts = [
+    { state: "committed" as const, operation: "createActor", entityKind: "actor" as const, requestId: "request-one", id: "actor-one", ownerHostId: "owner-one" },
+    { state: "committed" as const, operation: "spawn", entityKind: "agent" as const, requestId: "request-two", id: "agent-two", ownerHostId: "owner-two" },
+  ];
+  const text = formatResidentOutcomePriority(receipts);
+
+  it("keeps all reconciliation facts first, budgets logs/cause independently and preserves the full artifact", async () => {
+    const sections = [`logs-start ${"log detail; ".repeat(3_000)} logs-end`, `cause-start ${"cause detail; ".repeat(3_000)} cause-end`, "short progress"];
+    const full = [text, ...sections].join("\n\n");
+    const writer = vi.fn(async () => "/tmp/full.txt");
+    const result = await boundModelOutput(sections.join("\n\n"), 2_000, full, writer, { text, sections });
+    expect(result.text.length).toBeLessThanOrEqual(2_000);
+    expect(result.text.startsWith(text + "\n\n")).toBe(true);
+    for (const marker of ["logs-start", "logs-end", "cause-start", "cause-end", "short progress"]) expect(result.text).toContain(marker);
+    expect(result.text).toContain("saved to: /tmp/full.txt]");
+    expect(writer).toHaveBeenCalledExactlyOnceWith(full);
+    expect(result.omittedChars).toBeGreaterThan(0);
+  });
+
+  it("does not truncate a priority block or drop any ID even when receipts alone exceed the soft budget", async () => {
+    const many = Array.from({ length: 300 }, (_, index) => ({ ...receipts[index % 2]!, requestId: `request-${index}`, id: `entity-${index}`, ownerHostId: `owner-${index}` }));
+    const priority = formatResidentOutcomePriority(many);
+    const sections = ["guest prose must not replace receipts".repeat(1_000)];
+    const full = [priority, ...sections].join("\n\n");
+    const result = await boundModelOutput(sections[0]!, 1_000, full, async () => "/tmp/full.txt", { text: priority, sections });
+    expect(result.text).toBe(priority);
+    expect(result.artifactPath).toBe("/tmp/full.txt");
+    for (const receipt of many) for (const id of [receipt.requestId, receipt.id, receipt.ownerHostId]) expect(result.text).toContain(id);
+    expect(result.text).toContain("ResidentOutcomeUnknownError"); expect(result.text).toContain("Do not retry or reassign");
+  });
+
+  it("keeps priority facts when artifact writes fail and handles allocations smaller than a truncation marker", async () => {
+    const sections = ["logs ".repeat(1_000), "cause ".repeat(1_000)];
+    const full = [text, ...sections].join("\n\n");
+    const writer = async () => { throw new Error("disk full"); };
+    for (const budget of [text.length, text.length + 5, text.length + 100, 2_000]) {
+      const result = await boundModelOutput(sections.join("\n\n"), budget, full, writer, { text, sections });
+      expect(result.text.length).toBeLessThanOrEqual(budget);
+      expect(result.text.startsWith(text)).toBe(true);
+      expect(result.artifactPath).toBeUndefined();
+    }
+  });
+
+  it("keeps priority output first without artifact allocation when everything fits", async () => {
+    const sections = ["small logs", "small cause"];
+    const full = [text, ...sections].join("\n\n");
+    const writer = vi.fn(async () => "/tmp/full.txt");
+    const result = await boundModelOutput(sections.join("\n\n"), 2_000, full, writer, { text, sections });
+    expect(result.text).toBe(full); expect(writer).not.toHaveBeenCalled();
+  });
+
+  it("labels unavailable fence facts as unknown without inventing entity/owner IDs", () => {
+    const priority = formatResidentOutcomePriority([{ state: "unknown", operation: "spawn", entityKind: "agent", requestId: "unreadable-fence" }]);
+    expect(priority).toContain("state=unknown"); expect(priority).toContain("requestId=unreadable-fence");
+    expect(priority).toContain("agentId=not yet known, ownerHostId=not yet known");
+    expect(priority).toContain("Do not retry or reassign");
   });
 });
 

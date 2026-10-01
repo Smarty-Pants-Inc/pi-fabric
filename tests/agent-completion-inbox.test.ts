@@ -143,8 +143,8 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.emit("input");
     h.idle(false);
-    const resumed = h.emit("before_agent_start") as { message: { details: { ids: string[] } } };
-    expect(resumed.message.details.ids).toEqual(["a", "b"]);
+    expect(h.emit("before_agent_start")).toMatchObject({ message: { details: { ids: ["a", "b"] } } });
+    expect(h.sendMessage).not.toHaveBeenCalled();
     h.boundary();
     expect(h.sendMessage).not.toHaveBeenCalled();
   });
@@ -185,8 +185,7 @@ describe("AgentCompletionInbox", () => {
     h.inbox.enqueue(result("a"));
     await vi.advanceTimersByTimeAsync(100);
     h.idle(false);
-    const joined = h.emit("before_agent_start") as { message: { details: { ids: string[] } } };
-    expect(joined.message.details.ids).toEqual(["a"]);
+    expect(h.emit("before_agent_start")).toMatchObject({ message: { details: { ids: ["a"] } } });
     expect(h.sendMessage).not.toHaveBeenCalled();
   });
 

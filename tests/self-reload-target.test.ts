@@ -31,7 +31,7 @@ const entry = (name: string, packageName = "smarty-code") => {
   fs.writeFileSync(path.join(dir, "index.js"), "export default () => {};\n");
   return path.join(dir, "index.js");
 };
-const setup = (options: { uiQuery?: boolean; configured?: boolean; packages?: boolean; beforeStart?: (loaded: string) => void } = {}) => {
+const setup = (options: { uiQuery?: boolean; configured?: boolean; packages?: boolean; turnProvenance?: boolean; beforeStart?: (loaded: string) => void } = {}) => {
   const fabric = entry("fabric", "pi-fabric");
   const loaded = entry("code-old");
   const next = entry("code-new");
@@ -49,6 +49,7 @@ const setup = (options: { uiQuery?: boolean; configured?: boolean; packages?: bo
   const sent: string[] = [];
   const replies: Reply[] = [];
   const pi = {
+    ...(options.turnProvenance ? { hostCapabilities: { turnProvenance: 1 } } : {}),
     on: (name: string, handler: Handler) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
     events: {
       on: (name: string, handler: (data: any) => void) => {
@@ -58,7 +59,7 @@ const setup = (options: { uiQuery?: boolean; configured?: boolean; packages?: bo
       emit: (name: string, data: unknown) => { for (const handler of bus.get(name) ?? []) handler(data); },
     },
     registerCommand: (name: string, command: any) => commands.set(name, command),
-    sendUserMessage: (text: string) => { sent.push(text); },
+    sendUserMessage: vi.fn((text: string, _options?: unknown) => { sent.push(text); }),
   };
   pi.events.on(RESULT, data => replies.push(data));
   const state = { busy: 0, halted: false, idle: true, pending: false, prompt: false, settling: false, dialog: false, editor: "", compacting: false };
@@ -104,6 +105,22 @@ const setup = (options: { uiQuery?: boolean; configured?: boolean; packages?: bo
 };
 
 describe("reload-target v1 public producer/consumer counterexamples", () => {
+  it.each([false, true])("preserves pinned resource commands and provenance compatibility (capable=%s)", async turnProvenance => {
+    const s = setup({ turnProvenance }); await s.bind();
+    s.activate(s.next); await s.request(s.next);
+    s.emit("agent_settled", { outcome: "completed" });
+    s.emit("agent_settled", { outcome: "completed" });
+    expect(s.pi.sendUserMessage).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/^\/fabric-release-reload auto resource-\d+$/),
+      { expandPromptTemplates: true, ...(turnProvenance ? { provenance: {
+        v: 1, channel: "fabric", sender: { id: `session:${s.context.sessionManager.getSessionId()}`,
+          name: "main", kind: "main", verified: "mesh" }, via: "followUp",
+      } } : {}) },
+    );
+    await s.execute();
+    expect(s.context.reload).toHaveBeenCalledTimes(1);
+  });
+
   it.each([false, true])("changed Code-only target reloads once at a safe settle (packages=%s)", async packages => {
     const s = setup({ packages }); await s.bind();
     expect(s.sent).toEqual([]);

@@ -282,6 +282,55 @@ describe("AgentManager", () => {
     expect((await manager.wait(queued.id)).status).toBe("completed");
   });
 
+  it.each([false, true])("keeps the resident commit fence separate from activation authority (queued: %s)", async (queued) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const prepared = vi.fn(async () => {});
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      preparePiModel: prepared,
+    });
+    managers.push(manager);
+    const first = queued ? await manager.spawn({ task: "HANG", transport: "process" }) : undefined;
+    const commit = vi.fn((id: string): void => {
+      expect(prepared).toHaveBeenCalled();
+      expect(fs.existsSync(path.join(root, id))).toBe(false);
+    });
+    const handle = await manager.spawn({ task: "independent commit", transport: "process" }, undefined, () => true, commit);
+    if (first) {
+      expect(handle.status).toBe("queued");
+      expect(commit).not.toHaveBeenCalled();
+      await manager.stop(first.id);
+    }
+    expect(await manager.wait(handle.id)).toMatchObject({ status: "completed" });
+    expect(commit).toHaveBeenCalledExactlyOnceWith(handle.id);
+  });
+
+  it.each([false, true])("vetoes an abandoned resident commit before worker mutation and releases capacity (queued: %s)", async (queued) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = queued ? await manager.spawn({ task: "HANG", transport: "process" }) : undefined;
+    let abandonedId = "";
+    const commit = (id: string): void => { abandonedId = id; throw new Error("resident request abandoned"); };
+    const spawn = manager.spawn({ task: "no late mutation", transport: "process" }, undefined, () => true, commit);
+    if (first) {
+      const handle = await spawn;
+      expect(handle.status).toBe("queued");
+      await manager.stop(first.id);
+      expect(await manager.wait(handle.id)).toMatchObject({ status: "failed", error: "resident request abandoned" });
+    } else {
+      await expect(spawn).rejects.toThrow("resident request abandoned");
+    }
+    expect(abandonedId).not.toBe("");
+    expect(fs.existsSync(path.join(root, abandonedId))).toBe(false);
+    expect(manager.runningCount()).toBe(0);
+    expect(await manager.run({ task: "capacity released", transport: "process" })).toMatchObject({ status: "completed" });
+  });
+
   it("revokes a queued activation when its owner generation changes without aborting the signal", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

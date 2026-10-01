@@ -800,10 +800,12 @@ export class AgentManager {
     return runtime;
   }
 
-  /** authorize is host-only activation authority; unlike a guest deadline it survives queuing. */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): Promise<AgentHandleInfo> {
+  /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
+   * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
+   */
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal, authorize);
+    const pending = this.#spawn(request, signal, authorize, beforeCommit);
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -824,7 +826,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -914,6 +916,9 @@ export class AgentManager {
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
+        // Internal resident-host fence: preparation may outlive the caller's deadline.
+        // Activation authority and durable request commit are independent obligations.
+        beforeCommit?.(id);
       } catch (error) {
         release();
         throw error;
@@ -1301,6 +1306,16 @@ export class AgentManager {
     const handle = await this.spawn(request, signal, authorize);
     onSpawned?.(handle);
     return this.wait(handle.id);
+  }
+
+  /** Side-effect-free settlement join for preparation before a durable mutation fence. */
+  async join(id: string): Promise<void> {
+    if (this.#previousRun(id)) return;
+    const managed = this.#requireRun(id);
+    if (!managed.settled) {
+      if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
+      await managed.result;
+    }
   }
 
   /**

@@ -38,7 +38,8 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentsProvider, collectAgentToolPreviewNodes } from "../src/providers/agents-provider.js";
 import type { ResidencyClient } from "../src/residency/client.js";
-import { ResidentOutcomeUnknownError } from "../src/residency/protocol.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
+import { residentHostId, residentRoot, ResidentOutcomeUnknownError } from "../src/residency/protocol.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -110,6 +111,7 @@ const setup = (
     writeStalled?: () => Error | undefined;
     onBackgroundComplete?: (result: import("../src/agents/types.js").AgentRunResult) => void;
     onResultConsumed?: (id: string) => void;
+    canManageActor?: (id: string) => boolean | undefined;
   },
 ) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agents-provider-"));
@@ -170,6 +172,7 @@ const setup = (
     actorRoot: path.join(root, "actors"),
     persistent: true,
     mainAgent,
+    ...(options?.canManageActor ? { canManageActor: options.canManageActor } : {}),
   });
   actorManagers.push(actors);
   const globalActors = new GlobalActorRegistry(root, 64 * 1024);
@@ -464,7 +467,7 @@ describe("Main remote ASK observation ownership", () => {
   ] as const)("preserves accepted %s owner work at the Main ceiling (queued=%s)", async (route, queued) => {
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
-    const owner = setup([], [], undefined, { identity: { id: "session:remoteowner", name: "remote owner", kind: "main", sessionId: "remoteowner" } });
+    const owner = setup([], [], undefined, { workerPath: path.resolve("tests/fixtures/ask-owner-worker.mjs"), identity: { id: "session:remoteowner", name: "remote owner", kind: "main", sessionId: "remoteowner" } });
     const actor = await owner.actors.create({ name: "remote survivor", instructions: "Reply.", transport: "process", responseMode: "text", delivery: "followUp", triggerTurn: false });
     const ownerId = owner.identity.id;
     const senderIdentity: MeshIdentity = { id: "session:observer", name: "observer", kind: "main" };
@@ -497,14 +500,30 @@ describe("Main remote ASK observation ownership", () => {
     const sender = setup([], [member], senderControl);
     const stop = vi.spyOn(owner.agents, "stop");
     const run = vi.spyOn(owner.agents, "run");
+    const publishWorkerStatus = async () => {
+      // inFlightRun only proves acceptance; AgentManager can still expose a handle
+      // without counters until the child writes its first status.json (notably Windows).
+      const handle = owner.agents.list()[0]!;
+      expect(handle.status).toBe("running");
+      expect(handle).not.toHaveProperty("turns"); // Deliberately hold child initialization.
+      fs.writeFileSync(path.join(owner.root, "runs", "owner-worker-ready"), "ready\n");
+      await waitFor(() => {
+        const record = owner.agents.status(handle.id);
+        return "turns" in record && "toolCalls" in record;
+      }, 5_000);
+    };
     try {
       const first = queued ? owner.actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS").catch(error => error) : undefined;
-      if (queued) await waitFor(() => Boolean(owner.actors.status(actor.id).inFlightRun));
+      if (queued) {
+        await waitFor(() => Boolean(owner.actors.status(actor.id).inFlightRun));
+        await publishWorkerStatus();
+      }
       const controller = new AbortController();
       const observation = sender.provider.invoke("ask", { id: actor.id, message: queued ? "accepted queued request" : "LIVE_WITHOUT_PROGRESS" }, {
         ...context, signal: controller.signal, extensionContext: { ...context.extensionContext, mode: "rpc", sessionManager: { getSessionId: () => "observer" } } as unknown as ExtensionContext,
       }).catch(error => error);
       await waitFor(() => queued ? owner.actors.status(actor.id).queued === 1 : Boolean(owner.actors.status(actor.id).inFlightRun));
+      if (!queued) await publishWorkerStatus();
       const ceiling = createMainExecutionCeilingError(700);
       controller.abort(ceiling);
       const rejection = await observation;
@@ -514,6 +533,9 @@ describe("Main remote ASK observation ownership", () => {
       expect(stop).not.toHaveBeenCalled();
       if (queued) expect(owner.actors.status(actor.id).queued).toBe(1);
       else expect(owner.agents.list()[0]).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
+      // Completion is explicitly gated, not a 1.5 s scheduling assumption. Release
+      // accepted work only after proving the unchanged zero-progress ownership law.
+      fs.writeFileSync(path.join(owner.root, "runs", "owner-worker-complete"), "complete\n");
       await first;
       await waitFor(() => owner.actorDeliveries.length === (queued ? 2 : 1) && owner.actors.status(actor.id).status === "idle", 5_000);
       expect(owner.actors.messages(actor.id).filter(message => message.direction === "out")).toHaveLength(queued ? 2 : 1);
@@ -1254,8 +1276,8 @@ describe("AgentsProvider runner support", () => {
     expect(properties(ask)).toHaveProperty("model");
     expect(properties(ask).thinking?.enum).toContain("xhigh");
     expect(properties(tell)).toHaveProperty("model");
-    expect(properties(setModel).scope?.enum).toEqual(["session", "project"]);
-    expect(properties(setThinking).scope?.enum).toEqual(["session", "project"]);
+    expect(properties(setModel).scope?.enum).toEqual(["session", "project", "global"]);
+    expect(properties(setThinking).scope?.enum).toEqual(["session", "project", "global"]);
   });
   it("exposes the Veda runner and per-run persona on run and spawn", async () => {
     const { provider } = setup();
@@ -2973,7 +2995,192 @@ return { first, second, tail: "continued" };`,
   });
 });
 
+describe("AgentsProvider retained run authorization", () => {
+  const prepareAbsoluteSelection = (
+    logDir: string,
+    target: string,
+    archive: (directory: string) => void,
+    backend: typeof path = path,
+  ) => {
+    // POSIX can materialize the old unchecked join so rejection is not a
+    // missing-file accident. Win32 joins embed a second drive colon: never mkdir it.
+    if (backend.sep === "/") archive(backend.join(logDir, target));
+  };
+
+  it("does not mkdir an embedded drive path when preparing a Windows absolute selection", () => {
+    const logDir = "D:\\temp\\actors\\selected\\runs";
+    const target = "D:\\temp\\actors\\foreign\\runs\\33333333333333333333333333333333";
+    const mkdirGuard = vi.fn((directory: string) => {
+      // Reproduce the CI fixture failure without spoofing the host or touching disk.
+      if (directory.slice(2).includes(":")) throw new Error("ENOENT: mkdir embedded drive path");
+    });
+    prepareAbsoluteSelection(logDir, target, mkdirGuard, path.win32);
+    expect(mkdirGuard).not.toHaveBeenCalled();
+  });
+
+  const fixture = async () => {
+    const state = setup();
+    const actor = await state.actors.create(createRequest as FabricActorRequest);
+    const foreign = await state.actors.create({ ...createRequest, name: "foreign-log-owner" } as FabricActorRequest);
+    const ownId = "11111111111111111111111111111111";
+    const olderId = "22222222222222222222222222222222";
+    const foreignId = "33333333333333333333333333333333";
+    const logDir = state.actors.readLog(actor.id).logDir;
+    const foreignLogDir = state.actors.readLog(foreign.id).logDir;
+    const archive = (directory: string, id: string, actorId: string) => {
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id, actorId, status: "completed" }));
+      fs.writeFileSync(path.join(directory, "events.jsonl"), [1, 2, 3].map((index) => JSON.stringify({ index, actorId })).join("\n") + "\n");
+    };
+    archive(path.join(logDir, ownId), ownId, actor.id);
+    archive(path.join(logDir, olderId), olderId, actor.id);
+    archive(path.join(foreignLogDir, foreignId), foreignId, foreign.id);
+    const read = (runId: string, extra: Record<string, unknown> = {}) =>
+      state.provider.invoke("log", { id: actor.id, type: "run", runId, ...extra }, context);
+    return { ...state, actor, foreign, ownId, olderId, foreignId, logDir, foreignLogDir, archive, read };
+  };
+
+  const expectRejectedBeforeRunIO = async (state: Awaited<ReturnType<typeof fixture>>, runId: string) => {
+    const readLog = vi.spyOn(state.actors, "readLog");
+    const join = vi.spyOn(path, "join");
+    const readFile = vi.spyOn(fs, "readFileSync");
+    const open = vi.spyOn(fs, "openSync");
+    const realpath = vi.spyOn(fs, "realpathSync");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    try {
+      await expect(state.read(runId)).rejects.toThrow(/Invalid retained run ID/);
+      expect(readLog).toHaveBeenCalledExactlyOnceWith(state.actor.id, expect.objectContaining({ type: "run", runId }));
+      expect(join.mock.calls.some((parts) => parts.includes(runId))).toBe(false);
+      expect(readFile.mock.calls.some(([file]) => /(?:status\.json|events\.jsonl)$/.test(String(file)))).toBe(false);
+      expect(open).not.toHaveBeenCalled();
+      expect(realpath).not.toHaveBeenCalled();
+      expect(mkdir).not.toHaveBeenCalled();
+    } finally {
+      readLog.mockRestore(); join.mockRestore(); readFile.mockRestore();
+      open.mockRestore(); realpath.mockRestore(); mkdir.mockRestore();
+    }
+  };
+
+  it("rejects an explicitly empty run ID instead of falling back to the last run", async () => {
+    const state = await fixture();
+    await expect(state.read("")).rejects.toThrow(/Invalid retained run ID/);
+  });
+
+  it("rejects traversal to another actor's retained run through the public provider", async () => {
+    const state = await fixture();
+    const target = path.relative(state.logDir, path.join(state.foreignLogDir, state.foreignId));
+    await expect(state.read(target)).rejects.toThrow(/Invalid retained run ID/);
+  });
+
+  it("rejects an absolute caller-selected run path through the public provider", async () => {
+    const state = await fixture();
+    const target = path.join(state.foreignLogDir, state.foreignId);
+    expect(path.isAbsolute(target)).toBe(true);
+    prepareAbsoluteSelection(state.logDir, target, (directory) => state.archive(directory, state.foreignId, state.foreign.id));
+    if (path.sep === "/") {
+      // The old unchecked POSIX join really has readable foreign events.
+      expect(JSON.parse(fs.readFileSync(path.join(state.logDir, target, "status.json"), "utf8")))
+        .toMatchObject({ id: state.foreignId, actorId: state.foreign.id });
+    }
+    await expectRejectedBeforeRunIO(state, target);
+  });
+
+  it.each([
+    ["Windows drive absolute backslash", "C:\\foreign"],
+    ["Windows drive absolute slash", "C:/foreign"],
+    ["Windows drive relative", "C:relative"],
+    ["UNC", "\\\\server\\share"],
+    ["rooted backslash", "\\foreign"],
+    ["mixed separators", "C:\\foreign/../other\\run"],
+    ["colon / alternate data stream", "11111111111111111111111111111111:events"],
+    ["POSIX absolute", "/foreign/run"],
+    ["POSIX traversal", "../foreign/run"],
+    ["Windows traversal", "..\\foreign\\run"],
+    ["uppercase hexadecimal", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
+    ["wrong length", "1111111111111111111111111111111"],
+  ])("rejects %s caller run IDs before an unsafe join or filesystem read", async (_label, runId) => {
+    const state = await fixture();
+    // These values go straight to the public provider, never into fixture paths.
+    await expectRejectedBeforeRunIO(state, runId);
+  });
+
+  it("rejects a valid-shaped foreign actor run ID absent from the selected archive", async () => {
+    const state = await fixture();
+    await expect(state.read(state.foreignId)).rejects.toThrow(/not retained by actor/);
+  });
+
+  it("rejects a foreign actor status copied into the selected actor archive", async () => {
+    const state = await fixture();
+    state.archive(path.join(state.logDir, state.foreignId), state.foreignId, state.foreign.id);
+    await expect(state.read(state.foreignId)).rejects.toThrow(/does not belong to actor/);
+  });
+
+  it("rejects an archive whose status identifies a different run", async () => {
+    const state = await fixture();
+    state.archive(path.join(state.logDir, state.ownId), state.olderId, state.actor.id);
+    await expect(state.read(state.ownId)).rejects.toThrow(/does not belong to actor/);
+  });
+
+  it("rejects a symlinked retained run outside the selected actor archive", async () => {
+    const state = await fixture();
+    fs.symlinkSync(path.join(state.foreignLogDir, state.foreignId), path.join(state.logDir, state.foreignId), "junction");
+    await expect(state.read(state.foreignId)).rejects.toThrow(/outside actor log directory/);
+  });
+
+  it("rejects symlinked event content outside an otherwise owned retained run", async () => {
+    const state = await fixture();
+    const events = path.join(state.logDir, state.ownId, "events.jsonl");
+    fs.unlinkSync(events);
+    fs.symlinkSync(path.join(state.foreignLogDir, state.foreignId, "events.jsonl"), events);
+    await expect(state.read(state.ownId)).rejects.toThrow(/outside retained run directory/);
+  });
+
+  it("preserves legacy retained status without actor attribution only for a matching run ID", async () => {
+    const state = await fixture();
+    const statusFile = path.join(state.logDir, state.olderId, "status.json");
+    fs.writeFileSync(statusFile, JSON.stringify({ id: state.olderId, status: "completed" }));
+    await expect(state.read(state.olderId)).resolves.toMatchObject({ run: { runId: state.olderId, status: { id: state.olderId } } });
+    fs.writeFileSync(statusFile, JSON.stringify({ id: state.foreignId, status: "completed" }));
+    await expect(state.read(state.olderId)).rejects.toThrow(/does not belong to actor/);
+  });
+
+  it("preserves the default current retained run after registry bootstrap", async () => {
+    const state = await fixture();
+    await state.actors.close();
+    const registryFile = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+    registry.actors.find((record: { id: string }) => record.id === state.actor.id).lastRunId = state.ownId;
+    fs.writeFileSync(registryFile, JSON.stringify(registry));
+    const actors = new ActorManager("test", state.identity, state.mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, mainAgent: state.mainAgent,
+    });
+    actorManagers.push(actors);
+    const provider = new AgentsProvider(state.agents, actors, state.globalActors, state.mainAgent, state.participants, undefined, state.lifecycle);
+    await expect(provider.invoke("log", { id: state.actor.id, type: "run" }, context)).resolves.toMatchObject({
+      actorId: state.actor.id, run: { runId: state.ownId, status: { id: state.ownId, actorId: state.actor.id } },
+    });
+  });
+
+  it("preserves default session reads and generation-bound older retained run paging", async () => {
+    const state = await fixture();
+    await expect(state.provider.invoke("log", { id: state.actor.id }, context)).resolves.toMatchObject({ actorId: state.actor.id });
+    await expect(state.read(state.ownId)).resolves.toMatchObject({ run: { runId: state.ownId, events: expect.arrayContaining([expect.objectContaining({ parsed: { index: 1, actorId: state.actor.id } })]) } });
+    const latest = await state.read(state.olderId, { lines: 1 }) as { run: { before: number; generation: string; events: unknown[]; hasMore: boolean } };
+    expect(latest.run).toMatchObject({ events: [{ parsed: { index: 3, actorId: state.actor.id } }], hasMore: true, generation: expect.any(String) });
+    await expect(state.read(state.olderId, { lines: 1, before: latest.run.before, beforeGeneration: latest.run.generation })).resolves.toMatchObject({ run: { events: [{ parsed: { index: 2, actorId: state.actor.id } }], generation: latest.run.generation } });
+  });
+});
+
 describe("AgentsProvider shared actor definitions", () => {
+  it("refuses an unbound public log cursor instead of silently reusing bytes", async () => {
+    const { provider, actors } = setup();
+    const actor = await actors.create(createRequest as FabricActorRequest);
+    await expect(provider.invoke("log", { id: actor.id, before: 10 }, context)).rejects.toMatchObject({
+      name: "cursor-stale", message: expect.stringContaining("re-read from start"),
+    });
+    await expect(provider.invoke("log", { id: actor.id }, context)).resolves.toMatchObject({ actorId: actor.id });
+  });
+
   it("exposes the shared definition, mailbox, and logs while keeping mutation owner-gated", async () => {
     const members: FabricParticipantInfo[] = [];
     const { provider, actors } = setup([], members);
@@ -3187,7 +3394,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "host:resident",
       participant.id,
       "ask",
-      { message: "PING" },
+      { message: "PING", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } },
       "identity:resident",
       { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000, routedRemoteHost: null, detachOnMainCeiling: false },
     );
@@ -3200,7 +3407,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "host:resident",
       participant.id,
       "followUp",
-      expect.objectContaining({ message: "queue" }),
+      expect.objectContaining({ message: "queue", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } }),
       "identity:resident",
       { routedRemoteHost: null },
     );
@@ -4405,6 +4612,144 @@ describe("AgentsProvider switchModel", () => {
     await expect(
       provider.invoke("switchModel", { model: "  " }, modelContext()),
     ).rejects.toThrow(/requires a model selector/);
+  });
+});
+
+describe("own-root resident setters and authoritative status", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const remoteState = async () => {
+    let owned = true;
+    const members: FabricParticipantInfo[] = [];
+    const request = vi.fn<FabricControlPlane["request"]>(async () => ({ queued: true as const, messageId: "routed", routed: "mesh" as const, acknowledged: true as const }));
+    const requestResult = vi.fn(async (_host: string, _id: string, _operation: string, _input: Record<string, unknown>) => ({ id: "reply", text: "done" }));
+    const control = { request, requestResult } as unknown as FabricControlPlane;
+    const state = setup([], members, control, { canManageActor: () => owned });
+    const actor = await state.actors.create({ name: "resident", instructions: "Before", model: "provider/project", thinking: "low", residency: "durable" });
+    await state.actors.setModel(actor.id, "provider/session");
+    await state.actors.setThinking(actor.id, "high");
+    owned = false;
+    members.push({ ...state.participants.self(), id: actor.id, kind: "actor", rootId: state.identity.id,
+      ownerHostId: residentHostId(state.identity.id), ownerIdentityId: residentHostId(state.identity.id),
+      local: false, residency: "durable", capabilities: ["ask", "steer", "followUp", "actor-bindings"], name: actor.name,
+    });
+    const effective: FabricActorInfo = { ...actor, model: "provider/model-b", thinking: "max" };
+    const setActor = vi.fn<ResidencyClient["setActor"]>(async () => effective);
+    const actorStatus = vi.fn<ResidencyClient["actorStatus"]>(async () => effective);
+    const removeActor = vi.fn<ResidentActorClient["removeActor"]>(async () => ({ removed: true as const }));
+    const meshRoot = state.mesh.root;
+    const dir = residentRoot(meshRoot, state.identity.id); fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid: process.pid }));
+    const ensureActor = vi.fn<ResidencyClient["ensureActor"]>(async () => undefined);
+    const residency = { options: { config: { meshRoot, rootId: state.identity.id } }, setActor, actorStatus, removeActor, ensureActor } as unknown as ResidencyClient;
+    const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent, state.participants, control, state.lifecycle, undefined, residency, false);
+    return { ...state, provider, actor, effective, setActor, actorStatus, removeActor, ensureActor, request, requestResult, members };
+  };
+
+  it("routes resident setters without promoting session model/thinking to project", async () => {
+    const state = await remoteState();
+    for (const [operation, args] of [
+      ["setInstructions", { instructions: "After" }], ["setModel", { model: "provider/model-b", scope: "session" }],
+      ["setThinking", { thinking: "max", scope: "session" }], ["setTools", { tools: ["read"] }], ["setActivationFilter", { activationFilter: ["hold"] }],
+    ] as const) await state.provider.invoke(operation, { id: state.actor.id, ...args }, context);
+    expect(state.setActor.mock.calls.map(([mutation]) => mutation)).toEqual([
+      { operation: "setInstructions", id: state.actor.id, instructions: "After" },
+      { operation: "setModel", id: state.actor.id, model: "provider/model-b", scope: "session" },
+      { operation: "setThinking", id: state.actor.id, thinking: "max", scope: "session" },
+      { operation: "setTools", id: state.actor.id, tools: ["read"] },
+      { operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"] },
+    ]);
+    await state.provider.invoke("setModel", { id: state.actor.id, model: "provider/model-b", scope: "project" }, context);
+    expect(state.setActor).toHaveBeenLastCalledWith({ operation: "setModel", id: state.actor.id, model: "provider/model-b", scope: "project" }, context.signal, { identity: state.identity, hostId: state.identity.id });
+    expect(state.setActor.mock.calls.every(([, , caller]) => caller?.identity.id === state.mainAgent.id && caller.identity.kind === "main")).toBe(true);
+    expect(state.actors.status(state.actor.id)).toMatchObject({ model: "provider/session", projectDefaults: { model: "provider/project" } });
+  });
+
+  it.each(["inherited Main", "actor with local flag", "task with local flag", "different root identity"])("rejects resident setters from %s with a typed error before routing", async (caller) => {
+    const state = await remoteState();
+    if (caller === "inherited Main") state.mainAgent.local = false;
+    if (caller === "actor with local flag") state.identity.kind = "actor";
+    if (caller === "task with local flag") state.identity.kind = "agent";
+    if (caller === "different root identity") state.identity.id = "session:other";
+    for (const [operation, args] of [["setInstructions", { instructions: "After" }], ["setModel", { model: "provider/model-b" }],
+      ["setThinking", { thinking: "max" }], ["setTools", { tools: ["read"] }], ["setActivationFilter", { activationFilter: ["hold"] }]] as const) {
+      await expect(state.provider.invoke(operation, { id: state.actor.id, ...args }, context)).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
+    }
+    expect(state.setActor).not.toHaveBeenCalled();
+  });
+
+  it("refuses tools beyond the caller ceiling even for native and global setters", async () => {
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", '["read","fabric_exec"]');
+    try {
+      const { provider, actors, globalActors } = setup();
+      const actor = await actors.create({ name: "native ceiling", instructions: "Read only.", tools: ["read"] });
+      const template = globalActors.create({ name: "template ceiling", instructions: "Read only.", tools: ["read"] });
+      await expect(provider.invoke("setTools", { id: actor.id, tools: ["read", "bash"] }, context)).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
+      await expect(provider.invoke("setTools", { id: template.id, scope: "global", tools: ["write"] }, context)).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
+      expect(actors.status(actor.id).tools).toEqual(["read"]);
+      expect(globalActors.resolve(template.id)?.tools).toEqual(["read"]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("returns host effective status/list rather than a stale Main overlay", async () => {
+    const state = await remoteState();
+    const roster = vi.spyOn(ResidentActorClient.prototype, "actors").mockResolvedValue([state.effective]);
+    await expect(state.provider.invoke("actorStatus", { id: state.actor.id }, context)).resolves.toMatchObject({ model: "provider/model-b", thinking: "max" });
+    await expect(state.provider.invoke("actors", {}, context)).resolves.toEqual([state.effective]);
+    expect(state.actorStatus).toHaveBeenCalledWith(state.actor.id, context.signal);
+    roster.mockRestore();
+  });
+
+  it("sends only raw own-root ask/tell overrides; steer defaults are not auto-resolved into pins", async () => {
+    const state = await remoteState();
+    await state.provider.invoke("ask", { id: state.actor.id, message: "default" }, context);
+    expect(state.requestResult.mock.calls[0]?.[3]).toEqual({ message: "default", bindingProvenance: { kind: "owner-defaults", rootId: state.identity.id } });
+    await state.provider.invoke("tell", { id: state.actor.id, message: "partial", thinking: "xhigh" }, context);
+    expect(state.request.mock.calls[0]?.[3]).toMatchObject({ binding: { thinking: "xhigh" }, bindingProvenance: { kind: "owner-defaults", rootId: state.identity.id } });
+    expect(state.request.mock.calls[0]?.[3]).not.toHaveProperty("binding.model");
+    await state.provider.invoke("steer", { id: state.actor.id, message: "default steer" }, context);
+    expect(state.request.mock.calls[1]?.[3]).not.toHaveProperty("binding");
+    if (process.platform === "linux") {
+      expect(state.ensureActor).toHaveBeenCalledTimes(3);
+      expect(state.ensureActor.mock.calls.every(([id]) => id === state.actor.id)).toBe(true);
+    }
+  });
+
+  it("keeps foreign caller session bindings local and refuses foreign project mutations/removal", async () => {
+    const state = await remoteState();
+    state.members[0]!.rootId = "session:foreign"; state.members[0]!.ownerHostId = "host:foreign";
+    await state.provider.invoke("setModel", { id: state.actor.id, model: "provider/model-a" }, context);
+    await state.provider.invoke("setThinking", { id: state.actor.id, thinking: "xhigh" }, context);
+    expect(state.setActor).not.toHaveBeenCalled();
+    expect(state.actors.status(state.actor.id)).toMatchObject({ model: "provider/model-a", thinking: "xhigh", projectDefaults: { model: "provider/project", thinking: "low" } });
+    await expect(state.provider.invoke("setModel", { id: state.actor.id, model: "provider/model-a", scope: "project" }, context)).rejects.toThrow("owned by another host");
+    await expect(state.provider.invoke("setInstructions", { id: state.actor.id, instructions: "bad" }, context)).rejects.toThrow("owned by another host");
+    await expect(state.provider.invoke("setTools", { id: state.actor.id, tools: ["bash"] }, context)).rejects.toThrow("owned by another host");
+    await expect(state.provider.invoke("setThinking", { id: state.actor.id, thinking: "max", scope: "project" }, context)).rejects.toThrow("owned by another host");
+    await expect(state.provider.invoke("remove", { id: state.actor.id }, context)).rejects.toThrow("Only the owning root");
+  });
+
+  it("keeps a plain session actor local when no root resident owner exists", async () => {
+    const fromEnv = vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue(undefined);
+    const residentCreate = vi.spyOn(ResidentActorClient.prototype, "createActor");
+    const { provider, actors } = setup();
+    const actor = await provider.invoke("create", { name: "plain session", instructions: "Watch", residency: "session" }, context) as FabricActorInfo;
+    expect(actors.owns(actor.id)).toBe(true);
+    expect(residentCreate).not.toHaveBeenCalled();
+    fromEnv.mockRestore(); residentCreate.mockRestore();
+  });
+
+  it("keeps all setter global template mutations global and supports clearing model/thinking", async () => {
+    const { provider, globalActors } = setup();
+    const template = globalActors.create({ name: "template", instructions: "Before", model: "provider/project", thinking: "low" });
+    await provider.invoke("setModel", { id: template.id, model: "provider/model-b", scope: "global" }, context);
+    await provider.invoke("setThinking", { id: template.id, thinking: "max", scope: "global" }, context);
+    await provider.invoke("setInstructions", { id: template.id, instructions: "After", scope: "global" }, context);
+    await provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global" }, context);
+    expect(globalActors.resolve(template.id)).toMatchObject({ model: "provider/model-b", thinking: "max", instructions: "After", activationFilter: ["hold"] });
+    await provider.invoke("setModel", { id: template.id, scope: "global" }, context);
+    await provider.invoke("setThinking", { id: template.id, scope: "global" }, context);
+    expect(globalActors.resolve(template.id)).not.toHaveProperty("model");
+    expect(globalActors.resolve(template.id)).not.toHaveProperty("thinking");
   });
 });
 

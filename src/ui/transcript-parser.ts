@@ -5,6 +5,7 @@ import {
   clip,
   compactRedactedValue,
   contentText,
+  isCompactToolResult,
   messageError,
   recordOf,
   redact,
@@ -21,6 +22,8 @@ type FabricTranscriptEntryStatus = "running" | "completed" | "failed";
 export class TranscriptAccumulator {
   readonly entries: FabricTranscriptEntry[] = [];
   readonly #tools = new Map<string, FabricTranscriptEntry>();
+  readonly #finishedTools = new Set<string>();
+  readonly #toolResultMetadata = new Map<string, Record<string, unknown>>();
   readonly #anonymousTools = new Map<string, FabricTranscriptEntry[]>();
   readonly #activeTools: FabricTranscriptEntry[] = [];
   #assistant: FabricTranscriptEntry | undefined;
@@ -121,6 +124,9 @@ export class TranscriptAccumulator {
     label: string,
     args: unknown,
   ): FabricTranscriptEntry {
+    // Every explicit start ends any prior awaiting-canonical correlation,
+    // including reused IDs whose compact end kept the entry in #tools.
+    this.#toolResultMetadata.delete(id);
     const existing = this.#tools.get(id);
     const safeArgs = args === undefined ? undefined : redactRecord(args);
     if (existing) {
@@ -128,6 +134,7 @@ export class TranscriptAccumulator {
       if (args !== undefined) existing.text = compactRedactedValue(safeArgs ?? redact(args));
       return existing;
     }
+    this.#finishedTools.delete(id);
     const parent = this.#toolParent(id);
     const safeLabel = terminalSafe(label) || "tool";
     const entry: FabricTranscriptEntry = {
@@ -150,6 +157,10 @@ export class TranscriptAccumulator {
 
   #finishTool(id: string | undefined, label: string, result: unknown, failed: boolean): void {
     const safeLabel = terminalSafe(label) || "tool";
+    if (id) {
+      this.#finishedTools.add(id);
+      this.#toolResultMetadata.delete(id);
+    }
     const anonymous = this.#anonymousTools.get(safeLabel);
     const entry = id ? this.#tools.get(id) : anonymous?.shift();
     if (anonymous?.length === 0) this.#anonymousTools.delete(safeLabel);
@@ -211,11 +222,15 @@ export class TranscriptAccumulator {
     }
     if (message.role === "toolResult") {
       const toolId = typeof message.toolCallId === "string" ? message.toolCallId : undefined;
+      // Old RPC logs already completed the call with a full execution-end
+      // result. New logs defer that payload to this canonical message.
+      if (toolId && this.#finishedTools.has(toolId)) return;
       const label = typeof message.toolName === "string" ? message.toolName : "tool";
+      const metadata = toolId ? this.#toolResultMetadata.get(toolId) : undefined;
       this.#finishTool(
         toolId,
         label,
-        { content: message.content, ...(message.details !== undefined ? { details: message.details } : {}) },
+        { content: message.content, ...(message.details !== undefined ? { details: message.details } : {}), ...metadata },
         message.isError === true,
       );
     }
@@ -406,6 +421,10 @@ export class TranscriptAccumulator {
         this.#pushMessage("user", id, contentText(message.content), "completed", "User", this.#userIdentity(event, message));
         return;
       }
+      if (message.role === "toolResult") {
+        this.#appendSessionMessage(event, message);
+        return;
+      }
       if (message.role !== "assistant") return;
       const error = messageError(message);
       if (error) {
@@ -450,6 +469,18 @@ export class TranscriptAccumulator {
     }
 
     if (event.type === "tool_execution_end") {
+      // Neither the marker nor its extra fields are an interim result preview.
+      // Canonical content/details/isError finish the call; the message omits
+      // other tool result fields (e.g. fabric_reply's terminate).
+      if (isCompactToolResult(event.result)) {
+        const toolId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+        if (toolId && !this.#finishedTools.has(toolId)) {
+          const { content: _content, details: _details, ...metadata } = recordOf(event.resultMetadata) ?? {};
+          if (Object.keys(metadata).length > 0) this.#toolResultMetadata.set(toolId, metadata);
+          else this.#toolResultMetadata.delete(toolId);
+        }
+        return;
+      }
       const label = typeof event.toolName === "string" ? event.toolName : "tool";
       this.#finishTool(
         typeof event.toolCallId === "string" ? event.toolCallId : undefined,
@@ -592,7 +623,7 @@ const toolLifecycleEndIds = (event: Record<string, unknown>): string[] => {
   if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") {
     return [event.toolCallId];
   }
-  if (event.type === "message") {
+  if (event.type === "message" || event.type === "message_end") {
     const message = recordOf(event.message);
     return message?.role === "toolResult" && typeof message.toolCallId === "string"
       ? [message.toolCallId]
@@ -609,12 +640,56 @@ const toolLifecycleEndIds = (event: Record<string, unknown>): string[] => {
   });
 };
 
+// Recover only the nearest lifecycle. A prior canonical completion is a
+// boundary too: a reused ID must not borrow an older call's start or metadata.
+export const toolLifecycleContext = (
+  events: Array<Record<string, unknown>>,
+  missingIds: Set<string>,
+): Array<Record<string, unknown>> => {
+  const remaining = new Set(missingIds);
+  const ends = new Map<string, { index: number; event: Record<string, unknown> }>();
+  const selected: Array<{ index: number; event: Record<string, unknown> }> = [];
+  const finish = (id: string): void => {
+    const end = ends.get(id);
+    if (end) selected.push(end);
+    ends.delete(id);
+    remaining.delete(id);
+  };
+  for (let index = events.length - 1; index >= 0 && remaining.size > 0; index--) {
+    const event = events[index]!;
+    for (const start of normalizedToolStarts(event)) {
+      if (!remaining.has(start.id)) continue;
+      selected.push({ index, event: start.event });
+      finish(start.id);
+    }
+    for (const id of toolLifecycleEndIds(event)) {
+      if (!remaining.has(id)) continue;
+      if (event.type === "tool_execution_end" && !ends.has(id)) {
+        // The nearest end wins even if it carries no metadata. Retain full
+        // legacy ends too, so a canonical-only page keeps their args/result.
+        ends.set(id, { index, event });
+      } else if (event.type !== "tool_execution_end" || !isCompactToolResult(event.result)) {
+        finish(id);
+      }
+    }
+  }
+  for (const end of ends.values()) selected.push(end);
+  return selected.sort((a, b) => a.index - b.index).map(({ event }) => event);
+};
+
 export const missingToolStartIds = (events: Array<Record<string, unknown>>): Set<string> => {
   const active = new Set<string>();
   const missing = new Set<string>();
+  const ended = new Set<string>();
   for (const event of events) {
-    for (const start of normalizedToolStarts(event)) active.add(start.id);
+    for (const start of normalizedToolStarts(event)) {
+      active.add(start.id);
+      ended.delete(start.id);
+    }
     for (const id of toolLifecycleEndIds(event)) {
+      // RPC completion and its canonical message are one lifecycle boundary.
+      if (ended.has(id)) continue;
+      ended.add(id);
       if (active.has(id)) active.delete(id);
       else missing.add(id);
     }

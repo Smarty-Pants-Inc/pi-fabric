@@ -4,7 +4,7 @@ import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js"
 import type { FabricAgentMessageResult, FabricMainAgentTarget } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
-import type { FabricControlPlane, FabricControlCommand, FabricControlAcceptance } from "../topology/control-plane.js";
+import { controlActorBindingOptions, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { FabricAgentRunner } from "../config.js";
 import type { ResidencyClient } from "../residency/client.js";
@@ -299,14 +299,14 @@ export class AgentMessageRouter {
     if (!participant) throw new Error(`Fabric actor ${actor!.id} has no live execution owner`);
     if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
     const sessionBinding = actor?.binding;
-    const resolvedBinding = actor
+    const ownRoot = participant.rootId === this.mainAgent.id;
+    const resolvedBinding = ownRoot ? binding : actor
       ? this.actorManager.resolveBinding(actor.id, binding)
       : binding;
     const needsBinding = Boolean(
       resolvedBinding?.model ||
         resolvedBinding?.thinking ||
-        sessionBinding?.model ||
-        sessionBinding?.thinking,
+        (!ownRoot && (sessionBinding?.model || sessionBinding?.thinking)),
     );
     if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
       throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
@@ -328,6 +328,7 @@ export class AgentMessageRouter {
           ? { triggerTurn: options.triggerTurn }
           : {}),
         ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
+        ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
       },
       participant.ownerIdentityId,
       { routedRemoteHost: participant.remoteHost ?? null },
@@ -387,7 +388,7 @@ export class AgentMessageRouter {
           message,
           command.data,
           signal,
-          command.binding !== undefined ? { binding: command.binding } : {},
+          controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId),
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -446,7 +447,7 @@ export class AgentMessageRouter {
         actor.id,
         message,
         command.data,
-        command.binding !== undefined ? { binding: command.binding } : {},
+        controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId),
       );
       return { accepted: true, messageId: result.messageId };
     } catch (error) {

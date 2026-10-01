@@ -1013,8 +1013,8 @@ export class AgentsProvider implements FabricProvider {
         return this.stopParticipant(String(args.id));
       case "cleanup": {
         const id = String(args.id);
-        return this.residency?.hasAgent(id)
-          ? this.residency.cleanupAgent(id, args.deleteBranch === true, context.signal)
+        return (this.residency?.ownsAgent?.(id) ?? this.residency?.hasAgent(id))
+          ? this.residency!.cleanupAgent(id, args.deleteBranch === true, context.signal)
           : this.manager.cleanup(id, args.deleteBranch === true);
       }
       case "create": {
@@ -1397,8 +1397,8 @@ export class AgentsProvider implements FabricProvider {
           if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
           /* not an actor — fall through to agent */
         }
-        if (this.residency?.hasAgent(id)) {
-          return this.residency.readAgentLog(id, { lines, ...cursor });
+        if (this.residency?.ownsAgent?.(id) ?? this.residency?.hasAgent(id)) {
+          return this.residency!.readAgentLog(id, { lines, ...cursor });
         }
         return this.manager.readLog(id, { lines, ...cursor });
       }

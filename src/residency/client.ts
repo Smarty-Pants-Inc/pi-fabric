@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletionResult, saveCompletion, type CompletionRecipient } from "../agents/completion-journal.js";
+import { CompletionJournal, completionConsumed, consumeCompletion, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -398,7 +398,12 @@ export class ResidencyClient {
     return AGENT_ID_PATTERN.test(id) && (fs.existsSync(this.#metadataPath(id)) || this.#completions.result(id) !== undefined);
   }
 
-  statusAgent(id: string): AgentRunRecord | AgentHandleInfo {
+  /** Operational ownership excludes recovered/journal-only ordinary runs. */
+  ownsAgent(id: string): boolean {
+    return AGENT_ID_PATTERN.test(id) && fs.existsSync(this.#metadataPath(id));
+  }
+
+  statusAgent(id: string): AgentRunRecord | AgentHandleInfo | CompletionSummary {
     const metadata = this.#metadata(id);
     if (!metadata) {
       const completion = this.#completions.result(id);
@@ -453,27 +458,30 @@ export class ResidencyClient {
         }
       });
     const seen = new Set(records.map(record => record.id));
-    return [...records, ...this.#completions.pending().filter(value => !seen.has(value.result.id)).map(pendingCompletionResult)];
+    return [...records, ...this.#completions.pending().filter(value => !seen.has(value.result.id))
+      .flatMap(value => { const result = this.#completions.result(value.result.id); return result ? [result] : []; })];
   }
 
-  acknowledgeCompletion(id: string): void {
-    this.#completions.acknowledge(id);
+  /** localRunOwned is supplied only by the owning manager's consumption callback. */
+  acknowledgeCompletion(id: string, localRunOwned = false): void {
+    const journalConsumed = this.#completions.acknowledge(id, localRunOwned);
     const metadata = this.#metadata(id);
-    if (!metadata) return;
-    if (!metadata.completionConsumedAt) {
+    if (metadata && !metadata.completionConsumedAt) {
       atomicWrite(this.#metadataPath(id), { ...metadata, completionConsumedAt: Date.now() });
     }
-    this.options.onResultConsumed?.(id);
+    // Journal-only ordinary outcomes have no durable metadata, but their wait still
+    // retracts an already admitted completion from this session's inbox.
+    if (metadata || journalConsumed) this.options.onResultConsumed?.(id);
   }
 
-  async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult> {
+  async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult | CompletionSummary> {
     while (true) {
       if (signal?.aborted) throw new Error(`Waiting for durable Fabric agent ${id} was aborted`);
       const status = this.statusAgent(id);
-      if (terminal(status.status) && "startedAt" in status) {
+      if (terminal(status.status) && "startedAt" in status && !this.#attemptMayRetry(id)) {
         if (deferConsumption) deferConsumption(() => this.acknowledgeCompletion(id));
         else this.acknowledgeCompletion(id);
-        return status as AgentRunResult;
+        return status as AgentRunResult | CompletionSummary;
       }
       await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
     }
@@ -677,6 +685,19 @@ export class ResidencyClient {
     throw new Error(`Timed out publishing durable Fabric ${kind} ${id} from ${this.hostId}`);
   }
 
+  /** A replacement resident host does not supervise/retry the predecessor's old runs. */
+  #attemptMayRetry(id: string): boolean {
+    const metadata = this.#metadata(id);
+    if (!metadata) return false;
+    const saved = readJson<AgentRunRecord>(residentResultPath(this.options.config.residencyRoot, id));
+    if (saved?.id === id && terminal(saved.status)) return false;
+    const committed = this.#completions.result(id);
+    if (committed && "text" in committed) return false;
+    const manifest = readJson<{ supervisor?: { pid: number; processStartedAt?: string } }>(
+      path.join(metadata.runDirectory, "completion-recipient.json"));
+    return manifest?.supervisor !== undefined && residentProcessAlive(manifest.supervisor.pid, manifest.supervisor.processStartedAt);
+  }
+
   /**
    * The run's live status, else the terminal record the host saved before an idle exit removed
    * the run directory. With neither, no run directory and no live host, the run cannot still be
@@ -847,7 +868,7 @@ export class ResidencyClient {
           else await this.#adoptCompletion(entry);
         } catch { /* Retain the durable source for retry; other senders still drain. */ }
       }
-      if (this.options.config.agents.notifyOnComplete) await this.#completions.drain();
+      await this.#completions.drain(this.options.config.agents.notifyOnComplete);
     } finally {
       this.#drainingDeliveries = false;
     }

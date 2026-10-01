@@ -136,8 +136,12 @@ describe.each([
     inbox.enqueue({ id: "worker", name: "Worker", status: "completed", text: "done", startedAt: 1, finishedAt: 2 }, delivered);
     const first = await h.prompt();
     expect(first.map(entry => entry.details.ids)).toEqual([["worker"]]);
+    // The hook joins first inference, but cannot receipt a carrier Pi has not appended yet.
+    expect(delivered).not.toHaveBeenCalled();
+    await h.emit("context", { messages: first });
     expect(delivered).toHaveBeenCalledOnce();
     await h.emit("agent_settled", { outcome: "completed" });
+    expect(delivered).toHaveBeenCalledOnce();
     expect(await h.prompt()).toEqual(first);
     expect(h.fake.sendMessage.mock.calls.filter(call => call[1]?.triggerTurn)).toEqual([]);
     if (capability !== 1) expect(h.fake.sendMessage).not.toHaveBeenCalled();

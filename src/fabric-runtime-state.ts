@@ -745,7 +745,8 @@ export class FabricRuntimeState {
       },
       onResultConsumed: (id) => {
         completionInbox.acknowledge(id);
-        this.#residency?.acknowledgeCompletion(id);
+        // This manager owns the run: fence consumption even a temporarily failed journal save.
+        this.#residency?.acknowledgeCompletion(id, true);
         markStoppedDelivered(id);
       },
       onStoppedAtClose: (results) => {

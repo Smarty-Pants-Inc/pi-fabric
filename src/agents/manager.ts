@@ -9,7 +9,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import type { CompletionRecipient } from "./completion-journal.js";
+import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
+import { processStartTime } from "../residency/process-identity.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -932,7 +933,8 @@ export class AgentManager {
       }
       if (this.#completionRecipient && this.#meshRoot && !request.actorId) {
         writeJsonAtomic(path.join(runDirectory, "completion-recipient.json"),
-          { meshRoot: this.#meshRoot, recipient: this.#completionRecipient }, { durable: true });
+          { meshRoot: this.#meshRoot, recipient: this.#completionRecipient,
+            supervisor: { pid: process.pid, processStartedAt: processStartTime(process.pid) } }, { durable: true });
       }
       const taskFile = path.join(runDirectory, "task.txt");
       const statusFile = path.join(runDirectory, "status.json");
@@ -2073,6 +2075,9 @@ export class AgentManager {
       // the previous attempt published (token usage above all) before discarding
       // the journal it landed in.
       this.#drainLifecycle(managed);
+      // Once this attempt is superseded, a supervisor crash must not promote its old failure
+      // while the already-launched retry is still running. The previous worker has exited.
+      if (this.#meshRoot) discardWorkerCompletion(this.#meshRoot, managed.id);
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);

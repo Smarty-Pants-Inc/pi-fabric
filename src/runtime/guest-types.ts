@@ -251,6 +251,8 @@ interface FabricLifecycleSubscription {
   lastError?: string;
 }
 interface FabricAgentHandle {
+  /** Present on terminal status snapshots when the full log was retained. */
+  compactionSkipped?: string;
   /** One-based FIFO admission position; present only while queued. */
   queuePosition?: number;
   /** Resolved Fabric kernel, absent for non-Fabric runners. */
@@ -288,6 +290,8 @@ interface FabricRemoteControlResult {
   acknowledged: true;
 }
 interface FabricAgentResult extends FabricAgentHandle {
+  /** Terminal event-log optimization was skipped; the full original log remains. */
+  compactionSkipped?: string;
   task: string;
   startedAt: number;
   finishedAt?: number;

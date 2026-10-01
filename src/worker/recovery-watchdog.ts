@@ -23,7 +23,7 @@ export class PiRecoveryWatchdog {
     this.#timer.unref?.();
   }
 
-  /** Model output and tool activity refresh recovery; errors and retry chatter do not. */
+  /** An accepted assistant response ends recovery; output/tools refresh it if no start was observed. */
   observe(event: Record<string, unknown>): void {
     if (!this.#reason || this.#disposed) return;
     if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(String(event.type))) {
@@ -35,6 +35,13 @@ export class PiRecoveryWatchdog {
       typeof value === "object" && value !== null && !Array.isArray(value);
     const message = event.message;
     if (isRecord(message) && (message.stopReason === "error" || message.stopReason === "aborted")) return;
+    if (event.type === "message_start" && isRecord(message) && message.role === "assistant") {
+      // Pi emits this when the provider starts the retried response, not when
+      // retry scheduling begins. Silent reasoning after acceptance is healthy
+      // inference, governed by the existing overall/idle deadlines instead.
+      this.clear();
+      return;
+    }
     if (event.type === "message_update") {
       const stream = assistantStreamEvent(event);
       if (stream) {

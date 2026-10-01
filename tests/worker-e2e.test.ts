@@ -296,6 +296,21 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(events.some((event) => event.type === "fabric_recovery_error")).toBe(false);
   }, 90_000);
 
+  it("survives an accepted retry followed by 70 seconds of silent reasoning", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "terminated-silent-recover";
+    const result = await run("reason silently then answer", 120_000);
+    expect(result.status).toBe("completed");
+    expect(result.error).toBeUndefined();
+    expect(result.text).toBe("silent reasoning recovered");
+    expect(result.toolCalls).toBe(0);
+    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.filter((event) => event.type === "message_start")).toEqual([
+      { type: "message_start", message: { role: "assistant", content: [], stopReason: "stop" } },
+    ]);
+    expect(events.filter((event) => event.type === "message_update")).toHaveLength(1);
+    expect(events.some((event) => event.type === "fabric_recovery_error")).toBe(false);
+  }, 90_000);
+
   it.each(["terminated-hang", "retry-hang"])(
     "kills a stalled %s despite lifecycle chatter, EOF and SIGTERM refusal", async (behavior) => {
       process.env.FAKE_PI_BEHAVIOR = behavior;

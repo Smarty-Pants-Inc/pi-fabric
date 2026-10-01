@@ -112,6 +112,21 @@ switch (behavior) {
     emit({ type: "agent_start" });
     process.exit(0);
     break;
+  case "terminated-silent-recover": {
+    terminated();
+    emit({ type: "agent_end", willRetry: true });
+    emit({ type: "auto_retry_start", errorMessage: "Error: Terminated" });
+    emit({ type: "agent_start" });
+    emit({ type: "message_start", message: { role: "assistant", content: [], stopReason: "stop" } });
+    setTimeout(() => {
+      emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "silent reasoning recovered" } });
+      emit({ type: "message_end", message: { role: "assistant", content: "silent reasoning recovered", stopReason: "stop" } });
+      emit({ type: "agent_end", willRetry: false });
+      emit({ type: "auto_retry_end", success: true });
+      emit({ type: "agent_settled" });
+    }, 70_000);
+    break;
+  }
   case "terminated-stream-recover": {
     terminated();
     emit({ type: "agent_end", willRetry: true });

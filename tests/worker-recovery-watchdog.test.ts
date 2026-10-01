@@ -32,6 +32,46 @@ describe("assistantStreamEvent", () => {
 });
 
 describe("PiRecoveryWatchdog", () => {
+  it.each(["assistantMessageEvent", "event"])("disarms when the retry starts before 70 seconds of silent reasoning (%s)", (field) => {
+    const { fail, watchdog } = setup();
+    watchdog.arm("cliproxyapi/gpt-6.1-sol: terminated");
+    vi.advanceTimersByTime(2_000);
+    watchdog.observe({ type: "message_start", message: { role: "assistant", content: [], stopReason: "stop" } });
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(70_000);
+    watchdog.observe({ type: "message_update", [field]: { type: "text_delta", delta: "recovered" } });
+    expect(fail).not.toHaveBeenCalled();
+    watchdog.clear();
+    // Acceptance does not dispose the watchdog: a later failure is still bounded.
+    watchdog.arm("later independent error");
+    vi.advanceTimersByTime(60_000);
+    expect(fail).toHaveBeenCalledExactlyOnceWith(
+      "later independent error; no model stream or tool event for 60000ms; terminating child",
+    );
+  });
+
+  it.each(["assistantMessageEvent", "event"])("keeps runaway whitespace bounds after accepted recovery (%s)", (field) => {
+    for (const bound of ["time", "bytes"]) {
+      const { fail, watchdog } = setup();
+      const runaway = vi.fn();
+      const guard = new ToolCallStreamGuard(runaway, () => ({ model: "cliproxyapi/gpt-6.1-sol", effort: "high" }));
+      watchdog.arm("Error: Terminated");
+      const start = { type: "message_start", message: { role: "assistant", content: [] } };
+      guard.observe(start);
+      watchdog.observe(start);
+      const delta = { type: "message_update", [field]: {
+        type: "toolcall_delta", contentIndex: 0, delta: bound === "bytes" ? " ".repeat(65_536) : " \t\n",
+      } };
+      guard.observe(delta);
+      watchdog.observe(delta);
+      if (bound === "time") vi.advanceTimersByTime(60_000);
+      expect(fail).not.toHaveBeenCalled();
+      expect(runaway).toHaveBeenCalledTimes(1);
+      expect(runaway.mock.calls[0]![0]).toMatchObject(bound === "time"
+        ? { elapsedMs: 60_000, bytes: 3 } : { elapsedMs: 0, bytes: 65_536 });
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  });
   it.each(["assistantMessageEvent", "event"])("bounds whitespace-only tool arguments every 5s after recovery is armed (%s)", (field) => {
     const { fail, watchdog } = setup();
     const runaway = vi.fn();
@@ -175,7 +215,11 @@ describe("PiRecoveryWatchdog", () => {
         { type: "agent_start" }, { type: "agent_end", willRetry: true },
         { type: "auto_retry_start" }, { type: "auto_retry_end", success: false },
         { type: "queue_update" }, { type: "extension_error" },
-        { type: "message_start", message: { role: "assistant", content: [] } },
+        { type: "message_start", message: { role: "user", content: "retry prompt" } },
+        { type: "message_start", message: { role: "toolResult", content: [] } },
+        { type: "message_start", message: { role: "assistant", content: [], stopReason: "error" } },
+        { type: "message_start", message: { role: "assistant", content: [], stopReason: "aborted" } },
+        { type: "message_start" },
         { type: "message_update", assistantMessageEvent: { type: "error", error: "terminated" } },
         { type: "message_update", event: { type: "error", error: "terminated" } },
         { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "" }, message: { role: "assistant", content: "old output" } },

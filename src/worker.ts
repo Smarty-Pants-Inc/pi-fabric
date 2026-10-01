@@ -1008,8 +1008,8 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_start") {
       emitLifecycle("pi.agent_start");
       retryPending = false;
-      // Starting a retry is not proof of recovery: preserve the error and timer
-      // until the model actually produces output.
+      // Starting a retry is not proof of acceptance: preserve the error and timer
+      // until the provider starts a new assistant response.
       return;
     }
     if (event.type === "auto_retry_start" && !terminalStatus) {

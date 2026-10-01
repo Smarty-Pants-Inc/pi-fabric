@@ -649,6 +649,10 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
       if (!decisions.length) throw new Error(`No real commitment: ${text}`);
       const persisted = SessionManager.open(manager.getSessionFile()!).getBranch().find(entry => entry.type === "message" && entry.message.role === "toolResult");
       expect(persisted?.type === "message" && persisted.message).toEqual(result);
+      // The uncertainty probe intentionally holds the host's create response for
+      // 900 ms with a 250 ms client wait. Resident actorStatus now uses that same
+      // serial exchange, so reconcile only after the held request finishes.
+      await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       // Reconcile live entities before assertions that deliberately fail on the old head.
       for (const decision of decisions) {
         await waitFor(() => state.participants.get(decision.id)?.ownerHostId === residentHostId(state.config.rootId));

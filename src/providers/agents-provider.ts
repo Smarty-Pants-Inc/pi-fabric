@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { formatAge } from "../residency/protocol.js";
-import { ActorManager, parseBashTimeoutSeconds } from "../actors/manager.js";
+import { formatAge, residentHostId, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
+import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
+import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
@@ -380,6 +381,7 @@ export const messageTargetArgs = (
 
 export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
+  readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
   readonly name = "agents";
   readonly description =
@@ -1069,7 +1071,8 @@ export class AgentsProvider implements FabricProvider {
         if (!participant.capabilities.includes("ask")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support remote ask`);
         }
-        const binding = actor ? this.actorManager.resolveBinding(actor.id, overrides) : overrides;
+        const ownRoot = participant.rootId === this.mainAgent.id;
+        const binding = ownRoot ? overrides : actor ? this.actorManager.resolveBinding(actor.id, overrides) : overrides;
         const needsBinding = Boolean(binding.model || binding.thinking);
         if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
@@ -1085,6 +1088,7 @@ export class AgentsProvider implements FabricProvider {
             message,
             ...(args.data === undefined ? {} : { data: args.data }),
             ...(needsBinding ? { binding } : {}),
+            ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
           },
           participant.ownerIdentityId,
           {
@@ -1150,8 +1154,11 @@ export class AgentsProvider implements FabricProvider {
         });
         return result;
       }
-      case "actorStatus":
-        return this.actorManager.status(String(args.id));
+      case "actorStatus": {
+        const id = String(args.id);
+        const resident = this.#residentActorOwner(id);
+        return resident ? resident.client.actorStatus(resident.id, context.signal) : this.actorManager.status(id);
+      }
       case "instructions": {
         const actor = this.actorManager.status(String(args.id));
         const { instructions } = this.actorManager.definition(actor.id);
@@ -1163,8 +1170,16 @@ export class AgentsProvider implements FabricProvider {
           instructionsLength: instructions.length,
         };
       }
-      case "actors":
-        return args.scope === "global" ? this.globalActors.list() : this.#actorsWithLiveState();
+      case "actors": {
+        if (args.scope === "global") return this.globalActors.list();
+        const local = this.#actorsWithLiveState();
+        const resident = this.#liveResidentActorClient();
+        if (!resident) return local;
+        const authoritative = await resident.actors(context.signal);
+        const byId = new Map(local.map((actor) => [actor.id, actor]));
+        for (const actor of authoritative) byId.set(actor.id, actor);
+        return [...byId.values()];
+      }
       case "messages": {
         const actor = this.actorManager.status(String(args.id));
         return this.actorManager.messages(
@@ -1175,6 +1190,17 @@ export class AgentsProvider implements FabricProvider {
       case "setModel": {
         const id = String(args.id);
         const model = typeof args.model === "string" ? args.model.trim() : "";
+        if (args.scope === "global") {
+          const template = this.globalActors.resolve(id);
+          if (!template) throw new Error(`Unknown global actor: ${id}`);
+          const resolved = model && template.runner === "pi" ? await this.#resolvePiModel(model, context) : model;
+          return this.globalActors.update(template.id, { model: resolved });
+        }
+        const resident = this.#residentActorOwner(id);
+        if (resident) return this.#setResidentActor(resident, {
+          operation: "setModel", id: resident.id, ...(model ? { model } : {}),
+          scope: args.scope === "project" ? "project" : "session",
+        }, context.signal);
         const target = this.#resolveActorTarget(id);
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
         const runner = target.actor?.runner ?? target.participant!.runner;
@@ -1187,17 +1213,29 @@ export class AgentsProvider implements FabricProvider {
           args.scope === "project" ? "project" : "session",
         );
       }
-      case "setThinking":
-        return this.actorManager.setThinking(
-          String(args.id),
-          typeof args.thinking === "string" ? args.thinking : undefined,
-          args.scope === "project" ? "project" : "session",
-        );
+      case "setThinking": {
+        const id = String(args.id);
+        const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
+        if (thinking && !isFabricThinking(thinking)) throw new Error(`Invalid Fabric actor thinking level: ${thinking}`);
+        if (args.scope === "global") {
+          // The registry validates an empty string to absence; undefined means keep the template field.
+          return this.globalActors.update(id, { thinking: thinking as NonNullable<FabricActorRequest["thinking"]> });
+        }
+        const resident = this.#residentActorOwner(id);
+        if (resident) return this.#setResidentActor(resident, {
+          operation: "setThinking", id: resident.id, ...(isFabricThinking(thinking) ? { thinking } : {}),
+          scope: args.scope === "project" ? "project" : "session",
+        }, context.signal);
+        return this.actorManager.setThinking(id, thinking || undefined, args.scope === "project" ? "project" : "session");
+      }
       case "setTools": {
         const tools = stringArray(args.tools) ?? [];
+        assertResidentActorToolCeiling(tools, this.#toolCeiling === undefined ? undefined : [...this.#toolCeiling]);
         if (args.scope === "global") {
           return this.globalActors.update(String(args.id), { tools });
         }
+        const resident = this.#residentActorOwner(String(args.id));
+        if (resident) return this.#setResidentActor(resident, { operation: "setTools", id: resident.id, tools }, context.signal);
         return this.actorManager.setTools(String(args.id), tools);
       }
       case "setNice": {
@@ -1227,6 +1265,8 @@ export class AgentsProvider implements FabricProvider {
         if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");
         const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
         if (args.scope === "global") return this.globalActors.update(String(args.id), { activationFilter });
+        const resident = this.#residentActorOwner(String(args.id));
+        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter }, context.signal);
         return this.actorManager.setActivationFilter(String(args.id), activationFilter);
       }
       case "setEvents": {
@@ -1274,12 +1314,9 @@ export class AgentsProvider implements FabricProvider {
         }
         const { actor, participant } = target;
         if (actor && this.actorManager.owns(actor.id)) return this.actorManager.remove(actor.id);
-        const residency = actor?.residency ?? participant?.residency;
-        if (residency !== "durable") throw new Error("Only the owning host can remove this actor");
-        const id = actor?.id ?? participant!.id;
-        return this.residency
-          ? this.residency.removeActor(id, context.signal)
-          : this.#residentActorClient().removeActor(id, context.signal);
+        const resident = this.#residentActorOwner(actor?.id ?? participant!.id);
+        if (!resident) throw new Error("Only the owning root can remove this actor");
+        return resident.client.removeActor(resident.id, context.signal);
       }
       case "setInstructions": {
         const id = String(args.id);
@@ -1293,6 +1330,8 @@ export class AgentsProvider implements FabricProvider {
           );
         }
         if (global) return this.globalActors.update(id, { instructions });
+        const resident = this.#residentActorOwner(id);
+        if (resident) return this.#setResidentActor(resident, { operation: "setInstructions", id: resident.id, instructions }, context.signal);
         return this.actorManager.setInstructions(id, instructions);
       }
       case "import": {
@@ -1468,6 +1507,44 @@ export class AgentsProvider implements FabricProvider {
           : {}),
       };
     });
+  }
+
+  #liveResidentActorClient(): ResidentActorClient | undefined {
+    const config = this.residency?.options?.config;
+    const client = config ? new ResidentActorClient(config.meshRoot, config.rootId) : ResidentActorClient.fromEnv();
+    return client?.isLive() ? client : undefined;
+  }
+
+  #residentActorOwner(id: string): { id: string; client: Pick<ResidentActorClient, "setActor" | "actorStatus" | "removeActor"> | Pick<ResidencyClient, "setActor" | "actorStatus" | "removeActor"> } | undefined {
+    const { actor, participant } = this.#resolveActorTarget(id);
+    const rootId = actor?.rootId ?? participant?.rootId;
+    if (rootId !== this.mainAgent.id) return undefined; // foreign session overlays remain caller-local
+    const ownedLocally = actor ? this.actorManager.owns(actor.id) : false;
+    if (ownedLocally) return undefined;
+    if (participant && participant.ownerHostId !== residentHostId(this.mainAgent.id)) return undefined;
+    const client = this.residency ?? this.#liveResidentActorClient();
+    if (!client) throw new Error("Root resident host is not live");
+    return { id: actor?.id ?? participant!.id, client };
+  }
+
+  #setResidentActor(
+    resident: { id: string; client: Pick<ResidentActorClient, "setActor"> },
+    mutation: ResidentActorMutation,
+    signal?: AbortSignal,
+  ): Promise<FabricActorInfo> {
+    // mainAgent.id is inherited by actors/tasks. Native setters require local
+    // execution ownership; proxying must not turn inherited lineage into that authority.
+    if (!this.mainAgent.local) throw new ResidentActorAuthorizationError();
+    const self = this.participants.self();
+    const caller: ResidentActorCaller = {
+      identity: { ...this.actorManager.identity }, hostId: self.ownerHostId,
+      ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
+    };
+    assertResidentActorMain(caller, this.mainAgent.id);
+    if (self.kind !== "root" || self.id !== caller.identity.id || self.rootId !== this.mainAgent.id) {
+      throw new ResidentActorAuthorizationError();
+    }
+    return resident.client.setActor(mutation, signal, caller);
   }
 
   #residentActorClient(): ResidentActorClient {

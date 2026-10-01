@@ -5,9 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
+  type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MainAgentController } from "../src/main-agent.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import {
   type BridgeSide,
@@ -601,6 +604,133 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     await far.publish({ topic: "fabric.control.ack", kind: "ack", from: unknown, to: lane.hostId, data: { targetId: unknown.id } });
     expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 1 });
     expect(presence).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("cross-host Main delivery semantics (#3015)", () => {
+  it("starts a real idle Pi Main through the pipe bridge and returns triggered:true", async () => {
+    const { hub, far, bridge } = setup(undefined, { realPipe: true });
+    const source = await addRoot(hub, "real-source");
+    const target = await addRoot(far, "real-target");
+    const root = scratch();
+    const faux = fauxProvider();
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+    modelRuntime.registerNativeProvider(faux.provider);
+    let main!: MainAgentController;
+    let starts = 0;
+    const loader = new DefaultResourceLoader({ cwd: root, agentDir: path.join(root, "agent"), noExtensions: true,
+      noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [{ name: "remote-main", factory: pi => {
+        pi.on("session_start", (_event, ctx) => {
+          main = new MainAgentController(pi, target.identity.id, true, root, "real-target");
+          main.attachFollowUpDrain(ctx, 120_000, path.join(root, "followups.json"));
+        });
+        pi.on("agent_start", () => { starts++; });
+      } }] });
+    await loader.reload();
+    const { session } = await createAgentSession({ cwd: root, agentDir: path.join(root, "agent"), modelRuntime,
+      model: faux.getModel(), resourceLoader: loader, sessionManager: SessionManager.inMemory(root), tools: [],
+      settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }) });
+    const sourceDirectory = new ParticipantDirectory(hub, { enabled: true, hostId: source.hostId, rootId: source.identity.id, identity: source.identity });
+    const targetDirectory = new ParticipantDirectory(far, { enabled: true, hostId: target.hostId, rootId: target.identity.id, identity: target.identity });
+    const sender = new FabricControlPlane(hub, source.identity, { enabled: true, hostId: source.hostId, pollMs: 20,
+      readMirroredOwner: (...args) => sourceDirectory.mirroredControlOwner(...args) });
+    const receiver = new FabricControlPlane(far, target.identity, { enabled: true, hostId: target.hostId, pollMs: 20 });
+    try {
+      await session.bindExtensions({});
+      expect(starts).toBe(0);
+      faux.setResponses([fauxAssistantMessage("remote followUp received")]);
+      const sending = new AgentsProvider({ cwd: root } as any, { identity: source.identity } as any, {} as any,
+        { local: true, id: source.identity.id, matches: (id: string) => id === source.identity.id } as any,
+        sourceDirectory, sender, {} as any, () => false, undefined, false);
+      const receiving = new AgentMessageRouter({} as any, { identity: target.identity } as any, main, targetDirectory, receiver, binding => binding);
+      sender.start(() => ({ accepted: false }));
+      receiver.start((...args) => receiving.acceptControl(...args));
+      await bridge.start(); await bridge.syncPresence();
+      const receipt = sending.invoke("followUp", { id: target.identity.id, message: "wake real idle Main" }, { cwd: root } as any);
+      void receipt.catch(() => undefined);
+      await waitFor(() => on(hub, "fabric.control.command").length === 1);
+      await bridge.step();
+      await waitFor(() => starts === 1 && on(far, "fabric.control.ack").length === 1);
+      await bridge.step();
+      expect(await receipt).toMatchObject({ acknowledged: true, routed: "mesh", triggered: true });
+      await session.waitForIdle();
+      expect(session.getLastAssistantText()).toBe("remote followUp received");
+      expect(starts).toBe(1);
+    } finally {
+      await sender.close(); await receiver.close();
+      main?.closeFollowUpDrain(); await bridge.stop(); session.dispose();
+    }
+  });
+  it.each([
+    { delivery: "followUp" as const, idle: true, policy: undefined, triggered: true },
+    { delivery: "followUp" as const, idle: false, policy: undefined, triggered: false },
+    { delivery: "followUp" as const, idle: true, policy: false, triggered: false },
+    { delivery: "steer" as const, idle: true, policy: undefined, triggered: true },
+    { delivery: "steer" as const, idle: false, policy: undefined, triggered: false },
+  ])("$delivery idle=$idle policy=$policy preserves wake and receipt", async ({ delivery, idle, policy, triggered }) => {
+    const { hub, far, bridge } = setup(undefined, { realPipe: true });
+    const source = await addRoot(hub, "source");
+    const target = await addRoot(far, "target");
+    const handlers = new Map<string, Array<(event: any, ctx: ExtensionContext) => unknown>>();
+    const sendMessage = vi.fn();
+    const pi = { sendMessage, on: (name: string, fn: any) => {
+      handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+    } } as unknown as ExtensionAPI;
+    const state = { idle };
+    const ctx = { isIdle: () => state.idle, sessionManager: { getEntries: () => [] } } as unknown as ExtensionContext;
+    const main = new MainAgentController(pi, target.identity.id, true, os.tmpdir(), "target");
+    main.attachFollowUpDrain(ctx, 120_000, path.join(scratch(), "followups.json"));
+    const participants = (store: MeshStore, identity: MeshIdentity) => new ParticipantDirectory(store, {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity,
+    });
+    const sourceDirectory = participants(hub, source.identity);
+    const targetDirectory = participants(far, target.identity);
+    const sender = new FabricControlPlane(hub, source.identity, { enabled: true, hostId: source.hostId, pollMs: 20,
+      readMirroredOwner: (...args) => sourceDirectory.mirroredControlOwner(...args) });
+    const receiver = new FabricControlPlane(far, target.identity, { enabled: true, hostId: target.hostId, pollMs: 20 });
+    const provider = (identity: MeshIdentity, controller: any, store: MeshStore, control: FabricControlPlane) =>
+      new AgentsProvider({ cwd: os.tmpdir() } as any, { identity } as any, {} as any, controller,
+        store === hub ? sourceDirectory : targetDirectory, control, {} as any, () => false, undefined, false);
+    const sending = provider(source.identity, { local: true, id: source.identity.id, matches: (id: string) => id === source.identity.id }, hub, sender);
+    const receiving = provider(target.identity, main, far, receiver);
+    sender.start(() => ({ accepted: false }));
+    receiver.start((cmd, from, signal, verification) => receiving.acceptControl(cmd, from, signal, verification));
+    try {
+      await bridge.start();
+      await bridge.syncPresence();
+      const pending = policy === undefined
+        ? sending.invoke(delivery, { id: target.identity.id, message: "wake remote Main" }, { cwd: os.tmpdir() } as any)
+        : sending.routeMessage(target.identity.id, "passive", undefined, delivery, undefined, { triggerTurn: policy });
+      let routeError: unknown;
+      void pending.catch(error => { routeError = error; });
+      await waitFor(() => on(hub, "fabric.control.command").length === 1 || routeError !== undefined);
+      if (routeError) throw routeError;
+      const envelope = on(hub, "fabric.control.command")[0]!.data as Record<string, unknown>;
+      expect(envelope.triggerTurn).toBe(delivery === "followUp" ? policy ?? true : undefined);
+      await bridge.step();
+      await waitFor(() => on(far, "fabric.control.ack").length === 1);
+      await bridge.step();
+      expect(await pending).toMatchObject({ queued: true, acknowledged: true, routed: "mesh", triggered });
+      expect(on(far, "fabric.control.command")[0]!.verification).toBe("bridge");
+      if (delivery === "followUp" && !idle) {
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(main.queueDepth().pendingFollowUps).toBe(1);
+        main.flushHeldAtNextBoundary();
+        for (const fn of handlers.get("turn_end") ?? []) fn({ message: { role: "assistant", stopReason: "toolUse" } }, ctx);
+        expect(sendMessage).toHaveBeenCalledOnce();
+        expect(sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: true });
+        state.idle = true;
+        for (const fn of handlers.get("agent_settled") ?? []) fn({ outcome: "completed" }, ctx);
+        expect(sendMessage).toHaveBeenCalledOnce(); // no extra idle turn
+      } else {
+        expect(sendMessage).toHaveBeenCalledOnce();
+        expect(sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: delivery, triggerTurn: policy ?? true });
+      }
+    } finally {
+      await sender.close(); await receiver.close();
+      main.closeFollowUpDrain(); await bridge.stop();
+    }
   });
 });
 

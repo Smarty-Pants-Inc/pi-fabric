@@ -23,6 +23,15 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each(["steer", "followUp", "tell"])("types public %s wake receipts for object and positional Main targets", action => {
+    const code = `const object = await agents.${action}({ id: "main", message: "resume" });
+      const positional = await agents.${action}("main", "resume");
+      const triggered: Array<boolean | undefined> = [object.triggered, positional.triggered];
+      const reasons: Array<string | undefined> = [object.reason, positional.reason];
+      return { triggered, reasons };`;
+    expect(typeCheckFabricCode(code, GUEST_TYPE_DECLARATIONS, true).errors).toEqual([]);
+  });
+
   it("types the FIFO position on a queued spawn receipt", () => {
     const result = typeCheckFabricCode(
       `const handle = await agents.spawn({ task: "work" });

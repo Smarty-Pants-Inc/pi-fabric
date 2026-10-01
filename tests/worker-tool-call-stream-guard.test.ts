@@ -6,7 +6,10 @@ import {
   ToolCallStreamGuard,
 } from "../src/worker/tool-call-stream-guard.js";
 
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 const update = (type: string, contentIndex = 0, delta?: string) => ({
   type: "message_update", assistantMessageEvent: { type, contentIndex, delta },
 });
@@ -58,6 +61,47 @@ describe("ToolCallStreamGuard", () => {
     delta("\t");
     vi.advanceTimersByTime(60_000);
     expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 1 });
+  });
+
+  it("re-arms for the remainder when the timer wakes 1 ms before the monotonic deadline", () => {
+    const { fail, delta } = setup();
+    let now = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    delta(" ");
+    now += 59_999;
+    // The timer clock has reached its deadline, but the elapsed clock is 1 ms behind.
+    vi.advanceTimersByTime(60_000);
+    expect(fail).not.toHaveBeenCalled();
+    expect(timer).toHaveBeenLastCalledWith(expect.any(Function), 1);
+    expect(vi.getTimerCount()).toBe(1);
+    now += 1;
+    vi.advanceTimersByTime(1);
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 1 });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([-86_400_000, 86_400_000])("ignores a wall-clock adjustment of %i ms", adjustment => {
+    const { fail, delta } = setup();
+    delta(" ");
+    vi.setSystemTime(Date.now() + adjustment);
+    vi.advanceTimersByTime(59_999);
+    delta("\t");
+    expect(fail).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 2 });
+  });
+
+  it("reports monotonic elapsed time for the byte limit too", () => {
+    const { fail, delta } = setup();
+    delta(" ");
+    vi.advanceTimersByTime(125);
+    vi.setSystemTime(Date.now() - 86_400_000);
+    delta(" ".repeat(65535));
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(fail.mock.calls[0]![0]).toMatchObject({ elapsedMs: 125, bytes: 65536 });
   });
 
   it("counts UTF-8 bytes rather than characters for Unicode whitespace", () => {

@@ -4,6 +4,11 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const compactionLoaded = vi.hoisted(() => vi.fn());
+vi.mock("../src/compaction/hook.js", async original => {
+  compactionLoaded();
+  return original<typeof import("../src/compaction/hook.js")>();
+});
 const boundaryLoaded = vi.hoisted(() => vi.fn());
 vi.mock("../src/prewalk/handoff.js", async original => {
   boundaryLoaded();
@@ -50,6 +55,7 @@ describe("Prewalk startup boundary", () => {
       vi.resetModules();
       const { default: register } = await import("../src/index.js");
       expect(boundaryLoaded).not.toHaveBeenCalled();
+      expect(compactionLoaded).not.toHaveBeenCalled();
       await register(pi);
       expect(pi.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "fabric_exec" }));
       expect(pi.registerCommand).toHaveBeenCalledWith("fabric", expect.anything());
@@ -57,9 +63,11 @@ describe("Prewalk startup boundary", () => {
         expect(handlers.get(event)?.length).toBeGreaterThan(0);
         await emit(event);
         expect(boundaryLoaded).not.toHaveBeenCalled();
+        expect(compactionLoaded).not.toHaveBeenCalled();
       }
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(boundaryLoaded).not.toHaveBeenCalled();
+      expect(compactionLoaded).not.toHaveBeenCalled();
     } finally {
       await emit("session_shutdown");
       fs.rmSync(cwd, { recursive: true, force: true });

@@ -1950,6 +1950,7 @@ export class ActorManager {
       deferDrain?: boolean;
     } = {},
   ): ActorQueueItem {
+    if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
     const canManage = options.ownershipChecked
       ? this.#canManageCached(actor.id)
       : this.#canManage(actor.id);

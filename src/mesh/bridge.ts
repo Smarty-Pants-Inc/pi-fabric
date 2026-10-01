@@ -936,10 +936,11 @@ export class MeshBridge {
     while (true) {
       const start = cursor.after;
       const page = await source.read(start);
-      // Empty and allow-list-filtered pages need no routing decision. Authority reads are
-      // deliberately canonical (copied-marker ABA), so doing them on every idle tail poll
-      // parsed the entire fleet state eight times per tick. Presence still renews on its
-      // own schedule; every page with events retains the same fresh authority checks.
+      // Even filtered/skip-only reads can carry this drain past the mirrors' lease.
+      // Renew only when due, independently of whether the page needs routing authority.
+      if (Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS)) await this.syncPresence();
+      // Authority reads are deliberately canonical (copied-marker ABA), so idle pages
+      // avoid them; every page with events retains the same fresh authority checks.
       let rules = page.events.length ? await authority() : { recipients: new Set<string>() };
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;

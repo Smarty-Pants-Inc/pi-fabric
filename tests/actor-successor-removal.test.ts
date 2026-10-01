@@ -22,6 +22,7 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { lockFile } from "../src/residency/file-lock.js";
+import * as residencyFileLock from "../src/residency/file-lock.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 import { startTime, stopOwned, type Owned } from "./helpers/owned-processes.js";
@@ -746,6 +747,11 @@ describe.each(["win32", "darwin"] as const)("%s successor unknown worker evidenc
     // Model worker kernel support only; durable writes must see the native host.
     const kernelState = processIdentity.processStartIdentityState;
     const f = await fixture({ fakeProcesses: true });
+    // Authority is already faked for this worker-evidence unit case. Supply only
+    // a disposable fd fence: the real POSIX lock needs getuid/flock, unavailable
+    // on Windows. Keep native durable writes and worker-settlement checks real.
+    const fence = vi.spyOn(residencyFileLock, "lockFile").mockImplementation(async file =>
+      fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600));
     const caller = f.residency.options.participants.self()!.processIdentity!;
     const current = vi.spyOn(processIdentity, "readProcessStartIdentity").mockReturnValue(caller);
     const mainState = vi.spyOn(processIdentity, "processStartIdentityState").mockImplementation(expected =>
@@ -777,6 +783,7 @@ describe.each(["win32", "darwin"] as const)("%s successor unknown worker evidenc
     try {
       expect(await f.remove()).toMatchObject({ removed: false, pending: expect.stringContaining(
         kind === "null journal" ? "Missing worker/runner process identity" : "is unknown; settlement not proven") });
+      expect(fence).toHaveBeenCalledExactlyOnceWith(path.join(f.oldDir, "host.lock"), 0, true);
       expect(process.platform).toBe(nativePlatform);
       expect(fileSyncs).toBeGreaterThan(0);
       if (nativePlatform === "win32") expect(directorySyncs).toBe(0);
@@ -789,7 +796,7 @@ describe.each(["win32", "darwin"] as const)("%s successor unknown worker evidenc
       expect(f.mesh.get(`actor-removals/${f.actor.id}`)).toBeUndefined();
     } finally {
       sync.mockRestore();
-      signal.mockRestore(); write.mockRestore(); current.mockRestore(); mainState.mockRestore(); hostState.mockRestore();
+      signal.mockRestore(); write.mockRestore(); current.mockRestore(); mainState.mockRestore(); hostState.mockRestore(); fence.mockRestore();
     }
   });
 });

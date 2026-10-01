@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import os from "node:os";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +13,11 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { SessionsProvider } from "../src/providers/sessions-provider.js";
 
 const fake = fileURLToPath(new URL("./fixtures/fake-jev-fabric.mjs", import.meta.url));
+// This regression must never substitute the protocol fixture for the native backend.
+const realBackend = (() => {
+  try { return createRequire(import.meta.url)("jev-fabric").binaryPath() as string | undefined; }
+  catch { return undefined; }
+})();
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.unstubAllEnvs(); });
 
@@ -90,6 +96,58 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
     expect(await call("status", { id: program.id })).toMatchObject({ state: "cancelled" });
     expect(await call("status", { id: agent.id })).toMatchObject({ state: "running" });
     expect((await call("list", {}) as unknown as Array<{ id: string }>).map(entry => entry.id)).toEqual([agent.id]);
+  });
+
+  it.skipIf(!realBackend)("SEC-8 closes every settled owner's real backend and confirms exit without touching another owner", async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-sec8-real-")));
+    cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
+    const backendPids = path.join(root, "backend-pids");
+    const launcher = path.join(root, "record-real-backend");
+    // Record the serve PID, not the session worker's PPID. exec preserves it;
+    // all protocol handling and children remain in the unmodified real binary.
+    fs.writeFileSync(launcher, `#!/bin/sh\necho $$ >> '${backendPids}'\nexec '${realBackend}' "$@"\n`, { mode: 0o755 });
+    vi.stubEnv("PI_FABRIC_JEV_FABRIC_BIN", launcher);
+    const { call, provider } = setup({ root });
+    const open = async (owner: string) => {
+      const receipt = await call("open", { cmd: "echo $$; exec sleep 60" }, owner);
+      const output = await call("read", { id: receipt.id, offset: 0, waitMs: 5000 });
+      const child = Number(output.text.trim());
+      const backend = Number(fs.readFileSync(backendPids, "utf8").trim().split("\n").at(-1));
+      expect(child).toBeGreaterThan(0);
+      expect(backend).toBeGreaterThan(0);
+      expect(() => process.kill(backend, 0)).not.toThrow();
+      return { id: receipt.id, child, backend };
+    };
+    // Two fully settled opens by A each create an isolated serve connection.
+    const owned = [await open("jev:owner-A"), await open("jev:owner-A")];
+    const survivor = await open("jev:owner-B");
+    expect(new Set([...owned, survivor].map(child => child.backend)).size).toBe(3);
+    try {
+      await provider.invocationEnded("jev:owner-A");
+      // No polling after retirement: its promise must confirm backend exit.
+      for (const { id, child, backend } of owned) {
+        expect(() => process.kill(backend, 0)).toThrow();
+        expect(() => process.kill(child, 0)).toThrow();
+        const receipt = await call("status", { id });
+        expect(receipt).toMatchObject({ state: "cancelled" });
+        expect(await call("wait", { id })).toEqual(receipt);
+        expect(await call("stop", { id })).toEqual(receipt);
+      }
+      // Terminal reads must not replace retired connections with live backends.
+      expect(fs.readFileSync(backendPids, "utf8").trim().split("\n")).toHaveLength(3);
+      expect(await call("list", {})).toEqual([expect.objectContaining({ id: survivor.id })]);
+      expect(() => process.kill(survivor.backend, 0)).not.toThrow();
+      expect(() => process.kill(survivor.child, 0)).not.toThrow();
+      expect(await call("status", { id: survivor.id })).toMatchObject({ state: "running" });
+      await provider.invocationEnded("jev:owner-A");
+      expect(await call("status", { id: survivor.id })).toMatchObject({ state: "running" });
+      await provider.invocationEnded("jev:owner-B");
+      expect(() => process.kill(survivor.backend, 0)).toThrow();
+      expect(() => process.kill(survivor.child, 0)).toThrow();
+    } finally {
+      // Also reap this test's backends on the vulnerable head.
+      await provider.close();
+    }
   });
 
   it("refuses to bypass an extension's bash override and needs exactly one of argv or cmd", async () => {

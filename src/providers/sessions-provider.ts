@@ -9,6 +9,7 @@ import type { JevFabricServe } from "../jev-fabric/serve.js";
 
 const DAY_MS = 24 * 3_600_000;
 const OWNER_RECEIPT_GRACE_MS = 250;
+const TERMINAL_RECEIPT_LIMIT = 128;
 const id = { type: "string", minLength: 1, maxLength: 128, description: "Session ID from sessions.open (`s-…` for session lifetime). Output reads require a child opened here; use tasks.* for durable batch output." };
 const idOnly = { type: "object", properties: { id }, required: ["id"], additionalProperties: false };
 const waitMs = { type: "integer", minimum: 1, maximum: 300000, description: "Long-poll ceiling; ready evidence returns at once. Never stops the child." };
@@ -80,6 +81,7 @@ export class SessionsProvider implements FabricProvider {
   readonly #launchConnections = new Map<string, Set<Promise<JevFabricServe>>>();
   readonly #jobConnections = new Map<string, JevFabricServe>();
   readonly #opened = new Map<string, Opened>();
+  readonly #terminalReceipts = new Map<string, unknown>();
   #closed = false;
   readonly #allowedTools = readChildToolAllowlist();
   readonly #launches = new Map<Promise<unknown>, string>();
@@ -104,14 +106,15 @@ export class SessionsProvider implements FabricProvider {
 
   #connect(isolatedOwner?: string): Promise<JevFabricServe> {
     if (this.#closed) return Promise.reject(new Error("Sessions provider is closed"));
+    if (isolatedOwner !== undefined && this.#retiredOwners.has(isolatedOwner)) return Promise.reject(new Error("Session launch owner ended"));
     if (isolatedOwner === undefined && this.#serve) return this.#serve;
     const pending = (async () => {
       const [resolution, { JevFabricServe }] = await Promise.all([this.bridge.resolve("sessions"), import("../jev-fabric/serve.js")]);
       const serve = await JevFabricServe.open(resolution.path, { home: this.bridge.home, cwd: this.options.cwd, timeoutMs: DAY_MS });
       // A lost connection took its session children with it; the next call reconnects.
       void serve.exited.then(() => {
-        for (const [key, opened] of this.#opened) if (opened.lifetime === "session" && this.#jobConnections.get(key) === serve) {
-          this.#opened.delete(key);
+        for (const [key, connection] of this.#jobConnections) if (connection === serve) {
+          if (this.#opened.get(key)?.lifetime === "session") this.#opened.delete(key);
           this.#jobConnections.delete(key);
         }
         this.#connections.delete(pending);
@@ -133,6 +136,11 @@ export class SessionsProvider implements FabricProvider {
     }
     void pending.catch(() => {
       this.#connections.delete(pending);
+      if (isolatedOwner !== undefined) {
+        const connections = this.#launchConnections.get(isolatedOwner);
+        connections?.delete(pending);
+        if (!connections?.size) this.#launchConnections.delete(isolatedOwner);
+      }
       if (this.#serve === pending) this.#serve = undefined;
     });
     return pending;
@@ -151,6 +159,7 @@ export class SessionsProvider implements FabricProvider {
       try { return await launch; } finally { this.#launches.delete(launch); }
     }
     const job = args.id as string;
+    if ((name === "status" || name === "wait" || name === "stop") && this.#terminalReceipts.has(job)) return this.#terminalReceipts.get(job);
     // Batch output belongs exclusively to tasks.*, with its launch-time filter.
     if ((name === "read" || name === "events") && !this.#opened.has(job)) {
       throw new Error("Session output is available only for children opened here; use tasks for durable batch jobs");
@@ -223,16 +232,25 @@ export class SessionsProvider implements FabricProvider {
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([Promise.allSettled(launches), new Promise(resolve => { timer = setTimeout(resolve, OWNER_RECEIPT_GRACE_MS); })]);
     clearTimeout(timer);
-    // Do not await a stalled spawn receipt before initiating owner teardown.
-    if ([...this.#launches.values()].includes(parentToolCallId)) {
-      await Promise.allSettled([...(this.#launchConnections.get(parentToolCallId) ?? [])].map(async pending => (await pending).close()));
-    }
     const owned = [...this.#opened.values()].filter(opened => opened.owner === parentToolCallId);
     await Promise.allSettled(owned.map(async opened => {
       const serve = this.#jobConnections.get(opened.id);
-      try { await serve?.request("stop", { job: opened.id }, AbortSignal.timeout(OWNER_RECEIPT_GRACE_MS)); } catch { await serve?.close(); }
-      this.#opened.delete(opened.id);
+      try {
+        if (serve) {
+          const receipt = await serve.request("stop", { job: opened.id }, AbortSignal.timeout(OWNER_RECEIPT_GRACE_MS));
+          this.#terminalReceipts.set(opened.id, receipt);
+          if (this.#terminalReceipts.size > TERMINAL_RECEIPT_LIMIT) this.#terminalReceipts.delete(this.#terminalReceipts.keys().next().value!);
+        }
+      } catch { /* EOF below also handles an unresponsive child or lost receipt. */ }
     }));
+    // Connection ownership outlives its spawn receipt. Always close every
+    // isolated connection for this owner, and await confirmed backend exit;
+    // neither settled launches nor missing receipts may retain a serve process.
+    await Promise.allSettled([...(this.#launchConnections.get(parentToolCallId) ?? [])].map(async pending => (await pending).close()));
+    for (const opened of owned) {
+      this.#opened.delete(opened.id);
+      this.#jobConnections.delete(opened.id);
+    }
   }
 
   async close(): Promise<void> {
@@ -243,6 +261,7 @@ export class SessionsProvider implements FabricProvider {
     await Promise.allSettled(this.#launches.keys());
     this.#opened.clear();
     this.#jobConnections.clear();
+    this.#terminalReceipts.clear();
     this.#launchConnections.clear();
   }
 }

@@ -13,7 +13,7 @@ import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorDirectory } from "../src/actors/directory.js";
-import type { FabricActorDeliveryRequest, FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
+import type { FabricActorDeliveryRequest, FabricActorInfo, FabricActorReadInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type {
@@ -503,6 +503,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true, cleaned: false });
       // No participant/presence entry remains. agents.actors must still expose the stopped obligation.
       expect(state.participants.get(actor.id)).toBeUndefined();
+      expect(directory.owns(actor.id)).toBe(true);
       expect(await provider.invoke("actors", {}, context)).toContainEqual(expect.objectContaining({
         id: actor.id, scope, status: "stopped", rootId: state.identity.id, removal: expect.objectContaining({ state: expect.stringContaining("cleanup failed") }),
       }));
@@ -3149,6 +3150,134 @@ return { first, second, tail: "continued" };`,
       context,
     )) as { runner: string };
     expect(actor.runner).toBe("claude");
+  });
+});
+
+describe("#2726 resident actor live read views", () => {
+  const passiveState = async (stopped = false) => {
+    const state = setup();
+    const created = await state.actors.create({
+      ...createRequest, residency: "durable", model: "provider/project", thinking: "medium",
+    } as FabricActorRequest);
+    await state.actors.cede(created.id);
+    await state.actors.close();
+    const actorRoot = path.join(state.root, "actors");
+    const registryPath = path.join(actorRoot, "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+    const registryActor = registry.actors.find((row: { id: string }) => row.id === created.id);
+    registryActor.lastRunId = "settled-review-run";
+    if (stopped) {
+      registryActor.status = "stopped";
+      registryActor.removal = { requestedAt: Date.now() - 3_000, runId: "registry-removal-run", runStartedAt: Date.now() - 5_000 };
+    }
+    fs.writeFileSync(registryPath, JSON.stringify(registry));
+    const passive = new ActorManager("test", state.identity, state.mesh, DEFAULT_FABRIC_CONFIG.mesh, state.agents, () => {}, {
+      actorRoot, persistent: true, rootId: state.identity.id, canManageActor: () => false,
+    });
+    actorManagers.push(passive);
+    const actor = passive.status(created.id);
+    expect(passive.owns(actor.id)).toBe(false);
+    expect(actor).toMatchObject({ status: stopped ? "stopped" : "idle", queued: 0, lastRunId: "settled-review-run" });
+    const cached: FabricParticipantInfo = {
+      format: 1, id: actor.id, kind: "actor", rootId: state.identity.id,
+      ownerHostId: "resident:owner", ownerIdentityId: "resident:owner", parentId: state.identity.id,
+      name: "owner display name must not replace definition", status: "idle", residency: "durable",
+      runner: "pi", transport: "host", capabilities: [], startedAt: actor.createdAt,
+      updatedAt: Date.now(), actorQueued: 0, actorMessages: 0, controlProtocol: "v1", local: false, stale: false,
+    };
+    let live: FabricParticipantInfo | undefined = {
+      ...cached, status: "running", actorRun: { id: "live-review-run", startedAt: Date.now() - 2_000 },
+      actorQueued: 2, actorMessages: 7,
+    };
+    const get = vi.spyOn(state.participants, "get").mockImplementation((id, _now, options) =>
+      id === actor.id ? options?.fresh ? live : cached : undefined);
+    const provider = new AgentsProvider(state.agents, passive, state.globalActors, state.mainAgent,
+      state.participants, state.control, state.lifecycle);
+    return { ...state, passive, actor, provider, get, setLive: (row: FabricParticipantInfo | undefined) => { live = row; }, live: live! };
+  };
+
+  const read = async (state: Awaited<ReturnType<typeof passiveState>>, action: "actorStatus" | "actors") => {
+    state.get.mockClear();
+    const result = await state.provider.invoke(action, action === "actorStatus" ? { id: state.actor.name } : {}, context);
+    expect(state.get).toHaveBeenCalledWith(state.actor.id, undefined, { fresh: true });
+    return (action === "actors" ? (result as FabricActorReadInfo[]).find(row => row.id === state.actor.id) : result) as FabricActorReadInfo;
+  };
+
+  it.each(["actorStatus", "actors"] as const)("%s reads fresh running owner counts, then clears the settled run on idle", async action => {
+    const state = await passiveState();
+    const definition = state.passive.definition(state.actor.id);
+    expect(await read(state, action)).toMatchObject({
+      ...state.actor, status: "running", queued: 2, messages: 7,
+      inFlightRun: { id: "live-review-run", startedAt: state.live.actorRun!.startedAt, ageS: expect.any(Number) },
+    });
+    const { actorRun: _oldRun, ...idleOwner } = state.live;
+    state.setLive({ ...idleOwner, status: "idle", actorQueued: 1, actorMessages: 9 });
+    // A previously observed/local run must not survive spreading the passive row.
+    const oldView = { ...state.actor, inFlightRun: { ...state.live.actorRun!, ageS: 2 } };
+    const status = vi.spyOn(state.passive, "status").mockReturnValue(oldView);
+    const list = vi.spyOn(state.passive, "list").mockReturnValue([oldView]);
+    let idle: FabricActorReadInfo;
+    try { idle = await read(state, action); } finally { status.mockRestore(); list.mockRestore(); }
+    expect(idle).toMatchObject({ name: state.actor.name, status: "idle", queued: 1, messages: 9, lastRunId: "settled-review-run" });
+    expect(idle.inFlightRun).toBeUndefined();
+    expect(state.passive.definition(state.actor.id)).toEqual(definition);
+    expect(state.passive.status(state.actor.id)).toEqual(state.actor);
+  });
+
+  it.each(["actorStatus", "actors"] as const)("%s reports unknown, not false idle/counts/run, for stale, missing, or wrong-kind owners", async action => {
+    const state = await passiveState();
+    for (const live of [undefined, { ...state.live, stale: true }, { ...state.live, kind: "agent" as const }]) {
+      state.setLive(live);
+      const unknown = await read(state, action);
+      expect(unknown).toMatchObject({ id: state.actor.id, name: state.actor.name, status: "unknown", lastRunId: "settled-review-run" });
+      expect(unknown.queued).toBeUndefined();
+      expect(unknown.messages).toBeUndefined();
+      expect(unknown.inFlightRun).toBeUndefined();
+    }
+  });
+
+  it.each(["actorStatus", "actors"] as const)("%s omits counters missing from a fresh old-version owner rather than falling back to registry counts", async action => {
+    const state = await passiveState();
+    const { actorQueued: _queued, actorMessages: _messages, ...oldVersion } = state.live;
+    state.setLive(oldVersion);
+    const view = await read(state, action);
+    expect(view).toMatchObject({ status: "running", inFlightRun: { id: state.live.actorRun!.id }, lastRunId: "settled-review-run" });
+    expect(view).not.toHaveProperty("queued");
+    expect(view).not.toHaveProperty("messages");
+  });
+
+  it.each(["actorStatus", "actors"] as const)("%s preserves a stopped owner's active run and pending removal, but not an unavailable owner's state", async action => {
+    const state = await passiveState(true);
+    const removal = { requestedAt: Date.now() - 1_000, runId: state.live.actorRun!.id, runStartedAt: state.live.actorRun!.startedAt };
+    state.setLive({ ...state.live, status: "stopped", actorQueued: 0, actorRemoval: removal });
+    const stopped = await read(state, action);
+    expect(stopped).toMatchObject({ status: "stopped", queued: 0, messages: 7, inFlightRun: { id: removal.runId }, removal });
+    expect(stopped.removal!.state).toContain(`pending behind its in-flight run ${removal.runId}`);
+    const { actorRemoval: _ownerRemoval, ...ownerWithoutRemoval } = state.live;
+    state.setLive({ ...ownerWithoutRemoval, status: "stopped" });
+    const fallback = await read(state, action);
+    expect(fallback.removal).toMatchObject({ requestedAt: state.actor.removal!.requestedAt, runId: "registry-removal-run" });
+    expect(fallback.removal!.state).toContain("pending behind its in-flight run registry-removal-run");
+    state.setLive(undefined);
+    const unknown = await read(state, action);
+    expect(unknown.status).toBe("unknown");
+    expect(unknown.removal).toEqual(state.actor.removal);
+    expect(unknown.inFlightRun).toBeUndefined();
+    expect(unknown.queued).toBeUndefined();
+  });
+
+  it("leaves owned local actors and global templates unchanged without reading a remote owner", async () => {
+    const state = setup();
+    const actor = await state.actors.create(createRequest as FabricActorRequest);
+    const get = vi.spyOn(state.participants, "get");
+    const expected = state.actors.status(actor.id);
+    expect(await state.provider.invoke("actorStatus", { id: actor.id }, context)).toEqual(expected);
+    expect(await state.provider.invoke("actors", {}, context)).toEqual([expected]);
+    expect(get).not.toHaveBeenCalled();
+    await state.provider.invoke("create", { ...createRequest, scope: "global" }, context);
+    get.mockClear();
+    expect(await state.provider.invoke("actors", { scope: "global" }, context)).toEqual(state.globalActors.list());
+    expect(get).not.toHaveBeenCalled();
   });
 });
 

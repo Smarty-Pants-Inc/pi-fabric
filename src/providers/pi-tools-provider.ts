@@ -25,6 +25,7 @@ import {
   type PiCoreToolName,
 } from "../core/pi-tools.js";
 import { classifyPiBashError, classifyPiBashResult, piBashResultError } from "../core/pi-bash-error.js";
+import { emitNestedToolResult } from "../core/tool-result.js";
 import {
   appendShellHangNotice,
   DEFAULT_SHELL_HANG_MS,
@@ -645,7 +646,7 @@ export class PiToolsProvider implements FabricProvider {
   // core tools invoked through fabric_exec in full-code mode — exactly as
   // they would for a top-level call in the normal (non-codemode) flow, and
   // exactly as CapturedToolsProvider already does for captured extension
-  // tools. tool_result patches (content/details/isError) are applied, so
+  // tools. tool_result patches (including structured output) are applied, so
   // extensions like pi-vision-handoff can replace image blocks with text
   // descriptions before the result returns to the sandbox.
   async #invokeWithEvents(
@@ -722,27 +723,12 @@ export class PiToolsProvider implements FabricProvider {
     // nothing to re-attach for the kitty preview.
     this.#attachReadMedia(name, result, context);
 
-    const patch = await runAbortable(context.signal, () => runner.emitToolResult({
-      type: "tool_result",
-      toolName: name,
-      toolCallId,
-      input: args,
-      content: result.content,
-      details: result.details,
-      isError,
-    }));
-    if (patch) {
-      result = {
-        ...result,
-        content: patch.content ?? result.content,
-        ...(patch.details !== undefined ? { details: patch.details } : {}),
-      };
-      isError = patch.isError ?? isError;
-    }
-
-    // Middleware's effective status replaces the native flag, including
-    // explicit recovery; downstream normalization must not see a stale error.
-    result = { ...result, isError };
+    const effective = await emitNestedToolResult(
+      runner, { toolName: name, toolCallId, input: args }, result, isError,
+      context, tool.outputSchema !== undefined,
+    );
+    result = effective;
+    isError = effective.isError;
 
     // Capture the read's clean text note AFTER the patch — the handoff strips
     // pi's non-vision note and swaps the image for a description, so the first

@@ -40,6 +40,25 @@ Independent work can continue without polling. With `agents.notifyOnComplete` en
 
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results: Fabric does not start a turn to deliver them, and they join Main's next turn, whatever starts it (typed input, a peer message or another trigger). Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
 
+### Native runner session attribution
+
+Pi runs record the live native Pi session ID in `runnerSessionId`, including
+`--no-session` task agents and durable actors owned by Main or a resident host.
+This is the ID sent upstream as the gateway's `session_id`; it is **not** the
+transport `sessionId` (for example, a process PID) or the Fabric run ID.
+`agents.status`, `agents.wait`, and run listings expose the latest native ID.
+If Pi replaces its session during a run, `runnerSessionIds` keeps the distinct
+observed IDs in first-seen order, while `runnerSessionId` follows the latest.
+
+Run records also retain `mainAgentId` and `fabricSessionId` for the parent Main,
+alongside the task name and, for actor activations, `actorId`/`actorName`.
+Actor run copies retain these fields in `runs/<run-id>/status.json`.
+The `pi.agent_start` and terminal `run.*` lifecycle payloads carry
+`runnerSessionId` and the parent `fabricSessionId` when available.
+Native identity comes from Pi's live session manager, not a pre-launch session
+header: Pi can replace a header-only session's seeded ID during startup.
+No new store or configuration is required.
+
 ### Stalled Pi error recovery
 
 After a failed or aborted assistant response (including `Error: Terminated`), Fabric allows Pi's own retries to recover. If no recovery output arrives for 60 seconds, the worker fails the run with the original error and terminates the child, escalating from SIGTERM to SIGKILL after another 5 seconds. Repeated retry announcements, errors, or lifecycle events do not extend this deadline. Nonempty text/thinking/tool-call deltas refresh it; a successful assistant response clears it. Healthy inference and tool execution are not subject to this recovery timer, and the overall run deadline still applies.

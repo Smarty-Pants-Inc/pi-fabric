@@ -1818,9 +1818,11 @@ describe("AgentManager", () => {
     });
     expect(native.status).toBe("completed");
     // --no-extensions disables Fabric/discovery, not explicitly installed host helpers.
-    // Principal delivery stays available for later admitted steering without widening tools.
+    // Principal delivery and native session observation remain installed host helpers;
+    // neither widens the child's tools nor enables Fabric/discovery.
     expect(JSON.parse(native.text).extensionPaths).toEqual([
       path.resolve("src/worker/principal-delivery.ts"),
+      path.resolve("src/worker/session-id.ts"),
     ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,

@@ -295,6 +295,20 @@ const main = async (): Promise<void> => {
   fs.mkdirSync(deliveryDirectory, { recursive: true, mode: 0o700 });
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
+  if (options.runner === "pi") {
+    // The manager removes the old status to fence terminal verdicts on relaunch.
+    // History is explicitly handed across that boundary, not a Pi resume target.
+    if (options.runnerSessionIds?.length) record.runnerSessionIds = [...options.runnerSessionIds];
+    // Also accept a matching prior status for a direct worker restart.
+    try {
+      const prior = JSON.parse(fs.readFileSync(options.statusFile, "utf8")) as AgentRunRecord;
+      if (prior.id === options.id) {
+        const ids = [...(record.runnerSessionIds ?? []), ...(Array.isArray(prior.runnerSessionIds) ? prior.runnerSessionIds : []), prior.runnerSessionId]
+          .filter((id): id is string => typeof id === "string" && Boolean(id.trim()));
+        if (ids.length) record.runnerSessionIds = [...new Set(ids)];
+      }
+    } catch { /* first launch or malformed prior status: observe the live child */ }
+  }
   writeRunRecord(options.statusFile, record);
   const emitLifecycle = (
     event: string,
@@ -357,6 +371,12 @@ const main = async (): Promise<void> => {
   const deliveryHook = fileURLToPath(new URL(
     import.meta.url.endsWith(".ts") ? "./worker/principal-delivery.ts" : "./worker/principal-delivery.js", import.meta.url));
   piArguments.push("-e", deliveryHook);
+  // A session file can contain only a seeded header, which Pi replaces at
+  // startup. --no-session has no file at all. Observe the live SessionManager
+  // instead of guessing either identity from the launch arguments.
+  const sessionIdHook = fileURLToPath(new URL(
+    import.meta.url.endsWith(".ts") ? "./worker/session-id.ts" : "./worker/session-id.js", import.meta.url));
+  piArguments.push("-e", sessionIdHook);
   // smarty-dev#967: a structured Pi run replies through one tool call, never its final text.
   const replyTool = options.replyTool === true && options.runner === "pi" && schema !== undefined;
   const replyFile = replyTool ? path.join(path.dirname(options.statusFile), "reply.json") : undefined;
@@ -1004,6 +1024,16 @@ const main = async (): Promise<void> => {
       processClaudeEvent(event);
       return;
     }
+    if (event.type === "fabric_runner_session") {
+      const sessionId = stringField(event.sessionId);
+      if (event.runId === options.id && sessionId && record.runnerSessionId !== sessionId) {
+        record.runnerSessionId = sessionId;
+        record.runnerSessionIds ??= [];
+        if (!record.runnerSessionIds.includes(sessionId)) record.runnerSessionIds.push(sessionId);
+        update();
+      }
+      return;
+    }
     compactControl.observe(event);
     if (activationWindow && event.type === "fabric_activation_window_ready") {
       if (event.runId === options.id && event.nonce === activationNonce &&
@@ -1025,7 +1055,10 @@ const main = async (): Promise<void> => {
     }
     if (!terminalStatus) recoveryWatchdog.observe(event);
     if (event.type === "agent_start") {
-      emitLifecycle("pi.agent_start");
+      emitLifecycle("pi.agent_start", {
+        ...(record.runnerSessionId ? { runnerSessionId: record.runnerSessionId } : {}),
+        ...(record.fabricSessionId ? { fabricSessionId: record.fabricSessionId } : {}),
+      });
       retryPending = false;
       // Starting a retry is not proof of acceptance: preserve the error and timer
       // until the provider starts a new assistant response.

@@ -160,8 +160,15 @@ export interface AgentRunRecord {
   exitCode?: number | null;
   usage: AgentUsage;
   budget?: FabricBudgetSummary;
+  /** Transport identity (e.g. process PID), not the native Pi session. */
   sessionId?: string;
+  /** Latest native runner session; joins Pi gateway session_id to this run. */
   runnerSessionId?: string;
+  /** Distinct native Pi sessions observed during this run, in first-seen order. */
+  runnerSessionIds?: string[];
+  /** Parent Main participant and its Pi/Fabric session, not the child session. */
+  mainAgentId?: string;
+  fabricSessionId?: string;
   attachCommand?: string;
   branch?: string;
   worktree?: string;
@@ -261,6 +268,8 @@ export interface AgentWorkerOptions {
   branch?: string;
   worktree?: string;
   inheritedSessionPins?: InheritedSessionPin[];
+  /** Observed native Pi session history carried across a same-run worker relaunch. Not a resume target. */
+  runnerSessionIds?: string[];
   carryOver?: AgentRunCarryOver;
 }
 

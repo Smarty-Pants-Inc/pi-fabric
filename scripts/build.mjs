@@ -71,6 +71,7 @@ const lazyEntryPoints = [
   "src/worker/activation-window.ts",
   "src/worker/reply-tool.ts",
   "src/worker/principal-delivery.ts",
+  "src/worker/session-id.ts",
   "src/worker/model-control.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",

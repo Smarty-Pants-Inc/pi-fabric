@@ -1,3 +1,7 @@
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { MainAgentController } from "../src/main-agent.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -348,6 +352,67 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.acceptControl({ ...command("steer"), targetId: main.id }, { id: "sender", name: "Sender", kind: "main" }))
       .resolves.toMatchObject({ accepted: false, error: expect.stringContaining("non-interactive") });
     expect(main.deliverAgent).not.toHaveBeenCalled();
+  });
+
+  const failedInitialPresence = async (mode: ExtensionContext["mode"]) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-main-failed-presence-"));
+    const ports = routing();
+    const pi = { sendMessage: vi.fn(), sendUserMessage: vi.fn(), getThinkingLevel: () => "off" };
+    const main = new MainAgentController(pi as unknown as ExtensionAPI, "session:audit", true, root, "audit",
+      mode !== "print" && mode !== "json");
+    const context = { mode, isIdle: () => true, hasPendingMessages: () => false } as ExtensionContext;
+    main.attachFollowUpDrain(context, 0, path.join(root, "followups.json"));
+    const deliverAgent = vi.spyOn(main, "deliverAgent");
+    const identity = { id: main.id, name: "Main", kind: "main" as const };
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000);
+    const directory = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: main.id, rootId: main.id, identity, heartbeatMs: 60_000, leaseMs: 120_000,
+    });
+    directory.registerSource(() => [directory.root(main.info(context), mode !== "print" && mode !== "json")]);
+    const failure = Object.assign(new Error("Initial label write timed out"), { code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    const put = vi.spyOn(mesh, "put").mockRejectedValue(failure);
+    const router = new AgentMessageRouter(ports.agents, { ...ports.actors, identity }, main, directory, ports.control, (binding) => binding);
+    const close = async () => {
+      main.closeFollowUpDrain();
+      await directory.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    };
+    try {
+      await expect(directory.start()).rejects.toBe(failure);
+      expect(put).toHaveBeenCalledWith(expect.objectContaining({ key: "topology/peer-seq" }));
+      expect(directory.get(main.id)).toBeUndefined();
+      expect(directory.get(main.id, undefined, { fresh: true })).toBeUndefined();
+      return { router, main, pi, deliverAgent, close };
+    } catch (error) { await close(); throw error; }
+  };
+
+  it.each([
+    ["print", "steer"], ["print", "followUp"], ["json", "steer"], ["json", "followUp"],
+  ] as const)("rejects direct and incoming control to %s Main after failed initial presence (%s)", async (mode, kind) => {
+    const state = await failedInitialPresence(mode);
+    try {
+      const direct = await state.router.routeMessage("main", "audit must not answer", undefined, kind)
+        .catch((error: unknown) => error);
+      const incoming = await state.router.acceptControl({ ...command(kind), targetId: state.main.id },
+        { id: "sender", name: "Sender", kind: "main" }, undefined, "bridge");
+      expect.soft(state.deliverAgent).not.toHaveBeenCalled();
+      expect.soft(state.pi.sendMessage).not.toHaveBeenCalled();
+      expect.soft(state.pi.sendUserMessage).not.toHaveBeenCalled();
+      expect(direct).toMatchObject({ name: "FabricParticipantNonInteractiveError", code: "FABRIC_PARTICIPANT_NON_INTERACTIVE" });
+      expect(incoming).toMatchObject({ accepted: false, error: expect.stringContaining("non-interactive") });
+    } finally { await state.close(); }
+  });
+
+  it.each(["steer", "followUp"] as const)("delivers interactive Main direct and control messages despite failed initial presence (%s)", async (kind) => {
+    const state = await failedInitialPresence("tui");
+    try {
+      await expect(state.router.routeMessage("main", "direct", undefined, kind)).resolves.toMatchObject({ queued: true, routed: "main" });
+      await expect(state.router.acceptControl({ ...command(kind), targetId: state.main.id },
+        { id: "sender", name: "Sender", kind: "main" }, undefined, "bridge")).resolves.toMatchObject({ accepted: true });
+      expect(state.deliverAgent).toHaveBeenCalledTimes(2);
+      expect(state.pi.sendMessage).toHaveBeenCalledTimes(2);
+      expect(state.pi.sendUserMessage).not.toHaveBeenCalled();
+    } finally { await state.close(); }
   });
 
   it("preserves passive Main delivery and caller identity without actor validation", async () => {

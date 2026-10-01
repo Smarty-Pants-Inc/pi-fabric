@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { projectOf } from "../src/topology/project-identity.js";
@@ -571,6 +572,25 @@ describe("ParticipantDirectory.get", () => {
 
 // smarty-dev#784: roots publish their role and project, and peers show them.
 describe("ParticipantDirectory role and project", () => {
+  it("publishes normalized origin and marks print/JSON roots as discovery-only observers", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-origin-presence-"));
+    roots.push(dir);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "ignore" });
+    git("init", "-q");
+    git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
+    const identity: MeshIdentity = { id: "session:audit", name: "main", kind: "main", sessionId: "audit" };
+    let alpha: ParticipantDirectory;
+    const info = { id: identity.id, name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host",
+      cwd: dir, sessionId: "audit", startedAt: 1, updatedAt: 2, pendingMessages: false, local: true } as const;
+    alpha = createDirectory(path.join(dir, "mesh"), identity, identity.id, () => [alpha.root(info, false)]);
+    await alpha.start();
+    expect(alpha.get(identity.id)).toMatchObject({ repository: "github.com/smarty-pants-inc/pi-fabric", interactive: false, capabilities: ["fabric"] });
+    expect(alpha.root(info, true)).toMatchObject({ interactive: true, capabilities: ["steer", "followUp", "fabric"] });
+    const reader = createDirectory(path.join(dir, "mesh"), { id: "session:reader", name: "main", kind: "main" }, "session:reader", () => []);
+    expect(reader.peers()).toEqual([expect.objectContaining({ id: identity.id, repository: "github.com/smarty-pants-inc/pi-fabric", interactive: false })]);
+  });
+
+
   it("publishes a root's role and project, and shows them on peers", async () => {
     const previous = process.env.SMARTY_ROLE;
     process.env.SMARTY_ROLE = "project-agent@5358e96a418f";

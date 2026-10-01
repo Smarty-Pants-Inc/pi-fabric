@@ -1,6 +1,7 @@
+import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 
@@ -35,6 +36,8 @@ export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel";
 
 export interface FabricControlCommand {
+  /** Hydrated from the admitted MeshEvent envelope, never event.data. */
+  principal?: FabricPrincipal | undefined;
   version: 1;
   commandId: string;
   targetId: string;
@@ -166,7 +169,8 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   ) {
     return undefined;
   }
-  return data as unknown as FabricControlCommand;
+  return { ...data, principal: event.verification === "mesh" || event.verification === "bridge"
+    ? copyFabricPrincipal(event.principal) : undefined } as unknown as FabricControlCommand;
 };
 
 interface FabricControlSeenRecord {
@@ -209,6 +213,8 @@ export interface FabricControlPlaneOptions {
 }
 
 export interface FabricControlInput {
+  /** Host-only scope snapshot, not a model-facing parameter. */
+  principal?: FabricPrincipal | undefined;
   message?: string;
   data?: unknown;
   triggerTurn?: boolean;
@@ -490,6 +496,9 @@ export class FabricControlPlane {
         topic: CONTROL_TOPIC,
         kind: operation,
         from: this.identity,
+        principal: input.principal,
+        signal: operation === "ask" && options.detachOnMainCeiling
+          ? withoutMainExecutionCeiling(options.signal) : options.signal,
         to: ownerHostId,
         // Stamped at commit (smarty-dev#816): the owner gets the whole timeout, not what is
         // left after this sender waited for the mesh lock (2-3 s under load).

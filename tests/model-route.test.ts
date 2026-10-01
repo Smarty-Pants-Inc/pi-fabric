@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
+import { spawnSync } from "node:child_process";
+import { WorktreeManager } from "../src/agents/worktree-manager.js";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { decideModelRoute, prepareRouteDispatch, ROUTE_DEADLINE_MS, type RouteEvaluate } from "../src/agents/model-route.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -19,10 +21,13 @@ const response = (confidence = .95, probability = .95): JevResponse => ({ model:
 const roots: string[] = [];
 const managers: AgentManager[] = [];
 const root = () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-")); roots.push(dir); return dir; };
+const ledgerFile = () => path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl");
+beforeEach(() => { vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root(), "agent")); });
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -102,9 +107,90 @@ describe("shadow model routing", () => {
 });
 
 describe("durable route dispatch", () => {
+  it.skipIf(process.platform === "win32").each(["parent", "leaf"])("R2 ignores workspace ledger %s links", async kind => {
+    const dir = root(); const outside = root(); const target = path.join(outside, "target"); fs.writeFileSync(target, "unchanged");
+    if (kind === "parent") { fs.mkdirSync(path.join(dir, ".pi")); fs.symlinkSync(outside, path.join(dir, ".pi/fabric"), "dir"); }
+    else { fs.mkdirSync(path.join(dir, ".pi/fabric"), { recursive: true }); fs.symlinkSync(target, path.join(dir, ".pi/fabric/model-routing.jsonl")); }
+    const decision = await decideModelRoute(input, async () => response());
+    const manager = new AgentManager(dir, DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
+    await manager.run({ task: "lookup", routeDecision: decision, transport: "process" });
+    expect(fs.readdirSync(outside)).toEqual(["target"]); expect(fs.readFileSync(target, "utf8")).toBe("unchanged");
+  });
+  it.skipIf(process.platform === "win32").each(["link", "fifo"])("R2 refuses %s ledger endpoints without blocking or changing targets", kind => {
+    const dir = root(); const outside = path.join(dir, "outside"); fs.writeFileSync(outside, "unchanged");
+    const file = path.join(dir, "ledger");
+    if (kind === "link") fs.symlinkSync(outside, file); else expect(spawnSync("mkfifo", [file]).status).toBe(0);
+    const program = `import { appendRouteRecord } from ${JSON.stringify(path.resolve("src/agents/model-route.ts"))}; try { appendRouteRecord(${JSON.stringify(file)}, {type:"decision"}); process.exit(2); } catch { process.exit(0); }`;
+    const result = spawnSync("bun", ["-e", program], { timeout: 3000, killSignal: "SIGKILL" });
+    expect(fs.readFileSync(outside, "utf8")).toBe("unchanged"); expect(result.error).toBeUndefined(); expect(result.status).toBe(0);
+  });
+  it("R2 records every confirmed pre-worker worktree failure", async () => {
+    const dir = root();
+    vi.spyOn(WorktreeManager.prototype, "create").mockRejectedValue(new Error("worktree denied"));
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const manager = new AgentManager(dir, DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(dir, "runs") }); managers.push(manager);
+    const decision = await decideModelRoute(input, async () => response());
+    await expect(manager.spawn({ task: "lookup", worktree: true, routeDecision: decision })).rejects.toThrow("worktree denied");
+    const file = fs.existsSync(ledgerFile()) ? ledgerFile() : path.join(dir, ".pi/fabric/model-routing.jsonl");
+    const rows = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null }); expect(launch).not.toHaveBeenCalled();
+  });
+  it.each(["task.txt", "schema.json", "images.json"])("R2 settles failed pre-worker %s writes", async leaf => {
+    const dir = root(); const write = fs.writeFileSync;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => { if (String(file).endsWith(leaf)) throw new Error("input write failed"); return write(file, data, options); });
+    const decision = await decideModelRoute(input, async () => response());
+    const manager = new AgentManager(dir, DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(dir, "runs") }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    await expect(manager.spawn({ task: "lookup", schema: {}, images: [{ type: "image", data: "YQ==", mimeType: "image/png" }], routeDecision: decision })).rejects.toThrow("input write failed");
+    const file = fs.existsSync(ledgerFile()) ? ledgerFile() : path.join(dir, ".pi/fabric/model-routing.jsonl");
+    const rows = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ status: "failed", admittedModel: null, admittedEffort: null }); expect(launch).not.toHaveBeenCalled();
+  });
+  it("R2 retains and retries a failed queued outcome before cleanup", async () => {
+    const dir = root(); const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
+    const blocker = await manager.spawn({ task: "HANG", transport: "process" });
+    const decision = await decideModelRoute(input, async () => response());
+    const queued = await manager.spawn({ task: "lookup", routeDecision: decision, transport: "process" });
+    const open = fs.openSync; let broken = true;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { if (String(file).endsWith("model-routing.jsonl") && broken) throw new Error("temporary ledger outage"); return open(file, flags, mode); });
+    const result = await manager.stop(queued.id);
+    expect(result.warnings?.join(" ")).toContain("retained");
+    await expect(manager.cleanup(queued.id)).rejects.toThrow("retained");
+    expect(manager.list().some(run => run.id === queued.id)).toBe(true);
+    const pendingFile = path.join(dir, "runs", queued.id, "pending-route-outcome.json");
+    expect(JSON.parse(fs.readFileSync(pendingFile, "utf8")).record).toMatchObject({ decisionId: decision.decisionId, status: "stopped" });
+    broken = false; await manager.cleanup(queued.id); await manager.stop(blocker.id);
+    expect(fs.existsSync(pendingFile)).toBe(false);
+    const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ status: "stopped", decisionId: decision.decisionId });
+  });
+
+  it("R2 retries the first queued append failure and writes exactly one outcome", async () => {
+    const dir = root(); const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
+    const blocker = await manager.spawn({ task: "HANG", transport: "process" });
+    const decision = await decideModelRoute(input, async () => response());
+    const queued = await manager.spawn({ task: "lookup", routeDecision: decision, transport: "process" });
+    const open = fs.openSync; let attempts = 0;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { if (String(file).endsWith("model-routing.jsonl") && ++attempts === 1) throw new Error("first append failed"); return open(file, flags, mode); });
+    const result = await manager.stop(queued.id); expect(result.warnings).toBeUndefined(); expect(attempts).toBe(2);
+    await manager.cleanup(queued.id); await manager.stop(blocker.id);
+    expect(fs.readFileSync(ledgerFile(), "utf8").trim().split("\n")).toHaveLength(2);
+  });
+  it("R2 retains the exact pending queued join across close during persistent storage failure", async () => {
+    const dir = root(); const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1 }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") }); managers.push(manager);
+    await manager.spawn({ task: "HANG", transport: "process" });
+    const decision = await decideModelRoute(input, async () => response());
+    const queued = await manager.spawn({ task: "lookup", routeDecision: decision, transport: "process" });
+    const open = fs.openSync; let attempts = 0;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => { if (String(file).endsWith("model-routing.jsonl")) { attempts++; throw new Error("persistent append failure"); } return open(file, flags, mode); });
+    await manager.stop(queued.id); expect(attempts).toBe(3);
+    await manager.close(); expect(attempts).toBe(6);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "runs", queued.id, "pending-route-outcome.json"), "utf8"))).toMatchObject({ ledger: ledgerFile(), record: { decisionId: decision.decisionId, status: "stopped" } });
+    await expect(manager.cleanup(queued.id)).rejects.toThrow("retained");
+  });
   it("writes and fsyncs decision before launch, seeds child identity and appends terminal outcome once", async () => {
     const dir = root();
-    const file = path.join(dir, ".pi", "fabric", "model-routing.jsonl");
+    const file = ledgerFile();
     const decision = await decideModelRoute(input, async () => response());
     const launch = ProcessTransport.prototype.launch;
     const calls: string[][] = [];
@@ -136,7 +222,7 @@ describe("durable route dispatch", () => {
   });
   it("dispatches pin and marks record-failed when durable state cannot be written", async () => {
     const dir = root();
-    fs.writeFileSync(path.join(dir, ".pi"), "not a directory");
+    fs.writeFileSync(process.env.PI_CODING_AGENT_DIR!, "not a directory");
     const decision = await decideModelRoute(input, async () => response());
     const manager = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents }, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs"),
@@ -157,7 +243,7 @@ describe("durable route dispatch", () => {
     const queued = await manager.spawn({ task: "harmless lookup", transport: "process", routeDecision: decision });
     expect(queued).toMatchObject({ status: "queued", model: pin.model, thinking: pin.effort });
     await manager.stop(queued.id); await manager.stop(blocker.id);
-    const rows = fs.readFileSync(path.join(dir, ".pi/fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2);
     expect(rows[1]).toMatchObject({ type: "outcome", decisionId: decision.decisionId, status: "stopped", admittedModel: null, admittedEffort: null });
   });
@@ -182,7 +268,7 @@ describe("durable route dispatch", () => {
     const decision = await decideModelRoute(input, async () => response());
     const prepared = prepareRouteDispatch(decision, dir, runDir, "child-id");
     prepared.outcome({ status: "failed" }); prepared.outcome({ status: "failed" });
-    const rows = fs.readFileSync(path.join(dir, ".pi/fabric/model-routing.jsonl"), "utf8").trim().split("\n");
+    const rows = fs.readFileSync(ledgerFile(), "utf8").trim().split("\n");
     expect(rows).toHaveLength(2);
     expect(JSON.parse(rows[1]!)).toMatchObject({ admittedModel: null, tokens: null });
   });

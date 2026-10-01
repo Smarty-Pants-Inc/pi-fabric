@@ -8,7 +8,7 @@ import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import type { FabricActorDeliveryRequest, FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
@@ -252,7 +252,19 @@ const setup = (
 };
 
 describe('model: "auto" spawn routing (#2890)', () => {
+  beforeEach(() => {
+    const host = fs.mkdtempSync(path.join(os.tmpdir(), "route-provider-host-")); roots.push(host);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(host, "agent"));
+  });
+  afterEach(() => vi.unstubAllEnvs());
   const request = { task: "harmless bounded lookup", model: "auto", routeClass: "bounded-lookup", pinModel: "provider/model-a", pinThinking: "high", protected: false, transport: "process" };
+  it.each(["provider/modle-a", "modle-a", "", "auto"])("R2 refuses unavailable or invalid exact role pin: %s", async pinModel => {
+    const evaluate = vi.fn(async () => { throw new Error("must not infer"); });
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const launch = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke("spawn", { ...request, pinModel }, context)).rejects.toMatchObject({ name: "ModelRoutePinError", code: "MODEL_ROUTE_PIN_UNAVAILABLE" });
+    expect(launch).not.toHaveBeenCalled(); expect(evaluate).not.toHaveBeenCalled();
+  });
   it("records shadow choice yet launches the pin and appends actual outcome", async () => {
     const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
     const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
@@ -261,7 +273,7 @@ describe('model: "auto" spawn routing (#2890)', () => {
     expect(handle).toMatchObject({ model: "provider/model-a", thinking: "high", routeDecision: { model: "provider/model-b", effort: "medium", reasonCode: "shadow-choice" } });
     const result = await agents.wait(handle.id);
     expect(result).toMatchObject({ status: "completed", model: "provider/model-a", thinking: "high" });
-    const rows = fs.readFileSync(path.join(root, ".pi/fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const rows = fs.readFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows).toHaveLength(2); expect(rows[1].decisionId).toBe(rows[0].decisionId);
     expect(evaluate).toHaveBeenCalledTimes(1);
   });
@@ -272,6 +284,24 @@ describe('model: "auto" spawn routing (#2890)', () => {
     const handle = await provider.invoke("spawn", args, context) as AgentHandleInfo;
     await agents.wait(handle.id);
     expect(evaluate).not.toHaveBeenCalled(); expect(handle.model).toBe(request.pinModel);
+  });
+  it.each([null, undefined, ""])("R2 refuses invalid explicit pins rather than substituting role config: %s", async pinModel => {
+    const { provider, agents } = setup([], [], undefined, { agentsConfig: { modelRouting: { pinModel: request.pinModel, pinThinking: "high" } } });
+    const launch = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke("spawn", { ...request, pinModel }, context)).rejects.toMatchObject({ name: "ModelRoutePinError", code: "MODEL_ROUTE_PIN_UNAVAILABLE" });
+    expect(launch).not.toHaveBeenCalled();
+  });
+  it("R2 resolves explicit role aliases only to their exact targets", async () => {
+    const { provider, agents } = setup([], [], undefined, { modelsConfig: { ...DEFAULT_FABRIC_CONFIG.models, aliases: { role: { targets: ["provider/model-a"] } } } });
+    const handle = await provider.invoke("spawn", { ...request, pinModel: "role" }, context) as AgentHandleInfo;
+    expect(handle.model).toBe("provider/model-a"); await agents.wait(handle.id);
+  });
+  it("R2 refreshes a pin miss but remains exact after refresh", async () => {
+    const { provider, agents } = setup();
+    let available = visiblePiModels; const refresh = vi.fn(() => { available = [...visiblePiModels, { provider: "provider", id: "model-a0" }]; });
+    const owner = { ...context, extensionContext: { ...context.extensionContext, modelRegistry: { getAvailable: () => available, refresh } } as unknown as ExtensionContext };
+    const handle = await provider.invoke("spawn", { ...request, pinModel: "provider/model-a0" }, owner) as AgentHandleInfo;
+    expect(handle.model).toBe("provider/model-a0"); expect(refresh).toHaveBeenCalledTimes(1); await agents.wait(handle.id);
   });
   it("accepts explicit role-config pins, not inherited/default model or medium effort", async () => {
     const { root, provider, agents } = setup([], [], undefined, { agentsConfig: { modelRouting: { pinModel: request.pinModel, pinThinking: "high" } } });

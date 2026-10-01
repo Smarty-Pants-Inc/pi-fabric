@@ -900,7 +900,7 @@ export class FabricRuntimeState {
     );
     this.#agents.subscribeUi(() => this.#participants?.scheduleRefresh());
     this.#actors.subscribe(() => this.#participants?.scheduleRefresh());
-    let routeClient: import("./jev/client.js").JevClient | undefined;
+    let routeOwner: { client: import("./jev/client.js").JevClient; signal: AbortSignal; pending: Set<Promise<unknown>> } | undefined;
     const agentsProvider = new AgentsProvider(
       this.#agents,
       this.#actors,
@@ -914,8 +914,15 @@ export class FabricRuntimeState {
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
       (request, signal) => {
-        if (!routeClient) throw new Error("Jev routing unavailable");
-        return routeClient.evaluate(request, signal);
+        const owner = routeOwner;
+        if (!owner || owner.signal.aborted) throw new Error("Jev routing unavailable");
+        const pending = owner.client.evaluate(request, AbortSignal.any([signal, owner.signal])).catch(error => {
+          if (owner.signal.aborted && !signal.aborted) throw new Error("Jev routing owner retired");
+          throw error;
+        });
+        owner.pending.add(pending);
+        void pending.then(() => owner.pending.delete(pending), () => owner.pending.delete(pending));
+        return pending;
       },
     );
     this.#agentsProvider = agentsProvider;
@@ -977,10 +984,11 @@ export class FabricRuntimeState {
           });
           // A program may pin jev.evaluate itself. Cancel at owner retirement,
           // not only at provider.close(), which waits for those pins to drain.
-          routeClient = provider.client;
+          const owner = { client: provider.client, signal: component.signal, pending: new Set<Promise<unknown>>() };
+          routeOwner = owner;
           this.#jevPrograms = provider.manager;
           const stop = () => {
-            if (routeClient === provider.client) routeClient = undefined;
+            if (routeOwner === owner) routeOwner = undefined;
             observationHost?.close(); provider.manager.stopAll();
           };
           component.signal.addEventListener("abort", stop, { once: true });
@@ -989,6 +997,7 @@ export class FabricRuntimeState {
             observationHost?.close();
             if (this.#jevObservationHost === observationHost) this.#jevObservationHost = undefined;
             if (this.#jevPrograms === provider.manager) this.#jevPrograms = undefined;
+            await Promise.allSettled([...owner.pending]);
             await provider.manager.close();
           }, { label: "jev-program-owner", kind: "transactional", resources: ["jev:programs"], ordering: "ordered" });
           return provider;

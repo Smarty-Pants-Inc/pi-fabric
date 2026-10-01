@@ -61,6 +61,29 @@ export interface PiModelRegistryView extends RefreshableModelRegistry {
   getAvailable(): readonly { provider: unknown; id: unknown; name?: unknown }[];
 }
 
+export class ModelRoutePinError extends Error {
+  readonly code = "MODEL_ROUTE_PIN_UNAVAILABLE";
+  constructor(selector: string) {
+    super(`Role pin ${JSON.stringify(selector)} is not available to this Pi session. Auto spawn requires an exact registered provider/model or configured role alias and explicit pinThinking.`);
+    this.name = "ModelRoutePinError";
+  }
+}
+
+/** Routing authority is exact, even after refresh: never reuse fuzzy participant selection. */
+export const resolvePiRoutePin = (options: {
+  selector: string; registry: PiModelRegistryView; aliases: FabricModelAliases;
+}): Promise<FabricModelCandidate> => resolveWithModelRefresh(options.registry, () => {
+  const query = options.selector.trim().toLowerCase();
+  const alias = Object.entries(options.aliases).find(([name]) => name.toLowerCase() === query)?.[1];
+  const targets = alias?.targets ?? (/^[^\s/]+\/[^\s]+$/.test(query) ? [query] : []);
+  const available = registryCandidates(options.registry);
+  for (const target of targets) {
+    const model = available.find(model => `${model.provider}/${model.id}`.toLowerCase() === target.toLowerCase());
+    if (model) return model;
+  }
+  throw new ModelRoutePinError(options.selector);
+});
+
 const registryCandidates = (registry: PiModelRegistryView | undefined): FabricModelCandidate[] => {
   try {
     return (registry?.getAvailable() ?? []).map((model) => ({

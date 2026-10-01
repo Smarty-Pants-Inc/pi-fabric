@@ -18,6 +18,7 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
   const run = async (scenario: string, route = true) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-route-worker-")); roots.push(root);
     const scenarioFile = path.join(root, "scenario"); fs.writeFileSync(scenarioFile, scenario);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
     vi.stubEnv("FAKE_MODEL_SCENARIO", scenarioFile);
     vi.stubEnv("PI_FABRIC_ROUTE_HEADER", "parent-attribution-must-not-leak");
     const pin = { model: "openai-codex/gpt-5.6-sol", effort: "high" as const };
@@ -32,7 +33,7 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
       transport: "process", extensions: false, ...(route ? { routeDecision: decision } : {}) });
     const events = fs.readFileSync(path.join(root,"runs",result.id,"events.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line));
     const launch = events.find(event => event.type === "fake_route_launch");
-    const rows = route ? fs.readFileSync(path.join(root,".pi/fabric/model-routing.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+    const rows = route ? fs.readFileSync(path.join(root,"agent/fabric/model-routing.jsonl"),"utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
     return { result, rows, launch, events, pin };
   };
   it("loads attribution hook even when extensions are disabled and records verified admission", async () => {

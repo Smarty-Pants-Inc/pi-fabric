@@ -74,7 +74,7 @@ import {
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
-import { resolvePiModel } from "../core/model-refresh.js";
+import { resolvePiModel, resolvePiRoutePin, ModelRoutePinError } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
@@ -493,13 +493,14 @@ export class AgentsProvider implements FabricProvider {
       throw new Error('model: "auto" requires a bounded routeClass identifier');
     }
     const config = this.manager.config.modelRouting;
-    const pinModel = args.pinModel ?? config?.pinModel;
-    const pinThinking = args.pinThinking ?? config?.pinThinking;
+    const pinModel = Object.hasOwn(args, "pinModel") ? args.pinModel : config?.pinModel;
+    const pinThinking = Object.hasOwn(args, "pinThinking") ? args.pinThinking : config?.pinThinking;
     if (typeof pinModel !== "string" || !pinModel.trim() || pinModel === "auto" || !isFabricThinking(pinThinking)) {
-      throw new Error('model: "auto" requires explicit pinModel and pinThinking (call or agents.modelRouting role config)');
+      throw new ModelRoutePinError(String(pinModel ?? ""));
     }
     // Canonicalize only the pin: auto must never fall through to MRU/session/default medium.
-    const resolved = await this.#resolvePiModelArgs({ ...args, model: pinModel, thinking: pinThinking }, context);
+    const exactPin = await resolvePiRoutePin({ selector: pinModel, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
+    const resolved = { ...args, model: `${exactPin.provider}/${exactPin.id}`, thinking: pinThinking };
     const pin = { model: resolved.model as string, effort: pinThinking };
     const candidates = config?.shadowCandidates ?? [];
     const available = context.extensionContext.modelRegistry.getAvailable();

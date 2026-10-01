@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { CONFIG_DIR_NAME, CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import { writeJsonAtomic } from "../core/atomic-write.js";
+import { resolveAgentDir } from "../core/agent-dir.js";
 import { runAbortable } from "../async-settlement.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
 import type { FabricThinking } from "../thinking.js";
@@ -95,21 +97,39 @@ export function routeHeader(decision: ModelRouteDecision): string {
   return `${decision.routeClass}/${encodeURIComponent(decision.model).replace(/[!'()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`)}-${decision.effort}/${decision.reasonCode}:${decision.decisionId}`;
 }
 
-/** O_APPEND + fsync before launch: retained outside the ephemeral agent run directory. */
+/** Host-owned storage only. Reject links before mkdir, and special files before writing. */
 export function appendRouteRecord(file: string, record: object): void {
-  const directory = path.dirname(file);
-  const created = fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const fd = fs.openSync(file, "a", 0o600);
-  try { fs.writeFileSync(fd, `${JSON.stringify(record)}\n`, "utf8"); fs.fsyncSync(fd); }
-  finally { fs.closeSync(fd); }
-  // File fsync alone need not persist its new directory entry. Flush newly created
-  // ancestors too on hosts that support directory fsync (Windows flushes the file).
+  const text = `${JSON.stringify(record)}\n`;
+  if (Buffer.byteLength(text) > 64 * 1024) throw new Error("Routing record exceeds byte limit");
+  const directory = path.dirname(path.resolve(file));
+  const ancestors: string[] = [];
+  const created: string[] = [];
+  for (let current = directory; current !== path.dirname(current); current = path.dirname(current)) ancestors.unshift(current);
+  for (const current of ancestors) {
+    try { fs.mkdirSync(current, { mode: 0o700 }); created.push(current); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    const stat = fs.lstatSync(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe routing ledger directory");
+  }
+  for (const current of ancestors.slice(-2)) {
+    const stat = fs.lstatSync(current);
+    if (process.platform !== "win32" && (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0)) throw new Error("Unsafe routing ledger directory ownership or permissions");
+  }
+  const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
+  // lstat also enforces rejection on platforms without O_NOFOLLOW.
+  try { if (!fs.lstatSync(file).isFile()) throw new Error("Unsafe routing ledger endpoint"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const fd = fs.openSync(file, flags, 0o600);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1 || stat.size + Buffer.byteLength(text) > 64 * 1024 * 1024 ||
+      (process.platform !== "win32" && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0))) throw new Error("Unsafe or oversized routing ledger");
+    fs.writeFileSync(fd, text, "utf8"); fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
   if (process.platform !== "win32") {
-    const stop = created ? path.dirname(created) : directory;
-    for (let current = directory; ; current = path.dirname(current)) {
-      const dirFd = fs.openSync(current, "r");
+    // Persist the newly created file and directory entries without following links.
+    for (const current of new Set([directory, ...created.map(current => path.dirname(current))])) {
+      const dirFd = fs.openSync(current, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
       try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
-      if (current === stop) break;
     }
   }
 }
@@ -117,7 +137,7 @@ export function appendRouteRecord(file: string, record: object): void {
 export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string, runDirectory: string, childId: string): {
   header: string; sessionFile?: string; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
 } {
-  const file = path.join(cwd, CONFIG_DIR_NAME, "fabric", "model-routing.jsonl");
+  const file = path.join(resolveAgentDir(), "fabric", "model-routing.jsonl");
   let sessionFile: string | undefined;
   try {
     // Seed a real native Pi session so the decision's child ID is not a guessed transport ID.
@@ -133,16 +153,27 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string, 
     // Shadow failures never block pinned work. The header still carries the failed record's ID.
   }
   let appended = false;
+  let pendingRecord: object | undefined;
+  const pendingFile = path.join(runDirectory, "pending-route-outcome.json");
   return {
     header: routeHeader(decision), ...(sessionFile ? { sessionFile } : {}),
     outcome(result) {
       if (appended) return;
-      appendRouteRecord(file, { type: "outcome", decisionId: decision.decisionId, childSessionId: childId,
+      pendingRecord ??= { type: "outcome", decisionId: decision.decisionId, childSessionId: childId,
         status: result.status, admittedModel: result.admittedModel ?? (result.status === "completed" ? result.model ?? null : null),
         admittedEffort: result.admittedThinking ?? (result.status === "completed" ? result.thinking ?? null : null),
         observedModel: result.model ?? null,
-        tokens: result.usage ?? null, reasonCode: decision.reasonCode, at: Date.now() });
+        tokens: result.usage ?? null, reasonCode: decision.reasonCode, at: Date.now() };
+      try { appendRouteRecord(file, pendingRecord); }
+      catch (error) {
+        // Preserve the exact join across close/reload, including rejected pre-worker spawns.
+        // The manager also keeps its in-memory obligation if this storage write fails.
+        try { writeJsonAtomic(pendingFile, { ledger: file, record: pendingRecord }, { durable: true, renameRetries: 1 }); } catch { /* manager retains and surfaces the failure */ }
+        throw error;
+      }
       appended = true;
+      pendingRecord = undefined;
+      try { fs.unlinkSync(pendingFile); } catch { /* the durable ledger is authoritative */ }
     },
   };
 }

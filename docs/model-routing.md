@@ -32,7 +32,11 @@ authenticated label oracle**. No prompt-based override or cheaper live route exi
 
 Both pins are required. Call fields take precedence over dedicated role settings
 in the usual `fabric.json` configuration. The parent's model, global `agents.model`
-and Fabric's default medium effort do **not** qualify as role pins.
+and Fabric's default medium effort do **not** qualify as role pins. Pins resolve
+only as exact registered provider/model keys or exact targets of an explicitly
+configured alias, including after one registry refresh. Missing or invalid pins
+refuse spawn with `ModelRoutePinError` (`MODEL_ROUTE_PIN_UNAVAILABLE`) before
+inference or dispatch; ordinary non-auto fuzzy selection is unchanged.
 
 ```json
 {
@@ -65,6 +69,8 @@ answer, backend error or timeout records a fixed reason and uses the pin. Caller
 cancellation still cancels launch. The existing Jev provider/client supplies the
 backend; `jev.enabled: false`, Schema enforce's unavailable Jev programs, or owner
 retirement yields `jev-error` and pinned dispatch rather than relaxing that gate.
+Evaluation captures the Jev generation's revocation signal; retirement aborts
+credential/network work and joins the evaluations before owner cleanup completes.
 
 The handle includes `routeDecision` with `{ model, effort, confidence, probability,
 reasonCode, decisionId, ... }`. `model/effort` describes the accepted **would-be**
@@ -74,17 +80,28 @@ below threshold. `handle.model/thinking` and the worker's admission still use th
 ## Durable join and child header
 
 Before the transport dispatches, Fabric writes a `decision` row to
-`<requested cwd>/.pi/fabric/model-routing.jsonl`, outside the ephemeral agent run
-directory, using append-only writes and `fsync`. This records the decision ID,
+`<host Pi agent dir>/fabric/model-routing.jsonl`, outside both the workspace and
+ephemeral agent run directory. The host profile (`PI_CODING_AGENT_DIR`, otherwise
+`~/.pi/agent`) is the only path source; workspace configuration and requested cwd
+cannot redirect it. Append-open uses `O_NOFOLLOW` and `O_NONBLOCK`, rejects links,
+non-regular/hard-linked endpoints and unsafe ownership/permissions, and bounds
+records to 64 KiB and the ledger to 64 MiB. Writes use append and `fsync`. This records the decision ID,
 Main/child native session IDs, class, role pin, candidates, shadow choice,
 confidence, probability, fixed reason, latency and time. A seeded native child
 session binds the recorded child ID to Pi, not just to the process transport.
 Terminal `outcome` rows join on `decisionId`, with status, verified admitted model
 and effort, observed model, token/cache/cost counters when known and time.
 Pre-admission failures record null admission, not the requested model. Confirmed
-launch failures get an outcome; an unconfirmed launch is retained by the existing
+pre-worker failures (including task/schema/image writes and worktree creation)
+get a terminal outcome; an unconfirmed launch is retained by the existing
 manager's cleanup obligation rather than falsely reported as a completed child.
-Outcome writes use the manager's terminal-save retry/retention fence. A process
+Outcome writes use the manager's terminal-save retry/retention fence. Queued
+outcomes retry at most three times per settlement/cleanup/close attempt; persistent
+failure surfaces a warning and retains the full terminal receipt and run files.
+The exact pending ledger row is also kept in `pending-route-outcome.json` for
+reconciliation after close/reload; it is removed only after a successful append
+and deliberately remains outside the global sweeper's collectable-file allowlist.
+Cleanup refuses collection until the outcome has been written. A process
 crash before terminal settlement still requires a later outcome reconciler; PR1
 does not add one or invent quality/price estimates.
 
@@ -92,7 +109,7 @@ If the decision write fails, pinned work still dispatches with `record-failed` i
 the handle and header. If storage stays unavailable, no durable record can be
 promised; the retained terminal run lets the owner diagnose/reconcile the gap.
 There is no unlogged cheaper execution. Keep the state directory for Light's
-later outcome join; deleting the caller's cwd deletes this local ledger.
+later outcome join; deleting the caller's cwd does not delete this host ledger.
 
 Each provider request in the child has:
 

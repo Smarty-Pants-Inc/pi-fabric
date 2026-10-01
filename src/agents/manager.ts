@@ -307,6 +307,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 }
 
 interface QueuedAgent {
+  routeSaveFailure?: string;
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
   cleanupPending?: string;
@@ -915,7 +916,7 @@ export class AgentManager {
       const { prepareRouteDispatch } = await import("./model-route.js");
       routeDispatch = prepareRouteDispatch(request.routeDecision, selectedCwd, path.join(this.#runRoot, id), id);
     }
-    const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
+    const startPrepared = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
       try {
         if (runner === "pi") model = await this.#prepareModel(model);
         if (request.routeDecision && model !== request.routeDecision.pin.model) throw new Error("Shadow route pin changed during model preparation");
@@ -1220,6 +1221,18 @@ export class AgentManager {
         throw error;
       }
     };
+    const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
+      try { return await startPrepared(release, signal); }
+      catch (error) {
+        // Cover preparation writes and worktree creation as well as transport failures.
+        release();
+        if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown" && !this.#queued.has(id)) {
+          try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); }
+          catch (saveError) { console.warn(`[pi-fabric] Pre-worker route outcome save failed; files retained at ${path.join(this.#runRoot, id)}: ${String(saveError)}`); }
+        }
+        throw error;
+      }
+    };
     let release: (() => void) | undefined;
     try { release = this.#semaphore.tryAcquire("native", admissionSignal); }
     catch (error) {
@@ -1291,12 +1304,32 @@ export class AgentManager {
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     };
     queued.terminal = record;
+    this.#saveQueuedRouteOutcome(queued);
     queued.resolve(record);
     this.#emitLifecycle(queued.info, `run.${status}`, now, { status });
     this.#invalidateUiList();
-    try { queued.routeOutcome?.(record); } catch { /* routing storage never blocks terminal notification */ }
     try { this.#onSettled?.(record); } catch { /* must not break settlement */ }
     this.#notifyQueuedComplete(queued);
+  }
+
+  #saveQueuedRouteOutcome(queued: QueuedAgent): boolean {
+    if (!queued.terminal || queued.cleanupPending) return !queued.routeSaveFailure;
+    let failure: unknown;
+    // Finite retries only; persistent failure keeps the full terminal receipt and run files.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        queued.routeOutcome?.(queued.terminal);
+        if (queued.routeSaveFailure) queued.terminal.warnings = (queued.terminal.warnings ?? []).filter(warning => warning !== queued.routeSaveFailure);
+        delete queued.routeSaveFailure;
+        return true;
+      } catch (error) { failure = error; }
+    }
+    const warning = `Routing outcome save failed; queued run retained: ${String(failure)}`;
+    if (!queued.routeSaveFailure) console.warn(`[pi-fabric] ${warning}`);
+    queued.terminal.warnings = [...(queued.terminal.warnings ?? []).filter(item => item !== queued.routeSaveFailure), warning];
+    queued.routeSaveFailure = warning;
+    this.#invalidateUiList();
+    return false;
   }
 
   #notifyQueuedComplete(queued: QueuedAgent): void {
@@ -1629,6 +1662,7 @@ export class AgentManager {
       if (queued.cleanupPending || hasUnresolvedWorker(runDirectory)) {
         throw new Error(`Cannot clean up agent ${id}: Fabric lost track of its worker; check ${runDirectory} before removing its files`);
       }
+      if (!this.#saveQueuedRouteOutcome(queued)) throw new Error(`Cannot clean up agent ${id}: ${queued.routeSaveFailure}`);
       this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
       if (!this.config.retainRuns) await removeTree(runDirectory);
@@ -1766,6 +1800,7 @@ export class AgentManager {
     await Promise.allSettled([...this.#spawns]);
     await Promise.allSettled([...this.#queuedStarts]);
     await Promise.allSettled([...this.#launches]);
+    for (const queued of this.#queued.values()) this.#saveQueuedRouteOutcome(queued);
     const all = [...this.#runs.values()];
     await Promise.allSettled(all.map((managed) => this.#waitForTransportExit(managed)));
     const transports = [...all.map((managed) => managed.transport), ...this.#unregisteredTransports];
@@ -1773,7 +1808,7 @@ export class AgentManager {
     const alive = await Promise.all(transports.map((transport) =>
       transport.isAlive().then((alive) => alive || transport.lostContact?.() !== undefined).catch(() => true)));
     const unresolved = all.some((managed) => managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) ||
-      [...this.#queued.values()].some((queued) => queued.cleanupPending) || runRootHasUnresolvedWorker(this.#runRoot);
+      [...this.#queued.values()].some((queued) => queued.cleanupPending || queued.routeSaveFailure) || runRootHasUnresolvedWorker(this.#runRoot);
     // A failed stop is not authority to delete a child's working files.
     if (!alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();

@@ -467,7 +467,7 @@ describe("Main remote ASK observation ownership", () => {
   ] as const)("preserves accepted %s owner work at the Main ceiling (queued=%s)", async (route, queued) => {
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
-    const owner = setup([], [], undefined, { identity: { id: "session:remoteowner", name: "remote owner", kind: "main", sessionId: "remoteowner" } });
+    const owner = setup([], [], undefined, { workerPath: path.resolve("tests/fixtures/ask-owner-worker.mjs"), identity: { id: "session:remoteowner", name: "remote owner", kind: "main", sessionId: "remoteowner" } });
     const actor = await owner.actors.create({ name: "remote survivor", instructions: "Reply.", transport: "process", responseMode: "text", delivery: "followUp", triggerTurn: false });
     const ownerId = owner.identity.id;
     const senderIdentity: MeshIdentity = { id: "session:observer", name: "observer", kind: "main" };
@@ -500,14 +500,30 @@ describe("Main remote ASK observation ownership", () => {
     const sender = setup([], [member], senderControl);
     const stop = vi.spyOn(owner.agents, "stop");
     const run = vi.spyOn(owner.agents, "run");
+    const publishWorkerStatus = async () => {
+      // inFlightRun only proves acceptance; AgentManager can still expose a handle
+      // without counters until the child writes its first status.json (notably Windows).
+      const handle = owner.agents.list()[0]!;
+      expect(handle.status).toBe("running");
+      expect(handle).not.toHaveProperty("turns"); // Deliberately hold child initialization.
+      fs.writeFileSync(path.join(owner.root, "runs", "owner-worker-ready"), "ready\n");
+      await waitFor(() => {
+        const record = owner.agents.status(handle.id);
+        return "turns" in record && "toolCalls" in record;
+      }, 5_000);
+    };
     try {
       const first = queued ? owner.actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS").catch(error => error) : undefined;
-      if (queued) await waitFor(() => Boolean(owner.actors.status(actor.id).inFlightRun));
+      if (queued) {
+        await waitFor(() => Boolean(owner.actors.status(actor.id).inFlightRun));
+        await publishWorkerStatus();
+      }
       const controller = new AbortController();
       const observation = sender.provider.invoke("ask", { id: actor.id, message: queued ? "accepted queued request" : "LIVE_WITHOUT_PROGRESS" }, {
         ...context, signal: controller.signal, extensionContext: { ...context.extensionContext, mode: "rpc", sessionManager: { getSessionId: () => "observer" } } as unknown as ExtensionContext,
       }).catch(error => error);
       await waitFor(() => queued ? owner.actors.status(actor.id).queued === 1 : Boolean(owner.actors.status(actor.id).inFlightRun));
+      if (!queued) await publishWorkerStatus();
       const ceiling = createMainExecutionCeilingError(700);
       controller.abort(ceiling);
       const rejection = await observation;
@@ -517,6 +533,9 @@ describe("Main remote ASK observation ownership", () => {
       expect(stop).not.toHaveBeenCalled();
       if (queued) expect(owner.actors.status(actor.id).queued).toBe(1);
       else expect(owner.agents.list()[0]).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
+      // Completion is explicitly gated, not a 1.5 s scheduling assumption. Release
+      // accepted work only after proving the unchanged zero-progress ownership law.
+      fs.writeFileSync(path.join(owner.root, "runs", "owner-worker-complete"), "complete\n");
       await first;
       await waitFor(() => owner.actorDeliveries.length === (queued ? 2 : 1) && owner.actors.status(actor.id).status === "idle", 5_000);
       expect(owner.actors.messages(actor.id).filter(message => message.direction === "out")).toHaveLength(queued ? 2 : 1);

@@ -18,6 +18,7 @@ import {
   StoreBridgeSide,
 } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { runBridge, transportCommand } from "../src/mesh-bridge.js";
 import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
@@ -775,6 +776,72 @@ describe("mesh bridge", () => {
     expect(on(hub, "fabric.control.ack")).toHaveLength(0);
     expect(logs.join("\n")).toMatch(/claims a hub identity/);
     expect(logs.join("\n")).toMatch(/not a live participant of the remote/);
+  });
+
+  // PR #207: security F1 / Astra F1. A rename can precede the generation update.
+  it.each(["toRemote", "toLocal"] as const)("recovers archived control and work in %s from a persisted cursor before the generation bump", async (direction) => {
+    const cursorPath = path.join(scratch(), "cursor.json");
+    const { hub, far, remote, bridge } = setup(cursorPath, { presenceMs: 60_000 });
+    await remote.hello(); // exercise the byte-tail RPC for the remote source too
+    const lane = await addRoot(hub, "lane");
+    const forgeRoot = await addRoot(far, "forge-main");
+    const source = direction === "toRemote" ? hub : far;
+    const destination = direction === "toRemote" ? far : hub;
+    const sender = direction === "toRemote" ? lane : forgeRoot;
+    const recipient = direction === "toRemote" ? forgeRoot : lane;
+    const archive = scratch();
+    fs.writeFileSync(path.join(source.root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: archive }));
+    await source.publish({ topic: "chatter", from: sender.identity, text: "handled" });
+    await bridge.start();
+    await bridge.step();
+    const saved = JSON.parse(fs.readFileSync(cursorPath, "utf8"));
+    expect(saved[direction].after).toBe(1);
+    expect(saved[direction].offset).toBeGreaterThan(0);
+
+    const data = { ...command(recipient.hostId, sender.hostId), operation: "ask", commandId: "pending-ask" };
+    const pending: MeshEvent[] = [];
+    pending.push(await source.publish({ topic: "fabric.control.command", kind: "ask", from: sender.identity, to: recipient.hostId, data }));
+    pending.push(await source.publish({ topic: "fabric.control.command", kind: "cancel", from: sender.identity, to: recipient.hostId,
+      data: { ...data, operation: "cancel", commandId: "cancel-ask", cancelCommandId: data.commandId } }));
+    pending.push(await source.publish({ topic: "fabric.control.ack", kind: "accepted", from: sender.identity, to: recipient.hostId,
+      data: { version: 1, commandId: "earlier-ask", targetId: sender.hostId, accepted: true } }));
+    pending.push(await source.publish({ topic: "fleet.work.review", from: sender.identity, to: recipient.hostId, text: "unread work" }));
+    for (let i = 0; i < 4; i++) await source.publish({ topic: "chatter", from: sender.identity, text: "x".repeat(500) });
+
+    // Perform exactly compaction's first write. The old nonzero byte offset now points
+    // into a retained, entirely filtered-out suffix, still tagged with generation zero.
+    const eventsPath = path.join(source.root, "events.jsonl");
+    const retained = fs.readFileSync(eventsPath, "utf8").split("\n")
+      .filter(line => line && (JSON.parse(line) as MeshEvent).sequence > pending.at(-1)!.sequence);
+    fs.writeFileSync(`${eventsPath}.tmp`, retained.join("\n") + "\n");
+    fs.renameSync(`${eventsPath}.tmp`, eventsPath);
+    expect(source.oldestSequence()).toBe(6);
+    const raw = source.tail(saved[direction].offset);
+    expect(raw.nextOffset).toBeGreaterThanOrEqual(saved[direction].offset);
+    expect(raw.events[0]!.sequence).toBeGreaterThan(2);
+    expect(raw.events.every(event => event.topic === "chatter")).toBe(true);
+    expect(fs.existsSync(path.join(source.root, "generation"))).toBe(false);
+
+    // A new bridge loads the disk checkpoint, not the previous instance's memory.
+    const resumed = new MeshBridge({ ...bridge.options, local: new StoreBridgeSide(new MeshStore(hub.root, 64 * 1024, 100), "forge") });
+    try {
+      await resumed.start();
+      expect(await resumed.step()).toEqual({ toRemote: direction === "toRemote" ? 4 : 0, toLocal: direction === "toLocal" ? 4 : 0, dropped: 0 });
+      const deliveredIds = () => destination.read({ after: 0, limit: 100 })
+        .map(event => (event.data as { bridge: { id: string } }).bridge.id);
+      expect(deliveredIds()).toEqual(pending.map(event => event.id));
+      expect(on(destination, "fabric.control.command").map(event => event.kind)).toEqual(["ask", "cancel"]);
+      expect(on(destination, "fabric.control.command")[1]!.data).toMatchObject({ cancelCommandId: "pending-ask" });
+      expect(JSON.parse(fs.readFileSync(cursorPath, "utf8"))[direction].after).toBe(9);
+
+      // Only now does the second compaction write land; it must neither lose nor repeat work.
+      fs.writeFileSync(path.join(source.root, "generation"), "1");
+      const next = await source.publish({ topic: "fleet.work.review", from: sender.identity, to: recipient.hostId, text: "after bump" });
+      expect(await resumed.step()).toMatchObject({ [direction]: 1, dropped: 0 });
+      expect(deliveredIds()).toEqual([...pending.map(event => event.id), next.id]);
+      expect(await resumed.step()).toEqual({ toRemote: 0, toLocal: 0, dropped: 0 });
+      expect(JSON.parse(fs.readFileSync(cursorPath, "utf8"))[direction].offset).toBe(source.latestOffset());
+    } finally { await resumed.stop(); }
   });
 
   it("resumes from its cursor file without forwarding an event twice", async () => {

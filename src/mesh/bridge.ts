@@ -195,11 +195,18 @@ export class StoreBridgeSide implements BridgeSide {
   async tail(after: number, offset?: number, pageBytes = BRIDGE_PAGE_BYTES): Promise<BridgeRead> {
     if (offset !== undefined) {
       const page = this.store.tail(offset, this.store.maxReadEvents);
-      if (meshCursorGeneration(page.nextOffset) === meshCursorGeneration(offset) && page.nextOffset >= offset) {
+      // Compaction renames the live log before updating its separate generation file.
+      // Even a matching generation/offset can therefore hide unread archived events.
+      // Check before filtering topics or advancing through; a reserved sequence hole
+      // is harmless unless the store actually holds an event inside the gap.
+      const first = page.events.find(event => event.sequence > after);
+      const gap = first !== undefined && first.sequence > after + 1 &&
+        (this.store.nextEventAfter(after)?.sequence ?? Infinity) < first.sequence;
+      if (!gap && meshCursorGeneration(page.nextOffset) === meshCursorGeneration(offset) && page.nextOffset >= offset) {
         return this.#page(page.events, after, pageBytes, { start: offset, cursors: page.cursors ?? [], end: page.nextOffset });
       }
-      // Compaction changed the generation (or a truncation invalidated the offset). Sequence
-      // reconciliation can use the archive; a raw tail reset alone would lose older work.
+      // A generation change, truncation or unread gap reconciles from the unchanged
+      // sequence boundary via the archive; a raw tail reset alone would lose older work.
     }
     // Capture the committed boundary BEFORE the sequence read. Never adopt a later head
     // after an empty read: an append between those observations would be skipped forever.

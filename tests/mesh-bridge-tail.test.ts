@@ -145,6 +145,33 @@ describe("durable bridge byte cursors (smarty-dev#2854)", () => {
     expect(next.through).toBe(3);
   });
 
+  it.each([false, true])("passes reservation holes without sequence reconciliation (archive=%s)", async (archived) => {
+    const root = scratch();
+    if (archived) {
+      const archive = scratch();
+      fs.writeFileSync(path.join(root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: archive }));
+    }
+    const store = new MeshStore(root, 4096, 100);
+    const side = new StoreBridgeSide(store, "forge");
+    await store.publish({ topic: "fleet.work.test", from, to: "remote", text: "handled" });
+    const head = await side.latestCursor();
+    // A crashed publisher may reserve sequences without committing events.
+    fs.writeFileSync(path.join(root, "sequence"), "8");
+    const next = await store.publish({ topic: "fleet.work.test", from, to: "remote", text: "after hole" });
+    expect(next.sequence).toBe(9);
+    const lookup = vi.spyOn(store, "nextEventAfter");
+    const reconcile = vi.spyOn(side, "read");
+    const page = await side.tail(head.through, head.offset);
+    expect(page.events.map(event => event.id)).toEqual([next.id]);
+    expect(page.through).toBe(next.sequence);
+    expect(page.offset).toBe(store.latestOffset());
+    expect(lookup).toHaveBeenCalledWith(head.through);
+    expect(reconcile).not.toHaveBeenCalled();
+    lookup.mockClear();
+    expect(await side.tail(page.through, page.offset)).toEqual({ events: [], through: page.through, offset: page.offset });
+    expect(lookup).not.toHaveBeenCalled(); // idle polls remain byte-only
+  });
+
   it("reconciles generation changes through the archive, including work removed from the live log", async () => {
     const root = scratch(), archive = path.join(root, "archive");
     fs.mkdirSync(archive);

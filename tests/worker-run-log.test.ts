@@ -636,7 +636,8 @@ describe("worker run log", () => {
         const beforeNative = native.read(source, false);
         const cursor = readJsonlPage(file, 2);
         let fd = capability === "quiescent" ? undefined : fs.openSync(file, "r");
-        const inode = fs.statSync(file).ino;
+        // Windows file IDs exceed 2^53; a number `ino` can round two different files to one value.
+        const inode = fs.statSync(file, { bigint: true }).ino;
         try {
           if (capability.startsWith("Windows")) {
             denyHeldReplacement(file, fd!, capability === "Windows native denial" ? undefined : capability.includes("EPERM") ? "EPERM" : "EBUSY");
@@ -650,7 +651,7 @@ describe("worker run log", () => {
           expect(outcome.error).toBeUndefined();
           expect(outcome.compactionSkipped).toBeUndefined();
           expect(outcome.compacted).toBe(1);
-          expect(fs.statSync(file).ino).not.toBe(inode);
+          expect(fs.statSync(file, { bigint: true }).ino).not.toBe(inode);
           expect(() => readJsonlPage(file, 2, cursor.before, undefined, cursor.generation)).toThrowError(expect.objectContaining({ name: "cursor-stale" }));
           if (fd !== undefined) expect(fs.readFileSync(fd, "utf8")).toBe(live);
           const compacted = fs.readFileSync(file, "utf8");
@@ -695,7 +696,7 @@ describe("worker run log", () => {
         const before = reader.loadOlder(2)!;
         expect(before.messages.length).toBeGreaterThan(initial.messages.length);
         expect(before.hasMore).toBe(true);
-        const inode = fs.statSync(file).ino;
+        const inode = fs.statSync(file, { bigint: true }).ino;
         const cursor = readJsonlPage(file, 2);
         let descriptor = capability === "quiescent" ? undefined : fs.openSync(file, "r");
         try {
@@ -711,7 +712,7 @@ describe("worker run log", () => {
           expect(outcome.compactionSkipped).toBeUndefined();
           expect(outcome.compacted).toBe(160);
           expect(outcome.afterBytes).toBeGreaterThan(256 * 1024);
-          expect(fs.statSync(file).ino).not.toBe(inode);
+          expect(fs.statSync(file, { bigint: true }).ino).not.toBe(inode);
           expect(() => readJsonlPage(file, 2, cursor.before, undefined, cursor.generation)).toThrowError(expect.objectContaining({ name: "cursor-stale" }));
           if (descriptor !== undefined) expect(fs.readFileSync(descriptor, "utf8")).toBe(text);
           const compacted = fs.readFileSync(file, "utf8");

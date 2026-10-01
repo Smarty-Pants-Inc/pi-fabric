@@ -1044,16 +1044,12 @@ const main = async (): Promise<void> => {
       toolCallStreamGuard.observe(event);
       if (terminalStatus) return;
     }
-    if (event.type === "message_update" && !terminalStatus) {
-      const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
-      if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
-          typeof delta.delta === "string" && delta.delta.length > 0) recoveryWatchdog.progress();
-    }
+    if (!terminalStatus) recoveryWatchdog.observe(event);
     if (event.type === "agent_start") {
       emitLifecycle("pi.agent_start");
       retryPending = false;
-      // Starting a retry is not proof of recovery: preserve the error and timer
-      // until the model actually produces output.
+      // Starting a retry is not proof of acceptance: preserve the error and timer
+      // until the provider starts a new assistant response.
       return;
     }
     if (event.type === "auto_retry_start" && !terminalStatus) {

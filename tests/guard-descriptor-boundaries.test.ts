@@ -4,6 +4,8 @@ import { killsByPattern, scanCommand, wipesTmp } from "../src/core/pattern-kill.
 // R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
 // IDs/commands and the historical 102 false positives are unchanged.
 const round5IntentionalState = new Set<string>([
+  // R13: a relative/whitespace cwd operand no longer grants parent effects.
+  "D=' /tmp '; cd \"$D\"; rm -rf *",
   "IFS=:; P='/tmp/tmp.AbC123:/tmp'; printf -v D '%s\\n' \"$P\"; IFS=' \t\n'; rm -rf $D",
   "IFS=:; P=\"/tmp/tmp.AbC123:/tmp\"; printf -v D \"%s\" $P; rm -rf \"$D\"",
   "IFS=:; D='/tmp:'; cd \"$D\"; rm -rf *",

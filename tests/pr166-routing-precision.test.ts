@@ -3,7 +3,11 @@ import { killsByPattern, scanCommand, wipesTmp } from "../src/core/pattern-kill.
 
 // R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
 // IDs/commands and the historical 102 false positives are unchanged.
-const round5IntentionalState = new Set<string>([]);
+// R13 intentional A→R cuts; original tuple IDs and bytes remain unchanged.
+const round5IntentionalState = new Set<string>([
+  'cd /own; pushd -n /tmp; popd -n; popd; rm -rf tmp.*',
+  'cd /tmp; pushd /own; pushd /own; popd; rm -rf tmp.*',
+]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
   const intentional = round5IntentionalState.has(command);
   const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;

@@ -55,7 +55,10 @@ function readBalanced(text: string, index: number, open: string, close: string, 
     const c = text[index]!;
     // CR is not a Bash blank; only a proved single-quoted lexical DATA span may retain it.
     if (c === "\r" || (c === "\\" && text[index + 1] === "\r")) throw new ShellStateRefused();
-    if (c === "\\") { budget.spend(); index += 2; continue; }
+    if (c === "\\") {
+      if (text[index + 1] === "\n" && /[$(]/.test(text[index - 1] ?? "")) throw new ShellStateRefused();
+      budget.spend(); index += 2; continue;
+    }
     if (c === "'" && close !== "`") {
       index += 1;
       while (index < text.length && text[index] !== "'") { budget.spend(); index += 1; }
@@ -83,7 +86,10 @@ function readDouble(text: string, index: number, word: Expansion, budget: GuardB
       budget.spend(2);
       // A live continuation contributes no bytes; single quotes and quoted
       // heredoc DATA never pass through this double-quoted reader.
-      if (text[index + 1] === "\n") { index += 2; continue; }
+      if (text[index + 1] === "\n") {
+        if (/[$(]/.test(text[index - 1] ?? "") || word.dynamic || word.subs.length) throw new ShellStateRefused();
+        index += 2; continue;
+      }
       // This reader does not model every double-quoted escape. In particular Bash
       // preserves \n in a printf format; losing its slash must never prove safe bytes.
       const unproved = !/[$`"\\\n]/.test(text[index + 1] ?? "");
@@ -133,7 +139,10 @@ function expandHeredoc(body: string, budget: GuardBudget): Expansion & { text: s
     budget.spend(expansion.text.length + 1);
     const c = body[index]!;
     // In a heredoc a backslash escapes only $, ` and \: the reader gets `\$(…)` as `$(…)`.
-    if (c === "\\") { expansion.text += /[$`\\]/.test(body[index + 1] ?? "") ? body[index + 1] : body.slice(index, index + 2); index += 2; continue; }
+    if (c === "\\") {
+      if (body[index + 1] === "\n") throw new ShellStateRefused();
+      expansion.text += /[$`\\]/.test(body[index + 1] ?? "") ? body[index + 1] : body.slice(index, index + 2); index += 2; continue;
+    }
     if (c === "$" && (body.startsWith("$((", index) || body[index + 1] === "[")) throw new ShellStateRefused();
     if ((c === "$" && body[index + 1] === "(") || c === "`") {
       const start = index + (c === "`" ? 1 : 2);
@@ -210,7 +219,8 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
       while (text[end] === "\\" && text[end + 1] === "\n") { budget.spend(); end += 2; }
       // Operators were already emitted. A continuation joining their fragments
       // needs retokenization; decline instead of inventing an execution boundary.
-      if (/[;&|()<>]/.test(text[index - 1] ?? "") && /[;&|()<>]/.test(text[end] ?? "")) throw new ShellStateRefused();
+      if (/[$(]/.test(text[index - 1] ?? "") || word?.dynamic || word?.subs.length ||
+        (/[;&|()<>]/.test(text[index - 1] ?? "") && /[;&|()<>]/.test(text[end] ?? ""))) throw new ShellStateRefused();
       index = end; continue;
     }
     // Unsupported arithmetic must refuse before group/substitution admission.
@@ -761,6 +771,8 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
     // command. No command-name interpreter: decline its entire command instead.
     if (words[0]?.dynamic || (words[0] && !simpleWord(words[0]))) throw new ShellStateRefused();
     const name = words[0]?.text.split("/").pop() ?? "";
+    // A PRESENT receiver with an empty basename is not assignment-only syntax.
+    if (words.length && !name) throw new ShellStateRefused();
     if (SHELL_STATE_BUILTINS.has(name)) throw new ShellStateRefused();
     // A for/select destination writes shell state too; quote removal already
     // resolved its name. Refuse IFS without interpreting iterations or values.
@@ -1671,7 +1683,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       let declarationProved = declaration && name !== "local" && stage.words[0] === words[0] &&
         words[0]?.text === name && !words[0]?.quoted && words[0]?.assignment !== false &&
         !assignments.length && !childBinding && !redirectBinding;
-      const standalone = !name || (!declaration && assignments.some((word) => /^\w+\+?=\(/.test(word.pattern)));
+      const standalone = words.length === 0 || (!declaration && assignments.some((word) => /^\w+\+?=\(/.test(word.pattern)));
       if (standalone) assign();
       // Prefixes/arrays on declarations are outside the proved assignment subset. Do
       // not restore a safe caller value over a persistent or possibly failing write.
@@ -1873,7 +1885,12 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // Only a direct parent-shell builtin proves a cwd effect. Executable
       // wrappers (including command/builtin) do not confer parent-state credit.
       const directCwd = !wrapped && words[0]?.text === name && ["cd", "pushd", "popd"].includes(name);
-      const cdArgs = directCwd && name === "cd" ? positionalFields(args, 0).words : [];
+      const cwdArgs = directCwd ? positionalFields(args, 0).words : [];
+      // Convergence cut: no option/rotation/relative-target or redirect-success
+      // interpreter. Unproved complete argv/execution may never grant cwd/stack.
+      if (directCwd && (redirectBinding || cwdArgs.length !== 1 || !concrete(cwdArgs[0]!) ||
+        cwdArgs[0]!.unprovedLiteral || !unmask(expand(cwdArgs[0]!.pattern)).startsWith("/") || name === "popd")) throw new ShellStateRefused();
+      const cdArgs = directCwd && name === "cd" ? cwdArgs : [];
       // Plain absolute cd ignores CDPATH and cannot print a directory. Other
       // cd forms and all stack emitters have unproved stdout, not zero bytes.
       const silentCd = directCwd && name === "cd" && cdArgs.length === 1 &&
@@ -2000,7 +2017,8 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // file (including one written earlier here) supplies its own independent contents.
       let output: Feed = { lookup, tmp: listsTmp };
       let known = independent || lookup || listsTmp;
-      const silent = reads || silentCd || DELETERS.has(name) || ["kill", "set", ":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
+      const silent = reads || silentCd || DELETERS.has(name) || ["kill", ":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
+        (name === "set" && words[0]?.text === "set" && !wrapped && args.length > 0) ||
         (name === "printf" && args[0]?.text === "-v") || (stage.words[0] && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(stage.words[0].text) && words.length === 0);
       if (scripts.length) { output = scriptOutput; known = scriptKnown; }
       else if (silent) { output = NO_OUTPUT; known = true; }
@@ -2008,7 +2026,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
         budget.spend((cwd?.length ?? 0) + 1);
         output = cwd === undefined ? EMPTY_FEED : literalFeed(`${cwd}\n`);
         known = cwd !== undefined;
-      } else if (["mktemp", "date", "id", "whoami", "hostname", "uname"].includes(name)) { output = EMPTY_FEED; known = true; }
+      } else if ((name === "mktemp" || (["id", "whoami", "hostname", "uname"].includes(name) && args.length === 0))) { output = EMPTY_FEED; known = true; }
       else if (name === "echo" || name === "printf") {
         output = args.reduce((feed, arg) => mergeFeed(feed, literalSource(arg)), EMPTY_FEED);
         known = args.every(concrete);

@@ -7,11 +7,14 @@ const TMP = { ...SAFE, wipe: true };
 const PID = { ...SAFE, blocked: true };
 function check(command: string, expected: typeof SAFE): void {
   const actual = scanCommand(command);
-  expect(actual, command).toStrictEqual(expected);
-  expect(Object.keys(actual).sort(), command).toStrictEqual(Object.keys(expected).sort());
+  // R13 owner cut: preserve the old command/ID, but unsupported popd is STATE.
+  const state = command === 'cd /own; pushd /tmp; popd; rm -rf *';
+  const verdict = state ? { ...SAFE, shellState: true } : expected;
+  expect(actual, command).toStrictEqual(verdict);
+  expect(Object.keys(actual).sort(), command).toStrictEqual(Object.keys(verdict).sort());
   expect(actual.exhausted, command).toBe(false);
-  expect(killsByPattern(command), command).toBe(expected.blocked);
-  expect(wipesTmp(command), command).toBe(expected.wipe);
+  expect(killsByPattern(command), command).toBe(state || expected.blocked);
+  expect(wipesTmp(command), command).toBe(state || expected.wipe);
 }
 const skipped = [
   "if false; then printf '%s' /own; fi",

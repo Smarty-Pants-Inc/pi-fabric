@@ -67,6 +67,8 @@ describe("resident tracked result preservation", () => {
       expect(JSON.parse(worker)).toMatchObject({ status: original.status, text: original.text });
       expect(original.error).toBe(JSON.parse(worker).error);
       expect(fs.statSync(obstructed!).isDirectory()).toBe(true); // no authoritative saved result
+      // The worker file alone cannot certify settlement while its pinned supervisor lives.
+      await expect(client.waitAgent(handle.id, AbortSignal.timeout(100))).rejects.toThrow("aborted");
       // Counterexample: an unobstructed public completion must not pin all tracked runs.
       const saved = await client.spawnAgent({ task: "saved normally", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
       await host.agents.wait(saved.id, { timeoutMs: 5_000 });
@@ -77,6 +79,14 @@ describe("resident tracked result preservation", () => {
       expect(fs.existsSync(savedRun)).toBe(false);
       expect(fs.existsSync(run), "failed save must not delete the only completion").toBe(true);
       expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(worker);
+      // Production restarts exit the supervisor process. These embedded hosts share the
+      // still-live test PID, so explicitly model the predecessor's exit in its launch pin.
+      // A new host does not inherit the predecessor's authority to retry this run.
+      const manifestPath = path.join(run, "completion-recipient.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      expect(manifest.supervisor.pid).toBe(process.pid);
+      manifest.supervisor = { pid: 2147483647 };
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
       const expected = { id: handle.id, status: original.status, text: original.text, residency: "durable",
         ...(original.error === undefined ? {} : { error: original.error }) };
       for (let restart = 1; restart <= 2; restart++) {

@@ -127,7 +127,11 @@ describe("resident delivery wake scheduling", () => {
     const h = harness();
     await h.put("append-pending");
     const list = h.mesh.listAll.bind(h.mesh);
+    const hint = h.mesh.namespaceWatchHint.bind(h.mesh);
     let visible = false;
+    // This deliberately hidden startup snapshot cannot claim a validated hint
+    // for its contents; unknown/legacy evidence must still wake on the append.
+    vi.spyOn(h.mesh, "namespaceWatchHint").mockImplementation((namespace) => visible ? hint(namespace) : undefined);
     vi.spyOn(h.mesh, "listAll").mockImplementation((prefix, options) => visible ? list(prefix, options) : []);
     h.client().start();
     await delay(30);

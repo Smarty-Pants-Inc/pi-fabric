@@ -1052,6 +1052,24 @@ export class MeshStore {
     return this.#select(prefix, options).slice();
   }
 
+  /**
+   * Scheduling hint for an exact two-segment namespace (including its trailing slash).
+   * Never reads entries or refreshes the payload cache. Unknown signals require a fresh read.
+   * Stat/header binding detects ordinary replacement, not copied-marker + same-stat ABA:
+   * callers must still reconcile canonically on an independent bounded deadline.
+   */
+  namespaceWatchHint(namespace: string): string | undefined {
+    if (!KEY_PATTERN.test(namespace) || !/^[^/]+\/[^/]+\/$/.test(namespace)) return undefined;
+    const before = statStamp(this.#statePath);
+    if (before === undefined) return undefined;
+    const generation = this.#canonicalGeneration();
+    if (typeof generation !== "string") return undefined;
+    const index = this.#readSignalIndex(true);
+    if (index?.generation !== generation || index.stamp !== before) return undefined;
+    if (statStamp(this.#statePath) !== before || this.#canonicalGeneration() !== generation) return undefined;
+    return Object.hasOwn(index.namespaces, namespace) ? index.namespaces[namespace] as string : EMPTY_DIGEST;
+  }
+
   // The returned array is memoized per parsed state: callers copy it before handing it out.
   #select(prefix: string, options: MeshReadOptions): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
@@ -1102,13 +1120,14 @@ export class MeshStore {
 
   // The current signal's index: its bounded header every call, the full body only when the
   // generation differs from the memoized one (once per commit, across all namespaces).
-  #readSignalIndex(): { generation: string; stamp: string; namespaces: Record<string, unknown> } | undefined {
+  // The watch observer alone requests strict bounded body validation even for the same UUID.
+  #readSignalIndex(strict = false): { generation: string; stamp: string; namespaces: Record<string, unknown> } | undefined {
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#signalPath, "r");
       const generation = readHeader(descriptor, SIGNAL_HEADER);
       if (generation === undefined) return undefined;
-      if (this.#signalIndex?.generation === generation) return this.#signalIndex;
+      if (!strict && this.#signalIndex?.generation === generation) return this.#signalIndex;
       const size = fs.fstatSync(descriptor).size;
       if (size > MAX_SIGNAL_BYTES) return undefined;
       const buffer = Buffer.allocUnsafe(size);
@@ -1119,6 +1138,15 @@ export class MeshStore {
         signal?.generation !== generation || typeof signal.stamp !== "string" ||
         typeof namespaces !== "object" || namespaces === null || Array.isArray(namespaces)
       ) return undefined;
+      if (strict) {
+        for (const digest of Object.values(namespaces)) {
+          if (typeof digest !== "string") return undefined;
+          const decoded = Buffer.from(digest, "base64");
+          if (decoded.length !== 32 || decoded.toString("base64") !== digest) return undefined;
+        }
+        // Observer validation must not replace the private nonfresh listing memo.
+        return { generation, stamp: signal.stamp, namespaces: namespaces as Record<string, unknown> };
+      }
       return this.#signalIndex = { generation, stamp: signal.stamp, namespaces: namespaces as Record<string, unknown> };
     } catch {
       return undefined;

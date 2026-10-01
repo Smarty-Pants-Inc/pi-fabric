@@ -143,11 +143,14 @@ export class ResidencyClient {
   readonly #agentsPath: string;
   readonly #inheritedToolAllowlist = readChildToolAllowlist();
   readonly #deliveryPrefix: string;
+  readonly #deliveryNamespace: string;
   readonly #hostPath: string;
   #deliveryTimer: NodeJS.Timeout | undefined;
   #deliveryWatcher: fs.FSWatcher | undefined;
   #deliveryStarted = false;
   #deliveryWakePending = false;
+  #deliverySnapshotHint: string | undefined;
+  #deliveryReconcileAt = 0;
   #watchdogTimer: NodeJS.Timeout | undefined;
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
@@ -166,6 +169,7 @@ export class ResidencyClient {
     this.#responsesPath = path.join(options.config.residencyRoot, "responses");
     this.#agentsPath = path.join(options.config.residencyRoot, "agents");
     this.#deliveryPrefix = residentDeliveryPrefix(options.config.rootId);
+    this.#deliveryNamespace = `${this.#deliveryPrefix.split("/").slice(0, 2).join("/")}/`;
     this.#hostPath = options.hostPath ?? fileURLToPath(new URL("./launcher.js", import.meta.url));
   }
 
@@ -805,7 +809,7 @@ export class ResidencyClient {
         // Coalesce bursts, without shortening retained-work backpressure.
         if (this.#deliveryWakePending) return;
         this.#deliveryWakePending = true;
-        this.#scheduleDeliveryDrain(0);
+        this.#scheduleDeliveryDrain(0, false);
       });
       this.#deliveryWatcher = watcher;
       watcher.on("error", () => {
@@ -823,17 +827,17 @@ export class ResidencyClient {
     }
   }
 
-  #scheduleDeliveryDrain(ms: number): void {
+  #scheduleDeliveryDrain(ms: number, force = true): void {
     if (this.#closed || !this.#deliveryStarted) return;
     if (this.#deliveryTimer) clearTimeout(this.#deliveryTimer);
     this.#deliveryTimer = setTimeout(() => {
       this.#deliveryTimer = undefined;
-      void this.#drainDeliveries();
+      void this.#drainDeliveries(force);
     }, ms);
     this.#deliveryTimer.unref();
   }
 
-  async #drainDeliveries(): Promise<void> {
+  async #drainDeliveries(force = true): Promise<void> {
     if (this.#closed || !this.options.mainAgent.local) return;
     if (this.#drainingDeliveries) {
       this.#deliveryWakePending = true;
@@ -846,7 +850,19 @@ export class ResidencyClient {
     let retry = false;
     try {
       this.#watchDeliveries();
+      let hint: string | undefined;
+      try { hint = this.options.mesh.namespaceWatchHint?.(this.#deliveryNamespace); } catch {
+        // Hints never authorize or prevent a fresh read on observer failure.
+      }
+      // Equality suppresses only hint-driven work. Forced startup/retry reads
+      // and the absolute reconciliation deadline never use cached authority.
+      if (!force && Date.now() < this.#deliveryReconcileAt &&
+        hint !== undefined && hint === this.#deliverySnapshotHint) return;
       const entries = this.options.mesh.listAll(this.#deliveryPrefix, { fresh: true });
+      // Capture BEFORE the snapshot: a newer post-drain marker could hide a
+      // delivery committed while an admission or conditional delete awaited.
+      this.#deliverySnapshotHint = hint;
+      this.#deliveryReconcileAt = Date.now() + 30_000;
       for (const entry of entries) {
         if (this.#closed) break;
         try {
@@ -865,6 +881,7 @@ export class ResidencyClient {
         if (remaining.length > 0) this.#deliveryWakePending = true;
       }
     } catch {
+      this.#deliverySnapshotHint = undefined;
       retry = true;
     } finally {
       this.#drainingDeliveries = false;
@@ -872,7 +889,11 @@ export class ResidencyClient {
         const wake = this.#deliveryWakePending;
         // This flag also fences notification storms throughout retry backoff.
         this.#deliveryWakePending = retry;
-        this.#scheduleDeliveryDrain(retry ? 1_000 : wake ? 0 : 30_000);
+        // Unrelated notification storms must not slide the canonical deadline.
+        this.#scheduleDeliveryDrain(
+          retry ? 1_000 : wake ? 0 : Math.max(0, this.#deliveryReconcileAt - Date.now()),
+          retry || !wake,
+        );
       }
     }
   }

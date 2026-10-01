@@ -161,6 +161,11 @@ export const MAX_TERMINAL_LOG_BYTES = 64 * 1024 * 1024;
 export const MAX_TERMINAL_LOG_RECORDS = 100_000;
 export const MAX_TERMINAL_LOG_WORK_MS = 500;
 
+// ponytail: raw events.jsonl consumers (including smarty-install's child probe)
+// read small tool results directly, without transcript rehydration. Keep them
+// verbatim; only larger duplicate payloads justify a canonical-result pointer.
+export const MIN_ELIDED_TOOL_RESULT_BYTES = 8 * 1024;
+
 interface ToolCorrelation {
   ends: number;
   starts: number;
@@ -310,14 +315,16 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       checkWork();
       let bytes = record.bytes;
       const event = parseLogRecord(bytes);
-      if (event?.type === "tool_execution_end" &&
+      const resultBytes = event?.type === "tool_execution_end" && isRecord(event.result)
+        ? Buffer.byteLength(JSON.stringify(event.result), "utf8") : 0;
+      if (event?.type === "tool_execution_end" && resultBytes > MIN_ELIDED_TOOL_RESULT_BYTES &&
         bytes.toString("utf8").trimEnd().length <= MAX_EVENT_LINE_CHARS - CANONICAL_ENVELOPE_RESERVE_CHARS &&
         hasEquivalentCanonical(source, record.offset, event, index.get(String(event.toolCallId)), checkWork)) {
         const result = event.result as EventRecord;
         const { content: _content, details: _details, ...resultMetadata } = result;
         bytes = Buffer.from(`${JSON.stringify({
           ...event,
-          result: { elided: true, bytes: Buffer.byteLength(JSON.stringify(result), "utf8") },
+          result: { elided: true, bytes: resultBytes },
           ...(Object.keys(resultMetadata).length ? { resultMetadata } : {}),
         })}\n`);
         compacted++;

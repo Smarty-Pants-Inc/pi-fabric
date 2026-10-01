@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { formatAge, residentHostId, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
-import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
+import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
@@ -368,6 +368,7 @@ export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
   readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
+  readonly #projectLeadId: string | undefined;
   readonly name = "agents";
   readonly description =
     "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, tmux, screen, LocalTerm, or Herdr";
@@ -385,6 +386,7 @@ export class AgentsProvider implements FabricProvider {
     readonly ownsRuntime = true,
     readonly modelsConfig: () => FabricModelsConfig = () => DEFAULT_FABRIC_CONFIG.models,
   ) {
+    this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
       (binding, runner, context) => this.#resolvePiRunBinding(binding, runner, context),
@@ -831,7 +833,12 @@ export class AgentsProvider implements FabricProvider {
         if (stalled) throw stalled;
         const roots = this.participants.sessions?.() ??
           this.participants.list({ scope: "project", kinds: ["root"] });
-        return resolveProjectAgent(roots, participantProject(context.cwd));
+        const project = participantProject(context.cwd);
+        const repository = repositoryOf(project);
+        return resolveProjectAgent(roots, project, {
+          ...(repository ? { repository } : {}),
+          ...(this.#projectLeadId ? { leadId: this.#projectLeadId } : {}),
+        });
       }
       case "subscribe": {
         const events = Array.isArray(args.events)
@@ -1357,25 +1364,32 @@ export class AgentsProvider implements FabricProvider {
         const lines = typeof args.lines === "number" ? args.lines : 200;
         const runId = typeof args.runId === "string" ? args.runId : undefined;
         const before = typeof args.before === "number" ? args.before : undefined;
+        const beforeGeneration = typeof args.beforeGeneration === "string" ? args.beforeGeneration : undefined;
+        if (before !== undefined && beforeGeneration === undefined) {
+          const error = new Error("cursor-stale: Unbound log cursor; re-read from start or pass the returned generation as beforeGeneration");
+          error.name = "cursor-stale";
+          throw error;
+        }
+        const cursor = {
+          ...(before !== undefined ? { before } : {}),
+          ...(beforeGeneration !== undefined ? { beforeGeneration } : {}),
+        };
         try {
           const actor = this.actorManager.status(id);
           return this.actorManager.readLog(actor.id, {
             type,
             lines,
-            ...(runId ? { runId } : {}),
-            ...(before !== undefined ? { before } : {}),
+            ...(runId !== undefined ? { runId } : {}),
+            ...cursor,
           });
         } catch (error) {
           if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
           /* not an actor — fall through to agent */
         }
         if (this.residency?.hasAgent(id)) {
-          return this.residency.readAgentLog(id, {
-            lines,
-            ...(before !== undefined ? { before } : {}),
-          });
+          return this.residency.readAgentLog(id, { lines, ...cursor });
         }
-        return this.manager.readLog(id, { lines, ...(before !== undefined ? { before } : {}) });
+        return this.manager.readLog(id, { lines, ...cursor });
       }
       default:
         throw new Error(`Unknown agents action: ${actionName}`);

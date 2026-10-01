@@ -2,7 +2,12 @@
 // Unlike fake-worker, this validates the header and appends Pi's actual tree entries.
 import fs from "node:fs";
 import path from "node:path";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+// Test-only narrow entry to the *same* native SessionManager exported by Pi.
+// Every activation starts a fresh process: the public barrel also loads CLI,
+// UI and provider catalogs (~1.5 s/worker on Windows), unrelated to session I/O.
+// Resolve from the installed package, not a checkout or a hard-coded node_modules.
+const piEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
+const { SessionManager } = await import(new URL("./core/session-manager.js", piEntry).href);
 const args = new Map();
 for (let index = 2; index < process.argv.length; index += 2) args.set(process.argv[index].slice(2), process.argv[index + 1]);
 const file = args.get("session-file");

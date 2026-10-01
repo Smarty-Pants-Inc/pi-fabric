@@ -4,6 +4,7 @@ import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MAX_EXECUTOR_TIMEOUT_MS } from "../src/config.js";
 import type { FabricHostCall, FabricSandboxOptions } from "../src/runtime/kernel.js";
 import { MontyRuntime } from "../src/runtime/monty-runtime.js";
+import { ExecutionDeadline } from "../src/runtime/execution-deadline.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
 
 const require = createRequire(import.meta.url);
@@ -23,6 +24,22 @@ const run = (code: string, host: FabricHostCall = echo, extra: Partial<FabricSan
 afterEach(() => vi.restoreAllMocks());
 
 describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + missing + ")" : ""}`, () => {
+  it.each(["pool", "checkout"] as const)("contains a synchronous startup deadline before native %s admission without leaking a rejection", async (boundary) => {
+    // Windows native-package loading can consume the budget before the timer
+    // runs. checkDeadline aborts inside the async operation passed to runAbortable.
+    const native = await import("@pydantic/monty/node");
+    const create = vi.spyOn(native.Monty, "create");
+    const host = vi.fn(echo);
+    const reached = vi.spyOn(ExecutionDeadline.prototype, "reached", "get").mockReturnValue(true);
+    if (boundary === "checkout") reached.mockReturnValueOnce(false);
+    const result = await run("return await schema.status()", host, { timeoutMs: 1_500 });
+    expect(result).toMatchObject({ terminationReason: "timed_out", error: "Execution timed out after 1500ms" });
+    expect(create).toHaveBeenCalledTimes(boundary === "pool" ? 0 : 1);
+    expect(host).not.toHaveBeenCalled();
+    // Give Node its unhandled-rejection turn; Vitest must see none.
+    await new Promise<void>(resolve => setImmediate(resolve));
+  });
+
   it("routes the records primitive through the same host bridge", async () => {
     expect(await run('return await records.read(after=3, limit=2)')).toMatchObject({
       terminationReason: "completed", value: { ref: "records.read", args: { after: 3, limit: 2 } },

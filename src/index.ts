@@ -98,6 +98,7 @@ import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
+import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
@@ -930,16 +931,28 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       formatted.text || "(no output)",
       state.config.executor.maxOutputChars,
     );
-    // Directive lands after truncation so it survives maxOutputChars, and
-    // gates on "still armed" so one-shot trajectory handoffs stay silent.
-    const text = withTrajectoryRearmDirective(
-      output,
-      pending,
-      handoff,
-      state.prewalk,
-      context.sessionManager.getSessionId(),
+    const text = output;
+    const executionOutcome = pending.executionOutcome;
+    const boundarySucceeded = (handoff.completed === true || handoff.continued === true) &&
+      executionOutcome?.success !== false && !executionOutcome?.residentOutcomes.length && !outerToolResult.isError;
+    const residentPriority = executionOutcome?.residentOutcomes.length
+      ? formatResidentOutcomePriority(executionOutcome.residentOutcomes)
+      : undefined;
+    const sections = [
+      ...(executionOutcome?.error ? [`Original execution failed: ${executionOutcome.error}`] : []),
+      text,
+    ];
+    const fullOutput = [...(residentPriority ? [residentPriority] : []), ...sections].join("\n\n");
+    // Apply the same non-truncating receipt priority as execute(), at the final
+    // persisted/model-visible boundary. Transition success cannot cure an
+    // execution failure or authorize retrying its committed resident work.
+    const protectedOutput = await boundModelOutput(
+      fullOutput,
+      modelOutputBudget(state.config.executor.maxOutputChars, boundarySucceeded),
+      fullOutput,
+      undefined,
+      residentPriority ? { text: residentPriority, sections } : undefined,
     );
-    const boundarySucceeded = handoff.completed === true || handoff.continued === true;
     const details =
       typeof event.message.details === "object" &&
       event.message.details !== null &&
@@ -952,7 +965,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     return {
       message: {
         ...event.message,
-        content: [{ type: "text", text }],
+        content: [{ type: "text", text: withTrajectoryRearmDirective(
+          protectedOutput.text, pending, handoff, state.prewalk, context.sessionManager.getSessionId(),
+        ) }],
         isError: !boundarySucceeded,
         ...(details === undefined ? {} : { details }),
       },

@@ -71,7 +71,7 @@ export class ActorDirectory extends ActorManager {
   }
 
   override retryCapabilityWaiters(): void { super.retryCapabilityWaiters(); this.#secondary.retryCapabilityWaiters(); }
-  override async create(request: FabricActorRequest, options: { asRegistryOwner?: boolean } = {}): Promise<FabricActorInfo> {
+  override async create(request: FabricActorRequest, options: Parameters<ActorManager["create"]>[1] = {}): Promise<FabricActorInfo> {
     const scope = request.scope ?? this.#defaultScope;
     if (scope !== "project" && scope !== "session") {
       throw new Error(`Invalid Fabric actor storage scope: ${String(scope)}`);
@@ -81,10 +81,19 @@ export class ActorDirectory extends ActorManager {
     const sameName = this.list().filter((actor) => actor.name === name && !actor.removal);
     const existing = sameName.find((actor) => actor.status !== "stopped");
     if (existing) throw new Error(`A Fabric actor named ${name} is already active (${existing.id})`);
-    for (const actor of sameName) await this.remove(actor.id, { wait: false });
+    const fencedOptions = {
+      ...options,
+      beforeCommit: async (id: string): Promise<void> => {
+        await options.beforeCommit?.(id);
+        // Cross-scope predecessor removal is part of this create's mutation too.
+        for (const actor of sameName.filter((actor) => actor.scope !== scope)) {
+          await this.remove(actor.id, { wait: false });
+        }
+      },
+    };
     return scope === this.#defaultScope
-      ? super.create(request, options)
-      : this.#secondary.create(request, options);
+      ? super.create(request, fencedOptions)
+      : this.#secondary.create(request, fencedOptions);
   }
   override list(): FabricActorInfo[] { return [...super.list(), ...this.#secondary.list()]; }
   override listOwned(): FabricActorInfo[] { return [...super.listOwned(), ...this.#secondary.listOwned()]; }

@@ -9,11 +9,23 @@ export type FabricSandboxTerminationReason =
   | "timed_out"
   | "aborted";
 
+/** Immutable resident fence facts, never reconstructed from guest-controlled prose. */
+export interface FabricResidentOutcomeReceipt {
+  readonly requestId: string;
+  readonly state: "committed" | "unknown";
+  readonly operation: string;
+  readonly entityKind: "agent" | "actor";
+  readonly id?: string;
+  readonly ownerHostId?: string;
+}
+
 export interface FabricSandboxResult {
   value: unknown;
   logs: string[];
   terminationReason: FabricSandboxTerminationReason;
   error?: string;
+  /** Host-side reconciliation data, independent of verbose guest error prose. */
+  residentOutcomes?: FabricResidentOutcomeReceipt[];
   /** Host-only deadline cause. Guest error text is never a ceiling identity. */
   deadlineReason?: Error;
 }

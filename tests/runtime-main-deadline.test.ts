@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createMainExecutionCeilingError, mainExecutionCeilingAbortReason } from "../src/async-settlement.js";
+import { createMainExecutionCeilingError, mainExecutionCeilingAbortReason, registerCancellationEffect } from "../src/async-settlement.js";
 import { ExecutionDeadline } from "../src/runtime/execution-deadline.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { NodeProcessRuntime } from "../src/runtime/node-process-runtime.js";
@@ -66,6 +66,41 @@ for (const [backend, Runtime] of Object.entries(runtimes)) {
       try {
         expect(await result).toMatchObject({ terminationReason: "timed_out", value: undefined, deadlineReason: reason });
         expect((await result).deadlineReason).toBe(reason);
+      } finally { timer.restore(); release?.(); await result; }
+    });
+
+    it("retains committed resident receipts alongside the exact Main deadline cause", async () => {
+      const reason = createMainExecutionCeilingError(2_000);
+      const maximumDeadlineAt = Date.now() + 2_000;
+      const timer = captureRuntimeDeadline(backend);
+      const receipt = { requestId: "merged-request", state: "committed", operation: "createActor",
+        entityKind: "actor", id: "merged-actor", ownerHostId: "resident-host" } as const;
+      let signal: AbortSignal | undefined;
+      let release: (() => void) | undefined;
+      const result = executeAfterAdmission(safety => new Runtime().execute(backend === "monty" || backend === "cpython"
+        ? 'return await tools.call(ref="demo.hold", args={})' : 'return tools.call({ ref: "demo.hold", args: {} });',
+        async (_ref, _args, hostSignal) => {
+          signal = hostSignal;
+          registerCancellationEffect(hostSignal, () => Object.assign(
+            new Error("ResidentOutcomeUnknownError: merged-request committed merged-actor. Do not retry or reassign."),
+            { residentOutcome: receipt },
+          ));
+          return new Promise<void>(resolve => { release = resolve; });
+        }, { timeoutMs: 5_000, signal: safety, maximumDeadlineAt, maximumDeadlineReason: reason,
+          memoryLimitBytes: 128 * 1024 * 1024, minimumTimeoutMsForHostCall: () => 900_000 }),
+        () => Boolean(signal) && timer.ready(), () => {
+          timer.fireEarly(maximumDeadlineAt);
+          expect(signal!.aborted).toBe(false);
+          timer.fireAt(maximumDeadlineAt);
+          expect(mainExecutionCeilingAbortReason(signal)).toBe(reason);
+          release!();
+        });
+      try {
+        const outcome = await result;
+        expect(outcome).toMatchObject({ terminationReason: "timed_out", value: undefined,
+          residentOutcomes: [receipt] });
+        expect(outcome.deadlineReason).toBe(reason);
+        expect(outcome.error).toContain("Do not retry or reassign");
       } finally { timer.restore(); release?.(); await result; }
     });
 

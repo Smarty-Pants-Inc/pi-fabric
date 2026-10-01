@@ -14,6 +14,10 @@ const errorCode = (error: unknown): string | undefined =>
     ? String((error as NodeJS.ErrnoException).code)
     : undefined;
 
+const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some((actor) =>
+  typeof actor === "object" && actor !== null && "removal" in actor && actor.removal !== undefined,
+);
+
 /** Disk protocol shared by registry merges and fenced lineage adoption. */
 export class ActorRegistryStore {
   readonly #registryPath: string;
@@ -116,20 +120,30 @@ export class ActorRegistryStore {
     return JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
   }
 
-  /** Call within withLock for read-modify-write operations. */
+  /** Call within withLock for read-modify-write operations. Pending decisions are always durable. */
   write(actors: readonly Record<string, unknown>[], options?: { durable?: boolean }): void {
-    if (!options?.durable) {
+    // A barrier belongs to an inode, not its contents. Every replacement carrying an
+    // accepted removal must establish its own barriers, including foreign/preserved rows.
+    if (!options?.durable && !hasRemovalDecision(actors)) {
       writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2 });
       return;
     }
     const previous = fs.readFileSync(this.#registryPath, "utf8");
+    let rollbackDurable = false;
+    try {
+      const parsed = JSON.parse(previous) as { actors?: unknown } | null;
+      rollbackDurable = Array.isArray(parsed?.actors) && hasRemovalDecision(parsed.actors);
+    } catch {
+      // A malformed previous registry cannot contain an accepted, recoverable decision.
+    }
     try {
       writeJsonAtomic(this.#registryPath, { format: 1, actors }, { space: 2, durable: true });
     } catch (error) {
       // A directory barrier can fail after rename installed the new registry. Restore the
-      // live decision under the lock; the durable cleanup marker still covers a power loss
-      // during this rollback. Never report the failed commit as accepted.
-      writeFileAtomic(this.#registryPath, previous);
+      // live decision under the lock. If it carries an earlier accepted pending decision,
+      // this replacement needs barriers too; otherwise the cleanup marker covers rollback.
+      // Never report the failed commit as accepted.
+      writeFileAtomic(this.#registryPath, previous, { durable: rollbackDurable });
       throw error;
     }
   }

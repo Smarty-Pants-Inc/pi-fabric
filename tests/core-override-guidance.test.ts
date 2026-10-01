@@ -10,6 +10,7 @@ import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { coreOverridePromptGuidance } from "../src/core/core-override-guidance.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { FabricState } from "../src/fabric-state.js";
+import { emitBeforeAgentStart } from "./helpers/emit-before-agent-start.js";
 
 const runner = {
   createContext: () => ({ cwd: process.cwd() }),
@@ -107,8 +108,8 @@ describe("core override prompt guidance", () => {
     try {
       const { default: piFabric } = await import("../src/index.js");
       await piFabric(pi);
-      const handler = handlers.get("before_agent_start")?.[0];
-      if (!handler) throw new Error("before_agent_start handler was not registered");
+      const handler = (event: { systemPrompt: string; prompt: string; systemPromptOptions: { skills: unknown[] } }, context: unknown) =>
+        emitBeforeAgentStart(handlers, event, context);
       const result = await handler({
         systemPrompt: "base system",
         prompt: "inspect source",
@@ -185,9 +186,9 @@ describe("core override prompt guidance", () => {
         expect(skillPrompt).toBe(guidedPrompt);
         expect(skillPrompt).not.toContain("The active skill");
         // This host has no turn-provenance capability: preserve hook-result delivery.
-        expect(skillResult).toHaveProperty("message");
+        expect(skillResult.messages).toHaveLength(1);
         expect(sendMessage).not.toHaveBeenCalled();
-        const skillMessage = (skillResult as { message: { content: string } }).message;
+        const skillMessage = skillResult.messages[0]!;
         expect(skillMessage.content).toContain('The active skill "active" is already expanded');
         expect(skillMessage.content).toContain('- /dependency -> "/skills/dependency/SKILL.md"');
       } finally {

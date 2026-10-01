@@ -3004,7 +3004,8 @@ describe("ActorManager", () => {
     expect(log.actorName).toBe("reviewer");
     expect(log.sessionFile).toContain("session.jsonl");
     const sessionRoles = log.session.map(
-      (line) => (line.parsed as { role?: string } | undefined)?.role,
+      (line) => (line.parsed as { message?: { role?: string }; role?: string } | undefined)?.message?.role
+        ?? (line.parsed as { role?: string } | undefined)?.role,
     );
     expect(sessionRoles).toContain("user");
     expect(sessionRoles).toContain("assistant");

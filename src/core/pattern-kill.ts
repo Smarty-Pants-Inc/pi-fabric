@@ -53,6 +53,8 @@ function readBalanced(text: string, index: number, open: string, close: string, 
   while (index < text.length) {
     budget.spend();
     const c = text[index]!;
+    // CR is not a Bash blank; only a proved single-quoted lexical DATA span may retain it.
+    if (c === "\r" || (c === "\\" && text[index + 1] === "\r")) throw new ShellStateRefused();
     if (c === "\\") { budget.spend(); index += 2; continue; }
     if (c === "'" && close !== "`") {
       index += 1;
@@ -76,6 +78,7 @@ function readDouble(text: string, index: number, word: Expansion, budget: GuardB
   while (index < text.length && text[index] !== "\"") {
     budget.spend((word.text?.length ?? 0) + 1);
     const c = text[index]!;
+    if (c === "\r" || (c === "\\" && text[index + 1] === "\r")) throw new ShellStateRefused();
     if (c === "\\") {
       budget.spend(2);
       // A live continuation contributes no bytes; single quotes and quoted
@@ -105,6 +108,7 @@ function readDouble(text: string, index: number, word: Expansion, budget: GuardB
     while (end < text.length && !/["\\`]/.test(text[end]!) && !(text[end] === "$" && ["(", "["].includes(text[end + 1] ?? ""))) { budget.spend(); end += 1; }
     budget.spend(end - index + 1);
     const fragment = text.slice(index, end);
+    if (fragment.includes("\r")) throw new ShellStateRefused();
     // Aggregate argv boundaries are not scalar bytes. Inspect only live quoted
     // lexer runs: escaped dollars were consumed above, and single quotes are DATA.
     checkParameterSyntax(fragment, budget);
@@ -211,7 +215,8 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
     }
     // Unsupported arithmetic must refuse before group/substitution admission.
     if ((c === "(" && text.startsWith("((", index)) || (c === "$" && (text.startsWith("$((", index) || text[index + 1] === "["))) throw new ShellStateRefused();
-    if (c === " " || c === "\t" || c === "\r") { endWord(); index += 1; continue; }
+    if (c === "\r" || (c === "\\" && text[index + 1] === "\r")) throw new ShellStateRefused();
+    if (c === " " || c === "\t") { endWord(); index += 1; continue; }
     if (c === "\n") {
       endWord();
       index += 1;
@@ -221,6 +226,8 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
         while (index < text.length) {
           const end = text.indexOf("\n", index);
           const rawLine = text.slice(index, end < 0 ? text.length : end);
+          // Quote characters in a heredoc body are DATA, not single-quoted lexer spans.
+          if (rawLine.includes("\r")) throw new ShellStateRefused();
           index = end < 0 ? text.length : end + 1;
           // Unquoted continued heredoc lines affect delimiter recognition too.
           // Decline that unsupported boundary rather than attest physical lines.
@@ -243,6 +250,8 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
     }
     if (c === "#" && !word) {
       while (index < text.length && text[index] !== "\n") {
+        // Quote characters inside comments do not prove an inert single-quoted word.
+        if (text[index] === "\r") throw new ShellStateRefused();
         // Do not infer comment boundaries through an unsupported continuation.
         if (text[index] === "\\" && text[index + 1] === "\n") throw new ShellStateRefused();
         index += 1;
@@ -290,7 +299,9 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
     if (c === "<" || c === ">" || (c === "&" && text[index + 1] === ">")) {
       if (text.startsWith("<>", index) || text.startsWith("<<<", index) || text.startsWith(">|", index) || c === "&" || (word && !word.quoted && word.assignment !== false && /^\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(word.pattern))) throw new ShellStateRefused();
       // review/astra F3 on #105: the `2` of `2>/dev/null pkill …` is a descriptor, not a word.
-      const descriptor = word && !target && /^\d+$/.test(word.text) ? word.text : undefined;
+      // IO_NUMBER is an adjacent ORIGINAL plain-digit token. Quote removal must
+      // not turn '2', "2", \\2 or mixed quoted digits from argv into a descriptor.
+      const descriptor = word && !target && !word.quoted && word.assignment !== false && /^\d+$/.test(word.pattern) ? word.pattern : undefined;
       if (descriptor !== undefined) word = undefined;
       endWord();
       // Only an explicit stdin source overrides feed. Output and descriptor duplication do not.

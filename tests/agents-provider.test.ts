@@ -4640,7 +4640,9 @@ describe("own-root resident setters and authoritative status", () => {
     const dir = residentRoot(meshRoot, state.identity.id); fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid: process.pid }));
     const ensureActor = vi.fn<ResidencyClient["ensureActor"]>(async () => undefined);
-    const residency = { options: { config: { meshRoot, rootId: state.identity.id } }, setActor, actorStatus, removeActor, ensureActor } as unknown as ResidencyClient;
+    const residency = { options: { config: { meshRoot, rootId: state.identity.id } }, setActor, actorStatus, removeActor, ensureActor,
+      assertCurrentOwner: vi.fn<ResidencyClient["assertCurrentOwner"]>(),
+    } as unknown as ResidencyClient;
     const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent, state.participants, control, state.lifecycle, undefined, residency, false);
     return { ...state, provider, actor, effective, setActor, actorStatus, removeActor, ensureActor, request, requestResult, members };
   };

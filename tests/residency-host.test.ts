@@ -12,6 +12,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
+import * as processIdentity from "../src/residency/process-identity.js";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -239,7 +240,10 @@ describe("resident host ownership", () => {
       expect(fs.existsSync(ownerPath)).toBe(false);
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
-  it("fences config release changes while retaining late actor delivery for the replacement", async () => {
+  it.each(["native", "unavailable"] as const)("fences config release changes while retaining late actor delivery for the replacement (birth identity %s)", async (birthIdentity) => {
+    // Windows/macOS have no /proc start ticks; exercise their serialized-owner shape on Linux too.
+    const birth = birthIdentity === "unavailable"
+      ? vi.spyOn(processIdentity, "processStartTime").mockReturnValue(undefined) : undefined;
     const { root, config, host, idle } = fixture();
     const next = path.join(root, "other-package");
     fs.mkdirSync(path.join(next, "dist/residency"), { recursive: true });
@@ -252,7 +256,11 @@ describe("resident host ownership", () => {
       control.mockRestore();
       const ownerPath = path.join(config.residencyRoot, "owner.json");
       const owner = fs.readFileSync(ownerPath, "utf8");
-      expect(JSON.parse(owner)).toMatchObject({ fabricExtensionPath: config.fabricExtensionPath, processStartTime: processStartTime(process.pid) });
+      const parsedOwner = JSON.parse(owner);
+      expect(parsedOwner).toMatchObject({ fabricExtensionPath: config.fabricExtensionPath });
+      // JSON omits undefined fields, but property access must still preserve optional birth identity.
+      expect(parsedOwner.processStartTime).toBe(processStartTime(process.pid));
+      if (birthIdentity === "unavailable") expect(parsedOwner).not.toHaveProperty("processStartTime");
       const fence = vi.spyOn(host.actors, "fenceActivations");
       vi.spyOn(host.actors, "listOwned").mockReturnValue([{ residency: "durable", status: "idle", queued: 0 }] as ReturnType<typeof host.actors.listOwned>);
       vi.spyOn(host.actors, "owns").mockReturnValue(true);
@@ -269,6 +277,7 @@ describe("resident host ownership", () => {
     } finally {
       control.mockRestore();
       await host.close();
+      birth?.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -284,6 +293,7 @@ describe("resident host ownership", () => {
       await host.start();
       start.mockRestore();
       vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
       // A fenced ASK can wait for a queued activation, but is not an admitted run.
       vi.spyOn(host.actors, "ask").mockImplementation(() => new Promise((_resolve, reject) => {
         cancellation.signal.addEventListener("abort", () => reject(new Error("request cancelled")), { once: true });

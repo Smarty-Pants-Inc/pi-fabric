@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+import { SHELL_COMPLETED_HANDLES } from "../src/core/shell-jobs.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 
@@ -14,6 +15,24 @@ describe("self-reload busy gate (smarty-dev#2160)", () => {
       await job.finish(0);
       expect(runtime.backgroundWorkCount()).toBe(0);
     } finally { await runtime.shutdown(); }
+  });
+
+  it("does not prune finishing shell jobs out of the reload hold before their notices exist (smarty-dev#2216)", async () => {
+    const runtime = new FabricRuntimeState({} as ExtensionAPI, new CapturedToolCatalog());
+    let finishing: Promise<void>[] = [];
+    try {
+      const jobs = Array.from({ length: SHELL_COMPLETED_HANDLES + 1 }, () => runtime.shellJobs.begin("bash", "background build"));
+      for (const job of jobs) job.spill();
+      await Promise.all(jobs.map(job => job.persistLog()));
+      finishing = jobs.map(job => job.finish(0));
+      await Promise.resolve(); // finishedAt is set, but unlink still holds the finished events
+      expect(jobs.every(job => job.finishedAt !== undefined && !job.announced)).toBe(true);
+      runtime.shellJobs.list(); // retention pressure must not remove the reload hold
+      expect(runtime.backgroundWorkCount()).toBe(jobs.length);
+      await Promise.all(finishing);
+      expect(runtime.backgroundWorkCount()).toBe(0);
+      expect(runtime.shellJobs.list()).toHaveLength(SHELL_COMPLETED_HANDLES);
+    } finally { await Promise.all(finishing); await runtime.shutdown(); }
   });
 
   it("counts a finished job until its completion event is sent (smarty-dev#2216)", async () => {

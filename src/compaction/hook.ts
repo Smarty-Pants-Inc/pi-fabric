@@ -11,6 +11,7 @@ import { calculateContextTokens, DEFAULT_COMPACTION_SETTINGS, estimateTokens } f
 import { buildSessionContext, sessionEntryToContextMessages } from "../core/session-context.js";
 import { clipUtf8, MAX_SUMMARY_BYTES, utf8Bytes } from "./bounds.js";
 import { modelCompactionKey } from "./threshold.js";
+import { recordCompactionDecline } from "./cancellation.js";
 import { NO_BUILTIN_ENRICHERS, runEnrichers, type CompactionEnricher } from "./enrichers.js";
 import { compileFabricBranchSummary } from "./branch-summary.js";
 import {
@@ -870,7 +871,15 @@ export const handleFabricBeforeCompact = (
   event: SessionBeforeCompactEvent,
   context: ExtensionContext,
   options: CompactionHookOptions,
+  pi?: ExtensionAPI,
 ) => {
+    // Both lazy and synchronous registration carry the same runtime identity. Pi stops
+    // dispatch at a veto, so Main needs this operation signal to distinguish a benign
+    // decline from an owner cancellation without eagerly importing this engine.
+    const decline = (event: SessionBeforeCompactEvent): { cancel: true } => {
+      if (pi) recordCompactionDecline(pi, event);
+      return { cancel: true };
+    };
     if (event.customInstructions === "__pi_vcc__") return;
     const { preparation, branchEntries } = event;
     const contextWindow = context?.model?.contextWindow;
@@ -883,7 +892,7 @@ export const handleFabricBeforeCompact = (
       && typeof thresholdTokens === "number"
       && preparation.tokensBefore < thresholdTokens
     ) {
-      return { cancel: true };
+      return decline(event);
     }
     const threshold = modelKey === undefined || typeof thresholdTokens === "number"
       ? undefined
@@ -894,7 +903,7 @@ export const handleFabricBeforeCompact = (
       && typeof contextWindow === "number"
       && preparation.tokensBefore / contextWindow < threshold
     ) {
-      return { cancel: true };
+      return decline(event);
     }
     if (options.getEngine() !== "fabric") return;
     const targetContextRatio = options.getTargetContextRatio?.();
@@ -932,12 +941,12 @@ export const handleFabricBeforeCompact = (
     if ("cancel" in result) {
       if (result.instructionError) {
         notifyInstructionError(context, result.instructionError);
-        return { cancel: true };
+        return decline(event);
       }
       if ((event as SessionBeforeCompactEvent & { _piVccOverriding?: unknown })._piVccOverriding) {
         return;
       }
-      return { cancel: true };
+      return decline(event);
     }
     (event as SessionBeforeCompactEvent & { _fabricCompaction?: boolean })._fabricCompaction = true;
     return { compaction: result.compaction };
@@ -972,6 +981,6 @@ export const handleFabricBeforeTree = (
 
 // Keep the synchronous entrypoint for callers that already use the compaction engine.
 export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHookOptions): void => {
-  pi.on("session_before_compact", (event, context) => handleFabricBeforeCompact(event, context, options));
+  pi.on("session_before_compact", (event, context) => handleFabricBeforeCompact(event, context, options, pi));
   pi.on("session_before_tree", (event, context) => handleFabricBeforeTree(event, context, options));
 };

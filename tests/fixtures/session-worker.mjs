@@ -1,0 +1,17 @@
+// A real native session writer, with deterministic fake model output.
+// Unlike fake-worker, this validates the header and appends Pi's actual tree entries.
+import fs from "node:fs";
+import path from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+const args = new Map();
+for (let index = 2; index < process.argv.length; index += 2) args.set(process.argv[index].slice(2), process.argv[index + 1]);
+const file = args.get("session-file");
+const session = file ? SessionManager.open(file, path.dirname(file), args.get("cwd")) : undefined;
+// Let the fake produce run output, never its lightweight/headerless transcript.
+const index = process.argv.indexOf("--session-file");
+if (index >= 0) process.argv.splice(index, 2);
+await import("./fake-worker.mjs");
+if (session) {
+  session.appendMessage({ role: "user", content: fs.readFileSync(args.get("task-file"), "utf8"), timestamp: Date.now() });
+  session.appendMessage({ role: "assistant", content: [{ type: "text", text: "fake actor advice" }], api: "anthropic-messages", provider: "test", model: "test", usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() });
+}

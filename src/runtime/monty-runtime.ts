@@ -2,7 +2,7 @@ import { ExecutionDeadline } from "./execution-deadline.js";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import type * as MontyNative from "@pydantic/monty/node";
-import { mainExecutionCeilingAbortReason, runAbortable, settleWithin } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { MAX_EXECUTOR_TIMEOUT_MS } from "../config.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
@@ -53,6 +53,7 @@ export class MontyRuntime implements FabricKernelRuntime {
     let feed: Promise<unknown> | undefined;
     let stopped: "aborted" | "timed_out" | undefined;
     const hostAbort = new AbortController();
+    shareCancellationEffects(hostAbort.signal, options.signal);
     const tasks = new Set<Promise<unknown>>();
     const responseToken = randomUUID();
     let nextRequestId = 0;
@@ -100,7 +101,7 @@ export class MontyRuntime implements FabricKernelRuntime {
     scheduleDeadline();
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
-    let result: FabricSandboxResult;
+    let result: FabricSandboxResult | undefined;
     try {
       const { native, binaryPath } = await runAbortable(hostAbort.signal, loadNative);
       pool = await runAbortable(hostAbort.signal, async () => {
@@ -204,8 +205,9 @@ export class MontyRuntime implements FabricKernelRuntime {
     } finally {
       executionDeadline.clear();
       options.signal?.removeEventListener("abort", abort);
+      const interrupted = result?.terminationReason !== "completed" || hostAbort.signal.aborted || tasks.size > 0;
       pendingReceipts.clear();
-      hostAbort.abort(new Error("Monty execution ended"));
+      hostAbort.abort(new Error(result?.error ?? "Monty execution ended"));
       // Initiate pool closure first to prevent worker replacement. Native cleanup
       // is best effort and bounded: its failures must not replace the guest result.
       let cleanupFailed = false;
@@ -220,12 +222,13 @@ export class MontyRuntime implements FabricKernelRuntime {
       }
       workerPid = undefined;
       await settleWithin([...tasks, ...(feed ? [feed] : [])], 250);
+      if (result) preserveCancellationOutcome(result, hostAbort.signal, interrupted);
     }
     for (const text of Object.values(partial)) if (text) logs.push(text);
     if (truncated) logs.push("[Pi Fabric log output truncated]");
-    if (result.terminationReason === "completed" && executionDeadline.reached) {
-      return executionDeadline.timeoutResult(logs);
+    if (result!.terminationReason === "completed" && executionDeadline.reached) {
+      return preserveCancellationOutcome(executionDeadline.timeoutResult(logs), hostAbort.signal, true);
     }
-    return result;
+    return result!;
   }
 }

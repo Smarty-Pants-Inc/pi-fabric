@@ -2,7 +2,7 @@
 
 Fabric supplies structured admission metadata with user-message injections and custom-message deliveries whose sender has a recorded verification method or is an explicitly registered in-process producer. Deliveries without that admission evidence carry no claim. Message text, names quoted in a report, and payload fields cannot select a human channel or principal.
 
-```ts
+```ts host
 provenance: {
   v: 1,
   channel: "fabric",

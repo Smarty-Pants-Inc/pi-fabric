@@ -313,6 +313,7 @@ export class FabricState {
   }
   get advisorsHalted(): boolean { return this.#current()?.advisorsHalted ?? false; }
   get escapeHalted(): boolean { return this.#current()?.escapeHalted ?? false; }
+  haltMain(): void { this.#current()?.haltMain(); }
   haltAdvisors(): number { return this.#current()?.haltAdvisors() ?? 0; }
   noteMainActivity(context: ExtensionContext): void { this.#current()?.noteMainActivity(context); }
   dispatchHostEvent(event: FabricActorHostEvent, payload: unknown, context: ExtensionContext): number {
@@ -437,7 +438,7 @@ export class FabricState {
     if (this.#shutDown) throw new Error("Pi Fabric is shut down for this session (reload or session replacement); retry in the new session");
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(reason?: string): Promise<void> {
     this.#shutDown = true;
     const generation = ++this.#generation;
     const activation = this.#activation;
@@ -447,7 +448,7 @@ export class FabricState {
     const runtime = this.#runtime;
     this.#runtime = undefined;
     try {
-      await runtime?.shutdown();
+      await runtime?.shutdown(reason);
       await this.#managedHost?.close();
     } finally {
       if (generation === this.#generation) {

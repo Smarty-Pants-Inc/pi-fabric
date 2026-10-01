@@ -109,6 +109,7 @@ import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
+import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
@@ -399,7 +400,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       enabled: () => state.initialized && (state.config.mesh.enabled || state.config.jev.enabled) && state.config.ui.haltOnEscape,
       ownsInput: () => fabricUi.ownsInput,
       // Called only for a recognized lone Escape: latch it even when nothing was left to halt.
-      halted: () => { escapeLatched = true; return state.advisorsHalted; },
+      halted: () => { escapeLatched = true; state.haltMain(); return state.advisorsHalted; },
       halt: () => state.haltAdvisors(),
     });
   };
@@ -903,16 +904,28 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       formatted.text || "(no output)",
       state.config.executor.maxOutputChars,
     );
-    // Directive lands after truncation so it survives maxOutputChars, and
-    // gates on "still armed" so one-shot trajectory handoffs stay silent.
-    const text = withTrajectoryRearmDirective(
-      output,
-      pending,
-      handoff,
-      state.prewalk,
-      context.sessionManager.getSessionId(),
+    const text = output;
+    const executionOutcome = pending.executionOutcome;
+    const boundarySucceeded = (handoff.completed === true || handoff.continued === true) &&
+      executionOutcome?.success !== false && !executionOutcome?.residentOutcomes.length && !outerToolResult.isError;
+    const residentPriority = executionOutcome?.residentOutcomes.length
+      ? formatResidentOutcomePriority(executionOutcome.residentOutcomes)
+      : undefined;
+    const sections = [
+      ...(executionOutcome?.error ? [`Original execution failed: ${executionOutcome.error}`] : []),
+      text,
+    ];
+    const fullOutput = [...(residentPriority ? [residentPriority] : []), ...sections].join("\n\n");
+    // Apply the same non-truncating receipt priority as execute(), at the final
+    // persisted/model-visible boundary. Transition success cannot cure an
+    // execution failure or authorize retrying its committed resident work.
+    const protectedOutput = await boundModelOutput(
+      fullOutput,
+      modelOutputBudget(state.config.executor.maxOutputChars, boundarySucceeded),
+      fullOutput,
+      undefined,
+      residentPriority ? { text: residentPriority, sections } : undefined,
     );
-    const boundarySucceeded = handoff.completed === true || handoff.continued === true;
     const details =
       typeof event.message.details === "object" &&
       event.message.details !== null &&
@@ -925,7 +938,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     return {
       message: {
         ...event.message,
-        content: [{ type: "text", text }],
+        content: [{ type: "text", text: withTrajectoryRearmDirective(
+          protectedOutput.text, pending, handoff, state.prewalk, context.sessionManager.getSessionId(),
+        ) }],
         isError: !boundarySucceeded,
         ...(details === undefined ? {} : { details }),
       },
@@ -1151,11 +1166,12 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
 
   pi.on("session_shutdown", async (event, context) => {
     stopInboxWake();
+    const reason = event?.reason ?? "exit";
     let stopping = 0;
     try { stopping = state.initialized ? state.agents.runningCount() : 0; } catch { /* not initialized */ }
     if (stopping > 0 && context.hasUI) {
       context.ui.notify(
-        `${event.reason === "reload" ? "Reload" : "Shutdown"} stops ${stopping} running task agent${stopping === 1 ? "" : "s"}; ` +
+        `${reason === "reload" ? "Reload" : "Shutdown"} stops ${stopping} running task agent${stopping === 1 ? "" : "s"}; ` +
           'each spawner gets a stopped result. Spawn with residency: "durable" to keep an agent across reloads.',
         "warning",
       );
@@ -1171,7 +1187,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     directToolApproval.clear();
     toolDisplay.clear();
     try {
-      await state.shutdown();
+      await state.shutdown(reason);
     } finally {
       uninstallHaltOnEscape();
       uninstallShellHangKeys();

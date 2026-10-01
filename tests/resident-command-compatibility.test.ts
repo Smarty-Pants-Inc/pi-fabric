@@ -1,5 +1,7 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
+import { beforeEach } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +20,8 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 // CI can supply a pinned prior release; local rollout probes use installed B70.
 const legacyRelease = process.env.PI_FABRIC_LEGACY_RELEASE ?? path.join(os.homedir(), ".local/share/smarty-dev/fabric/releases/b243bc926beec5da8717135893dd6b578af73f7b");
 const legacyHost = path.join(legacyRelease, "dist/residency/host.js");
+beforeEach(() => installInProcessResidentFence());
+
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-mixed-release-"));

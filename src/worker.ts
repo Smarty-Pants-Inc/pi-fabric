@@ -13,6 +13,29 @@ import type {
   AgentRunStatus,
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
+import { processStartTime } from "./residency/process-identity.js";
+import { executionGroup } from "./worker/execution-group.js";
+
+// ProcessTransport's native channel transfers the execution cleanup obligation
+// before spawning. Other transports have no channel and retain normal signals.
+let externalStopRequested = false;
+let externalStop = () => { externalStopRequested = true; };
+const custodyReady = new Promise<void>((resolve) => {
+  if (process.platform === "win32" || !process.send) { resolve(); return; }
+  process.on("message", (message: unknown) => {
+    if (!message || typeof message !== "object" || !("type" in message)) return;
+    if (message.type === "fabric-execution-custody-ack") { process.channel?.unref(); resolve(); }
+    else if (message.type === "fabric-stop") { externalStopRequested = true; externalStop(); }
+  });
+  process.send({ type: "fabric-execution-custody" }, () => undefined);
+});
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+  process.once(signal, () => { externalStopRequested = true; externalStop(); });
+}
+const executionSettled = (): Promise<void> => new Promise(resolve => {
+  if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
+  else resolve();
+});
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
@@ -213,11 +236,11 @@ const assistantError = (message: Record<string, unknown>): string => {
 const runnerLabel = (runner: string): string =>
   runner === "claude" ? "Claude" : runner === "veda" ? "Veda" : "Pi";
 
+const executionGroups = new WeakMap<ChildProcess, ReturnType<typeof executionGroup>>();
+let executionCleanup: () => Promise<void> = async () => {};
 const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
-  if (!child.pid) return;
-  try {
-    process.kill(process.platform === "win32" ? child.pid : -child.pid, signal);
-  } catch { /* child process group already exited */ }
+  try { executionGroups.get(child)?.signal(signal); }
+  catch (error) { console.error(`Execution cleanup unresolved: ${String(error)}`); }
 };
 
 
@@ -236,18 +259,29 @@ const writeCrashStatus = (error: unknown): void => {
     // to "Agent transport exited without a result".
   }
 };
-process.on("uncaughtException", (error) => {
-  writeCrashStatus(error);
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : error}\n`);
-  process.exit(1);
-});
-process.on("unhandledRejection", (error) => {
-  writeCrashStatus(error);
-  process.stderr.write(`Unhandled rejection: ${error instanceof Error ? error.stack ?? error.message : error}\n`);
-  process.exit(1);
-});
+let crashPending = false;
+const finishCrash = async (error: unknown): Promise<void> => {
+  if (crashPending) return;
+  crashPending = true;
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  try {
+    // A crash result is not an exit receipt. Do not publish it (or exit this
+    // custodian) until every admitted execution obligation has been drained.
+    await executionCleanup();
+    await executionSettled();
+    writeCrashStatus(error);
+    process.exit(1);
+  } catch (cleanupError) {
+    console.error(`Crash cleanup unresolved; retaining execution custody: ${String(cleanupError)}`);
+    // Keep the custodian available to its parent even if no native pipes remain.
+    setInterval(() => {}, 1000);
+  }
+};
+process.on("uncaughtException", (error) => { void finishCrash(error); });
+process.on("unhandledRejection", (error) => { void finishCrash(error); });
 
 const main = async (): Promise<void> => {
+  await custodyReady;
   const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
@@ -447,6 +481,15 @@ const main = async (): Promise<void> => {
   }
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
+  if (externalStopRequested) {
+    record.status = "stopped"; record.error = "Agent stopped before execution launch";
+    record.finishedAt = Date.now(); record.updatedAt = record.finishedAt;
+    writeRunRecord(options.statusFile, record); terminalWritten = true;
+    await executionSettled();
+    await new Promise<void>(resolve => sessionStream ? sessionStream.end(resolve) : resolve());
+    process.exitCode = 1;
+    return;
+  }
   const child = spawnCli(childBinary, childArguments, {
     cwd: options.cwd,
     detached: process.platform !== "win32",
@@ -499,6 +542,43 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  const executionBirth = child.pid === undefined ? undefined : processStartTime(child.pid);
+  // Scope cut: Windows preserves the pre-custody native-child behavior. This
+  // local close check is NOT an execution-tree receipt and never crosses IPC.
+  const group = process.platform === "win32" ? {
+    observe(): void {},
+    exited: () => nativeClosed,
+    signal: (signal: NodeJS.Signals): void => {
+      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    },
+  } : executionGroup(child);
+  executionGroups.set(child, group);
+  let nativeClosed = false;
+  child.once("close", () => { nativeClosed = true; });
+  // Observe while the leader is alive, not first at cancellation after it has
+  // disappeared. This timer is also the unresolved custody keepalive.
+  const groupObserver = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, 100);
+  let draining: Promise<void> | undefined;
+  executionCleanup = () => draining ??= (async () => {
+    const exited = () => nativeClosed && group.exited();
+    const wait = async (ms: number) => {
+      const deadline = Date.now() + ms;
+      do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
+      return exited();
+    };
+    if (!exited()) {
+      group.signal("SIGTERM");
+      child.stdin?.end();
+      if (!await wait(KILL_GRACE_MS)) {
+        group.signal("SIGKILL");
+        if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
+      }
+    }
+    clearInterval(groupObserver);
+  })();
+  // Transfer exact execution identity immediately; even an instant custodian
+  // SIGKILL cannot turn a still-running child into permission for replacement.
+  if (process.platform !== "win32") process.send?.({ type: "fabric-execution-started", pid: child.pid, started: executionBirth }, () => undefined);
   let stderr = "";
   let outputBuffer = "";
   // Veda emits a single JSON document on stdout (progress goes to stderr, and
@@ -1415,19 +1495,20 @@ const main = async (): Promise<void> => {
     terminalError = "Agent stopped";
     killChild();
   };
-  process.once("SIGTERM", stop);
-  process.once("SIGINT", stop);
-  process.once("SIGHUP", stop);
+  externalStop = stop;
+  if (externalStopRequested) stop();
 
   const exitCode = await new Promise<number | null>((resolve) => {
     child.once("error", (error) => {
       terminalStatus = "failed";
       terminalError = error.message;
-      resolve(null);
     });
-    child.once("close", (code) => resolve(code));
+    child.once("close", (code) => {
+      void executionCleanup().then(() => executionSettled()).then(() => resolve(code)).catch(finishCrash);
+    });
   });
 
+  if (crashPending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
@@ -1602,8 +1683,4 @@ const main = async (): Promise<void> => {
   process.exitCode = record.status === "completed" ? 0 : 1;
 };
 
-main().catch((error) => {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-  writeCrashStatus(error);
-  process.exit(1);
-});
+main().catch(finishCrash);

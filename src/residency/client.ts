@@ -149,6 +149,7 @@ export class ResidencyClient {
   #drainingDeliveries = false;
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
+  #startupLauncher: Awaited<ReturnType<typeof spawnDetached>> | undefined;
   #nextWatchdogAt = 0;
   #watchdogFailures = 0;
   #watchdogWork: string | undefined;
@@ -185,6 +186,9 @@ export class ResidencyClient {
     this.#deliveryTimer = undefined;
     while (this.#drainingDeliveries) await delay(10);
     await this.#startingHost?.catch(() => undefined);
+    // A failed verification retains its owned handle so close can retry, or surface
+    // the cleanup failure instead of silently reporting an aborted start as settled.
+    await this.#stopStartingLauncher();
   }
 
   syncPiModels(): void {
@@ -214,18 +218,28 @@ export class ResidencyClient {
     finally { this.#startingHost = undefined; }
   }
 
+  async #stopStartingLauncher(): Promise<void> {
+    const launcher = this.#startupLauncher;
+    if (!launcher) return;
+    await launcher.stop();
+    if (this.#startupLauncher === launcher) this.#startupLauncher = undefined;
+  }
+
   async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
+    await this.#stopStartingLauncher();
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#liveOwner();
     if (existing) return existing;
     fs.rmSync(this.#errorPath, { force: true });
+    const launchToken = randomUUID();
     const launcher = await spawnDetached(
       this.#hostPath,
-      ["--config", this.#configPath],
+      ["--config", this.#configPath, "--launch-token", launchToken],
       this.options.config.cwd,
     );
+    this.#startupLauncher = launcher;
     // The budget counts from the launcher's first sign of life (its
     // launcher-started trace), so its own boot does not consume it.
     const budget = startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
@@ -234,18 +248,24 @@ export class ResidencyClient {
     let launcherExited = false;
     while (true) {
       if (this.#closed) {
-        await launcher.stop();
+        await this.#stopStartingLauncher();
         throw new Error("Fabric residency client is closed");
       }
       const owner = this.#liveOwner();
-      if (owner) return owner;
+      if (owner) {
+        // Only our attempt may transfer custody to durable residency. Another
+        // winner does not prove our losing launcher (or restored work) exited.
+        if (owner.launchToken !== launchToken) await this.#stopStartingLauncher();
+        else this.#startupLauncher = undefined;
+        return owner;
+      }
       const failure = readJson<{ error?: unknown }>(this.#errorPath);
       if (typeof failure?.error === "string") {
-        await launcher.stop();
+        await this.#stopStartingLauncher();
         throw new Error(`Fabric resident host failed to start: ${failure.error}`);
       }
-      // A launcher that exited leaves nothing to wait for; its last owner
-      // and error states were read above.
+      // An exited launcher cannot publish a new owner. Its last owner/error
+      // states were read above; retained group cleanup still runs below.
       if (launcherExited) break;
       launcherExited = !(await launcher.isAlive());
       if (launcherExited) continue;
@@ -258,7 +278,7 @@ export class ResidencyClient {
     }
     // Work must not outlive its owner: end the launcher this call spawned (its
     // own process group, which holds its Pi child) before reporting the timeout.
-    await launcher.stop();
+    await this.#stopStartingLauncher();
     // Surface any launcher-recorded child output so a silent slow start (or a
     // quiet child crash) is diagnosable from the error alone.
     const readIfPresent = (name: string): string => {

@@ -1,3 +1,5 @@
+import { beforeEach } from "vitest";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -5,13 +7,18 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { spawn } from "node:child_process";
 import { lockFile } from "../src/residency/file-lock.js";
+import * as fileLock from "../src/residency/file-lock.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as processUtils from "../src/agents/transports/process-utils.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { RESIDENT_HOST_FORMAT, residentResultPath, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
+import { launchLog, same } from "./helpers/owned-processes.js";
+
+beforeEach(() => installInProcessResidentFence());
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -34,6 +41,158 @@ const fixture = () => {
 };
 
 const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+describe("#2566 startup fence", () => {
+  it.skipIf(process.platform !== "linux")("item 1 fails closed when an injected non-Linux start has no shared flock", async () => {
+    const { root, host } = fixture();
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const unavailable = vi.spyOn(fileLock, "lockFile").mockRejectedValue(Object.assign(new Error("flock unavailable"), { code: "ENOENT" }));
+    try {
+      await expect(host.start()).rejects.toThrow("flock unavailable");
+      expect(host.actors).toBeUndefined();
+    } finally { unavailable.mockRestore(); platform.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform !== "linux")("item 2 rejects an inode replaced by an already-committed legacy reclaimer during acquisition", async () => {
+    const { root, config, host } = fixture();
+    const lock = path.join(config.residencyRoot, "host.lock");
+    const acquire = fileLock.lockFile;
+    const replacement = vi.spyOn(fileLock, "lockFile").mockImplementation(async (...args) => {
+      const fd = await acquire(...args);
+      if (args[0] === lock) {
+        fs.renameSync(lock, `${lock}.legacy-inode`);
+        fs.writeFileSync(lock, "");
+      }
+      return fd;
+    });
+    try {
+      await expect(host.start()).rejects.toThrow(/replaced|drain/);
+      expect(host.actors).toBeUndefined();
+      expect(fs.readFileSync(lock, "utf8")).toBe("");
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+    } finally { replacement.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform !== "linux")("item 1 fences an injected non-Linux delayed starter with stale diagnostics", async () => {
+    const { root, config, host: first } = fixture();
+    const second = new ResidentHost(config);
+    const lock = path.join(config.residencyRoot, "host.lock");
+    const read = fs.readFileSync.bind(fs);
+    let delayed = false;
+    const stale = JSON.stringify({ pid: -1, token: "stale" });
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const reads = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (delayed && String(file) === lock) return stale;
+      return read(file, options as never);
+    }) as typeof fs.readFileSync);
+    const control = vi.spyOn(FabricControlPlane.prototype, "start");
+    try {
+      const starting = first.start();
+      delayed = true;
+      const following = second.start();
+      delayed = false;
+      const results = await Promise.allSettled([starting, following]);
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(control).toHaveBeenCalledTimes(1);
+      const loser = results[0]!.status === "rejected" ? first : second;
+      expect(loser.actors).toBeUndefined();
+      reads.mockRestore();
+      const inode = fs.statSync(lock).ino;
+      await Promise.all([first.close(), second.close()]);
+      expect(fs.statSync(lock).ino).toBe(inode);
+    } finally {
+      reads.mockRestore(); platform.mockRestore(); control.mockRestore();
+      await Promise.all([first.close(), second.close()]);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux").each(["", "{", "null", JSON.stringify({ pid: -1, token: "legacy-dead" })])(
+    "item 2 refuses an unproven legacy startup inode (%j) without overwriting it", async (record) => {
+      const { root, config, host } = fixture();
+      const lock = path.join(config.residencyRoot, "host.lock");
+      fs.writeFileSync(lock, record);
+      const inode = fs.statSync(lock).ino;
+      try {
+        await expect(host.start()).rejects.toThrow(/legacy|uncertain|drain/i);
+        expect(host.actors).toBeUndefined();
+        expect(fs.statSync(lock).ino).toBe(inode);
+        expect(fs.readFileSync(lock, "utf8")).toBe(record);
+        // A legacy starter already committed to unlinking this dead record can
+        // now replace it; the new host must not have initialized alongside it.
+        fs.rmSync(lock);
+        fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: "legacy-reclaimer" }));
+        expect(host.actors).toBeUndefined();
+      } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    },
+  );
+});
+
+describe.skipIf(process.platform !== "linux")("#2566 owned startup shutdown", () => {
+  it("item 5 retains the exact launcher after failed verification and surfaces close cleanup failure", async () => {
+    const { root, config, host } = fixture();
+    const stop = vi.fn<() => Promise<void>>().mockRejectedValue(new Error("owned process exit unconfirmed"));
+    const spawn = vi.spyOn(processUtils, "spawnDetached").mockResolvedValue({ pid: process.pid, stop, isAlive: async () => true });
+    const client = new ResidencyClient({ config, mesh: host.mesh, participants: host.participants,
+      mainAgent: { local: false } as FabricMainAgentTarget, startupTimeoutMs: 20 });
+    try {
+      await expect(client.ensureHost()).rejects.toThrow("owned process exit unconfirmed");
+      expect(stop).toHaveBeenCalledTimes(1);
+      await expect(client.close()).rejects.toThrow("owned process exit unconfirmed");
+      expect(stop).toHaveBeenCalledTimes(2);
+      stop.mockResolvedValue(undefined);
+      await client.close();
+      expect(stop).toHaveBeenCalledTimes(3);
+      expect(spawn).toHaveBeenCalledTimes(1);
+    } finally {
+      stop.mockResolvedValue(undefined); await client.close(); spawn.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["timeout", "close", "failure"] as const)("item 5 confirms launcher and refusing Pi group exit before reporting %s", async (mode) => {
+    const { root, config, host } = fixture();
+    const launches = launchLog(root);
+    for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
+    const client = new ResidencyClient({
+      config, mesh: host.mesh, participants: host.participants,
+      mainAgent: { local: false } as FabricMainAgentTarget,
+      hostPath: path.resolve("tests/fixtures/stubborn-resident-launcher.mjs"),
+      startupTimeoutMs: mode === "timeout" ? 400 : 10_000,
+    });
+    const executing = () => launches.owned().filter((owned) => {
+      if (!same(owned)) return false;
+      try {
+        const stat = fs.readFileSync(`/proc/${owned.pid}/stat`, "utf8");
+        return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]!);
+      } catch { return false; }
+    });
+    // Attach the rejection observer immediately, including when close races startup.
+    const starting = client.ensureHost().then(() => undefined, (error: unknown) => error);
+    try {
+      await vi.waitFor(() => expect(fs.existsSync(path.join(config.residencyRoot, "stubborn-child-ready"))).toBe(true), { timeout: 5_000 });
+      expect(executing()).toHaveLength(2);
+      if (mode === "close") await client.close();
+      if (mode === "failure") fs.writeFileSync(path.join(config.residencyRoot, "error.json"), JSON.stringify({ error: "injected failure" }));
+      const error = await starting;
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(mode === "timeout" ? /Timed out/ : mode === "close" ? /client is closed/ : /injected failure/);
+      // No post-rejection grace period: settlement itself is the execution boundary.
+      expect(executing()).toEqual([]);
+    } finally {
+      // Baseline's fire-and-forget TERM leaves both alive. Kill ONLY launch-log
+      // identities from this fixture, with a fresh birth check before each signal.
+      for (const owned of executing()) if (same(owned)) {
+        try { process.kill(owned.pid, "SIGKILL"); } catch { /* already gone */ }
+      }
+      await starting;
+      await client.close();
+      await vi.waitFor(() => expect(executing()).toEqual([]), { timeout: 5_000 });
+      vi.unstubAllEnvs();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+});
+
 describe("resident tracked result preservation", () => {
   it.each(["LARGE_RESULT", "FAIL_DIRECTIVE"])("F1 save failure keeps the worker's %s completion through close and two host/client restarts", async (task) => {
     const { root, config, host: first } = fixture();
@@ -350,16 +509,19 @@ describe("resident host ownership", () => {
   it.skipIf(process.platform !== "linux")("R2 stale diagnostic file naming a dead PID cannot block or replace the kernel inode", async () => {
     const { root, config, host } = fixture();
     const lock = path.join(config.residencyRoot, "host.lock");
+    // Establish the shared-fence inode, then corrupt only its diagnostic bytes.
+    await host.start(); await host.close();
+    const recovering = new ResidentHost(config);
     fs.writeFileSync(lock, JSON.stringify({ pid: -1, token: "stale" }));
     const inode = fs.statSync(lock).ino;
     // Our own PID is not a different live legacy owner.
     fs.writeFileSync(path.join(config.residencyRoot, "owner.json"), JSON.stringify({ pid: process.pid }));
     try {
-      await host.start();
+      await recovering.start();
       expect(fs.statSync(lock).ino).toBe(inode);
-      await host.close();
+      await recovering.close();
       expect(fs.statSync(lock).ino).toBe(inode);
-    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { await recovering.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it.skipIf(process.platform !== "linux")("R2 SIGKILL releases host ownership without replacing its lock file", async () => {

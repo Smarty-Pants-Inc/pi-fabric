@@ -223,43 +223,214 @@ export const workerCommand = async (
 ): Promise<string> =>
   (await scriptSpawnArgs(workerPath, workerArguments)).map(shellQuote).join(" ");
 
+type LinuxGroupMember = { pid: number; parent: number; group: number; started: string; state: string };
+const linuxGroupMember = (pid: number): LinuxGroupMember | undefined => {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    return { pid, parent: Number(fields[1]), group: Number(fields[2]), started: fields[19]!, state: fields[0]! };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") return undefined;
+    throw error; // Unknown identity is not permission to signal or to report exit.
+  }
+};
+const linuxProcesses = (): LinuxGroupMember[] =>
+  fs.readdirSync("/proc").flatMap((entry) => {
+    if (!/^\d+$/.test(entry)) return [];
+    const member = linuxGroupMember(Number(entry));
+    return member && member.state !== "Z" && member.state !== "X" ? [member] : [];
+  });
+const STOP_TERM_MS = 2_000;
+const STOP_KILL_MS = 2_000;
+const stopDelay = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
+
 export const spawnDetached = async (
   workerPath: string,
   workerArguments: string[],
   cwd: string,
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize">,
+  /** Ordinary workers need time to run their five-second execution-child cleanup. */
+  termGraceMs = STOP_TERM_MS,
+  executionCustodian = false,
 ): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
+  // The new tree-custody protocol is unsupported on Windows. Even an internal
+  // caller requesting it must get only the legacy native worker-exit contract.
+  const tracksExecution = executionCustodian && process.platform !== "win32";
   const child = spawn(runtime, [workerPath, ...workerArguments], {
     cwd,
     detached: process.platform !== "win32",
-    stdio: "ignore",
+    stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });
   if (!child.pid) throw new Error("Failed to launch Fabric worker process");
   const pid = child.pid;
-  // Once the worker exited, its numeric id is no identity: after its group empties, the id
-  // can name an unrelated process (group). So nothing is signalled or probed by number then.
-  // ponytail: descendants an exited worker left in its group are not signalled; liveness
-  // (and so relaunch) is about the worker itself.
+  // Exit is latched: after the worker/group empties its numeric id is not identity.
   let exited = false;
   child.once("exit", () => { exited = true; });
   child.unref();
+  child.channel?.unref();
+  let executionPending = false;
+  child.on("message", (message: unknown) => {
+    if (!message || typeof message !== "object" || !("type" in message)) return;
+    if (message.type === "fabric-execution-custody") {
+      // The real worker cannot spawn execution until we acknowledge custody.
+      executionPending = true;
+      if (child.connected) child.send({ type: "fabric-execution-custody-ack" }, () => undefined);
+    } else if (message.type === "fabric-execution-started" && "pid" in message &&
+      Number.isSafeInteger(message.pid) && Number(message.pid) > 0 && "started" in message && typeof message.started === "string") {
+      // This private native channel belongs to our worker. Retain its reported
+      // birth even if the custodian already died and the child was reparented.
+      // members() still revalidates before signaling any reported group.
+      if (process.platform === "linux") {
+        owned.set(Number(message.pid), message.started);
+        groups.add(Number(message.pid));
+      }
+    } else if (message.type === "fabric-execution-settled") executionPending = false;
+  });
+  let birth: LinuxGroupMember | undefined;
+  try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { /* stop fails closed on unknown identity */ }
+  let stopping: Promise<void> | undefined;
+  const owned = new Map<number, string>();
+  if (birth) owned.set(pid, birth.started);
+  const groups = new Set([pid]);
+  let portableUncertain = false;
+  const portableMembers = async (): Promise<Array<{ pid: number; group: number }>> => {
+    const { stdout } = await executeFile("ps", ["-axo", "pid=,ppid=,pgid=,stat="], { timeoutMs: 1_000 });
+    const snapshot = stdout.split("\n").flatMap(line => {
+      if (!line.trim()) return [];
+      const fields = line.trim().split(/\s+/);
+      const [member, parent, group, state] = fields;
+      if (fields.length !== 4 || !/^\d+$/.test(member!) || !/^\d+$/.test(parent!) || !/^\d+$/.test(group!)) {
+        throw new Error(`Cannot confirm ownership/exit from process snapshot for ${pid}`);
+      }
+      return state && !state.startsWith("Z") && !state.startsWith("X") && (!exited || Number(member) !== pid)
+        ? [{ pid: Number(member), parent: Number(parent), group: Number(group) }] : [];
+    });
+    if (!exited) {
+      const descendants = new Set([pid]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const member of snapshot) if (descendants.has(member.parent) && !descendants.has(member.pid)) {
+          descendants.add(member.pid); groups.add(member.group); changed = true;
+        }
+      }
+    }
+    // Without birth identities these are cleanup obligations, NEVER permission
+    // to signal an extra group or kill its custodian before its own drain ends.
+    return snapshot.filter(member => groups.has(member.group));
+  };
+  let stopped = false;
+  const members = (): LinuxGroupMember[] => {
+    const snapshot = linuxProcesses().filter((member) => !exited || member.pid !== pid);
+    // Retain detached execution groups BEFORE their custodian can die/reparent
+    // them. An edge is admitted only while its parent's birth still matches.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const member of snapshot) {
+        if (owned.get(member.pid) === member.started) continue;
+        const parent = snapshot.find((candidate) => candidate.pid === member.parent);
+        if (!parent || owned.get(parent.pid) !== parent.started) continue;
+        const currentParent = linuxGroupMember(parent.pid);
+        const current = linuxGroupMember(member.pid);
+        if (currentParent?.started !== parent.started || current?.started !== member.started || current.parent !== parent.pid) {
+          throw new Error(`Cannot confirm ownership/exit of Fabric descendant ${member.pid}`);
+        }
+        owned.set(member.pid, member.started);
+        changed = true;
+      }
+    }
+    for (const member of snapshot) {
+      if (owned.get(member.pid) !== member.started || groups.has(member.group)) continue;
+      // Never signal a foreign group an owned process joined. Detached workers
+      // create their own group; its leader must itself be an owned birth.
+      const leader = snapshot.find((candidate) => candidate.pid === member.group);
+      if (!leader || owned.get(leader.pid) !== leader.started) {
+        throw new Error(`Cannot confirm ownership/exit of Fabric process group ${member.group}`);
+      }
+      groups.add(member.group);
+    }
+    const current = snapshot.filter((member) => groups.has(member.group));
+    for (const group of groups) {
+      const groupMembers = current.filter((member) => member.group === group);
+      if (groupMembers.length && !groupMembers.some((member) => owned.get(member.pid) === member.started)) {
+        throw new Error(`Cannot confirm ownership/exit of Fabric process group ${group}`);
+      }
+      for (const member of groupMembers) owned.set(member.pid, member.started);
+    }
+    return current;
+  };
+  const stop = async (): Promise<void> => {
+    if (stopped) return;
+    // Capture group identities BEFORE TERM, while the owned leader still pins it.
+    // A leader can exit before its refusing child. Retain that child's birth, not
+    // just a group number, and never adopt a recycled group with no owned member.
+    if (process.platform === "linux") members();
+    else if (process.platform !== "win32") await portableMembers();
+    const settled = async (): Promise<boolean> => {
+      if (process.platform === "linux") return members().length === 0 && exited && !(executionPending && groups.size === 1);
+      const remaining = process.platform === "win32" ? [] : await portableMembers();
+      if (!exited || executionPending || portableUncertain) return false;
+      return remaining.length === 0;
+    };
+    const signal = (value: NodeJS.Signals): void => {
+      const targets = process.platform === "linux"
+        ? [...new Set(members().filter(member => value !== "SIGTERM" || exited || member.group === pid).map(member => -member.group))]
+        : exited ? [] : [process.platform === "win32" ? pid : -pid];
+      // TERM the live custodian, not its execution first: it must record stop
+      // intent before the child can close. Escalation owns all retained groups.
+      // Escalate execution groups before their root custodian. Custody remains
+      // retained even if a child refuses KILL or another group appears meanwhile.
+      targets.sort((left, right) => left === -pid ? 1 : right === -pid ? -1 : 0);
+      for (const target of targets) {
+        // Refresh birth anchors immediately before EACH signal, not only once
+        // before signalling several independently detached execution groups.
+        if (process.platform === "linux" && !members().some((member) => member.group === -target)) continue;
+        try { process.kill(target, value); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+    };
+    const wait = async (ms: number): Promise<boolean> => {
+      const deadline = Date.now() + ms;
+      do { if (await settled()) return true; await stopDelay(); } while (Date.now() < deadline);
+      return settled();
+    };
+    // POSIX custodians drain cooperatively on TERM. Windows uses only its
+    // legacy native worker stop; no tree receipt or custody IPC is supported.
+    signal("SIGTERM");
+    if (await wait(termGraceMs)) return;
+    if (process.platform !== "linux" && (executionPending || portableUncertain || groups.size > 1)) {
+      throw new Error(`Fabric worker ${pid} execution exit unconfirmed; retaining custodian without birth-safe escalation`);
+    }
+    signal("SIGKILL");
+    if (!(await wait(STOP_KILL_MS))) throw new Error(`Fabric worker ${pid} did not exit after bounded SIGTERM/SIGKILL cleanup`);
+  };
   return {
     pid,
     async stop() {
-      if (exited) return;
-      try {
-        process.kill(process.platform === "win32" ? pid : -pid, "SIGTERM");
-      } catch { /* process group already exited */ }
+      if (stopping) return stopping;
+      const pending = stop();
+      stopping = pending;
+      try { await pending; stopped = true; } finally { stopping = undefined; }
     },
     async isAlive() {
-      if (exited) return false;
-      if (processIsAlive(pid)) return true;
+      // A dead custodian is not proof its retained execution groups stopped.
+      // The manager must not use it to admit an overlapping replacement.
+      if (exited) return process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
+      if (processIsAlive(pid)) {
+        // Retain observed descendants before a launcher can exit ahead of its Pi child.
+        if (process.platform === "linux") { try { members(); } catch { /* stop must fail closed */ } }
+        else if (process.platform !== "win32") { try { await portableMembers(); } catch { /* unknown descendants cannot authorize escalation */ portableUncertain = true; } }
+        return true;
+      }
       // Gone once is gone for good: the probe can see the exit before the "exit" event
       // (Windows), and any later answer for this number is another process.
       exited = true;
-      return false;
+      return process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
     },
   };
 };

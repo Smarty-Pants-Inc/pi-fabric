@@ -146,7 +146,7 @@ Persistent actors freeze their language and Python backend when created. `ask`/`
 const result = await agents.run({
   name: "security-review",
   task: "Review the current diff for concrete security defects. Do not edit files.",
-  transport: "localterm",
+  transport: "process",
   tools: ["read", "grep", "find", "ls"],
 });
 return result;
@@ -157,7 +157,7 @@ Create background handles explicitly:
 ```ts
 const handle = await agents.spawn({
   task: "Map the persistence layer and identify its public entry points.",
-  transport: "tmux",
+  transport: "process",
 });
 
 // Continue with independent work here.
@@ -207,6 +207,18 @@ The original TUI can shut down after the transfer. Durable agents continue until
 A durable actor has one resident execution owner. Other trusted sessions in the project can call `ask`, `tell`, `steer`, `followUp`, and `stop`; Fabric routes each call to that owner. Direct messages carry the caller's model and thinking binding. Actor status, mailbox history, logs, and definition export are shared project views. Only the owner can clear the mailbox or change tools, events, instructions, delivery policy, and project defaults. Fabric sends durable actor removal to the resident owner. The hidden host exits after a short idle grace when it owns no live durable actor or running durable agent. Durable residency requires a trusted project and `mesh.enabled`. Schema enforce mode does not support it.
 
 Recursive cwd also works with durable `agents.spawn()`: the caller resolves explicit relative cwd before ownership transfer, and persisted handles retain effective cwd, kernel, and recursion metadata for later status/log reads. Startup retries reuse the original launch (including effective worktree cwd and capability flags); they do not resolve the target again. Resident-host recovery does not replay an interrupted spawn: its outcome is reported as indeterminate to avoid duplicate execution. This is not migration of a running session to a new cwd; existing workers must finish or be replaced by a new launch.
+
+#### Resident startup fencing and legacy drain
+
+Explicit resident starts acquire the same immutable-inode process-shared `flock` on every supported POSIX platform before constructing managers or admitting execution. Linux also requires `setpriv --pdeathsig KILL` for the lock helper. Missing/broken lock tooling fails closed; there is no PID-file/unlink fallback. Automated recovery remains Linux-only. Windows durable residency remains unsupported.
+
+`host-fence.json` binds the established protocol to the exact device/inode of `host.lock`. The host never unlinks that inode, including on clean close. Corruption of PID diagnostics does not defeat an established kernel fence or block recovery after its holder exits. An empty/torn record, an unproven existing inode (even one naming a dead PID), or a replaced inode is instead refused before initialization, with a startup diagnostic directing the operator to verify a drain. A dead PID alone cannot exclude a legacy reclaimer already committed to inode replacement. The provenance record is not evidence that legacy processes were drained, and it must not be fabricated to bypass this refusal.
+
+**Rollout and rollback remain coordinated operations:** prevent legacy-capable launchers/starters from entering, record the identities of the launchers/hosts/Pi groups being drained, confirm their exit with bounded owned termination, and retain before/after process and residency-root scans. Only after those checks establish no old owner or pending reclaimer may an operator remove the legacy/uncertain startup records (and obsolete provenance, if an inode was replaced) to allow a fresh claim. Do not remove live or unknown records, and do not downgrade into an established root alongside a newer host. This change does not claim that such a fleet drain has run.
+
+A failed/timed-out start or client close keeps its owned launcher handle until termination is confirmed. Launcher stop waits up to two seconds for TERM, then escalates and verifies exit for up to two more seconds. Ordinary process workers instead have seven seconds to finish their existing five-second execution-child cleanup before outer escalation. Linux retains birth identities for observed descendants and their separately detached execution groups before stopping a custodian; exit/liveness includes all retained groups, not just the worker or launcher. Each signal revalidates an owned birth anchor; recycled or unknown groups fail closed. The real worker acknowledges its parent's cleanup custody before spawning execution, and reports native execution close over that same private IPC channel. Windows stop uses cooperative IPC instead of killing the worker with SIGTERM; the worker retains the native child handle. Other POSIX platforms retain observed descendant groups through `ps` but never use unknown births to signal those groups or escalate their custodian before its drain completes. Unconfirmed cleanup stays an error. Failed verification retains custody for retry/close and remains an error.
+
+Readiness transfers custody only when the published per-attempt launch token matches this client's launcher. If a competing host wins, the client leaves that winner untouched but joins/stops its own losing attempt before returning success. A successfully ready owned durable host is not terminated by client close. Unsupported-platform CI uses an explicit **test-only, in-process** lock adapter for isolated request/commit harnesses; this does not enable native Windows durable residency or replace the product kernel fence.
 
 #### Cancellation and uncertain durable outcomes
 
@@ -359,14 +371,53 @@ This is the host-level equivalent of the `pi-model-switch` extension's `switch_m
 
 ### Transports
 
+**Execution-custody scope cut (smarty-dev#2566 / pi-fabric#218):** agent
+admission currently supports only `process`; `auto` selects `process`.
+Explicit `tmux`, `screen`, `localterm`, and `herdr` requests fail before launch.
+Removing a session/pane does not prove its separately detached execution group
+exited. Those adapters and their historical integration details below remain in
+source, but must not be re-enabled until they retain birth-safe execution
+custody, cooperatively drain the worker, and confirm the entire group's exit.
+The follow-up belongs to [smarty-dev#2566](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/2566);
+this is a fail-closed implementation scope cut, not product-owner risk acceptance.
+
+Cancelled/revoked launches are registered for custody before attempting cleanup,
+even if cancellation won before normal admission registration. Queued stop joins
+that same fence; actor run/wait cannot finish its same-session drain while exit
+is unconfirmed. A later positive receipt from the exact transport can discharge
+a transient failed-cleanup mark and retry collection.
+
+On the supported execution-tree custody path, terminal results are not exit
+receipts. Public stop and manager close reject
+unconfirmed execution cleanup, retain the admission permit and run handle, and
+keep working files. Unknown process/group identity is never permission to signal
+a recycled numeric ID or to discard custody. Worker crash publication waits for
+execution drain; on Linux surviving same-birth group members remain cleanup
+anchors after the leader exits. Portable POSIX leaderless groups without such
+anchors remain unresolved rather than being signaled blindly.
+
+**Windows scope cut:** the new execution-tree custody/exit receipt is unsupported
+on Windows. Ordinary process workers preserve the pre-PR native-child cleanup
+and worker-exit behavior, with no custody handshake or `fabric-execution-settled`
+receipt. A native child close is **not** proof that its tool descendants exited;
+the Linux/POSIX tree guarantee above does not apply to Windows. Durable Windows
+residency remains unsupported. Re-enabling a Windows tree receipt requires an
+OS-backed, birth-safe boundary (for example a Job Object), plus native Windows
+stop/timeout/CLI-crash/custodian-death tests with pipe-independent descendants.
+This is an implementation scope cut, not certification of legacy Windows tree
+cleanup or a product-owner risk acceptance.
+
 | Transport   | Operation                                                     | Command to attach            |
 | ----------- | ------------------------------------------------------------- | ---------------------------- |
 | `process`   | Runs a detached local worker process with the lowest overhead. This is the default transport | none |
-| `tmux`      | Creates one detached tmux session for each child              | `tmux attach-session -t …`   |
-| `screen`    | Creates one detached GNU Screen session for each child        | `screen -r …`                |
-| `localterm` | Creates one pinned LocalTerm PTY for each child               | `localterm session attach …` |
-| `herdr`     | Creates one background Herdr tab for each child               | `herdr terminal attach …`    |
-| `auto`      | Tries Herdr, LocalTerm, tmux, screen, and then process         | Depends on the transport     |
+| `tmux`      | Disabled pending execution-custody support                    | —                           |
+| `screen`    | Disabled pending execution-custody support                    | —                           |
+| `localterm` | Disabled pending execution-custody support                    | —                           |
+| `herdr`     | Disabled pending execution-custody support                    | —                           |
+| `auto`      | Selects `process` only                                        | none                        |
+
+The following session-transport integration notes describe the disabled adapters
+and their re-enablement requirements, not currently supported admission paths.
 
 Herdr uses its local socket API to create an argv-backed background tab as one atomic operation. It does not change focus or require shell quoting. Automatic selection works only when the parent Pi process already runs in Herdr. This requires `HERDR_ENV=1` with an injected workspace and socket. Select `transport: "herdr"` under the same conditions. Use the attach command in the handle to open a child directly. Herdr workers inherit the server environment, not the parent shell. Fabric forwards an explicitly set `PI_CODING_AGENT_DIR` through the pane's environment map so the child uses the selected Pi profile; an unset selector leaves Herdr's default behavior unchanged. This does not copy profile files, credentials, `PATH`, or the rest of the parent environment. Instead, the parent resolves the Pi launcher and the worker runtime to absolute paths with its own `PATH` before launch. The worker runs JavaScript entrypoints and extensionless `#!/usr/bin/env node` launchers through its absolute runtime, and passes the selected launcher to nested Fabric as `PI_FABRIC_PI_BINARY`. Other commands inside the child still use Herdr's server `PATH`.
 
@@ -760,7 +811,7 @@ return agents.setDeliveryPolicy({
 return council.run({
   task: "Review the current implementation and recommend whether it is ready to merge.",
   roles: ["correctness reviewer", "security reviewer", "test reviewer"],
-  transport: "localterm",
+  transport: "process",
   synthesize: true,
 });
 ```

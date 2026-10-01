@@ -209,7 +209,6 @@ export class ResidentHost {
   actors!: ActorDirectory;
   lifecycle!: LifecycleBroker;
   #lockFd: number | undefined;
-  #fallbackLock = false;
   readonly #ownerPath: string;
   readonly #lockPath: string;
   readonly #errorPath: string;
@@ -468,6 +467,7 @@ export class ResidentHost {
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
         token: this.#token,
+        ...(process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ? { launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN } : {}),
         startedAt: now,
         readyAt: now,
         commands: RESIDENT_COMMANDS,
@@ -958,37 +958,60 @@ export class ResidentHost {
 
   async #acquireLock(): Promise<void> {
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
-    if (process.platform === "linux") {
-      try { this.#lockFd = await lockFile(this.#lockPath, 0, true); }
-      catch (error) {
-        if (error instanceof FileLockBusy) throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
-        throw error; // Never weaken Linux ownership when util-linux is missing/broken.
-      }
-    } else {
-      // ponytail: without Linux flock/setpriv, retain PID + start-time staleness.
-      // Windows durable residency is unsupported; non-Linux identity is #2566.
-      const existing = readJson<ResidentHostOwner>(this.#ownerPath);
-      const locked = readJson<ResidentHostOwner>(this.#lockPath);
-      if ((existing && residentProcessAlive(existing.pid, existing.processStartTime)) ||
-          (locked && residentProcessAlive(locked.pid, locked.processStartTime))) {
-        throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
-      }
-      fs.rmSync(this.#lockPath, { force: true });
-      try { this.#lockFd = fs.openSync(this.#lockPath, "wx", 0o600); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new ResidentHostAlreadyRunning("Fabric resident host is starting");
-        throw error;
-      }
-      this.#fallbackLock = true;
+    // Only an inode we created, or one previously established by this protocol,
+    // is safe to adopt. A dead legacy PID cannot exclude a reclaimer that already
+    // committed to unlinking that inode. Empty/torn legacy startup records prove even less.
+    // Serialize creation through provenance publication. A noncreator must
+    // never acquire host.lock ahead of its creator and strand a fresh root.
+    // This guard is immutable too; arbitrary empty legacy host.lock stays refused.
+    let establishmentFd: number;
+    try {
+      establishmentFd = await lockFile(path.join(this.config.residencyRoot, "host-fence-establish.lock"), 0, process.platform === "linux");
+    } catch (error) {
+      if (error instanceof FileLockBusy) throw new ResidentHostAlreadyRunning("Fabric resident host startup claim is busy");
+      throw error;
     }
-    // A pre-flock host may own these diagnostic records without holding our fence.
-    // Read BEFORE overwriting; unknown birth identity is not authority to displace it.
-    const records = [readJson<ResidentHostOwner>(this.#lockPath), readJson<ResidentHostOwner>(this.#ownerPath)];
-    if (records.some((owner) => owner && owner.pid !== process.pid && residentProcessAlive(owner.pid, owner.processStartTime))) {
-      this.#releaseLock();
-      throw new ResidentHostAlreadyRunning("Fabric resident host is already running (legacy owner)");
+    try { await this.#establishLockInode(); }
+    finally { fs.closeSync(establishmentFd); }
+  }
+
+  /** Called only while holding the immutable first-claim establishment guard. */
+  async #establishLockInode(): Promise<void> {
+    let created: fs.BigIntStats | undefined;
+    try {
+      const fd = fs.openSync(this.#lockPath, fs.constants.O_RDWR | fs.constants.O_CREAT |
+        fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      try { created = fs.fstatSync(fd, { bigint: true }); } finally { fs.closeSync(fd); }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    try { this.#lockFd = await lockFile(this.#lockPath, 0, process.platform === "linux"); }
+    catch (error) {
+      if (error instanceof FileLockBusy) throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
+      throw error; // Missing/broken flock fails closed, including explicit non-Linux starts.
     }
     try {
+      const locked = fs.fstatSync(this.#lockFd, { bigint: true });
+      const current = fs.lstatSync(this.#lockPath, { bigint: true });
+      const sameInode = (stat: { dev: bigint; ino: bigint }): boolean =>
+        stat.dev === locked.dev && stat.ino === locked.ino;
+      if (!sameInode(current)) throw new Error("Fabric resident host startup inode was replaced; verify legacy drain");
+      // Read before overwriting: an unknown birth identity is not permission to displace a live owner.
+      const records = [readJson<ResidentHostOwner>(this.#lockPath), readJson<ResidentHostOwner>(this.#ownerPath)];
+      if (records.some((owner) => owner && owner.pid !== process.pid && residentProcessAlive(owner.pid, owner.processStartTime))) {
+        throw new ResidentHostAlreadyRunning("Fabric resident host is already running (legacy owner)");
+      }
+      const provenancePath = path.join(this.config.residencyRoot, "host-fence.json");
+      const provenance = readJson<{ format: number; dev: string; ino: string }>(provenancePath);
+      const established = provenance?.format === 1 && provenance.dev === String(locked.dev) && provenance.ino === String(locked.ino);
+      if (!established) {
+        if (!created || !sameInode(created) || fs.existsSync(provenancePath) || fs.existsSync(this.#ownerPath)) {
+          throw new Error("Fabric resident host has a legacy or uncertain startup record; verify rollout/rollback drain before removing it");
+        }
+        // Bind provenance to the immutable flock inode, not the mutable PID diagnostic.
+        // After a crash, corrupt diagnostic bytes must not disable kernel-fenced recovery.
+        atomicWrite(provenancePath, { format: 1, dev: String(locked.dev), ino: String(locked.ino) });
+      }
       fs.ftruncateSync(this.#lockFd, 0);
       fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
     } catch (error) { this.#releaseLock(); throw error; }
@@ -996,12 +1019,9 @@ export class ResidentHost {
 
   #releaseLock(): void {
     if (this.#lockFd === undefined) return;
-    // Remove our publication while still holding the fence; never unlink the Linux inode.
+    // Remove our publication while holding the fence; never unlink its inode on any platform.
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (owner?.token === this.#token) fs.rmSync(this.#ownerPath, { force: true });
-    if (this.#fallbackLock && readJson<{ token?: string }>(this.#lockPath)?.token === this.#token) {
-      fs.rmSync(this.#lockPath, { force: true });
-    }
     fs.closeSync(this.#lockFd);
     this.#lockFd = undefined;
   }

@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import {
@@ -721,6 +722,73 @@ export class AgentManager {
     }
   }
 
+  defaultModel(runner: FabricAgentRunner = this.config.runner): string | undefined {
+    return runner === "claude" ? this.config.claude.model
+      : runner === "veda" ? this.config.veda.model : this.config.model;
+  }
+
+  assertModelAllowed(model: string | undefined, runner?: FabricAgentRunner): void {
+    // Veda owns its backend default. With an active deny policy, absence cannot
+    // prove admission; require a selector before queueing or durable dispatch.
+    if (runner === "veda" && !model?.trim() && this.config.deniedModels.length > 0) {
+      const error = new FabricModelDeniedError("veda/<unresolved-backend-default>", this.config.deniedModelReplacement);
+      error.message = "Fabric cannot admit the unresolved Veda backend default; set agents.veda.model or pass an explicit model. " + error.message;
+      throw error;
+    }
+    assertFabricModelAllowed(model, this.config);
+    // Admit the exact backend selector sent by each runner's argv builder too.
+    if (model && runner === "claude") assertFabricModelAllowed(normalizeClaudeModel(model), this.config);
+    if (model && runner === "veda") assertFabricModelAllowed(normalizeVedaModel(model), this.config);
+  }
+
+  /** Resolve the actual backend target without committing a run or binding. */
+  async prepareModelForAdmission(
+    model: string | undefined,
+    runner: FabricAgentRunner,
+    resolvePi?: (model: string) => Promise<string>,
+  ): Promise<string | undefined> {
+    this.assertModelAllowed(model, runner);
+    if (runner === "pi") {
+      const prepared = await this.#prepareModel(model);
+      this.assertModelAllowed(prepared, runner);
+      return prepared;
+    }
+    // Without host policy, preserve backend-owned aliases and defaults verbatim.
+    if (this.config.deniedModels.length === 0) return model;
+    const unresolved = (): never => {
+      const error = new FabricModelDeniedError(`${runner}/<unresolved-backend-model>`, this.config.deniedModelReplacement);
+      error.message = `Fabric cannot establish the ${runner} backend model under the active host policy; select a known concrete model. ` + error.message;
+      throw error;
+    };
+    let prepared: string;
+    try {
+      if (runner === "veda") {
+        const selector = model ? normalizeVedaModel(model) : "";
+        // Only Pi's registry can establish this backend's concrete provider/model.
+        // Do not reinterpret Veda aliases, bare IDs, other backends or fuzzy misses.
+        const prepare = resolvePi ?? this.#preparePiModel;
+        if (this.config.veda.backend !== "pi" || !/^[^\s/]+\/[^\s]+$/.test(selector) || !prepare) return unresolved();
+        const resolved = await prepare(selector);
+        if (typeof resolved !== "string" || resolved.trim().toLowerCase() !== selector.toLowerCase()) return unresolved();
+        prepared = resolved.trim();
+      } else {
+        const selector = model ? normalizeClaudeModel(model) : "default";
+        const catalog = await this.claudeModels();
+        const selected = catalog.find(entry => normalizeClaudeModel(entry.value) === selector || normalizeClaudeModel(entry.resolvedModel) === selector);
+        if (!selected?.resolvedModel || selected.resolvedModelKnown === false) return unresolved();
+        this.assertModelAllowed(selected.resolvedModel, runner);
+        prepared = normalizeClaudeModel(selected.resolvedModel);
+        // The native catalog names Claude IDs; host policies can name their Pi key.
+        assertFabricModelAllowed(`anthropic/${prepared}`, this.config);
+      }
+    } catch (error) {
+      if (error instanceof FabricModelDeniedError) throw error;
+      return unresolved();
+    }
+    this.assertModelAllowed(prepared, runner);
+    return prepared;
+  }
+
   async #prepareModel(model: string | undefined): Promise<string | undefined> {
     if (!this.#preparePiModel) return model;
     const key = model?.trim() || "<session-default>";
@@ -873,15 +941,12 @@ export class AgentManager {
     const tools = this.#childTools(request, runner, requiresFabricKernel);
     if (runner === "claude") mapClaudeTools(tools);
     if (runner === "veda") mapVedaTools(tools);
-    let model =
-      request.model ??
-      (runner === "claude"
-        ? this.config.claude.model
-        : runner === "veda"
-          ? this.config.veda.model
-          : this.config.model);
-    if (runner === "claude" && model) normalizeClaudeModel(model);
-    if (runner === "veda" && model) normalizeVedaModel(model);
+    let model = request.model?.trim() || this.defaultModel(runner);
+    this.assertModelAllowed(model, runner);
+    // Alternate backend targets must be known before even accepting a queue receipt.
+    if (runner !== "pi" && this.config.deniedModels.length > 0) {
+      model = await this.prepareModelForAdmission(model, runner);
+    }
     if (this.#budget) {
       const spent = readBudgetLedger(this.#budget.file).cost;
       if (spent >= this.#budget.budget) {
@@ -907,7 +972,7 @@ export class AgentManager {
     };
     const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
       try {
-        if (runner === "pi") model = await this.#prepareModel(model);
+        model = await this.prepareModelForAdmission(model, runner);
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();

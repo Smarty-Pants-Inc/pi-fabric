@@ -98,6 +98,21 @@ return results.map(result => result.status === "fulfilled"
   : { ok: false, error: String(result.reason) });
 ```
 
+### Parent inheritance and fleet model policy
+
+Without an explicit `model`, Pi children and live actors inherit the spawning run's **actual admitted model and thinking**, ahead of `agents.model` / `agents.thinking`. This includes actor/task parents, not just Main. Explicit model/effort choices still win; a different runner does not inherit a Pi model. Global actor templates retain deferred inheritance until import.
+
+The trusted host's `<agentDir>/fabric.json` can set:
+
+```json
+{ "agents": {
+  "deniedModels": ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"],
+  "deniedModelReplacement": "cliproxyapi/gpt-6.1-sol"
+} }
+```
+
+These policy keys are ignored in project/workspace `.pi/fabric.json`, even in trusted projects. The default deny-list is empty. Fabric checks requested selectors and canonical selections case-insensitively, including aliases, inherited models and defaults, before spawn/create or model-setter mutation. A denial raises `FabricModelDeniedError` (`code: "FABRIC_MODEL_DENIED"`), names #2236 and the configured replacement, and never silently falls back to another model. Alternate runners also admit the backend selector produced by their argv normalizer (including `veda/`, `claude/` and `anthropic/` routing forms). Under active policy, Claude aliases must have an allowed native CLI catalog `resolvedModel` (checked as both a runtime ID and `anthropic/<id>`); Veda requires backend `pi` and an exact concrete `provider/model` resolved by the Pi registry. Unknown targets, Veda aliases/bare IDs/defaults and other Veda backends fail closed with the same typed refusal before queueing or durable submission. Allowed canonical targets, not unresolved selectors, are forwarded to workers. In-place Prewalk checks policy at manual/automatic arm and again before switching Main, and denied binding clears preserve the old binding when the actual owning-session fallback is denied. The fixed refusal code is preserved in public TypeScript guest catches; arbitrary host error properties are not transferred. Deploy the host policy to enforce the fleet list; rebuilding does not retroactively change existing workers or resident owners. See the [public-path CLI proof and installation-only owner gate](model-policy-acceptance.md).
+
 ### Requested models are authoritative
 
 For Pi workers, Fabric reapplies the resolved `provider/model` over RPC **after startup extensions finish**, reapplies the requested thinking level, and independently reads `get_state` before sending the task. A successful `set_model` response alone is insufficient: it can echo the requested model even when an extension switches away during `model_select`. Thinking is reported at Pi's effective, capability-clamped level.
@@ -334,7 +349,7 @@ return agents.run({
 });
 ```
 
-Fabric forwards Veda model values unchanged to the selected backend. Use `agents.veda.model` to set a backend-specific default. An explicit `agents.run({ model })` value has priority. If you omit both values, Veda selects its own backend default. Personas do not depend on models. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
+With no active host policy, Fabric forwards Veda model values unchanged to the selected backend. Use `agents.veda.model` to set a backend-specific default. An explicit `agents.run({ model })` value has priority. If you omit both values and the host deny-list is empty, Veda selects its own backend default. Under an active host deny policy, Fabric refuses unknown defaults, aliases and bare selectors before queueing or durable submission; select `agents.veda.backend: "pi"` and configure `agents.veda.model` or pass an exact allowed `provider/model` present in the Pi registry. Other Veda backends are refused because their actual target cannot be established. The admitted concrete selection is forwarded to Veda. Personas do not depend on models. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
 
 For each run, Fabric passes `--tools <allowlist>`. It passes `--no-tools` for an empty allowlist. This setting has priority over tool frontmatter in the persona. The built-in read-only personas specify `tools: none`. The `worker` persona specifies `tools: all` with `sandbox: workspace-write`. Fabric does not pass `--sandbox`, so persona frontmatter defines the sandbox, and `worker` agents can change files. The `navigator-plan` persona also requires a `<program>` design block, and `worker` requires a `<worker_report>`. A failure in either protocol appears as a run error, so `navigator-chat` is the default for free-form tasks.
 

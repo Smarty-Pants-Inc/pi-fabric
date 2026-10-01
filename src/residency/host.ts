@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
 import { resolvePiModel, type PiModelRegistryView } from "../core/model-refresh.js";
 import {
@@ -300,6 +301,7 @@ export class ResidentHost {
         aliases: normalizeModelAliases(state?.aliases),
         defaultModel: state?.defaultModel,
         snapshot,
+        policy: config.agents,
       });
       return `${resolved.provider}/${resolved.id}`;
     };
@@ -909,6 +911,9 @@ export class ResidentHost {
         error: errorMessage(error),
         ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError
           ? { errorCode: error.code } : {}),
+        ...(error instanceof FabricModelDeniedError ? {
+          errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
+        } : {}),
         completedAt: Date.now(),
       };
     }

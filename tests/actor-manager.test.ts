@@ -93,6 +93,89 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("ActorManager fleet model policy (#2490)", () => {
+  it.each(["hook", "predecessor"] as const)("round 3 F4 rechecks the synchronous invocation fence after %s wait", async wait => {
+    const { actors, root, mesh } = setup(true);
+    const abort = new AbortController();
+    let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+    let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+    let remove: ReturnType<typeof vi.spyOn> | undefined;
+    if (wait === "predecessor") {
+      const previous = await actors.create({ name: "fenced", instructions: "Previous." });
+      await actors.stop(previous.id);
+      const original = actors.remove.bind(actors);
+      remove = vi.spyOn(actors, "remove").mockImplementation(async (...args) => { const result = await original(...args); enter(); await held; return result; });
+    }
+    const check = () => abort.signal.throwIfAborted();
+    const pending = actors.create({ name: "fenced", instructions: "Never publish after cancellation.", topics: ["round3.work"] }, {
+      async beforeCommit() { check(); if (wait === "hook") { enter(); await held; } }, checkActive: check,
+    }).catch(error => error);
+    try {
+      await entered; abort.abort(new Error("cancelled admission")); release();
+      expect(await pending).toMatchObject({ message: "cancelled admission" });
+      expect(actors.list().filter(actor => actor.name === "fenced")).toEqual([]);
+      const actorRoot = path.join(root, "actors");
+      expect(fs.existsSync(actorRoot) ? fs.readdirSync(actorRoot, { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== "bindings") : []).toEqual([]);
+      expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 }).filter(event => event.kind === "created")).toHaveLength(wait === "hook" ? 0 : 1);
+      remove?.mockRestore();
+      await expect(actors.create({ name: "fenced", instructions: "Allowed control." }, { checkActive() {} })).resolves.toMatchObject({ name: "fenced" });
+    } finally { release(); await pending; remove?.mockRestore(); }
+  });
+
+  it.each(["session", "project"] as const)("review round A2 refuses %s clear against the owning Pi fallback and preserves both layers", async (scope) => {
+    const denied = "cliproxyapi/gpt-6-astra";
+    const allowed = "cliproxyapi/gpt-6.1-sol";
+    const preparePiModel = vi.fn(async (model: string | undefined) => model ?? denied);
+    const { actors } = setup(false, undefined, undefined, { preparePiModel }, {}, { deniedModels: [denied] });
+    const actor = await actors.create({ name: "fallback", instructions: "Review.", ...(scope === "project" ? { model: allowed } : {}) });
+    if (scope === "session") await actors.setModel(actor.id, allowed, scope);
+    const definition = actors.definition(actor.id);
+    const binding = actors.status(actor.id).binding;
+    await expect(actors.setModel(actor.id, undefined, scope)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(preparePiModel).toHaveBeenCalledWith(undefined);
+    expect(actors.definition(actor.id)).toEqual(definition);
+    expect(actors.status(actor.id).binding).toEqual(binding);
+    expect(actors.status(actor.id).model).toBe(allowed);
+  });
+  it("review round A2 admits a project clear when an allowed session overlay remains", async () => {
+    const { actors } = setup(false, undefined, undefined, { preparePiModel: async () => "cliproxyapi/gpt-6-astra" }, {}, { deniedModels: ["cliproxyapi/gpt-6-astra"] });
+    const actor = await actors.create({ name: "overlay", instructions: "Review.", model: "cliproxyapi/gpt-6.1-sol" });
+    await actors.setModel(actor.id, "provider/session", "session");
+    await actors.setModel(actor.id, undefined, "project");
+    expect(actors.definition(actor.id).model).toBeUndefined();
+    expect(actors.status(actor.id).model).toBe("provider/session");
+  });
+  it("refuses denied aliases in a foreign actor's caller-local session setter", async () => {
+    let owns = true;
+    const { actors } = setup(false, () => owns, undefined, {
+      resolvePiModel: (model) => model === "bad-alias" ? "cliproxyapi/gpt-6-astra" : model,
+    }, {}, { deniedModels: ["cliproxyapi/gpt-6-astra"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" });
+    const actor = await actors.create({ name: "foreign", instructions: "Review.", model: "cliproxyapi/gpt-6.1-sol" });
+    owns = false;
+    await expect(actors.setModel(actor.id, "bad-alias")).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    expect(actors.status(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+  });
+  const denied = "cliproxyapi/gpt-6-astra";
+  const policy = { deniedModels: [denied], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol", model: denied };
+  it("refuses an explicit or default denied actor before registry mutation", async () => {
+    const { actors } = setup(false, undefined, undefined, undefined, {}, policy);
+    for (const model of [denied, undefined]) {
+      await expect(actors.create({ name: "review", instructions: "review", ...(model ? { model } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    }
+    expect(actors.list()).toEqual([]);
+  });
+  it("validates canonical model resolutions and both setter scopes", async () => {
+    const { actors } = setup(false, undefined, undefined, { resolvePiModel: (model) => model === "bad-alias" ? denied : model }, {}, policy);
+    await expect(actors.create({ name: "bad", instructions: "review", model: "bad-alias" })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    const actor = await actors.create({ name: "good", instructions: "review", model: "cliproxyapi/gpt-6.1-sol" });
+    for (const scope of ["session", "project"] as const) {
+      await expect(actors.setModel(actor.id, "bad-alias", scope)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      await expect(actors.setModel(actor.id, " CLIPROXYAPI/GPT-6-ASTRA ", scope)).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+    }
+    expect(actors.definition(actor.id).model).toBe("cliproxyapi/gpt-6.1-sol");
+  });
+});
+
 describe("ActorManager closing ingress", () => {
   it("P2-1 rejects tell while closing rather than accepting memory-only work", async () => {
     const { actors } = setup(true);

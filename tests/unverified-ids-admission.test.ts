@@ -37,14 +37,22 @@ const mainProvider = (main: MainAgentController, hosted: boolean) => hosted
   }), { steer: true, followUp: true }))
   : new AgentsProvider({} as Ports[0], { identity } as Ports[1], {} as Ports[2], main,
     { get: () => undefined } as unknown as Ports[4], undefined, {} as Ports[6]);
-const busyMain = () => {
+const busyMain = (journal?: string) => {
   const sent: string[] = [];
-  const pi = { on: () => () => {}, sendMessage: (message: { content: string }) => sent.push(message.content),
+  const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => void>>();
+  const pi = { on: (name: string, fn: (event: unknown, ctx: ExtensionContext) => void) => {
+    handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+    return () => handlers.set(name, (handlers.get(name) ?? []).filter(handler => handler !== fn));
+  }, sendMessage: (message: { content: string }) => sent.push(message.content),
     getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
   const main = new MainAgentController(pi, "session:main", true, process.cwd(), "main");
-  main.attachFollowUpDrain({ isIdle: () => false, hasPendingMessages: () => false,
-    signal: { aborted: false } } as unknown as ExtensionContext, 120_000);
-  return { main, sent };
+  const context = { isIdle: () => false, hasPendingMessages: () => false,
+    signal: { aborted: false } } as unknown as ExtensionContext;
+  main.attachFollowUpDrain(context, 120_000, journal);
+  const emit = (name: string, event: unknown) => {
+    for (const handler of handlers.get(name) ?? []) handler(event, context);
+  };
+  return { main, sent, emit };
 };
 
 // Round-1 F1: the original text fits the real admission limit, but the marker does not.
@@ -132,7 +140,9 @@ describe("round-1 admission invariance", () => {
   it("drops the marker after an explicit remote Main quota rejection, without duplicate delivery", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "id-remote-admission-"));
     const before = busyMain();
-    const after = busyMain();
+    // Remote control commands require durable delivery ids, hence a real Main journal.
+    const journal = path.join(root, "main-followups.json");
+    const after = busyMain(journal);
     const senderStore = new MeshStore(root, 64 * 1024, 100);
     const ownerIdentity: MeshIdentity = { id: after.main.id, name: "Main", kind: "main" };
     const sender = new FabricControlPlane(senderStore, identity, {
@@ -142,7 +152,9 @@ describe("round-1 admission invariance", () => {
       enabled: true, hostId: "owner-host", pollMs: 10, acknowledgementTimeoutMs: 1_000,
     });
     try {
-      const seed = { from: identity, message: "x".repeat(FOLLOW_UP_LIMITS.senderBytes - Buffer.byteLength(text) - 16), delivery: "followUp" as const };
+      // The remote command's UUID is now journalled and counts against the same byte quota.
+      const deliveryIdBytes = Buffer.byteLength(JSON.stringify("00000000-0000-0000-0000-000000000000"));
+      const seed = { from: identity, message: "x".repeat(FOLLOW_UP_LIMITS.senderBytes - Buffer.byteLength(text) - deliveryIdBytes - 16), delivery: "followUp" as const };
       before.main.deliverAgent(seed);
       after.main.deliverAgent(seed);
       expect(before.main.deliverAgent({ from: identity, message: text, delivery: "followUp" })).toMatchObject({ queued: true });
@@ -160,6 +172,8 @@ describe("round-1 admission invariance", () => {
       const commands = senderStore.read({ topic: "fabric.control.command" });
       expect(commands).toHaveLength(2);
       expect(commands.map(event => (event.data as { message: string }).message)).toEqual([`${text}\n\n${notice}`, text]);
+      expect(fs.existsSync(journal)).toBe(true);
+      after.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
       after.main.closeFollowUpDrain();
       expect(after.sent.join("\n")).toContain(text);
       expect(after.sent.join("\n")).not.toContain(notice);

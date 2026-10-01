@@ -198,6 +198,7 @@ describe.each([
 describe("round-3 provenance at the capable Pi API boundary", () => {
   it.each(["steer", "followUp"] as const)("old-bridge control %s has no recorded method and sends no claim", async delivery => {
     const h = mainFixture();
+    h.main.attachFollowUpDrain(h.context, 0, path.join(h.dir, "main-followups.json"));
     const router = new AgentMessageRouter({} as any, { identity: host } as any, h.main, { get: () => undefined } as any, undefined, binding => binding);
     const control = new FabricControlPlane(h.mesh, host, { enabled: true, hostId: "receiver", pollMs: 20, acknowledgementTimeoutMs: 5_000 });
     cleanups.push(() => control.close());
@@ -211,6 +212,7 @@ describe("round-3 provenance at the capable Pi API boundary", () => {
 
   it("recorded bridge control without an identity marker stays remote/bridge", async () => {
     const h = mainFixture();
+    h.main.attachFollowUpDrain(h.context, 0, path.join(h.dir, "main-followups.json"));
     const router = new AgentMessageRouter({} as any, { identity: host } as any, h.main, { get: () => undefined } as any, undefined, binding => binding);
     const control = new FabricControlPlane(h.mesh, host, { enabled: true, hostId: "receiver", pollMs: 20 });
     cleanups.push(() => control.close());

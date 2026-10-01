@@ -196,6 +196,19 @@ describe("resident orphan retention", () => {
 });
 
 describe("resident host ownership", () => {
+  it("publishes the request fence and process birth identity together, then releases ownership", async () => {
+    const { root, config, host } = fixture();
+    const ownerPath = path.join(config.residencyRoot, "owner.json");
+    try {
+      await host.start();
+      const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+      expect(owner).toMatchObject({ requestFence: 1, pid: process.pid, hostId: host.hostId });
+      expect(owner.processStartTime).toBe(processStartTime(process.pid));
+      expect(residentProcessAlive(owner.pid, owner.processStartTime)).toBe(true);
+      await host.close();
+      expect(fs.existsSync(ownerPath)).toBe(false);
+    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
   it("ignores a config release change and continues accepting actor work", async () => {
     const { root, config, host, idle } = fixture();
     const next = path.join(root, "other-package");

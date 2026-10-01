@@ -1,4 +1,4 @@
-import { createMainExecutionCeilingError, isMainExecutionCeilingError, mainExecutionCeilingAbortReason } from "./async-settlement.js";
+import { createMainExecutionCeilingError, isMainExecutionCeilingError, mainExecutionCeilingAbortReason, preserveCancellationOutcome, shareCancellationEffects } from "./async-settlement.js";
 import { ResultConsumption } from "./result-consumption.js";
 import { ExecutionDeadline } from "./runtime/execution-deadline.js";
 import type { Usage } from "@earendil-works/pi-ai";
@@ -56,6 +56,7 @@ import type {
   FabricKernel,
   FabricHostCall,
   FabricKernelRuntime,
+  FabricResidentOutcomeReceipt,
   FabricSandboxResult,
   FabricSandboxTerminationReason,
 } from "./runtime/kernel.js";
@@ -113,6 +114,7 @@ export interface FabricExecutionResult {
   elapsedMs: number;
   typeErrors?: FabricTypeError[];
   error?: string;
+  residentOutcomes?: FabricResidentOutcomeReceipt[];
   handoffRequest?: Record<string, unknown>;
   usage?: Usage;
 }
@@ -584,15 +586,20 @@ export class FabricExecutionService {
     const mainCeilingError = mainCeilingReason?.message ?? "";
     // Share the actual clamp record with the runtime: a lossy runtime-first
     // abort must not erase the host cause, including after a host-call floor.
-    const runtimeDeadline = mainBudget ? new ExecutionDeadline({
+    const runtimeDeadline = new ExecutionDeadline({
       timeoutMs: effectiveTimeoutMs,
-      maximumDeadlineAt: mainBudget.at,
-      maximumDeadlineReason: mainCeilingReason!,
-    }, mainBudget.startedAt) : undefined;
+      ...(mainBudget ? { maximumDeadlineAt: mainBudget.at, maximumDeadlineReason: mainCeilingReason! } : {}),
+    }, mainBudget?.startedAt);
     mainBudget?.scheduleDeadline(() => mainCeiling!.abort(mainCeilingReason), true);
     const programSignal = mainCeiling
-      ? options.signal ? AbortSignal.any([options.signal, mainCeiling.signal]) : mainCeiling.signal
-      : options.signal;
+      ? shareCancellationEffects(options.signal ? AbortSignal.any([options.signal, mainCeiling.signal]) : mainCeiling.signal, options.signal)
+      : options.signal ?? new AbortController().signal;
+    // Own a ledger even without an outer signal; successful resident handles can
+    // still be discarded by a later service finalization/publication deadline.
+    const preserveLateDeadline = (result: FabricSandboxResult): FabricSandboxResult =>
+      result.terminationReason === "completed" && !options.signal?.aborted && runtimeDeadline.reached
+        ? preserveCancellationOutcome({ ...result, ...runtimeDeadline.timeoutResult(result.logs) }, programSignal, true)
+        : result;
     // Observe the original outer signal before a runtime's lossy forwarding.
     // For runtime-first expiry, consult the shared host-owned clamp record,
     // never guest text/name or merely the fact that Main's wall time elapsed.
@@ -624,7 +631,9 @@ export class FabricExecutionService {
           runtimeSignal.addEventListener("abort", forward, { once: true });
           providerSignalCleanups.push(() => runtimeSignal.removeEventListener("abort", forward));
         }
-        combined = AbortSignal.any([programSignal, normalizedRuntime.signal]);
+        // Normalizing the abort cause must not split the invocation's resident
+        // receipt ledger from the runtime's outer cancellation/teardown boundary.
+        combined = shareCancellationEffects(AbortSignal.any([programSignal, normalizedRuntime.signal]), runtimeSignal);
         providerSignals.set(runtimeSignal, combined);
       }
       return combined;
@@ -992,7 +1001,7 @@ export class FabricExecutionService {
         }),
         {
           timeoutMs: effectiveTimeoutMs,
-          ...(runtimeDeadline ? { executionDeadline: runtimeDeadline } : {}),
+          executionDeadline: runtimeDeadline,
           ...(mainDeadlineAt !== undefined ? { maximumDeadlineAt: mainDeadlineAt, maximumDeadlineReason: mainCeilingReason! } : {}),
           cwd: options.context.cwd,
           memoryLimitBytes: this.config.executor.memoryLimitBytes,
@@ -1014,10 +1023,13 @@ export class FabricExecutionService {
       // A runtime-first ceiling carries its opaque cause. A shorter timeout
       // stays ordinary even if its cleanup runs past Main's deadline. Only a
       // completed late value constitutes a new publication-budget violation.
+      sandboxResult = preserveLateDeadline(sandboxResult);
       if (!options.signal?.aborted && ((sandboxResult.terminationReason === "aborted" && mainExecutionCeilingAbortReason(programSignal)) ||
-        isMainExecutionCeilingError(sandboxResult.deadlineReason) ||
-        (sandboxResult.terminationReason === "completed" && mainBudget?.reached))) {
-        sandboxResult = { ...sandboxResult, value: undefined, terminationReason: "timed_out", error: mainCeilingError };
+        isMainExecutionCeilingError(sandboxResult.deadlineReason))) {
+        sandboxResult = preserveCancellationOutcome({ ...sandboxResult, value: undefined, terminationReason: "timed_out" }, programSignal, true);
+        // Settlement may reuse a cached resident error from an earlier abort.
+        // Attach the host-owned ceiling cause AFTER settlement so it survives.
+        sandboxResult.error = sandboxResult.residentOutcomes?.length ? `${mainCeilingError}\n${sandboxResult.error ?? ""}` : mainCeilingError;
       }
       if (executionOutcomeFromTermination(sandboxResult.terminationReason) === "succeeded") invocationOutcome = "succeeded";
     } catch (error) {
@@ -1046,8 +1058,9 @@ export class FabricExecutionService {
     const sanitizedLogs = sandboxResult.logs.map(sanitizeFabricMediaText);
     // Cleanup and final media/log serialization also consume the absolute budget.
     // Reject before announcing success or attaching model-visible media.
-    if (sandboxResult.terminationReason === "completed" && !options.signal?.aborted && mainBudget?.reached) {
-      sandboxResult = { ...sandboxResult, value: undefined, terminationReason: "timed_out", error: mainCeilingError };
+    const finalizedResult = preserveLateDeadline(sandboxResult);
+    if (finalizedResult !== sandboxResult) {
+      sandboxResult = finalizedResult;
       sanitizedValue = sanitizeFabricMediaValue(undefined);
     }
     const runOutcome = executionOutcomeFromTermination(sandboxResult.terminationReason);
@@ -1066,6 +1079,7 @@ export class FabricExecutionService {
       trace: traceRecorder.seal(runOutcome, phases),
       elapsedMs: performance.now() - startedAt,
       ...(sandboxResult.error ? { error: sanitizeFabricMediaText(sandboxResult.error) } : {}),
+      ...(sandboxResult.residentOutcomes ? { residentOutcomes: sandboxResult.residentOutcomes } : {}),
       ...(handoffRequest ? { handoffRequest } : {}),
       ...(classifierUsages.length > 0
         ? { usage: aggregateUsage(classifierUsages) }

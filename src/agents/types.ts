@@ -1,3 +1,4 @@
+import type { ModelRouteDecision } from "./model-route.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
   SessionEntry,
@@ -41,6 +42,8 @@ export interface AgentSessionSeed {
 }
 
 export interface AgentRunRequest {
+  /** Host-created shadow decision; never accepted from external argument normalization. */
+  routeDecision?: ModelRouteDecision;
   task: string;
   images?: ImageContent[];
   name?: string;
@@ -119,6 +122,9 @@ export interface AgentCompactionStatus {
 export interface AgentRunRecord {
   /** Requested launch model; model below follows verified state/assistant attribution. */
   requestedModel?: string;
+  /** Shadow-route children: model/effort verified at the pre-prompt admission boundary. */
+  admittedModel?: string;
+  admittedThinking?: FabricThinking;
   id: string;
   name: string;
   task: string;
@@ -231,6 +237,7 @@ export interface AgentWorkerOptions {
   nice?: number;
   bashTimeoutSeconds?: number;
   fabricExtensionPath?: string;
+  routeHeader?: string;
   model?: string;
   thinking?: string;
   systemPrompt?: string;

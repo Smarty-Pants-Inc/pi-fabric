@@ -283,6 +283,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   lostContact?: string;
   model?: string;
   thinking?: AgentRunRequest["thinking"];
+  routeOutcome?: (result: AgentRunResult) => void;
   actorId?: string;
   actorName?: string;
   capabilityRequirements?: string[];
@@ -306,6 +307,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
 }
 
 interface QueuedAgent {
+  routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
   cleanupPending?: string;
   info: AgentHandleInfo;
@@ -526,6 +528,8 @@ const failedRecord = (
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     ...(managed.model ? { model: managed.model } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),
+    ...(managed.latestRecord?.admittedModel ? { admittedModel: managed.latestRecord.admittedModel } : {}),
+    ...(managed.latestRecord?.admittedThinking ? { admittedThinking: managed.latestRecord.admittedThinking } : {}),
     ...(managed.actorId ? { actorId: managed.actorId } : {}),
     ...(managed.actorName ? { actorName: managed.actorName } : {}),
     ...(managed.runnerSessionId ? { runnerSessionId: managed.runnerSessionId } : {}),
@@ -822,6 +826,12 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    if (request.model === "auto") throw new Error('Unresolved model: "auto" must go through agents.spawn routing');
+    if (request.routeDecision && ((request.runner ?? this.config.runner) !== "pi" ||
+      (request.transport ?? this.config.transport) !== "process" || (request.residency ?? "session") !== "session" ||
+      request.actorId || request.actorName || request.sessionSeed || request.sessionFile)) {
+      throw new Error("Shadow routing is only supported for new process/Pi task sessions");
+    }
     const kernel = this.resolveKernel({
       ...request,
       ...(request.recursive === true ? { extensions: true } : {}),
@@ -869,7 +879,7 @@ export class AgentManager {
     if (runner === "claude") mapClaudeTools(tools);
     if (runner === "veda") mapVedaTools(tools);
     let model =
-      request.model ??
+      request.routeDecision?.pin.model ?? request.model ??
       (runner === "claude"
         ? this.config.claude.model
         : runner === "veda"
@@ -900,9 +910,15 @@ export class AgentManager {
         throw new Error("Agent activation no longer authorized");
       }
     };
+    let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
+    if (request.routeDecision) {
+      const { prepareRouteDispatch } = await import("./model-route.js");
+      routeDispatch = prepareRouteDispatch(request.routeDecision, selectedCwd, path.join(this.#runRoot, id), id);
+    }
     const start = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
       try {
         if (runner === "pi") model = await this.#prepareModel(model);
+        if (request.routeDecision && model !== request.routeDecision.pin.model) throw new Error("Shadow route pin changed during model preparation");
         if (this.#closing) throw new Error("Fabric agent manager is closing");
         if (signal?.aborted) throw new Error("Agent launch aborted");
         assertAuthorized();
@@ -910,6 +926,7 @@ export class AgentManager {
         // Activation authority and durable request commit are independent obligations.
         beforeCommit?.(id);
       } catch (error) {
+        try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
         release();
         throw error;
       }
@@ -968,13 +985,13 @@ export class AgentManager {
               request.handoffCompact,
               request.handoffCompact ? await this.#resolveHandoffCompactionBudget?.(model, agentCwd) : undefined,
             )
-          : request.sessionFile;
+          : routeDispatch?.sessionFile ?? request.sessionFile;
         const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
         const timeoutMs = effectiveAgentTimeoutMs(
           this.config.timeoutMs,
           request.timeoutMs,
         );
-        const thinking = request.thinking ?? this.config.thinking;
+        const thinking = request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking;
         const nice = effectiveAgentNice(this.config.nice ?? 0, request.nice);
         const recursive = runner === "pi" && request.recursive === true;
         const extensions = recursive ? true : (request.extensions ?? this.config.extensions);
@@ -1053,6 +1070,7 @@ export class AgentManager {
             : []),
           ...(model ? ["--model", model] : []),
           ...(thinking ? ["--thinking", thinking] : []),
+          ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
           ...(sessionFile ? ["--session-file", sessionFile] : []),
           ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
@@ -1146,6 +1164,7 @@ export class AgentManager {
           abortHandler: undefined,
           ...(model ? { model } : {}),
           ...(thinking ? { thinking } : {}),
+          ...(routeDispatch ? { routeOutcome: routeDispatch.outcome } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
           ...(request.capabilityRequirements
@@ -1196,24 +1215,31 @@ export class AgentManager {
           } catch { /* best effort: the worktree is kept either way */ }
           throw error;
         }
+        try { routeDispatch?.outcome({ status: "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
         if (worktree) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
     };
-    const release = this.#semaphore.tryAcquire("native", admissionSignal);
+    let release: (() => void) | undefined;
+    try { release = this.#semaphore.tryAcquire("native", admissionSignal); }
+    catch (error) {
+      try { routeDispatch?.outcome({ status: admissionSignal.aborted ? "stopped" : "failed" }); } catch { /* storage does not block cancellation */ }
+      throw error;
+    }
     if (release) return start(release).catch((error) => { release(); throw error; });
     return this.#enqueue({
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
-      ...(request.thinking ?? this.config.thinking ? { thinking: request.thinking ?? this.config.thinking } : {}),
+      ...(request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking
+        ? { thinking: request.routeDecision?.pin.effort ?? request.thinking ?? this.config.thinking } : {}),
       ...(request.actorId ? { actorId: request.actorId } : {}),
       ...(request.actorName ? { actorName: request.actorName } : {}),
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start, authorize ? callerSignal : undefined);
+    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome);
   }
 
   #enqueue(
@@ -1221,6 +1247,7 @@ export class AgentManager {
     task: string,
     start: (release: () => void, signal: AbortSignal) => Promise<AgentHandleInfo>,
     ownerSignal?: AbortSignal,
+    routeOutcome?: (result: AgentRunResult) => void,
   ): AgentHandleInfo {
     const abort = new AbortController();
     // Guest receipts belong to the session, not a program deadline. Host-owned
@@ -1228,7 +1255,7 @@ export class AgentManager {
     const signal = AbortSignal.any([abort.signal, this.#closeAbort.signal, ...(ownerSignal ? [ownerSignal] : [])]);
     let resolve!: (result: AgentRunResult) => void;
     const result = new Promise<AgentRunResult>((done) => { resolve = done; });
-    const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false };
+    const queued: QueuedAgent = { info, task, enqueuedAt: Date.now(), abort, result, resolve, background: false, ...(routeOutcome ? { routeOutcome } : {}) };
     this.#queued.set(info.id, queued);
     const admission = this.#semaphore.acquire("native", signal);
     const pending = (async () => {
@@ -1267,6 +1294,7 @@ export class AgentManager {
     queued.resolve(record);
     this.#emitLifecycle(queued.info, `run.${status}`, now, { status });
     this.#invalidateUiList();
+    try { queued.routeOutcome?.(record); } catch { /* routing storage never blocks terminal notification */ }
     try { this.#onSettled?.(record); } catch { /* must not break settlement */ }
     this.#notifyQueuedComplete(queued);
   }
@@ -2250,6 +2278,7 @@ export class AgentManager {
 
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     try {
+      managed.routeOutcome?.(result);
       this.#onSettled?.(result);
       delete managed.settlementSaveFailure;
       return true;

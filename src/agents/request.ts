@@ -14,6 +14,7 @@ export const normalizeAgentRunRequest = (
   defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; timeoutMs: number; inheritedModel?: {provider: string; id: string}; models?: {aliases?: FabricModelAliases}},
   options: {allowCwd?: boolean} = {},
 ): AgentRunRequest => {
+  if (args.model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
   const transport =
     args.transport === "auto" ||
     args.transport === "process" ||

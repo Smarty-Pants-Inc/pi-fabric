@@ -900,6 +900,7 @@ export class FabricRuntimeState {
     );
     this.#agents.subscribeUi(() => this.#participants?.scheduleRefresh());
     this.#actors.subscribe(() => this.#participants?.scheduleRefresh());
+    let routeClient: import("./jev/client.js").JevClient | undefined;
     const agentsProvider = new AgentsProvider(
       this.#agents,
       this.#actors,
@@ -912,6 +913,10 @@ export class FabricRuntimeState {
       this.#residency,
       false,
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
+      (request, signal) => {
+        if (!routeClient) throw new Error("Jev routing unavailable");
+        return routeClient.evaluate(request, signal);
+      },
     );
     this.#agentsProvider = agentsProvider;
     this.#control.start((command, from, signal, verification) =>
@@ -972,8 +977,12 @@ export class FabricRuntimeState {
           });
           // A program may pin jev.evaluate itself. Cancel at owner retirement,
           // not only at provider.close(), which waits for those pins to drain.
+          routeClient = provider.client;
           this.#jevPrograms = provider.manager;
-          const stop = () => { observationHost?.close(); provider.manager.stopAll(); };
+          const stop = () => {
+            if (routeClient === provider.client) routeClient = undefined;
+            observationHost?.close(); provider.manager.stopAll();
+          };
           component.signal.addEventListener("abort", stop, { once: true });
           component.defer(async () => {
             component.signal.removeEventListener("abort", stop);

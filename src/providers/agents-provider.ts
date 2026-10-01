@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { RouteEvaluate } from "../agents/model-route.js";
 import { formatAge } from "../residency/protocol.js";
 import { ActorManager, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, resolveProjectAgent } from "../topology/project-identity.js";
@@ -382,6 +383,7 @@ export class AgentsProvider implements FabricProvider {
     readonly residency?: ResidencyClient,
     readonly ownsRuntime = true,
     readonly modelsConfig: () => FabricModelsConfig = () => DEFAULT_FABRIC_CONFIG.models,
+    readonly routeEvaluate: RouteEvaluate = async () => { throw new Error("Jev routing unavailable"); },
   ) {
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
@@ -472,8 +474,41 @@ export class AgentsProvider implements FabricProvider {
     if (runner !== "pi") return args;
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) return args;
+    if (model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
     const resolved = await this.#resolvePiModel(model, context);
     return resolved === model ? args : { ...args, model: resolved };
+  }
+
+  async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
+    if (args.model !== "auto") return runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager);
+    const runner = args.runner ?? this.manager.config.runner;
+    const transport = args.transport ?? this.manager.config.transport;
+    if (runner !== "pi" || transport !== "process" || (args.residency !== undefined && args.residency !== "session") ||
+      args.actorId !== undefined || args.actorName !== undefined) {
+      throw new Error('model: "auto" requires a session-owned process/Pi task, not an actor');
+    }
+    if (typeof args.routeClass !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(args.routeClass)) {
+      throw new Error('model: "auto" requires a bounded routeClass identifier');
+    }
+    const config = this.manager.config.modelRouting;
+    const pinModel = args.pinModel ?? config?.pinModel;
+    const pinThinking = args.pinThinking ?? config?.pinThinking;
+    if (typeof pinModel !== "string" || !pinModel.trim() || pinModel === "auto" || !isFabricThinking(pinThinking)) {
+      throw new Error('model: "auto" requires explicit pinModel and pinThinking (call or agents.modelRouting role config)');
+    }
+    // Canonicalize only the pin: auto must never fall through to MRU/session/default medium.
+    const resolved = await this.#resolvePiModelArgs({ ...args, model: pinModel, thinking: pinThinking }, context);
+    const pin = { model: resolved.model as string, effort: pinThinking };
+    const candidates = config?.shadowCandidates ?? [];
+    const available = context.extensionContext.modelRegistry.getAvailable();
+    const candidatesValid = candidates.length <= 16 && candidates.every(candidate =>
+      isFabricThinking(candidate.effort) && available.some(model => `${model.provider}/${model.id}` === candidate.model));
+    const { decideModelRoute } = await import("../agents/model-route.js");
+    const routeDecision = await decideModelRoute({ routeClass: args.routeClass, protected: args.protected, pin,
+      candidates, candidatesValid, parentSessionId: context.extensionContext.sessionManager?.getSessionId() ?? this.participants.self().sessionId ?? "unknown" },
+      this.routeEvaluate, context.signal);
+    // PR1 invariant: the choice is recorded, but dispatch ALWAYS uses the role pin.
+    return { ...runRequest(resolved, context, this.manager), routeDecision };
   }
 
   async #resolvePiRunBinding(
@@ -680,7 +715,7 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = runRequest(await this.#resolvePiModelArgs(args, context), context, this.manager);
+        const request = await this.#prepareSpawnRequest(args, context);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
         const durableCwd = request.residency === "durable" && request.cwd !== undefined
@@ -704,7 +739,7 @@ export class AgentsProvider implements FabricProvider {
           name: handle.name,
         });
         context.update(agentStartedMessage(handle));
-        return handle;
+        return request.routeDecision ? { ...handle, routeDecision: request.routeDecision } : handle;
       }
       case "join":
       case "wait": {

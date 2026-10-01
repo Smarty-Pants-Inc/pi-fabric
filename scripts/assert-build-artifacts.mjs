@@ -32,6 +32,7 @@ const stable = [
 const lazy = [
   "lifecycle/reload-target-profile.js",
   "coordination/unverified-ids.js",
+  "agents/model-route.js",
   "agents/claude-cli.js",
   "agents/compact-control.js",
   "agents/result.js",
@@ -67,6 +68,7 @@ const lazy = [
   "worker/activation-window.js",
   "worker/reply-tool.js",
   "guards/actor-bash-hook.js",
+  "guards/model-route-hook.js",
   "worker/options.js",
   "worker/recovery-watchdog.js",
   "worker/run-log.js",
@@ -166,6 +168,9 @@ const actorBashHookFiles = staticClosure([join(dist, "guards/actor-bash-hook.js"
 if (actorBashHookFiles.size !== 1) {
   throw new Error(`Actor bash hook pulls more than its timeout guard: ${[...actorBashHookFiles].join(", ")}`);
 }
+const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
+if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
+if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));
 const lazySource = [...lazyFiles].map((file) => readFileSync(file, "utf8")).join("\n");
 const mandatoryPowerShellFactoryImport =

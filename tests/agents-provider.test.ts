@@ -105,6 +105,7 @@ const setup = (
     identity?: MeshIdentity;
     switchModel?: FabricMainAgentTarget["switchModel"];
     modelsConfig?: FabricModelsConfig;
+    routeEvaluate?: import("../src/agents/model-route.js").RouteEvaluate;
     agentsConfig?: Partial<FabricAgentConfig>;
     workerPath?: string;
     writeStalled?: () => Error | undefined;
@@ -228,6 +229,7 @@ const setup = (
     undefined,
     undefined,
     () => options?.modelsConfig ?? DEFAULT_FABRIC_CONFIG.models,
+    options?.routeEvaluate,
   );
   return {
     root,
@@ -245,6 +247,52 @@ const setup = (
     actorDeliveries,
   };
 };
+
+describe('model: "auto" spawn routing (#2890)', () => {
+  const request = { task: "harmless bounded lookup", model: "auto", routeClass: "bounded-lookup", pinModel: "provider/model-a", pinThinking: "high", protected: false, transport: "process" };
+  it("records shadow choice yet launches the pin and appends actual outcome", async () => {
+    const evaluate = vi.fn(async () => ({ model: "jev", answers: { route: { type: "choice" as const, choice: "candidate-1", confidence: .95, probabilities: { "candidate-0": .05, "candidate-1": .95 } } }, usage: { input_tokens: 1, output_tokens: 1 } }));
+    const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate,
+      agentsConfig: { modelRouting: { shadowCandidates: [{ model: "provider/model-b", effort: "medium" }] } } });
+    const handle = await provider.invoke("spawn", { ...request, cwd: root }, context) as AgentHandleInfo & { routeDecision: { model: string } };
+    expect(handle).toMatchObject({ model: "provider/model-a", thinking: "high", routeDecision: { model: "provider/model-b", effort: "medium", reasonCode: "shadow-choice" } });
+    const result = await agents.wait(handle.id);
+    expect(result).toMatchObject({ status: "completed", model: "provider/model-a", thinking: "high" });
+    const rows = fs.readFileSync(path.join(root, ".pi/fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(rows).toHaveLength(2); expect(rows[1].decisionId).toBe(rows[0].decisionId);
+    expect(evaluate).toHaveBeenCalledTimes(1);
+  });
+  it.each([true, undefined])("excludes protected/unknown before Jev at the public API: %s", async protectedFlag => {
+    const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
+    const { root, provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const args = { ...request, cwd: root }; if (protectedFlag === undefined) delete (args as { protected?: boolean }).protected; else args.protected = protectedFlag;
+    const handle = await provider.invoke("spawn", args, context) as AgentHandleInfo;
+    await agents.wait(handle.id);
+    expect(evaluate).not.toHaveBeenCalled(); expect(handle.model).toBe(request.pinModel);
+  });
+  it("accepts explicit role-config pins, not inherited/default model or medium effort", async () => {
+    const { root, provider, agents } = setup([], [], undefined, { agentsConfig: { modelRouting: { pinModel: request.pinModel, pinThinking: "high" } } });
+    const { pinModel: _model, pinThinking: _effort, ...args } = request;
+    const handle = await provider.invoke("spawn", { ...args, cwd: root }, context) as AgentHandleInfo;
+    expect(await agents.wait(handle.id)).toMatchObject({ model: request.pinModel, thinking: "high" });
+  });
+  it.each([{ pinModel: undefined }, { pinThinking: undefined }, { runner: "claude" }, { transport: "tmux" }, { residency: "durable" }, { routeClass: "bad/header" }])("rejects unsupported/missing inputs without dispatch: %j", async override => {
+    const { provider, agents } = setup(); const spawn = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke("spawn", { ...request, ...override }, context)).rejects.toThrow();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it.each(["run", "handoff", "create"])("never resolves auto as a fuzzy model outside spawn: %s", async action => {
+    const { provider, agents } = setup(); const spawn = vi.spyOn(agents, "spawn");
+    await expect(provider.invoke(action, { task: "lookup", name: "not-auto", instructions: "lookup", model: "auto" }, context)).rejects.toThrow();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it("leaves explicit model calls unchanged and never asks Jev", async () => {
+    const evaluate = vi.fn(async () => { throw new Error("must not evaluate"); });
+    const { provider, agents } = setup([], [], undefined, { routeEvaluate: evaluate });
+    const handle = await provider.invoke("spawn", { task: "lookup", model: request.pinModel, thinking: "high", transport: "process" }, context) as AgentHandleInfo;
+    expect(await agents.wait(handle.id)).toMatchObject({ model: request.pinModel, thinking: "high" }); expect(evaluate).not.toHaveBeenCalled();
+  });
+});
 
 describe("queued spawn handles (#2576)", () => {
   const fixture = (maxConcurrent = 2, maxPerExecution = 10) => {

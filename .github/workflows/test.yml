@@ -11,18 +11,37 @@ permissions:
 
 jobs:
   check:
+    name: ${{ matrix.name }}
+    # Forge disposable VMs have 2 vCPU / 8 GB; the shared pool caps at 7 VMs.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - name: check (ubuntu-latest)
+            runner: smarty-linux-x64
+          - name: check (windows-latest)
+            # hosted-exception: pending Paul's decision on smarty-dev#1246
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
     steps:
+      - name: Install Forge base prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl git unzip
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with:
           # The affected-test selection diffs the push range or the pull-request
           # base, so that base commit has to be present in history.
           fetch-depth: 0
+      - name: Reject unapproved hosted runners
+        shell: bash
+        run: bash scripts/ci/no-hosted-runners.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - uses: oven-sh/setup-bun@v2
       - name: Install runtime prerequisites
         # pi's grep tool downloads rg on first use when it is absent; on shared

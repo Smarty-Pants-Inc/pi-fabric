@@ -115,7 +115,7 @@ import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
 import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
-import { installSelfReload, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
+import { installSelfReload, reloadTargetUiHold, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
 
 // Absolute path to the Fabric skills bundled with this extension. Resolved
 // relative to the extension entry so it works both in development (src/) and
@@ -1229,10 +1229,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // Escape's stop-the-world halt of actors or Jev observers (mesh off too); the user's next
     // input lifts it (review/astra on pi-fabric#158, #160).
     halted: () => escapeLatched || state.escapeHalted,
-    // The pinned public Pi UI API cannot query global native/extension dialogs, custom UI or
-    // the external editor. A resource-originated reload MUST fail closed until the host supplies
-    // a supported query covering all of these holds. Fabric's legacy package watch is unchanged.
-    reloadTargetUiHold: () => "unsupported-host:global-dialog/editor-hold-query",
+    // Pi's host-wide hold query covers native/extension dialogs, custom UI and editors.
+    // Old hosts remain fail-closed for resources and retain legacy Fabric-only behavior.
+    reloadTargetUiHold,
   });
 }
 

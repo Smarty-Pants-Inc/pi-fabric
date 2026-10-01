@@ -1,9 +1,66 @@
+import { createRequire } from "node:module";
+import type { parser as PythonParser } from "@lezer/python";
+
+const require = createRequire(import.meta.url);
+let pythonParser: typeof PythonParser | undefined;
+
+/** Wrap calls, not textual references: this preserves aliases, nested calls,
+ * gather concurrency, f-string expressions and user traceback line numbers.
+ * Ordinary Python functions retain their synchronous/async behavior. Load the
+ * optional parser only for an actual Monty execution, never at registration. */
+function wrapMontyCalls(code: string): string {
+  pythonParser ??= (require("@lezer/python") as typeof import("@lezer/python")).parser;
+  const edits: { at: number; text: string; order: number }[] = [];
+  const cursor = pythonParser.parse(code).cursor();
+  let order = 0;
+  do {
+    if (cursor.name !== "CallExpression") continue;
+    const node = cursor.node;
+    const args = node.lastChild;
+    if (args?.name !== "ArgList" || code[args.from] !== "(") continue;
+    edits.push({ at: node.from, text: "__fabric_result(", order: order++ });
+    edits.push({ at: node.to, text: ")", order: order++ });
+  } while (cursor.next());
+  // Stream insertions from one source snapshot: linear copying, even for
+  // programs with many nested calls. No insertion adds/removes a source line.
+  edits.sort((a, b) => a.at - b.at || a.order - b.order);
+  const output: string[] = [];
+  let copied = 0;
+  for (const edit of edits) {
+    output.push(code.slice(copied, edit.at), edit.text);
+    copied = edit.at;
+  }
+  output.push(code.slice(copied));
+  return output.join("");
+}
+
 interface Token { text: string; string?: boolean }
 interface PreparedSource { source: string; lines: string[] }
 
 // Validate before native conversion: Monty otherwise renders recursive containers
 // as strings such as "[...]", losing the evidence needed for host-side rejection.
 export const MONTY_BOOTSTRAP_SOURCE = `import asyncio
+
+async def __fabric_coroutine_probe():
+    return None
+
+__fabric_coroutine_kind = type(__fabric_coroutine_probe())
+
+def __fabric_result(value):
+    if type(value) is __fabric_coroutine_kind:
+        return __fabric_admit(value)
+    return value
+
+async def __fabric_admit(pending):
+    response = await pending
+    # Ordinary Python coroutines also pass here. The execution-specific marker
+    # distinguishes transport envelopes from arbitrary JSON-shaped user data.
+    if type(response) is dict and response.get("__fabric_response_token") == __fabric_response_token:
+        # This code runs in the separate native guest, after it has admitted the
+        # returned future. A host callback return or native write cannot run it.
+        __fabric_transport.response_ack(id=response["id"], responseId=response["responseId"])
+        return response["value"]
+    return response
 
 def __fabric_validate(value, active, depth):
     if depth > 48:
@@ -154,6 +211,7 @@ export function prepareMontySource(code: string, payloads: Record<string, string
   }
   if (missing.size) throw new Error("Pre-execution check: missing payloads " + [...missing].sort().join(", ") + "; pass these keys in fabric_exec.payloads");
   const lines = code.split("\n");
+  code = wrapMontyCalls(code);
   const indented = lines.map((_, index) => !stringContinuations.has(index));
   const body = code.split("\n").map((text, index) => (indented[index] ? "    " : "") + text).join("\n");
   // A trailing pass permits empty/comment-only bodies without shifting user lines.

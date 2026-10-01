@@ -18,6 +18,7 @@ import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 
 const text = "head fedc9876";
 const notice = "unverified ids: fedc9876";
+const omittedNotice = `${notice} (recipient marker omitted: message at the route size limit)`;
 const identity: MeshIdentity = { id: "session:sender", name: "Sender", kind: "main" };
 const session = (read = false) => {
   const manager = SessionManager.inMemory(process.cwd());
@@ -36,14 +37,22 @@ const mainProvider = (main: MainAgentController, hosted: boolean) => hosted
   }), { steer: true, followUp: true }))
   : new AgentsProvider({} as Ports[0], { identity } as Ports[1], {} as Ports[2], main,
     { get: () => undefined } as unknown as Ports[4], undefined, {} as Ports[6]);
-const busyMain = () => {
+const busyMain = (journal?: string) => {
   const sent: string[] = [];
-  const pi = { on: () => () => {}, sendMessage: (message: { content: string }) => sent.push(message.content),
+  const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => void>>();
+  const pi = { on: (name: string, fn: (event: unknown, ctx: ExtensionContext) => void) => {
+    handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+    return () => handlers.set(name, (handlers.get(name) ?? []).filter(handler => handler !== fn));
+  }, sendMessage: (message: { content: string }) => sent.push(message.content),
     getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
   const main = new MainAgentController(pi, "session:main", true, process.cwd(), "main");
-  main.attachFollowUpDrain({ isIdle: () => false, hasPendingMessages: () => false,
-    signal: { aborted: false } } as unknown as ExtensionContext, 120_000);
-  return { main, sent };
+  const context = { isIdle: () => false, hasPendingMessages: () => false,
+    signal: { aborted: false } } as unknown as ExtensionContext;
+  main.attachFollowUpDrain(context, 120_000, journal);
+  const emit = (name: string, event: unknown) => {
+    for (const handler of handlers.get(name) ?? []) handler(event, context);
+  };
+  return { main, sent, emit };
 };
 
 // Round-1 F1: the original text fits the real admission limit, but the marker does not.
@@ -59,7 +68,7 @@ describe("round-1 admission invariance", () => {
       expect(before).not.toHaveProperty("notice");
       expect(Buffer.byteLength(JSON.stringify(before))).toBe(262_128);
       const after = await provider.invoke("publish", { topic: "team", text: message }, invocation(session()));
-      expect(after).toMatchObject({ text: message, notice });
+      expect(after).toMatchObject({ text: message, notice: omittedNotice });
       expect(store.read()).toHaveLength(3); // Exactly one persisted event per successful publish.
       expect(store.read().at(-1)?.text).toBe(message);
       await expect(provider.invoke("publish", { topic: "team", text: message + "x".repeat(17) }, invocation(session())))
@@ -85,7 +94,7 @@ describe("round-1 admission invariance", () => {
     } as unknown as Ports[1], {} as Ports[2], { matches: () => false } as unknown as Ports[3],
     { get: () => undefined } as unknown as Ports[4], undefined, {} as Ports[6]);
     expect(await provider.invoke(action, { id: "actor", message, data }, invocation(session(true)))).not.toHaveProperty("notice");
-    expect(await provider.invoke(action, { id: "actor", message, data }, invocation(session()))).toHaveProperty("notice", notice);
+    expect(await provider.invoke(action, { id: "actor", message, data }, invocation(session()))).toHaveProperty("notice", omittedNotice);
     expect(delivered).toEqual([message, message]);
     await expect(provider.invoke(action, { id: "actor", message: message + "x".repeat(17), data }, invocation(session())))
       .rejects.toThrow("Actor message exceeds");
@@ -116,7 +125,7 @@ describe("round-1 admission invariance", () => {
       const base = mainProvider(before.main, hosted);
       const checked = mainProvider(after.main, hosted);
       expect(await base.invoke("followUp", { id: "main", message }, invocation(session(true)))).not.toHaveProperty("notice");
-      expect(await checked.invoke("followUp", { id: "main", message }, invocation(session()))).toHaveProperty("notice", notice);
+      expect(await checked.invoke("followUp", { id: "main", message }, invocation(session()))).toHaveProperty("notice", omittedNotice);
       expect(before.main.queueDepth().pendingFollowUps).toBe(seeded + 1);
       expect(after.main.queueDepth().pendingFollowUps).toBe(seeded + 1);
       after.main.closeFollowUpDrain(); // Inspect the text actually handed to Pi, not just a receipt.
@@ -131,7 +140,9 @@ describe("round-1 admission invariance", () => {
   it("drops the marker after an explicit remote Main quota rejection, without duplicate delivery", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "id-remote-admission-"));
     const before = busyMain();
-    const after = busyMain();
+    // Remote control commands require durable delivery ids, hence a real Main journal.
+    const journal = path.join(root, "main-followups.json");
+    const after = busyMain(journal);
     const senderStore = new MeshStore(root, 64 * 1024, 100);
     const ownerIdentity: MeshIdentity = { id: after.main.id, name: "Main", kind: "main" };
     const sender = new FabricControlPlane(senderStore, identity, {
@@ -141,7 +152,9 @@ describe("round-1 admission invariance", () => {
       enabled: true, hostId: "owner-host", pollMs: 10, acknowledgementTimeoutMs: 1_000,
     });
     try {
-      const seed = { from: identity, message: "x".repeat(FOLLOW_UP_LIMITS.senderBytes - Buffer.byteLength(text) - 16), delivery: "followUp" as const };
+      // The remote command's UUID is now journalled and counts against the same byte quota.
+      const deliveryIdBytes = Buffer.byteLength(JSON.stringify("00000000-0000-0000-0000-000000000000"));
+      const seed = { from: identity, message: "x".repeat(FOLLOW_UP_LIMITS.senderBytes - Buffer.byteLength(text) - deliveryIdBytes - 16), delivery: "followUp" as const };
       before.main.deliverAgent(seed);
       after.main.deliverAgent(seed);
       expect(before.main.deliverAgent({ from: identity, message: text, delivery: "followUp" })).toMatchObject({ queued: true });
@@ -154,11 +167,13 @@ describe("round-1 admission invariance", () => {
       const provider = new AgentsProvider({} as Ports[0], { identity } as Ports[1], {} as Ports[2],
         { matches: () => false } as unknown as Ports[3], { get: () => participant } as unknown as Ports[4], sender, {} as Ports[6]);
       expect(await provider.invoke("followUp", { id: after.main.id, message: text }, invocation(session())))
-        .toMatchObject({ queued: true, acknowledged: true, notice });
+        .toMatchObject({ queued: true, acknowledged: true, notice: omittedNotice });
       expect(after.main.queueDepth().pendingFollowUps).toBe(2); // Seed plus one report, not two reports.
       const commands = senderStore.read({ topic: "fabric.control.command" });
       expect(commands).toHaveLength(2);
       expect(commands.map(event => (event.data as { message: string }).message)).toEqual([`${text}\n\n${notice}`, text]);
+      expect(fs.existsSync(journal)).toBe(true);
+      after.emit("agent_before_settle", { outcome: "completed", context: { pendingMessages: [] } });
       after.main.closeFollowUpDrain();
       expect(after.sent.join("\n")).toContain(text);
       expect(after.sent.join("\n")).not.toContain(notice);

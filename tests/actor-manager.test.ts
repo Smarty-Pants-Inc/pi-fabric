@@ -10,6 +10,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { closeWithActors } from "../src/actors/close-order.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
@@ -41,11 +42,12 @@ const setup = (
     resolvePiModel?: (model: string) => string | Promise<string>;
   },
   meshOverrides: Partial<typeof DEFAULT_FABRIC_CONFIG.mesh> = {},
+  agentOverrides: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {},
 ) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-test-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-  const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...agentOverrides }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     runRoot: path.join(root, "runs"),
     ...(modelValidation?.preparePiModel
@@ -88,6 +90,99 @@ afterEach(async () => {
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("ActorManager closing ingress", () => {
+  it("P2-1 rejects tell while closing rather than accepting memory-only work", async () => {
+    const { actors } = setup(true);
+    const actor = await actors.create({ name: "Closing", instructions: "Wait", runner: "pi" });
+    await actors.close();
+    expect(() => actors.tell(actor.id, "must survive")).toThrow(/closing; retry/);
+  });
+});
+
+describe("queued actor activation revocation (#181 F1)", () => {
+  it.each(["stop", "remove", "halt"] as const)("never launches after %s behind a full permit pool", async (operation) => {
+    const { actors, agents } = setup(false, undefined, undefined, undefined, {}, { maxConcurrent: 1 });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const blocker = await agents.spawn({ task: "HANG", transport: "process" });
+      const actor = await actors.create({ name: "revoked", instructions: "Reply.", responseMode: "text" });
+      actors.tell(actor.id, "activation must not launch");
+      await waitFor(() => agents.list().some((run) => run.actorId === actor.id && run.status === "queued"));
+      const activation = agents.list().find((run) => run.actorId === actor.id)!;
+      let removal: ReturnType<ActorManager["remove"]> | undefined;
+      if (operation === "stop") await actors.stop(actor.id);
+      else if (operation === "remove") removal = actors.remove(actor.id, { wait: false });
+      else expect(actors.haltAll().halted).toBe(1);
+      if (removal) await removal;
+      await agents.stop(blocker.id);
+      await waitFor(() => actors.inFlightCount() === 0, 10_000);
+      expect(launch.mock.calls.map(([request]) => request.id)).toEqual([blocker.id]);
+      expect(launch.mock.calls.some(([request]) => request.id === activation.id)).toBe(false);
+      if (operation === "halt") {
+        actors.dispatchHostEvent("input", { source: "user" });
+        await actors.ask(actor.id, "new activation generation");
+        expect(launch).toHaveBeenCalledTimes(2);
+      }
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each(["stop", "remove", "halt"] as const)("revokes %s inside delayed transport creation before any process starts", async (operation) => {
+    const { actors, agents } = setup(false, undefined, undefined, undefined, {}, { maxConcurrent: 1 });
+    const original = ProcessTransport.prototype.launch;
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const preparing = new Promise<void>((resolve) => { ready = resolve; });
+    const created: string[] = [];
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      if (request.name === "delayed") { ready(); await gate; }
+      const handle = await original.call(this, request);
+      created.push(request.id);
+      return handle;
+    });
+    try {
+      const blocker = await agents.spawn({ task: "HANG", transport: "process" });
+      const actor = await actors.create({ name: "delayed", instructions: "Reply.", responseMode: "text", transport: "process" });
+      actors.tell(actor.id, "must not start during transport delay");
+      await waitFor(() => agents.list().some((run) => run.actorId === actor.id && run.status === "queued"));
+      const activation = agents.list().find((run) => run.actorId === actor.id)!;
+      await agents.stop(blocker.id);
+      await preparing;
+      if (operation === "stop") await actors.stop(actor.id);
+      else if (operation === "remove") await actors.remove(actor.id, { wait: false });
+      else expect(actors.haltAll().halted).toBe(1);
+      release();
+      await waitFor(() => actors.inFlightCount() === 0, 10_000);
+      expect(await agents.wait(activation.id)).toMatchObject({ status: "stopped" });
+      expect(created).toEqual([blocker.id]);
+      expect(launch.mock.calls.find(([request]) => request.id === activation.id)?.[0].signal?.aborted).toBe(true);
+    } finally { release(); await waitFor(() => actors.inFlightCount() === 0, 10_000); launch.mockRestore(); }
+  });
+
+  it("rechecks the activation generation right before launch after model preparation", async () => {
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const preparing = new Promise<void>((resolve) => { ready = resolve; });
+    const { actors, agents } = setup(false, undefined, undefined, {
+      preparePiModel: async (model) => { if (model === "test/actor") { ready(); await gate; } },
+    }, {}, { maxConcurrent: 1 });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const blocker = await agents.spawn({ task: "HANG", transport: "process" });
+      const actor = await actors.create({ name: "preparing", instructions: "Reply.", model: "test/actor", responseMode: "text" });
+      actors.tell(actor.id, "must not launch after preparation");
+      await waitFor(() => agents.list().some((run) => run.actorId === actor.id && run.status === "queued"));
+      await agents.stop(blocker.id);
+      await preparing;
+      await actors.stop(actor.id);
+      release();
+      await waitFor(() => actors.inFlightCount() === 0, 10_000);
+      expect(launch).toHaveBeenCalledTimes(1);
+    } finally { release(); launch.mockRestore(); }
+  });
 });
 
 // smarty-dev#448: presence writes lost on a contended mesh lock left the mesh without a new
@@ -1514,7 +1609,7 @@ describe("ActorManager", () => {
     });
   });
 
-  it("pins a queued activation before later session binding changes", async () => {
+  it("keeps a launched activation pinned across later session binding changes", async () => {
     const { actors, agents } = setup();
     const runSpy = vi.spyOn(agents, "run");
     const actor = await actors.create({
@@ -1527,6 +1622,7 @@ describe("ActorManager", () => {
     await actors.setThinking(actor.id, "low");
 
     const first = actors.ask(actor.id, "first");
+    await waitFor(() => runSpy.mock.calls.length === 1);
     await actors.setModel(actor.id, "provider/session-new");
     await actors.setThinking(actor.id, "high");
     await first;
@@ -1660,6 +1756,7 @@ describe("ActorManager", () => {
     expect(run).toHaveBeenCalledWith(
       expect.objectContaining({ capabilityRequirements: ["agents.followUp"] }),
       expect.any(AbortSignal),
+      expect.any(Function),
       expect.any(Function),
     );
   });
@@ -2959,7 +3056,8 @@ describe("ActorManager", () => {
     expect(log.actorName).toBe("reviewer");
     expect(log.sessionFile).toContain("session.jsonl");
     const sessionRoles = log.session.map(
-      (line) => (line.parsed as { role?: string } | undefined)?.role,
+      (line) => (line.parsed as { message?: { role?: string }; role?: string } | undefined)?.message?.role
+        ?? (line.parsed as { role?: string } | undefined)?.role,
     );
     expect(sessionRoles).toContain("user");
     expect(sessionRoles).toContain("assistant");
@@ -3945,6 +4043,68 @@ describe("ActorManager removal behind an in-flight run", () => {
     });
     return { release, runId };
   };
+  it.each(["acceptance", "unrelated update"])("#169 security S2 syncs the final pending-decision replacement after %s", async (phase) => {
+    const { actors, agents, root } = setup(true);
+    const { release, runId } = hangingRun(agents);
+    const actor = await actors.create({ name: "pending-decision", instructions: "Work." });
+    const other = await actors.create({ name: "unrelated", instructions: "Wait." });
+    actors.tell(actor.id, "go");
+    await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
+    const actorRoot = path.join(root, "actors");
+    const registry = path.join(actorRoot, "actors.json");
+    const descriptors = new Map<number, string>();
+    const syncedFiles = new Set<string>();
+    const replacements: Array<{ pending: boolean; fileSynced: boolean; directories: string[] }> = [];
+    const open = fs.openSync.bind(fs);
+    const sync = fs.fsyncSync.bind(fs);
+    const rename = fs.renameSync.bind(fs);
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      const fd = open(file, flags, mode);
+      descriptors.set(fd, String(file));
+      return fd;
+    });
+    const synced = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      const file = descriptors.get(fd)!;
+      sync(fd);
+      if (file.startsWith(`${registry}.`)) syncedFiles.add(file);
+      else replacements.at(-1)?.directories.push(file);
+    });
+    const renamed = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === registry) {
+        const records = JSON.parse(fs.readFileSync(from, "utf8")).actors as Array<{ removal?: unknown }>;
+        replacements.push({ pending: records.some((record) => !!record.removal),
+          fileSynced: syncedFiles.has(String(from)), directories: [] });
+      }
+      rename(from, to);
+    });
+    try {
+      const accepted = await actors.remove(actor.id, { wait: false }); // Exercise the whole public call, including presence save.
+      expect(accepted).toMatchObject({ removed: true, pending: expect.stringContaining(runId) });
+      if (phase === "unrelated update") {
+        replacements.length = 0;
+        await actors.setNice(other.id, 7);
+      } else {
+        expect(replacements.filter((replacement) => replacement.pending).length).toBeGreaterThanOrEqual(2);
+      }
+      const pending = replacements.filter((replacement) => replacement.pending);
+      expect(pending.length).toBeGreaterThan(0);
+      for (const replacement of pending) {
+        expect(replacement.fileSynced, "every pending-decision replacement needs its own file barrier").toBe(true);
+        if (process.platform !== "win32") {
+          expect(replacement.directories).toContain(actorRoot);
+          expect(replacement.directories).toContain(path.parse(actorRoot).root);
+        }
+      }
+      const saved = JSON.parse(fs.readFileSync(registry, "utf8"));
+      expect(saved.actors.find((record: { id: string }) => record.id === actor.id).removal.runId).toBe(runId);
+      if (phase === "unrelated update") expect(saved.actors.find((record: { id: string }) => record.id === other.id).nice).toBe(7);
+    } finally {
+      renamed.mockRestore(); synced.mockRestore(); opened.mockRestore();
+      release();
+      await actors.removalSettled(actor.id);
+    }
+  });
+
   it.each(process.platform === "win32" ? [1] : [1, 2])("#169 round 3 refuses the pending removal decision at barrier %i", async (barrier) => {
     const { actors, agents, root } = setup(true);
     const { release, runId } = hangingRun(agents);

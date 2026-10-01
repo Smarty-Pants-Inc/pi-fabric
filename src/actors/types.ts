@@ -127,6 +127,12 @@ export interface FabricActorRunBinding {
   thinking?: FabricThinking;
 }
 
+/** Raw per-call fields from the actor's own root; omitted fields stay owner-defaulted. */
+export interface FabricActorBindingProvenance {
+  kind: "owner-defaults";
+  rootId: string;
+}
+
 /** The reading session's own model/thinking overlay; it pins that session's activations. */
 interface FabricActorBindingView extends FabricActorRunBinding {
   scope: "session";
@@ -328,6 +334,8 @@ export interface FabricActorLog {
   session: FabricLogLine[];
   sessionHasMore: boolean;
   sessionBefore?: number;
+  /** Bind sessionBefore using beforeGeneration with type: "session". */
+  sessionGeneration?: string;
   run?: {
     runId: string;
     eventsFile: string;
@@ -335,6 +343,8 @@ export interface FabricActorLog {
     events: FabricLogLine[];
     hasMore: boolean;
     before?: number;
+    /** Bind before using beforeGeneration with type: "run". */
+    generation?: string;
   };
   retainedRuns: string[];
 }

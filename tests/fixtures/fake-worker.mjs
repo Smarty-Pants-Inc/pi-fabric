@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 const args = new Map();
@@ -326,12 +327,26 @@ if (task.includes("HANG_WITH_PROGRESS")) {
       nativePiSession = JSON.parse(first).type === "session";
     } catch {}
   }
-  if (sessionFile && !nativePiSession) {
+  // Actor files now arrive pre-seeded with a native header. Append tree-shaped
+  // messages there, while leaving branched trajectory handoff fixtures untouched.
+  if (sessionFile && (!nativePiSession || path.basename(sessionFile) === "session.jsonl")) {
     fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
     const turns = [
       { role: "user", content: task },
       { role: "assistant", content: text },
     ];
-    fs.appendFileSync(sessionFile, turns.map((turn) => JSON.stringify(turn)).join("\n") + "\n");
+    let parentId = null;
+    if (nativePiSession) {
+      const entries = fs.readFileSync(sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      parentId = entries.filter((entry) => entry.type !== "session").at(-1)?.id ?? null;
+    }
+    const entries = turns.map((turn) => {
+      if (!nativePiSession) return turn;
+      const id = randomUUID().slice(0, 8);
+      const entry = { type: "message", id, parentId, timestamp: new Date().toISOString(), message: { ...turn, timestamp: Date.now() } };
+      parentId = id;
+      return entry;
+    });
+    fs.appendFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
   }
 }

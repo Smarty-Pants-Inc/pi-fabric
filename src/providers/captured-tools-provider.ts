@@ -169,12 +169,19 @@ export class CapturedToolsProvider implements FabricProvider {
     // is captured BEFORE tool_result redaction/recovery (and cwd stays scoped).
     // Tools with prepareArguments use Fabric's wrapper: the registry already
     // prepared the authorized arguments; native dispatch would prepare twice.
-    // On a native host, its live callable set is authoritative even when
-    // shell/prepared-argument adapters need the legacy execution boundary.
-    if (native.executeTool && !native.tools?.some((tool) => tool.name === entry.name)) {
+    // Pi deliberately excludes model-only tools (including tool_search) from
+    // ctx.tools/executeTool even while active. Their captured proxies use the
+    // wrapped boundary, but only for the same live, active definition: absence
+    // from the callable set must never reopen an inactive or withdrawn tool.
+    const modelOnlyAdapter = !!native.executeTool && entry.definition.exposure === "model-only" &&
+      runner.getToolDefinition(entry.name) === entry.definition &&
+      runner.getActiveTools().includes(entry.name);
+    // All other tools, including shell/prepared-argument adapters, remain
+    // subject to the native host's live callable admission.
+    if (native.executeTool && !modelOnlyAdapter && !native.tools?.some((tool) => tool.name === entry.name)) {
       throw new Error(`Captured tool ${entry.name} is unavailable in the native callable tool set`);
     }
-    if (native.executeTool && !isPiShellToolName(entry.name) && !wrappedTool.prepareArguments) {
+    if (native.executeTool && !modelOnlyAdapter && !isPiShellToolName(entry.name) && !wrappedTool.prepareArguments) {
       const activeBefore = runner.getActiveTools();
       const outcome = await native.executeTool(entry.name, args, {
         ...(context.signal ? { signal: context.signal } : {}),

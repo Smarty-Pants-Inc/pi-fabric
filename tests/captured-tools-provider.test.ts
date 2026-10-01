@@ -106,6 +106,43 @@ describe("CapturedToolsProvider", () => {
     expect(runner.emitToolCall).not.toHaveBeenCalled();
   });
 
+  it("adapts an active model-only captured tool without native dispatch", async () => {
+    const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "loaded" }], details: {} }));
+    const definition = defineTool({
+      name: "tool_search", label: "Search", description: "Model-only search fixture",
+      exposure: "model-only", parameters: Type.Object({}), execute,
+    });
+    let active = [definition.name];
+    let liveDefinition: typeof definition | undefined = definition;
+    const runner = {
+      createContext: () => ({ cwd: process.cwd() }), getActiveTools: () => active,
+      getToolDefinition: () => liveDefinition,
+      emit: vi.fn(async () => {}), emitToolCall: vi.fn(async () => undefined), emitToolResult: vi.fn(async () => undefined),
+    } as unknown as ExtensionRunner;
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([{ definition, sourceInfo: createSyntheticSourceInfo("/extensions/tool-search.ts", { source: "test" }) }], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+    const provider = new CapturedToolsProvider(catalog);
+    const nativeExecute = vi.fn(async () => { throw new Error("model-only tools are never native-callable"); });
+    const nativeContext = { ...context, extensionContext: { cwd: process.cwd(), tools: [], executeTool: nativeExecute } as unknown as ExtensionContext };
+    await expect(provider.invoke(definition.name, {}, nativeContext)).resolves.toMatchObject({ text: "loaded", isError: false });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(runner.emitToolCall).toHaveBeenCalledTimes(1);
+    expect(runner.emitToolResult).toHaveBeenCalledTimes(1);
+    expect(nativeExecute).not.toHaveBeenCalled();
+
+    // A stale captured proxy must not override deactivation or withdrawal.
+    active = [];
+    await expect(provider.invoke(definition.name, {}, nativeContext)).rejects.toThrow("unavailable in the native callable tool set");
+    active = [definition.name];
+    liveDefinition = undefined;
+    await expect(provider.invoke(definition.name, {}, nativeContext)).rejects.toThrow("unavailable in the native callable tool set");
+    liveDefinition = { ...definition, exposure: "hidden" };
+    await expect(provider.invoke(definition.name, {}, nativeContext)).rejects.toThrow("unavailable in the native callable tool set");
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(runner.emitToolCall).toHaveBeenCalledTimes(1);
+    expect(nativeExecute).not.toHaveBeenCalled();
+  });
+
   it("prepares, validates, intercepts, and executes a captured tool lazily", async () => {
     const execute = vi.fn(async (_id, params: { value: string }, _signal, onUpdate, ctx) => {
       onUpdate?.({

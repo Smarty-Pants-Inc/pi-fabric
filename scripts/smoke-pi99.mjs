@@ -117,7 +117,10 @@ try {
       await session.prompt("Verify initial loadout.");
       assert.ok(session.getAllTools().some((t) => t.name === "mcp__fixture__echo"), "native MCP connected");
       api.registerTool(fixtureTool("fixture_late"));
-      api.setActiveTools(["read", "fixture_echo", "fixture_late", "codemode", "tool_search", "mcp__fixture__echo", ...(!fullCodeMode && schemaMode !== "enforce" ? ["fabric_exec"] : [])]);
+      // The positive proxy checks below invoke these direct tools. Pi 0.99
+      // makes direct tools callable only while active; adapters must not bypass
+      // that admission for prepared arguments or shells.
+      api.setActiveTools(["read", "bash", "fixture_echo", "fixture_late", "fixture_prepare", "codemode", "tool_search", "mcp__fixture__echo", ...(!fullCodeMode && schemaMode !== "enforce" ? ["fabric_exec"] : [])]);
       await session.prompt("Verify explicit replacement without fabric_exec is repaired.");
       if (fullCodeMode) {
         nextCode = 'const a = await extensions.fixture_echo({value:"rewrite"}); const b = await extensions.fixture_deferred({value:"deferred"}); const c = await extensions.mcp__fixture__echo({value:"native"}); const d = await extensions.tool_search({query:"fixture_deferred"}); return {a,b,c,d};';
@@ -132,6 +135,14 @@ try {
         assert.ok(toolContext.tools.some((t) => t.name === "fixture_echo"));
         assert.ok(events.some((e) => e.toolName === "fixture_echo" && e.parentToolCallId?.startsWith("outer-")));
         assert.ok(result.nestedCalls?.calls?.length >= 3, JSON.stringify(result.nestedCalls));
+        // model-only is an adapter boundary, not an inactive-tool exemption.
+        api.setActiveTools(api.getActiveTools().filter((name) => name !== "tool_search"));
+        nextCode = 'return await extensions.tool_search({query:"fixture_deferred"});';
+        await session.prompt("Inactive model-only captured tools must stay refused.");
+        const inactiveSearch = session.messages.findLast((m) => m.role === "toolResult" && m.toolName === "fabric_exec");
+        assert.equal(inactiveSearch?.isError, true, JSON.stringify(inactiveSearch));
+        assert.match(JSON.stringify(inactiveSearch.content), /unavailable in the native callable tool set/);
+        api.setActiveTools([...api.getActiveTools(), "tool_search"]);
         nextCode = 'return await extensions.fixture_prepare({value:"once"});';
         await session.prompt("Prepare captured arguments once, before approval and execution.");
         assert.equal(preparations, 1);
@@ -200,7 +211,7 @@ try {
   }
   await writeFile(path.join(scratch, "fabric.json"), JSON.stringify({ fullCodeMode: true, approvals: { read: "allow", write: "allow", execute: "allow" }, mcp: { enabled: false }, mesh: { enabled: false }, memory: { enabled: false }, agents: { enabled: false }, entropy: { compile: false }, ui: { enabled: false } }));
   const cli = path.resolve(path.dirname(hostEntry), "..", hostManifest.bin.pi);
-  const cliRun = promisify(execFile)(process.execPath, [cli, "--mode", "json", "--no-session", "--no-extensions", "-e", path.join(root, "dist/index.js"), "-e", path.join(root, "tests/fixtures/pi99-cli-extension.mjs"), "-e", "builtin:codemode", "-e", "builtin:tool-search", "--tools", "read,bash,fabric_exec,codemode,tool_search", "--provider", "offline-cli", "--model", "fixture", "-p", "Offline smoke"], { cwd: scratch, timeout: 30_000, maxBuffer: 4_000_000, env: process.env });
+  const cliRun = promisify(execFile)(process.execPath, [cli, "--mode", "json", "--no-session", "--no-extensions", "-e", path.join(root, "dist/index.js"), "-e", path.join(root, "tests/fixtures/pi99-cli-extension.mjs"), "-e", "builtin:codemode", "-e", "builtin:tool-search", "--tools", "read,bash,fabric_exec,fixture_cli,codemode,tool_search", "--provider", "offline-cli", "--model", "fixture", "-p", "Offline smoke"], { cwd: scratch, timeout: 30_000, maxBuffer: 4_000_000, env: process.env });
   // Print mode reads piped stdin before starting; close it (no fixture input).
   cliRun.child.stdin.end();
   const { stdout, stderr } = await cliRun;

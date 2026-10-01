@@ -5,7 +5,7 @@ import { rootInboxMessage } from "./root-inbox.js";
 
 /** Retained/mixed-version events need positive, recorded admission evidence. */
 const eventProvenance = (event: MeshEvent) => event.verification === "mesh" || event.verification === "bridge"
-  ? fabricTurnProvenance(event.from, "followUp", event.verification) : undefined;
+  ? fabricTurnProvenance(event.from, "followUp", event.verification, event.principal) : undefined;
 
 /** Pi injection stays separate from the mesh inbox's storage and pure message shaping. */
 export const deliverRootInbox = (

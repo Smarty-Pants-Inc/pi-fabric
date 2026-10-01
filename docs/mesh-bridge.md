@@ -10,7 +10,7 @@ existing events and mirrors root presence. There is no new store or protocol.
   `pr.wake`, when the recipient (`to`) is a live root or host native to the other side.
 - Presence: each side's live native hosts and root participants go into the other side's state at
   the same keys, with `remoteHost: <side name>` and the source identity as `updatedBy`. A mirrored
-  lease lasts one source TTL from the local observation, capped at 15 s; it does not end at
+  lease lasts one source TTL from the local observation, capped at 15 s. It does not use
   the source's absolute expiry. File-only heartbeats carry their effective renewal time. Presence
   is normally refreshed every 5 s; a lapsed mirror is refreshed and revalidated once before an
   event is refused. A source that stops renewing can remain mirrored for at most twice its TTL

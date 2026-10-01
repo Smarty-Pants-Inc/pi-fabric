@@ -1,6 +1,15 @@
 // Stable metadata facade. Co-located with host compatibility so eager and lazy consumers
 // share one existing bundle chunk, with no Main journal engine or optional runtime import.
 export {
+  copyFabricProvenance,
+  copyFabricPrincipal,
+  currentFabricPrincipal,
+  snapshotFabricInvocation,
+  invocationFabricPrincipal,
+  principalFromReceipt,
+  registerFabricPrincipalCapture,
+  type FabricPrincipal,
+  type FabricPrincipalAuthorityCheck,
   fabricHostIdentity,
   fabricProvenanceOptions,
   fabricProvenanceSupported,

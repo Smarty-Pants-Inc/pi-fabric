@@ -24,6 +24,26 @@ export type {
 
 type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>;
 
+// Explicit safe contracts, not Error serialization: never bridge stacks, causes, arbitrary
+// properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
+const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
+  FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",
+  FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
+  FABRIC_PROJECT_AGENT_AMBIGUOUS: "FabricProjectAgentAmbiguousError",
+  FABRIC_PROJECT_LEAD_INVALID: "FabricProjectLeadInvalidError",
+});
+const guestFabricErrorMetadata = (error: unknown): Record<string, string | boolean> | undefined => {
+  if (!(error instanceof Error)) return undefined;
+  const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
+  const name = Object.getOwnPropertyDescriptor(error, "name")?.value;
+  if (typeof code !== "string" || !Object.hasOwn(GUEST_FABRIC_ERROR_NAMES, code) || GUEST_FABRIC_ERROR_NAMES[code] !== name) return undefined;
+  const metadata: Record<string, string | boolean> = { name, code };
+  const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
+  if (typeof retryable === "boolean") metadata.retryable = retryable;
+  return metadata;
+};
+
 let quickJsModulePromise: Promise<QuickJsModule> | undefined;
 
 // Static π.<identifier> references (bracket access like π[k] is not provable).
@@ -1069,16 +1089,50 @@ export class QuickJsRuntime {
               const errorHandle = context.newError(
                 error instanceof Error ? error.message : String(error),
               );
-              const exit = reference === "pi.bash" || reference === "pi.powershell"
-                ? piBashExitMetadata(error)
-                : undefined;
-              if (exit) {
-                const metadata = jsonHandle(context, jsonObject, jsonParse, exit);
-                context.setProp(errorHandle, "__fabricBashExit", metadata);
-                metadata.dispose();
+              try {
+                const safeMetadata = guestFabricErrorMetadata(error);
+                // Fabric metadata includes its vetted name. Otherwise transfer only
+                // a host Error's string classification, never arbitrary properties
+                // or a caller-selected property key. Each key is assigned once.
+                const name = safeMetadata?.name ?? (error instanceof Error ? error.name : undefined);
+                if (!safeMetadata && typeof name === "string") {
+                  const nameHandle = context.newString(name);
+                  try {
+                    context.setProp(errorHandle, "name", nameHandle);
+                  } finally {
+                    nameHandle.dispose();
+                  }
+                }
+                if (safeMetadata) {
+                  for (const [key, value] of Object.entries(safeMetadata)) {
+                    if (typeof value === "boolean") {
+                      // Boolean handles are borrowed context constants, not owned.
+                      context.setProp(errorHandle, key, value ? context.true : context.false);
+                    } else {
+                      const metadata = context.newString(value);
+                      try {
+                        context.setProp(errorHandle, key, metadata);
+                      } finally {
+                        metadata.dispose();
+                      }
+                    }
+                  }
+                }
+                const exit = reference === "pi.bash" || reference === "pi.powershell"
+                  ? piBashExitMetadata(error)
+                  : undefined;
+                if (exit) {
+                  const metadata = jsonHandle(context, jsonObject, jsonParse, exit);
+                  try {
+                    context.setProp(errorHandle, "__fabricBashExit", metadata);
+                  } finally {
+                    metadata.dispose();
+                  }
+                }
+                promise.reject(errorHandle);
+              } finally {
+                errorHandle.dispose();
               }
-              promise.reject(errorHandle);
-              errorHandle.dispose();
             })
             .finally(() => {
               if (!closing) pumpJobs();

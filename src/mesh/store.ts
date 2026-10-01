@@ -3,7 +3,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, syncPathNamespace, writeFileAtomic } from "../core/atomic-write.js";
+import { DurableDirectory, readFileRetrying, syncPathNamespace, writeFileAtomic } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
@@ -340,14 +340,14 @@ export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STA
   readState(path.join(root, "state.json"), maxBytes, false);
 };
 
-const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY, durable = false): void => {
+const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY, durable = false, directoryReceipt?: DurableDirectory): void => {
   // Compact: the file is rewritten under the mesh lock on every write, and indenting made it 22%
   // larger and slower to serialize (smarty-dev#2004).
   const serialized = JSON.stringify(value);
   if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
     throw new Error(`Fabric mesh state exceeds ${maxBytes} bytes`);
   }
-  writeFileAtomic(filePath, serialized, { durable });
+  writeFileAtomic(filePath, serialized, { durable, ...(directoryReceipt ? { directoryReceipt } : {}) });
 };
 
 // Host invariant for the proved reducer: the persisted clock covers every
@@ -454,6 +454,7 @@ export class MeshBatchConflictError extends Error {
 export class MeshStore {
   readonly #eventsPath: string;
   readonly #statePath: string;
+  readonly #stateDirectory: DurableDirectory;
   readonly #counterPath: string;
   readonly #generationPath: string;
   readonly #lockPath: string;
@@ -498,6 +499,7 @@ export class MeshStore {
     this.#lockProtocol = lockProtocol;
     this.#eventsPath = path.join(root, "events.jsonl");
     this.#statePath = path.join(root, "state.json");
+    this.#stateDirectory = new DurableDirectory(path.dirname(this.#statePath));
     this.#counterPath = path.join(root, "sequence");
     this.#generationPath = path.join(root, "generation");
     this.#lockPath = path.join(root, ".lock");
@@ -1185,7 +1187,9 @@ export class MeshStore {
     const generation = randomUUID();
     const stamped: MeshStateFile = { readGeneration: generation, ...payload };
     // The revision clock must durably cover every issued CAS token, including evicted keys.
-    atomicWrite(this.#statePath, stamped, this.#maxStateBytes, true);
+    // Prepared outside the lock; only the changed parent entry owes a new barrier.
+    // Keep that barrier inside: successors must not consume a not-yet-durable clock.
+    atomicWrite(this.#statePath, stamped, this.#maxStateBytes, true, this.#stateDirectory);
     const stamp = statStamp(this.#statePath);
     if (stamp !== undefined) this.#writeSignal(stamped, stamp, generation);
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
@@ -1229,6 +1233,8 @@ export class MeshStore {
     const { key, value, identity, ifVersion } = input;
     this.#validateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    this.#stateDirectory.prepare();
     return this.#withLock(() => {
       const state = readState(this.#statePath, this.#maxStateBytes, false);
       const slot = stateSlot(state, request.key);
@@ -1282,6 +1288,8 @@ export class MeshStore {
     const { key, ifVersion } = input;
     this.#validateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    this.#stateDirectory.prepare();
     return this.#withLock(() => {
       const state = readState(this.#statePath, this.#maxStateBytes, false);
       const slot = stateSlot(state, request.key);
@@ -1324,6 +1332,8 @@ export class MeshStore {
   }): Promise<MeshBatchResult[]> {
     for (const op of input.ops) this.#validateKey(op.key);
     if (input.ops.length === 0) return [];
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    this.#stateDirectory.prepare();
     return this.#withLock(() => {
       // Each operation takes the same verified transition as put()/delete(), so a batch
       // advances the persistent clock exactly as the single writes would, and damaged

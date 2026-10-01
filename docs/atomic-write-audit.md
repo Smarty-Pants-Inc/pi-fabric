@@ -102,6 +102,87 @@ Ordinary **event publication without an archive is intentionally volatile**; ena
 
 Authoritative mesh state writes and ordinary actor registry writes are **not harmless hot caches**: they now pay fsync cost. There is no blanket change to the general helper default, graph budget, startup lifecycle, expiring presence, read signals, sequence hints or ordinary mesh publication. Review state/registry write latency on deployed storage before rollout; do not restore unsafe clock/lineage rollback merely to recover a benchmark number.
 
+## Mesh state commit barrier budget (#2479 cost follow-up)
+
+The six fsyncs observed at `77168bf4` are **one state temporary-file barrier plus
+five directory barriers through `/`** at the benchmark path, not sibling-state
+or read-signal fsyncs. Directory depth made the cost path-dependent.
+
+Mesh state writers now lazily prepare an identity-bound `DurableDirectory`
+receipt at the first actual state mutation, **before acquiring the mesh lock**.
+Preparation uses the same complete physical/lexical ancestry and symlink walk as
+`syncPathNamespace`, and records a receipt only after every barrier and the second
+namespace walk succeed. A failed setup is retried, including in fresh processes;
+existence alone is never accepted. No receipt preparation runs in constructor,
+idle lifecycle, or ordinary event publication.
+
+An unchanged receipt lets each steady-state state commit use exactly:
+
+1. fsync the complete temporary state file once;
+2. rename it to `state.json`;
+3. fsync the containing directory once (POSIX only).
+
+Every commit rechecks the directory/link identities before and after its parent
+barrier. Observed replacement/retargeting invalidates the receipt and requires a
+new full setup outside the lock. First mutation in each store/process therefore
+pays additional setup fsyncs; **two is the steady-state/locked-commit budget, not a
+claim that process initialization or namespace recovery costs only two calls**.
+Ancestor directory change times also invalidate a same-inode detach/reattach;
+only the leaf change time is excluded because normal state/lock writes change
+its entries. Unrelated ancestor entry changes conservatively require fresh setup.
+The mesh lock still does not make external namespace mutation transactional.
+
+The final commit-directory barrier remains **inside the lock**, before optional
+read signal/cache publication, lock handoff, and returned CAS token. This retains
+the existing durable-before-handoff ordering: no successor reads an unconfirmed
+head as the basis for a dependent commit. Moving it after handoff would need a
+separate review of successor/failure semantics, rather than silently redefining
+that ordering as part of this syscall reduction. The optional read signal already
+identifies its generation in the synced canonical payload and remains volatile;
+no extra marker or second full-file barrier is introduced. Ordinary publication,
+sequence hints, and other durable atomic callers keep their existing behavior.
+
+The new regression suite covers <=2 fsyncs per steady-state put/delete/batch,
+file -> rename -> directory -> signal order, first-use setup outside the lock,
+failed setup retries, failed commit barriers, namespace/root replacement and
+same-target symlink replacement. Existing full-chain crash-ordering tests remain
+unchanged. These are barrier-contract tests, not power-cut certification.
+
+### Final cost gate on ryzen2
+
+Same 2,301,068-byte synthetic fixture, five independent Node v24.19.0 writers at
+nice 0, 300-second runs, 300 state mutations/min and 24 volatile publications/min.
+Both current control and final head completed 1,500 mutations with zero errors;
+highWater, live entry count, and event sequence checks passed.
+
+| Build | Held % | Holds/min | Hold median/p90/max ms | Fsync/locked state commit |
+|---|---:|---:|---:|---:|
+| main `3f6a2963` (fresh control) | 15.51 | 305.0 | 29.1 / 38.5 / 139.9 | 0 |
+| PR `77168bf4` (previous retained run) | 29.18 | 303.6 | 39.5 / 122.5 / 280.2 | 6 |
+| This follow-up | 25.84 | 305.2 | 36.8 / 99.9 / 270.2 | 2 |
+
+**Occupancy gate FAIL:** +10.33 percentage points versus main, above +7. The
+maximum-hold gate passes (270.2 ms <1 s). This is **not rollout acceptance**.
+The older PR row is historical evidence, not a contemporaneous third control;
+host load varies substantially. Time-weighted final/control occupancy is
+26.13% / 15.65%, and also fails the relative gate.
+
+Final head paid 3,000 in-lock commit fsyncs plus **1,105 outside-lock namespace
+setup/reconfirmation fsyncs**, 4,105 total / 1,500 mutations (2.737 overall per
+mutation). Unrelated ancestor entry changes on this busy host conservatively
+invalidated receipts; initialization alone would cost 25 calls at this path.
+Therefore the <=2 assertion applies to each locked commit and to total calls in
+an unchanged prepared namespace, not to setup/recovery-inclusive API calls.
+No publication fsyncs occurred. A separate sustained strace diagnostic found the
+required full-state file barrier dominates the remaining cost; removing cheap
+unchanged-ancestor barriers does not by itself make the relative gate pass.
+
+Keep the owner performance gate blocked. Further reduction needs separately
+reviewed batching/coalescing or a persistence-layout change, not omission of a
+required file/parent barrier. Final targeted durability/cold/idle/first-use checks,
+typecheck, fresh build, and lazy graph pass; retained artifacts include per-write
+records, lock samples, strace, setup accounting, and exploratory runs.
+
 ## Verification on ryzen2 (nice 19)
 
 The mechanical inventory covers **72 direct helper/raw-publication sites in 34 source files**, including the shared helper implementation sites, with zero missing audit references. Wrapper expansions are separately listed above. Search evidence and the machine-readable coverage manifest are retained in the task artifacts.

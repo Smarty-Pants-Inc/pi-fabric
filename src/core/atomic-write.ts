@@ -10,6 +10,9 @@ export interface AtomicWriteOptions {
   // Opt in to stable-storage ordering: sync the file before rename, then its directory
   // and all containing directories through the filesystem root (except on Windows).
   durable?: boolean;
+  // An explicitly prepared, identity-bound namespace receipt lets a hot writer
+  // sync only its changed parent entry. Ordinary durable callers still sync the full chain.
+  directoryReceipt?: DurableDirectory;
   // Windows transiently rejects rename() with EPERM/EACCES/EEXIST/EBUSY while
   // an antivirus scan, indexer, or sibling reader probes the destination —
   // milliseconds of contention, not a policy failure. Retry a bounded number
@@ -86,8 +89,7 @@ const sameInode = (left: Inode, right: Inode): boolean => left.dev === right.dev
  * A second walk detects replacements, including links retargeted to the SAME inode.
  * Windows skips unsupported directory fsync, but still binds the opened receipt.
  */
-export const syncPathNamespace = (target: string, receipt?: Inode): void => {
-  const walk = () => {
+const walkPathNamespace = (target: string, receipt?: Inode) => {
     const absolute = path.isAbsolute(target) ? target : `${process.cwd()}${path.sep}${target}`;
     const split = (value: string) => value.split(path.sep === "\\" ? /[\\/]+/ : /\/+/);
     let current = path.parse(absolute).root;
@@ -141,9 +143,11 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
     record(current, endpoint);
     if (receipt && !sameInode(receipt, endpoint)) throw new Error("Session receipt inode changed during namespace confirmation");
     parents.push(endpoint.isDirectory() ? current : path.dirname(current));
-    return { entries, directories, parents };
-  };
-  const before = walk();
+    return { entries, directories, parents, endpoint: current, stat: endpoint };
+};
+
+const syncNamespace = (target: string, receipt?: Inode) => {
+  const before = walkPathNamespace(target, receipt);
   if (process.platform !== "win32") {
     const synced = new Set<string>();
     for (const parent of before.parents.reverse()) {
@@ -162,10 +166,83 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
       }
     }
   }
-  if (JSON.stringify(walk().entries) !== JSON.stringify(before.entries)) {
+  if (JSON.stringify(walkPathNamespace(target, receipt).entries) !== JSON.stringify(before.entries)) {
     throw new Error("Namespace changed during durability barriers");
   }
+  return before;
 };
+
+export const syncPathNamespace = (target: string, receipt?: Inode): void => {
+  syncNamespace(target, receipt);
+};
+
+const directoryReceiptOf = (walk: ReturnType<typeof walkPathNamespace>): string => JSON.stringify([
+  walk.entries,
+  // The leaf's own entries are the hot writes. Its ancestors are not: their
+  // change times catch a renamed-away-and-back inode even if identity is reused.
+  [...walk.directories].filter(([directory]) => directory !== walk.endpoint)
+    .map(([directory, stat]) => [directory, stat.ctimeMs]),
+]);
+
+/** A successful full-namespace barrier, not an existence cache. Lazily prepare
+ * outside a hot writer's lock; every commit rechecks all directory/link identities.
+ * Unchanged ancestors owe no new barrier when only the leaf's entries change.
+ * Ancestor change times also invalidate a same-inode detach/reattach. The leaf
+ * change time is excluded because state/lock entry writes legitimately change it.
+ */
+export class DurableDirectory {
+  #prepared: string | undefined;
+  #identities: string | undefined;
+
+  constructor(readonly directory: string) {}
+
+  prepare(): void {
+    try {
+      const current = walkPathNamespace(this.directory);
+      if (!current.stat.isDirectory()) throw new Error("Durability receipt is not a directory");
+      const entries = directoryReceiptOf(current);
+      if (this.#prepared === entries) return;
+      // Never keep a receipt after a failed/replaced namespace barrier. A later
+      // attempt (including a fresh process) must retry the entire owed chain.
+      this.#prepared = undefined;
+      const synced = syncNamespace(this.directory);
+      this.#prepared = directoryReceiptOf(synced);
+      this.#identities = JSON.stringify(synced.entries);
+    } catch (error) {
+      this.#prepared = undefined;
+      throw error;
+    }
+  }
+
+  sync(directory: string): void {
+    if (path.resolve(directory) !== path.resolve(this.directory)) throw new Error("Durability receipt directory mismatch");
+    try {
+      // Walk the actual writer path too: lexical normalization alone is unsafe
+      // when a symlink is followed by dot-dot.
+      const before = walkPathNamespace(directory);
+      // Sibling entry updates can change ancestor ctime during a commit without
+      // changing our namespace. Recheck identities here; prepare() conservatively
+      // re-establishes any changed ancestor receipt before the next lock.
+      if (this.#prepared === undefined || JSON.stringify(before.entries) !== this.#identities) {
+        throw new Error("Durability receipt namespace changed or unprepared");
+      }
+      if (process.platform !== "win32") {
+        const fd = fs.openSync(before.endpoint, fs.constants.O_RDONLY);
+        try {
+          const opened = fs.fstatSync(fd);
+          if (!opened.isDirectory() || !sameInode(opened, before.stat)) throw new Error("Namespace directory changed before barrier");
+          fs.fsyncSync(fd);
+        } finally { fs.closeSync(fd); }
+      }
+      if (JSON.stringify(walkPathNamespace(directory).entries) !== this.#identities) {
+        throw new Error("Namespace changed during durability barriers");
+      }
+    } catch (error) {
+      this.#prepared = undefined;
+      throw error;
+    }
+  }
+}
 
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {
@@ -220,7 +297,10 @@ export const writeFileAtomic = (
       });
     }
     renameAtomic(temporary, filePath, options);
-    if (options?.durable) syncDirectoryChain(directory);
+    if (options?.durable) {
+      if (options.directoryReceipt) options.directoryReceipt.sync(directory);
+      else syncDirectoryChain(directory);
+    }
   } finally {
     // No-op right after a successful rename; removes the temp on failure.
     fs.rmSync(temporary, { force: true });

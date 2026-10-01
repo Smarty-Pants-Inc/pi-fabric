@@ -121,6 +121,9 @@ describe.skipIf(process.platform === "win32")("durable shell tasks through jev-f
     const { tasks } = session(env);
     const external = await tasks.invoke("external", {}, invocation) as { jobs: Array<{ id: string; label?: string }> };
     expect(external.jobs).toEqual([expect.objectContaining({ id: jobId, label: "Dev server", state: "running" })]);
+    await expect(tasks.invoke("adopt", { jobId }, invocation)).rejects.toThrow("output policy is absent");
+    // External harnesses must publish explicit provenance before attachment.
+    await new DurableTaskRegistry(path.join(env.agentDir, "fabric")).allowUnfiltered(env.home, jobId);
     const adopted = await tasks.invoke("adopt", { jobId }, invocation) as { task: { id: string; description?: string } };
     expect(adopted.task.description).toBe("Dev server");
     expect(await tasks.invoke("external", {}, invocation)).toMatchObject({ jobs: [] });

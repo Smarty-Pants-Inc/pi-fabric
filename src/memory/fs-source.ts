@@ -23,6 +23,7 @@ import {
 /** Stable machine-readable coverage reasons (engine pattern-validated). */
 const REASON_MAX_SESSIONS = "fs_source_max_sessions";
 const REASON_SCAN_CAPPED = "fs_source_scan_capped";
+const REASON_UNREADABLE = "fs_source_unreadable";
 
 /** Defensive walk bound: directory entries examined per list call. */
 const SCAN_ENTRY_LIMIT = 100_000;
@@ -54,15 +55,17 @@ const compareByRecency = (left: DiscoveredSession, right: DiscoveredSession): nu
 /** Collect every *.jsonl file under root, newest first (mtime, then path).
  *  Symlinks are skipped: cycles cannot hang a listing, and a config should
  *  declare the real archive path. */
-const discoverSessionFiles = (root: string): { sessions: DiscoveredSession[]; scanCapped: boolean } => {
+const discoverSessionFiles = (root: string): { sessions: DiscoveredSession[]; scanCapped: boolean; unreadable: boolean } => {
   const sessions: DiscoveredSession[] = [];
   let examined = 0;
   let scanCapped = false;
+  let unreadable = false;
   const walk = (dir: string): void => {
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
+      unreadable = true;
       return;
     }
     for (const entry of entries) {
@@ -85,7 +88,7 @@ const discoverSessionFiles = (root: string): { sessions: DiscoveredSession[]; sc
   };
   walk(path.resolve(root));
   sessions.sort(compareByRecency);
-  return { sessions, scanCapped };
+  return { sessions, scanCapped, unreadable };
 };
 
 /** Resolve a session key inside root; absolute keys and traversal are rejected. */
@@ -185,7 +188,8 @@ export const createFileSystemMemorySource = (
     async listSessions({ limit, signal }) {
       signal?.throwIfAborted();
       const boundedLimit = Math.max(0, Math.floor(limit));
-      const { sessions: discovered, scanCapped } = discoverSessionFiles(root);
+      const { sessions: discovered, scanCapped, unreadable: scanUnreadable } = discoverSessionFiles(root);
+      let unreadable = scanUnreadable;
       const descriptors: MemorySourceSessionDescriptor[] = [];
       for (const found of discovered.slice(0, boundedLimit)) {
         signal?.throwIfAborted();
@@ -193,6 +197,7 @@ export const createFileSystemMemorySource = (
         try {
           content = readContainedSession(root, found.sessionKey).content;
         } catch {
+          unreadable = true;
           continue;
         }
         const header = headerForContent(content);
@@ -207,12 +212,12 @@ export const createFileSystemMemorySource = (
           },
         });
       }
-      if (!scanCapped && discovered.length <= boundedLimit) return descriptors;
+      if (!unreadable && !scanCapped && discovered.length <= boundedLimit) return descriptors;
       const page: MemorySourceListPage = {
         sessions: descriptors,
         coverage: {
           complete: false,
-          reason: scanCapped ? REASON_SCAN_CAPPED : REASON_MAX_SESSIONS,
+          reason: unreadable ? REASON_UNREADABLE : scanCapped ? REASON_SCAN_CAPPED : REASON_MAX_SESSIONS,
         },
       };
       return page;

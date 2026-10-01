@@ -106,6 +106,53 @@ const harness = (options: { middleware?: unknown; optIn?: boolean; hangMs?: numb
 };
 
 describe("cooperative bash middleware", () => {
+  it.skipIf(process.platform === "win32")("SEC-3 refuses cross-session adoption while discovered backend policy persistence is delayed", async () => {
+    const h = harness();
+    const fake = new URL("./fixtures/fake-jev-fabric.mjs", import.meta.url).pathname;
+    const binary = process.env.PI_FABRIC_JEV_FABRIC_BIN || path.join(h.cwd, "jev-fabric");
+    if (!process.env.PI_FABRIC_JEV_FABRIC_BIN) fs.writeFileSync(binary, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`, { mode: 0o755 });
+    const home = path.join(h.cwd, "home");
+    const settings = () => ({ binary, home, timeoutMs: 60_000 });
+    const jobs = h.provider.shellJobs;
+    jobs.durable = new DurableShellBridge(jobs, { cwd: h.cwd, agentDir: path.join(h.cwd, "launch-agent"), ownerId: "filtered-launch", settings, middleware: () => middleware() });
+    let releasePolicy!: () => void;
+    const gate = new Promise<void>(resolve => { releasePolicy = resolve; });
+    let entered = false;
+    const protect = DurableTaskRegistry.prototype.protect;
+    const spy = vi.spyOn(DurableTaskRegistry.prototype, "protect").mockImplementation(async function (this: DurableTaskRegistry, home, jobId) {
+      entered = true;
+      await gate;
+      return protect.call(this, home, jobId);
+    });
+    const other = new FabricShellJobStore();
+    other.durable = new DurableShellBridge(other, { cwd: h.cwd, agentDir: path.join(h.cwd, "other-agent"), ownerId: "unfiltered-reader", settings, middleware: () => undefined });
+    const tasks = new TasksProvider(other);
+    const releaseChild = path.join(h.cwd, "release-racing-child");
+    let taskId: string | undefined;
+    try {
+      const result = await h.invoke({ command: `printf '${SECRET}\n'; while [ ! -f '${releaseChild}' ]; do sleep 0.05; done`, durable: true });
+      taskId = (result.details as any).taskId;
+      await vi.waitFor(() => expect(entered).toBe(true));
+      const external = await tasks.invoke("external", {}, h.context) as { jobs: Array<{ id: string }> };
+      expect(external.jobs).toHaveLength(1);
+      // Discovery is independent of the original task publication fence.
+      expect(jobs.get(taskId!)!.durable!.jobId).toBeUndefined();
+      const jobId = external.jobs[0]!.id;
+      await expect(tasks.invoke("adopt", { jobId }, h.context)).rejects.toThrow("output policy is absent or initializing");
+      expect(other.list()).toEqual([]);
+      releasePolicy();
+      await vi.waitFor(() => expect(jobs.get(taskId!)!.durable!.jobId).toBe(jobId));
+      const adopted = await tasks.invoke("adopt", { jobId }, h.context) as any;
+      expect(await tasks.invoke("get", { id: adopted.task.id }, h.context)).toMatchObject({ output: expect.stringContaining("Output withheld") });
+      expect(JSON.stringify(await tasks.invoke("read", { id: adopted.task.id }, h.context))).not.toContain(SECRET);
+    } finally {
+      releasePolicy(); spy.mockRestore();
+      fs.writeFileSync(releaseChild, "done");
+      if (taskId) await vi.waitFor(() => expect(jobs.get(taskId!)?.finished).toBe(true), { timeout: 10_000 });
+      await other.close();
+    }
+  });
+
   it.skipIf(process.platform === "win32").each(["stdout", "stderr", "base64", "events", "adopt-running", "adopt-terminal"])("SEC-3 protects filtered durable output through %s", async (reader) => {
     vi.stubEnv("FAKE_JEV_FABRIC_FEATURES", "follow,list,label,sessions,serve-concurrent,read,cwd,serve-24h,durable-input");
     const h = harness();

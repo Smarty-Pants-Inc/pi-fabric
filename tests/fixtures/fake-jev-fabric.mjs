@@ -177,7 +177,7 @@ else if (command === "stop") {
     },
   };
   function open(r, lifetime) {
-    const id = `${lifetime === "session" ? "s-" : ""}${(++serial).toString(16).padStart(8, "0")}`;
+    const id = `${lifetime === "session" ? "s-" : ""}${randomUUID().replaceAll("-", "")}`;
     const proc = spawn(r.argv[0], r.argv.slice(1), { cwd: r.cwd, stdio: ["pipe", "pipe", "pipe"], detached: true });
     const c = { id, lifetime, label: r.label, proc, out: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, waiters: [] };
     for (const stream of ["stdout", "stderr"]) proc[stream].on("data", (chunk) => { c.out[stream] = Buffer.concat([c.out[stream], chunk]); settle(c); });
@@ -210,8 +210,12 @@ else if (command === "stop") {
     }
   });
   // End of input ends the connection and its session children; durable ones stay.
-  process.stdin.on("end", () => {
-    for (const c of children.values()) if (c.lifetime === "session" && !c.receipt) { try { process.kill(-c.proc.pid, "SIGKILL"); } catch {} }
-    setTimeout(() => process.exit(0), 50);
+  process.stdin.on("end", async () => {
+    const owned = [...children.values()].filter(c => c.lifetime === "session" && !c.receipt);
+    await Promise.all(owned.map(c => new Promise(resolve => {
+      c.proc.once("close", resolve);
+      try { process.kill(-c.proc.pid, "SIGTERM"); } catch { resolve(); }
+    })));
+    process.exit(0);
   });
 } else fail(`unknown command: ${command}`, 2);

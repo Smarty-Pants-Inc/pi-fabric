@@ -27,7 +27,7 @@ const descriptors: FabricActionDescriptor[] = [
   { name: "watch", description: "Wait without polling for matching lines, task exit, or timeout (default 5 seconds). With match (any background task, chosen now): returns complete output lines containing that literal after the byte cursor, omittedBytes, more and nextCursor. Without match: reads a launch-time monitor (pi.bash monitor with delivery ui). Returns reason, up to 64 lines after the cursor, losses (burst/evicted cursor ranges), omitted, more and nextCursor with task metadata; pass nextCursor as after, immediately again while more is true. The latest 256 positions are replayable. No inference, wakeup, renewal or cancellation of the task. Not a lossless RPC stream.", inputSchema: watchSchema, risk: "read", effect: { kind: "none", ordering: "commutative" } },
   { name: "stop", description: "Stop one session-owned shell task or monitor by ID using its existing abort controller, not an arbitrary PID. A durable task is stopped through jev-fabric. Cancellation does not wake the owning agent.", inputSchema: idSchema, risk: "execute", effect: { kind: "emission", ordering: "ordered" } },
   { name: "external", description: "List jev-fabric jobs in this session's durable store that no task here tracks, for example dev servers started by another harness or an earlier session. Returns id, state, label and start time; read-only.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, risk: "read", effect: { kind: "none", ordering: "commutative" } },
-  { name: "adopt", description: "Attach an existing jev-fabric job from tasks.external to this session as a durable task: its output, completion notification, wait/stop and inspector row. Adopting does not restart or signal the process.", inputSchema: { type: "object", properties: { jobId: { type: "string", minLength: 1, maxLength: 128 }, description: { type: "string", minLength: 1, maxLength: 120 } }, required: ["jobId"], additionalProperties: false }, risk: "read", effect: { kind: "emission", ordering: "ordered" } },
+  { name: "adopt", description: "Attach an existing jev-fabric job from tasks.external to this session as a durable task: its output, completion notification, wait/stop and inspector row. Requires persisted output-policy provenance; absent or initializing policy refuses attachment. Adopting does not restart or signal the process.", inputSchema: { type: "object", properties: { jobId: { type: "string", minLength: 1, maxLength: 128 }, description: { type: "string", minLength: 1, maxLength: 120 } }, required: ["jobId"], additionalProperties: false }, risk: "read", effect: { kind: "emission", ordering: "ordered" } },
 ];
 const durableOnly = new Set(["external", "adopt"]);
 
@@ -90,35 +90,46 @@ export class TasksProvider implements FabricProvider {
     const deadline = Date.now() + timeoutMs;
     const lines: string[] = [];
     let cursor = after;
+    let readCursor = after;
+    let pending = "";
     let omittedBytes = 0;
+    const result = (reason: "event" | "finished" | "timeout") =>
+      ({ task: job.info(), reason, lines, omittedBytes, more: cursor < job.written, nextCursor: cursor });
     for (;;) {
-      const page = job.read(cursor);
+      signal?.throwIfAborted();
+      // Snapshot the physical boundary, not the decoded boundary: job.read
+      // retains incomplete UTF-8 bytes for the next incremental read.
+      const physicalEnd = job.written;
+      const previous = readCursor;
+      const page = job.read(readCursor);
       omittedBytes += page.omittedBytes;
-      const text = page.text ?? "";
+      if (page.omittedBytes) { pending = ""; cursor = page.offset; }
+      pending += page.text ?? "";
+      readCursor = page.next;
       let consumed = 0;
-      for (let end = text.indexOf("\n"); end >= 0 && lines.length < WATCH_LINES; end = text.indexOf("\n", consumed)) {
-        const line = text.slice(consumed, end);
+      for (let end = pending.indexOf("\n"); end >= 0 && lines.length < WATCH_LINES; end = pending.indexOf("\n", consumed)) {
+        const line = pending.slice(consumed, end);
         consumed = end + 1;
         if (line.includes(match)) lines.push(clean(line).slice(0, WATCH_LINE_CHARS));
       }
-      // A final unterminated line counts once the task has ended.
-      if (page.eof && consumed < text.length && lines.length < WATCH_LINES) {
-        const line = text.slice(consumed);
-        consumed = text.length;
+      if (page.eof && consumed < pending.length && lines.length < WATCH_LINES) {
+        const line = pending.slice(consumed);
+        consumed = pending.length;
         if (line.includes(match)) lines.push(clean(line).slice(0, WATCH_LINE_CHARS));
       }
-      // A single line longer than a page would stall the cursor; consume it as clipped.
-      if (consumed === 0 && page.bytes >= SHELL_READ_MAX_BYTES) consumed = text.length;
-      cursor = page.offset + Buffer.byteLength(text.slice(0, consumed));
-      const result = (reason: "event" | "finished" | "timeout") =>
-        ({ task: job.info(), reason, lines, omittedBytes, more: cursor < job.written, nextCursor: cursor });
+      // Retain at most one page of an unterminated line. Clipped prefixes are
+      // consumed, but incomplete character bytes stay in the job's byte tail.
+      if (consumed === 0 && Buffer.byteLength(pending) >= SHELL_READ_MAX_BYTES) consumed = pending.length;
+      cursor = consumed === pending.length ? readCursor : cursor + Buffer.byteLength(pending.slice(0, consumed));
+      pending = pending.slice(consumed);
       if (lines.length) return result("event");
       if (page.eof) return result("finished");
-      // Bytes already past this page (a full page, or output that raced the read).
-      if (job.written > page.next) continue;
       const remaining = deadline - Date.now();
       if (remaining <= 0) return result("timeout");
-      await job.whenOutput(page.next, remaining, signal);
+      // Drain bounded pages only on actual read progress. A partial UTF-8
+      // tail otherwise makes written > next forever, starving timers/abort.
+      if (readCursor > previous && physicalEnd > page.next) continue;
+      await job.whenOutput(physicalEnd, remaining, signal);
     }
   }
 }

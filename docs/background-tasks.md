@@ -179,7 +179,10 @@ process registry across harnesses. `tasks.external` lists jobs there that no
 task of this session tracks (id, state, label, start time). `tasks.adopt({jobId,
 description?})` attaches one as a durable task of this session: output,
 completion notification, wait/watch/stop and an inspector row. Adoption never
-restarts or signals the process; stopping it afterwards does.
+restarts or signals the process; stopping it afterwards does. Attachment requires
+persisted Fabric output-policy provenance in the shared store. A job whose policy
+is absent, unreadable or still initializing is refused, including jobs launched
+by an external harness without that provenance; listing alone grants no raw reader.
 
 ```ts
 const {jobs} = await tools.call({ref: "tasks.external", args: {}});

@@ -205,14 +205,18 @@ author-defined observational equivalence are not claimed as Bend theorems.
 ## Reproducible bridge
 
 The contributor toolchain pins **Bend 2.0.34**. Installed Fabric needs neither
-Bend nor a Bend loader. Linux CI downloads that exact release archive and checks
-its SHA-256 before running proofs. Windows tests execute the checked-in generated
-JS and ABI; native Bend currently requires Linux, macOS, or WSL.
+Bend nor a Bend loader. The fork-owned GitHub Actions workflow currently installs
+Bend 2.0.26; `proof:check` there explicitly verifies the checked-in source/bridge/
+artifact hashes without invoking that incompatible compiler. This is freshness
+verification, not proof reproduction. Both CI platforms execute generated JS and
+ABI tests. Local `proof:check`, `proof:reproduce`, and `prepack` still require the
+pinned 2.0.34 compiler; native Bend requires Linux, macOS, or WSL.
 
 ```sh
 bend PROOF.bend --check-only
 bun run proof:generate    # prove, compile, regenerate JS + declarations + receipt
-bun run proof:check       # reprove, reproduce byte-for-byte, reject negative mutations
+bun run proof:check       # local: reproduce; GitHub Actions: artifact hashes only
+bun run proof:reproduce   # always reprove, reproduce bytes, reject negative mutations
 bun run proof:artifact    # compiler-free source/bridge/artifact freshness check
 bunx vitest run tests/verified-kernels.test.ts tests/verified-resources.test.ts tests/verified-providers.test.ts tests/verified-artifact.test.ts
 bunx vitest run tests/verified-authority.test.ts tests/verified-lifecycle.test.ts tests/verified-storage.test.ts
@@ -253,9 +257,9 @@ Storage revisions use canonical radix-`2^32` limbs to cover the full JS-safe int
 range. Booleans and tagged records/lists follow the emitted
 ABI. Tests exercise those representations on both CI platforms.
 
-Every build checks artifact freshness before bundling. Linux CI and `prepack`
-add fresh checking and byte-for-byte regeneration, so editing a receipt is not a
-substitute for proving the code. The standalone generated JS, declarations and receipt are
+Every build and GitHub Actions proof check verifies artifact freshness before
+bundling. `proof:reproduce` and `prepack` add fresh checking and byte-for-byte
+regeneration, so editing a receipt is not a substitute for proving the code. The standalone generated JS, declarations and receipt are
 copied into `dist/verified/generated/`. Laws, proofs, kernel source and Bend's
 license are included in the package for inspection. The receipt is a freshness
 record, **not a standalone independently verified proof certificate**.

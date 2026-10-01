@@ -114,12 +114,14 @@ export class DurableShellBridge {
       maxTimeoutMs: JEV_FABRIC_START_MAX_MS,
       label: options.label,
       onStarted: async (jobId, scriptPath) => {
-        if (options.filtered) {
-          // Policy belongs to the store/job, not a removable session binding.
-          try { await registry.protect(home, jobId); } catch (error) {
-            await cli.stop(jobId);
-            throw error;
-          }
+        // Backend visibility precedes this callback. Adopters must refuse
+        // absent/initializing provenance, including for unfiltered launches.
+        try {
+          if (options.filtered) await registry.protect(home, jobId);
+          else await registry.allowUnfiltered(home, jobId);
+        } catch (error) {
+          await cli.stop(jobId);
+          throw error;
         }
         // Do not publish a backend ID through task metadata until its required
         // output policy is persisted; another session can adopt a visible ID.
@@ -180,9 +182,8 @@ export class DurableShellBridge {
     const existing = this.jobs.list().find(job => job.durable?.jobId === jobId);
     if (existing) return existing;
     const status = await cli.status(jobId);
-    const filtered = await registry.isProtected(this.home, jobId)
-      || (await registry.all()).some(record => record.home === this.home && record.jobId === jobId && record.filtered);
-    if (filtered) await registry.protect(this.home, jobId);
+    const filtered = await registry.outputPolicy(this.home, jobId);
+    if (filtered === undefined) throw new Error("Durable task output policy is absent or initializing; refusing adoption");
     const { randomUUID } = await import("node:crypto");
     const record: DurableTaskRecord = {
       taskId: randomUUID(), jobId, home: this.home, ownerId: this.options.ownerId ?? "",
@@ -195,7 +196,9 @@ export class DurableShellBridge {
   }
 
   async #attach(record: DurableTaskRecord): Promise<FabricShellJobInfo> {
-    const [{ operations }, cli] = await Promise.all([this.#load(), this.#cli()]);
+    const [{ operations, registry }, cli] = await Promise.all([this.#load(), this.#cli()]);
+    const filtered = await registry.outputPolicy(record.home, record.jobId);
+    if (filtered === undefined) throw new Error("Durable task output policy is absent or initializing; refusing attachment");
     const job = this.jobs.begin("bash", record.command, {
       id: record.taskId, startedAt: record.startedAt, cwd: record.cwd,
       ...(record.ownerId ? { ownerId: record.ownerId } : {}),
@@ -212,7 +215,7 @@ export class DurableShellBridge {
       if (!wrapped || typeof wrapped.exec !== "function") throw new Error("Invalid Fabric bash middleware operations; refusing to bypass shell protection");
       exec = wrapped;
     } else exec = attach;
-    const withheld = record.filtered && !middleware;
+    const withheld = filtered && !middleware;
     if (withheld) job.append(Buffer.from("[Output withheld: this task was filtered by shell middleware that is not active now.]\n"));
     void exec.exec(record.command, record.cwd, {
       onData: data => { if (!withheld) job.append(data); },

@@ -163,6 +163,48 @@ describe.skipIf(process.platform === "win32")("sessions through jev-fabric serve
       await provider.close();
     }
   });
+  it.each(["abort", "owner-retire", "close"])("SEC-4 bounds cleanup with a withheld receipt and real child group on %s", async (mode) => {
+    const { root, provider, call } = setup({ delaySpawnResponse: true });
+    const ready = path.join(root, "withheld-ready.json");
+    const pids = path.join(root, "withheld-pids");
+    // Configure the gate before even the base head opens its shared connection.
+    vi.stubEnv("JEV_TEST_SPAWN_READY_FILE", ready);
+    // A separate owner's real child must survive owner-specific retirement.
+    const survivor = await call("open", { argv: ["sleep", "60"], label: "ungated-survivor" }, "fabric_exec_survivor");
+    const controller = new AbortController();
+    const script = `sleep 60 & child=$!; echo "$$ $child" > '${pids}'; trap 'kill "$child" 2>/dev/null; wait "$child"; exit 0' TERM; wait "$child"`;
+    const launch = provider.invoke("open", { argv: ["/bin/bash", "-c", script] }, {
+      parentToolCallId: "jev:withheld-owner", nestedToolCallId: "withheld-launch", signal: controller.signal,
+    } as FabricInvocationContext);
+    const outcome = launch.then(() => undefined, error => error);
+    await vi.waitFor(() => expect(fs.existsSync(ready) && fs.existsSync(pids)).toBe(true), { timeout: 5000 });
+    const descendants = fs.readFileSync(pids, "utf8").trim().split(" ").map(Number);
+    const group = descendants[0]!;
+    expect(() => process.kill(-group, 0)).not.toThrow();
+    let ended: Promise<void> = Promise.resolve();
+    try {
+      if (mode === "abort") controller.abort(new Error("withheld cancellation"));
+      if (mode === "owner-retire") ended = provider.invocationEnded("jev:withheld-owner");
+      if (mode === "close") ended = provider.close();
+      // Keep the response gate closed throughout the cleanup deadline.
+      await vi.waitFor(() => {
+        expect(fs.existsSync(ready + ".release")).toBe(false);
+        expect(() => process.kill(-group, 0)).toThrow();
+        for (const pid of descendants) expect(() => process.kill(pid, 0)).toThrow();
+      }, { timeout: 1800 });
+      await ended;
+      expect(await outcome).toBeInstanceOf(Error);
+      if (mode !== "close") expect(await call("status", { id: survivor.id })).toMatchObject({ state: "running" });
+    } finally {
+      // On the base head, release only AFTER the deadline assertion failed,
+      // then observe compensation and reap every process this test started.
+      fs.writeFileSync(ready + ".release", "release for cleanup");
+      await outcome;
+      await ended;
+      await provider.close();
+    }
+  });
+
   it("ends session children when the provider closes", async () => {
     const { call, provider } = setup();
     const { id } = await call("open", { cmd: "echo $$; exec sleep 30" });

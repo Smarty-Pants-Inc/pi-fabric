@@ -124,6 +124,39 @@ describe("tasks provider", () => {
     const tail = await provider.invoke("read", { id: job.id, offset: 0 }, context) as { offset: number; omittedBytes: number; next: number; eof: boolean };
     expect(tail).toMatchObject({ offset: 7 + 1024 * 1024 - 32 * 1024, eof: true, next: 7 + 1024 * 1024 });
   });
+  it.each(["continuation", "timeout", "cancel"])("SEC-6 literal watch retains split UTF-8 and yields on %s", async (mode) => {
+    const { store, provider } = setup();
+    const job = store.begin("bash", "split UTF-8"); job.spill();
+    const bytes = Buffer.from("héllo\n");
+    job.append(bytes.subarray(0, 2));
+    const read = job.read.bind(job);
+    let reads = 0;
+    // Turn the vulnerable synchronous spin into a deterministic failed test,
+    // rather than freezing Vitest (and preventing its timeout from firing).
+    vi.spyOn(job, "read").mockImplementation((...args) => {
+      if (++reads > 20) throw new Error("literal watch spun without yielding");
+      return read(...args);
+    });
+    const controller = new AbortController();
+    const pending = provider.invoke("watch", { id: job.id, match: "héllo", timeoutMs: 40 }, { ...context, signal: controller.signal });
+    const observed = pending.then(value => ({ value }), error => ({ error }));
+    const timer = setTimeout(() => {
+      if (mode === "continuation") job.append(bytes.subarray(2));
+      if (mode === "cancel") controller.abort(new Error("split watch cancelled"));
+    }, 10);
+    try {
+      const outcome = await observed;
+      if (mode === "cancel") expect(outcome).toMatchObject({ error: { message: "split watch cancelled" } });
+      else expect(outcome).toMatchObject({ value: { reason: mode === "timeout" ? "timeout" : "event", lines: mode === "timeout" ? [] : ["héllo"], nextCursor: mode === "timeout" ? 0 : bytes.length } });
+      expect(reads).toBeLessThan(8);
+      expect(job.abort.signal.aborted).toBe(false);
+      if (mode === "timeout") {
+        job.append(bytes.subarray(2));
+        expect(await provider.invoke("watch", { id: job.id, match: "héllo", after: 0 }, context)).toMatchObject({ lines: ["héllo"], nextCursor: bytes.length });
+      }
+    } finally { clearTimeout(timer); }
+  });
+
   it("long-polls a read for new bytes or exit, without stopping the task", async () => {
     const { store, provider } = setup();
     const job = store.begin("bash", "work"); job.spill();

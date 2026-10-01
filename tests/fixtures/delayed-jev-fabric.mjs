@@ -12,7 +12,7 @@ process.stdin.on("data", chunk => {
   let newline;
   while ((newline = input.indexOf("\n")) >= 0) {
     const line = input.slice(0, newline); input = input.slice(newline + 1);
-    try { const request = JSON.parse(line); operations.set(request.id, request.op); } catch {}
+    try { const request = JSON.parse(line); operations.set(request.id, request); } catch {}
     backend.stdin.write(line + "\n");
   }
 });
@@ -22,7 +22,7 @@ backend.stdout.on("data", chunk => {
   while ((newline = output.indexOf("\n")) >= 0) {
     const line = output.slice(0, newline); output = output.slice(newline + 1);
     let response; try { response = JSON.parse(line); } catch {}
-    if (response?.ok && operations.get(response.id) === "spawn" && process.env.JEV_TEST_SPAWN_READY_FILE) {
+    if (response?.ok && operations.get(response.id)?.op === "spawn" && operations.get(response.id)?.label !== "ungated-survivor" && process.env.JEV_TEST_SPAWN_READY_FILE) {
       const ready = process.env.JEV_TEST_SPAWN_READY_FILE;
       fs.writeFileSync(ready, JSON.stringify(response.result));
       const gate = setInterval(() => {

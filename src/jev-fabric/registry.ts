@@ -54,14 +54,48 @@ export class DurableTaskRegistry {
     return path.join(home, `.fabric-output-filter-${createHash("sha256").update(jobId).digest("hex")}`);
   }
 
+  async #persistPolicy(home: string, jobId: string, filtered: boolean): Promise<void> {
+    const target = this.#policyFile(home, jobId);
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      const file = await fs.promises.open(temporary, "wx", 0o600);
+      try {
+        await file.writeFile(filtered ? "filtered\n" : "unfiltered\n");
+        await file.sync();
+      } finally { await file.close(); }
+      // Publish only complete, synced provenance, never an initializing file.
+      try { await fs.promises.link(temporary, target); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const existing = await this.outputPolicy(home, jobId);
+        if (existing === undefined || (filtered && !existing)) throw new Error("Conflicting durable task output policy");
+      }
+      const directory = await fs.promises.open(home, "r");
+      try { await directory.sync(); } finally { await directory.close(); }
+    } finally { await fs.promises.rm(temporary, { force: true }); }
+  }
+
   async protect(home: string, jobId: string): Promise<void> {
-    try { await fs.promises.writeFile(this.#policyFile(home, jobId), "filtered\n", { flag: "wx", mode: 0o600 }); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    await this.#persistPolicy(home, jobId, true);
+  }
+
+  /** Persist explicit provenance for unfiltered launches too. Absence is not
+   * permission: a backend can be listed before its launch receipt reaches Pi. */
+  async allowUnfiltered(home: string, jobId: string): Promise<void> {
+    await this.#persistPolicy(home, jobId, false);
+  }
+
+  async outputPolicy(home: string, jobId: string): Promise<boolean | undefined> {
+    try {
+      const policy = await fs.promises.readFile(this.#policyFile(home, jobId), "utf8");
+      if (policy === "filtered\n") return true;
+      if (policy === "unfiltered\n") return false;
+      throw new Error("Invalid durable task output policy; refusing adoption");
+    } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
   }
 
   async isProtected(home: string, jobId: string): Promise<boolean> {
-    try { await fs.promises.lstat(this.#policyFile(home, jobId)); return true; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+    return await this.outputPolicy(home, jobId) === true;
   }
 
   async add(record: DurableTaskRecord): Promise<void> {

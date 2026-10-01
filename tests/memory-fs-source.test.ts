@@ -237,6 +237,35 @@ describe("runtime memory source wiring", () => {
     return created as MemoryProvider;
   };
 
+  it.each(["missing-root", "unreadable-subtree", "unreadable-file"])("astra-4 source-qualified recall reports incomplete archives on %s", async (failure) => {
+    const root = track(rootDir("unreadable"));
+    const missingRoot = path.join(root, "missing");
+    writeSessionFile(root, "good.jsonl", recordsFor("good-archive", "/work", ["archive needle"]));
+    const blockedDir = path.join(root, "blocked");
+    const blockedFile = writeSessionFile(blockedDir, "blocked.jsonl", recordsFor("blocked-archive", "/work", ["archive needle private"]));
+    const readdir = fs.readdirSync.bind(fs);
+    const open = fs.openSync.bind(fs);
+    // Deterministic across privileged test users and Windows; emulate the OS
+    // errors at the filesystem boundary, not adapter/engine return values.
+    const directorySpy = vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, options: any) => {
+      if (failure === "unreadable-subtree" && String(file) === blockedDir) throw Object.assign(new Error("private path must not leak"), { code: "EACCES" });
+      return readdir(file, options);
+    }) as typeof fs.readdirSync);
+    const fileSpy = vi.spyOn(fs, "openSync").mockImplementation((file, ...args) => {
+      if (failure === "unreadable-file" && String(file) === blockedFile) throw Object.assign(new Error("private path must not leak"), { code: "EACCES" });
+      return open(file, ...args);
+    });
+    try {
+      const provider = await installMemoryProvider(normalizeFabricConfig({ memory: { enabled: true, sources: [{ id: "archive", kind: "fs", root: failure === "missing-root" ? missingRoot : root }] } }));
+      const result = await provider.invoke("recall", { source: "archive", query: "archive needle" }, invocation()) as any;
+      expect(result.coverage.complete).toBe(false);
+      expect(JSON.stringify(result.coverage)).toContain("fs_source_unreadable");
+      expect(JSON.stringify(result)).not.toContain("private path must not leak");
+      if (failure !== "missing-root") expect(result.hits.map((hit: any) => hit.sessionId)).toContain("good-archive");
+      else expect(result.total).toBe(0);
+    } finally { directorySpy.mockRestore(); fileSpy.mockRestore(); }
+  });
+
   it("routes source-qualified recall through the configured fs source", async () => {
     const root = track(rootDir("wiring"));
     writeSessionFile(root, "exported.jsonl", recordsFor("wired-session", "/work", ["wired needle"]));

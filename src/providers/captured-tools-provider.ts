@@ -169,8 +169,12 @@ export class CapturedToolsProvider implements FabricProvider {
     // is captured BEFORE tool_result redaction/recovery (and cwd stays scoped).
     // Tools with prepareArguments use Fabric's wrapper: the registry already
     // prepared the authorized arguments; native dispatch would prepare twice.
-    if (native.executeTool && native.tools?.some((tool) => tool.name === entry.name) &&
-        !isPiShellToolName(entry.name) && !wrappedTool.prepareArguments) {
+    // On a native host, its live callable set is authoritative even when
+    // shell/prepared-argument adapters need the legacy execution boundary.
+    if (native.executeTool && !native.tools?.some((tool) => tool.name === entry.name)) {
+      throw new Error(`Captured tool ${entry.name} is unavailable in the native callable tool set`);
+    }
+    if (native.executeTool && !isPiShellToolName(entry.name) && !wrappedTool.prepareArguments) {
       const activeBefore = runner.getActiveTools();
       const outcome = await native.executeTool(entry.name, args, {
         ...(context.signal ? { signal: context.signal } : {}),

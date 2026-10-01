@@ -8,6 +8,7 @@ import type { DurableShellBridge } from "../jev-fabric/bridge.js";
 import type { JevFabricServe } from "../jev-fabric/serve.js";
 
 const DAY_MS = 24 * 3_600_000;
+const OWNER_RECEIPT_GRACE_MS = 250;
 const id = { type: "string", minLength: 1, maxLength: 128, description: "Session ID from sessions.open (`s-…` for session lifetime). Output reads require a child opened here; use tasks.* for durable batch output." };
 const idOnly = { type: "object", properties: { id }, required: ["id"], additionalProperties: false };
 const waitMs = { type: "integer", minimum: 1, maximum: 300000, description: "Long-poll ceiling; ready evidence returns at once. Never stops the child." };
@@ -68,13 +69,16 @@ type Opened = { id: string; lifetime: "session" | "durable"; label?: string; own
 /**
  * Interactive children through jev-fabric's serve protocol: the same verbs,
  * records and lifetimes as the jev-fabric CLI and clients (docs/composition.md
- * in jev-fabric). One serve connection per Pi session owns every `session`
- * child; a Jev program's session children end with that program.
+ * in jev-fabric). Session launches use isolated connections so a withheld
+ * receipt can be torn down without stopping another owner's children.
  */
 export class SessionsProvider implements FabricProvider {
   readonly name = "sessions";
   readonly description = "Interactive jev-fabric children: open, write, read, wait and stop";
   #serve: Promise<JevFabricServe> | undefined;
+  readonly #connections = new Set<Promise<JevFabricServe>>();
+  readonly #launchConnections = new Map<string, Set<Promise<JevFabricServe>>>();
+  readonly #jobConnections = new Map<string, JevFabricServe>();
   readonly #opened = new Map<string, Opened>();
   #closed = false;
   readonly #allowedTools = readChildToolAllowlist();
@@ -98,20 +102,40 @@ export class SessionsProvider implements FabricProvider {
     return descriptors.find(d => d.name === name);
   }
 
-  #connect(): Promise<JevFabricServe> {
+  #connect(isolatedOwner?: string): Promise<JevFabricServe> {
     if (this.#closed) return Promise.reject(new Error("Sessions provider is closed"));
-    this.#serve ??= (async () => {
+    if (isolatedOwner === undefined && this.#serve) return this.#serve;
+    const pending = (async () => {
       const [resolution, { JevFabricServe }] = await Promise.all([this.bridge.resolve("sessions"), import("../jev-fabric/serve.js")]);
       const serve = await JevFabricServe.open(resolution.path, { home: this.bridge.home, cwd: this.options.cwd, timeoutMs: DAY_MS });
       // A lost connection took its session children with it; the next call reconnects.
       void serve.exited.then(() => {
-        for (const [key, opened] of this.#opened) if (opened.lifetime === "session") this.#opened.delete(key);
-        this.#serve = undefined;
+        for (const [key, opened] of this.#opened) if (opened.lifetime === "session" && this.#jobConnections.get(key) === serve) {
+          this.#opened.delete(key);
+          this.#jobConnections.delete(key);
+        }
+        this.#connections.delete(pending);
+        if (isolatedOwner !== undefined) {
+          const connections = this.#launchConnections.get(isolatedOwner);
+          connections?.delete(pending);
+          if (!connections?.size) this.#launchConnections.delete(isolatedOwner);
+        }
+        if (this.#serve === pending) this.#serve = undefined;
       });
       return serve;
     })();
-    this.#serve.catch(() => { this.#serve = undefined; });
-    return this.#serve;
+    this.#connections.add(pending);
+    if (isolatedOwner === undefined) this.#serve = pending;
+    else {
+      let connections = this.#launchConnections.get(isolatedOwner);
+      if (!connections) this.#launchConnections.set(isolatedOwner, connections = new Set());
+      connections.add(pending);
+    }
+    void pending.catch(() => {
+      this.#connections.delete(pending);
+      if (this.#serve === pending) this.#serve = undefined;
+    });
+    return pending;
   }
 
   async invoke(name: string, args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
@@ -131,7 +155,7 @@ export class SessionsProvider implements FabricProvider {
     if ((name === "read" || name === "events") && !this.#opened.has(job)) {
       throw new Error("Session output is available only for children opened here; use tasks for durable batch jobs");
     }
-    const serve = await this.#connect();
+    const serve = this.#jobConnections.get(job) ?? await this.#connect();
     switch (name) {
       case "write": return serve.request("write", { job, text: args.text }, context.signal);
       case "closeInput": return serve.request("closeInput", { job }, context.signal);
@@ -159,14 +183,22 @@ export class SessionsProvider implements FabricProvider {
     }, context);
     const timeoutMs = typeof admitted.timeout === "number" ? Math.min(DAY_MS, Math.ceil(admitted.timeout * 1000)) : (args.timeoutMs ?? 3_600_000);
     const durable = args.durable === true;
-    const serve = await this.#connect();
+    const serve = await this.#connect(durable ? undefined : context.parentToolCallId);
     throwIfAborted(context.signal);
     if (this.#closed || this.#retiredOwners.has(context.parentToolCallId)) throw new Error("Session launch owner ended");
     if (this.options.shellOverride()) throw new Error("Interactive sessions would bypass bash shell protection");
     const fields = { argv, cwd, timeoutMs, ...pick(args, ["label"]) };
     // A spawn cannot be cancelled at the wire: keep its response so ownership
     // is never lost between dispatch and recording. Compensate before rejecting.
-    const result = await serve.request<Record<string, unknown>>(durable ? "start" : "spawn", durable ? { ...fields, input: "pipe" } : fields);
+    // Abort/retirement closes this launch's isolated connection even if the
+    // spawn response never arrives. close() rejects the pending receipt and
+    // confirms backend exit; a late receipt still uses compensation below.
+    const abortLaunch = (): void => { if (!durable) void serve.close(); };
+    context.signal?.addEventListener("abort", abortLaunch, { once: true });
+    let result: Record<string, unknown>;
+    try {
+      result = await serve.request<Record<string, unknown>>(durable ? "start" : "spawn", durable ? { ...fields, input: "pipe" } : fields);
+    } finally { context.signal?.removeEventListener("abort", abortLaunch); }
     const opened: Opened = {
       id: String(result.id), lifetime: durable ? "durable" : "session",
       ...(typeof args.label === "string" ? { label: args.label } : {}),
@@ -174,8 +206,9 @@ export class SessionsProvider implements FabricProvider {
       ...(!durable && context.parentToolCallId.startsWith("jev:") ? { owner: context.parentToolCallId } : {}),
     };
     this.#opened.set(opened.id, opened);
+    this.#jobConnections.set(opened.id, serve);
     if (!durable && (context.signal?.aborted || this.#closed || this.#retiredOwners.has(context.parentToolCallId))) {
-      try { await serve.request("stop", { job: opened.id }); } catch { await serve.close(); }
+      try { await serve.request("stop", { job: opened.id }, AbortSignal.timeout(OWNER_RECEIPT_GRACE_MS)); } catch { await serve.close(); }
       this.#opened.delete(opened.id);
       throwIfAborted(context.signal);
       throw new Error("Session launch owner ended");
@@ -186,23 +219,31 @@ export class SessionsProvider implements FabricProvider {
   async invocationEnded(parentToolCallId: string): Promise<void> {
     if (!parentToolCallId.startsWith("jev:")) return;
     this.#retiredOwners.add(parentToolCallId);
-    await Promise.allSettled([...this.#launches].filter(([, owner]) => owner === parentToolCallId).map(([pending]) => pending));
+    const launches = [...this.#launches].filter(([, owner]) => owner === parentToolCallId).map(([pending]) => pending);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([Promise.allSettled(launches), new Promise(resolve => { timer = setTimeout(resolve, OWNER_RECEIPT_GRACE_MS); })]);
+    clearTimeout(timer);
+    // Do not await a stalled spawn receipt before initiating owner teardown.
+    if ([...this.#launches.values()].includes(parentToolCallId)) {
+      await Promise.allSettled([...(this.#launchConnections.get(parentToolCallId) ?? [])].map(async pending => (await pending).close()));
+    }
     const owned = [...this.#opened.values()].filter(opened => opened.owner === parentToolCallId);
-    if (!owned.length || !this.#serve) return;
-    const serve = await this.#serve.catch(() => undefined);
     await Promise.allSettled(owned.map(async opened => {
-      try { await serve?.request("stop", { job: opened.id }); } catch { await serve?.close(); }
+      const serve = this.#jobConnections.get(opened.id);
+      try { await serve?.request("stop", { job: opened.id }, AbortSignal.timeout(OWNER_RECEIPT_GRACE_MS)); } catch { await serve?.close(); }
       this.#opened.delete(opened.id);
     }));
   }
 
   async close(): Promise<void> {
     this.#closed = true;
+    // Initiate teardown before observing pending launches. A missing receipt
+    // must never hold the connection (and its real children) open indefinitely.
+    await Promise.allSettled([...this.#connections].map(async pending => (await pending).close()));
     await Promise.allSettled(this.#launches.keys());
-    const serve = await this.#serve?.catch(() => undefined);
     this.#opened.clear();
-    // Ending the connection stops its session children; durable jobs stay in their store.
-    await serve?.close();
+    this.#jobConnections.clear();
+    this.#launchConnections.clear();
   }
 }
 

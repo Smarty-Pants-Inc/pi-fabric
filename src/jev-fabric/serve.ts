@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
 const BANNER_TIMEOUT_MS = 15_000;
-const CLOSE_GRACE_MS = 5_000;
+const CLOSE_GRACE_MS = 500;
 const LINE_MAX_CHARS = 2 * 1024 * 1024;
 
 export interface JevFabricBanner {
@@ -48,6 +48,7 @@ export class JevFabricServe {
         env: { ...(options.env ?? process.env), JEV_FABRIC_HOME: options.home },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
+        detached: process.platform !== "win32",
       });
       let stderr = "";
       let serve: JevFabricServe | undefined;
@@ -136,8 +137,18 @@ export class JevFabricServe {
 
   /** Ends the connection: jev-fabric stops its session children; durable jobs are untouched. */
   async close(): Promise<void> {
-    if (!this.#closed) this.#child.stdin.end();
-    const timer = setTimeout(() => this.#child.kill("SIGKILL"), CLOSE_GRACE_MS);
+    if (!this.#closed) {
+      this.#child.stdin.end();
+      this.#fail(new JevFabricServeError("jev-fabric connection closed by owner", null));
+    }
+    // A delayed wire receipt cannot postpone EOF. If the backend does not
+    // confirm exit promptly, terminate only its recorded, isolated group.
+    const timer = setTimeout(() => {
+      try {
+        if (process.platform !== "win32" && this.#child.pid) process.kill(-this.#child.pid, "SIGKILL");
+        else this.#child.kill("SIGKILL");
+      } catch { /* an exit raced the grace timer */ }
+    }, CLOSE_GRACE_MS);
     timer.unref?.();
     await this.exited;
     clearTimeout(timer);

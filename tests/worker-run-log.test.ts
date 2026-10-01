@@ -223,6 +223,128 @@ process.stdin.on("end", () => {
 });
 
 describe("worker run log", () => {
+  it("retries a single Windows EPERM replacement failure and commits the compacted log", () => {
+    const text = write(capEvents("retry replacement payload").events, true, false).text;
+    const file = logFile(text);
+    const rename = fs.renameSync;
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (spy.mock.calls.length === 1) throw Object.assign(new Error("injected EPERM replacement"), { code: "EPERM" });
+      rename(from, to);
+    });
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.compactionSkipped).toBeUndefined();
+      expect(outcome.compacted).toBe(1);
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(outcome.afterBytes).toBeLessThan(outcome.beforeBytes);
+    } finally { spy.mockRestore(); }
+    expect(fs.readFileSync(file, "utf8")).not.toBe(text);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  });
+
+  it("closes every owned source/temp descriptor after fsync and before replacement", () => {
+    const text = write(capEvents("closed source at rename").events, true, false).text;
+    const file = logFile(text);
+    const open = fs.openSync;
+    const close = fs.closeSync;
+    const rename = fs.renameSync;
+    const owned = new Set<number>();
+    const synced: number[] = [];
+    const fsync = fs.fsyncSync;
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation((name, flags, mode) => {
+      const fd = open(name, flags, mode);
+      owned.add(fd);
+      return fd;
+    });
+    const closeSpy = vi.spyOn(fs, "closeSync").mockImplementation((fd) => {
+      close(fd);
+      owned.delete(fd);
+    });
+    const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => { fsync(fd); synced.push(fd); });
+    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      expect(synced).toHaveLength(2);
+      expect(owned.size).toBe(0);
+      rename(from, to);
+    });
+    try {
+      expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 1 });
+      expect(renameSpy).toHaveBeenCalledTimes(1);
+      expect(owned.size).toBe(0);
+    } finally { openSpy.mockRestore(); closeSpy.mockRestore(); syncSpy.mockRestore(); renameSpy.mockRestore(); }
+  });
+
+  it.each(["EPERM", "EBUSY", "EACCES", "EIO"])("retains byte-identical full log with a warning after persistent %s replacement failure", (code) => {
+    const text = write(capEvents("persistent replacement payload").events, true, false).text;
+    const file = logFile(text);
+    const original = fs.readFileSync(file);
+    const inode = fs.statSync(file).ino;
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    const sleep = vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+      throw Object.assign(new Error(`injected ${code} replacement`), { code });
+    });
+    const unlink = vi.spyOn(fs, "unlinkSync");
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome).toMatchObject({ compacted: 0, beforeBytes: original.length, afterBytes: original.length,
+        error: expect.stringContaining(code) });
+      expect(rename).toHaveBeenCalledTimes(code === "EIO" ? 1 : 8);
+      expect(sleep.mock.calls.map((call) => call[3])).toEqual(code === "EIO" ? [] : [25, 50, 75, 100, 125, 150, 175]);
+      expect(unlink.mock.calls.every(([name]) => name !== file)).toBe(true);
+    } finally { rename.mockRestore(); sleep.mockRestore(); clock.mockRestore(); unlink.mockRestore(); }
+    expect(fs.readFileSync(file).equals(original)).toBe(true);
+    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  });
+
+  it.each(["identity", "size", "mtime"])("rechecks source %s before retrying replacement", (change) => {
+    const text = write(capEvents("changed during retry").events, true, false).text;
+    const file = logFile(text);
+    const replace = fs.renameSync;
+    const original = fs.statSync(file);
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+      if (change === "size") fs.appendFileSync(file, "external append\n");
+      if (change === "mtime") fs.utimesSync(file, original.atime, new Date(original.mtimeMs + 1000));
+      if (change === "identity") {
+        const replacement = `${file}.external`;
+        fs.writeFileSync(replacement, text);
+        replace(replacement, file);
+      }
+      throw Object.assign(new Error("injected EPERM replacement"), { code: "EPERM" });
+    });
+    try {
+      expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 0,
+        error: expect.stringContaining("changed during terminal compaction") });
+      expect(rename).toHaveBeenCalledTimes(1);
+    } finally { rename.mockRestore(); }
+    expect(fs.readFileSync(file, "utf8")).toBe(change === "size" ? `${text}external append\n` : text);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  });
+
+  it("keeps the terminal work deadline while backing off persistent replacement contention", () => {
+    const text = write(capEvents("bounded replacement wait").events, true, false).text;
+    const file = logFile(text);
+    let elapsed = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const sleep = vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, ms) => {
+      elapsed += ms ?? 0;
+      return "timed-out";
+    });
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+      throw Object.assign(new Error("injected EPERM replacement"), { code: "EPERM" });
+    });
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome).toMatchObject({ compacted: 0, beforeBytes: Buffer.byteLength(text), afterBytes: Buffer.byteLength(text),
+        compactionSkipped: expect.stringContaining("MAX_TERMINAL_LOG_WORK_MS") });
+      expect(rename).toHaveBeenCalledTimes(6);
+      expect(elapsed).toBe(MAX_TERMINAL_LOG_WORK_MS);
+    } finally { rename.mockRestore(); sleep.mockRestore(); clock.mockRestore(); }
+    expect(fs.readFileSync(file, "utf8")).toBe(text);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  });
+
   it("uses a write-capable source for Windows-style FlushFileBuffers and real fsync", () => {
     const { events, end, message } = capEvents("durable paired result", true, { terminate: true });
     const text = write(events, true, false).text;

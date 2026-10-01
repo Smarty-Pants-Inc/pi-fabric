@@ -343,12 +343,37 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       held.size !== original.size || held.mtimeMs !== original.mtimeMs) {
       throw new Error("Run log changed during terminal compaction");
     }
-    // ponytail: retained-byte optimization, NOT fewer physical writes. Commit
-    // last: earlier failures preserve the full source. Old FDs retain the full
-    // terminal transcript. No live rewrite, journal, fake canonical, or
-    // post-rename fallible commit step that could misreport preservation.
-    checkWork();
-    fs.renameSync(temporary, filePath);
+    // Windows may reject replacement while our source handle is open. Both
+    // source and temp have been synced; release every owned handle before commit.
+    fs.closeSync(source);
+    source = undefined;
+    // ponytail: keep this native-source-worker module self-contained, like
+    // run-record's rename retry (a .js dependency cannot resolve under Node's
+    // direct .ts worker entry). Never unlink the destination to force success.
+    // Commit last: every failure retains the full source, with no post-rename
+    // fallible step that could misreport preservation. External readers may
+    // briefly contend, so retry only transient codes with bounded backoff.
+    for (let attempt = 1; ; attempt++) {
+      checkWork();
+      // Closing the handle and waiting must not relax the source-generation
+      // guard: recheck identity, size and mtime immediately before EACH attempt.
+      const latest = fs.lstatSync(filePath);
+      if (!latest.isFile() || latest.dev !== original.dev || latest.ino !== original.ino ||
+        latest.size !== original.size || latest.mtimeMs !== original.mtimeMs) {
+        throw new Error("Run log changed during terminal compaction");
+      }
+      try {
+        fs.renameSync(temporary, filePath);
+        break;
+      } catch (error) {
+        const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : undefined;
+        if (attempt >= 8 || !["EPERM", "EACCES", "EEXIST", "EBUSY"].includes(code ?? "")) throw error;
+        const delay = Math.min(25 * attempt, Math.max(0, MAX_TERMINAL_LOG_WORK_MS - (performance.now() - started)));
+        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay); } catch {
+          // Atomics.wait unavailable: retry immediately, still bounded by count/time.
+        }
+      }
+    }
     temporary = undefined;
     outcome.compacted = compacted;
     outcome.afterBytes = afterBytes;

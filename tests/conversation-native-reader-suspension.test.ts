@@ -20,6 +20,11 @@ const entry = (i: number, length = 5000) => ({
 const header = { type: "session", id: "session" };
 const source = (file: string) => ({ id: "reader", status: "running", logFile: file });
 const content = (snapshot: NativeConversationTranscript) => ({ messages: snapshot.messages, entries: snapshot.entries, streaming: snapshot.streaming, pendingMessages: snapshot.pendingMessages, leafId: snapshot.leafId, hasMore: snapshot.hasMore, hasNewer: snapshot.hasNewer, historyComplete: snapshot.historyComplete });
+// All source reads (classification, forward/backward pages, verification and
+// relocation) pass an explicit numeric position. Checkpoint restore instead uses
+// readFileSync(fd), whose internal readSync calls may omit that fifth argument.
+const sourceReadCalls = (reads: { mock: { calls: unknown[][] } }) =>
+  reads.mock.calls.filter((call) => typeof call[4] === "number");
 const trackCheckpoints = () => {
   const original = fs.mkdtempSync.bind(fs);
   return vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
@@ -124,6 +129,30 @@ describe("native reader identical-prefix paging", () => {
   });
 });
 describe("native reader disk suspension", () => {
+  it("counts real session/events source reads but excludes corrupt checkpoint reads", () => {
+    const temporary = trackCheckpoints();
+    const checkpoint = new NativeReaderCheckpoint({ calibration: true });
+    fs.writeFileSync(path.join(temporary.mock.results[0]!.value as string, "checkpoint"), "corrupt");
+    const reads = vi.spyOn(fs, "readSync");
+    expect(() => checkpoint.restore()).toThrow("reader checkpoint checksum mismatch");
+    expect(sourceReadCalls(reads)).toHaveLength(0);
+    for (const kind of ["session", "events"] as const) {
+      const file = path.join(workspace(), `${kind}.jsonl`);
+      fs.writeFileSync(file, jsonl(kind === "session" ? [header, entry(0, 16)]
+        : [{ type: "message_end", message: entry(0, 16).message }]));
+      reads.mockClear();
+      const reader = new NativeConversationReader();
+      expect(reader.read(source(file), false).messages).toEqual([entry(0, 16).message]);
+      // A real source reread would fail the zero-source-read assertions below,
+      // including classification at position zero, not just page reads.
+      expect(sourceReadCalls(reads).length).toBeGreaterThan(0);
+      expect(sourceReadCalls(reads)).toHaveLength(reads.mock.calls.length);
+      reader.clear();
+    }
+    reads.mockRestore();
+    checkpoint.dispose();
+  });
+
   it.each(["relocation", "unread"] as const)("preserves poisoned evidence across a failed %s replacement transaction", (phase) => {
     const file = path.join(workspace(), "session.jsonl");
     const input = { id: "reader", status: "running", sessionFile: file };
@@ -173,7 +202,7 @@ describe("native reader disk suspension", () => {
       const unavailable = reader.read(input, false);
       expect(unavailable.messages).toEqual([]);
       expect(unavailable.error).toContain("Unable to restore reader history");
-      expect(rereads).not.toHaveBeenCalled();
+      expect(sourceReadCalls(rereads)).toHaveLength(0);
       rereads.mockRestore();
     }
     reader.clear();
@@ -321,7 +350,7 @@ describe("native reader disk suspension", () => {
     expect(failed.unavailable?.sessionFile).toBe(true);
     expect(failed.error).toContain("Unable to restore reader history");
     expect(reader.suspended).toBe(true);
-    expect(reads.mock.calls.length).toBe(0);
+    expect(sourceReadCalls(reads)).toHaveLength(0);
     reader.clear();
   });
   it.each(["grow", "shrink", "timestamp"] as const)("bounds changing logical-history evidence and relocates current fences (%s)", (variant) => {
@@ -383,7 +412,7 @@ describe("native reader disk suspension", () => {
       expect(failed.error).toContain("Unable to restore reader history");
       expect(failed.unavailable?.sessionFile).toBe(true);
       expect(reader.suspended).toBe(true);
-      expect(failedReads.mock.calls).toHaveLength(0);
+      expect(sourceReadCalls(failedReads)).toHaveLength(0);
       failedReads.mockRestore();
     }
     fs.writeFileSync(checkpoint, checkpointBytes);
@@ -407,7 +436,7 @@ describe("native reader disk suspension", () => {
       const failedReads = vi.spyOn(fs, "readSync");
       expect(reader.read(input, false).error).toContain("Unable to restore reader history");
       expect(reader.last!.messages).toEqual([]);
-      expect(failedReads.mock.calls).toHaveLength(0);
+      expect(sourceReadCalls(failedReads)).toHaveLength(0);
       failedReads.mockRestore();
     }
     fresh.clear();

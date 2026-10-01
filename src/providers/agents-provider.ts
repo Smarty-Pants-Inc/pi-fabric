@@ -1321,7 +1321,7 @@ export class AgentsProvider implements FabricProvider {
           return this.actorManager.readLog(actor.id, {
             type,
             lines,
-            ...(runId ? { runId } : {}),
+            ...(runId !== undefined ? { runId } : {}),
             ...cursor,
           });
         } catch (error) {

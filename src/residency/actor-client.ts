@@ -1,16 +1,21 @@
 import { randomUUID } from "node:crypto";
+import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import {
   abandonResidentRequest,
+  ResidentOutcomeUnknownError,
+  readResidentRequestDecision,
+  registerResidentCancellation,
   RESIDENT_HOST_FORMAT,
   residentHostStateNote,
   residentRoot,
   sleepUnlessAborted,
   type ResidentCommand,
   type ResidentCommandResponse,
+  type ResidentHostOwner,
 } from "./protocol.js";
 
 const COMMAND_TIMEOUT_MS = 30_000;
@@ -36,7 +41,7 @@ export class ResidentActorClient {
   readonly #ownerPath: string;
   readonly #residencyDir: string;
 
-  constructor(meshRoot: string, rootId: string) {
+  constructor(meshRoot: string, rootId: string, readonly commandTimeoutMs = COMMAND_TIMEOUT_MS) {
     this.#rootId = rootId;
     const residencyDir = residentRoot(meshRoot, rootId);
     this.#residencyDir = residencyDir;
@@ -79,17 +84,23 @@ export class ResidentActorClient {
   }
 
   async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    if (readJson<ResidentHostOwner>(this.#ownerPath)?.requestFence !== 1) {
+      throw new Error("Root resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
+    }
+    throwIfAborted(signal);
+    registerResidentCancellation(signal, this.#residencyDir, command);
     fs.mkdirSync(this.#requestsPath, { recursive: true });
-    writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
-    const deadline = Date.now() + COMMAND_TIMEOUT_MS;
     try {
+      writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command);
+      const deadline = Date.now() + this.commandTimeoutMs;
       while (Date.now() < deadline) {
         if (signal?.aborted) throw new Error("Resident host actor request was aborted");
         const response = readJson<ResidentCommandResponse>(responsePath);
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           fs.rmSync(responsePath, { force: true });
           if (!response.ok) throw new Error(response.error ?? "Resident host rejected actor request");
+          if (command.operation === "createActor" && !response.actor) throw new Error("Resident host returned no created actor");
           return response;
         }
         const owner = readJson<{ pid?: number }>(this.#ownerPath);
@@ -99,7 +110,15 @@ export class ResidentActorClient {
       const note = residentHostStateNote(this.#residencyDir);
       throw new Error(`Timed out waiting for resident host actor response (${command.operation})${note ? `: ${note}` : ""}`);
     } catch (error) {
-      abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
+      let decision;
+      try {
+        decision = abandonResidentRequest(this.#requestsPath, this.#responsesPath, command.requestId);
+      } catch (fenceError) {
+        let known;
+        try { known = readResidentRequestDecision(this.#residencyDir, command.requestId); } catch { /* unreadable fence */ }
+        throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);
+      }
+      if (decision.state === "committed") throw new ResidentOutcomeUnknownError(command, decision, error, signal);
       throw error;
     }
   }

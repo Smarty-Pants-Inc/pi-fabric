@@ -508,7 +508,7 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false }: { asRegistryOwner?: boolean } = {},
+    { asRegistryOwner = false, beforeCommit }: { asRegistryOwner?: boolean; beforeCommit?: (id: string) => void | Promise<void> } = {},
   ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
@@ -528,8 +528,6 @@ export class ActorManager {
     if (sameName && sameName.status !== "stopped") {
       throw new Error(`A Fabric actor named ${name} is already active (${sameName.id})`);
     }
-    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
-    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
     if (!request.instructions.trim()) throw new Error("Actor instructions must not be empty");
     if (Buffer.byteLength(request.instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
@@ -570,6 +568,10 @@ export class ActorManager {
       throw new Error("This Fabric host cannot commit actor capability requirements");
     }
     const id = randomUUID().replaceAll("-", "");
+    // Fence after async validation/model preparation, before even predecessor removal.
+    await beforeCommit?.(id);
+    // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
+    if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
     const actorDirectory = path.join(this.#actorRoot, id);
     fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     const actor: ManagedActor = {

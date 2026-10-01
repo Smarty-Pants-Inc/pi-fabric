@@ -7,6 +7,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentHost } from "../src/residency/host.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import {
@@ -155,6 +156,71 @@ describe.skipIf(process.platform !== "linux")("resident release plan and idle-po
       expect(readHandoverJson<{ nonce: string }>(mainGenerationPath(f.config.residencyRoot))?.nonce).not.toBe(main.nonce);
       expect(processStartTime(main.pid)).toBe(main.processStartTime);
       expect(f.idle).not.toHaveBeenCalled();
+    } finally { await f.close(); }
+  });
+
+  it("cancels release for a terminal failed record with a lost live worker", async () => {
+    const f = await fixture();
+    const launch = ProcessTransport.prototype.launch;
+    const handles: Array<Awaited<ReturnType<typeof launch>>> = [];
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const handle = await launch.call(this, request); handles.push(handle);
+      return { ...handle, relaunchable: false, isAlive: async () => false, lostContact: () => "unreachable pane may still run" };
+    });
+    const stop = vi.spyOn(f.host.agents, "stop");
+    try {
+      const result = await f.host.agents.run({ task: "HANG until stopped", transport: "process" });
+      expect(result.status).toBe("failed");
+      expect(await handles[0]!.isAlive()).toBe(true);
+      await f.client.reconcileRelease();
+      await until(() => ["cancelled", "custody"].includes(f.state()?.phase ?? ""));
+      expect(f.state()?.phase).toBe("cancelled");
+      expect(f.state()?.error).toMatch(/worker|quiescence/i);
+      expect(f.idle).not.toHaveBeenCalled();
+      expect(fs.existsSync(handoverCustodyPath(f.config.residencyRoot, f.state()!.plan.id))).toBe(false);
+      expect(stop).not.toHaveBeenCalled();
+      expect(await handles[0]!.isAlive()).toBe(true);
+    } finally { stop.mockRestore(); spy.mockRestore(); for (const handle of handles) await handle.stop(); await f.close(); }
+  }, 20_000);
+
+  it("cancels release for a pending launch with no registered UI run", async () => {
+    const f = await fixture();
+    const launch = ProcessTransport.prototype.launch;
+    let reached = false; let releaseLaunch!: () => void;
+    const gate = new Promise<void>(resolve => { releaseLaunch = resolve; });
+    const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      reached = true; await gate; return launch.call(this, request);
+    });
+    const spawning = f.host.agents.spawn({ task: "pending launch", transport: "process" });
+    try {
+      await until(() => reached);
+      expect(f.host.agents.listForUi()).toEqual([]);
+      await f.client.reconcileRelease();
+      await until(() => ["cancelled", "custody"].includes(f.state()?.phase ?? ""));
+      expect(f.state()?.phase).toBe("cancelled");
+      expect(f.state()?.error).toMatch(/pending launch/);
+      expect(f.idle).not.toHaveBeenCalled();
+      expect(fs.existsSync(handoverCustodyPath(f.config.residencyRoot, f.state()!.plan.id))).toBe(false);
+    } finally { releaseLaunch(); await spawning; spy.mockRestore(); await f.close(); }
+  });
+
+  it.each(["unresolved", "live", "unknown", "nested"])("cancels release for an earlier host's %s run obligation", async (kind) => {
+    const f = await fixture();
+    try {
+      const run = path.join(f.config.residencyRoot, "runs", "earlier-host"); fs.mkdirSync(run, { recursive: true });
+      fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "failed", transport: "process", sessionId: kind === "live" ? String(process.pid) : "999999999" }));
+      if (kind === "unresolved") fs.writeFileSync(path.join(run, "unresolved-worker.json"), "{}");
+      if (kind === "unknown") fs.writeFileSync(path.join(run, "status.json"), "corrupt");
+      if (kind === "nested") {
+        const nested = path.join(run, "nested", "survivor"); fs.mkdirSync(nested, { recursive: true });
+        fs.writeFileSync(path.join(nested, "unresolved-worker.json"), "{}");
+      }
+      await f.client.reconcileRelease();
+      await until(() => ["cancelled", "custody"].includes(f.state()?.phase ?? ""));
+      expect(f.state()?.phase).toBe("cancelled");
+      expect(f.idle).not.toHaveBeenCalled();
+      expect(fs.existsSync(run)).toBe(true);
+      expect(fs.existsSync(handoverCustodyPath(f.config.residencyRoot, f.state()!.plan.id))).toBe(false);
     } finally { await f.close(); }
   });
 

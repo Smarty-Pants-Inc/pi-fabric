@@ -81,8 +81,9 @@ function captureDescendants(attempt: Attempt): void {
 function ownedAlive(attempt: Attempt): OwnedProcess[] {
   return processRows().filter((row) => row.state !== "Z" && attempt.processes.get(row.pid)?.processStartTime === row.processStartTime);
 }
-/** Only children/descendants of THIS attempt, with observed birth identities.
- * TERM is not an exit receipt. Do not retry until every captured process exited.
+/** Best-effort stop of birth-validated, observed attempt processes only.
+ * Neither sampling nor a free host fence proves complete membership/exit.
+ * This cleanup must never authorize a fallback after a spawned target.
  */
 async function stopAttempt(attempt: Attempt): Promise<void> {
   if (process.platform !== "linux") { attempt.child.kill("SIGTERM"); await attempt.exit; return; }
@@ -255,6 +256,7 @@ async function supervise(configPath: string): Promise<void> {
         process.exitCode = exit.code ?? 1;
         return;
       }
+      let fallbackPublicationAttempted = false;
       try {
         await assertFenceFree(inode);
         // Native failure-proof seam: an inert, bounded pause with the launcher
@@ -263,10 +265,12 @@ async function supervise(configPath: string): Promise<void> {
         if (Number.isInteger(proofDelay) && proofDelay > 0 && proofDelay <= 10_000) await delay(proofDelay);
         let failure: unknown;
         let terminalPublicationAttempted = false;
+        let targetAttempted = false;
         if (exit.code === 0 && !exit.signal && mainGenerationCurrent(root, plan.main)) {
           try {
             validateLaunchSpec(plan.target);
             writeHandoverState(root, plan, "starting");
+            targetAttempted = true;
             attempt = start(plan.target, plan, "target");
             await ready(attempt, plan, plan.target, "target");
             if (!mainGenerationCurrent(root, plan.main)) throw new Error("Main lost at terminal release boundary");
@@ -289,8 +293,13 @@ async function supervise(configPath: string): Promise<void> {
               await attempt.exit; process.exitCode = 1; return;
             }
             failure = error;
-            await stopAttempt(attempt);
-            await assertFenceFree(inode);
+            if (targetAttempted) {
+              await stopAttempt(attempt);
+              // Sampled ancestry cannot prove membership after reparenting.
+              // Scope cut: after attempting B, cleanup never authorizes A
+              // fallback. Containment/exit receipts are a separate change.
+              throw new Error(`Resident target membership/exit is unproven; fallback blocked: ${failure instanceof Error ? failure.message : String(failure)}`);
+            }
           }
         } else failure = new Error("Main lost or A did not release cleanly; supervised A recovery");
         if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
@@ -298,9 +307,20 @@ async function supervise(configPath: string): Promise<void> {
         validateLaunchSpec(plan.previous);
         attempt = start(plan.previous, plan, "fallback");
         await ready(attempt, plan, plan.previous, "fallback");
+        fallbackPublicationAttempted = true;
         writeHandoverState(root, plan, "fallback", failure instanceof Error ? failure.message : String(failure));
         trace("handover-fallback", { transaction: plan.id, pid: attempt.child.pid, release: plan.previous.releaseRoot });
       } catch (error) {
+        if (fallbackPublicationAttempted) {
+          // The fallback rename may already have released A's business gate.
+          // Mirror target terminal uncertainty: keep the owned handle and do
+          // not overwrite an exposed terminal state with blocked or replay it.
+          trace("handover-terminal-uncertain", { transaction: plan.id, kind: "fallback", pid: attempt.child.pid,
+            reason: error instanceof Error ? error.message : String(error) });
+          if (custodyFd !== undefined) { fs.closeSync(custodyFd); custodyFd = undefined; }
+          while (!attempt.exited && !stopping) { captureDescendants(attempt); await delay(50); }
+          await attempt.exit; process.exitCode = 1; return;
+        }
         // Unknown fence/termination and failed fallback are explicit blocked
         // outcomes. No loop, and no fabricated service success.
         if (!attempt.exited) await stopAttempt(attempt).catch(() => undefined);

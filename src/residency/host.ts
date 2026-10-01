@@ -884,6 +884,7 @@ export class ResidentHost {
       await Promise.all([...this.#publications]);
       if (this.#publicationFailed) throw new Error("Resident release has unconfirmed public results/deliveries");
       await this.actors.checkpointForRelease();
+      await this.agents.checkpointForRelease();
       validateLaunchSpec(plan.previous); validateLaunchSpec(plan.target);
       writeHandoverState(this.config.residencyRoot, plan, "custody");
     } catch (error) {
@@ -1182,15 +1183,25 @@ function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaun
   if (launcher.pid !== process.ppid || !exactResidentProcess(launcher)) throw new Error("Resident launcher identity is uncertain");
   // host.ts and its built shared chunk both live one directory below dist.
   const loadedRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-  const spec = residentLaunchSpec(config, path.join(loadedRoot, "dist/residency/pi-entry.js"));
-  if (spec.digest !== process.env.PI_FABRIC_RESIDENT_SPEC_DIGEST) throw new Error("Resident loaded release does not match launcher snapshot");
+  // A bundled Pi executable is not a generic JS runtime. Reconstruct with
+  // the birth-validated parent launcher runtime, checked against its kernel exe.
+  if (fs.realpathSync(`/proc/${launcher.pid}/exe`) !== launcher.runtime) {
+    throw new Error("Resident launcher runtime identity is uncertain");
+  }
   const attempt = process.env.PI_FABRIC_RESIDENT_ATTEMPT ? JSON.parse(process.env.PI_FABRIC_RESIDENT_ATTEMPT) as ResidentHostLaunchContext["attempt"] : undefined;
+  let pinned: ResidentLaunchSpec | undefined;
   if (attempt) {
     const state = readHandoverJson<ResidentHandoverState>(handoverPath(config.residencyRoot));
-    const pinned = attempt.kind === "target" ? state?.plan.target : state?.plan.previous;
-    if (state?.plan.id !== attempt.id || pinned?.digest !== spec.digest || state.plan.launcher.token !== launcher.token) {
+    pinned = attempt.kind === "target" ? state?.plan.target : state?.plan.previous;
+    if (!["target", "fallback"].includes(attempt.kind) || state?.plan.id !== attempt.id || !pinned || state.plan.launcher.token !== launcher.token) {
       throw new Error("Resident successor is not the launcher's owned attempt");
     }
+  }
+  // The successor's retained script runtime can differ from launcher A's.
+  // Its identity is already bound to the immutable custody plan.
+  const spec = residentLaunchSpec(config, path.join(loadedRoot, "dist/residency/pi-entry.js"), pinned?.runtime ?? launcher.runtime);
+  if (spec.digest !== process.env.PI_FABRIC_RESIDENT_SPEC_DIGEST || (pinned && pinned.digest !== spec.digest)) {
+    throw new Error("Resident loaded release does not match launcher snapshot");
   }
   return { launcher, spec, ...(attempt ? { attempt } : {}) };
 }

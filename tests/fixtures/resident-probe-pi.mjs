@@ -8,10 +8,13 @@ if (mode !== 'missing') emit({ type: 'fabric_resident_extension_ready', protocol
   runId: mode === 'run' ? 'other' : process.env.PI_FABRIC_PARENT_RUN,
   nonce: mode === 'nonce' ? 'other' : process.env.PI_FABRIC_RESIDENT_PROBE_NONCE,
   extension: mode === 'extension' ? '/other/index.js' : args[args.indexOf('-e') + 1] });
+let model; let thinkingLevel;
 const input = readline.createInterface({ input: process.stdin });
 input.on('line', line => {
   const frame = JSON.parse(line); emit({ type: 'probe_received', frame });
-  if (frame.type === 'get_state') emit({ type: 'response', command: frame.type, id: frame.id, success: true, data: {} });
+  if (frame.type === 'get_state') emit({ type: 'response', command: frame.type, id: frame.id, success: true, data: { model, thinkingLevel, isStreaming: false, isCompacting: false } });
+  else if (frame.type === 'set_model') { model = { provider: frame.provider, id: frame.modelId }; emit({ type: 'response', command: frame.type, id: frame.id, success: true }); }
+  else if (frame.type === 'set_thinking_level') { thinkingLevel = frame.level; emit({ type: 'response', command: frame.type, id: frame.id, success: true }); }
   else if (frame.type === 'prompt') throw Error('startup probe invoked inference');
 });
 input.on('close', () => process.exit(0));

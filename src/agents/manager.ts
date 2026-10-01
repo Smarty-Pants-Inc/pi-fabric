@@ -73,6 +73,7 @@ import type { BudgetLedgerState } from "./budget-ledger.js";
 import { readJsonlPage } from "../log-tail.js";
 import {
   canRemoveManagedRunRoot,
+  canRemoveTerminalRun,
   hasUnresolvedWorker,
   markUnresolvedWorker,
   heartbeatRunRoot,
@@ -1711,6 +1712,57 @@ export class AgentManager {
     const line = JSON.stringify({ ...entry, id: messageId, ts: Date.now() }) + "\n";
     fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
     return { queued: true, messageId };
+  }
+
+  /** Non-destructive receipt for a paused resident release boundary. A terminal
+   * UI record is not a worker exit. Unknown launches or saved trees veto custody.
+   */
+  async checkpointForRelease(): Promise<void> {
+    const obligations = (): boolean => this.#closing || this.#spawns.size > 0 || this.#launches.size > 0 ||
+      this.#queuedStarts.size > 0 || [...this.#queued.values()].some(q => !q.terminal || q.cleanupPending !== undefined);
+    if (obligations()) throw new Error("Agent release quiescence has pending launch/cleanup obligations");
+    const runs = [...this.#runs.values()];
+    if (runs.some(run => !run.settled || run.lostContact || run.settlementSaveFailure || hasUnresolvedWorker(run.runDirectory))) {
+      throw new Error("Agent release quiescence has an unresolved worker/result");
+    }
+    // Allow the ordinary status-before-process-exit window to finish naturally.
+    await Promise.all(runs.map(run => this.#waitForTransportExit(run)));
+    const transports = [...runs.map(run => run.transport), ...this.#unregisteredTransports];
+    for (const transport of transports) {
+      if (await transport.isAlive() || transport.lostContact?.() !== undefined) {
+        throw new Error("Agent release quiescence cannot confirm worker exit");
+      }
+    }
+    // Check preserved trees from previous hosts too. Reuse the conservative
+    // retention predicate without removing anything. Unknown external transport
+    // identities have no surviving handle, so are deliberately out of scope.
+    const started = performance.now();
+    const expired = () => performance.now() - started > 100;
+    const inspect = (directory: string, tracked: boolean, depth = 0): void => {
+      if (expired() || depth > 32 || !canRemoveTerminalRun(directory, expired)) {
+        throw new Error(`Agent release quiescence has an unresolved run tree: ${directory}`);
+      }
+      if (!tracked) {
+        const record = readRecord(path.join(directory, "status.json"));
+        if (record?.transport !== "process" || typeof record.sessionId !== "string" || !/^\d+$/.test(record.sessionId) || Number(record.sessionId) <= 0) {
+          throw new Error(`Agent release quiescence has unknown worker identity: ${directory}`);
+        }
+      }
+      const nested = path.join(directory, "nested");
+      if (fs.existsSync(nested)) for (const name of fs.readdirSync(nested)) inspect(path.join(nested, name), false, depth + 1);
+    };
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(this.#runRoot, { withFileTypes: true }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || runs.length) throw error;
+      entries = [];
+    }
+    for (const entry of entries) {
+      if (this.#managedTempRoot && entry.name === ".fabric-owner.json") continue;
+      if (!entry.isDirectory()) throw new Error("Agent release quiescence has unknown run-root contents");
+      inspect(path.join(this.#runRoot, entry.name), this.#runs.has(entry.name));
+    }
+    if (obligations()) throw new Error("Agent release quiescence changed while checking workers");
   }
 
   close(): Promise<void> {

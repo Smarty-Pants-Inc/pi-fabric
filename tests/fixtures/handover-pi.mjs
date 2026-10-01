@@ -12,6 +12,14 @@ const launcher = JSON.parse(process.env.PI_FABRIC_RESIDENT_LAUNCHER);
 const attempt = process.env.PI_FABRIC_RESIDENT_ATTEMPT ? JSON.parse(process.env.PI_FABRIC_RESIDENT_ATTEMPT) : undefined;
 const release = path.resolve(path.dirname(config.fabricExtensionPath), '..');
 if (attempt?.kind === 'target' && process.env.PI_FABRIC_TEST_TARGET_MODE === 'exit') process.exit(7);
+if (attempt?.kind === 'target' && process.env.PI_FABRIC_TEST_TARGET_MODE === 'fast-exit') {
+  const helper = spawn(process.execPath, ['-e', `import fs from 'node:fs';
+const birth = fs.readFileSync('/proc/' + process.pid + '/stat','utf8').split(')').at(-1).trim().split(/\\s+/)[19];
+fs.writeFileSync(${JSON.stringify(path.join(root, 'fixture-escaped.json'))}, JSON.stringify({pid:process.pid,birth}));
+setInterval(()=>{},1000);`], { detached: true, stdio: 'ignore', env: process.env });
+  helper.once('spawn', () => process.exit(7));
+}
+
 const fd = fs.openSync(path.join(root, 'host.lock'), fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
 try { execFileSync('flock', ['-x', '-n', '3'], { stdio: ['ignore', 'ignore', 'inherit', fd] }); }
 catch { fs.closeSync(fd); process.exit(0); }
@@ -39,6 +47,12 @@ if (attempt?.kind === 'target' && process.env.PI_FABRIC_TEST_TARGET_MODE === 'ha
     if (!state) return;
     if (attempt && state.plan.id === attempt.id && state.phase === (attempt.kind === 'target' ? 'complete' : 'fallback')) {
       fs.writeFileSync(path.join(root, 'fixture-service.json'), JSON.stringify({ pid: process.pid, config, attempt, at: Date.now() }));
+      if (attempt.kind === 'fallback' && process.env.PI_FABRIC_TEST_TARGET_MODE === 'fallback-uncertain') {
+        spawn(process.execPath, ['-e', `import fs from 'node:fs';
+const birth = fs.readFileSync('/proc/' + process.pid + '/stat','utf8').split(')').at(-1).trim().split(/\\s+/)[19];
+let ticks=0;const write=()=>fs.writeFileSync(${JSON.stringify(path.join(root, 'fixture-business.json'))},JSON.stringify({pid:process.pid,birth,ticks:++ticks}));
+write();setInterval(write,20);`], { detached: true, stdio: 'ignore', env: process.env });
+      }
       clearInterval(timer);
     }
     if (!attempt && state.phase === 'custody' && state.plan.old.pid === process.pid && state.plan.old.token === token) {

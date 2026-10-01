@@ -64,7 +64,7 @@ const assertDiskEncoding = (directory: string) => {
 };
 
 describe("MeshStore one-pass entry encoding", () => {
-  it("encodes retained entries once for put, delete and batch while keeping exact index bytes", async () => {
+  it("encodes retained entries once for cold put, delete and batch writers with exact index bytes", async () => {
     const directory = root();
     const store = new MeshStore(directory, 64 * 1024, 100);
     const keys = ["test/beta/z", "test/beta/A", "test/alpha/a", "solo", "single/segment"];
@@ -73,22 +73,68 @@ describe("MeshStore one-pass entry encoding", () => {
     })) });
     assertDiskEncoding(directory);
     const counts = countEntryEncodings();
-    await store.put({ key: "other/heartbeats/a", value: 1, identity });
+    await new MeshStore(directory, 64 * 1024, 100).put({ key: "other/heartbeats/a", value: 1, identity });
     for (const key of keys) expect(counts.get(key), key).toBe(1);
     assertDiskEncoding(directory);
     counts.clear();
-    await store.delete({ key: "other/heartbeats/a" });
+    await new MeshStore(directory, 64 * 1024, 100).delete({ key: "other/heartbeats/a" });
     for (const key of keys) expect(counts.get(key), key).toBe(1);
     expect(counts.has("other/heartbeats/a")).toBe(false);
     assertDiskEncoding(directory);
     counts.clear();
-    await store.writeBatch({ identity, ops: [{ kind: "put", key: "test/beta/z", value: [0, "雪😀"] },
+    await new MeshStore(directory, 64 * 1024, 100).writeBatch({ identity, ops: [{ kind: "put", key: "test/beta/z", value: [0, "雪😀"] },
       { kind: "delete", key: "test/beta/A" }, { kind: "put", key: "other/heartbeats/b", value: false }] });
     for (const key of [...keys.filter((key) => key !== "test/beta/A"), "other/heartbeats/b"]) {
       expect(counts.get(key), key).toBe(1);
     }
     expect(counts.has("test/beta/A")).toBe(false);
     assertDiskEncoding(directory);
+  });
+
+  it("reuses warm entry bytes but freshly reads and hashes all entries on every commit", async () => {
+    const directory = root();
+    const store = new MeshStore(directory, 64 * 1024, 100);
+    const key = "test/retained/a";
+    await store.put({ key, value: { text: '雪😀"\\\n', nested: [true, null] }, identity });
+    const retained = assertDiskEncoding(directory).entries[key]!;
+    const counts = countEntryEncodings();
+    const reads = vi.spyOn(fs, "readFileSync");
+    const updates = vi.spyOn(Object.getPrototypeOf(createHash("sha256")), "update");
+    const probe = async (write: () => Promise<unknown>) => {
+      counts.clear(); reads.mockClear(); updates.mockClear();
+      await write();
+      expect(counts.has(key)).toBe(false);
+      expect(reads.mock.calls.filter(([file]) => String(file) === path.join(directory, "state.json"))).toHaveLength(1);
+      // Reused bytes are inputs to a NEW hash on each commit, not a cached namespace digest.
+      expect(updates.mock.calls.filter(([bytes]) => Buffer.isBuffer(bytes) &&
+        bytes.equals(Buffer.from(stringify(retained), "utf8")))).toHaveLength(1);
+      assertDiskEncoding(directory);
+    };
+    await probe(() => store.put({ key: "other/heartbeats/a", value: 1, identity }));
+    await probe(() => store.delete({ key: "other/heartbeats/a" }));
+    await probe(() => store.writeBatch({ identity, ops: [
+      { kind: "put", key: "other/heartbeats/b", value: 2 },
+      { kind: "put", key: "other/heartbeats/c", value: 3 },
+    ] }));
+    expect(counts.get("other/heartbeats/b")).toBe(1);
+    expect(counts.get("other/heartbeats/c")).toBe(1);
+  });
+
+  it("re-encodes a changed own version, including delete and recreation in one batch", async () => {
+    const directory = root();
+    const store = new MeshStore(directory, 64 * 1024, 100);
+    const key = "test/changed/a";
+    await store.put({ key, value: "old", identity });
+    const before = assertDiskEncoding(directory).entries[key]!.version;
+    const counts = countEntryEncodings();
+    await store.writeBatch({ identity, ops: [
+      { kind: "put", key, value: "intermediate" }, { kind: "delete", key },
+      { kind: "put", key, value: { text: "new雪😀" } },
+    ] });
+    expect(counts.get(key)).toBe(1);
+    const state = assertDiskEncoding(directory);
+    expect(state.entries[key]!.value).toEqual({ text: "new雪😀" });
+    expect(state.entries[key]!.version).toBeGreaterThan(before);
   });
 
   it("preserves legacy envelope fields, entry order, escaped keys and empty namespaces", async () => {
@@ -134,7 +180,9 @@ describe("MeshStore one-pass entry encoding", () => {
     fs.writeFileSync(file, stringify(state));
     vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) =>
       String(target) === file ? frozen : (stat as (...args: unknown[]) => fs.Stats)(target, ...rest)) as typeof fs.statSync);
+    const counts = countEntryEncodings();
     await writer.put({ key: "other/heartbeats/a", value: 1, identity });
+    expect(counts.get(key)).toBe(1); // same entry version and copied marker/stat are NOT encoding authority
     expect(assertDiskEncoding(directory).readGeneration).not.toBe(marker);
     now += 2001;
     expect(reader.listAll("test/legacy/")[0]?.value).toBe("new");

@@ -1,5 +1,6 @@
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import type * as MontyNative from "@pydantic/monty/node";
 import { mainExecutionCeilingAbortReason, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { MAX_EXECUTOR_TIMEOUT_MS } from "../config.js";
@@ -54,6 +55,10 @@ export class MontyRuntime implements FabricKernelRuntime {
     const hostAbort = new AbortController();
     shareCancellationEffects(hostAbort.signal, options.signal);
     const tasks = new Set<Promise<unknown>>();
+    const responseToken = randomUUID();
+    let nextRequestId = 0;
+    const pendingReceipts = new Map<number, { id: number; args: Record<string, unknown> }>();
+    let nextResponseId = 0;
     const logs: string[] = [];
     const partial = { stdout: "", stderr: "" };
     let logChars = 0;
@@ -82,6 +87,7 @@ export class MontyRuntime implements FabricKernelRuntime {
     const stop = (reason: "aborted" | "timed_out"): void => {
       if (stopped) return;
       stopped = reason;
+      pendingReceipts.clear();
       hostAbort.abort(reason === "timed_out" ? executionDeadline.reason :
         mainExecutionCeilingAbortReason(options.signal) ?? new Error("Execution cancelled"));
       kill();
@@ -129,6 +135,7 @@ export class MontyRuntime implements FabricKernelRuntime {
       if (!Number.isSafeInteger(workerPid) || workerPid! <= 0) throw new Error("Monty native worker PID unavailable; refusing execution without hard cancellation");
       const dispatch = async (ref: string, original: Record<string, unknown>): Promise<unknown> => {
         checkDeadline();
+        const id = ++nextRequestId;
         if (tasks.size >= 256) throw new Error("Too many concurrent Monty host calls");
         const args = { ...original };
         if (isPiShellRef(ref) && Object.hasOwn(args, "settle") && typeof args.settle !== "boolean") {
@@ -147,21 +154,38 @@ export class MontyRuntime implements FabricKernelRuntime {
         try {
           const value = await task;
           checkDeadline();
-          const normalized = montyInput(normalizeMontyValue(value, true));
+          const normalized = normalizeMontyValue(value, true);
           checkDeadline();
-          options.onHostResultDelivered?.(args);
-          return normalized;
+          const responseId = ++nextResponseId;
+          pendingReceipts.set(responseId, { id, args });
+          // Returning to the SDK (or sending a native future resolution) is
+          // not admission. The guest unwraps this envelope and confirms it.
+          return montyInput({ id, responseId, __fabric_response_token: responseToken, value: normalized });
         }
         catch (error) {
           const exit = settle ? piBashExitMetadata(error) : undefined;
-          if (exit) return montyInput({ ok: false, ...exit, details: null, error: montyErrorText(error) });
+          if (exit) {
+            checkDeadline();
+            return montyInput({ id, responseId: ++nextResponseId, __fabric_response_token: responseToken, value: { ok: false, ...exit, details: null, error: montyErrorText(error) } });
+          }
           throw error;
         } finally { tasks.delete(task); }
       };
       class PayloadValues {}
       const attributes = new PayloadValues();
       for (const [key, value] of Object.entries(strings)) Object.defineProperty(attributes, key, { value, enumerable: true });
-      const bindings = montyBindings(native, dispatch);
+      const bindings = montyBindings(native, dispatch, (id, responseId) => {
+        if (stopped || hostAbort.signal.aborted) return;
+        if (executionDeadline.reached) { stop("timed_out"); return; }
+        if (!Number.isSafeInteger(id) || !Number.isSafeInteger(responseId)) return;
+        const receipt = pendingReceipts.get(responseId as number);
+        if (!receipt || receipt.id !== id) return;
+        // Delete before committing: duplicate/reentrant confirmations cannot
+        // consume twice, and teardown cannot revive an unconfirmed receipt.
+        pendingReceipts.delete(responseId as number);
+        options.onHostResultDelivered?.(receipt.args);
+      });
+      bindings.__fabric_response_token = responseToken;
       bindings.payloads = montyInput(strings);
       bindings.π = new native.ClassInstance(attributes, { name: "FabricPayloads", eagerAttrs: Object.keys(strings) });
       // Bootstrap separately so user traceback offsets remain exactly one wrapper line.
@@ -182,6 +206,7 @@ export class MontyRuntime implements FabricKernelRuntime {
       executionDeadline.clear();
       options.signal?.removeEventListener("abort", abort);
       const interrupted = result?.terminationReason !== "completed" || hostAbort.signal.aborted || tasks.size > 0;
+      pendingReceipts.clear();
       hostAbort.abort(new Error(result?.error ?? "Monty execution ended"));
       // Initiate pool closure first to prevent worker replacement. Native cleanup
       // is best effort and bounded: its failures must not replace the guest result.

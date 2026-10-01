@@ -83,6 +83,50 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
     expect(await run('return await tools.call(ref="mcp._123._tool", args={"n": 2})')).toMatchObject({ terminationReason: "completed", value: { ref: "fabric.$call", args: { ref: "mcp._123._tool", args: { n: 2 } } } });
   });
 
+  it("acknowledges a native response before guest continuation, not at callback return", async () => {
+    const receipt = vi.fn();
+    let firstArgs: Record<string, unknown> | undefined;
+    const result = await run('first = await schema.status(n=1)\nsecond = await schema.status(n=2)\nreturn [first, second]', async (_ref, args) => {
+      if (!firstArgs) firstArgs = args;
+      else expect(receipt).toHaveBeenCalledExactlyOnceWith(firstArgs);
+      return args.n;
+    }, { onHostResultDelivered: receipt });
+    expect(result).toMatchObject({ terminationReason: "completed", value: [1, 2] });
+    expect(receipt).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    'def factory():\n    return schema.status\nreturn await factory()()',
+    'saved = [schema.status]\nreturn await saved[0](**{"n": 2})',
+    'return f"{await schema.status()}"',
+    'def identity(value):\n    return value\nreturn identity(await schema.status())',
+  ])("admits native responses through nested/aliased call syntax: %s", async code => {
+    const receipt = vi.fn();
+    const result = await run(code, async () => "Unicode π\\r\\n", { onHostResultDelivered: receipt });
+    expect(result, result.error).toMatchObject({ terminationReason: "completed", value: "Unicode π\\r\\n" });
+    expect(receipt).toHaveBeenCalledOnce();
+  });
+
+  it("preserves built-in method calls and ordinary coroutine JSON-shaped results", async () => {
+    const value = { id: 1, responseId: 1, __fabric_response_token: "user data", value: "unchanged" };
+    const receipt = vi.fn();
+    const result = await run('async def observe():\n    result = await schema.status()\n    items = []\n    items.append(result)\n    return {key: item for key, item in items[0].items()}\nreturn await observe()', async () => value, { onHostResultDelivered: receipt });
+    expect(result, result.error).toMatchObject({ terminationReason: "completed", value });
+    expect(receipt).toHaveBeenCalledOnce();
+  });
+
+  it("correlates out-of-order native responses before gather continuation", async () => {
+    let releaseFirst!: () => void;
+    const first = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const receipt = vi.fn((args: Record<string, unknown>) => { if (args.n === 2) releaseFirst(); });
+    const result = await run('return await asyncio.gather(schema.status(n=1), schema.status(n=2))', async (_ref, args) => {
+      if (args.n === 1) await first;
+      return args.n;
+    }, { onHostResultDelivered: receipt });
+    expect(result, result.error).toMatchObject({ terminationReason: "completed", value: [1, 2] });
+    expect(receipt.mock.calls.map(([args]) => args.n)).toEqual([2, 1]);
+  });
+
   it("runs actual host calls concurrently via asyncio.gather", async () => {
     const calls: string[] = [];
     let release!: () => void;

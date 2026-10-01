@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { expectRound14Migration } from "./pr166-round14-policy.js";
 import { killsByPattern, scanCommand, wipesTmp } from "../src/core/pattern-kill.js";
 
 // R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
 // IDs/commands and the historical 102 false positives are unchanged.
 const round5IntentionalState = new Set<string>([]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  if (expectRound14Migration(command, result)) return;
   const intentional = round5IntentionalState.has(command);
   const originallyRefused = original.blocked === true || original.wipe === true || original.exhausted === true || original.overall === true;
   if (!intentional && !(originallyRefused && result.shellState === true)) expect("shellState" in result, command).toBe(false);

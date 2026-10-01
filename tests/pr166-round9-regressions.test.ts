@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { expectRound14Migration } from "./pr166-round14-policy.js";
 import { killsByPattern, scanCommand, wipesTmp } from "../src/core/pattern-kill.js";
 
 // DATA ONLY: command strings must NEVER be dispatched to a shell, subprocess or native tool.
@@ -239,6 +240,7 @@ function expectVerdict([id, command, verdict]: Case): void {
     ? { blocked: false, wipe: false, exhausted: false, shellState: true }
     : { blocked: verdict === "PID", wipe: verdict === "TMP", exhausted: false };
   const actual = scanCommand(command);
+  if (expectRound14Migration(command, actual)) return;
   expect(actual, id).toStrictEqual(expected);
   expect(Object.keys(actual).sort(), id).toStrictEqual(Object.keys(expected).sort());
   expect(killsByPattern(command), id).toBe(verdict === "PID" || verdict === "STATE");

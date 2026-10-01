@@ -196,6 +196,11 @@ function tokenize(source: string, budget: GuardBudget): Token[] {
         if (braces.pop()) throw new ShellStateRefused();
       } else if (braces.length && (char === "," || (char === "." && syntax[at + 1] === "."))) braces[braces.length - 1] = true;
     }
+    // A lexer-live subscripted assignment is not executable DATA or a scalar
+    // replacement. Reject before either pass can retain stale parent bindings;
+    // quoted/escaped NAME text never enters this lexical projection.
+    if (/^[A-Za-z_][A-Za-z0-9_]*\[/.test(braceSyntax) &&
+      (braceSyntax.includes("=") || !braceSyntax.includes("]"))) throw new ShellStateRefused();
     if (word && target) {
       // Admit only ordinary file targets and plain descriptor duplication. These
       // are the ORIGINAL lexer patterns, never expanded executable/target text.
@@ -608,7 +613,7 @@ function sourceScopes(tokens: Token[], budget: GuardBudget): SourceScopes {
 }
 
 /** The command words after assignments and wrappers (sudo, env, timeout, xargs, …), and whether xargs feeds them. */
-function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>, budget: GuardBudget, argv: (words: Word[]) => Word[]): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined; chdirs: Word[]; assignments: Word[]; wrapped: boolean } {
+function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word }>, budget: GuardBudget, argv: (words: Word[]) => Word[]): { words: Word[]; fedByXargs: boolean; argFile: Word | undefined; chdirs: Word[]; assignments: Word[]; wrapped: boolean; outputProved: boolean } {
   let words = stageWords;
   let fedByXargs = false;
   let argFile: Word | undefined;
@@ -616,11 +621,13 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
   const assignments: Word[] = [];
   let environment = false;
   let wrapped = false;
+  let outputProved = true;
   for (;;) {
     budget.spend(4 * words.length + 1);
     while (words[0] && (words[0].assignment || (environment && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(words[0].text)))) {
       budget.spend(words.length + 1);
       assignments.push(words[0]);
+      if (wrapped) outputProved = false; // env assignment argv can change invocation/startup.
       words = words.slice(1);
     }
     environment = false;
@@ -634,7 +641,7 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
       // assignment syntax. Refuse before either pass can bind wrapper argv in
       // the parent; genuine leading assignment-only commands remain supported.
       if (wrapped && !words.length) throw new ShellStateRefused();
-      return { words, fedByXargs, argFile, chdirs, assignments, wrapped };
+      return { words, fedByXargs, argFile, chdirs, assignments, wrapped, outputProved };
     }
     // Wrapper option values are actual argv: unquoted empty fields disappear before
     // deciding which word -C/-D consumes, and quoted values remain one field.
@@ -643,12 +650,18 @@ function unwrap(stageWords: Word[], scripts: Array<{ text: string; source: Word 
     // receiver either. Never return its empty words as parent assignment proof.
     if (prefix === "command" && words[1] && /^-[a-zA-Z]*[vV]/.test(words[1].text)) throw new ShellStateRefused();
     if (prefix === "xargs") fedByXargs = true;
-    if (!["!", "{", "then", "do", "else", "if", "elif", "while", "until"].includes(prefix)) wrapped = true;
+    if (!["!", "{", "then", "do", "else", "if", "elif", "while", "until"].includes(prefix)) {
+      wrapped = true;
+      // Dangerous child detection is not proof that a wrapper executed. Only
+      // option-free env/command/builtin belongs to the existing output subset.
+      outputProved &&= ["env", "command", "builtin"].includes(prefix) && assignments.length === 0;
+    }
     words = words.slice(1);
     while (words[0]?.text.startsWith("-") && words[0].text.length > 1) {
       budget.spend(words.length + words[0].text.length + 1);
       const flag = words[0].text;
       if (flag === "--") { words = words.slice(1); break; }
+      outputProved = false; // No general wrapper option/success interpreter.
       let value: string | undefined;
       let takes = false;
       // review/astra F7 on #105: remember that the option is env's split string (-S), whatever its spelling.
@@ -780,8 +793,14 @@ function checkShellReceiver(stage: Command, scopes: SourceScopes, context: Conte
     // Only explicit lexical for NAME in LIST belongs to the existing subset.
     if (name === "for" && !words[0]?.quoted && words[0]?.assignment !== false &&
       (words[2]?.pattern !== "in" || words[2]?.quoted || words[2]?.assignment === false)) throw new ShellStateRefused();
-    if (!["readonly", "set", "printf"].includes(name)) return;
     const args = words.slice(1);
+    if (["test", "["].includes(name) && args.some((arg) => arg.text === "-v")) {
+      // Only a literal scalar existence check has proved non-writing argv.
+      // Bash interprets subscript strings even when their quotes were DATA.
+      const operands = name === "[" && args.at(-1)?.text === "]" ? args.slice(0, -1) : args;
+      if (operands.length !== 2 || operands[0]?.text !== "-v" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(operands[1]?.pattern ?? "")) throw new ShellStateRefused();
+    }
+    if (!["readonly", "set", "printf"].includes(name)) return;
     if (name === "printf") {
       const format = args[0];
       // Lexical literal stdout formats need no exact-byte proof here. Masked
@@ -1614,7 +1633,7 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (stage.closed === undefined) applyOutputRedirects(stageSinks, stage.redirects, inheritedRedirect);
       const scripts: Array<{ text: string; extra?: string[]; tmpExtra?: string[]; remote?: boolean; heredoc?: boolean; positionals?: Word[]; tails?: PositionalTail }> = [];
       const envScripts: Array<{ text: string; source: Word }> = [];
-      const { words, fedByXargs, argFile, chdirs, assignments, wrapped } = unwrap(stage.words, envScripts, budget, (words) => {
+      const { words, fedByXargs, argFile, chdirs, assignments, wrapped, outputProved } = unwrap(stage.words, envScripts, budget, (words) => {
         const argv = positionalFields(words, 0).words;
         budget.spend(argv.reduce((size, word) => size + 2 * word.text.length + 1, 1));
         return argv.map((word) => ({ ...word, text: word.text.replaceAll(LITERAL, "$"), quoted: true }));
@@ -1884,6 +1903,9 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       const xargsTmp = fedByXargs && (pipeTmp || stage.words.some((word) => tmpOperand(word.pattern)));
       // Only a direct parent-shell builtin proves a cwd effect. Executable
       // wrappers (including command/builtin) do not confer parent-state credit.
+      // command/builtin can change the CURRENT shell; merely withholding their
+      // effect would retain a falsely private cwd. Unproved wrapped forms refuse.
+      if (wrapped && ["cd", "pushd", "popd"].includes(name)) throw new ShellStateRefused();
       const directCwd = !wrapped && words[0]?.text === name && ["cd", "pushd", "popd"].includes(name);
       const cwdArgs = directCwd ? positionalFields(args, 0).words : [];
       // Convergence cut: no option/rotation/relative-target or redirect-success
@@ -1952,11 +1974,25 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       }
       // xargs appends its input: from a lookup, `{}` and every positional parameter hold it.
       const xargsFeed = fedByXargs && pipeFeed;
+      let killSilent = false;
       if (name === "kill") {
-        const probe = args.some((arg, i) => arg.text === "-0" || arg.text === "-l" || (arg.text === "-s" && args[i + 1]?.text === "0"));
+        const argv = positionalFields(args, 0).words;
+        const zero = /^-0+$/.test(argv[0]?.text ?? "") ? 1 : ["-s", "-n"].includes(argv[0]?.text ?? "") && argv[1]?.text === "0" ? 2 : 0;
+        const operands = argv.slice(zero);
+        const listing = argv.some((arg) => ["-l", "-L", "--list", "--help"].includes(arg.text));
+        const probe = (zero > 0 && operands.length > 0 && (operands[0]?.text === "--" || operands.every((arg) => concrete(arg) && /^[0-9]+$/.test(unmask(expand(arg.pattern)))))) ||
+          (argv[0]?.text === "-l" && (argv.length === 1 || (argv.length === 2 && /^[A-Za-z0-9]+$/.test(argv[1]!.pattern))));
+        // A zero token somewhere does not prove the effective operation. In
+        // particular unknown argv can supply a later selector; -- closes that
+        // option boundary without interpreting lookup output as numeric bytes.
+        if (!probe && argv.some((arg, i) => /^-0+$/.test(arg.text) || (["-s", "-n"].includes(arg.text) && argv[i + 1]?.text === "0"))) throw new ShellStateRefused();
         // A PID file (`$(cat run.pid)`, `$(< run.pid)`) is a recorded PID; a lookup is not.
         const byLookup = args.some((arg) => fromLookup(arg.text) || tainted.has(arg.text));
-        if (!probe && (byLookup || xargsFeed)) verdict.blocked = true;
+        // A harmless list operation is not silent. Unknown argv may select it;
+        // only a proved zero operation or concrete non-list argv attests silence.
+        killSilent = (probe && zero > 0) || (!listing && argv.every(concrete));
+        const priorProbeSelector = args.some((arg, i) => arg.text === "-0" || arg.text === "-l" || (arg.text === "-s" && args[i + 1]?.text === "0"));
+        if ((!probe || !priorProbeSelector) && (byLookup || xargsFeed)) verdict.blocked = true;
       }
       // review/astra F6 on #105: a heredoc script as the shell receives it, placeholders included.
       if (SHELLS.has(name) || name === "ssh") for (const heredoc of heredocs) scripts.push({
@@ -2017,15 +2053,17 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       // file (including one written earlier here) supplies its own independent contents.
       let output: Feed = { lookup, tmp: listsTmp };
       let known = independent || lookup || listsTmp;
-      const silent = reads || silentCd || DELETERS.has(name) || ["kill", ":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
+      const silent = reads || silentCd || killSilent || DELETERS.has(name) || [":", "true", "false", "test", "[", "for", "select", "done", "}"].includes(name) ||
         (name === "set" && words[0]?.text === "set" && !wrapped && args.length > 0) ||
         (name === "printf" && args[0]?.text === "-v") || (stage.words[0] && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(stage.words[0].text) && words.length === 0);
       if (scripts.length) { output = scriptOutput; known = scriptKnown; }
       else if (silent) { output = NO_OUTPUT; known = true; }
       else if (name === "pwd") {
         budget.spend((cwd?.length ?? 0) + 1);
-        output = cwd === undefined ? EMPTY_FEED : literalFeed(`${cwd}\n`);
-        known = cwd !== undefined;
+        // Only the plain direct no-argv builtin can attest these bytes.
+        const proved = !wrapped && words[0]?.text === "pwd" && args.length === 0 && !redirectBinding && cwd !== undefined;
+        output = proved ? literalFeed(`${cwd}\n`) : UNKNOWN_FEED;
+        known = proved;
       } else if ((name === "mktemp" || (["id", "whoami", "hostname", "uname"].includes(name) && args.length === 0))) { output = EMPTY_FEED; known = true; }
       else if (name === "echo" || name === "printf") {
         output = args.reduce((feed, arg) => mergeFeed(feed, literalSource(arg)), EMPTY_FEED);
@@ -2089,6 +2127,14 @@ function scanPass(tokens: Token[], scopes: SourceScopes, sources: Map<Word, Feed
       if (stage.closed !== undefined) {
         known = compoundKnown.get(stage.closed) ?? true;
         output = compoundFeeds.get(stage.closed) ?? NO_OUTPUT;
+      }
+      // Output proof is separate from child discovery. Unproved wrapper/shell
+      // startup or redirect execution must not contribute an invented prefix,
+      // including the exact literal produced by an otherwise simple builtin.
+      const shellOutputProved = !SHELLS.has(name) || args.length === 0 || (args[0]?.text === "-c" && args[1] !== undefined);
+      if ((wrapped && !outputProved) || !shellOutputProved ||
+        (redirectBinding && output.literal !== undefined && output.literal !== "")) {
+        output = mergeFeed(output, UNKNOWN_FEED); known = false;
       }
       // F36: a lexical visit does not prove a conditional/loop producer ran
       // once (or at all). Before any stream/file composition, discard exact

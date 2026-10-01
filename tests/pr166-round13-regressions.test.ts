@@ -1,8 +1,9 @@
 import {describe,it,expect} from 'vitest';
+import {expectRound14Migration} from './pr166-round14-policy.js';
 import {scanCommand,killsByPattern,wipesTmp} from '../src/core/pattern-kill.js';
 // Every shell string is inert scanner DATA, never executed.
 const SAFE={blocked:false,wipe:false,exhausted:false};const STATE={...SAFE,shellState:true};const TMP={...SAFE,wipe:true};const PID={...SAFE,blocked:true};
-function check(command:string,expected:typeof SAFE|typeof STATE):void{const actual=scanCommand(command);expect(actual,command).toStrictEqual(expected);expect(Object.keys(actual).sort(),command).toStrictEqual(Object.keys(expected).sort());expect(actual.exhausted,command).toBe(false);expect(killsByPattern(command),command).toBe(expected.blocked||'shellState'in expected);expect(wipesTmp(command),command).toBe(expected.wipe||'shellState'in expected);}
+function check(command:string,expected:typeof SAFE|typeof STATE):void{const actual=scanCommand(command);if(expectRound14Migration(command,actual))return;expect(actual,command).toStrictEqual(expected);expect(Object.keys(actual).sort(),command).toStrictEqual(Object.keys(expected).sort());expect(actual.exhausted,command).toBe(false);expect(killsByPattern(command),command).toBe(expected.blocked||'shellState'in expected);expect(wipesTmp(command),command).toBe(expected.wipe||'shellState'in expected);}
 const continuation='\\\n';
 describe('PR166 R13 convergence execution/output admission',()=>{
  const expansions=[`rm -rf $${continuation}'/tmp'`,`rm -rf $${continuation}"/tmp"`,`kill "$${continuation}(pgrep worker)"`,`D=/tmp; : $(${continuation}(D=7)); rm -rf "$D"`,`P=$(pgrep worker); : $${continuation}((P=4242)); kill "$P"`];

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { expectRound14Migration } from "./pr166-round14-policy.js";
 import { killsByPattern, PATTERN_KILL_REASON, scanCommand, wipesTmp } from "../src/core/pattern-kill.js";
 
 // R5 owner scope cut: only these exact formerly-allowed complex commands migrate.
@@ -35,6 +36,7 @@ const round11IntentionalPattern = new Set<string>([
   'for file in .local/server.pid .local/worker.pid; do cat "$file"; done > .local/selected.pids; cat .local/selected.pids | xargs kill',
 ]);
 function expectRound5Guard(command: string, result: ReturnType<typeof scanCommand>, original: { blocked?: boolean; wipe?: boolean; exhausted?: boolean; overall?: boolean }): void {
+  if (expectRound14Migration(command, result)) return;
   if (round11IntentionalPattern.has(command)) {
     expect(result, command).toStrictEqual({ blocked: true, wipe: false, exhausted: false });
     expect(killsByPattern(command), command).toBe(true);

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { expectRound14Migration } from './pr166-round14-policy.js';
 import { scanCommand, killsByPattern, wipesTmp } from '../src/core/pattern-kill.js';
 
 // All commands are inert scanner DATA, never dispatched to Bash.
@@ -7,6 +8,7 @@ const TMP = { ...SAFE, wipe: true };
 const PID = { ...SAFE, blocked: true };
 function check(command: string, expected: typeof SAFE): void {
   const actual = scanCommand(command);
+  if (expectRound14Migration(command, actual)) return;
   // R13 owner cut: preserve the old command/ID, but unsupported popd is STATE.
   const state = command === 'cd /own; pushd /tmp; popd; rm -rf *';
   const verdict = state ? { ...SAFE, shellState: true } : expected;

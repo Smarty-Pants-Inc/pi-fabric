@@ -185,6 +185,7 @@ const armPrewalk = async (
       : `Fabric prewalk armed for the next task; ${modeLabel} with ${model}${state.config.prewalk.alwaysRearm ? "; always re-arm enabled" : ""}`,
     "info",
   );
+  // This is the principal's typed task, not a host-generated Fabric directive.
   if (task) pi.sendUserMessage(task);
   return { ok: true };
 };

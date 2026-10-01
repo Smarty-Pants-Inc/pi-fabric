@@ -3,7 +3,7 @@ import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
-import { runAbortable, settleWithin } from "../async-settlement.js";
+import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
@@ -957,6 +957,11 @@ export class QuickJsRuntime {
     let executionGate: any;
     let pendingResolution: Promise<any> | undefined;
     const hostAbortController = new AbortController();
+    shareCancellationEffects(hostAbortController.signal, options.signal);
+    let executionResult: FabricSandboxResult | undefined;
+    const recordResult = (result: FabricSandboxResult): FabricSandboxResult => executionResult = result;
+    const cancellationMessage = (message: string): string =>
+      cancellationError(hostAbortController.signal, new Error(message)).message;
     const abortHostCalls = (reason: string | Error): void => {
       if (!hostAbortController.signal.aborted) {
         hostAbortController.abort(reason instanceof Error ? reason : new Error(reason));
@@ -982,8 +987,9 @@ export class QuickJsRuntime {
       timedOut = true;
       const message = timeoutMessage();
       abortHostCalls(interruptedByCpu ? message : executionDeadline.reason);
-      rejectExecutionGate(message);
-      rejectDeadline?.(new Error(message));
+      const outcome = cancellationMessage(message);
+      rejectExecutionGate(outcome);
+      rejectDeadline?.(new Error(outcome));
     };
     const scheduleDeadline = (): void => {
       if (!rejectDeadline || closing || cancelled || timedOut) return;
@@ -1124,13 +1130,13 @@ export class QuickJsRuntime {
         const deadlineExceeded = interruptedByCpu || deadlineReached();
         if (deadlineExceeded) timedOut = true;
         const error = options.signal?.aborted
-          ? "Execution cancelled"
+          ? cancellationMessage("Execution cancelled")
           : deadlineExceeded
-            ? timeoutMessage()
+            ? cancellationMessage(timeoutMessage())
             : formatValue(context.dump(setupResult.error));
         setupResult.error.dispose();
         abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error);
-        return {
+        return recordResult({
           value: undefined,
           logs,
           terminationReason: options.signal?.aborted
@@ -1141,7 +1147,7 @@ export class QuickJsRuntime {
           error,
           ...(deadlineExceeded && !interruptedByCpu && !options.signal?.aborted && executionDeadline.timeoutResult(logs).deadlineReason
             ? { deadlineReason: executionDeadline.reason } : {}),
-        };
+        });
       }
       setupResult.value.dispose();
 
@@ -1175,13 +1181,13 @@ export class QuickJsRuntime {
         const deadlineExceeded = interruptedByCpu || deadlineReached();
         if (deadlineExceeded) timedOut = true;
         const error = options.signal?.aborted
-          ? "Execution cancelled"
+          ? cancellationMessage("Execution cancelled")
           : deadlineExceeded
-            ? timeoutMessage()
+            ? cancellationMessage(timeoutMessage())
             : remapGuestErrorText(formatValue(context.dump(evaluation.error)), guestStackMap, guestLineCount);
         evaluation.error.dispose();
         abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error);
-        return {
+        return recordResult({
           value: undefined,
           logs,
           terminationReason: options.signal?.aborted
@@ -1192,7 +1198,7 @@ export class QuickJsRuntime {
           error,
           ...(deadlineExceeded && !interruptedByCpu && !options.signal?.aborted && executionDeadline.timeoutResult(logs).deadlineReason
             ? { deadlineReason: executionDeadline.reason } : {}),
-        };
+        });
       }
 
       activePromiseHandle = evaluation.value;
@@ -1200,8 +1206,9 @@ export class QuickJsRuntime {
         abortHandler = () => {
           cancelled = true;
           hostAbortController.abort(options.signal?.reason);
-          rejectExecutionGate("Execution cancelled");
-          reject(new Error("Execution cancelled"));
+          const outcome = cancellationMessage("Execution cancelled");
+          rejectExecutionGate(outcome);
+          reject(new Error(outcome));
         };
         if (options.signal?.aborted) abortHandler();
         else options.signal?.addEventListener("abort", abortHandler, { once: true });
@@ -1221,13 +1228,13 @@ export class QuickJsRuntime {
         const deadlineExceeded = timedOut || interruptedByCpu || deadlineReached();
         if (deadlineExceeded) timedOut = true;
         const error = options.signal?.aborted
-          ? "Execution cancelled"
+          ? cancellationMessage("Execution cancelled")
           : deadlineExceeded
-            ? timeoutMessage()
+            ? cancellationMessage(timeoutMessage())
             : remapGuestErrorText(formatValue(context.dump(resolution.error)), guestStackMap, guestLineCount);
         resolution.error.dispose();
         abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error);
-        return {
+        return recordResult({
           value: undefined,
           logs,
           terminationReason: options.signal?.aborted
@@ -1238,43 +1245,42 @@ export class QuickJsRuntime {
           error,
           ...(deadlineExceeded && !interruptedByCpu && !options.signal?.aborted && executionDeadline.timeoutResult(logs).deadlineReason
             ? { deadlineReason: executionDeadline.reason } : {}),
-        };
+        });
       }
       if (deadlineReached()) {
         resolution.value.dispose();
         timedOut = true;
         abortHostCalls(executionDeadline.reason);
-        return executionDeadline.timeoutResult(logs);
+        return recordResult(executionDeadline.timeoutResult(logs));
       }
       const value = context.dump(resolution.value);
       resolution.value.dispose();
       if (deadlineReached()) {
         timedOut = true;
         abortHostCalls(executionDeadline.reason);
-        return executionDeadline.timeoutResult(logs);
+        return recordResult(executionDeadline.timeoutResult(logs));
       }
-      return { value, logs, terminationReason: "completed" };
+      return recordResult({ value, logs, terminationReason: "completed" });
     } catch (error) {
       const deadlineExceeded = timedOut || interruptedByCpu || deadlineReached();
       if (deadlineExceeded) timedOut = true;
       abortHostCalls(deadlineExceeded && !interruptedByCpu ? executionDeadline.reason : error instanceof Error ? error : String(error));
-      return {
+      return recordResult({
         ...(deadlineExceeded && !interruptedByCpu && !cancelled ? executionDeadline.timeoutResult(logs) : {}),
         value: undefined,
         logs,
         terminationReason: cancelled ? "aborted" : deadlineExceeded ? "timed_out" : "runtime_error",
         error: cancelled
-          ? "Execution cancelled"
+          ? cancellationMessage("Execution cancelled")
           : deadlineExceeded
-            ? timeoutMessage()
-            : error instanceof Error
-              ? error.message
-              : String(error),
-      };
+            ? cancellationMessage(timeoutMessage())
+            : cancellationMessage(error instanceof Error ? error.message : String(error)),
+      });
     } finally {
       executionDeadline.clear();
       for (const timer of pendingTimers) clearTimeout(timer);
       if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
+      const unawaitedHostCalls = pendingHostPromises.size > 0;
       if (hostTasks.size > 0) {
         const settled = await settleWithin(hostTasks, HOST_TASK_SETTLE_GRACE_MS);
         if (!settled) {
@@ -1312,6 +1318,9 @@ export class QuickJsRuntime {
           if (promise.alive !== false) promise.dispose();
         }
       }
+      // A guest can finish or swallow a rejection before an unawaited host
+      // mutation settles. Teardown still owes the caller every committed ID.
+      if (executionResult) preserveCancellationOutcome(executionResult, hostAbortController.signal, hostAbortController.signal.aborted || unawaitedHostCalls);
       if (activePromiseHandle?.alive !== false) activePromiseHandle?.dispose();
       if (executionGate?.alive !== false) executionGate?.dispose();
       pumpJobs();

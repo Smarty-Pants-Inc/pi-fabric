@@ -1206,6 +1206,7 @@ describe("FabricControlPlane", () => {
       }),
       expect.objectContaining({ id: "host:sender" }),
       expect.any(AbortSignal),
+      "mesh",
     );
     expect(observe).not.toHaveBeenCalled();
   });
@@ -1281,6 +1282,7 @@ describe("FabricControlPlane", () => {
       }),
       expect.objectContaining({ id: "host:sender" }),
       expect.any(AbortSignal),
+      "mesh",
     );
   });
   it("ignores an acknowledgement forged by a different mesh identity", async () => {

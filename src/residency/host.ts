@@ -23,11 +23,21 @@ import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycl
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshIdentity } from "../mesh/store.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
-import { FabricControlPlane, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
   RESIDENT_HOST_FORMAT,
+  RESIDENT_ACTOR_COMMAND_FORMAT,
+  ResidentActorAuthorizationError,
+  ResidentCommandUnsupportedError,
+  RESIDENT_COMMANDS,
+  isResidentCommandOperation,
+  assertResidentActorMain,
+  assertResidentActorToolCeiling,
+  type ResidentActorCaller,
+  commitResidentRequest,
+  readResidentRequestDecision,
   residentDeliveryPrefix,
   residentHostId,
   residentRemovalsPath,
@@ -119,6 +129,13 @@ const HOST_CLOSING_RETRY = "Fabric resident host is closing; retry";
 
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Test-only native-process proof seam. Unset/invalid values are inert; never a startup hook. */
+const testResidentRequestDelay = async (stage: "before_commit" | "after_commit"): Promise<void> => {
+  if (process.env.PI_FABRIC_TEST_RESIDENT_DELAY_STAGE !== stage) return;
+  const ms = Number(process.env.PI_FABRIC_TEST_RESIDENT_DELAY_MS);
+  if (Number.isInteger(ms) && ms > 0 && ms <= 10_000) await delay(ms);
+};
 
 const atomicWrite = (filePath: string, value: unknown): void => {
   writeJsonAtomic(filePath, value, { space: 2 });
@@ -460,6 +477,8 @@ export class ResidentHost {
         token: this.#token,
         startedAt: now,
         readyAt: now,
+        commands: RESIDENT_COMMANDS,
+        requestFence: 1,
       };
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
@@ -503,18 +522,18 @@ export class ResidentHost {
 
   async #acceptControl(
     command: FabricControlCommand,
-    _from: MeshIdentity,
+    from: MeshIdentity,
     signal?: AbortSignal,
   ): Promise<FabricControlAcceptance> {
     if (this.#closed) {
       return { accepted: false, error: HOST_CLOSING_RETRY };
     }
     this.#admissions++;
-    try { return await this.#handleControl(command, signal); }
+    try { return await this.#handleControl(command, from, signal); }
     finally { this.#admissions--; }
   }
 
-  async #handleControl(command: FabricControlCommand, signal?: AbortSignal): Promise<FabricControlAcceptance> {
+  async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
     }
@@ -552,7 +571,8 @@ export class ResidentHost {
           message,
           command.data,
           signal,
-          command.binding !== undefined ? { binding: command.binding } : {},
+          controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+            this.participants.get(from.id)?.rootId),
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -574,12 +594,12 @@ export class ResidentHost {
       if (!this.actors.owns(command.targetId)) {
         return { accepted: false, error: `Resident host does not own ${command.targetId}` };
       }
-      const binding = await this.actors.resolveActivationBinding(
-        command.targetId,
-        command.binding !== undefined ? { binding: command.binding } : {},
-      );
+      const options = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+        this.participants.get(from.id)?.rootId);
+      // Validate now without turning the resolved owner defaults into per-call overrides.
+      await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
-      const result = this.actors.tell(command.targetId, message, command.data, { binding });
+      const result = this.actors.tell(command.targetId, message, command.data, options);
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       return { accepted: false, error: errorMessage(error) };
@@ -746,18 +766,41 @@ export class ResidentHost {
     if (Date.now() - this.#idleSince >= IDLE_EXIT_MS) this.onIdle();
   }
 
+  #authorizeResidentSetter(caller: ResidentActorCaller | undefined): void {
+    assertResidentActorMain(caller, this.config.rootId);
+    // Verify the actual root session's existing control identity, not merely
+    // inherited mainAgent.id. get(fresh) validates the record's writer and host
+    // lease through the same directory used by native Fabric control routing.
+    const root = this.participants.get(this.config.rootId, Date.now(), { fresh: true });
+    if (!caller || caller.identity.sessionId !== this.config.sessionId ||
+      !root || root.stale || root.remoteHost !== undefined || root.kind !== "root" ||
+      root.rootId !== this.config.rootId || root.sessionId !== this.config.sessionId ||
+      root.ownerIdentityId !== caller.identity.id || root.ownerHostId !== caller.hostId) {
+      throw new ResidentActorAuthorizationError();
+    }
+  }
+
   async #processRequest(filePath: string): Promise<void> {
     const command = readJson<ResidentCommand>(filePath);
-    const requestId = command?.requestId ?? path.basename(filePath, ".json");
+    const requestId = path.basename(filePath, ".json");
     let response: ResidentCommandResponse;
     try {
       if (
-        command?.format !== RESIDENT_HOST_FORMAT ||
+        (command?.format !== RESIDENT_HOST_FORMAT && command?.format !== RESIDENT_ACTOR_COMMAND_FORMAT) ||
         command.rootId !== this.config.rootId ||
         command.requestId !== requestId
       ) {
         throw new Error("Invalid Fabric residency request");
       }
+      // Validate the runtime JSON discriminant before any actor lookup/mutation.
+      if (!isResidentCommandOperation(command.operation)) {
+        throw new ResidentCommandUnsupportedError(`Unsupported Fabric residency command: ${String(command.operation)}`);
+      }
+      if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+        throw new Error(`Fabric residency request ${requestId} was abandoned before commit`);
+      }
+      await testResidentRequestDelay("before_commit");
+      const commit = (id: string): void => commitResidentRequest(this.config.residencyRoot, command, id, this.hostId);
       if (command.operation === "spawn") {
         if (
           command.request.sessionSeed ||
@@ -771,7 +814,7 @@ export class ResidentHost {
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
-        const handle = await this.agents.spawn({ ...command.request, residency: "durable" });
+        const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) {
           // Durable metadata currently requires an admitted run directory. Never
@@ -803,6 +846,7 @@ export class ResidentHost {
           completedAt: Date.now(),
         };
       } else if (command.operation === "foreground") {
+        commit(command.id);
         this.agents.markForeground(command.id);
         response = {
           format: RESIDENT_HOST_FORMAT,
@@ -811,7 +855,10 @@ export class ResidentHost {
           completedAt: Date.now(),
         };
       } else if (command.operation === "cleanup") {
-        await this.agents.wait(command.id);
+        // Joining is preparation, not foregrounding or consumption: abandonment
+        // must preserve the background completion notification as well as files.
+        await this.agents.join(command.id);
+        commit(command.id);
         await this.agents.cleanup(command.id, command.deleteBranch);
         fs.rmSync(path.join(this.#agentsPath, `${command.id}.json`), { force: true });
         fs.rmSync(residentResultPath(this.config.residencyRoot, command.id), { force: true });
@@ -828,7 +875,7 @@ export class ResidentHost {
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.
-        const actor = await this.actors.create(command.request, { asRegistryOwner: true });
+        const actor = await this.actors.create(command.request, { asRegistryOwner: true, beforeCommit: commit });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,
@@ -836,12 +883,40 @@ export class ResidentHost {
           actor: actor as FabricActorInfo,
           completedAt: Date.now(),
         };
+      } else if (command.operation === "actors") {
+        response = {
+          format: RESIDENT_HOST_FORMAT, requestId, ok: true,
+          actors: this.actors.listOwned().filter((actor) => actor.rootId === this.config.rootId),
+          completedAt: Date.now(),
+        };
+      } else if (command.operation !== "removeActor") {
+        if (command.operation === "setInstructions" || command.operation === "setModel" ||
+          command.operation === "setThinking" || command.operation === "setActivationFilter" || command.operation === "setTools") {
+          this.#authorizeResidentSetter(command.caller);
+          if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
+        }
+        const actor = this.actors.status(String(command.id));
+        if (actor.rootId !== this.config.rootId || !this.actors.owns(actor.id)) {
+          throw new Error(`Resident host does not own root actor ${actor.id}`);
+        }
+        let updated: FabricActorInfo;
+        switch (command.operation) {
+          case "actorStatus": updated = actor; break;
+          case "setInstructions": updated = await this.actors.setInstructions(actor.id, command.instructions, commit); break;
+          case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit); break;
+          case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;
+          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit); break;
+          case "setTools": updated = await this.actors.setTools(actor.id, command.tools, commit); break;
+          default: throw new Error("Unknown resident actor operation");
+        }
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, completedAt: Date.now() };
       } else {
         const cleanup = this.actors.cleanupObligation(command.id);
         if (!this.actors.owns(command.id) || (cleanup && cleanup.residency !== "durable")) {
           throw new Error(`Resident host does not own ${command.id}`);
         }
         // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
+        commit(command.id);
         const removed = await this.actors.remove(command.id, { wait: false });
         this.#writeRemovals();
         if (removed.pending) {
@@ -865,10 +940,18 @@ export class ResidentHost {
         requestId,
         ok: false,
         error: errorMessage(error),
+        ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError
+          ? { errorCode: error.code } : {}),
         completedAt: Date.now(),
       };
     }
-    atomicWrite(path.join(this.#responsesPath, `${requestId}.json`), response);
+    if (response.ok) await testResidentRequestDelay("after_commit");
+    const responsePath = path.join(this.#responsesPath, `${requestId}.json`);
+    atomicWrite(responsePath, response);
+    // An abandoned caller already left; clean late responses as well as processing files.
+    if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+      fs.rmSync(responsePath, { force: true });
+    }
     fs.rmSync(filePath, { force: true });
     this.participants.scheduleRefresh();
   }
@@ -889,6 +972,11 @@ export class ResidentHost {
     }
     for (const entry of entries) {
       const requestId = path.basename(entry, ".json");
+      if (readResidentRequestDecision(this.config.residencyRoot, requestId)?.state === "abandoned") {
+        fs.rmSync(path.join(this.#processingPath, entry), { force: true });
+        fs.rmSync(path.join(this.#responsesPath, entry), { force: true });
+        continue;
+      }
       const response: ResidentCommandResponse = {
         format: RESIDENT_HOST_FORMAT,
         requestId,

@@ -1,7 +1,105 @@
+import type { FabricResidentOutcomeReceipt, FabricSandboxResult } from "./runtime/kernel.js";
+
+// Cancellation is not a safe rejection once a durable mutation may have committed.
+// Effects are shared only along one invocation's signal lineage, never with a
+// registry/provider shutdown signal (which is shared by unrelated invocations).
+// Keep receipts until that signal is collected: a guest may receive a successful
+// host result, then be interrupted before it can return the ID to its caller.
+type CancellationEffect = (reason: Error) => Error | undefined;
+const cancellationEffects = new WeakMap<AbortSignal, Set<CancellationEffect>>();
+const effectsFor = (signal: AbortSignal): Set<CancellationEffect> => {
+  let effects = cancellationEffects.get(signal);
+  if (!effects) cancellationEffects.set(signal, effects = new Set());
+  return effects;
+};
+
+// Actual host-originated uncertainties, independent of terminal cancellation.
+// Successful calls install cancellation effects but never enter this ledger.
+const residentOutcomes = new WeakMap<AbortSignal, Map<string, FabricResidentOutcomeReceipt>>();
+const outcomesFor = (signal: AbortSignal): Map<string, FabricResidentOutcomeReceipt> => {
+  let outcomes = residentOutcomes.get(signal);
+  if (!outcomes) residentOutcomes.set(signal, outcomes = new Map());
+  return outcomes;
+};
+
+export const recordResidentOutcome = (signal: AbortSignal | undefined, receipt: FabricResidentOutcomeReceipt): void => {
+  if (signal) outcomesFor(signal).set(receipt.requestId, receipt);
+};
+
+export const shareCancellationEffects = (signal: AbortSignal, parent?: AbortSignal): AbortSignal => {
+  if (parent) {
+    cancellationEffects.set(signal, effectsFor(parent));
+    residentOutcomes.set(signal, outcomesFor(parent));
+  }
+  return signal;
+};
+
+/** The callback must synchronously fence cancellation, not wait for a remote host. */
+export const registerCancellationEffect = (signal: AbortSignal | undefined, effect: CancellationEffect): void => {
+  if (signal) effectsFor(signal).add(effect);
+};
+
+/** Settle every effect BEFORE presenting cancellation, even if the guest cannot resume. */
+export const cancellationError = (signal: AbortSignal | undefined, reason: Error): Error => {
+  const errors: Error[] = [];
+  for (const effect of signal ? cancellationEffects.get(signal) ?? [] : []) {
+    try {
+      const error = effect(reason);
+      if (error) errors.push(error);
+    } catch (error) {
+      // A failed settlement must never look like a proved, safe rejection.
+      errors.push(new Error(`Cancellation outcome unknown; do not retry or reassign. ${String(error)}`, { cause: error }));
+    }
+  }
+  if (errors.length === 0) return reason;
+  if (errors.length === 1) return errors[0]!;
+  return new AggregateError(errors, errors.map((error) => error.message).join("\n"), { cause: reason });
+};
+
+// These errors come from host-installed cancellation effects, not serialized
+// guest errors. Aggregate settlement must retain the entire receipt list.
+const residentOutcomeReceipts = (error: Error): FabricResidentOutcomeReceipt[] => {
+  if (error instanceof AggregateError) {
+    return error.errors.flatMap(cause => cause instanceof Error ? residentOutcomeReceipts(cause) : []);
+  }
+  const receipt = (error as Error & { residentOutcome?: FabricResidentOutcomeReceipt }).residentOutcome;
+  return receipt ? [receipt] : [];
+};
+
+/** Apply the invocation's complete receipt ledger at any engine's outer boundary.
+ * Mutate in place because QuickJS returns from try before its async finally runs.
+ * Completed runs become failures when teardown found unawaited resident work,
+ * even if its reply arrives during the grace window before cleanup aborts.
+ * Host-originated uncertainty survives even when the guest handles it and
+ * completes normally. Ordinary successful replies keep their handles and are
+ * not uncertainty unless the enclosing execution is interrupted.
+ */
+export const preserveCancellationOutcome = <T extends Pick<FabricSandboxResult, "value" | "terminationReason" | "error" | "residentOutcomes">>(
+  result: T,
+  signal: AbortSignal,
+  interrupted = signal.aborted,
+): T => {
+  if (interrupted) {
+    const reason = new Error(result.error ?? "Fabric guest ended before its host calls settled");
+    const outcome = cancellationError(signal, reason);
+    if (outcome !== reason) {
+      result.value = undefined;
+      result.error = outcome.message;
+      for (const receipt of residentOutcomeReceipts(outcome)) recordResidentOutcome(signal, receipt);
+      if (result.terminationReason === "completed") result.terminationReason = "runtime_error";
+    }
+  }
+  const receipts = residentOutcomes.get(signal);
+  if (receipts?.size) result.residentOutcomes = [...new Map([
+    ...(result.residentOutcomes ?? []), ...receipts.values(),
+  ].map(receipt => [receipt.requestId, receipt])).values()];
+  return result;
+};
+
 const abortError = (signal: AbortSignal): Error => {
   const reason = signal.reason;
-  if (reason instanceof Error) return reason;
-  return new Error(typeof reason === "string" && reason ? reason : "Operation aborted");
+  return cancellationError(signal, reason instanceof Error ? reason
+    : new Error(typeof reason === "string" && reason ? reason : "Operation aborted"));
 };
 
 // Identity, not text/name/prototype: guest exceptions can reproduce every public field.

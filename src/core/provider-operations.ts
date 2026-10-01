@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { throwIfAborted, throwIfExecutionExpired, settleWithin } from "../async-settlement.js";
+import { throwIfAborted, throwIfExecutionExpired, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { providerTake, providerRevoke, type ProviderTicket, type StateText } from "../verified/generated/provider-kernel.js";
 import type { FabricInvocationContext, FabricScopedProviderResult } from "../protocol.js";
 import type { FabricProviderBinding, FabricProviderBindings } from "./provider-bindings.js";
@@ -56,7 +56,7 @@ export class ProviderOperations {
       return this.bindings.track(binding.id, async () => {
         const context = {
           ...input.context,
-          signal: AbortSignal.any([...(input.context.signal ? [input.context.signal] : []), ...(signal ? [signal] : [])]),
+          signal: shareCancellationEffects(AbortSignal.any([...(input.context.signal ? [input.context.signal] : []), ...(signal ? [signal] : [])]), input.context.signal),
         };
         throwIfAborted(context.signal);
         const observed = await input.observe(context);

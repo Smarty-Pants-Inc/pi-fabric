@@ -254,6 +254,7 @@ export class StoreBridgeSide implements BridgeSide {
     const data = { ...checked.data, bridge: { from: this.peer, id: checked.data.bridge.id } };
     const published = await this.store.publish({
       ...checked,
+      from: { ...checked.from, verified: "bridge" },
       // Evaluated under the mesh lock that commits the event, so the ownership it checks is the
       // ownership at commit: a native takeover before it refuses the event (security review
       // round 3, F2). Every state writer takes the same lock. Under the participants-files policy a

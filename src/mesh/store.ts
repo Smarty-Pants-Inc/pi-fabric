@@ -13,9 +13,13 @@ export interface MeshIdentity {
   name: string;
   kind: "main" | "actor" | "agent";
   sessionId?: string;
+  /** Set only by the admitting mesh bridge, after its sender/ownership checks. */
+  verified?: "bridge";
 }
 
 export interface MeshEvent {
+  /** Recorded at publication, never reconstructed from retained event payloads. */
+  verification?: "mesh" | "bridge";
   id: string;
   sequence: number;
   topic: string;
@@ -556,6 +560,11 @@ export class MeshStore {
         topic: input.topic,
         kind: input.kind?.trim() || "message",
         from: jsonClone(input.from),
+        // Old bridges only wrote data.bridge. It can veto a native attestation, but
+        // arbitrary payload data cannot establish bridge verification or any authority.
+        ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
+          : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
+          : { verification: "mesh" as const }),
         ...(input.to ? { to: input.to } : {}),
         ...(input.text !== undefined ? { text: input.text } : {}),
         ...(eventData !== undefined ? { data: eventData } : {}),

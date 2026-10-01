@@ -4,7 +4,7 @@ import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js"
 import type { FabricAgentMessageResult, FabricMainAgentTarget } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
-import type { FabricControlPlane, FabricControlCommand, FabricControlAcceptance } from "../topology/control-plane.js";
+import { controlActorBindingOptions, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { FabricAgentRunner } from "../config.js";
 import type { ResidencyClient } from "../residency/client.js";
@@ -59,6 +59,15 @@ export const unknownParticipant = (
   return new Error(`Unknown ${label}: ${id} (${when}, so the session has probably ended)`);
 };
 
+/** The selected root authority disappeared or changed before delivery; nothing was published. */
+export class FabricRouteAuthorityError extends Error {
+  readonly code = "FABRIC_ROUTE_AUTHORITY_CHANGED";
+  constructor(id: string) {
+    super(`Fabric native routing is unavailable for ${id}; the routed owner could not be revalidated; this attempt was not published. Retry after its native presence returns.`);
+    this.name = "FabricRouteAuthorityError";
+  }
+}
+
 export class AgentMessageRouter {
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
@@ -74,10 +83,28 @@ export class AgentMessageRouter {
     if (this.participants.writeStalled?.()) return undefined;
     const known = this.participants.lastKnown?.(id);
     if (!known || known.participant.kind !== "root" || known.lapsedMs > LAPSED_ROOT_REPLY_WINDOW_MS) return undefined;
+    // Reload leases are a hard bound, not an ordinary heartbeat flap; an exit is never routable.
+    if (["reloading", "stopping"].includes(known.participant.status)) return undefined;
     // A mirrored lease lapses when the mesh bridge stops: nothing would carry the reply, so the
     // sender gets the lapse error at once instead of an acknowledgement timeout (smarty-dev#2004).
     if (known.participant.remoteHost) return undefined;
     return known.participant;
+  }
+
+  #rootRouteSnapshot(id: string): FabricParticipantInfo | undefined {
+    const cached = this.participants.get(id);
+    // Keep a mirrored root's original bridge for the control plane's fresh admission check.
+    if (cached?.kind === "root" && cached.remoteHost) return cached;
+    const fresh = this.participants.get(id, undefined, { fresh: true });
+    if (cached?.kind === "root") {
+      // Refresh native lifecycle state only under the same authority. A replacement mirror
+      // with the same id must never turn a private native delivery into bridge publication.
+      if (!fresh || fresh.kind !== "root" || fresh.remoteHost || fresh.id !== cached.id ||
+        fresh.rootId !== cached.rootId || fresh.ownerHostId !== cached.ownerHostId ||
+        fresh.ownerIdentityId !== cached.ownerIdentityId) throw new FabricRouteAuthorityError(id);
+      return fresh;
+    }
+    return fresh ?? this.#recentlyLapsedRoot(id);
   }
 
   // A bare session UUID addresses its Main `session:<uuid>` when no participant has exactly
@@ -89,6 +116,11 @@ export class AgentMessageRouter {
     return this.mainAgent.matches(session) || this.participants.get(session) || this.#recentlyLapsedRoot(session)
       ? session
       : id;
+  }
+
+  /** Use the same exact session-UUID alias resolution as delivery when grouping lifecycle sources. */
+  isLocalMainTarget(id: string): boolean {
+    return this.mainAgent.local && this.mainAgent.matches(this.#sessionTarget(id));
   }
 
   async routeMessage(
@@ -160,7 +192,7 @@ export class AgentMessageRouter {
   ): Promise<FabricAgentMessageResult> {
     id = this.#sessionTarget(id);
     const isMain = this.mainAgent.matches(id);
-    const remoteRoot = isMain ? undefined : this.participants.get(id) ?? this.#recentlyLapsedRoot(id);
+    const remoteRoot = isMain ? undefined : this.#rootRouteSnapshot(id);
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.
     if (isMain || remoteRoot?.kind === "root") {
@@ -173,6 +205,7 @@ export class AgentMessageRouter {
         });
         return this.mainAgent.deliverAgent({
           from: options.from ?? this.actorManager.identity,
+          verification: "mesh", // In-process registered producer, not a received command.
           message,
           delivery: kind,
           ...(typeof options.triggerTurn === "boolean"
@@ -181,8 +214,7 @@ export class AgentMessageRouter {
           ...(data === undefined ? {} : { data }),
         });
       }
-      const participant = remoteRoot ?? this.participants.get(this.mainAgent.id) ??
-        this.#recentlyLapsedRoot(this.mainAgent.id);
+      const participant = remoteRoot ?? this.#rootRouteSnapshot(this.mainAgent.id);
       if (!participant) {
         throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");
       }
@@ -202,7 +234,11 @@ export class AgentMessageRouter {
             : {}),
         },
         participant.ownerIdentityId,
-        { routedRemoteHost: participant.remoteHost ?? null },
+        {
+          routedRemoteHost: participant.remoteHost ?? null,
+          ...(participant.status === "reloading" && typeof participant.reloadUntil === "number"
+            ? { timeoutMs: Math.max(1, participant.reloadUntil - Date.now()) } : {}),
+        },
       );
     }
 
@@ -263,14 +299,14 @@ export class AgentMessageRouter {
     if (!participant) throw new Error(`Fabric actor ${actor!.id} has no live execution owner`);
     if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
     const sessionBinding = actor?.binding;
-    const resolvedBinding = actor
+    const ownRoot = participant.rootId === this.mainAgent.id;
+    const resolvedBinding = ownRoot ? binding : actor
       ? this.actorManager.resolveBinding(actor.id, binding)
       : binding;
     const needsBinding = Boolean(
       resolvedBinding?.model ||
         resolvedBinding?.thinking ||
-        sessionBinding?.model ||
-        sessionBinding?.thinking,
+        (!ownRoot && (sessionBinding?.model || sessionBinding?.thinking)),
     );
     if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
       throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
@@ -292,6 +328,7 @@ export class AgentMessageRouter {
           ? { triggerTurn: options.triggerTurn }
           : {}),
         ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
+        ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
       },
       participant.ownerIdentityId,
       { routedRemoteHost: participant.remoteHost ?? null },
@@ -302,6 +339,7 @@ export class AgentMessageRouter {
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
+    verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
@@ -350,7 +388,7 @@ export class AgentMessageRouter {
           message,
           command.data,
           signal,
-          command.binding !== undefined ? { binding: command.binding } : {},
+          controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId),
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -365,8 +403,10 @@ export class AgentMessageRouter {
       try {
         result = this.mainAgent.deliverAgent({
         from,
+        ...(verification === undefined ? {} : { verification }),
         message,
         delivery: command.operation,
+        deliveryId: command.commandId,
         ...(typeof command.triggerTurn === "boolean"
           ? { triggerTurn: command.triggerTurn }
           : {}),
@@ -407,7 +447,7 @@ export class AgentMessageRouter {
         actor.id,
         message,
         command.data,
-        command.binding !== undefined ? { binding: command.binding } : {},
+        controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId),
       );
       return { accepted: true, messageId: result.messageId };
     } catch (error) {

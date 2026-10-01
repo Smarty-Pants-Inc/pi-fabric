@@ -11,6 +11,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as retention from "../src/storage/retention.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -180,6 +181,107 @@ describe.skipIf(process.platform !== "linux")("dead predecessor durable removal 
     expect(f.mesh.get(`actor-removals/${f.actor.id}`)?.updatedBy.id).toBe(f.identity.id);
     write.mockRestore();
   });
+  it.each(["direct", "nested"])("scheduled retention preserves a live %s runner's evidence and rejects a false clean-close receipt until exit", async kind => {
+    const f = await fixture();
+    await dead(f.host);
+    const runner = await child();
+    const runs = path.join(f.oldDir, "runs");
+    // Exercise the real registered retention callback against the predecessor's canonical
+    // run tree. Disable only managed-temp housekeeping (resident trees have no owner marker)
+    // and the unrelated detached global sweep; process settlement stays real.
+    const mkdtemp = fs.mkdtempSync;
+    const allocate = vi.spyOn(fs, "mkdtempSync").mockImplementation((prefix, options) =>
+      String(prefix).endsWith("pi-fabric-runs-") ? runs : mkdtemp(prefix, options));
+    const mark = vi.spyOn(retention, "markRunRootActive").mockImplementation(() => {});
+    const heartbeat = vi.spyOn(retention, "heartbeatRunRoot").mockImplementation(() => {});
+    const globalSweep = vi.spyOn(retention, "claimTempRunSweep").mockReturnValue(false);
+    const interval = globalThis.setInterval;
+    let scheduled: (() => void) | undefined;
+    const timer = vi.spyOn(globalThis, "setInterval").mockImplementation((callback, ms, ...args) => {
+      if (ms === 15 * 60 * 1_000 && !scheduled) scheduled = callback as () => void;
+      return interval(callback, ms, ...args);
+    });
+    const inheritedRunRoot = process.env.PI_FABRIC_RUN_ROOT;
+    delete process.env.PI_FABRIC_RUN_ROOT;
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true, sessionExport: false },
+      { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), retention: { ...DEFAULT_FABRIC_CONFIG.retention, oneShotRunMs: 60_000 } });
+    if (inheritedRunRoot !== undefined) process.env.PI_FABRIC_RUN_ROOT = inheritedRunRoot;
+    cleanups.push(() => manager.close());
+    allocate.mockRestore();
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const dir = path.dirname(request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!);
+      const attempt = request.workerArguments[request.workerArguments.indexOf("--launch-attempt") + 1]!;
+      const parentRunner = kind === "direct" ? runner.identity : f.main.identity;
+      runEvidence(runs, request.id, f.main.identity, parentRunner);
+      fs.appendFileSync(path.join(dir, "worker-processes.jsonl"), JSON.stringify({ attempt, worker: f.main.identity, runner: parentRunner }) + "\n");
+      if (kind === "nested") runEvidence(path.join(dir, "nested"), "nested-runner", f.main.identity, runner.identity);
+      const status = { id: request.id, name: request.name,
+        task: "worker exited with surviving runner", status: "completed", runner: "pi", transport: "process",
+        cwd: request.cwd, startedAt: Date.now(), updatedAt: Date.now(), finishedAt: Date.now(), turns: 0, toolCalls: 0, text: "done", exitCode: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
+      fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify(status));
+      if (kind === "nested") fs.writeFileSync(path.join(dir, "nested", "nested-runner", "status.json"), JSON.stringify({ ...status, id: "nested-runner" }));
+      return { kind: "process", sessionId: String(f.main.identity.pid), isAlive: async () => false, stop: async () => {} };
+    });
+    const { runResidentHostFromConfigPath } = await import("../src/residency/host.js");
+    const configPath = path.join(f.oldDir, "config.json");
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as ResidentHostConfig;
+    config.agents = { ...config.agents, budgetUsd: 0, retainRuns: true, sessionExport: false };
+    fs.writeFileSync(configPath, JSON.stringify(config));
+    const closeHost = () => runResidentHostFromConfigPath(configPath, AbortSignal.abort());
+    // The scheduled callback queues its async sweep on setImmediate; drain it before observing.
+    const sweep = async () => {
+      expect(scheduled).toBeTypeOf("function");
+      scheduled!();
+      await new Promise(resolve => setTimeout(resolve, 100));
+    };
+    try {
+      const result = await manager.run({ task: "worker exited with surviving runner", transport: "process", extensions: false });
+      expect(result.status).toBe("completed");
+      launch.mockRestore();
+      const dir = path.join(runs, result.id);
+      expect(manager.runDirectory(result.id)).toBe(dir);
+      const evidenceDir = kind === "nested" ? path.join(dir, "nested", "nested-runner") : dir;
+      const processJournal = fs.readFileSync(path.join(evidenceDir, "worker-processes.jsonl"), "utf8");
+      const launchJournal = fs.readFileSync(path.join(dir, "worker-launches.jsonl"), "utf8");
+      // Make this terminal run due only after its initial scheduled startup sweep drains.
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const statusFile = path.join(dir, "status.json");
+      const terminal = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      fs.writeFileSync(statusFile, JSON.stringify({ ...terminal, finishedAt: 1, updatedAt: 1 }));
+      await sweep();
+      expect.soft(manager.runDirectory(result.id)).toBe(dir);
+      expect.soft(fs.existsSync(path.join(evidenceDir, "worker-processes.jsonl"))).toBe(true);
+      expect.soft(fs.existsSync(path.join(dir, "worker-launches.jsonl"))).toBe(true);
+      if (fs.existsSync(dir)) {
+        expect(fs.readFileSync(path.join(evidenceDir, "worker-processes.jsonl"), "utf8")).toBe(processJournal);
+        expect(fs.readFileSync(path.join(dir, "worker-launches.jsonl"), "utf8")).toBe(launchJournal);
+      }
+      await closeHost(); // real host shutdown/receipt code, not a test-side settlement predicate
+      expect.soft(fs.existsSync(path.join(f.oldDir, "workers-settled.json"))).toBe(false);
+      const removal = await f.remove();
+      expect.soft(removal).toMatchObject({ removed: false, pending: expect.stringContaining("settlement not proven") });
+      expect.soft(f.mesh.get(`actor-removals/${f.actor.id}`)).toBeUndefined();
+      expect(processIdentity.processStartIdentityState(runner.identity)).toBe("alive");
+      if ((removal as { removed?: boolean }).removed) return; // Baseline failure already proves unsafe acceptance; cleanup still runs.
+      await dead(runner);
+      await sweep();
+      await vi.waitFor(() => expect(fs.existsSync(dir)).toBe(false));
+      await vi.waitFor(() => expect(manager.runDirectory(result.id)).toBeUndefined());
+      // Successor preflight permanently retired this root; it must not restart to
+      // produce a receipt. The safely emptied evidence tree now authorizes retry.
+      expect(fs.existsSync(path.join(f.oldDir, "workers-settled.json"))).toBe(false);
+      await expect(f.remove()).resolves.toEqual({ removed: true });
+    } finally {
+      launch.mockRestore();
+      await dead(runner);
+      await manager.close();
+      timer.mockRestore();
+      globalSweep.mockRestore();
+      heartbeat.mockRestore();
+      mark.mockRestore();
+    }
+  }, 30_000);
   it.each(["worker", "runner"])("keeps removal pending after a replacement %s spawn crashes before process registration", async kind => {
     const f = await fixture();
     await dead(f.host);

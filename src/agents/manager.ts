@@ -1801,7 +1801,9 @@ export class AgentManager {
       await this.#startTempRunSweep();
     }
     const expired = [...this.#runs.values()].filter((managed) => {
-      if (!managed.settled || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
+      // A terminal worker does not prove its recorded runner or nested runners exited.
+      // Preserve their evidence and handle just as explicit cleanup and close do.
+      if (!managed.settled || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory) || hasUnsettledRecordedProcesses(managed.runDirectory)) return false;
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       const finishedAt = record?.finishedAt ?? record?.updatedAt;
       return typeof finishedAt === "number" && now - finishedAt >= this.#retention.oneShotRunMs;

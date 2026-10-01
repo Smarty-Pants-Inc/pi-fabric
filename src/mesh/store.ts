@@ -316,6 +316,41 @@ const digestEntries = (entries: Iterable<MeshStateEntry>): string => {
   for (const entry of entries) hash.update(`${JSON.stringify(entry)}\n`);
   return hash.digest("base64");
 };
+// Encode each entry once for both the canonical payload and the optional namespace index.
+// Preserve JSON.stringify's field/key order and omission rules, including legacy envelope fields.
+// The encodings live only for this commit: UUID + stat cannot authorize reuse after a legacy
+// copied-marker ABA (smarty-dev#2355, #2395).
+const encodeState = (state: MeshStateFile): { serialized: Buffer; entries: Map<string, Buffer> } => {
+  const entries = new Map<string, Buffer>();
+  const fields: Buffer[] = [Buffer.from("{")];
+  const comma = Buffer.from(",");
+  for (const [field, value] of Object.entries(state)) {
+    if (field === "entries") {
+      if (fields.length > 1) fields.push(comma);
+      fields.push(Buffer.from('"entries":{'));
+      let first = true;
+      for (const key of Object.keys(state.entries)) {
+        const serialized = JSON.stringify(state.entries[key]);
+        if (serialized === undefined) continue;
+        const encodedKey = JSON.stringify(key);
+        const bytes = Buffer.from(`${encodedKey}:${serialized}`, "utf8");
+        // The canonical member and the hash's entry-only view share the same UTF-8 bytes.
+        entries.set(key, bytes.subarray(Buffer.byteLength(encodedKey, "utf8") + 1));
+        if (!first) fields.push(comma);
+        first = false;
+        fields.push(bytes);
+      }
+      fields.push(Buffer.from("}"));
+    } else {
+      const serialized = JSON.stringify(value);
+      if (serialized === undefined) continue;
+      if (fields.length > 1) fields.push(comma);
+      fields.push(Buffer.from(`${JSON.stringify(field)}:${serialized}`, "utf8"));
+    }
+  }
+  fields.push(Buffer.from("}"));
+  return { serialized: Buffer.concat(fields), entries };
+};
 const EMPTY_DIGEST = digestEntries([]);
 const sortedKeys = (keys: string[]): string[] => keys.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 const stampOf = (stat: fs.Stats): string =>
@@ -1154,7 +1189,7 @@ export class MeshStore {
   }
 
   // A commit's write, signal and cache, under the lock. The stamp is taken right after the rename,
-  // before hashing; the signal is published and the cache kept only while the file still has it,
+  // before hashing the encoded entries; the signal is published and the cache kept only while the file still has it,
   // so a lock-bypassing writer replacing the file meanwhile never gets this payload's hashes or
   // cache label. ponytail: a replace between the rename and that first stat cannot be detected
   // without the written descriptor (atomic-write.ts); the lock protocol excludes it.
@@ -1166,29 +1201,32 @@ export class MeshStore {
     delete payload.readGeneration;
     const generation = randomUUID();
     const stamped: MeshStateFile = { readGeneration: generation, ...payload };
-    atomicWrite(this.#statePath, stamped, this.#maxStateBytes);
+    const encoded = encodeState(stamped);
+    if (encoded.serialized.byteLength > this.#maxStateBytes) {
+      throw new Error(`Fabric mesh state exceeds ${this.#maxStateBytes} bytes`);
+    }
+    writeFileAtomic(this.#statePath, encoded.serialized);
     const stamp = statStamp(this.#statePath);
-    if (stamp !== undefined) this.#writeSignal(stamped, stamp, generation);
+    if (stamp !== undefined) this.#writeSignal(encoded.entries, stamp, generation);
     if (stamp === undefined || !this.#cacheState(stamped, stamp)) this.#stateCache = undefined;
   }
 
   // Best effort, after a commit: a failure leaves an older signal whose generation no longer
   // matches the canonical header, which only forces re-reads. It never fails the committed write.
-  #writeSignal(state: MeshStateFile, stamp: string, generation: string): boolean {
+  #writeSignal(entries: Map<string, Buffer>, stamp: string, generation: string): boolean {
     try {
-      const groups = new Map<string, MeshStateEntry[]>();
-      for (const key of sortedKeys(Object.keys(state.entries))) {
+      const hashes = new Map<string, ReturnType<typeof createHash>>();
+      const delimiter = Buffer.from("\n");
+      // Same ordered entry bytes and newline framing as digestEntries, without re-encoding.
+      for (const key of sortedKeys([...entries.keys()])) {
         const namespace = keyNamespace(key);
         if (!namespace) continue;
-        let group = groups.get(namespace);
-        if (!group) groups.set(namespace, group = []);
-        group.push(state.entries[key]!);
+        let hash = hashes.get(namespace);
+        if (!hash) hashes.set(namespace, hash = createHash("sha256"));
+        hash.update(entries.get(key)!).update(delimiter);
       }
       const namespaces: Record<string, string> = {};
-      // ponytail: hash all entries; UUID + stat cannot authorize reused hashes after a legacy
-      // copied-marker ABA. B68 accepts this bounded writer cost (smarty-dev#2355). If it matters,
-      // use one-pass JSON encoding for primary + hashes (smarty-dev#2395), not weaker validation.
-      for (const [namespace, entries] of groups) namespaces[namespace] = digestEntries(entries);
+      for (const [namespace, hash] of hashes) namespaces[namespace] = hash.digest("base64");
       if (statStamp(this.#statePath) !== stamp) return false;   // replaced while hashing: publish nothing
       // `generation` first: readers take it from the file's first HEADER_BYTES; it must equal the canonical readGeneration.
       const serialized = JSON.stringify({ generation, stamp, namespaces });

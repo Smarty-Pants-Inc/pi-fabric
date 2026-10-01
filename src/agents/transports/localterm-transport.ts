@@ -11,6 +11,8 @@ import {
   workerCommand,
 } from "./process-utils.js";
 
+import { assertTransportLaunchAllowed } from "./launch-authority.js";
+
 interface LocaltermSession {
   id: string;
   pid: number;
@@ -31,6 +33,7 @@ export class LocaltermTransport implements AgentTransportAdapter {
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     const command = `${await workerCommand(request.workerPath, request.workerArguments)}; exit $?`;
+    assertTransportLaunchAllowed(request);
     const { stdout } = await executeFile("localterm", [
       "session",
       "new",

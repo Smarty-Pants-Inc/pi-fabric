@@ -1,3 +1,4 @@
+import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -102,6 +103,7 @@ export interface BridgeRead {
 export interface BridgeHead { through: number; offset?: number }
 
 export interface BridgePublish {
+  principal?: FabricPrincipal | undefined;
   topic: string;
   kind: string;
   from: MeshIdentity;
@@ -532,6 +534,7 @@ const ignoreConflict = (error: unknown): void => {
 export const checkBridgePublish = (input: unknown): BridgePublish => {
   if (!isObject(input)) throw new Error("Bridge publish is not an object");
   const { topic, kind, from, to, text, data } = input;
+  const principal = copyFabricPrincipal(input.principal);
   if (typeof topic !== "string" || typeof kind !== "string" || !isBridgedTopic({ topic, kind })) {
     throw new Error(`Bridge topic is not allowed: ${String(topic)}`);
   }
@@ -541,6 +544,7 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
   if (!isObject(data) || !bridgeStampOf({ data })) throw new Error("Bridge publish has no bridge stamp");
   return {
     topic, kind, to,
+    ...(principal ? { principal } : {}),
     from: { id: from.id, name: from.name, kind: from.kind, ...(typeof from.sessionId === "string" ? { sessionId: from.sessionId } : {}) },
     ...(text !== undefined ? { text } : {}),
     data: data as BridgePublish["data"],
@@ -1060,6 +1064,7 @@ export class MeshBridge {
               if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
               return target.publish({
                 topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
+                ...(event.verification === "mesh" || event.verification === "bridge" ? { principal: event.principal } : {}),
                 ...(event.text !== undefined ? { text: event.text } : {}),
                 data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
               }, held);

@@ -339,6 +339,8 @@ export interface FabricConfig {
   fullCodeMode: boolean;
   /** A Main reloads itself onto a newer active Fabric release at a safe run end (smarty-dev#2160). */
   autoReload: boolean;
+  /** Automatic reload slots shared per host/user; 0 disables admission and jitter. */
+  selfReloadConcurrency: number;
   executor: FabricExecutorConfig;
   approvals: FabricApprovalConfig;
   mcp: FabricMcpConfig;
@@ -391,6 +393,7 @@ export const maxExecutorMemoryLimitBytes = (
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   fullCodeMode: true,
   autoReload: true,
+  selfReloadConcurrency: 6,
   executor: {
     kernel: "typescript",
     pythonRuntime: "monty",
@@ -859,6 +862,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   return {
     fullCodeMode: booleanValue(input.fullCodeMode, DEFAULT_FABRIC_CONFIG.fullCodeMode),
     autoReload: booleanValue(input.autoReload, DEFAULT_FABRIC_CONFIG.autoReload),
+    selfReloadConcurrency: typeof input.selfReloadConcurrency === "number"
+      && Number.isSafeInteger(input.selfReloadConcurrency) && input.selfReloadConcurrency >= 0
+      ? input.selfReloadConcurrency : DEFAULT_FABRIC_CONFIG.selfReloadConcurrency,
     executor: {
       kernel: executorKernel,
       pythonRuntime: executor.pythonRuntime === "cpython" ? "cpython" : "monty",

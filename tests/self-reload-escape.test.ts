@@ -36,7 +36,7 @@ describe("self-reload after an idle Escape with the mesh off (pi-fabric#160)", (
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     vi.stubEnv("PI_FABRIC_PROJECT_ROOT", root);
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({
-      fullCodeMode: true, mcp: { enabled: false, cache: { enabled: false } }, mesh: { enabled: mesh },
+      fullCodeMode: true, selfReloadConcurrency: 0, mcp: { enabled: false, cache: { enabled: false } }, mesh: { enabled: mesh },
       agents: { enabled: false }, memory: { enabled: false }, residency: { enabled: false },
       prewalk: { enabled: false, alwaysRearm: false },
       approvals: { agent: "allow", execute: "allow", read: "allow", network: "deny" },

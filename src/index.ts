@@ -1223,6 +1223,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       ? state.agents.runningCount() + state.actors.inFlightCount() + state.backgroundWorkCount()
       : 0,
     autoReloadConfigured: () => state.provisionalConfig().autoReload,
+    selfReloadConcurrency: () => state.provisionalConfig().selfReloadConcurrency,
     moduleUrl: import.meta.url,
     publishHeld: data => { void state.publishOpsEvent(RELOAD_HELD_TOPIC, "fabric.reload_held", data); },
     // Escape's stop-the-world halt of actors or Jev observers (mesh off too); the user's next

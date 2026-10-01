@@ -152,7 +152,7 @@ const explicitExtensions = (): string[] => {
 // module but keeps the process and the session id; the next runtime reports what it replaced.
 const HANDOFF = Symbol.for("pi-fabric.self-reload");
 const ATTEMPTS = Symbol.for("pi-fabric.self-reload.attempts");
-interface SelfReloadHandoff { old: string; target: string; owner?: string; resource?: string; reported?: boolean }
+interface SelfReloadHandoff { old: string; target: string; owner?: string; resource?: string; reported?: boolean; releaseSlot?: () => void }
 const handoffs = (): Map<string, SelfReloadHandoff> =>
   ((globalThis as Record<symbol, unknown>)[HANDOFF] ??= new Map<string, SelfReloadHandoff>()) as Map<string, SelfReloadHandoff>;
 
@@ -169,6 +169,8 @@ export const attemptedSelfReload = (sessionId: string, target: string): boolean 
 export const takeSelfReload = (sessionId: string, reason: string): SelfReloadHandoff | undefined => {
   const handoff = handoffs().get(sessionId);
   if (reason !== "reload" || !handoff || handoff.reported) return undefined;
+  handoff.releaseSlot?.();
+  delete handoff.releaseSlot;
   handoff.reported = true;
   return handoff;
 };
@@ -190,6 +192,11 @@ export interface SelfReloadDeps {
   busy(): number;
   /** fabric.json autoReload. */
   autoReloadConfigured(): boolean;
+  /** fabric.json selfReloadConcurrency (default 6, 0 = unlimited/no jitter). */
+  selfReloadConcurrency?(): number;
+  /** Test overrides; production uses one host/user directory and random 0–30 s jitter. */
+  reloadSlotsDirectory?: string;
+  reloadJitterMs?(): number;
   moduleUrl: string;
   settingsPath?: string;
   /** Best-effort mesh publish of RELOAD_HELD_TOPIC; the runtime skips it when the mesh is off. */
@@ -222,6 +229,10 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
   let profileLoad: Promise<typeof import("./reload-target-profile.js")> | undefined;
   let sessionId: string | undefined;
   let scheduled: { candidate: ReloadCandidate; token: string } | undefined;
+  let slotsLoad: Promise<typeof import("./reload-slots.js")> | undefined;
+  let admitting = false;
+  const notBefore = new Map<string, number>();
+  const concurrency = (): number => deps.selfReloadConcurrency?.() ?? 6;
   const commandSequenceKey = Symbol.for("pi-fabric.self-reload.command-sequence");
   const settingsPath = deps.settingsPath ?? path.join(resolveAgentDir(), "settings.json");
   const explicit = explicitExtensions();
@@ -370,6 +381,15 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     retry = undefined;
   };
   /** One scheduler and one native command for Fabric changes and bound resource changes. */
+  const jitterReady = (candidate: ReloadCandidate): boolean => {
+    if (concurrency() === 0) return true;
+    let when = notBefore.get(candidate.target);
+    if (when === undefined) {
+      when = Date.now() + (deps.reloadJitterMs?.() ?? Math.floor(Math.random() * 30_001));
+      notBefore.set(candidate.target, when);
+    }
+    return Date.now() >= when;
+  };
   const request = (context: ExtensionContext): boolean => {
     const candidate = candidateNow();
     if (!candidate || autoReloadOptedOut(deps.autoReloadConfigured())
@@ -377,6 +397,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       held = undefined;
       return true;
     }
+    const ready = jitterReady(candidate);
     if (candidate.kind === "resource") {
       const hold = resourceHold(context);
       if (hold?.startsWith("unsupported-host:")) { invalidate(candidate, hold, candidate.target); return false; }
@@ -385,8 +406,8 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     const busy = deps.busy();
     if (busy > 0) noteHeld(context, candidate.target, busy);
     else held = undefined;
-    if (busy > 0 || context.hasPendingMessages()) return false;
-    if (scheduled) return false; // keep the shared idle retry until the queued command executes
+    if (busy > 0 || context.hasPendingMessages() || !ready) return false;
+    if (scheduled || admitting) return false; // keep the shared idle retry until the queued command executes
     const globals = globalThis as Record<symbol, unknown>;
     const sequence = Number(globals[commandSequenceKey] ?? 0) + 1;
     globals[commandSequenceKey] = sequence;
@@ -423,7 +444,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
   };
   pi.on("session_shutdown", () => {
     generation++;
-    stopRetry(); bindings.clear(); pending.clear(); scheduled = undefined; contextNow = undefined;
+    stopRetry(); bindings.clear(); pending.clear(); notBefore.clear(); scheduled = undefined; contextNow = undefined;
     unsubscribe?.(); unsubscribe = undefined;
   });
   let statusShown = false;
@@ -462,14 +483,38 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
       const id = context.sessionManager.getSessionId();
       if (candidate.kind === "resource" && id !== sessionId) { invalidate(candidate, "session-changed"); return; }
       if (auto && attempted(id, candidate)) return;
-      // No await between the final profile/safety checks and invoking the native reload.
-      if (!recheck(candidate)) return;
-      const tried = attempts.get(id) ?? new Set<string>(); tried.add(candidate.target); attempts.set(id, tried);
-      if (candidate.kind === "resource") {
-        pending.delete(pendingKey(candidate));
-        handoffs().set(id, { old: candidate.loaded, target: candidate.target, owner: candidate.owner!, resource: candidate.resource! });
-      } else rememberSelfReload(id, candidate.loaded, candidate.target);
-      await context.reload();
+      if (auto && (admitting || !jitterReady(candidate))) return;
+      const commandGeneration = generation;
+      let releaseSlot: (() => void) | undefined;
+      admitting = true;
+      try {
+        if (auto && concurrency() > 0) {
+          // The filesystem limiter stays off cold import/registration/idle, and unlimited mode.
+          let slots: typeof import("./reload-slots.js");
+          try { slots = await (slotsLoad ??= import("./reload-slots.js")); }
+          catch { slotsLoad = undefined; return; } // leave pending; ordinary idle retry tries again
+          // A first-use import is an async boundary: recheck session and every safety hold.
+          if (generation !== commandGeneration || id !== sessionId || userHalted()
+            || autoReloadOptedOut(deps.autoReloadConfigured()) || !safe(context, candidate) || !recheck(candidate)) return;
+          try { releaseSlot = slots.tryAcquireReloadSlot(concurrency(), deps.reloadSlotsDirectory); }
+          catch { return; } // inaccessible host state fails closed, without consuming the target
+          if (!releaseSlot) return;
+        }
+        // No await between final profile/safety checks, lease acquisition and native reload.
+        if (!safe(context, candidate) || !recheck(candidate)) return;
+        const tried = attempts.get(id) ?? new Set<string>(); tried.add(candidate.target); attempts.set(id, tried);
+        if (candidate.kind === "resource") {
+          pending.delete(pendingKey(candidate));
+          handoffs().set(id, { old: candidate.loaded, target: candidate.target, owner: candidate.owner!, resource: candidate.resource! });
+        } else rememberSelfReload(id, candidate.loaded, candidate.target);
+        // The new module can release the old module's lease at session_start, even if the old
+        // ctx.reload promise has not yet resolved. Shutdown alone must not free it early.
+        if (releaseSlot) handoffs().get(id)!.releaseSlot = releaseSlot;
+        await context.reload();
+      } finally {
+        releaseSlot?.();
+        admitting = false;
+      }
     },
   });
 
@@ -477,16 +522,16 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     /** Arm the watch and clear session-scoped resource proofs; report a finished native reload once. */
     sessionStart(reason: string, context: ExtensionContext): { old: string; new: string; owner?: string; resource?: string; target?: string } | undefined {
       generation++;
-      stopRetry(); bindings.clear(); pending.clear(); scheduled = undefined;
+      stopRetry(); bindings.clear(); pending.clear(); notBefore.clear(); scheduled = undefined;
       noticed = undefined; held = undefined; stopped = false;
       sessionId = context.sessionManager.getSessionId();
       contextNow = selfReloadEligible(context.mode) ? context : undefined;
       if (!unsubscribe) unsubscribe = pi.events?.on(RELOAD_TARGET_TOPIC, receive);
+      const done = takeSelfReload(sessionId, reason);
       const loaded = loadedFabricRoot(deps.moduleUrl);
       if (!loaded || !contextNow) { watch = undefined; return undefined; }
       // Session switches keep the Fabric watch's original profile eligibility proof.
       if (watch?.loaded !== loaded) watch = new ActiveReleaseWatch(loaded, deps.settingsPath);
-      const done = takeSelfReload(sessionId, reason);
       statusShown = done !== undefined;
       if (!done) return undefined;
       return done.resource ? { old: releaseLabel(done.old), new: releaseLabel(done.target), owner: done.owner!, resource: done.resource, target: done.target }

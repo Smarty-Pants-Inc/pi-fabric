@@ -1,12 +1,15 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
+import { readFileRetrying } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
-import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
+import type { FabricThinking } from "../thinking.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
-import type { FabricKernel } from "../runtime/kernel.js";
+import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { ProcessIdentity } from "../core/process-identity.js";
 import type { FabricParticipantRecord } from "../topology/types.js";
@@ -33,23 +36,159 @@ export const sleepUnlessAborted = (ms: number, signal?: AbortSignal): Promise<vo
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 
+export interface ResidentRequestDecision {
+  requestId: string;
+  state: "abandoned" | "committed";
+  /** Allocated before the first mutation, even if publication is still pending. */
+  id?: string;
+  operation?: ResidentCommand["operation"];
+  ownerHostId?: string;
+}
+
+const residentDecisionPath = (residencyRoot: string, requestId: string): string =>
+  path.join(residencyRoot, "decisions", `${requestId}.json`);
+
+export const readResidentRequestDecision = (
+  residencyRoot: string,
+  requestId: string,
+): ResidentRequestDecision | undefined => {
+  const file = residentDecisionPath(residencyRoot, requestId);
+  try {
+    const decision = JSON.parse(readFileRetrying(file)) as ResidentRequestDecision;
+    if (decision.requestId !== requestId || !["abandoned", "committed"].includes(decision.state) ||
+      (decision.state === "committed" && (typeof decision.id !== "string" ||
+        typeof decision.ownerHostId !== "string" ||
+        typeof decision.operation !== "string"))) {
+      throw new Error(`Invalid Fabric residency decision for ${requestId}`);
+    }
+    return decision;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error; // Corruption is not permission to commit.
+  }
+};
+
 /**
- * Remove an abandoned file-exchange request. The resident host renames
- * unstarted requests out of `requests/` before running them, so deleting our
- * file cancels work the host has not picked up yet; a late host response is
- * removed as well. Deleting a request the host already moved is a no-op, and
- * in-flight work still runs to completion. Best effort: never throws.
+ * The hard-link is a filesystem compare-and-set: publish a complete, immutable
+ * record ONLY if the shared fence is absent. Unlike rename (overwrite) or an
+ * open("wx") followed by write (an empty-file window), readers always see the
+ * winner's complete record. Both commit and abandonment use this same fence.
+ * Keep decisions across host restarts: an old picked-up request must never replay.
+ */
+const decideResidentRequest = (residencyRoot: string, decision: ResidentRequestDecision): boolean => {
+  const file = residentDecisionPath(residencyRoot, decision.requestId);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(decision), { mode: 0o600, flag: "wx" });
+    try {
+      fs.linkSync(temporary, file);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error; // Fail closed if the filesystem cannot provide the fence.
+    }
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+};
+
+/** Called at the first mutation, after asynchronous preparation, never at pickup. */
+export const commitResidentRequest = (
+  residencyRoot: string,
+  command: ResidentCommand,
+  id: string,
+  ownerHostId: string,
+): void => {
+  if (decideResidentRequest(residencyRoot, {
+    requestId: command.requestId, state: "committed", operation: command.operation, id, ownerHostId,
+  })) return;
+  const decision = readResidentRequestDecision(residencyRoot, command.requestId);
+  throw new Error(decision?.state === "abandoned"
+    ? `Fabric residency request ${command.requestId} was abandoned before commit`
+    : `Fabric residency request ${command.requestId} was already committed; do not replay`);
+};
+
+/**
+ * Publish the abandonment tombstone BEFORE removing exchange files. If commit
+ * won, retain those files and return its known ID: cancellation cannot undo a
+ * mutation, and the caller must not mistake this for a rejected spawn/create.
  */
 export const abandonResidentRequest = (
   requestsPath: string,
   responsesPath: string,
   requestId: string,
-): void => {
-  for (const directory of [requestsPath, responsesPath]) {
-    try {
-      fs.rmSync(path.join(directory, `${requestId}.json`), { force: true });
-    } catch { /* best effort: an abandoned request must not raise a second error */ }
+): ResidentRequestDecision => {
+  const root = path.dirname(requestsPath);
+  decideResidentRequest(root, { requestId, state: "abandoned" });
+  const decision = readResidentRequestDecision(root, requestId)!;
+  if (decision.state === "abandoned") {
+    for (const directory of [requestsPath, responsesPath]) {
+      try {
+        fs.rmSync(path.join(directory, `${requestId}.json`), { force: true });
+      } catch { /* The durable tombstone, not deletion, prevents a late commit. */ }
+    }
   }
+  return decision;
+};
+
+/** Existing handle/actor return contracts cannot represent an unconfirmed launch. */
+export class ResidentOutcomeUnknownError extends Error {
+  readonly residentOutcome: FabricResidentOutcomeReceipt;
+  readonly requestId: string;
+  readonly id: string | undefined;
+  readonly operation: ResidentCommand["operation"];
+  readonly ownerHostId: string | undefined;
+
+  constructor(command: ResidentCommand, decision: ResidentRequestDecision | undefined, cause: unknown, signal?: AbortSignal) {
+    const id = decision?.id ?? ("id" in command ? command.id : undefined);
+    const kind = ["spawn", "foreground", "cleanup"].includes(command.operation) ? "agent" : "actor";
+    // Guest runtimes may preserve only message, so the classification and IDs live there too.
+    super(`ResidentOutcomeUnknownError: Fabric residency ${command.operation} outcome unknown: requestId=${command.requestId}` +
+      `, ${kind}Id=${id ?? "not yet known"}` +
+      `${decision?.ownerHostId ? `, ownerHostId=${decision.ownerHostId}` : ""}. ` +
+      `Do not retry or reassign this work. Check agents.${kind === "actor" ? "actorStatus" : "status"}` +
+      ` / agents.list${id ? ` for ${id}` : ` and request ${command.requestId}`}; ` +
+      `publication may still be pending. Use agents.stop with the known ID once registered to cancel. ` +
+      `Cause: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "ResidentOutcomeUnknownError";
+    this.requestId = command.requestId;
+    this.id = id;
+    this.operation = command.operation;
+    this.ownerHostId = decision?.ownerHostId;
+    this.residentOutcome = Object.freeze({
+      requestId: command.requestId,
+      state: decision?.state === "committed" ? "committed" : "unknown",
+      operation: command.operation,
+      entityKind: kind,
+      ...(id ? { id } : {}),
+      ...(decision?.ownerHostId ? { ownerHostId: decision.ownerHostId } : {}),
+    });
+    recordResidentOutcome(signal, this.residentOutcome);
+  }
+}
+
+/** Install before request publication; outer abort races can now settle the same fence. */
+export const registerResidentCancellation = (
+  signal: AbortSignal | undefined,
+  residencyRoot: string,
+  command: ResidentCommand,
+): void => {
+  // A committed receipt is immutable. Reuse its first error instead of nesting
+  // already-formatted uncertainty again at each enclosing cancellation gate.
+  let committedOutcome: ResidentOutcomeUnknownError | undefined;
+  registerCancellationEffect(signal, (reason) => {
+    if (committedOutcome) return committedOutcome;
+    let decision: ResidentRequestDecision | undefined;
+    try {
+      decision = abandonResidentRequest(path.join(residencyRoot, "requests"), path.join(residencyRoot, "responses"), command.requestId);
+    } catch (error) {
+      try { decision = readResidentRequestDecision(residencyRoot, command.requestId); } catch { /* unreadable fence */ }
+      return new ResidentOutcomeUnknownError(command, decision, error, signal);
+    }
+    if (decision.state === "committed") return committedOutcome = new ResidentOutcomeUnknownError(command, decision, reason, signal);
+    return undefined;
+  });
 };
 
 /** A short age such as "42s", "3m12s" or "1h05m". */
@@ -100,6 +239,11 @@ export const residentHostStateNote = (residencyRoot: string, now = Date.now()): 
 };
 
 export const RESIDENT_HOST_FORMAT = 1 as const;
+// Only command envelopes for post-B70 registry operations use format 2.
+// B70 validates format before dispatch and otherwise treats unknown operations
+// as removeActor: an unclaimed request MUST remain safe across crash/rollback.
+// Keep host config, owner records, responses and the five legacy commands at 1.
+export const RESIDENT_ACTOR_COMMAND_FORMAT = 2 as const;
 const RESIDENT_DELIVERY_PREFIX = "residency/deliveries/";
 
 const digest = (value: string): string =>
@@ -172,6 +316,10 @@ export interface ResidentHostOwner {
   token: string;
   startedAt: number;
   readyAt: number;
+  /** Commands supported by this running binary; absent on pre-negotiation hosts. */
+  commands?: readonly string[];
+  /** New clients must not dispatch mutations to an already-running pre-fence host. */
+  requestFence?: 1;
 }
 
 interface ResidentSpawnCommand {
@@ -220,12 +368,97 @@ interface ResidentCreateActorCommand {
   createdAt: number;
 }
 
+/** Existing Pi runtime control identity, captured by the provider, never from action args. */
+export interface ResidentActorCaller {
+  identity: MeshIdentity;
+  hostId: string;
+  /** Frozen optional-tool authority; absence means an unrestricted Main. */
+  toolCeiling?: string[];
+}
+
+export class ResidentActorAuthorizationError extends Error {
+  readonly code = "RESIDENT_ACTOR_FORBIDDEN" as const;
+  constructor(message = "Only the actual owning Main can mutate a resident actor") {
+    super(message);
+    this.name = "ResidentActorAuthorizationError";
+  }
+}
+
+export const assertResidentActorMain = (caller: ResidentActorCaller | undefined, rootId: string): void => {
+  if (!caller || caller.identity?.kind !== "main" || caller.identity.id !== rootId) {
+    throw new ResidentActorAuthorizationError();
+  }
+};
+
+export const assertResidentActorToolCeiling = (tools: string[], ceiling: readonly string[] | undefined): void => {
+  if (ceiling === undefined) return;
+  if (!Array.isArray(ceiling) || !ceiling.every((tool) => typeof tool === "string") ||
+    !Array.isArray(tools) || !tools.every((tool) => typeof tool === "string" &&
+      (tool.trim() === "fabric_exec" || ceiling.includes(tool.trim())))) {
+    throw new ResidentActorAuthorizationError("Actor tools cannot exceed the caller's tool ceiling");
+  }
+};
+
+/** Root-owned registry operations; these never start a resident host. */
+export type ResidentActorMutation =
+  | { operation: "setInstructions"; id: string; instructions: string }
+  | { operation: "setTools"; id: string; tools: string[] }
+  | { operation: "setModel"; id: string; model?: string; scope: FabricActorBindingScope }
+  | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
+  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null };
+
+type ResidentActorMutationCommand = ResidentActorMutation & {
+  caller?: ResidentActorCaller;
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
+  requestId: string;
+  rootId: string;
+  createdAt: number;
+};
+
+interface ResidentActorStatusCommand {
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
+  operation: "actorStatus" | "actors";
+  requestId: string;
+  rootId: string;
+  id?: string;
+  createdAt: number;
+}
+
 export type ResidentCommand =
   | ResidentSpawnCommand
   | ResidentCleanupCommand
   | ResidentForegroundCommand
   | ResidentRemoveActorCommand
-  | ResidentCreateActorCommand;
+  | ResidentCreateActorCommand
+  | ResidentActorMutationCommand
+  | ResidentActorStatusCommand;
+
+// The only operations every format-1 host predating command negotiation understood.
+const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
+export const RESIDENT_COMMANDS = [
+  ...LEGACY_RESIDENT_COMMANDS, "actors", "actorStatus", "setInstructions", "setModel",
+  "setThinking", "setTools", "setActivationFilter",
+] as const satisfies readonly ResidentCommand["operation"][];
+
+export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
+  typeof operation === "string" && (RESIDENT_COMMANDS as readonly string[]).includes(operation);
+
+export class ResidentCommandUnsupportedError extends Error {
+  readonly code = "RESIDENT_COMMAND_UNSUPPORTED" as const;
+  constructor(message = "The owning resident host runs an older release; it is relaunched on the current release at its next idle point; retry then") {
+    super(message);
+    this.name = "ResidentCommandUnsupportedError";
+  }
+}
+
+/** Check the running owner's publication, never the caller's release/config. */
+export const assertResidentCommandSupported = (owner: ResidentHostOwner, operation: ResidentCommand["operation"]): void => {
+  const supported = owner.commands === undefined ? LEGACY_RESIDENT_COMMANDS : owner.commands;
+  if (!isResidentCommandOperation(operation) || !Array.isArray(supported) ||
+      !(supported as readonly string[]).includes(operation)) {
+    throw new ResidentCommandUnsupportedError();
+  }
+};
 
 export interface ResidentCommandResponse {
   format: typeof RESIDENT_HOST_FORMAT;
@@ -233,10 +466,12 @@ export interface ResidentCommandResponse {
   ok: boolean;
   handle?: AgentHandleInfo;
   actor?: FabricActorInfo;
+  actors?: FabricActorInfo[];
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;
   error?: string;
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED";
   completedAt: number;
 }
 

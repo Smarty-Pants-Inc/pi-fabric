@@ -133,7 +133,6 @@ const loadVedaCli = async (): Promise<VedaCliModule> => {
 };
 
 const MAX_STDERR_CHARS = 20_000;
-const MAX_EVENT_LINE_CHARS = 4 * 1024 * 1024;
 const STEER_READ_CHUNK_BYTES = 256 * 1024;
 const MAX_STEER_LINE_BYTES = 64 * 1024;
 const MAX_STEER_COMMANDS_PER_POLL = 256;
@@ -249,7 +248,7 @@ process.on("unhandledRejection", (error) => {
 });
 
 const main = async (): Promise<void> => {
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter }, { ToolCallStreamGuard }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -1581,12 +1580,22 @@ const main = async (): Promise<void> => {
     }
   }
   delete record.currentTool;
-  writeRunRecord(options.statusFile, record);
-  terminalWritten = true;
-  process.stdout.write(`\n[pi-fabric] ${record.status}\n`);
   await new Promise<void>((resolve) =>
     sessionStream ? sessionStream.end(resolve) : resolve(),
   );
+  // Child close drained stdout/stderr, decoder tails and held log events above.
+  // The result is now terminal, including reply/schema validation. Compact only
+  // this quiescent source, before publishing terminal status: manager settlement
+  // and actor/residency retention can copy/remove the run as soon as it appears.
+  // Failure is best-effort and must never change or mask the original run result.
+  const logCompaction = compactTerminalRunLog(options.logFile, record.status);
+  if (logCompaction.compactionSkipped || logCompaction.error) {
+    record.compactionSkipped = logCompaction.compactionSkipped ??
+      `Terminal run-log compaction failed; full log retained: ${logCompaction.error}`;
+  }
+  writeRunRecord(options.statusFile, record);
+  terminalWritten = true;
+  process.stdout.write(`\n[pi-fabric] ${record.status}\n`);
   process.exitCode = record.status === "completed" ? 0 : 1;
 };
 

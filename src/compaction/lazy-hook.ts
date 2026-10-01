@@ -7,7 +7,7 @@ export const registerLazyCompactionHook = (pi: ExtensionAPI, options: Compaction
   pi.on("session_before_compact", async (event, context) => {
     if (event.customInstructions === "__pi_vcc__") return;
     const { handleFabricBeforeCompact } = await import("./hook.js");
-    return handleFabricBeforeCompact(event, context, options);
+    return handleFabricBeforeCompact(event, context, options, pi);
   });
   pi.on("session_before_tree", async (event, context) => {
     if (options.getEngine() !== "fabric" || !event.preparation.userWantsSummary

@@ -260,6 +260,49 @@ describe("resident orphan retention", () => {
 });
 
 describe("resident host ownership", () => {
+  it.each(["ask", "followUp"] as const)("preserves owner-default provenance through %s admission without pinning resolved defaults", async (operation) => {
+    const { root, config, host } = fixture();
+    let handler!: Parameters<typeof host.control.start>[0];
+    const control = vi.spyOn(FabricControlPlane.prototype, "start").mockImplementation((accept) => { handler = accept; });
+    try {
+      await host.start();
+      control.mockRestore();
+      vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
+      const binding = vi.spyOn(host.actors, "resolveActivationBinding").mockResolvedValue({ model: "provider/current", thinking: "high" });
+      const tell = vi.spyOn(host.actors, "tell").mockReturnValue({ messageId: "accepted" } as ReturnType<typeof host.actors.tell>);
+      const ask = vi.spyOn(host.actors, "ask").mockResolvedValue({ id: "accepted" } as Awaited<ReturnType<typeof host.actors.ask>>);
+      const command = { operation, targetId: "actor", commandId: "owner-defaults", message: "keep working", binding: { model: "provider/pinned" }, bindingProvenance: { kind: "owner-defaults" as const, rootId: config.rootId } } as Parameters<typeof handler>[0];
+      const from = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+      const signal = new AbortController().signal;
+      await expect(handler(command, from, signal)).resolves.toMatchObject({ accepted: true, messageId: "accepted" });
+      const options = { overrides: { model: "provider/pinned" } };
+      if (operation === "ask") expect(ask).toHaveBeenCalledWith("actor", "keep working", undefined, signal, options);
+      else {
+        expect(binding).toHaveBeenCalledWith("actor", options);
+        expect(tell).toHaveBeenCalledWith("actor", "keep working", undefined, options);
+      }
+      await expect(handler(command, { ...from, id: "session:foreign" }, signal)).resolves.toMatchObject({ accepted: false, error: "Invalid actor owner-default binding provenance" });
+      expect(operation === "ask" ? ask : tell).toHaveBeenCalledOnce();
+    } finally {
+      control.mockRestore();
+      await host.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("publishes the request fence and process birth identity together, then releases ownership", async () => {
+    const { root, config, host } = fixture();
+    const ownerPath = path.join(config.residencyRoot, "owner.json");
+    try {
+      await host.start();
+      const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+      expect(owner).toMatchObject({ requestFence: 1, commands: expect.arrayContaining(["setModel", "setTools"]), pid: process.pid, hostId: host.hostId });
+      expect(owner.processStartTime).toBe(processStartTime(process.pid));
+      expect(residentProcessAlive(owner.pid, owner.processStartTime)).toBe(true);
+      await host.close();
+      expect(fs.existsSync(ownerPath)).toBe(false);
+    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
   it("ignores a config release change and continues accepting actor work", async () => {
     const { root, config, host, idle } = fixture();
     const next = path.join(root, "other-package");
@@ -275,6 +318,7 @@ describe("resident host ownership", () => {
       const owner = fs.readFileSync(ownerPath, "utf8");
       vi.spyOn(host.actors, "listOwned").mockReturnValue([{ residency: "durable", status: "idle", queued: 0 }] as ReturnType<typeof host.actors.listOwned>);
       vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
       vi.spyOn(host.actors, "resolveActivationBinding").mockResolvedValue({});
       const tell = vi.spyOn(host.actors, "tell").mockReturnValue({ messageId: "accepted" } as ReturnType<typeof host.actors.tell>);
       fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify({ ...config, fabricExtensionPath: path.join(next, "dist/index.js") }));
@@ -291,7 +335,7 @@ describe("resident host ownership", () => {
   });
 
   it("rejects delayed and new admissions during ordinary close", async () => {
-    const { root, host } = fixture();
+    const { root, config, host } = fixture();
     let handler!: Parameters<typeof host.control.start>[0];
     const control = vi.spyOn(FabricControlPlane.prototype, "start").mockImplementation((accept) => { handler = accept; });
     let resolve: ((binding: Awaited<ReturnType<typeof host.actors.resolveActivationBinding>>) => void) | undefined;
@@ -300,6 +344,7 @@ describe("resident host ownership", () => {
       await host.start();
       control.mockRestore();
       vi.spyOn(host.actors, "owns").mockReturnValue(true);
+      vi.spyOn(host.actors, "status").mockReturnValue({ rootId: config.rootId } as ReturnType<typeof host.actors.status>);
       vi.spyOn(host.actors, "resolveActivationBinding").mockImplementation(() => new Promise((done) => { resolve = done; }));
       const tell = vi.spyOn(host.actors, "tell");
       const admission = handler({ operation: "followUp", targetId: "actor", commandId: "delayed", message: "keep me" } as Parameters<typeof handler>[0], host.identity, new AbortController().signal);

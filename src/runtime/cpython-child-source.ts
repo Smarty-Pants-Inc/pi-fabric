@@ -1,6 +1,21 @@
 // Embedded so installed bundles do not depend on a source-tree Python asset.
 export const CPYTHON_CHILD_SOURCE = String.raw`
 import sys
+# Opt-in from the test observer's spawn argv, never ordinary execution logs.
+_trace_startup = "--fabric-startup-trace" in sys.argv[1:]
+if _trace_startup:
+    import time
+    _startup_started = time.perf_counter()
+
+
+def _startup(step):
+    if _trace_startup:
+        sys.stderr.write("[fabric-cpython-startup] at=%.6f elapsedMs=%.3f %s\n" %
+            (time.time(), (time.perf_counter() - _startup_started) * 1000, step))
+        sys.stderr.flush()
+
+
+_startup("interpreter start")
 if sys.implementation.name != "cpython" or sys.version_info < (3, 10):
     sys.stderr.write("Fabric requires CPython 3.10 or newer; set executor.cpython.binary to a supported interpreter.\n")
     sys.exit(1)
@@ -13,6 +28,8 @@ import os
 import socket
 import sys
 import traceback
+
+_startup("imports done")
 
 _MAX_FRAME = 16 * 1024 * 1024
 _MAX_INTEGER = 9007199254740991
@@ -42,6 +59,10 @@ async def _send(message):
     if len(data) > _MAX_FRAME:
         raise ValueError("Fabric IPC frame exceeds 16 MiB")
     _writer.write(data)
+    if message.get("type") == "hello":
+        _startup("IPC hello written")
+    elif message.get("type") == "call" and message.get("id") == 1:
+        _startup("first request written")
     await _writer.drain()
 
 
@@ -80,6 +101,10 @@ async def _responses(reader):
                 continue
             if message.get("ok") is True:
                 future.set_result(message.get("value"))
+                # Resolution admits this response. Send the correlated receipt
+                # before a resumed guest call or terminal result can overtake it.
+                if "responseId" in message:
+                    await _send({"type": "response_ack", "id": message["id"], "responseId": message["responseId"]})
             else:
                 future.set_exception(_HostError(message.get("error", "Host call failed"), message.get("bashExit")))
     except Exception as error:
@@ -193,8 +218,15 @@ def _error_text(error, source):
         if isinstance(original, SyntaxError) and original.filename == "fabric-exec.py":
             frames = []
         current.stack = traceback.StackSummary.from_list(frames)
-        if current.exc_type is _HostError:
-            current.exc_type = RuntimeError
+        if type(original) is _HostError:
+            # Python 3.14 derives read-only exc_type_str from these name fields.
+            if hasattr(current, "exc_type_qualname"):
+                current.exc_type_qualname = "RuntimeError"
+                current.exc_type_module = "builtins"
+            elif hasattr(current, "exc_type_str"):
+                current.exc_type_str = "RuntimeError"
+            else:
+                current.exc_type = RuntimeError
         if len(seen) >= 8:
             current.__cause__ = None
             current.__context__ = None
@@ -218,13 +250,20 @@ async def _main():
     # TCP listener and proves a one-time token from the environment instead.
     port = os.environ.get("FABRIC_IPC_PORT")
     token = os.environ.get("FABRIC_IPC_TOKEN")
+    _startup("event loop running")
     if port and token:
+        _startup("connecting to 127.0.0.1:%s" % port)
         reader, _writer = await asyncio.open_connection("127.0.0.1", int(port), limit=_MAX_FRAME)
+        _startup("connected")
         await _send({"type": "hello", "token": token})
     else:
+        _startup("connecting to inherited socket fd 3")
         channel = socket.socket(fileno=3)
         reader, _writer = await asyncio.open_connection(sock=channel, limit=_MAX_FRAME)
+        _startup("connected")
+    _startup("waiting for execute request")
     request = json.loads(await reader.readline())
+    _startup("execute request received")
     if request.get("type") != "execute":
         raise RuntimeError("Invalid Fabric execution request")
     response_task = asyncio.create_task(_responses(reader))
@@ -268,6 +307,7 @@ async def _main():
 
 
 try:
+    _startup("event loop starting")
     asyncio.run(_main())
 except BaseException:
     traceback.print_exc()

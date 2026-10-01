@@ -80,8 +80,8 @@ const residencySchema = {
 
 const actorBindingScopeSchema = {
   type: "string",
-  enum: ["session", "project"],
-  description: "session (default) changes only this Pi session; project pins the shared actor default and requires ownership.",
+  enum: ["session", "project", "global"],
+  description: "session (default) changes this root's live session binding or a foreign caller's local overlay; project pins the shared default and requires ownership; global updates a non-live template.",
 };
 
 const actorInvocationProperties = {
@@ -280,7 +280,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "projectAgent",
-    description: "Return the live project agent for this session's project: the root whose role is project-agent and whose project (the checkout that owns the git common directory) is this session's. A worktree agent reports to it. Throws with the reason when none is live.",
+    description: "Return this session's interactive project lead by normalized repository origin, using the lead id recorded at launch (SMARTY_LEAD_SESSION or .local/lead) to resolve ambiguity and moved lanes. Unrecorded bridge mirrors cannot claim leadership. Throws a named error when unresolved or ambiguous.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },
@@ -839,7 +839,11 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         before: {
           type: "number",
           minimum: 0,
-          description: "Exclusive line cursor returned by a previous page to load older entries",
+          description: "Exclusive byte offset returned by a previous page. Requires beforeGeneration; an unbound cursor returns cursor-stale rather than silently reading wrong bytes.",
+        },
+        beforeGeneration: {
+          type: "string",
+          description: "Required with before: previous generation (agent generation, actor sessionGeneration or run.generation). Actor type must be session or run, not all. On cursor-stale, re-read from the start without the cursor pair.",
         },
         runId: { type: "string", description: "Specific retained run (default: actor's last run)" },
       },

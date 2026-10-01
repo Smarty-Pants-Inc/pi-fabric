@@ -5,6 +5,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeConversationReader, type NativeConversationTranscript } from "../src/ui/conversation-native-reader.js";
 import { NativeReaderCheckpoint } from "../src/ui/conversation-native-reader-checkpoint.js";
+import { compactTerminalRunLog } from "../src/worker/run-log.js";
+import { descriptorIdentity, fileIdentity, replaceGeneration, retainCompactionGeneration } from "./helpers/native-reader-file-generation.js";
 
 const directories: string[] = [];
 const workspace = () => {
@@ -20,6 +22,11 @@ const entry = (i: number, length = 5000) => ({
 const header = { type: "session", id: "session" };
 const source = (file: string) => ({ id: "reader", status: "running", logFile: file });
 const content = (snapshot: NativeConversationTranscript) => ({ messages: snapshot.messages, entries: snapshot.entries, streaming: snapshot.streaming, pendingMessages: snapshot.pendingMessages, leafId: snapshot.leafId, hasMore: snapshot.hasMore, hasNewer: snapshot.hasNewer, historyComplete: snapshot.historyComplete });
+// All source reads (classification, forward/backward pages, verification and
+// relocation) pass an explicit numeric position. Checkpoint restore instead uses
+// readFileSync(fd), whose internal readSync calls may omit that fifth argument.
+const sourceReadCalls = (reads: { mock: { calls: unknown[][] } }) =>
+  reads.mock.calls.filter((call) => typeof call[4] === "number");
 const trackCheckpoints = () => {
   const original = fs.mkdtempSync.bind(fs);
   return vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
@@ -34,7 +41,518 @@ afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
+describe("native reader identical-prefix paging", () => {
+  it.each([
+    ["session", "readFollow"], ["events", "readFollow"],
+    ["session", "loadNewer"], ["events", "loadNewer"],
+  ] as const)("keeps one-click older progress and one-page %s growth via %s", (kind, api) => {
+    const file = path.join(workspace(), `${kind}.jsonl`);
+    const record = (i: number) => kind === "session" ? entry(i)
+      : { type: "message_end", message: entry(i).message };
+    const records = Array.from({ length: 650 }, (_, i) => record(i));
+    const bytes = jsonl([...(kind === "session" ? [header] : []), ...records.slice(0, 150)]);
+    fs.writeFileSync(file, bytes);
+    const input = { id: "reader", status: "running", ...(kind === "session" ? { sessionFile: file } : { eventsFile: file }) };
+    const reader = new NativeConversationReader();
+    reader.read(input, false);
+    const before = reader.loadOlder()!;
+    const olderReader = new NativeConversationReader();
+    const olderBefore = olderReader.read(input, api === "readFollow");
+    const oldInode = fileIdentity(file);
+    fs.writeFileSync(`${file}.new`, bytes + jsonl(records.slice(150)));
+    replaceGeneration(`${file}.new`, file);
+    const inode = fileIdentity(file);
+    expect(inode).not.toBe(oldInode);
+    const realRead = fs.readSync.bind(fs);
+    const suffixReads: Array<{ position: number; length: number; replacement: boolean }> = [];
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
+      const stack = new Error().stack ?? "";
+      if (descriptorIdentity(fd) === inode && stack.includes("readForwardPage") && !stack.includes("matchesLoadedPages")) {
+        suffixReads.push({ position, length, replacement: stack.includes("replaceWindowIfNeeded") });
+      }
+      return realRead(fd, buffer, offset, length, position);
+    }) as typeof fs.readSync);
+    const older = olderReader.loadOlder(1)!;
+    expect(older.messages.length).toBeGreaterThan(olderBefore.messages.length);
+    expect(older.messages.slice(-olderBefore.messages.length)).toEqual(olderBefore.messages);
+    expect(older.messages.at(-1)?.timestamp).toBe(149);
+    expect(older.leafId).toBe(olderBefore.leafId);
+    expect(older.hasNewer).toBe(api !== "readFollow");
+    expect(suffixReads).toEqual([]); // Even prior following must not consume unseen records.
+    const grown = api === "readFollow" ? reader.read(input, true) : reader.loadNewer()!;
+    expect(suffixReads).toEqual([{ position: Buffer.byteLength(bytes), length: 1024 * 1024, replacement: true }]);
+    const added = grown.messages.filter((message) => message.timestamp >= 150);
+    expect(added.length).toBeGreaterThan(0);
+    expect(added.length).toBeLessThan(500);
+    expect(grown.messages).toEqual([...before.messages, ...records.slice(150, 150 + added.length).map((record) => record.message)]);
+    expect(grown.hasNewer).toBe(false); // hasNewer is only reported while pinned.
+    suffixReads.length = 0;
+    const next = reader.read(input, true);
+    expect(suffixReads).toHaveLength(1);
+    expect(suffixReads[0]!.length).toBe(1024 * 1024);
+    expect(suffixReads[0]!.replacement).toBe(false);
+    expect(next.messages.slice(0, grown.messages.length)).toEqual(grown.messages);
+    expect(next.messages.length).toBeGreaterThan(grown.messages.length);
+    expect(next.hasNewer).toBe(false);
+    const sourceCalls = reads.mock.calls.length;
+    const pinned = reader.read(input, false);
+    expect(pinned.hasNewer).toBe(true); // Following did not consume all pending records.
+    expect(pinned.messages).toEqual(next.messages);
+    expect(pinned.leafId).toBe(next.leafId);
+    expect(reads).toHaveBeenCalledTimes(sourceCalls); // Pinning reads no suffix.
+    expect(suffixReads).toHaveLength(1);
+    reads.mockRestore();
+    reader.clear();
+    olderReader.clear();
+  });
+
+  it.each(["session", "events"] as const)("does not read a new %s tail after identical EOF adoption", (kind) => {
+    const file = path.join(workspace(), `${kind}.jsonl`);
+    const bytes = jsonl(kind === "session" ? [header, entry(0, 16)] : [{ type: "message_end", message: entry(0, 16).message }]);
+    fs.writeFileSync(file, bytes);
+    const input = { id: "reader", status: "running", ...(kind === "session" ? { sessionFile: file } : { eventsFile: file }) };
+    const reader = new NativeConversationReader();
+    const before = reader.read(input, true);
+    const inode = fileIdentity(file);
+    fs.writeFileSync(`${file}.new`, bytes);
+    replaceGeneration(`${file}.new`, file);
+    expect(fileIdentity(file)).not.toBe(inode);
+    const realRead = fs.readSync.bind(fs);
+    const positions: number[] = [];
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
+      positions.push(position);
+      return realRead(fd, buffer, offset, length, position);
+    }) as typeof fs.readSync);
+    const after = reader.read(input, true);
+    expect(content(after)).toEqual(content(before));
+    expect(reads).toHaveBeenCalledTimes(1); // Loaded-page verification only.
+    expect(positions).toEqual([0]);
+    reader.clear();
+  });
+});
+describe("native reader initial recovery suspension", () => {
+  it.each([
+    ["missing", true], ["missing", false], ["initial EIO", true], ["initial EIO", false],
+  ] as const)("resumes canonical after %s recovery and production replacement (follow=%s)", (failure, follow) => {
+    const file = path.join(workspace(), "events.jsonl");
+    const input = { id: "reader", status: "running", eventsFile: file };
+    const toolCallId = "suspended-recovery";
+    const args = { command: "model-free", nested: { keep: [1, 2] } };
+    const content = [{ type: "text", text: "full-result:" + "x".repeat(4000) }];
+    const details = { exact: { audits: [{ id: "nested-call", args: { path: "whole" } }] } };
+    const result = { content, details, customFlag: { retained: true } };
+    const partial = { content: [{ type: "text", text: "partial-only" }], details: { progress: 1 } };
+    const prefix = jsonl([
+      { type: "tool_execution_start", toolCallId, toolName: "bash", args },
+      { type: "tool_execution_update", toolCallId, partialResult: partial },
+      { type: "tool_execution_end", toolCallId, toolName: "bash", result, isError: true },
+    ]);
+    const canonical = { role: "toolResult", toolCallId, toolName: "bash", content, details, isError: true, timestamp: 9,
+      metadata: { provenance: "canonical-only", padding: "m".repeat(600) } };
+    if (failure === "initial EIO") fs.writeFileSync(file, prefix);
+    const reader = new NativeConversationReader();
+    const realRead = fs.readSync.bind(fs);
+    let injected = 0;
+    let failedFd = -1;
+    const fault = failure === "initial EIO" ? vi.spyOn(fs, "readSync").mockImplementation(((...values: Parameters<typeof fs.readSync>) => {
+      if (/readBackwardPage|readForwardPage/.test(new Error().stack ?? "")) {
+        injected++;
+        failedFd = values[0];
+        throw Object.assign(new Error("initial page EIO"), { code: "EIO" });
+      }
+      return realRead(...values);
+    }) as typeof fs.readSync) : undefined;
+    const realOpen = fs.openSync.bind(fs);
+    let admissionFailures = 0;
+    const admission = failure === "initial EIO" ? vi.spyOn(fs, "openSync").mockImplementation(((...values: Parameters<typeof fs.openSync>) => {
+      if ((new Error().stack ?? "").includes("growFile")) {
+        admissionFailures++;
+        throw Object.assign(new Error("initial retry EIO"), { code: "EIO" });
+      }
+      return realOpen(...values);
+    }) as typeof fs.openSync) : undefined;
+    const initial = reader.read(input, false);
+    fault?.mockRestore();
+    admission?.mockRestore();
+    expect(initial.eventsFile).toBe(file);
+    expect(initial.messages).toEqual([]);
+    expect(initial.streaming.tools).toEqual([]);
+    expect(initial.unavailable?.eventsFile).toBe(true);
+    if (failure === "initial EIO") {
+      expect(injected).toBe(1); // actual initial page read failed
+      expect(admissionFailures).toBe(1); // same-call retry remained unavailable
+      expect(() => fs.fstatSync(failedFd)).toThrow();
+    } else fs.writeFileSync(file, prefix);
+    const recovered = reader.read(input, true);
+    expect(recovered.messages).toEqual([]);
+    expect(recovered.unavailable).toBeUndefined();
+    expect(recovered.streaming.tools).toHaveLength(1);
+    expect(recovered.streaming.tools[0]).toMatchObject({ toolCallId, toolName: "bash", args, executionStarted: true,
+      argsComplete: true, status: "failed", isError: true, result: { content, details }, partial });
+    if (!follow) expect(reader.read(input, false).streaming.tools).toEqual(recovered.streaming.tools);
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    expect(reader.suspended).toBe(true);
+    const checkpointDirectory = temporary.mock.results[0]!.value as string;
+    fs.appendFileSync(file, jsonl([{ type: "message_end", message: canonical }]));
+    const inode = fileIdentity(file);
+    retainCompactionGeneration(file);
+    const compacted = compactTerminalRunLog(file, "failed");
+    expect(compacted).toMatchObject({ compacted: 1 });
+    expect(compacted.error).toBeUndefined();
+    expect(fileIdentity(file)).not.toBe(inode);
+    const bytes = fs.readFileSync(file);
+    const lines = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
+    expect(lines[2].resultMetadata).toEqual({ customFlag: result.customFlag });
+    expect(lines[2].result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify(result)) });
+    expect(lines[3]).toEqual({ type: "message_end", message: canonical });
+    const canonicalStart = bytes.indexOf(Buffer.from('{"type":"message_end"'));
+    const consumed = Buffer.byteLength(prefix);
+    expect(canonicalStart).toBeGreaterThan(0);
+    expect(canonicalStart).toBeLessThan(consumed);
+    expect(consumed).toBeLessThan(bytes.length);
+    expect(() => JSON.parse(bytes.subarray(consumed).toString("utf8"))).toThrow();
+    const resumed = reader.read({ ...input, status: "failed" }, follow);
+    expect(reader.suspended).toBe(false);
+    expect(fs.existsSync(checkpointDirectory)).toBe(false);
+    if (!follow) {
+      expect(resumed.messages).toEqual([]);
+      expect(resumed.hasNewer).toBe(true);
+      expect.soft(resumed.streaming.tools[0]?.result).toBeUndefined(); // still reach the canonical-loss assertion
+      expect(resumed.streaming.tools[0]?.partial).toEqual(partial);
+    }
+    const completed = follow ? resumed : reader.loadNewer()!;
+    expect(completed.messages).toEqual([canonical]);
+    expect(completed.streaming.tools).toHaveLength(1);
+    expect(completed.streaming.tools[0]).toEqual({ toolCallId, toolName: "bash", args, executionStarted: true,
+      argsComplete: true, status: "failed", isError: true, result: { content, details }, partial });
+    expect(completed.error).toBeUndefined();
+    expect(completed.unavailable).toBeUndefined();
+    expect(completed.hasMore).toBe(false); // no session branch is required for events-only sources
+    expect(completed.hasNewer).toBe(false);
+    const reads = vi.spyOn(fs, "readSync");
+    expect(reader.read({ ...input, status: "failed" }, true).messages).toEqual([canonical]);
+    expect(reader.loadNewer()!.messages).toEqual([canonical]);
+    expect(sourceReadCalls(reads)).toHaveLength(0);
+    reader.clear();
+  });
+});
+
 describe("native reader disk suspension", () => {
+  it("counts real session/events source reads but excludes corrupt checkpoint reads", () => {
+    const temporary = trackCheckpoints();
+    const checkpoint = new NativeReaderCheckpoint({ calibration: true });
+    fs.writeFileSync(path.join(temporary.mock.results[0]!.value as string, "checkpoint"), "corrupt");
+    const reads = vi.spyOn(fs, "readSync");
+    expect(() => checkpoint.restore()).toThrow("reader checkpoint checksum mismatch");
+    expect(sourceReadCalls(reads)).toHaveLength(0);
+    for (const kind of ["session", "events"] as const) {
+      const file = path.join(workspace(), `${kind}.jsonl`);
+      fs.writeFileSync(file, jsonl(kind === "session" ? [header, entry(0, 16)]
+        : [{ type: "message_end", message: entry(0, 16).message }]));
+      reads.mockClear();
+      const reader = new NativeConversationReader();
+      expect(reader.read(source(file), false).messages).toEqual([entry(0, 16).message]);
+      // A real source reread would fail the zero-source-read assertions below,
+      // including classification at position zero, not just page reads.
+      expect(sourceReadCalls(reads).length).toBeGreaterThan(0);
+      expect(sourceReadCalls(reads)).toHaveLength(reads.mock.calls.length);
+      reader.clear();
+    }
+    reads.mockRestore();
+    checkpoint.dispose();
+  });
+
+  it.each(["relocation", "unread"] as const)("preserves poisoned evidence across a failed %s replacement transaction", (phase) => {
+    const file = path.join(workspace(), "session.jsonl");
+    const input = { id: "reader", status: "running", sessionFile: file };
+    fs.writeFileSync(file, jsonl([header, entry(0, 16)]));
+    const reader = new NativeConversationReader();
+    reader.read(input, false);
+    fs.writeFileSync(file, jsonl([header, { ...entry(0, 16), message: { ...entry(0, 16).message, content: "mutated" } }]));
+    reader.loadLatest(); // Contradictory interval permanently poisons the proof.
+    const newRecord = { ...entry(0, 16), message: { ...entry(0, 16).message, content: "new-generation" } };
+    const oldInode = fileIdentity(file);
+    fs.writeFileSync(`${file}.new`, jsonl([header, newRecord, entry(1, 16)]));
+    replaceGeneration(`${file}.new`, file);
+    const inode = fileIdentity(file);
+    expect(inode).not.toBe(oldInode);
+    const realRead = fs.readSync.bind(fs);
+    let injected = 0;
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+      const stack = new Error().stack ?? "";
+      const actualPhase = stack.includes("relocateBounds") ? "relocation"
+        : stack.includes("replaceWindowIfNeeded") && !stack.includes("readBackwardPage") ? "unread" : "other";
+      if (descriptorIdentity(args[0]) === inode && actualPhase === phase) {
+        injected++;
+        throw Object.assign(new Error("private payload EIO"), { code: "EIO" });
+      }
+      return realRead(...args);
+    }) as typeof fs.readSync);
+    const failed = reader.read({ ...input, status: "completed" }, true);
+    expect(injected).toBe(1);
+    expect(failed.messages).toEqual([]);
+    expect(failed.entries).toEqual([]);
+    expect(failed.unavailable?.sessionFile).toBe(true);
+    expect(failed.error).not.toContain("private");
+    reads.mockRestore();
+    const recovered = reader.read(input, false);
+    expect(fileIdentity(file)).toBe(inode);
+    expect(recovered.messages).toEqual([newRecord.message]);
+    expect(recovered.leafId).toBe("m0");
+    expect(recovered.hasNewer).toBe(true);
+    expect(reader.loadNewer()!.messages).toEqual([newRecord.message, entry(1, 16).message]);
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[0]!.value as string, "checkpoint");
+    for (const damage of ["missing", "corrupt"]) {
+      if (damage === "missing") fs.unlinkSync(checkpoint);
+      else fs.writeFileSync(checkpoint, "corrupt");
+      const rereads = vi.spyOn(fs, "readSync");
+      const unavailable = reader.read(input, false);
+      expect(unavailable.messages).toEqual([]);
+      expect(unavailable.error).toContain("Unable to restore reader history");
+      expect(sourceReadCalls(rereads)).toHaveLength(0);
+      rereads.mockRestore();
+    }
+    reader.clear();
+  });
+
+  it.each(["session", "events"] as const)("bounds duplicate %s page verification across loadLatest and suspension", (kind) => {
+    const file = path.join(workspace(), `${kind}.jsonl`);
+    const record = (i: number) => kind === "session" ? entry(i, 16)
+      : { type: "message_end", message: entry(i, 16).message };
+    const bytes = jsonl([...(kind === "session" ? [header] : []), record(0)]);
+    fs.writeFileSync(file, bytes);
+    const input = { id: "reader", status: "running", ...(kind === "session" ? { sessionFile: file } : { eventsFile: file }) };
+    const reader = new NativeConversationReader();
+    const before = reader.read(input, false);
+    const replaceIdentically = (replacementBytes = bytes) => {
+      const inode = fileIdentity(file);
+      fs.writeFileSync(`${file}.new`, replacementBytes);
+      replaceGeneration(`${file}.new`, file);
+      expect(fileIdentity(file)).not.toBe(inode);
+    };
+    const reads = vi.spyOn(fs, "readSync");
+    replaceIdentically();
+    reads.mockClear();
+    const baseline = reader.read(input, false);
+    expect(content(baseline)).toEqual(content(before));
+    expect(baseline.revision).toBe(before.revision);
+    const baselineReads = reads.mock.calls.length;
+    expect(baselineReads).toBe(1);
+    trackCheckpoints();
+    let resumedVerificationReads = 0;
+    for (let round = 0; round < 2; round++) {
+      for (let i = 0; i < 128; i++) {
+        const latest = reader.loadLatest()!;
+        expect(content(latest)).toEqual(content(before));
+        expect(latest.status).toBe(before.status);
+        expect(latest.unavailable).toBeUndefined();
+        expect(latest.error).toBeUndefined();
+      }
+      if (round === 0) {
+        const latest = reader.last!;
+        expect(reader.suspend()).toBe(true);
+        const resumed = reader.last!;
+        expect(content(resumed)).toEqual(content(latest));
+        expect(resumed.revision).toBe(latest.revision + 1);
+        // Validate before any post-resume page reload could recreate evidence.
+        replaceIdentically();
+        reads.mockClear();
+        const verifiedResume = reader.read(input, false);
+        resumedVerificationReads = reads.mock.calls.length;
+        expect(content(verifiedResume)).toEqual(content(resumed));
+        expect(verifiedResume.revision).toBe(resumed.revision);
+      }
+    }
+    const latest = reader.last!;
+    replaceIdentically();
+    reads.mockClear();
+    const pinned = reader.read(input, false);
+    const verificationReads = reads.mock.calls.length;
+    expect(content(pinned)).toEqual(content(before));
+    expect(pinned.revision).toBe(latest.revision);
+    expect(pinned.status).toBe(before.status);
+    expect(pinned.unavailable).toBeUndefined();
+    expect(pinned.error).toBeUndefined();
+    expect(verificationReads).toBe(baselineReads);
+    expect(resumedVerificationReads).toBe(baselineReads);
+    fs.appendFileSync(file, jsonl([record(1)]));
+    const appended = reader.read(input, false);
+    expect(appended.messages).toEqual(before.messages);
+    expect(appended.hasNewer).toBe(true);
+    expect(appended.revision).toBe(pinned.revision + 1);
+    const newer = reader.loadNewer()!;
+    expect(newer.messages).toEqual([...before.messages, entry(1, 16).message]);
+    expect(newer.hasNewer).toBe(false);
+    expect(newer.revision).toBe(appended.revision + 1);
+    const appendedBytes = bytes + jsonl([record(1)]);
+    replaceIdentically(appendedBytes);
+    reads.mockClear();
+    expect(content(reader.read(input, false))).toEqual(content(newer));
+    expect(reads.mock.calls.length).toBe(2); // Original page plus appended page.
+    for (let i = 0; i < 128; i++) expect(content(reader.loadLatest()!)).toEqual(content(newer));
+    replaceIdentically(appendedBytes);
+    reads.mockClear();
+    expect(content(reader.read(input, false))).toEqual(content(newer));
+    // The overlapping full page is distinct evidence, not a replacement for
+    // either earlier fingerprint; duplicate invocations still add nothing.
+    expect(reads.mock.calls.length).toBe(3);
+    reader.clear();
+  });
+
+  it.each(["missing", "corrupt"])("retains prior digests after reloading mutated offsets with a %s checkpoint", (failure) => {
+    const file = path.join(workspace(), "session.jsonl");
+    const original = jsonl([header, entry(0, 16)]);
+    fs.writeFileSync(file, original);
+    const reader = new NativeConversationReader();
+    reader.read(source(file), false);
+    for (let i = 0; i < 128; i++) reader.loadLatest();
+    fs.writeFileSync(file, original.replace(/x/g, "y"));
+    reader.loadLatest();
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[0]!.value as string, "checkpoint");
+    if (failure === "missing") fs.unlinkSync(checkpoint);
+    else fs.writeFileSync(checkpoint, "corrupt");
+    const failed = reader.read({ ...source(file), status: "completed" }, false);
+    expect(failed.messages).toEqual([]);
+    expect(failed.error).toContain("Unable to restore reader history");
+    expect(failed.unavailable?.sessionFile).toBe(true);
+    expect(failed.status).toBe("completed");
+    expect(reader.suspended).toBe(true);
+    reader.clear();
+  });
+  it.each(["missing", "corrupt"])("bounds distinct fixed-interval rewrite hash work and fails closed with a %s checkpoint", (failure) => {
+    const file = path.join(workspace(), "session.jsonl");
+    const input = { id: "reader", status: "running", sessionFile: file };
+    const bytes = (i: number) => jsonl([header, { ...entry(0, 16), message: { role: "user", content: String(i).padStart(16, "0"), timestamp: 0 } }]);
+    fs.writeFileSync(file, bytes(0));
+    const size = fs.statSync(file).size;
+    const inode = fileIdentity(file);
+    const reader = new NativeConversationReader();
+    reader.read(input, false);
+    const stringify = vi.spyOn(JSON, "stringify");
+    for (let i = 1; i <= 256; i++) {
+      fs.writeFileSync(file, bytes(i));
+      const latest = reader.loadLatest()!;
+      expect(latest.messages).toEqual([{ role: "user", content: String(i).padStart(16, "0"), timestamp: 0 }]);
+      expect(latest.entries).toHaveLength(1);
+      expect(latest.leafId).toBe("m0");
+    }
+    // Hash input is the raw record array, not a decoded history/payload. Once
+    // contradictory, this fixed interval needs no further hashes or versions.
+    const hashes = stringify.mock.calls.filter(([value]) => Array.isArray(value) && value.length === 2 && typeof value[0] === "string" && value[0].startsWith('{"type":"session"')).length;
+    stringify.mockRestore();
+    expect(fs.statSync(file).size).toBe(size);
+    expect(fileIdentity(file)).toBe(inode);
+    expect(hashes).toBeLessThanOrEqual(2);
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[0]!.value as string, "checkpoint");
+    if (failure === "missing") fs.unlinkSync(checkpoint);
+    else fs.writeFileSync(checkpoint, "corrupt");
+    const reads = vi.spyOn(fs, "readSync");
+    const failed = reader.read({ ...input, status: "completed" }, false);
+    expect(failed.messages).toEqual([]);
+    expect(failed.status).toBe("completed");
+    expect(failed.unavailable?.sessionFile).toBe(true);
+    expect(failed.error).toContain("Unable to restore reader history");
+    expect(reader.suspended).toBe(true);
+    expect(sourceReadCalls(reads)).toHaveLength(0);
+    reader.clear();
+  });
+  it.each(["grow", "shrink", "timestamp"] as const)("bounds changing logical-history evidence and relocates current fences (%s)", (variant) => {
+    const file = path.join(workspace(), "session.jsonl");
+    const input = { id: "reader", status: "running", sessionFile: file };
+    const record = (i: number) => ({
+      ...entry(0, 16),
+      timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, variant === "timestamp" ? i : 0)).toISOString(),
+      message: { role: "user", content: String(i).padStart(variant === "grow" ? 16 + i : variant === "shrink" ? 272 - i : 16, "x"), timestamp: variant === "timestamp" ? 1000 + i : 0 },
+    });
+    fs.writeFileSync(file, jsonl([header, record(0)]));
+    const inode = fileIdentity(file);
+    const initialSize = fs.statSync(file).size;
+    const reader = new NativeConversationReader();
+    const stringify = vi.spyOn(JSON, "stringify");
+    const reads = vi.spyOn(fs, "readSync");
+    const evidenceSizes: number[] = [];
+    const originalSet = Map.prototype.set;
+    // Observe ordinary map allocations, without accessing reader private state.
+    const evidenceSet = vi.spyOn(Map.prototype, "set").mockImplementation(function (this: Map<unknown, unknown>, key: unknown, value: unknown) {
+      const result = originalSet.call(this, key, value);
+      if (value && typeof value === "object" && "digest" in value && "start" in value && "first" in value) evidenceSizes.push(this.size);
+      return result;
+    });
+    reader.read(input, false);
+    for (let i = 1; i <= 256; i++) {
+      fs.writeFileSync(file, jsonl([header, record(i)]));
+      const latest = reader.loadLatest()!;
+      expect(latest.messages).toEqual([record(i).message]);
+      expect(latest.entries).toHaveLength(1);
+      expect(latest.entries[0]!.timestamp).toBe(record(i).timestamp);
+      expect(latest.leafId).toBe("m0");
+    }
+    const hashes = stringify.mock.calls.filter(([value]) => Array.isArray(value) && value.length === 2 && typeof value[0] === "string" && value[0].startsWith('{"type":"session"')).length;
+    stringify.mockRestore();
+    const rereadCount = reads.mock.calls.length;
+    reads.mockRestore();
+    evidenceSet.mockRestore();
+    expect(fileIdentity(file)).toBe(inode);
+    expect(Math.sign(fs.statSync(file).size - initialSize)).toBe(variant === "grow" ? 1 : variant === "shrink" ? -1 : 0);
+    // The same two logical records must not generate 256 obsolete fingerprints.
+    expect(evidenceSizes.length).toBeLessThanOrEqual(257);
+    expect(Math.max(...evidenceSizes)).toBe(1);
+    expect(hashes).toBeLessThanOrEqual(2);
+    expect(rereadCount).toBe(257);
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const resumed = reader.last!;
+    expect(resumed.messages).toEqual([record(256).message]);
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[1]!.value as string, "checkpoint");
+    const checkpointBytes = fs.readFileSync(checkpoint);
+    for (const failure of ["missing", "corrupt"]) {
+      if (failure === "missing") fs.unlinkSync(checkpoint);
+      else fs.writeFileSync(checkpoint, "corrupt");
+      const failedReads = vi.spyOn(fs, "readSync");
+      const failed = reader.read(input, false);
+      expect(failed.messages).toEqual([]);
+      expect(failed.error).toContain("Unable to restore reader history");
+      expect(failed.unavailable?.sessionFile).toBe(true);
+      expect(reader.suspended).toBe(true);
+      expect(sourceReadCalls(failedReads)).toHaveLength(0);
+      failedReads.mockRestore();
+    }
+    fs.writeFileSync(checkpoint, checkpointBytes);
+    expect(reader.last!.messages).toEqual([record(256).message]);
+    fs.copyFileSync(file, `${file}.new`);
+    replaceGeneration(`${file}.new`, file);
+    expect(fileIdentity(file)).not.toBe(inode);
+    const fresh = new NativeConversationReader();
+    const expected = fresh.read(input, false);
+    const relocated = reader.read(input, false);
+    expect(content(relocated)).toEqual(content(expected));
+    expect(relocated.entries[0]!.timestamp).toBe(record(256).timestamp);
+    expect(relocated.error).toBeUndefined();
+    expect(relocated.unavailable).toBeUndefined();
+    // Re-parsing a new inode refreshes fences but cannot erase prior conflict.
+    expect(reader.suspend()).toBe(true);
+    const relocatedCheckpoint = path.join(temporary.mock.results[2]!.value as string, "checkpoint");
+    for (const failure of ["missing", "corrupt"]) {
+      if (failure === "missing") fs.unlinkSync(relocatedCheckpoint);
+      else fs.writeFileSync(relocatedCheckpoint, "corrupt");
+      const failedReads = vi.spyOn(fs, "readSync");
+      expect(reader.read(input, false).error).toContain("Unable to restore reader history");
+      expect(reader.last!.messages).toEqual([]);
+      expect(sourceReadCalls(failedReads)).toHaveLength(0);
+      failedReads.mockRestore();
+    }
+    fresh.clear();
+    reader.clear();
+  });
+
   it("checkpoints only final-sized live tool state and replays older pages exactly after resume", () => {
     const file = path.join(workspace(), "events.jsonl");
     const oldMessage = { role: "user", content: "old" + "o".repeat(300000), timestamp: 1 };
@@ -99,10 +617,48 @@ describe("native reader disk suspension", () => {
     expect(reader.suspend()).toBe(true);
     expect(content(reader.last!)).toEqual(content(unavailable));
     fs.writeFileSync(file, jsonl([...records, entry(150)]));
-    expect(reader.read(source(file), false).messages).toHaveLength(pinned.messages.length);
-    expect(reader.loadNewer()!.messages).toHaveLength(pinned.messages.length + 1);
+    const recreated = reader.read(source(file), false);
+    expect(recreated.messages).toHaveLength(pinned.messages.length);
+    expect(content(recreated)).toEqual(content(pinned));
+    expect(recreated.unavailable).toBeUndefined();
+    expect(recreated.status).toBe("running");
+    expect(recreated.revision).toBeGreaterThan(unavailable.revision);
+    const newer = reader.loadNewer()!;
+    expect(newer.messages).toHaveLength(pinned.messages.length + 1);
+    expect(newer.messages).toEqual([...pinned.messages, entry(150).message]);
+    expect(newer.hasNewer).toBe(false);
+    expect(reader.read(source(file), false).messages).toEqual(newer.messages);
+    fs.appendFileSync(file, jsonl([entry(151)]));
+    expect(reader.read(source(file), false).hasNewer).toBe(true);
+    expect(reader.loadNewer()!.messages).toEqual([...newer.messages, entry(151).message]);
     expect(reader.suspend()).toBe(true);
     expect(reader.loadOlder()!.historyComplete).toBe(true);
+    reader.clear();
+  });
+
+  it.each(["missing", "corrupt"])("fails closed on a %s checkpoint with rewritten loaded ranges", (failure) => {
+    const file = path.join(workspace(), "session.jsonl");
+    fs.writeFileSync(file, jsonl([header, ...Array.from({ length: 150 }, (_, i) => entry(i))]));
+    const reader = new NativeConversationReader();
+    reader.read(source(file), false);
+    reader.loadOlder();
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    const checkpoint = path.join(temporary.mock.results[0]!.value as string, "checkpoint");
+    if (failure === "missing") fs.unlinkSync(checkpoint);
+    else fs.writeFileSync(checkpoint, "corrupt");
+    // Same inode, same record sizes, but different payloads: never replay them
+    // as though they were the checkpoint's original loaded history.
+    fs.writeFileSync(file, jsonl([header, ...Array.from({ length: 150 }, (_, i) => ({
+      ...entry(i), message: { ...entry(i).message, content: entry(i).message.content.replace(/x/g, "y") },
+    }))]));
+    const failed = reader.read({ ...source(file), status: "completed" }, false);
+    expect(failed.messages).toEqual([]);
+    expect(failed.error).toContain("Unable to restore reader history");
+    expect(failed.error!.length).toBeLessThanOrEqual(201);
+    expect(failed.unavailable?.sessionFile).toBe(true);
+    expect(failed.status).toBe("completed");
+    expect(reader.suspended).toBe(true);
     reader.clear();
   });
 

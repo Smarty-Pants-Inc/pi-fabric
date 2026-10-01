@@ -334,6 +334,7 @@ export class ActorManager {
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
   readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
+  readonly #isOwnResidentActor: ((id: string) => boolean) | undefined;
   // Set while one mesh event is delivered synchronously after a single ownership refresh.
   #ownershipSnapshot = false;
   readonly #resolvePiModel: ((model: string) => string | Promise<string>) | undefined;
@@ -402,6 +403,8 @@ export class ActorManager {
       persistent?: boolean;
       mainAgent?: FabricMainAgentTarget;
       canManageActor?: (id: string) => boolean | undefined;
+      /** Creation-only proof of a live actor owned by this Main's resident host. Never grants management. */
+      isOwnResidentActor?: (id: string) => boolean;
       /** May refresh the model registry on a miss, so it is awaited (smarty-dev#1830). */
       resolvePiModel?: (model: string) => string | Promise<string>;
       lineageAlive?: (rootId: string) => boolean;
@@ -443,6 +446,7 @@ export class ActorManager {
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
+    this.#isOwnResidentActor = options.isOwnResidentActor;
     this.#resolvePiModel = options.resolvePiModel;
     this.#lineageAlive = options.lineageAlive;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
@@ -513,6 +517,8 @@ export class ActorManager {
    * host already is the authoritative registry owner, so the foreign-live-actor
    * guard—which protects against concurrent local starters—must not veto the
    * request while a transferred actor still advertises its creating host.
+   * A Main may also create session actors beside its own live resident-owned
+   * durable rows. This creation-only exception never grants actor management.
    */
   async create(
     request: FabricActorRequest,
@@ -520,10 +526,14 @@ export class ActorManager {
   ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
+    const sessionMainCreate = (request.residency ?? "session") === "session" &&
+      this.#claimResidency === "session" && this.identity.kind === "main" && this.identity.id === this.#rootId;
     if (
       !registryOwnerCreate &&
       [...this.#actors.values()].some(
-        (actor) => actor.status !== "stopped" && !this.#canManage(actor.id),
+        (actor) => actor.status !== "stopped" && !this.#canManage(actor.id) &&
+          !(sessionMainCreate && actor.rootId === this.#rootId && actor.residency === "durable" &&
+            this.#isOwnResidentActor?.(actor.id) === true),
       )
     ) {
       throw new ActorRegistryOwnershipError();

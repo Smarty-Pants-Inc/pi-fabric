@@ -961,6 +961,22 @@ export class ResidentHost {
     // Only an inode we created, or one previously established by this protocol,
     // is safe to adopt. A dead legacy PID cannot exclude a reclaimer that already
     // committed to unlinking that inode. Empty/torn legacy startup records prove even less.
+    // Serialize creation through provenance publication. A noncreator must
+    // never acquire host.lock ahead of its creator and strand a fresh root.
+    // This guard is immutable too; arbitrary empty legacy host.lock stays refused.
+    let establishmentFd: number;
+    try {
+      establishmentFd = await lockFile(path.join(this.config.residencyRoot, "host-fence-establish.lock"), 0, process.platform === "linux");
+    } catch (error) {
+      if (error instanceof FileLockBusy) throw new ResidentHostAlreadyRunning("Fabric resident host startup claim is busy");
+      throw error;
+    }
+    try { await this.#establishLockInode(); }
+    finally { fs.closeSync(establishmentFd); }
+  }
+
+  /** Called only while holding the immutable first-claim establishment guard. */
+  async #establishLockInode(): Promise<void> {
     let created: fs.BigIntStats | undefined;
     try {
       const fd = fs.openSync(this.#lockPath, fs.constants.O_RDWR | fs.constants.O_CREAT |

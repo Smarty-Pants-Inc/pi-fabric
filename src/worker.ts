@@ -21,7 +21,7 @@ import { executionGroup } from "./worker/execution-group.js";
 let externalStopRequested = false;
 let externalStop = () => { externalStopRequested = true; };
 const custodyReady = new Promise<void>((resolve) => {
-  if (!process.send) { resolve(); return; }
+  if (process.platform === "win32" || !process.send) { resolve(); return; }
   process.on("message", (message: unknown) => {
     if (!message || typeof message !== "object" || !("type" in message)) return;
     if (message.type === "fabric-execution-custody-ack") { process.channel?.unref(); resolve(); }
@@ -33,7 +33,7 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
   process.once(signal, () => { externalStopRequested = true; externalStop(); });
 }
 const executionSettled = (): Promise<void> => new Promise(resolve => {
-  if (process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
+  if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
   else resolve();
 });
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
@@ -543,7 +543,15 @@ const main = async (): Promise<void> => {
     stdio: ["pipe", "pipe", "pipe"],
   });
   const executionBirth = child.pid === undefined ? undefined : processStartTime(child.pid);
-  const group = executionGroup(child);
+  // Scope cut: Windows preserves the pre-custody native-child behavior. This
+  // local close check is NOT an execution-tree receipt and never crosses IPC.
+  const group = process.platform === "win32" ? {
+    observe(): void {},
+    exited: () => nativeClosed,
+    signal: (signal: NodeJS.Signals): void => {
+      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    },
+  } : executionGroup(child);
   executionGroups.set(child, group);
   let nativeClosed = false;
   child.once("close", () => { nativeClosed = true; });
@@ -570,7 +578,7 @@ const main = async (): Promise<void> => {
   })();
   // Transfer exact execution identity immediately; even an instant custodian
   // SIGKILL cannot turn a still-running child into permission for replacement.
-  process.send?.({ type: "fabric-execution-started", pid: child.pid, started: executionBirth }, () => undefined);
+  if (process.platform !== "win32") process.send?.({ type: "fabric-execution-started", pid: child.pid, started: executionBirth }, () => undefined);
   let stderr = "";
   let outputBuffer = "";
   // Veda emits a single JSON document on stdout (progress goes to stderr, and

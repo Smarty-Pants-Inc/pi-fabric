@@ -17,6 +17,9 @@ const member = (pid: number): Member | undefined => {
  * leader lives, then retain surviving anchors until the entire group is empty.
  * An unobserved/recycled group is an unresolved obligation, not signal authority. */
 export const executionGroup = (child: ChildProcess) => {
+  // A Windows native child handle is not an owned execution-tree boundary.
+  // Windows keeps its legacy native-child behavior outside this receipt API.
+  if (process.platform === "win32") throw new Error("Windows execution-tree custody is unsupported");
   const pid = child.pid;
   const owned = new Map<number, string>();
   let empty = false;
@@ -50,8 +53,6 @@ export const executionGroup = (child: ChildProcess) => {
     exited(): boolean {
       if (!pid) return closed;
       if (process.platform === "linux") return members().length === 0;
-      // Windows has no detached POSIX group; native close is its receipt.
-      if (process.platform === "win32") return closed;
       // Portable POSIX: pipes closing is not proof the detached group emptied.
       // Never signal a leaderless group without birth-safe ownership.
       if (empty) return true;
@@ -60,10 +61,6 @@ export const executionGroup = (child: ChildProcess) => {
     },
     signal(signal: NodeJS.Signals): void {
       if (!pid) return;
-      if (process.platform === "win32") {
-        if (child.exitCode === null && child.signalCode === null) child.kill(signal);
-        return;
-      }
       if (process.platform === "linux") {
         if (!members().length) return;
         // Refresh immediately before signal, not only in the observation timer.

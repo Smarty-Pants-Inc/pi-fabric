@@ -37,7 +37,11 @@ const fixture = () => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 describe.skipIf(process.platform !== "linux")("round 2 execution custody", () => {
-  it.each(["linux", "win32", "darwin"] as const)("F1 ProcessTransport -> real worker retains its separately detached refusing execution until stop settles (%s parent)", async platformName => {
+  // The former Windows-parent-only injection still ran a Linux group-tracking
+  // worker, so it was never a Windows tree proof. Round 4 excludes that new tree
+  // contract; windows-custody-scope.test.ts now drives BOTH Windows branches and
+  // native worker-e2e's kill-worker case remains required on Windows CI.
+  it.each(["linux", "darwin"] as const)("F1 ProcessTransport -> real worker retains its separately detached refusing execution until stop settles (%s POSIX parent)", async platformName => {
     const platform = platformName === "linux" ? undefined : vi.spyOn(process, "platform", "get").mockReturnValue(platformName);
     const { root, config } = fixture();
     const ready = path.join(root, "execution.json");
@@ -55,10 +59,7 @@ describe.skipIf(process.platform !== "linux")("round 2 execution custody", () =>
       leaf = JSON.parse(fs.readFileSync(ready, "utf8"));
       const group = (pid: number) => fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]!.split(" ")[2];
       expect(group(workerPid)).not.toBe(group(leaf!.pid));
-      const kill = vi.spyOn(process, "kill");
       await manager.stop(run.id);
-      if (platformName === "win32") expect(kill.mock.calls.filter(call => call[0] === workerPid && call[1] !== 0)).toEqual([]);
-      kill.mockRestore();
       expect(executing(leaf!.pid, leaf!.started), "stop must not settle while execution remains authorized").toBe(false);
       const record = JSON.parse(fs.readFileSync(path.join(root, "runs", run.id, "status.json"), "utf8"));
       expect(record.status, "worker's five-second child cleanup must finish before custodian escalation").toBe("stopped");

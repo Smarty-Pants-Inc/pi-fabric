@@ -478,11 +478,15 @@ describe("AgentManager", () => {
     const queued = await manager.spawn({ task: "uncertain queued launch", transport: "process" });
     vi.spyOn(ProcessTransport.prototype, "launch").mockRejectedValueOnce(Object.assign(new Error("launch outcome unknown"), { launchOutcome: "unknown" }));
     await manager.stop(first.id);
-    expect(await manager.wait(queued.id)).toMatchObject({ status: "failed", error: "launch outcome unknown" });
+    await expect(manager.wait(queued.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
+    await expect(manager.stop(queued.id)).rejects.toThrow(/execution exit unconfirmed/);
+    const next = await manager.spawn({ task: "no replacement", transport: "process" });
+    expect(next.status).toBe("queued");
+    await manager.stop(next.id);
     const runDirectory = path.join(root, queued.id);
     expect(fs.existsSync(runDirectory)).toBe(true);
-    await expect(manager.cleanup(queued.id)).rejects.toThrow("lost track of its worker");
-    await manager.close();
+    await expect(manager.cleanup(queued.id)).rejects.toThrow("queued agent");
+    await expectUnconfirmedClose(manager);
     expect(fs.existsSync(runDirectory)).toBe(true);
   });
 
@@ -525,24 +529,24 @@ describe("AgentManager", () => {
       const stopped = manager.stop(queued.id);
       release();
       // Exit is not confirmed: even a successful stop request is not deletion authority.
-      const result = await stopped;
-      expect({ status: result.status, error: result.error, worktreeRetained: fs.existsSync(worktree!) }).toMatchObject({
-        status: "stopped", error: expect.stringContaining("cleanup pending"), worktreeRetained: true,
-      });
+      await expect(stopped).rejects.toThrow(/execution exit unconfirmed/);
+      await expect(manager.wait(queued.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
+      expect(fs.existsSync(worktree!)).toBe(true);
       expect(Date.now() - started).toBeLessThan(9_000);
       if (mode === "alive") expect(Date.now() - started).toBeGreaterThanOrEqual(6_900);
-      expect(stop).toHaveBeenCalledTimes(1);
+      expect(stop).toHaveBeenCalledTimes(mode === "lost-contact" ? 0 : 1);
       const runDirectory = path.join(root, queued.id);
-      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8"))).toMatchObject({ runId: queued.id, worktree, cleanupPending: true, sessionId: "unconfirmed-worker" });
+      expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8"))).toMatchObject({ runId: queued.id, sessionId: "unconfirmed-worker" });
       expect(fs.existsSync(path.join(runDirectory, "task.txt"))).toBe(true);
       expect(fs.existsSync(worktree!)).toBe(true);
-      await expect(manager.cleanup(queued.id)).rejects.toThrow("lost track of its worker");
+      await expect(manager.cleanup(queued.id)).rejects.toThrow("running agent");
       expect(fs.existsSync(runDirectory)).toBe(true);
       expect(fs.existsSync(worktree!)).toBe(true);
-      // The manager and retention guards preserve the obligation across shutdown too.
+      // A later exact exit discharges transient custody, never a terminal-only receipt.
       workerExited = true;
+      expect((await manager.stop(queued.id)).status).toBe("stopped");
+      expect(fs.existsSync(path.join(runDirectory, "unresolved-worker.json"))).toBe(false);
       await manager.close();
-      expect(fs.existsSync(runDirectory)).toBe(true);
       expect(fs.existsSync(worktree!)).toBe(true);
     } finally {
       workerExited = true; release(); launch.mockRestore();
@@ -577,7 +581,7 @@ describe("AgentManager", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(settled).toBe(false);
       expect(fs.existsSync(path.join(root, queued.id, "task.txt"))).toBe(true);
-      expect(await stopped).toMatchObject({ status: "stopped", error: "Agent launch aborted" });
+      expect(await stopped).toMatchObject({ status: "stopped", error: "Agent stopped" });
       expect(fs.existsSync(path.join(root, queued.id, "unresolved-worker.json"))).toBe(false);
       expect(await manager.cleanup(queued.id)).toEqual({ cleaned: true });
       expect(fs.existsSync(path.join(root, queued.id))).toBe(false);
@@ -1157,13 +1161,16 @@ describe("AgentManager", () => {
         runRoot: root,
       });
       managers.push(manager);
-      await expect(manager.spawn({ task: "HANG until stopped", transport: "process", worktree: true })).rejects.toThrow("did not confirm");
+      const uncertain = await manager.spawn({ task: "HANG until stopped", transport: "process", worktree: true });
+      expect(uncertain.status).toBe("queued");
+      await expect(manager.stop(uncertain.id)).rejects.toThrow(/execution exit unconfirmed/);
+      await expect(manager.wait(uncertain.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
       const marked = fs.readdirSync(root).map((name) => path.join(root, name, "unresolved-worker.json")).filter((file) => fs.existsSync(file));
       expect(marked).toHaveLength(1);
       worktree = JSON.parse(fs.readFileSync(marked[0]!, "utf8")).worktree as string;
       expect(fs.existsSync(worktree)).toBe(true);
       expect(git("worktree", "list", "--porcelain")).toContain("branch refs/heads/");
-      await manager.close();
+      await expectUnconfirmedClose(manager);
       expect(fs.existsSync(path.dirname(marked[0]!))).toBe(true);
       expect(fs.existsSync(worktree)).toBe(true);
     } finally {

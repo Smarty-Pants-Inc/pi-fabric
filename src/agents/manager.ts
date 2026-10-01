@@ -287,6 +287,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Terminal results do not discharge execution custody or admission permits. */
   executionExited?: boolean;
   executionRelease?: () => void;
+  executionDrain?: Promise<void>;
   /** Set when the run failed because its transport lost contact: its worker may still run. */
   lostContact?: string;
   model?: string;
@@ -1118,18 +1119,15 @@ export class AgentManager {
           lifecycle.result = queued.result;
           lifecycle.resolve = queued.resolve;
         }
-        if (signal?.aborted || this.#closing || (authorize && !authorize())) {
-          queued?.abort.abort();
-          if (await this.#stopUnregisteredTransport(transport)) {
-            this.#unregisteredTransports.delete(transport);
-            throw new Error("Agent launch aborted");
-          }
-          // A stop acknowledgment alone is not proof of exit. Retain both sets of
-          // working files and expose the obligation through the stopped receipt.
-          throw Object.assign(new Error("Agent launch aborted; cleanup pending: worker exit unconfirmed"), {
-            launchOutcome: "unknown", cleanupPending: true, transport: transport.kind, sessionId: transport.sessionId,
-          });
+        // Install the normal execution fence before attempting cancelled-launch
+        // cleanup. Error-layer release/queued settlement cannot bypass custody.
+        let launchCancelled = Boolean(signal?.aborted || this.#closing);
+        // Revocation predicates may throw; after launch that means cancellation,
+        // never permission to reject admission before installing custody.
+        if (!launchCancelled && authorize) {
+          try { launchCancelled = !authorize(); } catch { launchCancelled = true; }
         }
+        if (launchCancelled) queued?.abort.abort();
         const managed: ManagedAgent = {
           id,
           name,
@@ -1174,7 +1172,7 @@ export class AgentManager {
           background: queued?.background ?? false,
           lastLivenessCheckAt: 0,
           resumeAttempts: 0,
-          stopRequested: false,
+          stopRequested: launchCancelled,
           observedProgress: {
             turns: 0,
             toolCalls: 0,
@@ -1190,36 +1188,57 @@ export class AgentManager {
         this.#queued.delete(id);
         this.#unregisteredTransports.delete(transport);
         this.#invalidateUiList();
-        void this.#monitor(managed, timeoutMs).catch((error) => {
-          // Failed cleanup leaves result/admission pending and custody retained.
-          this.#markLost(managed, String(error));
-        });
+        if (launchCancelled) {
+          // Return a custody handle even for immediate admission. Actor run/wait
+          // remains joined to this exact attempt until a retry confirms exit.
+          void this.stop(id).catch(() => undefined);
+        } else {
+          void this.#monitor(managed, timeoutMs).catch((error) => {
+            // Failed cleanup leaves result/admission pending and custody retained.
+            this.#markLost(managed, String(error));
+          });
+        }
         return this.#handleInfo(managed, "running");
       } catch (error) {
-        release();
         // An unconfirmed launch may have started a worker that already uses the worktree
         // and run files: keep both, marked, and neither retry nor adopt it.
         if ((error as { launchOutcome?: string } | undefined)?.launchOutcome === "unknown") {
           const obligation = error as Error & { cleanupPending?: boolean; transport?: string; sessionId?: string };
-          const queued = this.#queued.get(id);
-          if (queued) {
-            queued.cleanupPending = obligation.message;
-            queued.info = { ...queued.info, ...(worktree ? { worktree } : {}), ...(branch ? { branch } : {}) };
+          let queued = this.#queued.get(id);
+          if (!queued) {
+            let resolve!: (result: AgentRunResult) => void;
+            const result = new Promise<AgentRunResult>(done => { resolve = done; });
+            queued = {
+              info: { id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
+                cwd: agentCwd, residency, recursive: request.recursive === true,
+                ...(request.actorId ? { actorId: request.actorId } : {}),
+                ...(request.actorName ? { actorName: request.actorName } : {}) },
+              task: request.task, enqueuedAt: Date.now(), abort: new AbortController(), result, resolve, background: false,
+            };
+            this.#queued.set(id, queued);
           }
+          queued.cleanupPending = obligation.message;
+          queued.info = { ...queued.info, ...(worktree ? { worktree } : {}), ...(branch ? { branch } : {}) };
           try {
             markUnresolvedWorker(runDirectory, obligation.message, {
               runId: id, ...(worktree ? { worktree } : {}),
               ...(obligation.cleanupPending ? { cleanupPending: true, transport: obligation.transport, sessionId: obligation.sessionId } : {}),
             });
           } catch { /* best effort: the worktree is kept either way */ }
-          throw error;
+          // No exact handle means no safe retry or exit receipt. Preserve the
+          // permit and actor/queue join rather than rejecting into another writer.
+          return this.#queuedInfo(queued);
         }
+        release();
         if (worktree) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
     };
     const release = this.#semaphore.tryAcquire("native", admissionSignal);
-    if (release) return start(release).catch((error) => { release(); throw error; });
+    if (release) return start(release).catch((error) => {
+      if ((error as { launchOutcome?: string } | undefined)?.launchOutcome !== "unknown") release();
+      throw error;
+    });
     return this.#enqueue({
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
@@ -1256,6 +1275,10 @@ export class AgentManager {
         if (signal.aborted) throw new Error("Agent launch aborted");
         await start(release, signal);
       } catch (error) {
+        if (queued.cleanupPending || (error as { launchOutcome?: string } | undefined)?.launchOutcome === "unknown") {
+          queued.cleanupPending ??= error instanceof Error ? error.message : String(error);
+          return;
+        }
         release?.();
         this.#settleQueued(queued, signal.aborted ? "stopped" : "failed", error instanceof Error ? error.message : String(error));
       }
@@ -1583,6 +1606,10 @@ export class AgentManager {
       queued.background = false;
       queued.abort.abort();
       await queued.pending;
+      // Admission may have promoted this queued receipt while stop was joining
+      // launch. Join its installed execution fence, not a terminal queue fallback.
+      if (this.#runs.has(id)) return this.stop(id);
+      if (queued.cleanupPending) throw new Error(`Agent ${id} execution exit unconfirmed; custody retained: ${queued.cleanupPending}`);
       return queued.result;
     }
     const previous = this.#previousRuns.get(id);
@@ -1622,13 +1649,15 @@ export class AgentManager {
     }
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
+    // Retry transient custody, but retain the public lost-worker diagnostic
+    // when the exact transport still cannot confirm exit.
+    await this.#drainExecution(managed).catch(() => undefined);
     if (managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) {
       throw new Error(
         `Cannot clean up agent ${id}: Fabric lost track of its worker (${managed.lostContact ?? "see its run directory"}), ` +
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
-    await this.#drainExecution(managed);
     if (!this.#canCollect(managed)) {
       throw new Error(`Cannot clean up agent ${id}: ${managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
     }
@@ -1742,7 +1771,10 @@ export class AgentManager {
   close(): Promise<void> {
     this.#closing = true;
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
-    return this.#closePromise ??= this.#close();
+    return this.#closePromise ??= this.#close().catch(error => {
+      this.#closePromise = undefined; // exact transport receipts may succeed on a later close
+      throw error;
+    });
   }
 
   async #close(): Promise<void> {
@@ -1806,7 +1838,8 @@ export class AgentManager {
     }
     if (this.#budgetOwned) clearOwnedBudgetEnv();
     if (this.#managedTempRoot) await this.#startTempRunSweep();
-    if (alive.some(Boolean) || all.some((managed) => !managed.executionExited)) {
+    if (alive.some(Boolean) || all.some((managed) => !managed.executionExited) ||
+        [...this.#queued.values()].some(queued => queued.cleanupPending)) {
       throw new Error("Agent manager close incomplete: execution exit unconfirmed; custody and files retained");
     }
   }
@@ -1888,12 +1921,14 @@ export class AgentManager {
       } finally { if (timer) clearTimeout(timer); }
     };
     // A failed close request can still be followed by a proven exit.
-    await bounded(() => transport.stop()).catch(() => undefined);
+    let stopFailed = false;
+    await bounded(() => transport.stop()).catch(() => { stopFailed = true; });
     try {
       while (Date.now() < deadline) {
         const alive = await bounded(() => transport.isAlive());
         if (transport.lostContact?.() !== undefined) return false;
         if (!alive) return true;
+        if (stopFailed) return false; // a fresh exact receipt may discharge this on retry
         await delay(Math.min(transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS, deadline - Date.now()));
       }
     } catch { /* failed or hung liveness never authorizes deletion */ }
@@ -1903,11 +1938,14 @@ export class AgentManager {
   // After a stop: a worker whose exit is not confirmed (lost contact, or still reported
   // alive) may keep using its files, so the run is marked unresolved (never cleaned up).
   async #noteUnconfirmedExit(managed: ManagedAgent): Promise<void> {
-    if (managed.lostContact) return;
     const lost = managed.transport.lostContact?.();
     const alive = lost === undefined && await managed.transport.isAlive().catch(() => true);
     if (lost === undefined && !alive) {
       managed.executionExited = true;
+      // Only this exact transport's positive exit probe discharges a transient
+      // manager mark. Unknown/lost transport identity never reaches this branch.
+      delete managed.lostContact;
+      fs.rmSync(path.join(managed.runDirectory, "unresolved-worker.json"), { force: true });
       managed.executionRelease?.();
       delete managed.executionRelease;
       return;
@@ -1917,17 +1955,22 @@ export class AgentManager {
 
   async #drainExecution(managed: ManagedAgent): Promise<void> {
     if (managed.executionExited) return;
-    try {
-      if (await managed.transport.isAlive() || managed.transport.lostContact?.() !== undefined) {
-        await managed.transport.stop();
-        await this.#waitForTransportExit(managed);
+    if (managed.executionDrain) return managed.executionDrain;
+    const pending = (async () => {
+      // The same bounded stop/probe contract covers launches promoted solely
+      // for custody. A hung liveness RPC must not make public stop hang forever.
+      if (managed.transport.lostContact?.() !== undefined || !await this.#stopUnregisteredTransport(managed.transport)) {
+        this.#markLost(managed, managed.transport.lostContact?.() ?? "worker execution exit unconfirmed; custody retained");
+        throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
       }
-      await this.#noteUnconfirmedExit(managed);
-      if (!managed.executionExited) throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained${managed.lostContact ? `: ${managed.lostContact}` : ""}`);
-    } catch (error) {
-      this.#markLost(managed, String(error));
-      throw error;
-    }
+      managed.executionExited = true;
+      delete managed.lostContact;
+      fs.rmSync(path.join(managed.runDirectory, "unresolved-worker.json"), { force: true });
+      managed.executionRelease?.();
+      delete managed.executionRelease;
+    })();
+    managed.executionDrain = pending;
+    try { await pending; } finally { delete managed.executionDrain; }
   }
 
   #markLost(managed: ManagedAgent, reason: string): void {

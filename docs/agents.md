@@ -381,15 +381,31 @@ custody, cooperatively drain the worker, and confirm the entire group's exit.
 The follow-up belongs to [smarty-dev#2566](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/2566);
 this is a fail-closed implementation scope cut, not product-owner risk acceptance.
 
-Terminal results are not exit receipts. Public stop and manager close reject
+Cancelled/revoked launches are registered for custody before attempting cleanup,
+even if cancellation won before normal admission registration. Queued stop joins
+that same fence; actor run/wait cannot finish its same-session drain while exit
+is unconfirmed. A later positive receipt from the exact transport can discharge
+a transient failed-cleanup mark and retry collection.
+
+On the supported execution-tree custody path, terminal results are not exit
+receipts. Public stop and manager close reject
 unconfirmed execution cleanup, retain the admission permit and run handle, and
 keep working files. Unknown process/group identity is never permission to signal
 a recycled numeric ID or to discard custody. Worker crash publication waits for
 execution drain; on Linux surviving same-birth group members remain cleanup
 anchors after the leader exits. Portable POSIX leaderless groups without such
-anchors remain unresolved rather than being signaled blindly. Ordinary Windows
-process workers keep their cooperative IPC/native-child cleanup; durable Windows
-residency remains unsupported.
+anchors remain unresolved rather than being signaled blindly.
+
+**Windows scope cut:** the new execution-tree custody/exit receipt is unsupported
+on Windows. Ordinary process workers preserve the pre-PR native-child cleanup
+and worker-exit behavior, with no custody handshake or `fabric-execution-settled`
+receipt. A native child close is **not** proof that its tool descendants exited;
+the Linux/POSIX tree guarantee above does not apply to Windows. Durable Windows
+residency remains unsupported. Re-enabling a Windows tree receipt requires an
+OS-backed, birth-safe boundary (for example a Job Object), plus native Windows
+stop/timeout/CLI-crash/custodian-death tests with pipe-independent descendants.
+This is an implementation scope cut, not certification of legacy Windows tree
+cleanup or a product-owner risk acceptance.
 
 | Transport   | Operation                                                     | Command to attach            |
 | ----------- | ------------------------------------------------------------- | ---------------------------- |

@@ -255,10 +255,13 @@ export const spawnDetached = async (
 ): Promise<{ pid: number; stop(): Promise<void>; isAlive(): Promise<boolean> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   assertTransportLaunchAllowed(authority);
+  // The new tree-custody protocol is unsupported on Windows. Even an internal
+  // caller requesting it must get only the legacy native worker-exit contract.
+  const tracksExecution = executionCustodian && process.platform !== "win32";
   const child = spawn(runtime, [workerPath, ...workerArguments], {
     cwd,
     detached: process.platform !== "win32",
-    stdio: executionCustodian ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
+    stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });
   if (!child.pid) throw new Error("Failed to launch Fabric worker process");
   const pid = child.pid;
@@ -394,11 +397,9 @@ export const spawnDetached = async (
       do { if (await settled()) return true; await stopDelay(); } while (Date.now() < deadline);
       return settled();
     };
-    // Windows SIGTERM kills the custodian outright; use its retained IPC
-    // channel so the real worker can close its separately owned native child.
-    if (process.platform === "win32" && executionPending && child.connected) {
-      child.send({ type: "fabric-stop" }, () => undefined);
-    } else signal("SIGTERM");
+    // POSIX custodians drain cooperatively on TERM. Windows uses only its
+    // legacy native worker stop; no tree receipt or custody IPC is supported.
+    signal("SIGTERM");
     if (await wait(termGraceMs)) return;
     if (process.platform !== "linux" && (executionPending || portableUncertain || groups.size > 1)) {
       throw new Error(`Fabric worker ${pid} execution exit unconfirmed; retaining custodian without birth-safe escalation`);

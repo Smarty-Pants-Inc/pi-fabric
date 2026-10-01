@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import { lockFile } from "../residency/file-lock.js";
 import net from "node:net";
 import path from "node:path";
 import type { RecordsAnchor, RecordsVerifyResult } from "./chain.js";
@@ -169,41 +170,7 @@ export const issuePrincipal = async (config: RecordsServiceConfig, id: string, r
   }
 };
 
-/**
- * Take an exclusive flock(2) on `file` (created 0600, never followed, owned by this user) and return its fd;
- * closing the fd, or the process's death, releases it.
- */
-// ponytail: util-linux flock(1) locks the open file description it inherits as fd 3, which this process keeps
-// open after the child exits; no native addon, and the wait does not block the event loop.
-// #1720: the wait is bounded (`flock -w`), and on Linux `setpriv --pdeathsig KILL` kills the helper when this
-// process dies, so a killed issuer never leaves a waiter behind. Without setpriv only the deadline bounds it.
-export const lockFile = async (file: string, waitSeconds = 120): Promise<number> => {
-  const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
-  try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.uid !== process.getuid?.()) throw new Error(`${file} is not a regular file owned by this user`);
-    const { spawn } = await import("node:child_process");
-    const flock = ["flock", "-x", "-w", String(waitSeconds), "3"];
-    const run = (argv: string[]) => new Promise<number | null>((resolve, reject) => {
-      const child = spawn(argv[0]!, argv.slice(1), { stdio: ["ignore", "ignore", "inherit", fd] });
-      child.on("error", reject);
-      child.on("exit", (status) => resolve(status));
-    });
-    const code = process.platform === "linux"
-      ? await run(["setpriv", "--pdeathsig", "KILL", ...flock]).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return run(flock);
-        throw error;
-      })
-      : await run(flock);
-    // flock(1) exits 1 when -w expires.
-    if (code === 1) throw new Error(`timed out after ${waitSeconds}s waiting for lock ${file}`);
-    if (code !== 0) throw new Error(`cannot lock ${file} (flock exited ${code})`);
-    return fd;
-  } catch (error) {
-    fs.closeSync(fd);
-    throw error;
-  }
-};
+export { lockFile } from "../residency/file-lock.js";
 
 /**
  * Issue (or, with reissue, rotate) an operator credential into `out`, never publishing a revoked

@@ -1104,6 +1104,112 @@ describe("Main benign compaction rejection and owner cancellation in a real Pi s
   );
 });
 
+// smarty-dev#2793 S7: session_compact is not terminal while later handlers still run.
+describe("Main manual compaction completion authority in a real Pi session", () => {
+  const cases = [0, 60_000].flatMap(flushMs => (["followUp", "steer"] as const).flatMap(delivery =>
+    (["late-owner-abort", "success", "declined"] as const).map(outcome => ({ flushMs, delivery, outcome }))));
+  it.each(cases)(
+    "$outcome retains native cancellation evidence through completion and reload (flushMs=$flushMs, delivery=$delivery)",
+    async ({ flushMs, delivery, outcome }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manual-completion-"));
+      roots.push(root);
+      const journal = path.join(root, "journal.json");
+      const faux = fauxProvider();
+      const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+      modelRuntime.registerNativeProvider(faux.provider);
+      const mains: MainAgentController[] = [];
+      const failures: Array<{ reason: string; aborted: boolean }> = [];
+      let releaseCompletion: (() => void) | undefined;
+      let operation: AbortSignal | undefined;
+      let starts = 0;
+      const loader = new DefaultResourceLoader({
+        cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{ name: "manual-completion", factory: (pi: ExtensionAPI) => {
+          pi.on("agent_start", () => { starts++; });
+          pi.on("session_before_compact", event => {
+            operation = event.signal;
+            if (outcome === "declined") return { cancel: true };
+            return { compaction: { summary: "summary", firstKeptEntryId: event.preparation.firstKeptEntryId,
+              tokensBefore: event.preparation.tokensBefore } };
+          });
+          pi.on("session_compact_failed", event => { failures.push(event); });
+          pi.on("session_start", (_event, ctx) => {
+            const main = new MainAgentController(pi, "session:root", true, root, "root");
+            main.attachFollowUpDrain(ctx, flushMs, journal);
+            mains.push(main);
+            // Registered AFTER Main: its session_compact handler has already returned.
+            pi.on("session_compact", () => new Promise<void>(resolve => { releaseCompletion = resolve; }));
+          });
+          pi.on("session_shutdown", () => { mains.at(-1)?.closeFollowUpDrain(); });
+        } }],
+      });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd: root, agentDir: path.join(root, "agent"), modelRuntime, model: faux.getModel(), resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(root), noTools: "all",
+        settingsManager: SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 1 } }),
+      });
+      sessions.push(session);
+      await session.bindExtensions({ shutdownHandler: () => undefined });
+      faux.setResponses(Array.from({ length: 6 }, (_, index) => fauxAssistantMessage(`answer ${index}`)));
+      let compacting: Promise<unknown> | undefined;
+      const stopped = outcome === "late-owner-abort";
+      try {
+        await session.prompt("first question");
+        await session.prompt("second question");
+        const initialStarts = starts;
+        const initialCalls = faux.state.callCount;
+        compacting = session.compact().then(() => "completed", () => "failed");
+        if (outcome === "declined") {
+          expect(await compacting).toBe("failed");
+          expect(failures).toMatchObject([{ reason: "manual", aborted: true }]);
+          expect(operation?.aborted).toBe(false); // Benign veto is not native cancellation.
+        } else {
+          await waitFor(() => releaseCompletion !== undefined);
+          expect(session.isIdle).toBe(false);
+          expect(starts).toBe(initialStarts);
+          if (stopped) session.abortCompaction(); // Native SDK cancellation, never main.halt().
+          expect(operation?.aborted).toBe(stopped);
+          releaseCompletion!();
+          await compacting; // Pi versions differ on whether late abort emits compact_failed.
+        }
+        for (const phase of ["before", "after"] as const) {
+          if (phase === "after") {
+            await session.reload();
+            expect(mains).toHaveLength(2);
+          }
+          const result = mains.at(-1)!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+            message: `peer ${phase} reload`, delivery, deliveryId: `completion-${phase}` });
+          await session.waitForIdle();
+          const received = session.messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
+          expect(received).toHaveLength(phase === "before" ? 1 : 2);
+          expect(received.at(-1)).toMatchObject({ details: { id: result.messageId, triggerTurn: !stopped } });
+          const runs = stopped ? 0 : phase === "before" ? 1 : 2;
+          expect(starts - initialStarts).toBe(runs);
+          expect(faux.state.callCount - initialCalls).toBe(runs);
+          expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+        }
+        if (stopped) {
+          await session.prompt("explicit owner resume");
+          expect(starts - initialStarts).toBe(1);
+          mains.at(-1)!.deliverAgent({ from: { id: "session:peer", name: "peer", kind: "main" },
+            message: "peer after owner resume", delivery });
+          await session.waitForIdle();
+          expect(starts - initialStarts).toBe(2);
+          expect(faux.state.callCount - initialCalls).toBe(2);
+        }
+      } finally {
+        session.abortCompaction();
+        releaseCompletion?.();
+        await compacting;
+        await session.abort();
+        await session.waitForIdle();
+        mains.at(-1)?.closeFollowUpDrain();
+      }
+    },
+  );
+});
+
 // pi-fabric#184 Astra R6: operation outcomes are not durable owner intent.
 describe("Main non-owner automatic decline and compaction recovery in a real Pi session", () => {
   const cases = [0, 60_000].flatMap(flushMs => (["automatic-decline", "failure-recovery"] as const).flatMap(outcome =>

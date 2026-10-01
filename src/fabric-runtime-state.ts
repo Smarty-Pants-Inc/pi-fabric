@@ -134,6 +134,7 @@ import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type 
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { resolveInheritedSessionPins } from "./agents/session-pins.js";
 import { ResidencyClient } from "./residency/client.js";
+import { isOwnResidentActor } from "./residency/actor-ownership.js";
 import { RESIDENT_HOST_FORMAT, residentRoot } from "./residency/protocol.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
 
@@ -786,6 +787,7 @@ export class FabricRuntimeState {
             persistent: true,
             mainAgent,
             canManageActor,
+            isOwnResidentActor: (id) => isOwnResidentActor(this.#participants!, id, mainAgentId),
             lineageAlive,
             claimResidency: "session",
             rootId: mainAgentId,

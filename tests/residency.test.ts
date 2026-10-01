@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -1130,6 +1130,52 @@ describe("durable completion receipts", () => {
       await state.participants.close();
     }
   });
+
+  it.each([['tmux', 'closed'], ['screen', 'closed'], ['tmux', 'unknown'], ['screen', 'unknown']] as const)("vetoes public durable cleanup of terminal live %s after host %s without an unresolved marker", async (kind, route) => {
+    const state = await rootHarness(`external-cleanup-${kind}-${route}`);
+    const source = path.join(state.root, 'source'); initRepository(source);
+    const seeded = await seedCompletion(state, 'failed');
+    const branch = `pi-fabric/external-${kind}-${seeded.id.slice(0, 8)}`;
+    const worktree = path.join(source, '.pi', 'fabric', 'worktrees', seeded.id);
+    fs.mkdirSync(path.dirname(worktree), { recursive: true });
+    git(source, 'worktree', 'add', '-q', '-b', branch, worktree, 'HEAD');
+    const record = { ...seeded.result, transport: kind, sessionId: 'external-pane', cwd: worktree };
+    fs.writeFileSync(path.join(seeded.runDirectory, 'status.json'), JSON.stringify(record));
+    const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, 'utf8'));
+    fs.writeFileSync(seeded.metadataPath, JSON.stringify({ ...metadata, handle: { ...record, worktree, branch }, worktreeGitRoot: source }));
+    const resultPath = residentResultPath(state.config.residencyRoot, seeded.id);
+    fs.mkdirSync(path.dirname(resultPath), { recursive: true }); fs.writeFileSync(resultPath, JSON.stringify(record));
+    // A real live cwd holder substitutes for the external pane, without requiring tmux/screen on CI.
+    const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: worktree, stdio: 'ignore' });
+    const exited = new Promise<void>((resolve, reject) => { worker.once('error', reject); worker.once('close', () => resolve()); });
+    const host = new ResidentHost(state.config);
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
+    const agents = new AgentManager(repo, { ...state.config.agents, budgetUsd: 0, nice: 19 }, { workerPath: fakeWorker, runRoot: path.join(state.root, "session-runs") });
+    const actors = new ActorManager(state.config.sessionId, state.identity, state.mesh, state.meshConfig, agents, () => {}, { actorRoot: path.join(state.root, "session-actors"), persistent: true });
+    const lifecycle = new LifecycleBroker(state.mesh, state.identity, state.participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(agents, actors, new GlobalActorRegistry(state.root, 64 * 1024), state.mainAgent, state.participants, undefined, lifecycle, () => false, client);
+    const context: FabricInvocationContext = { cwd: repo, signal: undefined, parentToolCallId: "public-external-cleanup", nestedToolCallId: "cleanup", extensionContext: {} as ExtensionContext, update() {} };
+    const cleanup = vi.spyOn(AgentManager.prototype, "cleanup");
+    const join = vi.spyOn(AgentManager.prototype, "join");
+    try {
+      await host.start();
+      if (route === 'closed') await host.close();
+      expect(fs.existsSync(path.join(seeded.runDirectory, 'unresolved-worker.json'))).toBe(false);
+      await expect(provider.invoke("cleanup", { id: seeded.id, deleteBranch: true }, context)).rejects.toThrow(/checked.*exit|exit.*unconfirmed/);
+      expect(join).toHaveBeenCalledTimes(route === "unknown" ? 1 : 0);
+      expect(worker.exitCode).toBeNull(); expect(worker.signalCode).toBeNull();
+      expect(cleanup).not.toHaveBeenCalled();
+      for (const file of [seeded.runDirectory, seeded.metadataPath, resultPath, worktree]) expect(fs.existsSync(file)).toBe(true);
+      expect(worktreeBranches(source)).toContain(branch);
+      expect(git(source, 'branch', '--list', branch)).toContain(branch);
+      const decisions = path.join(state.config.residencyRoot, 'decisions');
+      const committed = fs.existsSync(decisions) ? fs.readdirSync(decisions).map(name => JSON.parse(fs.readFileSync(path.join(decisions, name), 'utf8'))).filter(decision => decision.state === 'committed') : [];
+      expect(committed).toEqual([]);
+    } finally {
+      worker.kill("SIGTERM"); await exited; cleanup.mockRestore(); join.mockRestore();
+      await client.close(); await host.close(); await actors.close(); await agents.close(); await lifecycle.close(); await state.participants.close();
+    }
+  }, 15_000);
 
   it("refuses the fallback cleanup of a completed durable run whose nested child is marked", async () => {
     const state = await rootHarness("unresolved-nested-cleanup");

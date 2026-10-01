@@ -1,3 +1,4 @@
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +25,36 @@ describe("checked agent release observations", () => {
       expect(fs.existsSync(run)).toBe(true);
     } finally { fs.rmSync(temp, { recursive: true, force: true }); }
   });
+
+  it.each([["tmux", "cleanup"], ["screen", "cleanup"], ["tmux", "close"], ["screen", "close"]] as const)("vetoes tracked process-parent %s tree deletion via %s with a terminal live nested worker", async (kind, action) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-nested-cleanup-'));
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'ignore' });
+    git('init', '-q'); git('config', 'user.name', 'Fixture'); git('config', 'user.email', 'fixture@example.invalid');
+    fs.writeFileSync(path.join(root, 'input.txt'), 'parent input'); git('add', '.'); git('commit', '-qm', 'fixture');
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, notifyOnComplete: false, retainRuns: false, nice: 19 },
+      { workerPath: path.resolve('tests/fixtures/fake-worker.mjs'), runRoot: path.join(root, 'runs'), piBinary: process.execPath });
+    let worker: ChildProcess | undefined; let exited: Promise<void> | undefined;
+    try {
+      const info = await manager.spawn({ task: 'complete parent', transport: 'process', worktree: true });
+      await manager.wait(info.id);
+      const run = manager.runDirectory(info.id)!;
+      const child = path.join(run, 'nested', 'external'); fs.mkdirSync(child, { recursive: true });
+      fs.writeFileSync(path.join(child, 'status.json'), JSON.stringify({ status: 'failed', transport: kind, sessionId: 'live-external-pane', finishedAt: 1 }));
+      fs.writeFileSync(path.join(child, 'task.txt'), 'retained child input');
+      worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: child, stdio: "ignore" });
+      exited = new Promise<void>((resolve, reject) => { worker!.once("error", reject); worker!.once("close", () => resolve()); });
+      expect(hasUnresolvedWorker(run)).toBe(false);
+      if (action === "cleanup") await expect(manager.cleanup(info.id)).rejects.toThrow(/checked.*exit|exit.*unconfirmed/);
+      else await manager.close();
+      expect(worker.exitCode).toBeNull(); expect(worker.signalCode).toBeNull();
+      expect(fs.existsSync(run)).toBe(true); expect(fs.existsSync(info.worktree!)).toBe(true);
+      await manager.close();
+      expect(fs.existsSync(child)).toBe(true); expect(fs.existsSync(info.worktree!)).toBe(true);
+    } finally {
+      worker?.kill("SIGTERM"); await exited; await manager.close();
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  }, 20_000);
 
   it("bounds a hung process-handle query by the reversible release deadline and retains the unresolved worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-query-deadline-"));
@@ -55,8 +86,14 @@ describe("checked agent release observations", () => {
       expect(await handle!.isAlive()).toBe(true);
     } finally {
       finishQuery(); hung = false; await check?.catch(() => undefined);
-      await handle?.stop(); spy.mockRestore(); await manager.close();
-      fs.rmSync(root, { recursive: true, force: true });
+      await handle?.stop();
+      // stop() sends a signal; wait for the owned child's exit before removing its
+      // cwd. Windows keeps it locked until exit/handle release has completed.
+      const deadline = Date.now() + 5_000;
+      while (handle && await handle.isAlive() && Date.now() < deadline) await sleep(20);
+      if (handle) expect(await handle.isAlive()).toBe(false);
+      spy.mockRestore(); await manager.close();
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   }, 20_000);
 });

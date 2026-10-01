@@ -825,12 +825,16 @@ export class ResidentHost {
     writeLaunchSnapshot(this.config.residencyRoot, previous);
     writeLaunchSnapshot(this.config.residencyRoot, command.target);
     commitResidentRequest(this.config.residencyRoot, command, plan.id, this.hostId);
+    // Check before publishing an active transaction: a crash between preparing
+    // and cancellation would otherwise strand dead-host recovery without custody.
+    // A deferred diagnostic is terminal from its very first publication.
+    try { assertAutomaticReleaseRecovery(); }
+    catch (error) {
+      writeHandoverState(this.config.residencyRoot, plan, "cancelled", errorMessage(error));
+      return;
+    }
     writeHandoverState(this.config.residencyRoot, plan, "preparing");
     this.#handover = plan;
-    // Cancel synchronously, before yielding to the launcher or gating A's
-    // backlog. A protocol ABI is not proof of safe failed-attempt recovery.
-    try { assertAutomaticReleaseRecovery(); }
-    catch (error) { this.#cancelRelease(plan, errorMessage(error)); return; }
     this.actors.pauseForRelease(); this.control.pause(); this.lifecycle.pause();
   }
 

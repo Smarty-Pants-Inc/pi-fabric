@@ -21,7 +21,7 @@ async function until(predicate: () => boolean, ms = 15_000): Promise<void> {
   while (!predicate()) { if (Date.now() >= deadline) throw Error("native release deferral deadline"); await sleep(20); }
 }
 describe.skipIf(process.platform !== "linux" || !fs.existsSync("dist/residency/launcher.js"))("client to compiled launcher/host pre-exit deferral (Pi wire substitute)", () => {
-  it.each(["broken-script-B", "disposed-Main"] as const)("keeps acknowledged actor queue served on A for %s with distinct bundled Main/runtime", async mode => {
+  it.each(["broken-script-B", "disposed-Main", "crash-at-first-publication"] as const)("keeps acknowledged actor queue served on A for %s with distinct bundled Main/runtime", async mode => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-real-host-defer-"));
     const ownership = launchLog(root);
     let summary: Record<string, unknown> | undefined;
@@ -37,6 +37,27 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync("dist/residency/l
       fs.writeFileSync(path.join(release, "dist/worker.js"), `await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-worker.mjs")).href)});`);
       return release;
     }) as [string, string];
+    // Crash after the FIRST durable handover publication, before a possible second
+    // cancellation. Old code exposes preparing; deferred code must publish cancelled directly.
+    const crashReceipt = path.join(root, 'first-handover-publication.json');
+    if (mode === 'crash-at-first-publication') {
+      const preload = path.join(root, 'crash-handover-preload.mjs');
+      fs.writeFileSync(preload, `import fs from 'node:fs'; import path from 'node:path';
+const remove = fs.rmSync;
+fs.rmSync = function(file, options) {
+ const config = process.env.PI_FABRIC_RESIDENT_CONFIG;
+ if (config) {
+  const handover = path.join(path.dirname(config), 'handover.json');
+  if (String(file).startsWith(handover + '.') && String(file).endsWith('.tmp') && fs.existsSync(handover)) {
+   const state = JSON.parse(fs.readFileSync(handover, 'utf8'));
+   fs.writeFileSync(${JSON.stringify(crashReceipt)}, JSON.stringify({phase:state.phase,pid:process.pid}));
+   process.kill(process.pid, 'SIGKILL');
+  }
+ }
+ return remove.call(this, file, options);
+};`);
+      ownership.env.NODE_OPTIONS += ` --import=${pathToFileURL(preload).href}`;
+    }
     const identity = { id: "session:pre-exit", name: "Main", kind: "main" as const, sessionId: "pre-exit" };
     const config: ResidentHostConfig = { format: 1, rootId: identity.id, sessionId: identity.sessionId, cwd: root, projectRoot: root,
       meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"), fullCodeMode: true,
@@ -77,7 +98,22 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync("dist/residency/l
       const queued = await control.request(clientA.hostId, actor.id, "followUp", { message: "queued-before-intent" }, clientA.hostId);
       expect(queued.acknowledged).toBe(true);
       process.execPath = bundled; vi.stubEnv("PI_FABRIC_NODE_BINARY", successorRuntime);
-      await clientB.reconcileRelease();
+      if (mode === 'crash-at-first-publication') {
+        const releaseRequest = clientB.reconcileRelease().catch(error => error);
+        await until(() => fs.existsSync(crashReceipt));
+        await exited; // The original launcher has no custody and must exit, too.
+        await clientB.close(); await releaseRequest;
+        expect(JSON.parse(fs.readFileSync(crashReceipt, 'utf8')).phase).toBe('cancelled');
+        process.execPath = exec; vi.unstubAllEnvs();
+        vi.stubEnv('NODE_OPTIONS', ownership.env.NODE_OPTIONS);
+        vi.stubEnv('PI_FABRIC_TEST_LAUNCH_LOG', ownership.env.PI_FABRIC_TEST_LAUNCH_LOG);
+        vi.stubEnv('PI_FABRIC_NODE_BINARY', runtime);
+        const recovered = await clientA.ensureHost();
+        expect(recovered.token).not.toBe(owner.token);
+        expect(recovered.releaseRoot).toBe(a);
+      } else {
+        await clientB.reconcileRelease();
+      }
       await until(() => ["cancelled", "custody", "released", "starting"].includes(state()?.phase ?? ""));
       expect(state()?.plan.target.runtime).toBe(successorRuntime);
       expect(state()?.plan.target.runtime).not.toBe(bundled);
@@ -91,8 +127,10 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync("dist/residency/l
       const messages = actorMessages();
       expect(messages.filter(message => message.direction === "in" && message.id === queued.messageId)).toHaveLength(1);
       expect((await clientA.actorStatus(actor.id)).id).toBe(actor.id);
-      expect(readHandoverJson<ResidentHostOwner>(ownerPath)?.token).toBe(owner.token);
-      expect(residentProcessAlive(owner.pid, owner.processStartTime)).toBe(true);
+      const serving = readHandoverJson<ResidentHostOwner>(ownerPath)!;
+      if (mode === 'crash-at-first-publication') expect(serving.token).not.toBe(owner.token);
+      else expect(serving.token).toBe(owner.token);
+      expect(residentProcessAlive(serving.pid, serving.processStartTime)).toBe(true);
       expect(fs.existsSync(handoverCustodyPath(config.residencyRoot, state()!.plan.id))).toBe(false);
       expect(mesh.read({ topic: "host.reloaded" })).toHaveLength(0);
       const traces = fs.readFileSync(path.join(config.residencyRoot, "launcher.log"), "utf8").trim().split("\n").map(line => JSON.parse(line));
@@ -103,7 +141,11 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync("dist/residency/l
         completedOutputs: messages.filter(message => message.direction === "out").length, ownerPid: owner.pid, launcherPid: launcher.pid,
         ownerTokenUnchanged: readHandoverJson<ResidentHostOwner>(ownerPath)?.token === owner.token,
         targetRuntime: state()?.plan.target.runtime, bundledMain: bundled, phase: state()?.phase,
-        successorSpawns: successorSpawns.length, custodyPublished: false, reloadedEvents: mesh.read({ topic: "host.reloaded" }).length };
+        successorSpawns: successorSpawns.length, custodyPublished: false, reloadedEvents: mesh.read({ topic: "host.reloaded" }).length,
+        firstPublication: mode === "crash-at-first-publication" ? JSON.parse(fs.readFileSync(crashReceipt, "utf8")) : undefined,
+        recoveryToken: mode === "crash-at-first-publication" ? serving.token : undefined,
+        recoveryPid: mode === "crash-at-first-publication" ? serving.pid : undefined,
+        recoveryRelease: mode === "crash-at-first-publication" ? serving.releaseRoot : undefined };
     } catch (error) { throw new Error(`${error instanceof Error ? error.stack : error}; state: ${JSON.stringify(state())}; launcher stderr: ${stderr}`); }
     finally {
       process.execPath = exec; vi.unstubAllEnvs();

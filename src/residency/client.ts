@@ -18,7 +18,7 @@ import {
   mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
-import { hasUnresolvedWorker } from "../storage/retention.js";
+import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
@@ -606,9 +606,10 @@ export class ResidencyClient {
     if (!("startedAt" in status) || !terminal(status.status)) {
       throw new Error(`Cannot clean up running durable Fabric agent ${metadata.id}`);
     }
-    if (hasUnresolvedWorker(metadata.runDirectory)) {
+    const exitVeto = runTreeExitVeto(metadata.runDirectory);
+    if (exitVeto) {
       throw new Error(
-        `Cannot clean up durable Fabric agent ${metadata.id}: its worker may still be running ` +
+        `Cannot clean up durable Fabric agent ${metadata.id}: ${exitVeto} ` +
         `(see ${metadata.runDirectory}). Check the worker, then remove its files by hand.`,
       );
     }

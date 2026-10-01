@@ -76,6 +76,7 @@ import {
   canRemoveManagedRunRoot,
   canRemoveTerminalRun,
   hasUnresolvedWorker,
+  runTreeExitVeto,
   markUnresolvedWorker,
   heartbeatRunRoot,
   markRunRootActive,
@@ -1210,7 +1211,7 @@ export class AgentManager {
           } catch { /* best effort: the worktree is kept either way */ }
           throw error;
         }
-        if (worktree) await this.#worktrees.cleanup(id, true).catch(() => false);
+        if (worktree && !runTreeExitVeto(runDirectory)) await this.#worktrees.cleanup(id, true).catch(() => false);
         throw error;
       }
     };
@@ -1616,6 +1617,8 @@ export class AgentManager {
       if (queued.cleanupPending || hasUnresolvedWorker(runDirectory)) {
         throw new Error(`Cannot clean up agent ${id}: Fabric lost track of its worker; check ${runDirectory} before removing its files`);
       }
+      const exitVeto = runTreeExitVeto(runDirectory);
+      if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
       if (!this.config.retainRuns) await removeTree(runDirectory);
@@ -1631,6 +1634,8 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
+    const exitVeto = runTreeExitVeto(managed.runDirectory);
+    if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {
       throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
     }
@@ -2369,7 +2374,7 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
-    if (uncheckedExternalExit(managed.transport)) return false;
+    if (uncheckedExternalExit(managed.transport) || runTreeExitVeto(managed.runDirectory)) return false;
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
     if (managed.settlementSaveFailure &&
         !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;

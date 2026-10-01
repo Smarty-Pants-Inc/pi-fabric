@@ -48,14 +48,17 @@ When Pi exhausts its retries, Fabric ends the run; it no longer waits forever on
 
 ### Fleet write attribution for process children
 
-Ordinary process children receive `SMARTY_ROLE=task-agent`, whether the parent has a stamped
-fleet role or no role. The fleet write governor derives their lane from the child's cwd, not
-from a role or a lane environment variable. Explicit actor runs retain their inherited role
+Ordinary process workers and their CLI children receive `SMARTY_ROLE=task-agent` before
+exec. A valid parent `@SHA` stamp is retained as `task-agent@SHA`: `smarty-role` stamps
+all session roles with the shared org repository revision, not a role-specific content hash.
+An unstamped parent stays unstamped; Fabric does not invent provenance. The fleet write
+governor derives their lane from the child's cwd, not from a role or a lane environment variable. Explicit actor runs retain their inherited role
 and set `PI_FABRIC_ACTOR_NAME`; that actor identity takes precedence in the governor. An
 ordinary task spawned by an actor also inherits `PI_FABRIC_ACTOR_NAME`, so its governed
 writes still count as that actor. This is write attribution, not an authorization boundary.
-`PI_FABRIC_ROLE` is unchanged: when the parent sets it, `participantRole` still prefers that
-inherited value over `SMARTY_ROLE`.
+Ordinary tasks drop the spawner's `PI_FABRIC_ROLE` override and `SMARTY_READ_CLASS`,
+so participant discovery cannot still report the parent's role or critical-read class.
+Explicit actor runs retain both. Parent environment and bound session/mesh routing are unchanged.
 
 Task agents return status to their parent; they must not call `smarty-status` to update the
 parent's status comment. That helper keys ordinary comments by role/worktree, so a task

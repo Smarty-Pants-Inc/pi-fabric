@@ -8,9 +8,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readJsonlPage } from "../src/log-tail.js";
 import { NativeConversationReader } from "../src/ui/conversation-native-reader.js";
 import { AgentTranscriptReader } from "../src/ui/transcript-reader.js";
-import { compactTerminalRunLog, createRunLogWriter, MAX_EVENT_LINE_CHARS, MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_LOG_RECORDS, MAX_TERMINAL_LOG_WORK_MS } from "../src/worker/run-log.js";
+import { compactTerminalRunLog, createRunLogWriter, MIN_ELIDED_TOOL_RESULT_BYTES, MAX_EVENT_LINE_CHARS, MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_LOG_RECORDS, MAX_TERMINAL_LOG_WORK_MS } from "../src/worker/run-log.js";
 import { PiEventProjection } from "../src/worker/event-projection.js";
 import { TranscriptAccumulator } from "../src/ui/transcript-parser.js";
+import { fileIdentity, retainCompactionGeneration } from "./helpers/native-reader-file-generation.js";
+
+// Legacy elision/safety fixtures must still exercise canonical eligibility,
+// replacement and rehydration above the small-result retention threshold.
+const largeResultText = (label: string): string => `${label}:${"x".repeat(9 * 1024)}`;
 
 const directories: string[] = [];
 afterEach(() => {
@@ -254,8 +259,71 @@ process.stdin.on("end", () => {
 });
 
 describe("worker run log", () => {
+  it("retains a small fabric_exec probe-1234 return verbatim after real terminal compaction", () => {
+    const small = capEvents("probe-1234", false, { receipt: { exact: true } });
+    (small.events[0]! as Record<string, unknown>).args = { code: 'return "probe-1234";' };
+    for (const event of small.events) {
+      if (event.toolName) event.toolName = "fabric_exec";
+      const message = ("message" in event ? event.message : undefined) as Record<string, unknown> | undefined;
+      if (message) message.toolName = "fabric_exec";
+    }
+    const large = capEvents("x".repeat(16 * 1024));
+    const largeEvents = large.events.map((event) => JSON.parse(JSON.stringify(event).replaceAll("capcall", "largecall")) as Record<string, unknown>);
+    const live = write([...small.events, ...largeEvents], true, false).text;
+    const originalLine = live.split("\n").find((line) => line.includes('"tool_execution_end"') && line.includes("probe-1234"))!;
+    const file = logFile(live);
+    retainCompactionGeneration(file);
+    const inode = fileIdentity(file);
+    const outcome = compactTerminalRunLog(file, "completed");
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.compactionSkipped).toBeUndefined();
+    const compacted = fs.readFileSync(file, "utf8");
+    expect(fileIdentity(file)).not.toBe(inode);
+    expect(compacted.split("\n")).toContain(originalLine);
+    expect(outcome.compacted).toBe(1);
+    expect(readEntries(compacted)).toEqual(readEntries(live));
+    expect(readTranscript(compacted).streaming).toEqual(readTranscript(live).streaming);
+  });
+
+  it("exports the small-result retention threshold as exactly 8KiB", () => {
+    expect(MIN_ELIDED_TOOL_RESULT_BYTES).toBe(8 * 1024);
+  });
+
+  it.each([8191, 8192, 8193])("uses serialized UTF-8 result bytes at the 8KiB boundary (%s bytes)", (size) => {
+    const fixture = capEvents("", true, { terminate: true, opaque: { values: [null, false, 7] } });
+    const overhead = Buffer.byteLength(JSON.stringify(fixture.end.result));
+    // Multibyte content ensures the boundary is bytes, not UTF-16 characters.
+    const bodyBytes = size - overhead;
+    const body = "界".repeat(Math.floor(bodyBytes / 3)) + "x".repeat(bodyBytes % 3);
+    const { events, end } = capEvents(body, true, { terminate: true, opaque: { values: [null, false, 7] } });
+    expect(Buffer.byteLength(JSON.stringify(end.result))).toBe(size);
+    const live = write(events, true, false).text;
+    const file = logFile(live);
+    retainCompactionGeneration(file);
+    const inode = fileIdentity(file);
+    const outcome = compactTerminalRunLog(file, "completed");
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.compactionSkipped).toBeUndefined();
+    const compacted = fs.readFileSync(file, "utf8");
+    const records = compacted.trimEnd().split("\n").map((line) => JSON.parse(line));
+    if (size <= 8192) {
+      expect(outcome.compacted).toBe(0);
+      expect(compacted).toBe(live);
+      expect(fileIdentity(file)).toBe(inode);
+      expect(records[1]).toEqual(end);
+    } else {
+      expect(outcome.compacted).toBe(1);
+      expect(records[1]).toEqual({ ...end, result: { elided: true, bytes: size }, resultMetadata: { terminate: true, opaque: { values: [null, false, 7] } } });
+      expect(fileIdentity(file)).not.toBe(inode);
+    }
+    expect(readEntries(compacted)).toEqual(readEntries(live));
+    expect(readEntries(compacted)[0]).toMatchObject({ status: "failed", result: end.result });
+    expect(readTranscript(compacted).streaming).toEqual(readTranscript(live).streaming);
+    expect(readTranscript(compacted).streaming.tools[0]?.result).toEqual({ content: end.result.content, details: end.result.details });
+  });
+
   it("retries a single Windows EPERM replacement failure and commits the compacted log", () => {
-    const text = write(capEvents("retry replacement payload").events, true, false).text;
+    const text = write(capEvents(largeResultText("retry replacement payload")).events, true, false).text;
     const file = logFile(text);
     const rename = fs.renameSync;
     const spy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
@@ -275,7 +343,7 @@ describe("worker run log", () => {
   });
 
   it("closes every owned source/temp descriptor after fsync and before replacement", () => {
-    const text = write(capEvents("closed source at rename").events, true, false).text;
+    const text = write(capEvents(largeResultText("closed source at rename")).events, true, false).text;
     const file = logFile(text);
     const open = fs.openSync;
     const close = fs.closeSync;
@@ -306,7 +374,7 @@ describe("worker run log", () => {
   });
 
   it.each(["EPERM", "EBUSY", "EACCES", "EIO"])("retains byte-identical full log with a warning after persistent %s replacement failure", (code) => {
-    const text = write(capEvents("persistent replacement payload").events, true, false).text;
+    const text = write(capEvents(largeResultText("persistent replacement payload")).events, true, false).text;
     const file = logFile(text);
     const original = fs.readFileSync(file);
     const inode = fs.statSync(file).ino;
@@ -330,7 +398,7 @@ describe("worker run log", () => {
   });
 
   it.each(["identity", "size", "mtime"])("rechecks source %s before retrying replacement", (change) => {
-    const text = write(capEvents("changed during retry").events, true, false).text;
+    const text = write(capEvents(largeResultText("changed during retry")).events, true, false).text;
     const file = logFile(text);
     const replace = fs.renameSync;
     const original = fs.statSync(file);
@@ -354,7 +422,7 @@ describe("worker run log", () => {
   });
 
   it("keeps the terminal work deadline while backing off persistent replacement contention", () => {
-    const text = write(capEvents("bounded replacement wait").events, true, false).text;
+    const text = write(capEvents(largeResultText("bounded replacement wait")).events, true, false).text;
     const file = logFile(text);
     let elapsed = 0;
     const clock = vi.spyOn(performance, "now").mockImplementation(() => elapsed);
@@ -377,7 +445,7 @@ describe("worker run log", () => {
   });
 
   it("uses a write-capable source for Windows-style FlushFileBuffers and real fsync", () => {
-    const { events, end, message } = capEvents("durable paired result", true, { terminate: true });
+    const { events, end, message } = capEvents(largeResultText("durable paired result"), true, { terminate: true });
     const text = write(events, true, false).text;
     const file = logFile(text);
     const original = fs.statSync(file);
@@ -427,7 +495,7 @@ describe("worker run log", () => {
   });
 
   it("retains full bytes and inode when source write access is denied", () => {
-    const text = write(capEvents("read-only source").events, true, false).text;
+    const text = write(capEvents(largeResultText("read-only source")).events, true, false).text;
     const file = logFile(text);
     const inode = fs.statSync(file).ino;
     const open = fs.openSync;
@@ -445,7 +513,7 @@ describe("worker run log", () => {
     expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
   });
   it.each(["execution", "session", "claude", "after-canonical"])("retains missing-first-start ends across a later reused-ID start (%s)", (kind) => {
-    const content = [{ type: "text", text: "same output" }];
+    const content = [{ type: "text", text: largeResultText("same output") }];
     const details = { exitCode: 0 };
     const end = { type: "tool_execution_end", toolCallId: "reused", toolName: "bash", result: { content, details, terminate: true }, isError: false };
     const start = kind === "session"
@@ -473,7 +541,7 @@ describe("worker run log", () => {
   });
 
   it("still compacts a unique same-lifecycle pair with no start", () => {
-    const { end, message } = capEvents("allowed missing start", false, { terminate: true });
+    const { end, message } = capEvents(largeResultText("allowed missing start"), false, { terminate: true });
     const text = [end, { type: "message_end", message }].map((event) => `${JSON.stringify(event)}\n`).join("");
     const file = logFile(text);
     expect(compactTerminalRunLog(file, "completed").compacted).toBe(1);
@@ -510,7 +578,7 @@ describe("worker run log", () => {
   });
 
   it.each(["bytes", "records", "elapsed"])("retains full bytes/inode and removes partial temp at the named %s work bound", (bound) => {
-    const text = write(capEvents("bounded fallback", false, { terminate: true }).events, true, false).text;
+    const text = write(capEvents(largeResultText("bounded fallback"), false, { terminate: true }).events, true, false).text;
     const file = logFile(text);
     if (bound === "bytes") fs.truncateSync(file, MAX_TERMINAL_LOG_BYTES + 1);
     if (bound === "records") fs.appendFileSync(file, "{}\n".repeat(MAX_TERMINAL_LOG_RECORDS));
@@ -531,7 +599,7 @@ describe("worker run log", () => {
     expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
   });
   it("keeps the full live end through crash/abort before canonical and refuses nonterminal compaction", () => {
-    const { events, end } = capEvents("durable crash result", false, { terminate: true });
+    const { events, end } = capEvents(largeResultText("durable crash result"), false, { terminate: true });
     const live = write(events.slice(0, 2), true, false);
     expect(live.lines[1]).toEqual(end);
     const file = logFile(live.text);
@@ -548,7 +616,7 @@ describe("worker run log", () => {
   });
 
   it.each(["content", "details", "isError", "toolName", "partial", "duplicate", "reused"])("preserves full ends with unavailable/different/ambiguous canonical (%s)", (difference) => {
-    const { events, end } = capEvents("main-kept result", false, { opaque: { elided: true }, terminate: true });
+    const { events, end } = capEvents(largeResultText("main-kept result"), false, { opaque: { elided: true }, terminate: true });
     const message = { ...((events[3]! as Record<string, unknown>).message as Record<string, unknown>) };
     if (difference === "content") message.content = [{ type: "text", text: "different" }];
     if (difference === "details") message.details = { changed: true };
@@ -567,7 +635,7 @@ describe("worker run log", () => {
   });
 
   it("preserves opaque legacy marker fields during paired compaction", () => {
-    const content = [{ type: "text", text: "legacy full result" }];
+    const content = [{ type: "text", text: largeResultText("legacy full result") }];
     const result = { content, details: { a: 1, b: 2 }, elided: true, bytes: 17, terminate: true };
     const events = [
       { type: "tool_execution_start", toolCallId: "legacy", toolName: "tool", args: {} },
@@ -586,7 +654,9 @@ describe("worker run log", () => {
     const content = [{ type: "text", text: "budgeted details" }];
     const events = [
       { type: "tool_execution_start", toolCallId: "order", toolName: "tool", args: {} },
-      { type: "tool_execution_end", toolCallId: "order", toolName: "tool", result: { content, details }, isError: false },
+      // Add size after details so the original ordered-details dashboard
+      // budget counterexample is not hidden by a newly enlarged content body.
+      { type: "tool_execution_end", toolCallId: "order", toolName: "tool", result: { content, details, padding: "x".repeat(9 * 1024) }, isError: false },
       { type: "message_end", message: { role: "toolResult", toolCallId: "order", toolName: "tool", content, details: Object.fromEntries(Object.entries(details).reverse()), isError: false, timestamp: 1 } },
     ];
     const full = write(events, true, false).text;
@@ -595,7 +665,7 @@ describe("worker run log", () => {
   });
 
   it.each(["source-fsync", "temp-fsync", "rename"])("preserves original and cleans only owned temp when %s fails", (failure) => {
-    const text = write(capEvents("durability payload").events, true, false).text;
+    const text = write(capEvents(largeResultText("durability payload")).events, true, false).text;
     const file = logFile(text);
     const directory = path.dirname(file);
     const foreign = path.join(directory, "foreign.compact.tmp");
@@ -619,11 +689,13 @@ describe("worker run log", () => {
 
   describe.each(["quiescent", "Windows EPERM denial", "Windows EBUSY denial", "POSIX held-FD replacement", "Windows native denial"])("reader replacement: %s", (capability) => {
     describe.skipIf((capability.startsWith("POSIX") && process.platform === "win32") || (capability === "Windows native denial" && process.platform !== "win32"))("native replacement capability", () => {
-      it.each(["x".repeat(2000), ""])("invalidates held reader offsets on atomic replacement (body length=%s)", (body) => {
+      it.each(["x".repeat(9 * 1024), ""])("invalidates held reader offsets on atomic replacement (body length=%s)", (body) => {
         const { events: fullEvents } = capEvents(body);
         const events: Array<Record<string, unknown>> = body ? fullEvents : [
           fullEvents[0]!,
-          { type: "tool_execution_end", toolCallId: "capcall", toolName: "cap", result: { content: [] }, isError: false },
+          // Empty canonical content still exercises the old growing-replacement
+          // case: opaque result metadata alone puts this result above 8KiB.
+          { type: "tool_execution_end", toolCallId: "capcall", toolName: "cap", result: { content: [], padding: "x".repeat(9 * 1024) }, isError: false },
           { type: "message_end", message: { role: "toolResult", toolCallId: "capcall", toolName: "cap", content: [], isError: false, timestamp: 1 } },
         ];
         const raw = events.map((event) => `${JSON.stringify(event)}\n`).join("");
@@ -679,7 +751,7 @@ describe("worker run log", () => {
         directories.push(directory);
         const file = path.join(directory, "events.jsonl");
         const events = Array.from({ length: 160 }, (_, index) => {
-          const content = [{ type: "text", text: `body-${index}:${"x".repeat(4000)}` }];
+          const content = [{ type: "text", text: `body-${index}:${"x".repeat(9 * 1024)}` }];
           const toolCallId = `call-${index}`;
           return [
             { type: "tool_execution_start", toolCallId, toolName: "bash", args: {} },
@@ -837,7 +909,7 @@ describe("worker run log", () => {
 
   it.each([false, true])("writes each final result once and replays both readers (isError=%s)", (isError) => {
     const content = [
-      { type: "text", text: "unique final result 🦄" },
+      { type: "text", text: largeResultText("unique final result 🦄") },
       { type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
     ];
     const details = { exitCode: isError ? 1 : 0, audits: [{ toolCallId: "nested", output: "unclipped" }] };
@@ -872,7 +944,7 @@ describe("worker run log", () => {
     { terminate: true }, // Real fabric_reply result shape: Pi's message omits terminate.
     { opaque: { version: 2, values: [false, null, "kept"] }, customFlag: 0 },
   ])("retains noncanonical result metadata without duplicating the body (%j)", (metadata) => {
-    const content = [{ type: "text", text: "Reply delivered." }];
+    const content = [{ type: "text", text: largeResultText("Reply delivered.") }];
     const details = {};
     const result = { content, details, ...metadata };
     const end = { type: "tool_execution_end", toolCallId: "reply", toolName: "fabric_reply", result, isError: false };

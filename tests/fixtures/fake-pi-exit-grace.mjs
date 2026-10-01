@@ -15,6 +15,12 @@ process.stdin.on("data", async (chunk) => {
   const behavior = frame.message;
   if (behavior === "crash") process.exit(1);
   const toolReply = behavior.startsWith("reply-");
+  // Native Pi now reports settlement outcome. Keep a legacy omitted-outcome
+  // control while all slow-exit text/reply controls report explicit success.
+  const outcome = behavior.endsWith("-error") ? "error"
+    : behavior.endsWith("-aborted") ? "aborted"
+    : behavior === "never-exit" ? undefined : "completed";
+  const unsuccessfulSettlement = outcome === "error" || outcome === "aborted";
   emit({ type: "fake_child_pid", pid: process.pid });
   process.on("SIGTERM", () => {
     // This snapshot proves persistence happened BEFORE cleanup signalled Pi.
@@ -23,7 +29,7 @@ process.stdin.on("data", async (chunk) => {
   });
   process.stdin.on("end", () => {
     emit({ type: "fake_stdin_eof" });
-    if (behavior === "slow-exit" || toolReply) setTimeout(() => process.exit(0), 10_000);
+    if (behavior === "slow-exit" || toolReply || unsuccessfulSettlement) setTimeout(() => process.exit(0), 10_000);
   });
   setInterval(() => {}, 1000);
   if (toolReply) {
@@ -42,7 +48,7 @@ process.stdin.on("data", async (chunk) => {
     }
     emit({ type: "fake_assistant_consumed", replyExists: fs.existsSync(replyFile) });
     if (behavior === "reply-after-settle") {
-      emit({ type: "agent_settled" });
+      emit({ type: "agent_settled", outcome });
       // Exercise the grace-time check too, after EOF has requested disposal.
       await new Promise(resolve => process.stdin.once("end", resolve));
     }
@@ -61,5 +67,13 @@ process.stdin.on("data", async (chunk) => {
     descendant.on("error", (error) => { throw error; });
   }
 
-  if (behavior !== "reply-after-settle") emit({ type: "agent_settled" });
+  if (unsuccessfulSettlement) {
+    // Automatic compaction can fail/abort after a valid assistant response
+    // without emitting another error-bearing assistant message_end.
+    emit({ type: "compaction_start", reason: "threshold" });
+    emit({ type: "compaction_end", reason: "threshold", aborted: outcome === "aborted", willRetry: false,
+      ...(outcome === "error" ? { errorMessage: "Auto-compaction failed: fixture failure" } : {}) });
+    emit({ type: "agent_end", willRetry: false });
+  }
+  if (behavior !== "reply-after-settle") emit({ type: "agent_settled", outcome });
 });

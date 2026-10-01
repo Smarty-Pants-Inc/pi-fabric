@@ -44,6 +44,9 @@ describe("settled Pi exit grace", () => {
     expect(result.error).toBeUndefined();
     expect(result.warnings).toEqual([expect.stringContaining("did not exit after stdin closed for 5000ms")]);
     const events = readEvents(result.logFile!);
+    expect(events.filter(event => event.type === "agent_settled")).toEqual([
+      { type: "agent_settled", ...(behavior === "never-exit" ? {} : { outcome: "completed" }) },
+    ]);
     expect(events.filter(event => event.type === "worker_warning")).toHaveLength(1);
     expect(events.some(event => event.type === "fabric_recovery_error")).toBe(false);
     expect(events.some(event => event.type === "fake_stdin_eof")).toBe(true);
@@ -63,6 +66,39 @@ describe("settled Pi exit grace", () => {
     if (behavior === "never-exit" && process.platform !== "win32") {
       expect(events.filter(event => event.type === "fake_descendant_pid")).toHaveLength(1);
     }
+  }, 45_000);
+
+  it.each([
+    ["settle-error", "error", false],
+    ["settle-aborted", "aborted", false],
+    ["reply-settle-error", "error", true],
+    ["reply-settle-aborted", "aborted", true],
+  ] as const)("keeps unsuccessful settlement failed after slow exit for %s", async (behavior, outcome, replyTool) => {
+    const { manager, result } = await run(behavior, replyTool ? directiveSchema : undefined, replyTool);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("did not exit after stdin closed for 5000ms");
+    expect(result.text).toBe(replyTool ? "" : "durable final result");
+    expect(result.value).toBeUndefined();
+    expect(result.replyVia).toBeUndefined();
+    expect(result.warnings ?? []).toEqual([]);
+    const events = readEvents(result.logFile!);
+    expect(events.filter(event => event.type === "agent_settled")).toEqual([{ type: "agent_settled", outcome }]);
+    expect(events.find(event => event.type === "compaction_end")).toMatchObject({
+      reason: "threshold", aborted: outcome === "aborted", willRetry: false,
+      ...(outcome === "error" ? { errorMessage: "Auto-compaction failed: fixture failure" } : {}),
+    });
+    expect(events.filter(event => event.type === "message_end" && event.message.role === "assistant")
+      .every(event => !["error", "aborted"].includes(event.message.stopReason))).toBe(true);
+    if (replyTool) {
+      expect(JSON.parse(fs.readFileSync(path.join(path.dirname(result.logFile!), "reply.json"), "utf8"))).toEqual({ action: "silent" });
+    }
+    expect(events.filter(event => event.type === "worker_warning")).toHaveLength(0);
+    expect(events.filter(event => event.type === "fabric_recovery_error")).toHaveLength(1);
+    expect(events.some(event => event.type === "fake_stdin_eof")).toBe(true);
+    const durable = JSON.parse(fs.readFileSync(path.join(path.dirname(result.logFile!), "status.json"), "utf8"));
+    expect(durable.status).toBe("failed");
+    expect(manager.listForUi()[0]).toMatchObject({ status: "failed" });
+    for (const event of events.filter(event => event.type === "fake_child_pid")) expect(isRunning(event.pid)).toBe(false);
   }, 45_000);
 
   it.each(["crash", "crash-before-settle"])("keeps %s failed even if text was recorded", async behavior => {
@@ -89,6 +125,7 @@ describe("settled Pi exit grace", () => {
     expect(events.filter(event => event.type === "fake_assistant_consumed")).toEqual([
       { type: "fake_assistant_consumed", replyExists: false },
     ]);
+    expect(events.filter(event => event.type === "agent_settled")).toEqual([{ type: "agent_settled", outcome: "completed" }]);
     expect(events.filter(event => event.type === "worker_warning")).toHaveLength(1);
     expect(events.some(event => event.type === "fabric_recovery_error")).toBe(false);
     expect(events.some(event => event.type === "fake_stdin_eof")).toBe(true);

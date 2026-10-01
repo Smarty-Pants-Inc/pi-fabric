@@ -509,7 +509,7 @@ const main = async (): Promise<void> => {
   let terminalError: string | undefined;
   let sawAgentError = false;
   let retryPending = false;
-  let piSettled = false;
+  let piSettledSuccessfully = false;
   let hasFinalText = false;
   let hasFinalResult = false;
 
@@ -558,7 +558,7 @@ const main = async (): Promise<void> => {
       // fabric_reply writes after assistant message_end; inspect the durable
       // reply now too. Post-drain reply/schema validation remains authoritative.
       hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
-      if (piSettled && hasFinalResult && modelControl.ready && !terminalStatus &&
+      if (piSettledSuccessfully && hasFinalResult && modelControl.ready && !terminalStatus &&
           !terminalError && !sawAgentError && !lostResult) {
         const warning = `${error}; preserving final result and terminating child`;
         record.warnings = [...(record.warnings ?? []), warning].slice(-20);
@@ -1034,7 +1034,7 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_start") {
       emitLifecycle("pi.agent_start");
       retryPending = false;
-      piSettled = false;
+      piSettledSuccessfully = false;
       hasFinalText = false;
       hasFinalResult = false;
       // Starting a retry is not proof of recovery: preserve the error and timer
@@ -1156,7 +1156,10 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_settled") {
       emitLifecycle("pi.agent_settled");
       if (!retryPending) {
-        piSettled = true;
+        // Settlement ends automatic work, not necessarily successfully: native
+        // compaction failures/aborts need not emit an assistant error message.
+        // Older Pi frames omit outcome; retain their existing result checks.
+        piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted";
         // Tool-only assistant events precede the tool's durable reply write.
         hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
         // Pull controls that landed with the final stream events before deciding

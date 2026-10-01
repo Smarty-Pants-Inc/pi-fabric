@@ -293,6 +293,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   capabilityRequirements?: string[];
   capabilityDigest?: string;
   runnerSessionId?: string;
+  mainAgentId?: string;
+  fabricSessionId?: string;
   branch?: string;
   worktree?: string;
   nestedSnapshot?: AgentRunRecord[];
@@ -517,6 +519,9 @@ const failedRecord = (
     task: managed.task,
     status,
     runner: managed.runner,
+    ...(managed.mainAgentId ? { mainAgentId: managed.mainAgentId } : {}),
+    ...(managed.fabricSessionId ? { fabricSessionId: managed.fabricSessionId } : {}),
+    ...(managed.latestRecord?.runnerSessionIds ? { runnerSessionIds: [...managed.latestRecord.runnerSessionIds] } : {}),
     ...(managed.kernel ? { kernel: managed.kernel } : {}),
     transport: managed.transport.kind,
     cwd: managed.cwd,
@@ -1131,6 +1136,8 @@ export class AgentManager {
           id,
           name,
           task: request.task,
+          ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
+          ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
           outputPrincipal: copyFabricPrincipal(request.provenance?.principal),
           onOutputPrincipalDowngrade,
           runner,
@@ -2064,6 +2071,18 @@ export class AgentManager {
       // the previous attempt published (token usage above all) before discarding
       // the journal it landed in.
       this.#drainLifecycle(managed);
+      if (managed.runner === "pi") {
+        // status.json must be removed to fence the new attempt from the old
+        // terminal verdict. Hand off its native-session joins separately, after
+        // confirmed exit so the previous worker's final observations are included.
+        const ids = [record, managed.latestRecord, readRecord(managed.statusFile)]
+          .filter((prior): prior is AgentRunRecord => prior?.id === managed.id)
+          .flatMap(prior => [...(Array.isArray(prior.runnerSessionIds) ? prior.runnerSessionIds : []), prior.runnerSessionId])
+          .filter((id): id is string => typeof id === "string" && Boolean(id.trim()));
+        if (ids.length) {
+          setWorkerArgument(managed.launch.workerArguments, "runner-session-ids", JSON.stringify([...new Set(ids)]));
+        }
+      }
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
@@ -2136,6 +2155,7 @@ export class AgentManager {
           !previous ||
           previous.updatedAt !== record.updatedAt ||
           previous.status !== record.status ||
+          previous.runnerSessionId !== record.runnerSessionId ||
           previous.currentTool !== record.currentTool
         ) {
           managed.latestUiRecord = compactUiRecord(record);
@@ -2143,7 +2163,7 @@ export class AgentManager {
         }
       }
       if (managed.recursive) this.#nestedAgents(managed);
-      if (record?.runnerSessionId && !managed.runnerSessionId) {
+      if (record?.runnerSessionId) {
         managed.runnerSessionId = record.runnerSessionId;
       }
       if (record && terminalStatuses.has(record.status)) {
@@ -2248,6 +2268,10 @@ export class AgentManager {
     fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
     this.#emitLifecycle(managed, `run.${result.status}`, result.finishedAt ?? Date.now(), {
       status: result.status,
+      data: {
+        ...(result.runnerSessionId ? { runnerSessionId: result.runnerSessionId } : {}),
+        ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
+      },
     });
 
     if (this.#budget) {
@@ -2588,6 +2612,7 @@ export class AgentManager {
     const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;
     const model = record.model ?? managed.model;
     const thinking = record.thinking ?? managed.thinking;
+    const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
     return {
       ...safeRecord,
       ...(managed.settlementSaveFailure
@@ -2609,7 +2634,9 @@ export class AgentManager {
         : {}),
       ...(managed.capabilityDigest ? { capabilityDigest: managed.capabilityDigest } : {}),
       ...(managed.recursive ? { recursive: true } : {}),
-      ...(managed.runnerSessionId ? { runnerSessionId: managed.runnerSessionId } : {}),
+      ...(runnerSessionId ? { runnerSessionId } : {}),
+      ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
+      ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
       ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
       ...(managed.transport.attachCommand
         ? { attachCommand: managed.transport.attachCommand }

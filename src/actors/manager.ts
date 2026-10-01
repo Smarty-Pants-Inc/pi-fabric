@@ -373,6 +373,7 @@ export class ActorManager {
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
   #closing = false;
+  #releasePaused = false;
   readonly #closeGraceMs: number;
   // Stop-the-world gate armed by haltAll() (ESC): while true, host-event and
   // mesh dispatch are frozen so interrupted actors are not re-armed by the
@@ -393,6 +394,8 @@ export class ActorManager {
     readonly agents: AgentManager,
     readonly onDeliver: (request: FabricActorDeliveryRequest) => void,
     options: {
+      /** Staged resident successor: no business activation before launcher commitment. */
+      releasePaused?: boolean;
       actorRoot?: string;
       actorScope?: import("./types.js").FabricActorStorageScope;
       persistent?: boolean;
@@ -435,6 +438,7 @@ export class ActorManager {
       options.actorRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actors-"));
     this.#actorScope = options.actorScope ?? meshConfig.actorScope;
     this.#persistent = options.persistent ?? false;
+    this.#releasePaused = options.releasePaused ?? false;
     this.#closeGraceMs = Math.max(0, options.closeGraceMs ?? 30_000);
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
     this.#mainAgent = options.mainAgent;
@@ -471,6 +475,7 @@ export class ActorManager {
       cursorPath: options.meshCursorPath,
       maxReplayAgeMs: options.meshReplayAgeMs,
       beforePoll: () => {
+        if (this.#releasePaused) return false;
         this.#syncActorsFromRegistry();
         this.#refreshOwnership();
         // Preserve deferred events while halted; fencing remains manager-owned.
@@ -1950,6 +1955,32 @@ export class ActorManager {
     return this.#finishCleanup(cleanup);
   }
 
+  /** Reversible activation gate. It never aborts a worker or consumes mesh input. */
+  pauseForRelease(): void { this.#releasePaused = true; }
+  resumeAfterRelease(): void {
+    this.#releasePaused = false;
+    for (const actor of this.#actors.values()) if (actor.queue.length) this.#ensureDrain(actor);
+    this.#meshMonitor.schedule();
+  }
+  /** Save accepted queues (including empty completion fences) BEFORE either cursor advances. */
+  async checkpointForRelease(): Promise<void> {
+    if (!this.#releasePaused || this.inFlightCount() || this.#pendingResets.size ||
+        this.#removals.size || this.#removeCalls.size || this.#finishCalls.size || this.pendingRemovals().length) {
+      throw new Error("Actor release boundary is not quiescent");
+    }
+    await Promise.all([...this.#presenceChains.values()]);
+    let checkpointedActor = false;
+    for (const actor of this.#actors.values()) {
+      if (!this.#ownershipDecision(actor.id)) continue;
+      checkpointedActor = true;
+      if (!this.#persistQueue(actor.id, true)) throw new Error(`Actor ${actor.id} queue did not checkpoint`);
+    }
+    // An untouched empty secondary scope has no registry inode to checkpoint.
+    // Do not turn its proven absence into a rollback-read of a nonexistent file.
+    if (checkpointedActor || this.#registry.records().length) await this.#saveActors(new Set(), { durable: true });
+    this.#meshMonitor.checkpointForRelease();
+  }
+
   async close(): Promise<void> {
     if (this.#closing) return;
     this.#closing = true;
@@ -2126,6 +2157,7 @@ export class ActorManager {
       // replaced the object an older drain still runs on (smarty-dev#442).
       this.#draining.has(actor.id) ||
       actor.status === "stopped" ||
+      (this.#releasePaused && !actor.queue.some((item) => item.resolve || item.reject)) ||
       this.#closing ||
       !this.#canManage(actor.id)
     ) {
@@ -2145,6 +2177,7 @@ export class ActorManager {
     try {
       while (
         actor.queue.length > 0 &&
+        (!this.#releasePaused || actor.queue.some((item) => item.resolve || item.reject)) &&
         actor.status !== "stopped" &&
         !this.#closing &&
         this.#canManage(actor.id)
@@ -3274,7 +3307,7 @@ export class ActorManager {
 
   // Returns whether this lineage's file now holds the actor's work. Only then are the predecessor
   // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
-  #persistQueue(actorId: string): boolean {
+  #persistQueue(actorId: string, release = false): boolean {
     if (!this.#persistent || this.#closing) return false;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
@@ -3284,8 +3317,9 @@ export class ActorManager {
     ]
       .filter((item) => !item.resolve && !item.reject);
     const file = this.#ownQueueFile(actor);
+    const cleanHandover = release || this.#releasePaused;
     try {
-      if (items.length === 0) fs.rmSync(file, { force: true });
+      if (items.length === 0 && !cleanHandover) fs.rmSync(file, { force: true });
       else {
       const records = items.flatMap((item) => {
         try {
@@ -3297,7 +3331,8 @@ export class ActorManager {
             attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
           }))];
-        } catch {
+        } catch (error) {
+          if (release) throw error;
           return [];
         }
       });
@@ -3305,9 +3340,11 @@ export class ActorManager {
         writeJsonAtomic(file, {
           format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
           mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
-        });
+          ...(cleanHandover ? { cleanHandover: true } : {}),
+        }, release ? { durable: true } : undefined);
       }
-    } catch {
+    } catch (error) {
+      if (release) throw error;
       return false;                                         // best-effort; memory still runs the work
     }
     for (const source of this.#takenOver.get(actorId) ?? []) if (source !== file) fs.rmSync(source, { force: true });
@@ -3354,7 +3391,7 @@ export class ActorManager {
   #restoreQueue(actor: ManagedActor, parsed: unknown, foreign: boolean): void {
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
-      format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown;
+      format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
@@ -3387,7 +3424,9 @@ export class ActorManager {
         typeof value.id !== "string" || typeof value.source !== "string" || held.has(value.id) ||
         typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null
       ) continue;
-      const attempts = (typeof value.attempts === "number" ? value.attempts : 0) + 1;
+      // A deliberate quiescent release is not a failed attempt at untouched backlog.
+      const attempts = (typeof value.attempts === "number" ? value.attempts : 0) +
+        (saved.cleanHandover === true && (value as { resumed?: unknown }).resumed !== true ? 0 : 1);
       const item = {
         id: value.id,
         source: value.source,

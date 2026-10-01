@@ -111,6 +111,7 @@ import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import path from "node:path";
+import { writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool } from "./core/reply-tool-identity.js";
@@ -688,7 +689,18 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       // until the user's next input.
       context.ui.setStatus(SELF_RELOAD_STATUS, notice);
     }
-    if (stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+    const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
+    const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
+    if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
+      throw new Error("resident startup probe requires a bound RPC worker");
+    }
+    if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+    if (residentProbe) {
+      // Pi redirects console/stdout during extension startup; the native RPC
+      // descriptor carries a positive ACK only after this generation activated.
+      writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,
+        runId: process.env.PI_FABRIC_PARENT_RUN, nonce: probeNonce, extension: FABRIC_EXTENSION_ENTRY_PATH })}\n`);
+    }
     if (selfReloaded) {
       await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
         ...selfReloaded,

@@ -999,6 +999,7 @@ export class AgentManager {
           ? sessionExportFileFor(sessionExportDir, agentCwd, id, new Date())
           : undefined;
         const workerArguments = [
+          ...(request.residentStartupProbe ? ["--resident-startup-probe", "true"] : []),
           "--id",
           id,
           "--name",

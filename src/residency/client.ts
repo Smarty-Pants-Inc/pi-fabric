@@ -12,7 +12,11 @@ import { awaitAgentCwd } from "../agents/manager.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, spawnDetached } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
-import { residentProcessAlive } from "./process-identity.js";
+import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import {
+  RESIDENT_HANDOVER_ABI, residentLaunchSpec, handoverActive, handoverPath, handoverOutcomePath,
+  mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
+} from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
 import { hasUnresolvedWorker } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
@@ -62,6 +66,7 @@ const startupBudgetMs = (base: number): number => {
   return Math.round(base * Math.min(4, Math.max(1, loadPerCore)));
 };
 const COMMAND_TIMEOUT_MS = 30_000;
+const HANDOVER_WAIT_MS = 180_000;
 const STATUS_POLL_MS = 100;
 const WATCHDOG_INTERVAL_MS = 5_000;
 const WATCHDOG_MAX_BACKOFF_MS = 60_000;
@@ -152,6 +157,10 @@ export class ResidencyClient {
   #nextWatchdogAt = 0;
   #watchdogFailures = 0;
   #watchdogWork: string | undefined;
+  readonly #runtimeNonce = randomUUID();
+  #generationRecorded = false;
+  readonly #releaseAbort = new AbortController();
+  readonly #releaseOwners = new Set<string>();
 
   constructor(readonly options: ResidencyClientOptions) {
     this.hostId = residentHostId(options.config.rootId);
@@ -177,10 +186,23 @@ export class ResidencyClient {
     );
     this.#deliveryTimer.unref();
     void this.#drainDeliveries().catch(() => undefined);
+    // Every runtime activation, including manual native /reload, reconciles
+    // a live owner. This never starts an empty root or loads an optional engine.
+    void this.reconcileRelease().catch((error) => this.#deferRelease(error));
   }
 
   async close(): Promise<void> {
     this.#closed = true;
+    // Disposing a runtime during native reload/shutdown ends its authority even
+    // while the OS process remains alive. Never invalidate a newer runtime.
+    if (this.#generationRecorded) {
+      try {
+        const recorded = readHandoverJson<ResidentMainGeneration>(mainGenerationPath(this.options.config.residencyRoot));
+        if (recorded?.nonce === this.#runtimeNonce) writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot),
+          { ...recorded, nonce: `closed:${this.#runtimeNonce}` }, { durable: true });
+      } catch (error) { this.#deferRelease(error); }
+    }
+    this.#releaseAbort.abort();
     if (this.#deliveryTimer) clearInterval(this.#deliveryTimer);
     this.#deliveryTimer = undefined;
     while (this.#drainingDeliveries) await delay(10);
@@ -220,6 +242,18 @@ export class ResidencyClient {
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#liveOwner();
     if (existing) return existing;
+    // The detached launcher already owns the exact attempt/fallback. Neither
+    // ensureHost nor the watchdog may become a competing handover executor.
+    const releaseDeadline = Date.now() + HANDOVER_WAIT_MS;
+    while (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) {
+      const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
+      if (this.#closed || state?.phase === "blocked" || Date.now() >= releaseDeadline) {
+        throw new Error("Resident release transaction is in launcher custody; do not start a duplicate");
+      }
+      await delay(STATUS_POLL_MS);
+    }
+    const followed = this.#liveOwner();
+    if (followed) return followed;
     fs.rmSync(this.#errorPath, { force: true });
     const launcher = await spawnDetached(
       this.#hostPath,
@@ -228,6 +262,7 @@ export class ResidencyClient {
     );
     // The budget counts from the launcher's first sign of life (its
     // launcher-started trace), so its own boot does not consume it.
+    const launcherBirth = processStartTime(launcher.pid);
     const budget = startupBudgetMs(this.options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS);
     let deadline = Date.now() + budget;
     let started = false;
@@ -239,8 +274,11 @@ export class ResidencyClient {
       }
       const owner = this.#liveOwner();
       if (owner) return owner;
-      const failure = readJson<{ error?: unknown }>(this.#errorPath);
-      if (typeof failure?.error === "string") {
+      const failure = readJson<{ error?: unknown; launcherPid?: number; launcherBirth?: string }>(this.#errorPath);
+      // An exiting prior launcher can race this start after error.json was
+      // cleared. Its root diagnostic is not evidence about our owned attempt.
+      if (typeof failure?.error === "string" && (failure.launcherPid === undefined ||
+          (failure.launcherPid === launcher.pid && failure.launcherBirth === launcherBirth))) {
         await launcher.stop();
         throw new Error(`Fabric resident host failed to start: ${failure.error}`);
       }
@@ -273,6 +311,46 @@ export class ResidencyClient {
       ownerState ? `Owner state: ${ownerState}` : "Owner state: absent",
     ].filter(Boolean).join(" | ");
     throw new Error(`${launcherExited ? "Launcher exited while starting" : `Timed out after ${budget}ms starting`} Fabric resident host ${this.hostId}. ${diagnostics}`);
+  }
+
+  /** Host-only Main lifecycle hook; not a guest-selected release path. */
+  async reconcileRelease(): Promise<void> {
+    if (this.#closed || !this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId) return;
+    const owner = this.#liveOwner();
+    const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
+    // A new runtime must invalidate the old nonce even after A exited or while
+    // B is staged. Business readiness is not the Main generation boundary.
+    if (!owner && !handoverActive(state)) return;
+    const self = this.options.participants.self();
+    if (self.kind !== "root" || self.id !== this.options.config.rootId || self.sessionId !== this.options.config.sessionId) throw new ResidentActorAuthorizationError();
+    const releaseRoot = path.resolve(path.dirname(this.#hostPath), "../..");
+    const main: ResidentMainGeneration = { nonce: this.#runtimeNonce, pid: process.pid,
+      processStartTime: processStartTime(process.pid) ?? "", rootId: this.options.config.rootId,
+      sessionId: this.options.config.sessionId, releaseRoot };
+    if (!this.#generationRecorded) {
+      writeJsonAtomic(mainGenerationPath(this.options.config.residencyRoot), main, { durable: true });
+      this.#generationRecorded = true;
+    }
+    if (!owner || handoverActive(state) || this.#releaseOwners.has(owner.token)) return;
+    this.#releaseOwners.add(owner.token);
+    if (owner.releaseRoot === releaseRoot) return;
+    if (owner.handover?.abi !== RESIDENT_HANDOVER_ABI || !owner.commands?.includes("releaseChange")) {
+      this.#deferRelease(new Error("Legacy resident host/launcher has no release custody protocol; installer drain required")); return;
+    }
+    this.#refreshPiModels();
+    const target = residentLaunchSpec(this.options.config, path.join(path.dirname(this.#hostPath), "pi-entry.js"));
+    if (readHandoverJson(handoverOutcomePath(this.options.config.residencyRoot, target))) return;
+    await this.#command({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "releaseChange",
+      requestId: randomUUID(), rootId: main.rootId, createdAt: Date.now(), main, target,
+      caller: { identity: { id: self.id, name: self.name, kind: "main", sessionId: main.sessionId }, hostId: self.ownerHostId },
+    }, this.#releaseAbort.signal);
+  }
+
+  #deferRelease(error: unknown): void {
+    try { writeJsonAtomic(path.join(this.options.config.residencyRoot, "handover-deferred.json"), {
+      at: Date.now(), release: this.options.config.fabricExtensionPath,
+      reason: error instanceof Error ? error.message : String(error),
+    }); } catch { /* Deferred is diagnostic; never permission to exit A. */ }
   }
 
   #refreshPiModels(): void {
@@ -730,6 +808,10 @@ export class ResidencyClient {
     ) {
       return undefined;
     }
+    if (owner.attempt) {
+      const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
+      if (state?.plan.id !== owner.attempt.id || state.phase !== (owner.attempt.kind === "target" ? "complete" : "fallback")) return undefined;
+    }
     return owner;
   }
 
@@ -737,7 +819,11 @@ export class ResidencyClient {
     const now = Date.now();
     if (this.#closed || this.#startingHost || now < this.#nextWatchdogAt || !kernelFenceAvailable()) return;
     this.#nextWatchdogAt = now + WATCHDOG_INTERVAL_MS;
-    if (this.#liveOwner()) return;
+    if (this.#liveOwner()) {
+      void this.reconcileRelease().catch((error) => this.#deferRelease(error));
+      return;
+    }
+    if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) return;
     const work = this.#durableWork();
     if (!work) { this.#watchdogWork = undefined; this.#watchdogFailures = 0; return; }
     const noProgress = work === this.#watchdogWork;

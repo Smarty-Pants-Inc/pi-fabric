@@ -35,6 +35,7 @@ export class LifecycleBroker {
   #publishTail: Promise<void> = Promise.resolve();
   #pollScheduled = false;
   #closed = false;
+  #paused = false;
   /** Cursors past events that matched nothing, not yet saved, by subscription id. */
   readonly #unsaved = new Map<string, number>();
 
@@ -163,6 +164,14 @@ export class LifecycleBroker {
     return { removed: result.deleted };
   }
 
+  pause(): void { this.#paused = true; }
+  resume(): void { this.#paused = false; this.#schedulePoll(); }
+  async checkpointForRelease(): Promise<void> {
+    if (!this.#paused) throw new Error("Lifecycle release gate is not paused");
+    await this.#publishTail;
+    await this.#polling;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
@@ -187,7 +196,7 @@ export class LifecycleBroker {
   }
 
   async #poll(): Promise<void> {
-    if (this.#closed || !this.options.enabled) return;
+    if (this.#closed || this.#paused || !this.options.enabled) return;
     if (this.#polling) return this.#polling;
     const operation = this.#drain();
     this.#polling = operation;
@@ -241,7 +250,7 @@ export class LifecycleBroker {
   ): Promise<void> {
     let entry = initialEntry;
     let subscription = initial;
-    while (!this.#closed) {
+    while (!this.#closed && !this.#paused) {
       const latestSequence = this.mesh.latestSequence();
       const from = this.#cursor(subscription);
       if (latestSequence <= from) return;

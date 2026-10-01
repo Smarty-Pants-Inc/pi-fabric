@@ -6,11 +6,8 @@ export const DELETE_REASON = "Recursive delete refused: delete only inside your 
 type Word = { text: string; literal: boolean };
 type Split = { words: Word[]; simple: boolean };
 const SIGNALS = new Set(["kill", "pkill", "killall", "killall5"]);
-const DATA = new Set(["echo", "printf", "grep", "rg"]);
-// These are grammar/execution prefixes, never proof that following words are DATA.
-const RESERVED = new Set(["!", "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "in", "esac", "select", "coproc", "function", "time", "{", "}"]);
-const EXECUTORS = new Set(["sudo", "doas", "env", "command", "builtin", "exec", "nice", "ionice", "timeout", "time", "nohup", "setsid", "stdbuf", "xargs", "bash", "sh", "zsh", "dash", "ksh", "ssh", "eval", "source", ".", "find", "trap"]);
-const basename = (word: string): string => word.slice(word.lastIndexOf("/") + 1);
+const DATA = new Set(["echo", "printf", "cat", "ls", "grep", "rg", "head", "tail", "wc"]);
+const DELETES = new Set(["rm", "find", "shred", "xargs"]);
 
 /** Literal words only. No expansion, bindings, output, shell argv, or execution interpretation. */
 function split(source: string): Split {
@@ -64,10 +61,61 @@ function split(source: string): Split {
   return { words, simple };
 }
 
-// Opaque executable text (including trap actions) never receives a literal-command grant.
-// A lexical path prefix may be relative or absolute; no cwd/executable lookup is inferred.
-const SIGNAL_TEXT = /(?:^|[\s;|&()<>"'`=]|-[A-Za-z]*S)(?:[^\s;|&()<>"'`]+\/)?(?:kill|pkill|killall|killall5)(?=$|[\s;|&()<>"'`])/;
-const DELETE_TEXT = /(?:^|[\s;|&()<>"'`=]|-[A-Za-z]*S)(?:[^\s;|&()<>"'`]+\/)?(?:rm|find|shred)(?=$|[\s;|&()<>"'`])/;
+/** One forward pass: each lexical token/basename is considered once, without path backtracking. */
+function protectedTokens(source: string): { signal: boolean; deletion: boolean } {
+  let signal = false, deletion = false, start = 0, slash = -1;
+  for (let i = 0; i <= source.length; i++) {
+    const c = source[i];
+    if (c === "/") slash = i;
+    if (c !== undefined && !/\s/.test(c) && !";|&()<>\"'`=".includes(c)) continue;
+    if (i > start) {
+      // The attached env -S spelling is lexical evidence, not an argv/receiver interpreter.
+      const token = source.slice(Math.max(start, slash + 1), i).replace(/^-[A-Za-z]*S/, "");
+      signal ||= SIGNALS.has(token);
+      deletion ||= DELETES.has(token);
+    }
+    start = i + 1; slash = -1;
+  }
+  return { signal, deletion };
+}
+
+const FIND_VALUES = new Set(["-type", "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-size", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-user", "-group", "-uid", "-gid", "-perm", "-links", "-inum", "-maxdepth", "-mindepth"]);
+const FIND_FLAGS = new Set(["-H", "-L", "-P", "-print", "-print0", "-empty", "-readable", "-writable", "-executable", "-true", "-false", "-depth", "-mount", "-xdev", "-prune", "-ls"]);
+
+function literalFileMaintenance(words: Word[]): boolean {
+  const args = words.slice(1).map(word => word.text);
+  if (words[0]?.text === "rm") {
+    let i = 0;
+    while (args[i] === "-f") i++;
+    if (args[i] === "--") i++;
+    return i < args.length && args.slice(i).every(arg => arg.length > 0 && !arg.startsWith("-") && !/[$`*?\[\]{}~\r\n]/.test(arg));
+  }
+  if (words[0]?.text !== "find" || args.some(arg => /[$`*?\[\]{}~\r\n]/.test(arg))) return false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (FIND_FLAGS.has(arg)) continue;
+    if (FIND_VALUES.has(arg)) {
+      if (!args[++i]) return false;
+      continue;
+    }
+    if (!arg.startsWith("-") && arg.length > 0 && i === 0) continue;
+    return false;
+  }
+  return true;
+}
+
+function literalData(words: Word[], simple: boolean): boolean {
+  if (!simple || words.length === 0 || words.some(word => !word.literal)) return false;
+  const head = words[0]!.text;
+  if (head.includes("/")) return false;
+  if (literalFileMaintenance(words)) return true;
+  if (DATA.has(head)) {
+    // Search preprocessors execute their argv. Never grant either attached or separated spelling.
+    return !["rg", "grep"].includes(head) || !words.some(word => /^--pre(?:-glob)?(?:=|$)/.test(word.text));
+  }
+  // No configurable aliases, pager/exec flags, scripts or arbitrary subcommands receive DATA credit.
+  return head === "git" && words.length === 2 && ["log", "status", "diff"].includes(words[1]!.text);
+}
 
 function literalKill(words: Word[]): boolean {
   if (words[0]?.text !== "kill" || words.some(word => !word.literal)) return false;
@@ -104,44 +152,26 @@ function literalRm(words: Word[], tmpdir: string | undefined): boolean {
 
 /**
  * Scope cut from PR166: only one literal kill or recursive rm command can receive an allowance.
- * Complex/wrapped/nested protected forms refuse; no safety bytes or parent effects are inferred.
- * This is a mistake guard, not a sandbox: aliases, script files, other languages and dynamically
- * selected command names are outside its lexical scope. Non-protected commands pass unchanged.
+ * Outside the fixed inert-head grant, visible protected tokens and opaque execution refuse.
+ * No safety bytes, executor semantics or parent effects are inferred. This is a mistake guard,
+ * not a sandbox: aliases, custom script files, other languages and dynamic names are not proved.
  */
 export function bashGuardRefusal(command: string, tmpdir: string | undefined): string | undefined {
   const { words, simple } = split(command);
-  const name = basename(words[0]?.text ?? "");
-  const commandHead = words[0]?.literal && /^[A-Za-z_./][A-Za-z0-9_./+-]*$/.test(words[0].text) && !RESERVED.has(name);
-  const preprocessor = ["rg", "grep"].includes(name) && words.some(word => /^--pre(?:-glob)?(?:=|$)/.test(word.text));
-  // Literal arguments to an unrelated command are DATA, not shell code. Known command/script
-  // executors are excluded; custom scripts and other languages remain outside this lexical scope.
-  if (simple && commandHead && !preprocessor && DATA.has(name) && words.every(word => !/[$`]/.test(word.text))) return undefined;
-  if (simple && commandHead && !preprocessor && !words[0]!.text.includes("=") && !SIGNALS.has(name) && !["rm", "shred"].includes(name) &&
-      !EXECUTORS.has(name) && words.every(word => word.literal)) return undefined;
-  // Opaque execution never gets an absence-of-protected-code proof from unsupported quoting.
-  // Do not decode ANSI-C/locale strings or re-lex an inline script's escaped/concatenated name.
-  const rawSignal = /\b(?:kill|pkill|killall|killall5)\b/.test(command);
-  const rawDelete = /\b(?:rm|find|shred|xargs)\b/.test(command);
-  const unsupported = /\$['"]|\\\r?\n|<</.test(command);
-  const opaqueExecutor = preprocessor || words.some(word => EXECUTORS.has(basename(word.text)) || RESERVED.has(word.text));
-  if ((unsupported && (rawSignal || rawDelete)) ||
-      (opaqueExecutor && (unsupported || words.some(word => /['"\\]/.test(word.text))))) {
-    return rawSignal || !rawDelete ? SIGNAL_REASON : DELETE_REASON;
+  if (literalData(words, simple) || (simple && literalKill(words)) || (simple && literalRm(words, tmpdir))) return undefined;
+  const raw = protectedTokens(command);
+  let signal = raw.signal, deletion = raw.deletion;
+  for (const word of words) {
+    const found = protectedTokens(word.text);
+    signal ||= found.signal; deletion ||= found.deletion;
   }
-  const signal = words.some(word => SIGNALS.has(basename(word.text)) || SIGNAL_TEXT.test(word.text));
-  if (signal) return simple && literalKill(words) ? undefined : SIGNAL_REASON;
-  const rm = words.some(word => basename(word.text) === "rm");
-  const find = words.some(word => basename(word.text) === "find") && words.some(word => word.text === "-delete");
-  const shred = words.some(word => basename(word.text) === "shred");
-  // With unproved argv/syntax, a delete option or operand may become the recursive selector.
-  const recursive = words.some(word => /^-[a-zA-Z]*[rR][a-zA-Z]*$/.test(word.text) || word.text.startsWith("--recursive"));
-  const remove = words.some(word => /^-[a-zA-Z]*u[a-zA-Z]*$/.test(word.text) || /^--remove(?:=|$)/.test(word.text));
-  const uncertain = !simple || words.some(word => !word.literal);
-  const opaque = words.some(word => DELETE_TEXT.test(word.text)) &&
-    (recursive || uncertain || words.some(word => /(?:[$`]|-[a-zA-Z]*[rRu]|--recursive|--remove|-delete)/.test(word.text)));
-  if (find || (shred && (recursive || uncertain || remove)) ||
-      (rm && (recursive || uncertain)) || opaque) {
-    return simple && literalRm(words, tmpdir) ? undefined : DELETE_REASON;
-  }
+  // No executor denylist: live substitutions/process substitutions/backticks and unsupported
+  // script quoting cannot prove absence of a fragmented protected receiver. Do not decode them.
+  const execution = /\$\(|`|[<>]\(|\$['"]|\\\r?\n|<</.test(command);
+  const unprovedQuoting = words.some(word => /['"\\]/.test(word.text));
+  if (signal) return SIGNAL_REASON;
+  if (deletion) return DELETE_REASON;
+  if (execution || unprovedQuoting) return SIGNAL_REASON;
+  // No visible protected token or opaque execution. This is not an unrelated-command DATA grant.
   return undefined;
 }

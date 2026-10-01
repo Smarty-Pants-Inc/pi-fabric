@@ -1425,12 +1425,20 @@ const fixtures: readonly Fixture[] = [
   ["tests/tmp-wipe.test.ts:428 — N4.12: bounded printf percent-q identity preserves an exact own path — conservative refusal", "printf -v P '%q' /tmp/tmp.AbC123; rm -rf $P", "R"],
 ];
 
+// Round 4 owner-directed structural cuts: historical IDs/commands/labels remain unchanged.
+const ownerDirectedCuts: Record<string, string> = {
+  "tests/pattern-kill.test.ts:225 — a gh api comment that names the forms": SIGNAL_REASON,
+  "tests/pattern-kill.test.ts:226 — a commit message": SIGNAL_REASON,
+  "tests/tmp-wipe.test.ts:206 — a gh comment that names the command": DELETE_REASON,
+  "tests/tmp-wipe.test.ts:216 — echo of the command, unquoted": DELETE_REASON,
+};
+
 describe("literal Bash guard — historical PR166 signal/recursive-TMP DATA", () => {
   for (const [sourceId, command, expected] of fixtures) {
     it(`${expected}: ${sourceId}`, () => {
       const reason = bashGuardRefusal(command, TMPDIR);
       if (expected === "literalallow") {
-        expect(reason).toBeUndefined();
+        expect(reason).toBe(ownerDirectedCuts[sourceId]);
       } else {
         expect([SIGNAL_REASON, DELETE_REASON]).toContain(reason);
         expect(typeof reason).toBe("string");

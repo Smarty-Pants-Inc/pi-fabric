@@ -18,7 +18,9 @@ output, cwd changes, attributes, files, descriptors or producer provenance.
 | --- | --- | --- |
 | Process signals | One bare `kill` with positive literal integer PID operands, optionally one literal `-SIGNAL` and/or `--` | Refuse with **“use the PID you recorded”**. `pkill`, `killall`, variables, substitutions, job selectors, wrappers, nested/compound commands and unproved operands get no allowance. |
 | Recursive deletion | One bare `rm` using `-r`/`-R` and optional `-f`, or literal `--recursive`/`--force`, optionally `--`; **all** operands literal absolute descendants of the host session's private TMPDIR | Refuse with **“delete only inside your own TMPDIR”**. No shared root, TMPDIR equality, `..`, globs, expansions, relative paths, mixed outside operands or unproved flags. `find -delete` and `shred -r`/`-u` (including short clusters)/`--remove[=...]` cannot receive this allowance. |
-| Unrelated command/DATA | Pass unchanged | No general command allowlist, arbitrary execution interpreter or output-safety claim. Literal examples in ordinary DATA argv/comments remain DATA. |
+| Inert DATA | Whole-literal, single bare `echo`, `printf`, `cat`, `ls`, `grep`, `rg`, `head`, `tail`, `wc`; or exact `git log`/`git status`/`git diff` | No expansion, live substitution, process substitution, backquote, shell grammar or unknown head receives this grant. Search `--pre`/`--pre-glob` options are excluded. `sed` is deliberately omitted. |
+| Everyday maintenance | Whole-literal nonrecursive `rm`/`rm -f` with explicit operands; or `find` with only the source's fixed non-executing predicates | No `rm -d`, recursive option, glob or expansion; no find exec/ok/delete/file-write action or unknown predicate. This narrow owner exception is not a general argv interpreter. |
+| Outside these grants | Pass only if there is no visible protected token and no unproved opaque execution/quoting | Visible signal/delete tokens refuse; all shred forms refuse. No unrelated-head or executor-denylist DATA credit. |
 
 Complex protected forms are refused as whole calls rather than interpreted.
 Protected names in opaque scripts/heredocs cannot earn an allowance. Command
@@ -27,14 +29,14 @@ Unproved `rm` argv can select recursive options and therefore refuses. This
 intentionally trades complex-command precision for a small conservative policy.
 Reserved-word or punctuation prefixes do not establish an unrelated-command/DATA
 allowance. `rg`/`grep` with `--pre` or `--pre-glob` is execution-bearing, not inert
-search DATA. Unsupported dollar quoting, continuation or heredoc syntax cannot
-hide visible protected names. Known opaque executors with inner quotes/escapes
-refuse rather than decoding quote-concatenated or escaped receiver spellings;
-when the protected class itself is unproved, the stable signal reason is used.
-Protected basenames behind a lexical relative or absolute path prefix remain
-protected inside opaque execution strings; a path-regex miss is not a DATA grant.
-`trap` action strings are executable text, not unrelated argv DATA. No cwd,
-executable lookup, trap state or deferred-handler execution is modelled.
+search DATA. Unsupported dollar quoting, live substitutions/backticks/process
+substitution, continuation or heredoc syntax cannot hide protected receivers.
+Opaque inner quotes/escapes confer no absence proof; when the protected class
+itself is unproved, the stable signal reason is used. Protected lexical basenames
+are detected by a **forward token scan**, not a backtracking path-prefix regex.
+No execution-boundary denylist exists: `trap`, `complete`, `compgen`, unknown
+heads and future executors receive no generic DATA grant. No cwd, executable
+lookup, trap/completion state or deferred action is modelled.
 
 TMPDIR is read **at each guard call**, never from the submitted shell text. Missing,
 relative, expansion-bearing, traversing or shared-root TMPDIR values confer no
@@ -67,11 +69,15 @@ the TMPDIR itself is refused; the literal operand must be below it.
 - `tests/literal-bash-guard-round3.test.ts`: derived relative shell/eval receivers
   and EXIT/zero trap action witnesses, with independent bare-literal, non-protected
   trap and inert printed-DATA controls.
+- `tests/literal-bash-guard-round4.test.ts`: Astra F5–F7 / security S7–S9,
+  fixed-head and narrow maintenance cuts, and increasing nonmatching input sizes.
+  Cost coverage has no flaky millisecond threshold; the source scans tokens once.
+  Owner-directed changes to old broad allowances retain their command/ID bytes.
 
-No corpus command is dispatched to Bash. Round 2 additionally requires one real
-Pi 0.87.1 run on the freshly built head: only an owned PID's literal signal-zero
-call is admitted; a pattern signal and outside recursive delete must refuse before
-execution. Internal MAX reviews and seal chains are not acceptance gates.
+No corpus command is dispatched to Bash. Each native proof uses real Pi 0.87.1
+and the freshly built head as its only extension. Round 4 admits only the owned
+PID's literal signal-zero call and an inert grep, and refuses harmless S7/S8 forms
+before execution. Internal MAX reviews and seal chains are not acceptance gates.
 
 ## Owner gate / limits
 

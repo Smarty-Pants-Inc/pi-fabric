@@ -42,7 +42,10 @@ describe("literal-only signal and recursive-delete guard", () => {
     "grep -n pkill README.md", "rg 'rm -rf' docs", "pgrep worker", "ls -al /tmp", "pwd",
     "printf '%s' '$P'", "rm -f /tmp/a", "rm /tmp/a", "find /tmp -type f", "shred /tmp/a",
     "echo ok; git status", "P=4242; printf '%s' $P",
-  ])("passes unrelated commands and inert literal DATA: %s", command => expect(bashGuardRefusal(command, tmpdir)).toBeUndefined());
+  ])("passes unrelated commands and inert literal DATA: %s", command => {
+    // Same historical ID/command; owner-directed round-4 cut refuses all shred forms.
+    expect(bashGuardRefusal(command, tmpdir)).toBe(command === "shred /tmp/a" ? DELETE_REASON : undefined);
+  });
   it.each([undefined, "", "/", "/tmp", "/var/tmp", "relative", "/tmp/session/../other", "$TMPDIR"])(
     "never grants recursive deletion from an absent/shared/unproved TMPDIR: %s", root => {
       expect(bashGuardRefusal("rm -rf /tmp/session-literal-guard/a", root)).toBe(DELETE_REASON);

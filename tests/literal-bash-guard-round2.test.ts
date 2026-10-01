@@ -50,7 +50,11 @@ describe("PR231 round 2 conservative class cuts", () => {
       }
     });
     it(`${pair.id}: SIMPLE / inert DATA allowance`, () => {
-      for (const command of pair.simple) expect(bashGuardRefusal(command, tmpdir), command).toBeUndefined();
+      for (const command of pair.simple) {
+        // Historical commands/IDs preserved; round-4 fixed-head cut refuses all shred, even -z.
+        const expected = command.startsWith("shred ") ? DELETE_REASON : undefined;
+        expect(bashGuardRefusal(command, tmpdir), command).toBe(expected);
+      }
     });
   }
 });

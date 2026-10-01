@@ -118,10 +118,45 @@ const harness = async (beforeCommit: boolean, seed?: (config: ResidentHostConfig
       for (const [name, previous] of signalListeners) {
         for (const listener of process.listeners(name)) if (!previous.has(listener)) process.removeListener(name, listener);
       }
-      fs.rmSync(root, { recursive: true, force: true });
+      // Host shutdown confirms worker exit, and CPython controls also await guest
+      // close. Windows can still transiently retain a cwd/directory in the OS;
+      // opt into Node's bounded recursive-rm retry rather than masking EBUSY.
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
     },
   };
 };
+
+describe("resident fence harness teardown", () => {
+  it("retries a transient Windows EBUSY after the resident host has closed", async () => {
+    const state = await harness(false);
+    const rm = fs.rmSync.bind(fs);
+    let attempts = 0;
+    let cleanupOptions: fs.RmOptions | undefined;
+    const busy = Object.assign(new Error("Windows still holds the removed cwd"), { code: "EBUSY" });
+    const cleanup = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) !== state.root) return rm(target, options);
+      cleanupOptions = options;
+      expect(fs.existsSync(path.join(state.residencyRoot, "owner.json"))).toBe(false);
+      // Model Node's documented recursive rm retry contract on Linux: the first
+      // rmdir is busy, then the OS releases it. Native Windows exercises the real
+      // implementation; maxRetries defaults to zero without the harness opt-in.
+      for (let retry = 0; ; retry++) {
+        attempts++;
+        if (attempts > 1) return rm(target, options);
+        if (retry >= (options?.maxRetries ?? 0)) throw busy;
+      }
+    });
+    try {
+      await expect(state.close()).resolves.toBeUndefined();
+      expect(attempts).toBe(2);
+      expect(cleanupOptions).toMatchObject({ recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
+      expect(fs.existsSync(state.root)).toBe(false);
+    } finally {
+      cleanup.mockRestore();
+      rm(state.root, { recursive: true, force: true });
+    }
+  });
+});
 
 const kinds = ["main spawn", "main create", "nested create"] as const;
 const endings = ["timeout", "abort"] as const;

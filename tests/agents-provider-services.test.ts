@@ -399,6 +399,30 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.routeMessage("missing", "hello", undefined, "steer")).rejects.toBe(failure);
   });
 
+  it.each(["ask", "followUp"] as const)("%s carries principal alongside raw own-root and resolved foreign bindings", async (operation) => {
+    const { router, actors } = routing();
+    actors.status.mockReturnValue({ id: "child", rootId: actors.identity.id } as ReturnType<Ports[1]["status"]>);
+    actors.ask.mockResolvedValue({ id: "accepted" } as Awaited<ReturnType<Ports[1]["ask"]>>);
+    actors.tell.mockReturnValue({ messageId: "accepted" } as ReturnType<Ports[1]["tell"]>);
+    const principal = { id: "paul", binding: "voice-call" as const };
+    const signal = new AbortController().signal;
+    const own = { ...command(operation), principal, binding: { model: "provider/pinned" }, bindingProvenance: { kind: "owner-defaults" as const, rootId: actors.identity.id } };
+    const check = (options: unknown) => {
+      if (operation === "ask") expect(actors.ask).toHaveBeenLastCalledWith("child", "hello", undefined, signal, options);
+      else expect(actors.tell).toHaveBeenLastCalledWith("child", "hello", undefined, options);
+    };
+    await expect(router.acceptControl(own, actors.identity, signal, "mesh")).resolves.toMatchObject({ accepted: true });
+    check({ overrides: own.binding, provenance: expect.objectContaining({ principal }) });
+    const foreign = { ...actors.identity, id: "foreign" };
+    await expect(router.acceptControl(own, foreign, signal, "mesh")).resolves.toMatchObject({ accepted: false, error: "Invalid actor owner-default binding provenance" });
+    for (const binding of [undefined, {}, { thinking: "high" as const }]) {
+      await expect(router.acceptControl({ ...command(operation), principal, ...(binding ? { binding } : {}) }, foreign, signal, "bridge")).resolves.toMatchObject({ accepted: true });
+      check({ binding: binding ?? {}, provenance: expect.objectContaining({ principal }) });
+    }
+    await expect(router.acceptControl({ ...command(operation), principal }, foreign, signal)).resolves.toMatchObject({ accepted: true });
+    check({ binding: {}, provenance: undefined });
+  });
+
   it("leaves cancel commands to the control plane and refreshes successful stops", async () => {
     const { router, agents, participants, actors } = routing();
     await expect(router.acceptControl(command("cancel"), actors.identity)).resolves.toEqual({

@@ -7,7 +7,8 @@ import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
-import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorRequest, FabricActorBindingScope, FabricActorActivationFilter } from "../actors/types.js";
+import type { FabricThinking } from "../thinking.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
@@ -41,6 +42,8 @@ export interface ResidentRequestDecision {
   id?: string;
   operation?: ResidentCommand["operation"];
   ownerHostId?: string;
+  /** Originating requester metadata; never grants mutation authority. */
+  principal?: FabricPrincipal | undefined;
 }
 
 const residentDecisionPath = (residencyRoot: string, requestId: string): string =>
@@ -100,6 +103,7 @@ export const commitResidentRequest = (
 ): void => {
   if (decideResidentRequest(residencyRoot, {
     requestId: command.requestId, state: "committed", operation: command.operation, id, ownerHostId,
+    ...(("caller" in command && command.caller?.principal) ? { principal: command.caller.principal } : {}),
   })) return;
   const decision = readResidentRequestDecision(residencyRoot, command.requestId);
   throw new Error(decision?.state === "abandoned"
@@ -237,6 +241,11 @@ export const residentHostStateNote = (residencyRoot: string, now = Date.now()): 
 };
 
 export const RESIDENT_HOST_FORMAT = 1 as const;
+// Only command envelopes for post-B70 registry operations use format 2.
+// B70 validates format before dispatch and otherwise treats unknown operations
+// as removeActor: an unclaimed request MUST remain safe across crash/rollback.
+// Keep host config, owner records, responses and the five legacy commands at 1.
+export const RESIDENT_ACTOR_COMMAND_FORMAT = 2 as const;
 const RESIDENT_DELIVERY_PREFIX = "residency/deliveries/";
 
 const digest = (value: string): string =>
@@ -306,6 +315,8 @@ export interface ResidentHostOwner {
   token: string;
   startedAt: number;
   readyAt: number;
+  /** Commands supported by this running binary; absent on pre-negotiation hosts. */
+  commands?: readonly string[];
   /** New clients must not dispatch mutations to an already-running pre-fence host. */
   requestFence?: 1;
 }
@@ -356,12 +367,99 @@ interface ResidentCreateActorCommand {
   createdAt: number;
 }
 
+/** Existing Pi runtime control identity, captured by the provider, never from action args. */
+export interface ResidentActorCaller {
+  identity: MeshIdentity;
+  hostId: string;
+  /** Captured host turn provenance, independent of owning-Main authorization. */
+  principal?: FabricPrincipal | undefined;
+  /** Frozen optional-tool authority; absence means an unrestricted Main. */
+  toolCeiling?: string[];
+}
+
+export class ResidentActorAuthorizationError extends Error {
+  readonly code = "RESIDENT_ACTOR_FORBIDDEN" as const;
+  constructor(message = "Only the actual owning Main can mutate a resident actor") {
+    super(message);
+    this.name = "ResidentActorAuthorizationError";
+  }
+}
+
+export const assertResidentActorMain = (caller: ResidentActorCaller | undefined, rootId: string): void => {
+  if (!caller || caller.identity?.kind !== "main" || caller.identity.id !== rootId) {
+    throw new ResidentActorAuthorizationError();
+  }
+};
+
+export const assertResidentActorToolCeiling = (tools: string[], ceiling: readonly string[] | undefined): void => {
+  if (ceiling === undefined) return;
+  if (!Array.isArray(ceiling) || !ceiling.every((tool) => typeof tool === "string") ||
+    !Array.isArray(tools) || !tools.every((tool) => typeof tool === "string" &&
+      (tool.trim() === "fabric_exec" || ceiling.includes(tool.trim())))) {
+    throw new ResidentActorAuthorizationError("Actor tools cannot exceed the caller's tool ceiling");
+  }
+};
+
+/** Root-owned registry operations; these never start a resident host. */
+export type ResidentActorMutation =
+  | { operation: "setInstructions"; id: string; instructions: string }
+  | { operation: "setTools"; id: string; tools: string[] }
+  | { operation: "setModel"; id: string; model?: string; scope: FabricActorBindingScope }
+  | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
+  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null };
+
+type ResidentActorMutationCommand = ResidentActorMutation & {
+  caller?: ResidentActorCaller;
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
+  requestId: string;
+  rootId: string;
+  createdAt: number;
+};
+
+interface ResidentActorStatusCommand {
+  format: typeof RESIDENT_ACTOR_COMMAND_FORMAT;
+  operation: "actorStatus" | "actors";
+  requestId: string;
+  rootId: string;
+  id?: string;
+  createdAt: number;
+}
+
 export type ResidentCommand =
   | ResidentSpawnCommand
   | ResidentCleanupCommand
   | ResidentForegroundCommand
   | ResidentRemoveActorCommand
-  | ResidentCreateActorCommand;
+  | ResidentCreateActorCommand
+  | ResidentActorMutationCommand
+  | ResidentActorStatusCommand;
+
+// The only operations every format-1 host predating command negotiation understood.
+const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
+export const RESIDENT_COMMANDS = [
+  ...LEGACY_RESIDENT_COMMANDS, "actors", "actorStatus", "setInstructions", "setModel",
+  "setThinking", "setTools", "setActivationFilter",
+] as const satisfies readonly ResidentCommand["operation"][];
+
+export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
+  typeof operation === "string" && (RESIDENT_COMMANDS as readonly string[]).includes(operation);
+
+export class ResidentCommandUnsupportedError extends Error {
+  readonly code = "RESIDENT_COMMAND_UNSUPPORTED" as const;
+  constructor(message = "The owning resident host runs an older release; it is relaunched on the current release at its next idle point; retry then") {
+    super(message);
+    this.name = "ResidentCommandUnsupportedError";
+  }
+}
+
+/** Check the running owner's publication, never the caller's release/config. */
+export const assertResidentCommandSupported = (owner: ResidentHostOwner, operation: ResidentCommand["operation"]): void => {
+  const supported = owner.commands === undefined ? LEGACY_RESIDENT_COMMANDS : owner.commands;
+  if (!isResidentCommandOperation(operation) || !Array.isArray(supported) ||
+      !(supported as readonly string[]).includes(operation)) {
+    throw new ResidentCommandUnsupportedError();
+  }
+};
 
 export interface ResidentCommandResponse {
   format: typeof RESIDENT_HOST_FORMAT;
@@ -369,10 +467,12 @@ export interface ResidentCommandResponse {
   ok: boolean;
   handle?: AgentHandleInfo;
   actor?: FabricActorInfo;
+  actors?: FabricActorInfo[];
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;
   error?: string;
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED";
   completedAt: number;
 }
 

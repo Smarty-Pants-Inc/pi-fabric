@@ -417,7 +417,7 @@ describe("ActorManager across a session reload", () => {
     return manager;
   };
 
-  it("keeps originating principal through an actor queue reload and task launch", async () => {
+  it.each(["owner-defaults", "resolved"] as const)("keeps originating principal and %s binding mode through an actor queue reload and task launch", async (bindingMode) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-principal-actor-")); roots.push(root);
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
     const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -426,12 +426,15 @@ describe("ActorManager across a session reload", () => {
     const principal = { id: "paul", binding: "voice-call" as const };
     const before = reloadable(root, mesh, agents);
     const actor = await before.create({ name: "relay", instructions: "Harmless.", responseMode: "text" });
+    await before.setModel(actor.id, "provider/private");
     // Pin a real private queue before its asynchronous drain gets the next event-loop slice.
     before.tell(actor.id, "harmless relay", { principal: { id: "admin" } }, {
       provenance: fabricTurnProvenance({ id: "lead", name: "lead", kind: "agent" }, "actor", "mesh", principal),
+      ...(bindingMode === "resolved" ? { binding: {} } : {}),
     });
     const saved = queueFiles(root, actor.id).flatMap(({ text }) => JSON.parse(text).items ?? []);
     expect(saved[0].provenance.principal).toEqual(principal);
+    expect(saved[0]).toMatchObject({ bindingMode, bindingVersion: 2 });
     // Shut down before the scheduled activation, retaining the private queued admission.
     await before.close();
     const spawned = vi.spyOn(agents, "spawn");
@@ -440,6 +443,7 @@ describe("ActorManager across a session reload", () => {
     expect(spawned.mock.calls.some(([request]) => request.provenance?.principal?.id === "paul")).toBe(true);
     const request = spawned.mock.calls.find(([request]) => request.provenance?.principal?.id === "paul")![0];
     expect(request.provenance?.principal).toEqual(principal);
+    expect(request.model).toBe(bindingMode === "resolved" ? undefined : "provider/private");
     expect(after.messages(actor.id).find(m => m.direction === "out" && !m.error)?.principal).toEqual(principal);
   }, 30_000);
   it("delivers an event published while the session reloaded, after the reload", async () => {
@@ -1583,7 +1587,7 @@ describe("ActorManager", () => {
     });
   });
 
-  it("pins a queued activation before later session binding changes", async () => {
+  it("keeps a launched activation pinned across later session binding changes", async () => {
     const { actors, agents } = setup();
     const runSpy = vi.spyOn(agents, "run");
     const actor = await actors.create({
@@ -1596,6 +1600,7 @@ describe("ActorManager", () => {
     await actors.setThinking(actor.id, "low");
 
     const first = actors.ask(actor.id, "first");
+    await waitFor(() => runSpy.mock.calls.length === 1);
     await actors.setModel(actor.id, "provider/session-new");
     await actors.setThinking(actor.id, "high");
     await first;

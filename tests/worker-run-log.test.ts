@@ -5,6 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readJsonlPage } from "../src/log-tail.js";
 import { NativeConversationReader } from "../src/ui/conversation-native-reader.js";
 import { AgentTranscriptReader } from "../src/ui/transcript-reader.js";
 import { compactTerminalRunLog, createRunLogWriter, MAX_EVENT_LINE_CHARS, MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_LOG_RECORDS, MAX_TERMINAL_LOG_WORK_MS } from "../src/worker/run-log.js";
@@ -83,6 +84,36 @@ const compactText = (text: string): string => {
   expect(outcome.error).toBeUndefined();
   return fs.readFileSync(file, "utf8");
 };
+// Model Windows sharing denial with a REAL external descriptor, then let the
+// caller close it and require a native production replacement. No fake identity.
+const denyHeldReplacement = (file: string, held: number, code?: "EPERM" | "EBUSY"): void => {
+  const original = fs.readFileSync(file);
+  const identity = fs.fstatSync(held, { bigint: true });
+  const rename = code === undefined ? undefined : vi.spyOn(fs, "renameSync").mockImplementation((_from, to) => {
+    expect(to).toBe(file);
+    const current = fs.fstatSync(held, { bigint: true });
+    expect(current.dev).toBe(identity.dev);
+    expect(current.ino).toBe(identity.ino);
+    throw Object.assign(new Error(`injected Windows ${code}: open destination`), { code });
+  });
+  // Count-bounded denial, without a 700ms real sleep or a raised work budget.
+  const sleep = code === undefined ? undefined : vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+  try {
+    const outcome = compactTerminalRunLog(file, "completed");
+    expect(outcome).toMatchObject({ compacted: 0, beforeBytes: original.length, afterBytes: original.length });
+    if (code !== undefined) {
+      expect(outcome.error).toContain(code);
+      expect(rename).toHaveBeenCalledTimes(8);
+    } else {
+      // Native Windows sharing denial may exhaust the real 500ms deadline.
+      expect(outcome.error ?? outcome.compactionSkipped).toMatch(/EPERM|EBUSY|EACCES|MAX_TERMINAL_LOG_WORK_MS=.*full log retained/);
+    }
+  } finally { rename?.mockRestore(); sleep?.mockRestore(); }
+  expect(fs.readFileSync(file).equals(original)).toBe(true);
+  expect(fs.statSync(file, { bigint: true }).ino).toBe(identity.ino);
+  expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+};
+
 const readTranscript = (text: string) => new NativeConversationReader().read({ id: "run", status: "running", logFile: logFile(text) });
 // Entry ids are derived from line positions, which compaction changes.
 const readEntries = (text: string) => new AgentTranscriptReader()
@@ -586,92 +617,118 @@ describe("worker run log", () => {
     expect(fs.readdirSync(directory).sort()).toEqual(["events.jsonl", "foreign.compact.tmp"]);
   });
 
-  it.each(["x".repeat(2000), ""])("invalidates held reader offsets on atomic replacement (body length=%s)", (body) => {
-    const { events: fullEvents } = capEvents(body);
-    const events: Array<Record<string, unknown>> = body ? fullEvents : [
-      fullEvents[0]!,
-      { type: "tool_execution_end", toolCallId: "capcall", toolName: "cap", result: { content: [] }, isError: false },
-      { type: "message_end", message: { role: "toolResult", toolCallId: "capcall", toolName: "cap", content: [], isError: false, timestamp: 1 } },
-    ];
-    const raw = events.map((event) => `${JSON.stringify(event)}\n`).join("");
-    const live = write(events, true, false).text;
-    const file = logFile(live);
-    const source = { id: "held", status: "completed", logFile: file };
-    const dashboard = new AgentTranscriptReader();
-    const native = new NativeConversationReader();
-    const beforeDashboard = dashboard.read(source, false);
-    const beforeNative = native.read(source, false);
-    const fd = fs.openSync(file, "r");
-    const inode = fs.statSync(file).ino;
-    try {
-      const outcome = compactTerminalRunLog(file, "completed");
-      expect(outcome.compacted).toBe(1);
-      expect(fs.statSync(file).ino).not.toBe(inode);
-      expect(fs.readFileSync(fd, "utf8")).toBe(live);
-      const compacted = fs.readFileSync(file, "utf8");
-      expect(compacted.trimEnd().split("\n")).toHaveLength(live.trimEnd().split("\n").length);
-      expect(readEntries(compacted)).toEqual(readEntries(raw));
-      const fresh = readTranscript(compacted);
-      expect(fresh.messages).toEqual(readTranscript(raw).messages);
-      expect(fresh.streaming).toEqual(readTranscript(raw).streaming);
-      const afterNative = native.read(source, false);
-      expect(afterNative.revision).toBeGreaterThan(beforeNative.revision);
-      expect(afterNative.hasNewer).toBe(false);
-      expect(afterNative.messages).toEqual(beforeNative.messages);
-      expect(afterNative.streaming).toEqual(beforeNative.streaming);
-      expect(dashboard.read(source, false).entries).toEqual(beforeDashboard.entries);
-      if (body) expect(outcome.afterBytes).toBeLessThan(outcome.beforeBytes);
-      else expect(outcome.afterBytes).toBeGreaterThan(outcome.beforeBytes);
-      fs.appendFileSync(file, `${JSON.stringify({ type: "message_end", message: { role: "user", content: "new-path-offset", timestamp: 99 } })}\n`);
-      expect(native.read(source).messages.at(-1)).toMatchObject({ role: "user", content: "new-path-offset" });
-      expect(dashboard.read(source).entries.at(-1)).toMatchObject({ kind: "user", text: "new-path-offset" });
-      expect(beforeNative.messages).not.toEqual(native.last!.messages);
-    } finally { fs.closeSync(fd); }
-  });
+  describe.each(["quiescent", "Windows EPERM denial", "Windows EBUSY denial", "POSIX held-FD replacement", "Windows native denial"])("reader replacement: %s", (capability) => {
+    describe.skipIf((capability.startsWith("POSIX") && process.platform === "win32") || (capability === "Windows native denial" && process.platform !== "win32"))("native replacement capability", () => {
+      it.each(["x".repeat(2000), ""])("invalidates held reader offsets on atomic replacement (body length=%s)", (body) => {
+        const { events: fullEvents } = capEvents(body);
+        const events: Array<Record<string, unknown>> = body ? fullEvents : [
+          fullEvents[0]!,
+          { type: "tool_execution_end", toolCallId: "capcall", toolName: "cap", result: { content: [] }, isError: false },
+          { type: "message_end", message: { role: "toolResult", toolCallId: "capcall", toolName: "cap", content: [], isError: false, timestamp: 1 } },
+        ];
+        const raw = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+        const live = write(events, true, false).text;
+        const file = logFile(live);
+        const source = { id: "held", status: "completed", logFile: file };
+        const dashboard = new AgentTranscriptReader();
+        const native = new NativeConversationReader();
+        const beforeDashboard = dashboard.read(source, false);
+        const beforeNative = native.read(source, false);
+        const cursor = readJsonlPage(file, 2);
+        let fd = capability === "quiescent" ? undefined : fs.openSync(file, "r");
+        const inode = fs.statSync(file).ino;
+        try {
+          if (capability.startsWith("Windows")) {
+            denyHeldReplacement(file, fd!, capability === "Windows native denial" ? undefined : capability.includes("EPERM") ? "EPERM" : "EBUSY");
+            expect(native.read(source, false).streaming).toEqual(beforeNative.streaming);
+            expect(dashboard.read(source, false).entries).toEqual(beforeDashboard.entries);
+            expect(readJsonlPage(file, 2, cursor.before, undefined, cursor.generation).generation).toBe(cursor.generation);
+            fs.closeSync(fd!);
+            fd = undefined;
+          }
+          const outcome = compactTerminalRunLog(file, "completed");
+          expect(outcome.error).toBeUndefined();
+          expect(outcome.compactionSkipped).toBeUndefined();
+          expect(outcome.compacted).toBe(1);
+          expect(fs.statSync(file).ino).not.toBe(inode);
+          expect(() => readJsonlPage(file, 2, cursor.before, undefined, cursor.generation)).toThrowError(expect.objectContaining({ name: "cursor-stale" }));
+          if (fd !== undefined) expect(fs.readFileSync(fd, "utf8")).toBe(live);
+          const compacted = fs.readFileSync(file, "utf8");
+          expect(compacted.trimEnd().split("\n")).toHaveLength(live.trimEnd().split("\n").length);
+          expect(readEntries(compacted)).toEqual(readEntries(raw));
+          const fresh = readTranscript(compacted);
+          expect(fresh.messages).toEqual(readTranscript(raw).messages);
+          expect(fresh.streaming).toEqual(readTranscript(raw).streaming);
+          const afterNative = native.read(source, false);
+          expect(afterNative.revision).toBeGreaterThan(beforeNative.revision);
+          expect(afterNative.hasNewer).toBe(false);
+          expect(afterNative.messages).toEqual(beforeNative.messages);
+          expect(afterNative.streaming).toEqual(beforeNative.streaming);
+          expect(dashboard.read(source, false).entries).toEqual(beforeDashboard.entries);
+          if (body) expect(outcome.afterBytes).toBeLessThan(outcome.beforeBytes);
+          else expect(outcome.afterBytes).toBeGreaterThan(outcome.beforeBytes);
+          fs.appendFileSync(file, `${JSON.stringify({ type: "message_end", message: { role: "user", content: "new-path-offset", timestamp: 99 } })}\n`);
+          expect(native.read(source).messages.at(-1)).toMatchObject({ role: "user", content: "new-path-offset" });
+          expect(dashboard.read(source).entries.at(-1)).toMatchObject({ kind: "user", text: "new-path-offset" });
+          expect(beforeNative.messages).not.toEqual(native.last!.messages);
+        } finally { if (fd !== undefined) fs.closeSync(fd); }
+      });
 
-  it.each([false, true])("retains loaded older native pages after large terminal replacement (follow=%s)", (follow) => {
-    const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
-    directories.push(directory);
-    const file = path.join(directory, "events.jsonl");
-    const events = Array.from({ length: 160 }, (_, index) => {
-      const content = [{ type: "text", text: `body-${index}:${"x".repeat(4000)}` }];
-      const toolCallId = `call-${index}`;
-      return [
-        { type: "tool_execution_start", toolCallId, toolName: "bash", args: {} },
-        { type: "tool_execution_end", toolCallId, toolName: "bash", result: { content }, isError: false },
-        { type: "message_end", message: { role: "toolResult", toolCallId, toolName: "bash", content, isError: false, timestamp: index + 1 } },
-      ];
-    }).flat();
-    const text = events.map((event) => `${JSON.stringify(event)}\n`).join("");
-    fs.writeFileSync(file, text);
-    const source = { id: "loaded", status: "completed", eventsFile: file };
-    const reader = new NativeConversationReader();
-    const initial = reader.read(source, follow);
-    const before = reader.loadOlder(2)!;
-    expect(before.messages.length).toBeGreaterThan(initial.messages.length);
-    expect(before.hasMore).toBe(true);
-    const inode = fs.statSync(file).ino;
-    const descriptor = fs.openSync(file, "r");
-    try {
-      const outcome = compactTerminalRunLog(file, "completed");
-      expect(outcome.error).toBeUndefined();
-      expect(outcome.compacted).toBe(160);
-      expect(outcome.afterBytes).toBeGreaterThan(256 * 1024);
-      expect(fs.statSync(file).ino).not.toBe(inode);
-      expect(fs.readFileSync(descriptor, "utf8")).toBe(text);
-      const compacted = fs.readFileSync(file, "utf8");
-      const types = (value: string) => value.trimEnd().split("\n").map((line) => JSON.parse(line).type);
-      expect(types(compacted)).toEqual(types(text));
-      const after = reader.read(source, follow);
-      expect(after.messages.length).toBeGreaterThanOrEqual(before.messages.length);
-      expect(after.messages.slice(-before.messages.length)).toEqual(before.messages);
-      expect(after.hasMore).toBe(true);
-      expect(after.hasNewer).toBe(false);
-      expect(after.revision).toBeGreaterThan(before.revision);
-    } finally {
-      fs.closeSync(descriptor);
-      reader.clear();
-    }
+      it.each([false, true])("retains loaded older native pages after large terminal replacement (follow=%s)", (follow) => {
+        const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
+        directories.push(directory);
+        const file = path.join(directory, "events.jsonl");
+        const events = Array.from({ length: 160 }, (_, index) => {
+          const content = [{ type: "text", text: `body-${index}:${"x".repeat(4000)}` }];
+          const toolCallId = `call-${index}`;
+          return [
+            { type: "tool_execution_start", toolCallId, toolName: "bash", args: {} },
+            { type: "tool_execution_end", toolCallId, toolName: "bash", result: { content }, isError: false },
+            { type: "message_end", message: { role: "toolResult", toolCallId, toolName: "bash", content, isError: false, timestamp: index + 1 } },
+          ];
+        }).flat();
+        const text = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+        fs.writeFileSync(file, text);
+        const source = { id: "loaded", status: "completed", eventsFile: file };
+        const reader = new NativeConversationReader();
+        const initial = reader.read(source, follow);
+        const before = reader.loadOlder(2)!;
+        expect(before.messages.length).toBeGreaterThan(initial.messages.length);
+        expect(before.hasMore).toBe(true);
+        const inode = fs.statSync(file).ino;
+        const cursor = readJsonlPage(file, 2);
+        let descriptor = capability === "quiescent" ? undefined : fs.openSync(file, "r");
+        try {
+          if (capability.startsWith("Windows")) {
+            denyHeldReplacement(file, descriptor!, capability === "Windows native denial" ? undefined : capability.includes("EPERM") ? "EPERM" : "EBUSY");
+            expect(reader.read(source, follow).messages).toEqual(before.messages);
+            expect(readJsonlPage(file, 2, cursor.before, undefined, cursor.generation).generation).toBe(cursor.generation);
+            fs.closeSync(descriptor!);
+            descriptor = undefined;
+          }
+          const outcome = compactTerminalRunLog(file, "completed");
+          expect(outcome.error).toBeUndefined();
+          expect(outcome.compactionSkipped).toBeUndefined();
+          expect(outcome.compacted).toBe(160);
+          expect(outcome.afterBytes).toBeGreaterThan(256 * 1024);
+          expect(fs.statSync(file).ino).not.toBe(inode);
+          expect(() => readJsonlPage(file, 2, cursor.before, undefined, cursor.generation)).toThrowError(expect.objectContaining({ name: "cursor-stale" }));
+          if (descriptor !== undefined) expect(fs.readFileSync(descriptor, "utf8")).toBe(text);
+          const compacted = fs.readFileSync(file, "utf8");
+          const types = (value: string) => value.trimEnd().split("\n").map((line) => JSON.parse(line).type);
+          expect(types(compacted)).toEqual(types(text));
+          const after = reader.read(source, follow);
+          expect(after.messages.length).toBeGreaterThanOrEqual(before.messages.length);
+          expect(after.messages.slice(-before.messages.length)).toEqual(before.messages);
+          expect(after.hasMore).toBe(true);
+          expect(after.hasNewer).toBe(false);
+          expect(after.revision).toBeGreaterThan(before.revision);
+        } finally {
+          if (descriptor !== undefined) fs.closeSync(descriptor);
+          reader.clear();
+        }
+      });
+    });
   });
 
   it.each([false, true])("retains the only accepted result when canonical envelopes exceed the unchanged cap (isError=%s)", (isError) => {

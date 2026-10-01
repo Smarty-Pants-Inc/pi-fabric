@@ -2680,6 +2680,28 @@ return { first, second, tail: "continued" };`,
 });
 
 describe("AgentsProvider retained run authorization", () => {
+  const prepareAbsoluteSelection = (
+    logDir: string,
+    target: string,
+    archive: (directory: string) => void,
+    backend: typeof path = path,
+  ) => {
+    // POSIX can materialize the old unchecked join so rejection is not a
+    // missing-file accident. Win32 joins embed a second drive colon: never mkdir it.
+    if (backend.sep === "/") archive(backend.join(logDir, target));
+  };
+
+  it("does not mkdir an embedded drive path when preparing a Windows absolute selection", () => {
+    const logDir = "D:\\temp\\actors\\selected\\runs";
+    const target = "D:\\temp\\actors\\foreign\\runs\\33333333333333333333333333333333";
+    const mkdirGuard = vi.fn((directory: string) => {
+      // Reproduce the CI fixture failure without spoofing the host or touching disk.
+      if (directory.slice(2).includes(":")) throw new Error("ENOENT: mkdir embedded drive path");
+    });
+    prepareAbsoluteSelection(logDir, target, mkdirGuard, path.win32);
+    expect(mkdirGuard).not.toHaveBeenCalled();
+  });
+
   const fixture = async () => {
     const state = setup();
     const actor = await state.actors.create(createRequest as FabricActorRequest);
@@ -2702,6 +2724,27 @@ describe("AgentsProvider retained run authorization", () => {
     return { ...state, actor, foreign, ownId, olderId, foreignId, logDir, foreignLogDir, archive, read };
   };
 
+  const expectRejectedBeforeRunIO = async (state: Awaited<ReturnType<typeof fixture>>, runId: string) => {
+    const readLog = vi.spyOn(state.actors, "readLog");
+    const join = vi.spyOn(path, "join");
+    const readFile = vi.spyOn(fs, "readFileSync");
+    const open = vi.spyOn(fs, "openSync");
+    const realpath = vi.spyOn(fs, "realpathSync");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    try {
+      await expect(state.read(runId)).rejects.toThrow(/Invalid retained run ID/);
+      expect(readLog).toHaveBeenCalledExactlyOnceWith(state.actor.id, expect.objectContaining({ type: "run", runId }));
+      expect(join.mock.calls.some((parts) => parts.includes(runId))).toBe(false);
+      expect(readFile.mock.calls.some(([file]) => /(?:status\.json|events\.jsonl)$/.test(String(file)))).toBe(false);
+      expect(open).not.toHaveBeenCalled();
+      expect(realpath).not.toHaveBeenCalled();
+      expect(mkdir).not.toHaveBeenCalled();
+    } finally {
+      readLog.mockRestore(); join.mockRestore(); readFile.mockRestore();
+      open.mockRestore(); realpath.mockRestore(); mkdir.mockRestore();
+    }
+  };
+
   it("rejects an explicitly empty run ID instead of falling back to the last run", async () => {
     const state = await fixture();
     await expect(state.read("")).rejects.toThrow(/Invalid retained run ID/);
@@ -2716,10 +2759,33 @@ describe("AgentsProvider retained run authorization", () => {
   it("rejects an absolute caller-selected run path through the public provider", async () => {
     const state = await fixture();
     const target = path.join(state.foreignLogDir, state.foreignId);
-    // path.join does not reset on an absolute second operand: make the pre-fix
-    // selection readable too, so this is rejection, not merely a missing file.
-    state.archive(path.join(state.logDir, target), state.foreignId, state.foreign.id);
-    await expect(state.read(target)).rejects.toThrow(/Invalid retained run ID/);
+    expect(path.isAbsolute(target)).toBe(true);
+    prepareAbsoluteSelection(state.logDir, target, (directory) => state.archive(directory, state.foreignId, state.foreign.id));
+    if (path.sep === "/") {
+      // The old unchecked POSIX join really has readable foreign events.
+      expect(JSON.parse(fs.readFileSync(path.join(state.logDir, target, "status.json"), "utf8")))
+        .toMatchObject({ id: state.foreignId, actorId: state.foreign.id });
+    }
+    await expectRejectedBeforeRunIO(state, target);
+  });
+
+  it.each([
+    ["Windows drive absolute backslash", "C:\\foreign"],
+    ["Windows drive absolute slash", "C:/foreign"],
+    ["Windows drive relative", "C:relative"],
+    ["UNC", "\\\\server\\share"],
+    ["rooted backslash", "\\foreign"],
+    ["mixed separators", "C:\\foreign/../other\\run"],
+    ["colon / alternate data stream", "11111111111111111111111111111111:events"],
+    ["POSIX absolute", "/foreign/run"],
+    ["POSIX traversal", "../foreign/run"],
+    ["Windows traversal", "..\\foreign\\run"],
+    ["uppercase hexadecimal", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
+    ["wrong length", "1111111111111111111111111111111"],
+  ])("rejects %s caller run IDs before an unsafe join or filesystem read", async (_label, runId) => {
+    const state = await fixture();
+    // These values go straight to the public provider, never into fixture paths.
+    await expectRejectedBeforeRunIO(state, runId);
   });
 
   it("rejects a valid-shaped foreign actor run ID absent from the selected archive", async () => {

@@ -18,6 +18,7 @@ import { followUpDrainSupported } from "../src/host-compatibility.js";
 import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { registerCompactionHook } from "../src/compaction/hook.js";
+import { registerLazyCompactionHook } from "../src/compaction/lazy-hook.js";
 import { rootInboxSession } from "../src/topology/root-inbox.js";
 
 // smarty-dev#1495: a followUp to a Main that chains turns arrived about an hour late.
@@ -1107,10 +1108,10 @@ describe("Main benign compaction rejection and owner cancellation in a real Pi s
 describe("Main non-owner automatic decline and compaction recovery in a real Pi session", () => {
   const cases = [0, 60_000].flatMap(flushMs => (["automatic-decline", "failure-recovery"] as const).flatMap(outcome =>
     (["followUp", "steer"] as const).flatMap(delivery => [false, true].flatMap(ownerHalt =>
-      [false, true].map(reloadFirst => ({ flushMs, outcome, delivery, ownerHalt, reloadFirst }))))));
+      [false, true].flatMap(reloadFirst => [false, true].map(lazy => ({ flushMs, outcome, delivery, ownerHalt, reloadFirst, lazy })))))));
   it.each(cases)(
-    "$outcome permits exactly one peer $delivery run before and after reload unless owner halted (flushMs=$flushMs, ownerHalt=$ownerHalt, reloadFirst=$reloadFirst)",
-    async ({ flushMs, outcome, delivery, ownerHalt, reloadFirst }) => {
+    "$outcome permits exactly one peer $delivery run before and after reload unless owner halted (flushMs=$flushMs, ownerHalt=$ownerHalt, reloadFirst=$reloadFirst, lazy=$lazy)",
+    async ({ flushMs, outcome, delivery, ownerHalt, reloadFirst, lazy }) => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-compaction-r6-"));
       roots.push(root);
       const journal = path.join(root, "journal.json");
@@ -1145,7 +1146,7 @@ describe("Main non-owner automatic decline and compaction recovery in a real Pi 
             });
             // Register the actual Fabric veto BEFORE Main's handler. Pi short-circuits
             // cancel dispatch, so the drain cannot rely on seeing session_before_compact.
-            registerCompactionHook(pi, { getEngine: () => "pi", getThresholdTokens: () => outcome === "automatic-decline" ? 100_000 : undefined });
+            (lazy ? registerLazyCompactionHook : registerCompactionHook)(pi, { getEngine: () => "pi", getThresholdTokens: () => outcome === "automatic-decline" ? 100_000 : undefined });
             pi.on("session_start", (_event, ctx) => {
               const main = new MainAgentController(pi, "session:root", true, root, "root");
               main.attachFollowUpDrain(ctx, flushMs, journal);

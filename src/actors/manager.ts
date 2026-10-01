@@ -47,6 +47,7 @@ import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js
 import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore } from "./registry-store.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 
 export interface ActorMessageBindingOptions {
@@ -54,6 +55,8 @@ export interface ActorMessageBindingOptions {
   overrides?: FabricActorRunBinding;
   /** Already-resolved caller view received through the owner control plane. */
   binding?: FabricActorRunBinding;
+  /** Host-only ASK policy: Main's program ceiling ends observation, not accepted activation. */
+  detachOnMainCeiling?: boolean;
 }
 
 interface ActorQueueItem {
@@ -1083,6 +1086,14 @@ export class ActorManager {
         { ...bindingOptions, resolve, reject },
       );
       const onAbort = () => {
+        // Only the interactive Main watchdog is observation-only. Escape, ordinary deadlines,
+        // explicit stop and non-Main callers keep their existing activation cancellation.
+        // Keep the accepted item (queued or in flight), its result history and normal delivery.
+        const reason = bindingOptions.detachOnMainCeiling ? mainExecutionCeilingAbortReason(signal) : undefined;
+        if (reason) {
+          reject(reason);
+          return;
+        }
         const index = actor.queue.findIndex((queued) => queued.id === item.id);
         if (index >= 0) {
           actor.queue.splice(index, 1);
@@ -1888,6 +1899,7 @@ export class ActorManager {
       holdWhenFull?: boolean;
     } = {},
   ): ActorQueueItem {
+    if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
     const canManage = options.ownershipChecked
       ? this.#canManageCached(actor.id)
       : this.#canManage(actor.id);
@@ -2102,6 +2114,12 @@ export class ActorManager {
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
               void this.#publishPresence(actor).catch(() => undefined);
             },
+            // The controller identity is this activation's generation token. A
+            // permit may arrive after stop/remove/halt or after a newer drain.
+            () => !this.#closing && !abortController.signal.aborted &&
+              this.#runningActor(actor.id)?.abortController === abortController &&
+              actor.status !== "stopped" && this.#actors.has(actor.id) &&
+              this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id),
           );
           runId = result.id;
           // Captured before any check that can throw: a completed run is never parked and

@@ -34,6 +34,21 @@ afterEach(async () => {
 const entry = (data: unknown) => ({ type: "custom", customType: STOPPED_AGENTS_ENTRY, data });
 
 describe("task agents stopped by a reload (smarty-dev#1602)", () => {
+  it("defers consumption of a restored terminal result until delivery", async () => {
+    const consumed = vi.fn();
+    const next = manager({ onResultConsumed: consumed });
+    next.restorePreviousRuns([{
+      id: "old-run", name: "worker", task: "", status: "stopped", runner: "pi", transport: "process", cwd: process.cwd(),
+      startedAt: 1, updatedAt: 2, finishedAt: 2, turns: 1, toolCalls: 0, text: "restored result", error: HOST_STOP_REASON,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    } as AgentRunResult]);
+    let commit: (() => void) | undefined;
+    await expect(next.wait("old-run", { deferConsumption(consume) { commit = consume; } })).resolves.toMatchObject({ text: "restored result" });
+    expect(consumed).not.toHaveBeenCalled();
+    expect(commit).toBeTypeOf("function");
+    commit!();
+    expect(consumed).toHaveBeenCalledExactlyOnceWith("old-run");
+  });
   it("reports each run the close stopped, with the reason, last error and last event time", async () => {
     const onStoppedAtClose = vi.fn();
     const first = manager({ onStoppedAtClose });

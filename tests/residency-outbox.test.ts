@@ -73,15 +73,22 @@ describe("resident producer durable outbox", () => {
       expect(pending.agentCompletionId).toBe(id);
       expect(completions).not.toHaveBeenCalled();
       await wait(() => !same(originalHost), 75_000); // actual idle shutdown and process exit
+      // Inject a lock-release delay across the watchdog tick. It can observe the
+      // absent owner before this test observes process exit; an automatic ensureHost
+      // is legal while the mesh is still locked. Count recovery over the whole exit,
+      // not relative to our 25 ms polling loop's observation of it.
+      await wait(() => ensure.mock.calls.length > 0, 10_000);
+      await sleep(250);
       expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json"))).toBe(false);
       expect(fs.existsSync(path.join(f.outbox, entry))).toBe(true);
       for (const root of [f.config.actorRoot, f.config.sessionActorRoot!]) {
         const registry = path.join(root, "actors.json");
         expect(fs.existsSync(registry) ? JSON.parse(fs.readFileSync(registry, "utf8")).actors : []).toEqual([]);
       }
-      expect(ensure).not.toHaveBeenCalled();
+      expect(completions).not.toHaveBeenCalled();
+      expect(ensure).toHaveBeenCalledOnce();
       fs.rmSync(lock, { recursive: true });
-      // No explicit restart, ensureHost, or new spawn after the idle exit.
+      // Only the live watchdog starts recovery: no explicit restart or new spawn.
       try {
         await wait(() => completions.mock.calls.length > 0, 45_000);
       } catch (error) {

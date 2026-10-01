@@ -798,9 +798,9 @@ export class AgentManager {
   /** authorize is host-only activation authority; unlike a guest deadline it survives queuing.
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
-    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade);
+    const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched);
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
@@ -821,7 +821,7 @@ export class AgentManager {
     }
   }
 
-  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -1184,7 +1184,10 @@ export class AgentManager {
         this.#unregisteredTransports.delete(transport);
         this.#invalidateUiList();
         void this.#monitor(managed, timeoutMs);
-        return this.#handleInfo(managed, "running");
+        const handle = this.#handleInfo(managed, "running");
+        // A queued receipt is not a worker. Notify only after launch and registration.
+        try { onLaunched?.(handle); } catch { /* observers must not undo a launched worker */ }
+        return handle;
       } catch (error) {
         release();
         // An unconfirmed launch may have started a worker that already uses the worktree
@@ -1292,9 +1295,11 @@ export class AgentManager {
     onSpawned?: (handle: AgentHandleInfo) => void,
     authorize?: () => boolean,
     onOutputPrincipalDowngrade?: () => void,
+    onQueued?: (handle: AgentHandleInfo) => void,
   ): Promise<AgentRunResult> {
-    const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade);
-    onSpawned?.(handle);
+    const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned);
+    const queued = this.#queued.get(handle.id);
+    if (queued && !queued.terminal) onQueued?.(this.#queuedInfo(queued));
     return this.wait(handle.id);
   }
 

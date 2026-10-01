@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PI_RECOVERY_TIMEOUT_MS, PiRecoveryWatchdog } from "../src/worker/recovery-watchdog.js";
+import { ToolCallStreamGuard } from "../src/worker/tool-call-stream-guard.js";
+import { assistantStreamEvent } from "../src/worker/assistant-stream-event.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -9,7 +11,66 @@ const setup = () => {
   return { fail, watchdog: new PiRecoveryWatchdog(fail) };
 };
 
+describe("assistantStreamEvent", () => {
+  it("normalizes both envelopes without changing whitespace bytes", () => {
+    const stream = { type: "toolcall_delta", contentIndex: 0, delta: " \t\n" };
+    for (const field of ["assistantMessageEvent", "event"]) {
+      expect(assistantStreamEvent({ type: "message_update", [field]: stream })).toBe(stream);
+    }
+  });
+
+  it("prefers a valid legacy envelope and falls back to native for malformed legacy values", () => {
+    const legacy = { type: "text_delta", delta: "legacy" };
+    const native = { type: "text_delta", delta: "native" };
+    expect(assistantStreamEvent({ type: "message_update", assistantMessageEvent: legacy, event: native })).toBe(legacy);
+    for (const malformed of [undefined, null, "invalid", [], false]) {
+      expect(assistantStreamEvent({ type: "message_update", assistantMessageEvent: malformed, event: native })).toBe(native);
+      expect(assistantStreamEvent({ type: "message_update", event: malformed })).toBeUndefined();
+    }
+    expect(assistantStreamEvent({ type: "message_start", event: native })).toBeUndefined();
+  });
+});
+
 describe("PiRecoveryWatchdog", () => {
+  it.each(["assistantMessageEvent", "event"])("bounds whitespace-only tool arguments every 5s after recovery is armed (%s)", (field) => {
+    const { fail, watchdog } = setup();
+    const runaway = vi.fn();
+    const guard = new ToolCallStreamGuard(runaway, () => ({ model: "cliproxyapi/gpt-6.1-sol", effort: "high" }));
+    watchdog.arm("Error: Terminated");
+    const observe = () => {
+      const event = { type: "message_update", [field]: { type: "toolcall_delta", contentIndex: 0, delta: " \t\n" },
+        message: { role: "assistant", content: "old output" } };
+      // Same ordering and same unnormalized event as worker.ts.
+      guard.observe(event);
+      watchdog.observe(event);
+    };
+    observe();
+    for (let i = 0; i < 11; i++) {
+      vi.advanceTimersByTime(5_000);
+      observe();
+    }
+    vi.advanceTimersByTime(4_999);
+    expect(fail).not.toHaveBeenCalled();
+    expect(runaway).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(runaway).toHaveBeenCalledTimes(1);
+    expect(runaway.mock.calls[0]![0]).toMatchObject({ elapsedMs: 60_000, bytes: 36 });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["assistantMessageEvent", "event"])("does not count whitespace-only model deltas as recovery progress (%s)", (field) => {
+    for (const type of ["text_delta", "thinking_delta", "toolcall_delta"]) {
+      const { fail, watchdog } = setup();
+      watchdog.arm("Error: Terminated");
+      for (let i = 0; i < 11; i++) {
+        vi.advanceTimersByTime(5_000);
+        watchdog.observe({ type: "message_update", [field]: { type, delta: " \t\n" } });
+      }
+      vi.advanceTimersByTime(5_000);
+      expect(fail).toHaveBeenCalledTimes(1);
+    }
+  });
   it("bounds a terminated response and reports the original cause exactly once", () => {
     const { fail, watchdog } = setup();
     expect(PI_RECOVERY_TIMEOUT_MS).toBe(60_000);

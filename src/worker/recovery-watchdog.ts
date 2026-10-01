@@ -1,3 +1,5 @@
+import { assistantStreamEvent } from "./assistant-stream-event.js";
+
 export const PI_RECOVERY_TIMEOUT_MS = 60_000;
 
 /** Bounds stalled Pi error recovery, not healthy inference or tool execution. */
@@ -34,11 +36,12 @@ export class PiRecoveryWatchdog {
     const message = event.message;
     if (isRecord(message) && (message.stopReason === "error" || message.stopReason === "aborted")) return;
     if (event.type === "message_update") {
-      // Legacy Pi RPC uses assistantMessageEvent; native harness streams use event.
-      const stream = event.assistantMessageEvent ?? event.event;
-      if (isRecord(stream)) {
+      const stream = assistantStreamEvent(event);
+      if (stream) {
         if (["text_delta", "thinking_delta", "toolcall_delta"].includes(String(stream.type))) {
-          if (typeof stream.delta === "string" && stream.delta.length > 0) this.progress();
+          // Whitespace is not recovery progress. Tool argument whitespace is
+          // still counted by ToolCallStreamGuard toward its time/byte bounds.
+          if (typeof stream.delta === "string" && /\S/.test(stream.delta)) this.progress();
         } else if (["text_start", "text_end", "thinking_start", "thinking_end", "toolcall_start", "toolcall_end"].includes(String(stream.type))) {
           this.progress();
         }

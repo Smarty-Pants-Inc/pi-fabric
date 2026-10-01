@@ -119,6 +119,11 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
+const expectUnconfirmedClose = async (manager: AgentManager) => {
+  await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
+  managers.splice(managers.indexOf(manager), 1);
+};
+
 describe("AgentManager", () => {
   it("F1 tracked retention retries the full failed save before collection, without pinning session or actor runs", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-save-fault-"));
@@ -1070,7 +1075,7 @@ describe("AgentManager", () => {
       await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
       expect(fs.existsSync(runDirectory)).toBe(true);
       expect(await handles[0]!.isAlive()).toBe(true);           // the real worker still runs
-      await manager.close();
+      await expectUnconfirmedClose(manager);
       expect(fs.existsSync(runDirectory)).toBe(true);           // shutdown kept its files
     } finally {
       spy.mockRestore();
@@ -1111,13 +1116,13 @@ describe("AgentManager", () => {
       });
       managers.push(manager);
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
-      const result = path_ === "stop" ? await manager.stop(handle.id) : await manager.wait(handle.id);
-      expect(result.status).toBe(path_ === "stop" ? "stopped" : "timed_out");
+      if (path_ === "stop") await expect(manager.stop(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
+      else expect((await manager.wait(handle.id)).status).toBe("timed_out");
       const runDirectory = manager.runDirectory(handle.id)!;
       expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
         .toMatch(/Herdr server has been unreachable/);
-      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
-      await manager.close();
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(path_ === "stop" ? /running agent/ : /lost track of its worker/);
+      await expectUnconfirmedClose(manager);
       expect(fs.existsSync(runDirectory)).toBe(true);
     } finally {
       spy.mockRestore();
@@ -1204,6 +1209,7 @@ describe("AgentManager", () => {
       // review/astra on e170d9e: the worker that did not stop may still use its files.
       await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
       expect(fs.existsSync(manager.runDirectory(handle.id)!)).toBe(true);
+      await expectUnconfirmedClose(manager);
     } finally {
       spy.mockRestore();
       await first?.stop();

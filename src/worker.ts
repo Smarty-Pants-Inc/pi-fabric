@@ -14,12 +14,12 @@ import type {
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
 import { processStartTime } from "./residency/process-identity.js";
+import { executionGroup } from "./worker/execution-group.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
 // before spawning. Other transports have no channel and retain normal signals.
 let externalStopRequested = false;
 let externalStop = () => { externalStopRequested = true; };
-let ownedExecutionStarted = false;
 const custodyReady = new Promise<void>((resolve) => {
   if (!process.send) { resolve(); return; }
   process.on("message", (message: unknown) => {
@@ -235,18 +235,11 @@ const assistantError = (message: Record<string, unknown>): string => {
 const runnerLabel = (runner: string): string =>
   runner === "claude" ? "Claude" : runner === "veda" ? "Veda" : "Pi";
 
-const executionBirths = new WeakMap<ChildProcess, string | undefined>();
+const executionGroups = new WeakMap<ChildProcess, ReturnType<typeof executionGroup>>();
+let executionCleanup: () => Promise<void> = async () => {};
 const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-  if (process.platform === "linux") {
-    const birth = executionBirths.get(child);
-    if (birth === undefined || processStartTime(child.pid) !== birth) return;
-  }
-  // Native Windows ChildProcess retains the OS handle, unlike a recycled PID.
-  if (process.platform === "win32") { child.kill(signal); return; }
-  try {
-    process.kill(-child.pid, signal);
-  } catch { /* child process group already exited */ }
+  try { executionGroups.get(child)?.signal(signal); }
+  catch (error) { console.error(`Execution cleanup unresolved: ${String(error)}`); }
 };
 
 
@@ -265,16 +258,26 @@ const writeCrashStatus = (error: unknown): void => {
     // to "Agent transport exited without a result".
   }
 };
-process.on("uncaughtException", (error) => {
-  writeCrashStatus(error);
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : error}\n`);
-  process.exit(1);
-});
-process.on("unhandledRejection", (error) => {
-  writeCrashStatus(error);
-  process.stderr.write(`Unhandled rejection: ${error instanceof Error ? error.stack ?? error.message : error}\n`);
-  process.exit(1);
-});
+let crashPending = false;
+const finishCrash = async (error: unknown): Promise<void> => {
+  if (crashPending) return;
+  crashPending = true;
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  try {
+    // A crash result is not an exit receipt. Do not publish it (or exit this
+    // custodian) until every admitted execution obligation has been drained.
+    await executionCleanup();
+    await executionSettled();
+    writeCrashStatus(error);
+    process.exit(1);
+  } catch (cleanupError) {
+    console.error(`Crash cleanup unresolved; retaining execution custody: ${String(cleanupError)}`);
+    // Keep the custodian available to its parent even if no native pipes remain.
+    setInterval(() => {}, 1000);
+  }
+};
+process.on("uncaughtException", (error) => { void finishCrash(error); });
+process.on("unhandledRejection", (error) => { void finishCrash(error); });
 
 const main = async (): Promise<void> => {
   await custodyReady;
@@ -530,9 +533,32 @@ const main = async (): Promise<void> => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  ownedExecutionStarted = true;
   const executionBirth = child.pid === undefined ? undefined : processStartTime(child.pid);
-  executionBirths.set(child, executionBirth);
+  const group = executionGroup(child);
+  executionGroups.set(child, group);
+  let nativeClosed = false;
+  child.once("close", () => { nativeClosed = true; });
+  // Observe while the leader is alive, not first at cancellation after it has
+  // disappeared. This timer is also the unresolved custody keepalive.
+  const groupObserver = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, 100);
+  let draining: Promise<void> | undefined;
+  executionCleanup = () => draining ??= (async () => {
+    const exited = () => nativeClosed && group.exited();
+    const wait = async (ms: number) => {
+      const deadline = Date.now() + ms;
+      do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
+      return exited();
+    };
+    if (!exited()) {
+      group.signal("SIGTERM");
+      child.stdin?.end();
+      if (!await wait(KILL_GRACE_MS)) {
+        group.signal("SIGKILL");
+        if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
+      }
+    }
+    clearInterval(groupObserver);
+  })();
   // Transfer exact execution identity immediately; even an instant custodian
   // SIGKILL cannot turn a still-running child into permission for replacement.
   process.send?.({ type: "fabric-execution-started", pid: child.pid, started: executionBirth }, () => undefined);
@@ -1454,9 +1480,12 @@ const main = async (): Promise<void> => {
       terminalStatus = "failed";
       terminalError = error.message;
     });
-    child.once("close", (code) => { void executionSettled().then(() => resolve(code)); });
+    child.once("close", (code) => {
+      void executionCleanup().then(() => executionSettled()).then(() => resolve(code)).catch(finishCrash);
+    });
   });
 
+  if (crashPending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
@@ -1631,9 +1660,4 @@ const main = async (): Promise<void> => {
   process.exitCode = record.status === "completed" ? 0 : 1;
 };
 
-main().catch(async (error) => {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-  writeCrashStatus(error);
-  if (!ownedExecutionStarted) await executionSettled();
-  process.exit(1);
-});
+main().catch(finishCrash);

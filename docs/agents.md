@@ -146,7 +146,7 @@ Persistent actors freeze their language and Python backend when created. `ask`/`
 const result = await agents.run({
   name: "security-review",
   task: "Review the current diff for concrete security defects. Do not edit files.",
-  transport: "localterm",
+  transport: "process",
   tools: ["read", "grep", "find", "ls"],
 });
 return result;
@@ -157,7 +157,7 @@ Create background handles explicitly:
 ```ts
 const handle = await agents.spawn({
   task: "Map the persistence layer and identify its public entry points.",
-  transport: "tmux",
+  transport: "process",
 });
 
 // Continue with independent work here.
@@ -371,14 +371,37 @@ This is the host-level equivalent of the `pi-model-switch` extension's `switch_m
 
 ### Transports
 
+**Execution-custody scope cut (smarty-dev#2566 / pi-fabric#218):** agent
+admission currently supports only `process`; `auto` selects `process`.
+Explicit `tmux`, `screen`, `localterm`, and `herdr` requests fail before launch.
+Removing a session/pane does not prove its separately detached execution group
+exited. Those adapters and their historical integration details below remain in
+source, but must not be re-enabled until they retain birth-safe execution
+custody, cooperatively drain the worker, and confirm the entire group's exit.
+The follow-up belongs to [smarty-dev#2566](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/2566);
+this is a fail-closed implementation scope cut, not product-owner risk acceptance.
+
+Terminal results are not exit receipts. Public stop and manager close reject
+unconfirmed execution cleanup, retain the admission permit and run handle, and
+keep working files. Unknown process/group identity is never permission to signal
+a recycled numeric ID or to discard custody. Worker crash publication waits for
+execution drain; on Linux surviving same-birth group members remain cleanup
+anchors after the leader exits. Portable POSIX leaderless groups without such
+anchors remain unresolved rather than being signaled blindly. Ordinary Windows
+process workers keep their cooperative IPC/native-child cleanup; durable Windows
+residency remains unsupported.
+
 | Transport   | Operation                                                     | Command to attach            |
 | ----------- | ------------------------------------------------------------- | ---------------------------- |
 | `process`   | Runs a detached local worker process with the lowest overhead. This is the default transport | none |
-| `tmux`      | Creates one detached tmux session for each child              | `tmux attach-session -t …`   |
-| `screen`    | Creates one detached GNU Screen session for each child        | `screen -r …`                |
-| `localterm` | Creates one pinned LocalTerm PTY for each child               | `localterm session attach …` |
-| `herdr`     | Creates one background Herdr tab for each child               | `herdr terminal attach …`    |
-| `auto`      | Tries Herdr, LocalTerm, tmux, screen, and then process         | Depends on the transport     |
+| `tmux`      | Disabled pending execution-custody support                    | —                           |
+| `screen`    | Disabled pending execution-custody support                    | —                           |
+| `localterm` | Disabled pending execution-custody support                    | —                           |
+| `herdr`     | Disabled pending execution-custody support                    | —                           |
+| `auto`      | Selects `process` only                                        | none                        |
+
+The following session-transport integration notes describe the disabled adapters
+and their re-enablement requirements, not currently supported admission paths.
 
 Herdr uses its local socket API to create an argv-backed background tab as one atomic operation. It does not change focus or require shell quoting. Automatic selection works only when the parent Pi process already runs in Herdr. This requires `HERDR_ENV=1` with an injected workspace and socket. Select `transport: "herdr"` under the same conditions. Use the attach command in the handle to open a child directly. Herdr workers inherit the server environment, not the parent shell. Fabric forwards an explicitly set `PI_CODING_AGENT_DIR` through the pane's environment map so the child uses the selected Pi profile; an unset selector leaves Herdr's default behavior unchanged. This does not copy profile files, credentials, `PATH`, or the rest of the parent environment. Instead, the parent resolves the Pi launcher and the worker runtime to absolute paths with its own `PATH` before launch. The worker runs JavaScript entrypoints and extensionless `#!/usr/bin/env node` launchers through its absolute runtime, and passes the selected launcher to nested Fabric as `PI_FABRIC_PI_BINARY`. Other commands inside the child still use Herdr's server `PATH`.
 
@@ -772,7 +795,7 @@ return agents.setDeliveryPolicy({
 return council.run({
   task: "Review the current implementation and recommend whether it is ready to merge.",
   roles: ["correctness reviewer", "security reviewer", "test reviewer"],
-  transport: "localterm",
+  transport: "process",
   synthesize: true,
 });
 ```

@@ -279,6 +279,9 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   lastRetriedTransportFailure?: AgentRunResult;
   /** Set when a relaunch failed; the run settles with it, not the attempt it replaced. */
   relaunchFailure?: AgentRunRecord;
+  /** Terminal results do not discharge execution custody or admission permits. */
+  executionExited?: boolean;
+  executionRelease?: () => void;
   /** Set when the run failed because its transport lost contact: its worker may still run. */
   lostContact?: string;
   model?: string;
@@ -1142,6 +1145,10 @@ export class AgentManager {
           launch: { ...launch, signal: authorize ? signal : undefined },
           startupAttempts: 1,
           ...lifecycle,
+          release: () => {
+            if (managed.executionExited) release();
+            else managed.executionRelease = release;
+          },
           abortSignal: queued && !authorize ? undefined : signal,
           abortHandler: undefined,
           ...(model ? { model } : {}),
@@ -1175,7 +1182,10 @@ export class AgentManager {
         this.#queued.delete(id);
         this.#unregisteredTransports.delete(transport);
         this.#invalidateUiList();
-        void this.#monitor(managed, timeoutMs);
+        void this.#monitor(managed, timeoutMs).catch((error) => {
+          // Failed cleanup leaves result/admission pending and custody retained.
+          this.#markLost(managed, String(error));
+        });
         return this.#handleInfo(managed, "running");
       } catch (error) {
         release();
@@ -1408,7 +1418,7 @@ export class AgentManager {
     const managed = this.#runs.get(id);
     if (!managed || managed.settled || this.#closing) return;
     if (!this.#observedWork(managed)) {
-      void this.stop(id);
+      void this.stop(id).catch(() => undefined);
       return;
     }
     this.#detach(managed, "caller aborted; the run continues");
@@ -1572,17 +1582,10 @@ export class AgentManager {
     // A requested stop is terminal: record the intent before any transport work
     // so recovery never restarts a run the operator, a tool, or shutdown ended.
     managed.stopRequested = true;
+    // Even a settled/terminal run may still own a detached execution group.
+    await this.#drainExecution(managed);
     if (managed.settled) return this.wait(id);
     managed.background = false;
-    const existing = readRecord(managed.statusFile);
-    if (existing && terminalStatuses.has(existing.status)) {
-      const result = this.#withTransportMetadata(existing, managed) as AgentRunResult;
-      this.#settle(managed, result);
-      return result;
-    }
-    await managed.transport.stop();
-    await this.#waitForTransportExit(managed);
-    await this.#noteUnconfirmedExit(managed);
     const terminal = readRecord(managed.statusFile);
     const record =
       terminal && terminalStatuses.has(terminal.status)
@@ -1616,6 +1619,7 @@ export class AgentManager {
         `which may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
       );
     }
+    await this.#drainExecution(managed);
     if (!this.#canCollect(managed)) {
       throw new Error(`Cannot clean up agent ${id}: ${managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
     }
@@ -1724,15 +1728,20 @@ export class AgentManager {
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
     await this.#retentionSweep?.catch(() => undefined);
-    const running = [...this.#runs.values()].filter((managed) => !managed.settled);
+    const tracked = [...this.#runs.values()];
+    const running = tracked.filter((managed) => !managed.settled);
     const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
     const stopped = await Promise.allSettled([
-      ...running.map((managed) => this.stop(managed.id)),
+      ...tracked.map((managed) => this.stop(managed.id)),
+      ...[...this.#unregisteredTransports].map(async (transport) => {
+        if (!await this.#stopUnregisteredTransport(transport)) throw new Error("Unregistered execution exit unconfirmed");
+      }),
       ...queuedAtClose.map((queued) => this.stop(queued.info.id)),
     ]);
     // A reload or shutdown ends these runs; tell the spawner's session (smarty-dev#1602).
     const results = stopped.flatMap((outcome) =>
-      outcome.status === "fulfilled" ? [hostStoppedResult(outcome.value, lastEventAt.get(outcome.value.id))] : []);
+      outcome.status === "fulfilled" && outcome.value && lastEventAt.has(outcome.value.id)
+        ? [hostStoppedResult(outcome.value, lastEventAt.get(outcome.value.id))] : []);
     if (results.length > 0) {
       try { this.#onStoppedAtClose?.(results); } catch { /* must not block close */ }
     }
@@ -1774,6 +1783,9 @@ export class AgentManager {
     }
     if (this.#budgetOwned) clearOwnedBudgetEnv();
     if (this.#managedTempRoot) await this.#startTempRunSweep();
+    if (alive.some(Boolean) || all.some((managed) => !managed.executionExited)) {
+      throw new Error("Agent manager close incomplete: execution exit unconfirmed; custody and files retained");
+    }
   }
 
   /**
@@ -1821,7 +1833,7 @@ export class AgentManager {
       await this.#startTempRunSweep();
     }
     const expired = [...this.#runs.values()].filter((managed) => {
-      if (!managed.settled || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
+      if (!managed.settled || !managed.executionExited || managed.actorId || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       const finishedAt = record?.finishedAt ?? record?.updatedAt;
       return typeof finishedAt === "number" && now - finishedAt >= this.#retention.oneShotRunMs;
@@ -1871,8 +1883,28 @@ export class AgentManager {
     if (managed.lostContact) return;
     const lost = managed.transport.lostContact?.();
     const alive = lost === undefined && await managed.transport.isAlive().catch(() => true);
-    if (lost === undefined && !alive) return;
+    if (lost === undefined && !alive) {
+      managed.executionExited = true;
+      managed.executionRelease?.();
+      delete managed.executionRelease;
+      return;
+    }
     this.#markLost(managed, lost ?? "the worker did not confirm its exit after it was stopped");
+  }
+
+  async #drainExecution(managed: ManagedAgent): Promise<void> {
+    if (managed.executionExited) return;
+    try {
+      if (await managed.transport.isAlive() || managed.transport.lostContact?.() !== undefined) {
+        await managed.transport.stop();
+        await this.#waitForTransportExit(managed);
+      }
+      await this.#noteUnconfirmedExit(managed);
+      if (!managed.executionExited) throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained${managed.lostContact ? `: ${managed.lostContact}` : ""}`);
+    } catch (error) {
+      this.#markLost(managed, String(error));
+      throw error;
+    }
   }
 
   #markLost(managed: ManagedAgent, reason: string): void {
@@ -2043,6 +2075,7 @@ export class AgentManager {
       this.#drainLifecycle(managed);
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+      managed.executionExited = false;
       managed.transport = await this.#launchTransport(managed.adapter, managed.launch);
       this.#unregisteredTransports.delete(managed.transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
@@ -2127,6 +2160,7 @@ export class AgentManager {
         if (await this.#resumeStopped(managed, record, deadline)) continue;
         // A relaunch that failed is terminal: no fallback launch may run after it.
         if (!managed.relaunchFailure && await this.#retryStartup(managed, record, deadline)) continue;
+        await this.#drainExecution(managed);
         this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;
       }
@@ -2202,6 +2236,7 @@ export class AgentManager {
               managed.lastRetriedTransportFailure = failed;
               continue;
             }
+            await this.#noteUnconfirmedExit(managed);
             const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
             writeRecord(managed.statusFile, settled);
             this.#settle(managed, settled);
@@ -2217,12 +2252,15 @@ export class AgentManager {
 
   #settle(managed: ManagedAgent, result: AgentRunResult): void {
     if (managed.settled) return;
+    // An actor result resumes its same-session activation drain. Holding only
+    // a parent concurrency permit would not fence that writer when capacity >1.
+    if (managed.actorId && !managed.executionExited) return;
     this.#drainLifecycle(managed);
     if (!beginAgentSettlement(managed)) return;
     // Images are transport inputs, not retained run artifacts. Startup retries
     // have finished by settlement, so remove the owner-only handoff file for
     // every terminal outcome even when retainRuns keeps the rest of the run.
-    fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
+    if (managed.executionExited) fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
     this.#emitLifecycle(managed, `run.${result.status}`, result.finishedAt ?? Date.now(), {
       status: result.status,
     });
@@ -2266,6 +2304,7 @@ export class AgentManager {
   }
 
   #canCollect(managed: ManagedAgent): boolean {
+    if (!managed.executionExited || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
     if (managed.settlementSaveFailure &&
         !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;
@@ -2446,6 +2485,13 @@ export class AgentManager {
   }
 
   async #resolveTransport(requested: FabricAgentTransport): Promise<AgentTransportAdapter> {
+    // Session removal is not an execution-exit receipt for the separately
+    // detached group. Until those adapters retain birth-safe outer custody,
+    // fail closed rather than reintroducing a forced-session cleanup bypass.
+    // Follow-up: smarty-dev#2566 (execution custody for session transports).
+    if (requested !== "auto" && requested !== "process") {
+      throw new Error(`Fabric agent transport ${requested} is disabled: detached execution custody is not confirmed; use process`);
+    }
     if (requested !== "auto") {
       const adapter = this.#transports.get(requested);
       if (!adapter || !(await adapter.available())) {
@@ -2453,7 +2499,7 @@ export class AgentManager {
       }
       return adapter;
     }
-    for (const kind of ["herdr", "localterm", "tmux", "screen", "process"] as const) {
+    for (const kind of ["process"] as const) {
       const adapter = this.#transports.get(kind);
       if (adapter && (await adapter.available())) return adapter;
     }
@@ -2464,7 +2510,8 @@ export class AgentManager {
     const settled = [...this.#runs.values()].filter((managed) => managed.settled);
     const evicted = settled.slice(0, -MAX_RETAINED_RUN_HANDLES);
     for (const managed of evicted) {
-      if (!managed.settlementSaveFailure) this.#runs.delete(managed.id);
+      if (managed.executionExited && !managed.lostContact && !hasUnresolvedWorker(managed.runDirectory) &&
+          !managed.settlementSaveFailure) this.#runs.delete(managed.id);
     }
     const retained = evicted.length > 0 ? settled.slice(evicted.length) : settled;
     if (retained.length <= MAX_RETAINED_UI_RUNS) return;

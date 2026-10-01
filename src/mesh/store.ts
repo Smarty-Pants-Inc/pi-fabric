@@ -3,7 +3,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, writeFileAtomic } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, type MeshArchiveEntry } from "./archive.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
@@ -1479,7 +1479,7 @@ export class MeshStore {
     const deadline = Date.now() + this.#lockTimeoutMs;
     const token = randomUUID();
     const ownerPath = path.join(this.#lockPath, "owner");
-    const startTime = this.#lockProtocol === 2 ? processIncarnation(process.pid) : undefined;
+    const startTime = this.#lockProtocol === 2 ? await ownProcessIncarnation() : undefined;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     // Attempts and the largest gap between two of them: a large gap means this waiter stalled
     // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -1528,7 +1528,7 @@ export class MeshStore {
         const code = errorCode(error);
         if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
           (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-        if (this.#clearStaleLock(ownerPath)) continue;
+        if (await this.#clearStaleLock(ownerPath)) continue;
         if (Date.now() >= deadline) {
           throw Object.assign(new Error(
             `Timed out waiting for the Fabric mesh lock${describeLockHolder(ownerPath)} ` +
@@ -1574,7 +1574,7 @@ export class MeshStore {
   // Dead holders are recoverable at once; only missing/corrupt records need the stale
   // directory window. A live PID (including stopped/permission-denied) remains protected,
   // unless the native platform proves a different incarnation from the optional fourth owner line.
-  #clearStaleLock(ownerPath: string): boolean {
+  async #clearStaleLock(ownerPath: string): Promise<boolean> {
     try {
       const stat = fs.lstatSync(this.#lockPath);
       if (!stat.isDirectory()) return false;
@@ -1592,7 +1592,7 @@ export class MeshStore {
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (validPid && processAlive(pid)) {
         if (!validOwner || !validProcessIncarnation(recordedStart)) return false;
-        const actualStart = processIncarnation(pid);
+        const actualStart = await processIncarnation(pid);
         if (!actualStart || actualStart === recordedStart) return false;
       } else if (!validOwner && Date.now() - stat.mtimeMs <= this.#staleLockMs) {
         return false;

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 
 // Participant records outside the shared state (smarty-dev#2004). Each record lived in the one
@@ -50,6 +50,7 @@ export const writeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
   decide: (current: MeshStateEntry | undefined) => MeshStateEntry | undefined,
+  options: { durable?: boolean } = {},
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) throw new Error(`Not a participant key: ${key}`);
@@ -57,7 +58,10 @@ export const writeParticipantFileIf = async (
     const entry = decide(readFresh(file));
     if (!entry) return false;
     if (entry.key !== key) throw new Error(`Participant entry key mismatch: ${entry.key}`);
-    writeJsonAtomic(file, { format: 1, ...entry });
+    writeJsonAtomic(file, { format: 1, ...entry }, options);
+    if (options.durable && JSON.stringify(readFresh(file)) !== JSON.stringify(entry)) {
+      throw new Error(`Participant migration verification failed: ${key}`);
+    }
     rescan(path.dirname(file));
     return true;
   });
@@ -107,7 +111,7 @@ const readFresh = (file: string): MeshStateEntry | undefined => {
 
 const LOCK_WAIT_MS = 5_000;
 
-const holderAlive = (owner: string): boolean => {
+const holderAlive = async (owner: string): Promise<boolean> => {
   const [pidText, startTime, token] = owner.split("\n");
   const pid = Number(pidText);
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
@@ -118,7 +122,7 @@ const holderAlive = (owner: string): boolean => {
   }
   // Read once: an unreadable or foreign/torn identity proves nothing about PID reuse.
   if (!owner.endsWith("\n") || !token || !validProcessIncarnation(startTime)) return true;
-  const actual = processIncarnation(pid);
+  const actual = await processIncarnation(pid);
   return actual === undefined || actual === startTime;
 };
 
@@ -132,7 +136,7 @@ const withKeyLock = async <T>(mesh: ParticipantFileMesh, file: string, operation
   const locks = path.join(mesh.root, DIR, ".locks");
   const lock = path.join(locks, path.basename(file, ".json"));
   fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
-  const token = `${process.pid}\n${processIncarnation(process.pid) ?? ""}\n${randomUUID()}\n`;
+  const token = `${process.pid}\n${await ownProcessIncarnation() ?? ""}\n${randomUUID()}\n`;
   const deadline = Date.now() + LOCK_WAIT_MS;
   for (;;) {
     const staging = `${lock}.${process.pid}.${randomUUID()}.tmp`;
@@ -173,7 +177,7 @@ const readOwner = (lock: string): string | undefined => {
 
 const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string): Promise<void> => {
   const seen = readOwner(lock);
-  if (seen === undefined || holderAlive(seen)) return;
+  if (seen === undefined || await holderAlive(seen)) return;
   await mesh.exclusive(() => {
     // Compare, then delete by a rename to a unique name and a second compare: a lock that is not
     // the one judged dead goes back (it cannot be, while recoveries share the mesh lock).

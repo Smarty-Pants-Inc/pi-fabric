@@ -62,7 +62,11 @@ const mockNativePlatform = (platform: "darwin" | "win32", start: string) => {
     if (String(file).startsWith("/proc/")) throw Object.assign(new Error("no procfs"), { code: "ENOENT" });
     return (read as (...args: unknown[]) => unknown)(file, ...args);
   }) as typeof fs.readFileSync);
-  return vi.spyOn(childProcess, "execFileSync").mockReturnValue(start + "\n");
+  return vi.spyOn(childProcess, "execFile").mockImplementation(((...args: unknown[]) => {
+    const done = args[args.length - 1] as (error: Error | null, stdout: string, stderr: string) => void;
+    done(null, start + "\n", "");
+    return {} as childProcess.ChildProcess;
+  }) as typeof childProcess.execFile);
 };
 const setPolicy = (root: string) => new MeshStore(root, 64 * 1024, 1_000).put({
   key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files", participants: "files" }, identity: identityOf("owner"),
@@ -123,6 +127,48 @@ describe("participant files", () => {
     }
   });
 
+  it.each([false, true])("renewal does not await a slow Windows holder probe and unknown stays occupied (files-only=%s)", async (filesOnly) => {
+    vi.useFakeTimers({ now: Date.now() });
+    const root = meshRoot();
+    if (filesOnly) await setPolicy(root);
+    let status: "idle" | "running" = "idle";
+    const alpha = directory(root, "alpha", () => [record("alpha", { status }), record("healthy", { status })]);
+    let pending: Promise<void> | undefined;
+    const lock = path.join(root, "participants", ".locks", keyOf("session:alpha").slice(PREFIX.length));
+    try {
+      await alpha.start();
+      mockNativePlatform("win32", "639264528000000000");
+      const runner = vi.fn<atomic.IncarnationCommandRunner>(() => new Promise(() => {}));
+      const native = atomic.createProcessIncarnationReader({ platform: "win32", systemRoot: "C:\\Windows", run: runner });
+      vi.spyOn(atomic, "processIncarnation").mockImplementation(native.read);
+      vi.spyOn(atomic, "ownProcessIncarnation").mockResolvedValue("win32:639264528000000000");
+      fs.mkdirSync(lock, { recursive: true });
+      const owner = `${process.pid}\nwin32:639264528000000000\nlive-native-holder\n`;
+      fs.writeFileSync(path.join(lock, "owner"), owner);
+      if (filesOnly) status = "running";
+      else fs.rmSync(path.join(root, "participants", `${keyOf("session:alpha").slice(PREFIX.length)}.json`));
+      const leaseBefore = readHostLease(root, "session:alpha")!;
+      pending = alpha.refresh();
+      await vi.advanceTimersByTimeAsync(3_000); // longer than the lease and one native timeout
+      expect(readHostLease(root, "session:alpha")!.updatedAt).toBeGreaterThan(leaseBefore.updatedAt);
+      expect(readHostLease(root, "session:alpha")!.expiresAt).toBeGreaterThan(Date.now());
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+      expect(runner).toHaveBeenCalled();
+      expect(runner.mock.calls[0]![2].signal.aborted).toBe(true); // timed-out evidence stays unknown
+      await vi.advanceTimersByTimeAsync(4_000);
+      await pending;
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+      expect(readParticipantFiles(root).find(entry => entry.key === keyOf("session:healthy"))).toBeDefined();
+      expect(readHostLease(root, "session:alpha")!.expiresAt).toBeGreaterThan(Date.now());
+    } finally {
+      fs.rmSync(lock, { recursive: true, force: true });
+      await vi.advanceTimersByTimeAsync(3_000);
+      await pending;
+      await alpha.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("renews during a contended initial publish, before start has returned", async () => {
     vi.useFakeTimers({ now: Date.now() });
     const root = meshRoot();
@@ -165,6 +211,134 @@ describe("participant files", () => {
     expect(readParticipantFiles(root, { maxAgeMs: 0 }).map((entry) => entry.key)).not.toContain(keyOf("session:old"));
     expect(readParticipantFiles(root, { maxAgeMs: 0 }).find((entry) => entry.key === keyOf("session:alpha")))
       .toMatchObject({ value: { status: "running" } });
+  });
+
+  it.each(["write", "barrier", "verification", "refused"] as const)("keeps the last state ownership record after a failed migration (%s), then durably retries", async (failure) => {
+    const root = meshRoot();
+    const alpha = directory(root, "alpha", () => [record("alpha"), record("healthy")]);
+    await alpha.refresh();
+    const key = keyOf("session:alpha");
+    const before = stateParticipants(root).find((entry) => entry.key === key)!;
+    const file = path.join(root, "participants", `${key.slice(PREFIX.length)}.json`);
+    fs.rmSync(file);
+    await setPolicy(root);
+    const write = participantFiles.writeParticipantFileIf;
+    let fail = true;
+    vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementation(async (mesh, writtenKey, decide, options) => {
+      if (writtenKey !== key || !fail) return write(mesh, writtenKey, decide, options);
+      fail = false;
+      if (failure === "write") throw new Error("migration I/O failed");
+      if (failure === "refused") return false;
+      if (failure === "barrier") {
+        const barrier = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => { throw new Error("migration barrier failed"); });
+        try { return await write(mesh, writtenKey, decide, options); }
+        finally { barrier.mockRestore(); }
+      }
+      const read = fs.readFileSync.bind(fs);
+      const torn = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+        if (String(target) === file && fs.existsSync(file)) return "{}";
+        return (read as (...args: unknown[]) => unknown)(target, ...args);
+      }) as typeof fs.readFileSync);
+      try { return await write(mesh, writtenKey, decide, options); }
+      finally { torn.mockRestore(); }
+    });
+    await alpha.refresh();
+    expect(stateParticipants(root).find((entry) => entry.key === key)).toEqual(before);
+    expect(stateParticipants(root).find((entry) => entry.key === keyOf("session:healthy"))).toBeUndefined();
+    expect(readParticipantFiles(root).find((entry) => entry.key === keyOf("session:healthy"))).toBeDefined();
+    const beta = directory(root, "beta", () => [record("beta"), record("alpha")]);
+    await beta.refresh();
+    expect(stateParticipants(root).find((entry) => entry.key === key)).toEqual(before);
+    expect(beta.get("session:alpha", Date.now(), { fresh: true })).toMatchObject({ ownerHostId: "session:alpha", stale: false });
+    const barriers = vi.spyOn(fs, "fsyncSync");
+    const batch = alpha.mesh.writeBatch.bind(alpha.mesh);
+    let verifiedBeforeDeletion = false;
+    vi.spyOn(alpha.mesh, "writeBatch").mockImplementation(async (request) => {
+      if (request.ops.some((op) => op.kind === "delete" && op.key === key)) {
+        expect(barriers).toHaveBeenCalled();
+        expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ key, value: { ownerHostId: "session:alpha" } });
+        verifiedBeforeDeletion = true;
+      }
+      return batch(request);
+    });
+    await alpha.refresh();
+    expect(verifiedBeforeDeletion).toBe(true);
+    expect(stateParticipants(root).find((entry) => entry.key === key)).toBeUndefined();
+    expect(readParticipantFiles(root).find((entry) => entry.key === key)).toMatchObject({ value: { ownerHostId: "session:alpha" } });
+  });
+
+  it.each([false, true])("a slow injected Windows probe cannot lapse a live owner observed from another process (files-only=%s)", async (filesOnly) => {
+    const root = meshRoot();
+    if (filesOnly) await setPolicy(root);
+    let commands = 0;
+    const native = atomic.createProcessIncarnationReader({
+      platform: "win32", systemRoot: "C:\\Windows",
+      run: async () => { commands++; await new Promise((resolve) => setTimeout(resolve, 900)); return "639264528000000000\r\n"; },
+    });
+    const sync = vi.spyOn(childProcess, "execFileSync");
+    let status: "idle" | "running" = "idle";
+    const identity: MeshIdentity = { ...identityOf("alpha"), kind: "agent" };
+    const alpha = new ParticipantDirectory(new MeshStore(root, 64 * 1024, 1_000), {
+      enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 300, reapDeadHosts: false,
+    });
+    alpha.registerSource(() => Array.from({ length: 12 }, (_, index) => record(index === 0 ? "alpha" : `key-${index}`, { kind: "agent", rootId: identity.id, status })));
+    directories.push(alpha);
+    // Establish the authoritative host before observing the slow update. The first
+    // files-only publish may briefly precede its first shared host record; that is
+    // not lease expiry (the fresh file lease already prevents ownership takeover).
+    await alpha.start();
+    const ready = path.join(root, "observer.ready");
+    const stop = path.join(root, "observer.stop");
+    fs.mkdirSync(root, { recursive: true });
+    const code = `
+      import { createJiti } from "jiti";
+      import { pathToFileURL } from "node:url";
+      import fs from "node:fs";
+      const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+      const { MeshStore } = await jiti.import("./src/mesh/store.ts");
+      const { ParticipantDirectory } = await jiti.import("./src/topology/participant-directory.ts");
+      const { readHostLease } = await jiti.import("./src/topology/host-leases.ts");
+      const [root, ready, stop] = process.argv.slice(1);
+      const identity = { id: "observer", kind: "agent", name: "observer" };
+      const observer = new ParticipantDirectory(new MeshStore(root, 65536, 1000), {
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false,
+      });
+      let samples = 0, lapses = 0, seen = 0;
+      fs.writeFileSync(ready, "");
+      const deadline = Date.now() + 10000;
+      while (!fs.existsSync(stop) && Date.now() < deadline) {
+        const lease = readHostLease(root, "session:alpha");
+        if (lease) { samples++; if (lease.expiresAt < Date.now()) lapses++; }
+        const participant = observer.list({ fresh: true, includeStale: true }).find(p => p.id === "session:alpha");
+        if (participant) { seen++; if (participant.stale || participant.ownerHostId !== "session:alpha") lapses++; }
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      console.log(JSON.stringify({ samples, lapses, seen, stopped: fs.existsSync(stop) }));`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", code, root, ready, stop], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const closed = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    // Avoid an unhandled rejection on early startup failure; still check it below.
+    closed.catch(() => undefined);
+    try {
+      await vi.waitFor(() => expect(fs.existsSync(ready)).toBe(true), { timeout: 10_000, interval: 20 });
+      vi.spyOn(atomic, "ownProcessIncarnation").mockImplementation(native.own);
+      status = "running";
+      await alpha.refresh();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(commands).toBe(1); // not one PowerShell per key or heartbeat
+      expect(sync).not.toHaveBeenCalled();
+      expect(readHostLease(root, "session:alpha")!.expiresAt).toBeGreaterThan(Date.now());
+      expect(readParticipantFiles(root)).toHaveLength(12);
+    } finally {
+      fs.writeFileSync(stop, "");
+      expect(await closed, stderr).toBe(0); // join close before removing the owned root
+    }
+    const result = JSON.parse(stdout.trim());
+    expect(result).toMatchObject({ lapses: 0, stopped: true });
+    expect(result.samples).toBeGreaterThan(20); // observed while the probe exceeded the lease
+    expect(result.seen).toBeGreaterThan(0);
   });
 
   it("before the fleet owner's switch, write each committed record to the shared state and its file", async () => {
@@ -548,11 +722,11 @@ describe("participant files", () => {
       ].sort());
     });
 
-    it.skipIf(!["linux", "darwin", "win32"].includes(process.platform))("native participant publication records incarnation and recovers a proven reused PID", async () => {
+    it.skipIf(!["linux", "darwin", "win32"].includes(process.platform) || (process.platform === "linux" && !fs.existsSync(`/proc/${process.pid}/stat`)))("native participant publication records incarnation and recovers a proven reused PID", async () => {
       const root = meshRoot();
       const mesh = new MeshStore(root, 64 * 1024, 1_000);
       const key = keyOf("session:a");
-      const start = processIncarnation(process.pid);
+      const start = await processIncarnation(process.pid);
       expect(start).toBeDefined();
       await participantFiles.writeParticipantFileIf(mesh, key, () => {
         expect(fs.readFileSync(path.join(lockOf(root, "session:a"), "owner"), "utf8").split("\n")[1]).toBe(start);
@@ -567,12 +741,12 @@ describe("participant files", () => {
       }))).resolves.toBe(true);
     });
 
-    it.skipIf(process.platform !== "linux")("keeps unreadable, torn and permission-denied live Linux key holders", async () => {
+    it.skipIf(process.platform !== "linux" || !fs.existsSync(`/proc/${process.pid}/stat`))("keeps unreadable, torn and permission-denied live Linux key holders", async () => {
       vi.useFakeTimers({ now: Date.now() });
       const root = meshRoot();
       const mesh = new MeshStore(root, 64 * 1024, 1_000);
       const lock = holdLock(root, "session:a", process.pid);
-      const start = processIncarnation(process.pid)!;
+      const start = (await processIncarnation(process.pid))!;
       const read = fs.readFileSync.bind(fs);
       try {
         for (const scenario of ["unreadable", "torn", "permission"] as const) {
@@ -614,7 +788,7 @@ describe("participant files", () => {
       try {
         await vi.advanceTimersByTimeAsync(5_000);
         expect(await pending).toBe(true);
-        expect(childProcess.execFileSync).toHaveBeenCalled();
+        expect(childProcess.execFile).toHaveBeenCalled();
       } finally { vi.useRealTimers(); }
     });
 

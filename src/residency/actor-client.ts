@@ -7,6 +7,9 @@ import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import {
   abandonResidentRequest,
   ResidentActorAuthorizationError,
+  ResidentCommandUnsupportedError,
+  assertResidentCommandSupported,
+  type ResidentHostOwner,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
   RESIDENT_HOST_FORMAT,
@@ -124,6 +127,9 @@ export class ResidentActorClient {
 
   async #send(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
     if (!this.isLive()) throw new Error("Root resident host is not live");
+    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+    if (!owner) throw new Error("Root resident host is not live");
+    assertResidentCommandSupported(owner, command.operation);
     fs.mkdirSync(this.#requestsPath, { recursive: true });
     writeJsonAtomic(path.join(this.#requestsPath, `${command.requestId}.json`), command);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
@@ -136,6 +142,7 @@ export class ResidentActorClient {
           fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
+            if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
             throw new Error(response.error ?? "Resident host rejected actor request");
           }
           return response;

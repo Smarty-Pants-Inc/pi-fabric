@@ -27,6 +27,9 @@ import { actorParticipantRecord, agentParticipantRecords } from "../topology/rec
 import {
   RESIDENT_HOST_FORMAT,
   ResidentActorAuthorizationError,
+  ResidentCommandUnsupportedError,
+  RESIDENT_COMMANDS,
+  isResidentCommandOperation,
   assertResidentActorMain,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
@@ -455,6 +458,7 @@ export class ResidentHost {
         token: this.#token,
         startedAt: now,
         readyAt: now,
+        commands: RESIDENT_COMMANDS,
       };
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
@@ -737,6 +741,10 @@ export class ResidentHost {
       ) {
         throw new Error("Invalid Fabric residency request");
       }
+      // Validate the runtime JSON discriminant before any actor lookup/mutation.
+      if (!isResidentCommandOperation(command.operation)) {
+        throw new ResidentCommandUnsupportedError(`Unsupported Fabric residency command: ${String(command.operation)}`);
+      }
       if (command.operation === "spawn") {
         if (
           command.request.sessionSeed ||
@@ -871,7 +879,8 @@ export class ResidentHost {
         requestId,
         ok: false,
         error: errorMessage(error),
-        ...(error instanceof ResidentActorAuthorizationError ? { errorCode: error.code } : {}),
+        ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError
+          ? { errorCode: error.code } : {}),
         completedAt: Date.now(),
       };
     }

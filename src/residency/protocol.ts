@@ -168,6 +168,8 @@ export interface ResidentHostOwner {
   token: string;
   startedAt: number;
   readyAt: number;
+  /** Commands supported by this running binary; absent on pre-negotiation hosts. */
+  commands?: readonly string[];
 }
 
 interface ResidentSpawnCommand {
@@ -281,6 +283,33 @@ export type ResidentCommand =
   | ResidentActorMutationCommand
   | ResidentActorStatusCommand;
 
+// The only operations every format-1 host predating command negotiation understood.
+const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
+export const RESIDENT_COMMANDS = [
+  ...LEGACY_RESIDENT_COMMANDS, "actors", "actorStatus", "setInstructions", "setModel",
+  "setThinking", "setTools", "setActivationFilter",
+] as const satisfies readonly ResidentCommand["operation"][];
+
+export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
+  typeof operation === "string" && (RESIDENT_COMMANDS as readonly string[]).includes(operation);
+
+export class ResidentCommandUnsupportedError extends Error {
+  readonly code = "RESIDENT_COMMAND_UNSUPPORTED" as const;
+  constructor(message = "The owning resident host runs an older release; it is relaunched on the current release at its next idle point; retry then") {
+    super(message);
+    this.name = "ResidentCommandUnsupportedError";
+  }
+}
+
+/** Check the running owner's publication, never the caller's release/config. */
+export const assertResidentCommandSupported = (owner: ResidentHostOwner, operation: ResidentCommand["operation"]): void => {
+  const supported = owner.commands === undefined ? LEGACY_RESIDENT_COMMANDS : owner.commands;
+  if (!isResidentCommandOperation(operation) || !Array.isArray(supported) ||
+      !(supported as readonly string[]).includes(operation)) {
+    throw new ResidentCommandUnsupportedError();
+  }
+};
+
 export interface ResidentCommandResponse {
   format: typeof RESIDENT_HOST_FORMAT;
   requestId: string;
@@ -292,7 +321,7 @@ export interface ResidentCommandResponse {
   pending?: string;
   cleaned?: boolean;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN";
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED";
   completedAt: number;
 }
 

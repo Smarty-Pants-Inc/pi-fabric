@@ -21,6 +21,8 @@ import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
   ResidentActorAuthorizationError,
+  ResidentCommandUnsupportedError,
+  assertResidentCommandSupported,
   assertResidentActorMain,
   assertResidentActorToolCeiling,
   type ResidentActorCaller,
@@ -533,6 +535,9 @@ export class ResidencyClient {
   }
 
   async #command(command: ResidentCommand, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    const owner = this.#liveOwner();
+    if (!owner) throw new Error("Root resident host is not live");
+    assertResidentCommandSupported(owner, command.operation);
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
     atomicWrite(path.join(this.#requestsPath, `${command.requestId}.json`), command);
     const deadline = Date.now() + COMMAND_TIMEOUT_MS;
@@ -544,6 +549,7 @@ export class ResidencyClient {
           fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
+            if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
             throw new Error(response.error ?? "Fabric resident host rejected request");
           }
           return response;

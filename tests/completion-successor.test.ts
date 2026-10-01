@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
+import * as atomicWrite from "../src/core/atomic-write.js";
 import { CompletionJournal, completionConsumed, completionSuccessor, consumeCompletion, pendingCompletions, saveCompletion, saveWorkerCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import type { AgentRunResult, AgentHandleInfo } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -147,6 +148,92 @@ const postRenameFault = (target: string) => {
   });
   return state;
 };
+
+describe("round 5 Windows completion file confirmation", () => {
+  it("F6: reopens existing envelopes and receipts with writable Windows handles without changing their bytes or inode", () => {
+    const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result);
+    const dir = path.join(h.meshRoot, "agent-completions");
+    const envelope = path.join(dir, fs.readdirSync(dir).find(file => file.endsWith(".json"))!);
+    const receipt = path.join(dir, "receipts", path.basename(envelope));
+    const originalEnvelope = fs.readFileSync(envelope, "utf8");
+    const inode = fs.statSync(envelope);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const open = fs.openSync; const sync = fs.fsyncSync;
+    const flags = new Map<number, string | number>();
+    const namespace = vi.spyOn(atomicWrite, "syncPathNamespace");
+    const opened = vi.spyOn(fs, "openSync").mockImplementation((file, mode, permissions) => {
+      const fd = open(file, mode, permissions); flags.set(fd, mode); return fd;
+    });
+    let fileSyncs = 0;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      // Model Windows FlushFileBuffers, not a directory barrier failure.
+      if (fs.fstatSync(fd).isFile()) {
+        fileSyncs++;
+        if (flags.get(fd) === "r" || flags.get(fd) === fs.constants.O_RDONLY) {
+          throw Object.assign(new Error("Windows file fsync requires a writable handle"), { code: "EPERM" });
+        }
+      }
+      sync(fd);
+    });
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      saveCompletion(h.meshRoot, h.recipient, h.result); // Existing-envelope retry.
+      expect(opened.mock.calls.filter(([file]) => file === envelope).map(([, mode]) => mode)).toEqual(["r+"]);
+      expect(fs.readFileSync(envelope, "utf8")).toBe(originalEnvelope);
+      expect(fs.statSync(envelope)).toMatchObject({ dev: inode.dev, ino: inode.ino });
+      consumeCompletion(h.meshRoot, h.result.id, "B");
+      const originalReceipt = fs.readFileSync(receipt, "utf8");
+      const receiptInode = fs.statSync(receipt);
+      expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
+      consumeCompletion(h.meshRoot, h.result.id, "C"); // Must reconfirm, not replace B's receipt.
+      expect(pendingCompletions(h.meshRoot, h.root)).toEqual([]);
+      const receiptOpens = opened.mock.calls.filter(([file]) => file === receipt);
+      expect(receiptOpens.length).toBeGreaterThan(0);
+      expect(receiptOpens.every(([, mode]) => mode === "r+")).toBe(true);
+      expect(fs.readFileSync(receipt, "utf8")).toBe(originalReceipt);
+      expect(JSON.parse(originalReceipt)).toMatchObject({ sessionId: "B" });
+      expect(fs.statSync(receipt)).toMatchObject({ dev: receiptInode.dev, ino: receiptInode.ino });
+      expect(namespace.mock.calls.some(([file, stat]) => file === envelope && stat?.dev === inode.dev && stat?.ino === inode.ino)).toBe(true);
+      expect(namespace.mock.calls.some(([file, stat]) => file === receipt && stat?.dev === receiptInode.dev && stat?.ino === receiptInode.ino)).toBe(true);
+      expect(fileSyncs).toBeGreaterThanOrEqual(5);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
+  it.each(["win32", "linux", "darwin"])("F6: %s file-fsync EPERM retains the receipt, envelope and successor claim until confirmation succeeds", async platformName => {
+    const h = harness(); h.setLive([h.participant("B", 200)]);
+    const journal = new CompletionJournal(h.meshRoot, { ...h.recipient, rootId: "session:B", sessionId: "B", startedAt: 200 }, h.participants, h.mesh, vi.fn());
+    journal.save(h.result); await journal.drain(false);
+    const [claim] = h.mesh.listAll("residency/completion-claims/"); expect(claim).toBeDefined();
+    consumeCompletion(h.meshRoot, h.result.id, "B"); // Visible receipt with a crash-left claim.
+    const dir = path.join(h.meshRoot, "agent-completions");
+    const envelope = path.join(dir, fs.readdirSync(dir).find(file => file.endsWith(".json"))!);
+    const receipt = path.join(dir, "receipts", path.basename(envelope));
+    const originalReceipt = fs.readFileSync(receipt, "utf8");
+    const originalEnvelope = fs.readFileSync(envelope, "utf8");
+    const sync = fs.fsyncSync;
+    const denied = Object.assign(new Error("file fsync denied"), { code: "EPERM" });
+    const failed = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isFile()) throw denied;
+      sync(fd);
+    });
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: platformName });
+      expect(() => completionConsumed(h.meshRoot, h.result.id)).toThrow(denied);
+      expect(() => consumeCompletion(h.meshRoot, h.result.id, "C")).toThrow(denied);
+      expect(() => journal.acknowledge(h.result.id)).toThrow(denied);
+      expect(() => journal.forget(h.result.id)).toThrow(denied);
+      await expect(journal.drain(false)).rejects.toThrow(denied);
+      expect(h.mesh.listAll("residency/completion-claims/")).toEqual([claim]);
+      expect(fs.readFileSync(receipt, "utf8")).toBe(originalReceipt);
+      expect(fs.readFileSync(envelope, "utf8")).toBe(originalEnvelope);
+      expect(journal.enqueue).not.toHaveBeenCalled();
+    } finally { Object.defineProperty(process, "platform", platform); failed.mockRestore(); }
+    await journal.drain(false);
+    expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+    expect(journal.enqueue).not.toHaveBeenCalled();
+  });
+});
 
 describe("round 4 completion fences", () => {
   it.each([true, false])("Astra 3: quiet resident settlement survives a live supervisor; successor notices=%s", async notifyOnComplete => {

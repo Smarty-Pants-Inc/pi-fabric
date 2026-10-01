@@ -85,7 +85,8 @@ const readReplayFence = <T>(file: string, label = "Completion"): T | undefined =
 /** A readable rename may have failed its post-rename barrier. Confirm this attempt,
  * binding both the validated bytes and reopenable namespace to the synced inode. */
 const syncCompletionFile = (file: string, value: unknown): void => {
-  const fd = fs.openSync(file, "r");
+  // Match the inbox: Windows FlushFileBuffers requires a write-capable file handle.
+  const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || JSON.stringify(JSON.parse(fs.readFileSync(fd, "utf8"))) !== JSON.stringify(value)) {

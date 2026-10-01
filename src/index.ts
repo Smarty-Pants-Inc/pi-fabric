@@ -1,7 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { rootInboxMessage, rootInboxSession } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
-import { fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
+import { fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { foregroundWaitRefusal } from "./guards/foreground-wait.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp } from "./core/pattern-kill.js";
@@ -1099,8 +1099,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       details: {},
     };
     if (!fabricProvenanceSupported(pi)) return { message, systemPrompt: `${systemPrompt}\n\n${guidance}` };
-    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
-    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
     return { systemPrompt: `${systemPrompt}\n\n${guidance}` };
   });
 
@@ -1133,8 +1132,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       details: { names: fresh, origin: "skill" },
     };
     if (!fabricProvenanceSupported(pi)) return { message };
-    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false },
-    () => fabricHostIdentity(context.sessionManager.getSessionId()), "actor", "mesh");
+    sendFabricMessage(pi, message, { deliverAs: "nextTurn", triggerTurn: false });
   });
 
   // Work events a steer missed reach the Main with its next turn (smarty-dev#754).

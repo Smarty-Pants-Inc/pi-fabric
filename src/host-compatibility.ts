@@ -198,7 +198,7 @@ export const sendFabricUserMessage = (
   else pi.sendUserMessage(content, deliveryOptions);
 };
 
-/** Fabric's own runtime identity for host-generated messages, with no human principal. */
+/** Runtime participant identity, with no human principal. Participant-free notices make no claim. */
 export const fabricHostIdentity = (
   sessionId: string,
   environment: NodeJS.ProcessEnv = process.env,

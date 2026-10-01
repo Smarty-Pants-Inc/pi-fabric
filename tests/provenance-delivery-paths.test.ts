@@ -77,10 +77,10 @@ describe("Fabric delivery producers record provenance at the Pi call", () => {
     },
   );
 
-  it("a host-generated actor failure alarm identifies the host, not the failing actor", () => {
+  it("a participant-free actor failure alarm claims neither the host nor the failing actor", () => {
     const { fake, pi } = recording();
     deliverActorToMain(pi, host, actorOutput("followUp", true, "fabric-host"));
-    expect(fake.sendMessage.mock.calls[0]![1].provenance).toEqual(provenance(host, "actor"));
+    expect(fake.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
   });
 
   it("legacy actor delivery retains the old call, including passive nextTurn", () => {

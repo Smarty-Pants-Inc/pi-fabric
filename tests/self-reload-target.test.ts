@@ -105,17 +105,14 @@ const setup = (options: { uiQuery?: boolean; configured?: boolean; packages?: bo
 };
 
 describe("reload-target v1 public producer/consumer counterexamples", () => {
-  it.each([false, true])("preserves pinned resource commands and provenance compatibility (capable=%s)", async turnProvenance => {
+  it.each([false, true])("preserves pinned participant-free resource commands without a sender claim (capable=%s)", async turnProvenance => {
     const s = setup({ turnProvenance }); await s.bind();
     s.activate(s.next); await s.request(s.next);
     s.emit("agent_settled", { outcome: "completed" });
     s.emit("agent_settled", { outcome: "completed" });
     expect(s.pi.sendUserMessage).toHaveBeenCalledExactlyOnceWith(
       expect.stringMatching(/^\/fabric-release-reload auto resource-\d+$/),
-      { expandPromptTemplates: true, ...(turnProvenance ? { provenance: {
-        v: 1, channel: "fabric", sender: { id: `session:${s.context.sessionManager.getSessionId()}`,
-          name: "main", kind: "main", verified: "mesh" }, via: "followUp",
-      } } : {}) },
+      { expandPromptTemplates: true },
     );
     await s.execute();
     expect(s.context.reload).toHaveBeenCalledTimes(1);

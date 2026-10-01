@@ -107,7 +107,7 @@ describe("installSelfReload", () => {
     return { old, next, pi, emit, commands, sent, selfReload };
   };
 
-  it.each([false, true])("keeps Fabric commands untokenized with provenance compatibility (capable=%s)", async turnProvenance => {
+  it.each([false, true])("keeps participant-free Fabric reload commands untokenized and unclaimed (capable=%s)", async turnProvenance => {
     const { next, pi, emit, commands, selfReload } = setup({ turnProvenance });
     const context = fakeContext(`s-fabric-provenance-${turnProvenance}`, { idle: true, pending: false });
     selfReload.sessionStart("startup", context as never);
@@ -115,10 +115,7 @@ describe("installSelfReload", () => {
     emit("agent_settled", context);
     emit("agent_settled", context);
     expect(pi.sendUserMessage).toHaveBeenCalledExactlyOnceWith(`/${SELF_RELOAD_COMMAND} auto`,
-      { expandPromptTemplates: true, ...(turnProvenance ? { provenance: {
-        v: 1, channel: "fabric", sender: { id: `session:${context.sessionManager.getSessionId()}`,
-          name: "main", kind: "main", verified: "mesh" }, via: "followUp",
-      } } : {}) });
+      { expandPromptTemplates: true });
     await commands.get(SELF_RELOAD_COMMAND)!.handler("auto", context);
     expect(context.reload).toHaveBeenCalledTimes(1);
     emit("session_shutdown", context);

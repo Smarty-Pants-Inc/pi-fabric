@@ -9,14 +9,15 @@ const escapeXmlText = (text: string): string => text.replaceAll("&", "&amp;").re
 /** The production actor/lifecycle output call site, shared with the runtime's ActorDirectory. */
 export const deliverActorToMain = (
   pi: ExtensionAPI,
-  host: MeshIdentity,
+  _host: MeshIdentity,
   { actor, message, delivery, triggerTurn }: FabricActorDeliveryRequest,
 ): void => {
   const text = message.text ?? "";
   if (!text) return;
   const deliveryNotice = actorDeliveryNotice(delivery, triggerTurn);
-  // Failure alarms are emitted by Fabric's host, not by the failing actor.
-  const from: MeshIdentity = message.source === "fabric-host" ? host : { id: actor.id, name: actor.name, kind: "actor" };
+  // Participant-free failure alarms pass no claim; only actor-produced output
+  // names the actor. Neither text nor the failing actor supplies alarm authority.
+  const from: MeshIdentity | undefined = message.source === "fabric-host" ? undefined : { id: actor.id, name: actor.name, kind: "actor" };
   sendFabricMessage(pi, {
     customType: "pi-fabric-actor",
     content: [

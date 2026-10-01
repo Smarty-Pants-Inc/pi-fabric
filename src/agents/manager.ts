@@ -1,4 +1,4 @@
-import type { FabricTurnProvenance } from "../fabric-provenance.js";
+import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import type { FabricKernel } from "../runtime/kernel.js";
@@ -246,6 +246,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   id: string;
   name: string;
   task: string;
+  /** Conservative activation lineage: foreign/UNKNOWN admitted input clears it forever. */
+  outputPrincipal: FabricPrincipal | undefined;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
   recursive: boolean;
@@ -1127,6 +1129,7 @@ export class AgentManager {
           id,
           name,
           task: request.task,
+          outputPrincipal: copyFabricPrincipal(request.provenance?.principal),
           runner,
           ...(kernel ? { kernel } : {}),
           recursive,
@@ -1650,6 +1653,11 @@ export class AgentManager {
     };
   }
 
+  /** Automatic outputs must use admitted task lineage, never the original mailbox item. */
+  outputPrincipal(id: string): FabricPrincipal | undefined {
+    return copyFabricPrincipal(this.#runs.get(id)?.outputPrincipal);
+  }
+
   steer(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance): AgentSteerResult {
     this.#requireSteerable(id);
     return this.#appendSteer(id, { type: "steer", message, data, provenance });
@@ -1710,6 +1718,12 @@ export class AgentManager {
     const messageId = randomUUID();
     const line = JSON.stringify({ ...entry, id: messageId, ts: Date.now() }) + "\n";
     fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    if (entry.type === "steer" || entry.type === "follow_up") {
+      const incoming = copyFabricPrincipal(entry.provenance?.principal);
+      if (!incoming || incoming.id !== managed.outputPrincipal?.id || incoming.binding !== managed.outputPrincipal?.binding) {
+        managed.outputPrincipal = undefined;
+      }
+    }
     return { queued: true, messageId };
   }
 

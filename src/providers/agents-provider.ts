@@ -1,4 +1,4 @@
-import { currentFabricPrincipal, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
+import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
 import { formatAge, residentHostId, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -184,7 +184,7 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
 
 const runRequest = (args: Record<string, unknown>, context: FabricInvocationContext, manager: AgentManager, options: {allowCwd?: boolean} = {}): AgentRunRequest => ({
   ...normalizeAgentRunRequest({...args, timeoutMs: longerTimeoutOverride(args.timeoutMs, manager)}, { ...manager.config, ...(context.extensionContext.model ? {inheritedModel: context.extensionContext.model} : {}) }, options),
-  ...(context.extensionContext.sessionManager ? { provenance: fabricTurnProvenance(fabricHostIdentity(context.extensionContext.sessionManager.getSessionId()), "actor", "mesh", currentFabricPrincipal(context.extensionContext)) } : {}),
+  ...(context.extensionContext.sessionManager ? { provenance: fabricTurnProvenance(fabricHostIdentity(context.extensionContext.sessionManager.getSessionId()), "actor", "mesh", invocationFabricPrincipal(context)) } : {}),
 });
 
 const handoffTask = (args: Record<string, unknown>): string => {
@@ -527,6 +527,7 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<Record<string, unknown>> {
+    context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
     checkedHandoffCompaction(args.compact);
@@ -555,6 +556,7 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     sessionSeed: AgentSessionSeed,
   ): Promise<Record<string, unknown>> {
+    context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
     const request = runRequest(
@@ -620,6 +622,7 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<unknown> {
+    context = snapshotFabricInvocation(context);
     try {
       return await this.#invoke(actionName, args, context);
     } catch (error) {
@@ -1034,6 +1037,7 @@ export class AgentsProvider implements FabricProvider {
           kind: "actor",
           name: actor?.name ?? participant!.name,
         });
+        context.signal?.throwIfAborted();
         if (actor && ownsActor) {
           return waitWithActorProgress(
             this.manager,
@@ -1042,7 +1046,7 @@ export class AgentsProvider implements FabricProvider {
             actor.name,
             this.actorManager.ask(actor.id, message, args.data, context.signal, {
               overrides,
-              provenance: fabricTurnProvenance(this.actorManager.identity, "actor", "mesh", currentFabricPrincipal(context.extensionContext)),
+              provenance: fabricTurnProvenance(this.actorManager.identity, "actor", "mesh", invocationFabricPrincipal(context)),
               detachOnMainCeiling: isInteractiveMain(context.extensionContext),
             }),
             context,
@@ -1062,12 +1066,13 @@ export class AgentsProvider implements FabricProvider {
         if (!this.control || participant.controlProtocol === "legacy") {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} has no result control channel`);
         }
+        context.signal?.throwIfAborted();
         return this.control.requestResult<FabricActorMessage>(
           participant.ownerHostId,
           participant.id,
           "ask",
           {
-            principal: currentFabricPrincipal(context.extensionContext),
+            principal: invocationFabricPrincipal(context),
             message,
             ...(args.data === undefined ? {} : { data: args.data }),
             ...(needsBinding ? { binding } : {}),
@@ -1403,6 +1408,7 @@ export class AgentsProvider implements FabricProvider {
     // Host-authored lifecycle routing has no sender invocation/history. Check
     // only model sends, before *all* local/actor/remote routing branches.
     if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
+    context = snapshotFabricInvocation(context);
     const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
     const result = await deliverWithMessageNotice(message, checked,
       text => this.#router.routeMessage(id, text, data, kind, context, options), `agents.${kind}`);
@@ -1519,7 +1525,7 @@ export class AgentsProvider implements FabricProvider {
     // execution ownership; proxying must not turn inherited lineage into that authority.
     if (!this.mainAgent.local) throw new ResidentActorAuthorizationError();
     const self = this.participants.self();
-    const principal = currentFabricPrincipal(context.extensionContext);
+    const principal = invocationFabricPrincipal(context);
     const caller: ResidentActorCaller = {
       identity: { ...this.actorManager.identity }, hostId: self.ownerHostId,
       ...(principal ? { principal } : {}),

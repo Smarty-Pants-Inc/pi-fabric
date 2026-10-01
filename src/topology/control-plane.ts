@@ -1,7 +1,7 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 
@@ -481,6 +481,8 @@ export class FabricControlPlane {
         kind: operation,
         from: this.identity,
         principal: input.principal,
+        signal: operation === "ask" && options.detachOnMainCeiling
+          ? withoutMainExecutionCeiling(options.signal) : options.signal,
         to: ownerHostId,
         // Stamped at commit (smarty-dev#816): the owner gets the whole timeout, not what is
         // left after this sender waited for the mesh lock (2-3 s under load).

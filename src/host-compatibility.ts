@@ -162,6 +162,20 @@ export const registerFabricPrincipalCapture = (pi: ExtensionAPI): void => {
 export const currentFabricPrincipal = (context?: { sessionManager?: object }): FabricPrincipal | undefined =>
   context?.sessionManager ? copyFabricPrincipal(turnPrincipals.get(context.sessionManager)) : undefined;
 
+// A private host-owned token survives invocation-context spreads. Presence with an
+// undefined principal is an immutable UNKNOWN snapshot, not permission to re-sample.
+const invocationPrincipal = Symbol("fabric.invocation-principal");
+type PrincipalInvocation = { extensionContext?: { sessionManager?: object } };
+type CapturedInvocation = { [invocationPrincipal]?: Readonly<{ principal: FabricPrincipal | undefined }> };
+export const snapshotFabricInvocation = <T extends PrincipalInvocation>(context: T): T => {
+  if ((context as CapturedInvocation)[invocationPrincipal]) return context;
+  return { ...context, [invocationPrincipal]: Object.freeze({ principal: currentFabricPrincipal(context.extensionContext) }) };
+};
+export const invocationFabricPrincipal = (context: PrincipalInvocation): FabricPrincipal | undefined => {
+  const captured = (context as CapturedInvocation)[invocationPrincipal];
+  return captured ? captured.principal : currentFabricPrincipal(context.extensionContext);
+};
+
 export interface FabricIdentityResolution {
   identity: MeshIdentity;
   mainAgentId: string;

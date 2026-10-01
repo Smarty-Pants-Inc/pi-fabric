@@ -1135,6 +1135,7 @@ export class ActorManager {
     kind: "steer" | "followUp",
     data?: unknown,
     principal?: FabricPrincipal,
+    signal?: AbortSignal,
   ): Promise<{ queued: true; messageId: string; routed: "mesh" }> {
     if (!this.meshConfig.enabled) {
       throw new Error("Fabric mesh is disabled; cannot steer a remote agent");
@@ -1143,6 +1144,7 @@ export class ActorManager {
     const event = await this.mesh.publish({
       topic: "fabric.steer",
       principal,
+      signal,
       kind,
       from: this.identity,
       to: targetId,
@@ -2275,7 +2277,8 @@ export class ActorManager {
             throw new Error(result.error || `Actor run ${result.status}`);
           }
           const message = this.#outgoingMessage(actor, item, result);
-          if (item.provenance?.principal) message.principal = item.provenance.principal;
+          const principal = this.agents.outputPrincipal(result.id);
+          if (principal) message.principal = principal;
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
           this.#failureStreaks.delete(actor.id);

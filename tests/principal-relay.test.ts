@@ -9,6 +9,11 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { MeshProvider } from "../src/providers/mesh-provider.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
+import * as messageNotice from "../src/providers/message-id-notice.js";
+import { ActorManager } from "../src/actors/manager.js";
+import { AgentManager } from "../src/agents/manager.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
 import principalDelivery from "../src/worker/principal-delivery.js";
 
@@ -44,6 +49,91 @@ const router = (h: ReturnType<typeof host>, mesh: MeshStore, targets: ReturnType
   control.start((command, from, signal, verification) => routes.acceptControl(command, from, signal, verification));
   return { routes, control };
 };
+
+describe("round-two invocation and activation fencing (#821)", () => {
+  const nextTurn = (h: ReturnType<typeof host>) => h.input(receipt({ v: 1, channel: "voice", principal: { id: "next", binding: "voice-call" } }));
+  it.each([["mesh", false], ["mesh", true], ["agents", false], ["agents", true]] as const)("%s captures principal before blocked preflight (attributed=%s), without borrowing the next turn", async (route, attributed) => {
+    const h = host("pending"), mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100);
+    h.input(attributed ? receipt({ v: 1, channel: "voice", principal }) : undefined);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(messageNotice, "outgoingMessageNotice").mockImplementation(async text => { await gate; return { text }; });
+    const provider = new AgentsProvider({} as any, { identity: h.identity } as any, {} as any, h.main, { get: () => undefined } as any, undefined, {} as any);
+    const pending = route === "mesh" ? new MeshProvider(mesh, h.identity, {} as any).invoke("publish", { topic: "work", text: "old send" }, invocation(h)) : provider.routeMessage("main", "old send", undefined, "steer", invocation(h));
+    nextTurn(h); release(); await pending;
+    const p = route === "mesh" ? mesh.read({ topic: "work" })[0]?.principal : h.pi.sendMessage.mock.calls.at(-1)?.[1].provenance.principal;
+    expect(p).toEqual(attributed ? principal : undefined);
+  });
+  it.each(["mesh", "agents"] as const)("%s fences a cancelled UNKNOWN send after blocked preparation", async route => {
+    const h = host("cancel-unknown"), mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100);
+    h.input(undefined);
+    const abort = new AbortController(), ctx = { ...invocation(h), signal: abort.signal };
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(messageNotice, "outgoingMessageNotice").mockImplementation(async text => { await gate; return { text }; });
+    const provider = new AgentsProvider({} as any, { identity: h.identity } as any, {} as any, h.main, { get: () => undefined } as any, undefined, {} as any);
+    const pending = (route === "mesh" ? new MeshProvider(mesh, h.identity, {} as any).invoke("publish", { topic: "work", text: "old send" }, ctx) : provider.routeMessage("main", "old send", undefined, "steer", ctx)).then(() => "published", () => "cancelled");
+    abort.abort(new Error("cancelled old invocation")); nextTurn(h); release();
+    expect(await pending).toBe("cancelled");
+    expect(mesh.read({ topic: "work" })).toHaveLength(0);
+    expect(h.pi.sendMessage).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("optional-marker retry retains invocation principal and respects cancellation=%s", async cancel => {
+    const h = host("retry"), mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100);
+    h.input(receipt({ v: 1, channel: "voice", principal }));
+    const abort = new AbortController(), ctx = { ...invocation(h), signal: abort.signal };
+    vi.spyOn(messageNotice, "outgoingMessageNotice").mockResolvedValue({ text: "old send\nnotice", notice: "unverified ids: test" });
+    const publish = mesh.publish.bind(mesh), calls: any[] = [];
+    vi.spyOn(mesh, "publish").mockImplementation(async input => {
+      calls.push(input.principal);
+      if (calls.length === 1) { nextTurn(h); if (cancel) abort.abort(new Error("cancelled retry")); throw new Error("Mesh event exceeds 100 bytes"); }
+      return publish(input);
+    });
+    const pending = new MeshProvider(mesh, h.identity, {} as any).invoke("publish", { topic: "work", text: "old send" }, ctx);
+    if (cancel) { await expect(pending).rejects.toThrow("cancelled retry"); expect(calls).toEqual([principal]); }
+    else { await pending; expect(calls).toEqual([principal, principal]); expect(mesh.read({ topic: "work" })[0]?.principal).toEqual(principal); }
+  });
+  it.each([false, true])("agents optional-marker retry keeps the snapshot and fences cancellation=%s", async cancel => {
+    const h = host("agents-retry");
+    h.input(receipt({ v: 1, channel: "voice", principal }));
+    const abort = new AbortController(), ctx = { ...invocation(h), signal: abort.signal };
+    vi.spyOn(messageNotice, "outgoingMessageNotice").mockResolvedValue({ text: "old send\nnotice", notice: "unverified ids: test" });
+    const deliver = h.main.deliverAgent.bind(h.main), calls: any[] = [];
+    vi.spyOn(h.main, "deliverAgent").mockImplementation(input => {
+      calls.push(input.principal);
+      if (calls.length === 1) {
+        nextTurn(h); if (cancel) abort.abort(new Error("cancelled retry"));
+        throw new Error("Main's followUp queue is full (10); Main is busy and reads followUps only at its next tool boundary. Wait, or send a short steer.");
+      }
+      return deliver(input);
+    });
+    const provider = new AgentsProvider({} as any, { identity: h.identity } as any, {} as any, h.main, { get: () => undefined } as any, undefined, {} as any);
+    const pending = provider.routeMessage("main", "old send", undefined, "steer", ctx);
+    if (cancel) { await expect(pending).rejects.toThrow("cancelled retry"); expect(calls).toEqual([principal]); expect(h.pi.sendMessage).not.toHaveBeenCalled(); }
+    else { await pending; expect(calls).toEqual([principal, principal]); expect(h.pi.sendMessage.mock.calls.at(-1)![1].provenance.principal).toEqual(principal); }
+  });
+  it.each(["foreign", "UNKNOWN"])("%s task steering permanently downgrades automatic actor output and Main delivery", async source => {
+    const h = host("actor-main"), dir = root(), mesh = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(dir, "runs") });
+    cleanup.push(() => agents.close());
+    const actors = new ActorManager("actor-main", h.identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents,
+      ({ actor, message }) => { h.main.deliverAgent({ from: { id: actor.id, name: actor.name, kind: "actor" }, verification: "mesh", principal: message.principal, message: message.text!, delivery: "steer" }); }, { actorRoot: path.join(dir, "actors"), persistent: true });
+    cleanup.push(() => actors.close());
+    const actor = await actors.create({ name: "relay", instructions: "Harmless", responseMode: "text", delivery: "steer", triggerTurn: false });
+    const pending = actors.ask(actor.id, "LIVE_WITH_PROGRESS", undefined, undefined, { provenance: fabricTurnProvenance(h.identity, "actor", "mesh", principal) });
+    await vi.waitFor(() => expect(actors.status(actor.id).inFlightRun?.id).toBeTruthy());
+    const id = actors.status(actor.id).inFlightRun!.id;
+    agents.steer(id, "foreign input", undefined, fabricTurnProvenance({ id: "foreign", name: "foreign", kind: "agent" }, "steer", "mesh", source === "foreign" ? forged : undefined));
+    // Neither a later input from A nor a follow-up may restore the original attribution.
+    agents.followUp(id, "original again", undefined, fabricTurnProvenance(h.identity, "followUp", "mesh", principal));
+    const output = await pending;
+    expect(output.principal).toBeUndefined();
+    expect(mesh.read({ topic: "fabric.actor.output" }).at(-1)?.principal).toBeUndefined();
+    expect(actors.messages(actor.id).filter(m => m.direction === "out").at(-1)?.principal).toBeUndefined();
+    await vi.waitFor(() => expect(h.pi.sendMessage).toHaveBeenCalled());
+    expect(h.pi.sendMessage.mock.calls.at(-1)![1].provenance).not.toHaveProperty("principal");
+  }, 15_000);
+});
 
 describe("originating principal relay (#821)", () => {
   it.each(["steer", "followUp"] as const)("principal -> org -> lead -> task via %s keeps the principal unchanged", async delivery => {

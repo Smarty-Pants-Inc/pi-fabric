@@ -542,6 +542,8 @@ export class MeshStore {
     from: MeshIdentity;
     to?: string;
     text?: string;
+    /** Host-only cancellation fence, checked under the lock before admission. */
+    signal?: AbortSignal | undefined;
     /** Host-only relay metadata. The public provider never forwards args.principal. */
     principal?: FabricPrincipal | undefined;
     /** A function receives the commit time, under the lock (smarty-dev#816). */
@@ -553,6 +555,7 @@ export class MeshStore {
     const stamp = typeof input.data === "function" ? input.data as (createdAt: number) => unknown : undefined;
     const fixedData = stamp || input.data === undefined ? undefined : jsonClone(input.data);
     return this.#withLock(() => {
+      input.signal?.throwIfAborted();
       this.#repairEventLog();
       const archive = MeshArchive.fromRoot(this.root);
       if (archive) this.#recoverArchive(archive);

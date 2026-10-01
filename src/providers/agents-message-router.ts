@@ -1,4 +1,4 @@
-import { currentFabricPrincipal, fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
 import type { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js";
@@ -138,7 +138,8 @@ export class AgentMessageRouter {
     } = {},
   ): Promise<FabricAgentMessageResult> {
     // Capture before routing yields; a queued incoming turn cannot change this send.
-    options = { ...options, principal: context ? currentFabricPrincipal(context.extensionContext) : undefined };
+    if (context) context = snapshotFabricInvocation(context);
+    options = { ...options, principal: context ? invocationFabricPrincipal(context) : undefined };
     const result = await this.#withDurableRecovery(id, () => this.#route(id, message, data, kind, context, options));
     // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
     // Older owners never report `stalled`, so their results pass unchanged.
@@ -195,6 +196,7 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    context?.signal?.throwIfAborted();
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
     id = this.#sessionTarget(id);
     const isMain = this.mainAgent.matches(id);
@@ -227,8 +229,8 @@ export class AgentMessageRouter {
       }
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       if (!this.control || participant.controlProtocol === "legacy") {
-        return options.principal
-          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal)
+        return context?.signal || options.principal
+          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
           : this.actorManager.steerRemote(participant.id, message, kind, data);
       }
       return this.control.request(
@@ -245,6 +247,7 @@ export class AgentMessageRouter {
         },
         participant.ownerIdentityId,
         {
+          ...(context?.signal ? { signal: context.signal } : {}),
           routedRemoteHost: participant.remoteHost ?? null,
           ...(participant.status === "reloading" && typeof participant.reloadUntil === "number"
             ? { timeoutMs: Math.max(1, participant.reloadUntil - Date.now()) } : {}),
@@ -279,7 +282,7 @@ export class AgentMessageRouter {
         kind,
         { message, data, principal: options.principal },
         remoteAgent.ownerIdentityId,
-        { routedRemoteHost: remoteAgent.remoteHost ?? null },
+        { routedRemoteHost: remoteAgent.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
       );
     }
 
@@ -299,6 +302,7 @@ export class AgentMessageRouter {
     const binding = options.binding && context && localActor
       ? await this.resolvePiRunBinding(options.binding, actor!.runner, context)
       : options.binding;
+    context?.signal?.throwIfAborted();
     if (actor && localActor) {
       context?.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
       const result = this.actorManager.tell(actor.id, message, data, {
@@ -326,8 +330,8 @@ export class AgentMessageRouter {
       if (needsBinding) {
         throw new Error(`Fabric actor owner ${participant.ownerHostId} has no binding control channel`);
       }
-      return options.principal
-          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal)
+      return context?.signal || options.principal
+          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
           : this.actorManager.steerRemote(participant.id, message, kind, data);
     }
     return this.control.request(
@@ -345,7 +349,7 @@ export class AgentMessageRouter {
         ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
       },
       participant.ownerIdentityId,
-      { routedRemoteHost: participant.remoteHost ?? null },
+      { routedRemoteHost: participant.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
     );
   }
 

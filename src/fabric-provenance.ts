@@ -4,6 +4,8 @@ export {
   copyFabricProvenance,
   copyFabricPrincipal,
   currentFabricPrincipal,
+  snapshotFabricInvocation,
+  invocationFabricPrincipal,
   principalFromReceipt,
   registerFabricPrincipalCapture,
   type FabricPrincipal,

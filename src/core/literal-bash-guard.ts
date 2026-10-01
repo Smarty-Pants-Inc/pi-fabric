@@ -6,7 +6,23 @@ export const DELETE_REASON = "Recursive delete refused: delete only inside your 
 type Word = { text: string; literal: boolean };
 type Split = { words: Word[]; simple: boolean };
 const SIGNALS = new Set(["kill", "pkill", "killall", "killall5"]);
-const DATA = new Set(["echo", "printf", "cat", "ls", "grep", "rg", "head", "tail", "wc"]);
+// A head AND its flags need inert proof. Unknown options never confer DATA credit.
+const DATA_FLAGS: Record<string, readonly string[]> = {
+  echo: ["-n", "-e", "-E"],
+  cat: ["-A", "-b", "-e", "-E", "-n", "-s", "-t", "-T", "-v", "--number", "--number-nonblank", "--squeeze-blank", "--show-all"],
+  ls: ["-a", "-A", "-l", "-d", "-h", "-t", "-r", "-S", "-1", "--all", "--almost-all", "--directory", "--human-readable"],
+  grep: ["-F", "-E", "-G", "-P", "-n", "-i", "-v", "-w", "-x", "-c", "-l", "-L", "-o", "-q", "-s", "-H", "-h", "-r", "-R", "--fixed-strings", "--line-number", "--ignore-case", "--invert-match", "--word-regexp", "--line-regexp", "--count", "--quiet"],
+  rg: ["-F", "-n", "-i", "-v", "-w", "-x", "-c", "-l", "-q", "-s", "-H", "--fixed-strings", "--line-number", "--ignore-case", "--invert-match", "--word-regexp", "--line-regexp", "--count", "--quiet", "--no-config"],
+  head: ["-q", "-v", "--quiet", "--verbose"],
+  tail: ["-q", "-v", "--quiet", "--verbose"],
+  wc: ["-c", "-m", "-l", "-w", "-L", "--bytes", "--chars", "--lines", "--words", "--max-line-length"],
+};
+const DATA_VALUES: Record<string, readonly string[]> = {
+  grep: ["-e", "-f", "--regexp", "--file"],
+  rg: ["-e", "-f", "--regexp", "--file"],
+  head: ["-n", "-c", "--lines", "--bytes"],
+  tail: ["-n", "-c", "--lines", "--bytes"],
+};
 const DELETES = new Set(["rm", "find", "shred", "xargs"]);
 
 /** Literal words only. No expansion, bindings, output, shell argv, or execution interpretation. */
@@ -104,15 +120,35 @@ function literalFileMaintenance(words: Word[]): boolean {
   return true;
 }
 
+function inertOptions(head: string, args: string[]): boolean {
+  // printf's first stdout format is DATA, not a variable destination or flag selector.
+  if (head === "printf") return args[0] === "--" || (!!args[0] && !args[0].startsWith("-"));
+  const flags = Object.hasOwn(DATA_FLAGS, head) ? DATA_FLAGS[head] : undefined;
+  const values = Object.hasOwn(DATA_VALUES, head) ? DATA_VALUES[head]! : [];
+  if (!flags) return false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--") return true; // All remaining words are literal operands.
+    if (arg === "-" || !arg.startsWith("-")) continue;
+    if (flags.includes(arg)) continue;
+    if (values.includes(arg)) {
+      const value = args[++i];
+      if (!value || (["head", "tail"].includes(head) && !/^[0-9]+$/.test(value))) return false;
+      continue;
+    }
+    // Only clusters of individually listed inert single-letter switches; no attached values.
+    if (/^-[A-Za-z]+$/.test(arg) && [...arg.slice(1)].every(c => flags.includes(`-${c}`))) continue;
+    return false;
+  }
+  return true;
+}
+
 function literalData(words: Word[], simple: boolean): boolean {
   if (!simple || words.length === 0 || words.some(word => !word.literal)) return false;
   const head = words[0]!.text;
   if (head.includes("/")) return false;
   if (literalFileMaintenance(words)) return true;
-  if (DATA.has(head)) {
-    // Search preprocessors execute their argv. Never grant either attached or separated spelling.
-    return !["rg", "grep"].includes(head) || !words.some(word => /^--pre(?:-glob)?(?:=|$)/.test(word.text));
-  }
+  if (inertOptions(head, words.slice(1).map(word => word.text))) return true;
   // No configurable aliases, pager/exec flags, scripts or arbitrary subcommands receive DATA credit.
   return head === "git" && words.length === 2 && ["log", "status", "diff"].includes(words[1]!.text);
 }

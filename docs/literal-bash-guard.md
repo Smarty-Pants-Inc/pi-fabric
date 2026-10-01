@@ -18,7 +18,7 @@ output, cwd changes, attributes, files, descriptors or producer provenance.
 | --- | --- | --- |
 | Process signals | One bare `kill` with positive literal integer PID operands, optionally one literal `-SIGNAL` and/or `--` | Refuse with **“use the PID you recorded”**. `pkill`, `killall`, variables, substitutions, job selectors, wrappers, nested/compound commands and unproved operands get no allowance. |
 | Recursive deletion | One bare `rm` using `-r`/`-R` and optional `-f`, or literal `--recursive`/`--force`, optionally `--`; **all** operands literal absolute descendants of the host session's private TMPDIR | Refuse with **“delete only inside your own TMPDIR”**. No shared root, TMPDIR equality, `..`, globs, expansions, relative paths, mixed outside operands or unproved flags. `find -delete` and `shred -r`/`-u` (including short clusters)/`--remove[=...]` cannot receive this allowance. |
-| Inert DATA | Whole-literal, single bare `echo`, `printf`, `cat`, `ls`, `grep`, `rg`, `head`, `tail`, `wc`; or exact `git log`/`git status`/`git diff` | No expansion, live substitution, process substitution, backquote, shell grammar or unknown head receives this grant. Search `--pre`/`--pre-glob` options are excluded. `sed` is deliberately omitted. |
+| Inert DATA | Whole-literal, single bare `echo`, `printf`, `cat`, `ls`, `grep`, `rg`, `head`, `tail`, `wc`; or exact `git log`/`git status`/`git diff` | No expansion, live substitution, process substitution, backquote, shell grammar or unknown head receives this grant. Each head has a fixed inert flag/value allowlist; every unknown option forfeits DATA credit. No `printf -v`, search program/decompressor selector (`--pre`, `--pre-glob`, `--hostname-bin`, `-z`/`--search-zip`), or `sed` grant. |
 | Everyday maintenance | Whole-literal nonrecursive `rm`/`rm -f` with explicit operands; or `find` with only the source's fixed non-executing predicates | No `rm -d`, recursive option, glob or expansion; no find exec/ok/delete/file-write action or unknown predicate. This narrow owner exception is not a general argv interpreter. |
 | Outside these grants | Pass only if there is no visible protected token and no unproved opaque execution/quoting | Visible signal/delete tokens refuse; all shred forms refuse. No unrelated-head or executor-denylist DATA credit. |
 
@@ -29,7 +29,12 @@ Unproved `rm` argv can select recursive options and therefore refuses. This
 intentionally trades complex-command precision for a small conservative policy.
 Reserved-word or punctuation prefixes do not establish an unrelated-command/DATA
 allowance. `rg`/`grep` with `--pre` or `--pre-glob` is execution-bearing, not inert
-search DATA. Unsupported dollar quoting, live substitutions/backticks/process
+search DATA. No option denylist: `inertOptions` accepts only the source's listed
+single switches, clusters of listed inert switches, and explicit value-taking
+selectors; a literal `--` ends options. `printf` accepts only a stdout format
+(non-option first word or a literal `--`), never a destination selector. Unknown
+flags reach the protected-token/opaque checks instead of receiving DATA credit.
+Unsupported dollar quoting, live substitutions/backticks/process
 substitution, continuation or heredoc syntax cannot hide protected receivers.
 Opaque inner quotes/escapes confer no absence proof; when the protected class
 itself is unproved, the stable signal reason is used. Protected lexical basenames
@@ -73,6 +78,9 @@ the TMPDIR itself is refused; the literal operand must be below it.
   fixed-head and narrow maintenance cuts, and increasing nonmatching input sizes.
   Cost coverage has no flaky millisecond threshold; the source scans tokens once.
   Owner-directed changes to old broad allowances retain their command/ID bytes.
+- `tests/literal-bash-guard-round5.test.ts`: security S10/S11 destination-writing
+  and hostname-executable boundaries, fixed flags across every inert head,
+  decompressor selectors, ordinary formatting/search and unchanged rm/find forms.
 
 No corpus command is dispatched to Bash. Each native proof uses real Pi 0.87.1
 and the freshly built head as its only extension. Round 4 admits only the owned

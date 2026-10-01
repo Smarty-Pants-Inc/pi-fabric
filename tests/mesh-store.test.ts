@@ -34,10 +34,19 @@ const mockNativePlatform = (platform: "darwin" | "win32", start: string) => {
     return {} as childProcess.ChildProcess;
   }) as typeof childProcess.execFile);
 };
-const createStore = (options?: MeshStoreOptions): MeshStore => {
+const createStore = (options?: MeshStoreOptions, Store: typeof MeshStore = MeshStore): MeshStore => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-"));
   roots.push(root);
-  return new MeshStore(root, 64 * 1024, 100, options);
+  return new Store(root, 64 * 1024, 100, options);
+};
+
+// A simulated native platform must not inherit the process-wide own-PID promise
+// from earlier real publication tests (notably on native Windows CI). Reload both
+// the reader and its importing store; production own-PID memoization is unchanged.
+const createSimulatedNativeStore = async (): Promise<MeshStore> => {
+  vi.resetModules();
+  const { MeshStore: Store } = await import("../src/mesh/store.js");
+  return createStore({ lockProtocol: 2, lockTimeoutMs: 100 }, Store);
 };
 
 afterEach(() => {
@@ -805,11 +814,45 @@ describe("MeshStore lock recovery", () => {
     expect(fs.readdirSync(store.root).filter((name) => name.startsWith(".lock.dead."))).toHaveLength(1);
   });
 
+  it.each(["darwin", "win32"] as const)("isolates simulated %s publication after a cached native read", async (platform) => {
+    // First use the real host reader, as the earlier protocol-2 cases do in CI.
+    vi.resetModules();
+    const real = await import("../src/core/atomic-write.js");
+    const nativeOwn = real.ownProcessIncarnation();
+    await nativeOwn;
+    expect(real.ownProcessIncarnation()).toBe(nativeOwn);
+
+    // Prime the exact same platform/SystemRoot key even on Linux, so every host
+    // reproduces the native Windows collision rather than relying on CI ordering.
+    const previous = platform === "darwin" ? "Wed Sep 30 12:00:00 2026" : "639263664000000000";
+    const start = platform === "darwin" ? "Thu Oct  1 12:00:00 2026" : "639264528000000000";
+    const command = mockNativePlatform(platform, previous);
+    vi.resetModules();
+    const cached = await import("../src/core/atomic-write.js");
+    const own = cached.ownProcessIncarnation();
+    expect(await own).toBe(`${platform}:${previous}`);
+    command.mockImplementation(((...args: unknown[]) => {
+      const done = args[args.length - 1] as (error: Error | null, stdout: string, stderr: string) => void;
+      done(null, start + "\n", "");
+      return {} as childProcess.ChildProcess;
+    }) as typeof childProcess.execFile);
+    expect(cached.ownProcessIncarnation()).toBe(own);
+    expect(await cached.ownProcessIncarnation()).toBe(`${platform}:${previous}`);
+
+    const store = await createSimulatedNativeStore();
+    for (let publication = 0; publication < 2; publication++) {
+      await store.exclusive(() => {
+        expect(fs.readFileSync(path.join(store.root, ".lock", "owner"), "utf8").split("\n")[3]).toBe(`${platform}:${start}`);
+      });
+    }
+    expect(command).toHaveBeenCalledTimes(2); // one old read, one memoized isolated read
+  });
+
   it.each(["darwin", "win32"] as const)("publishes native %s incarnation and recovers a reused PID", async (platform) => {
     vi.useFakeTimers({ now: Date.now() });
     const start = platform === "darwin" ? "Thu Oct  1 12:00:00 2026" : "639264528000000000";
     mockNativePlatform(platform, start);
-    const store = createStore({ lockProtocol: 2, lockTimeoutMs: 100 });
+    const store = await createSimulatedNativeStore();
     await store.exclusive(() => {
       expect(fs.readFileSync(path.join(store.root, ".lock", "owner"), "utf8").split("\n")[3]).toBe(`${platform}:${start}`);
     });
@@ -825,7 +868,7 @@ describe("MeshStore lock recovery", () => {
     vi.useFakeTimers({ now: Date.now() });
     const start = platform === "darwin" ? "Thu Oct  1 12:00:00 2026" : "639264528000000000";
     const native = mockNativePlatform(platform, start);
-    const store = createStore({ lockProtocol: 2, lockTimeoutMs: 100 });
+    const store = await createSimulatedNativeStore();
     const owner = `live\n${process.pid}\n${Date.now() - 60_000}\n${platform}:${start}\n`;
     const lock = holdLock(store, owner);
     for (const scenario of ["live", "unknown", "torn", "legacy"] as const) {

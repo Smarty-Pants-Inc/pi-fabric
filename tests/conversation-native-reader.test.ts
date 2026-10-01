@@ -574,10 +574,10 @@ describe("native conversation reader — paging and rollover", () => {
     reader.clear();
   });
 
-  it.each([false, true])("preserves 93 loaded messages through production compaction and reads the 119-message page (follow=%s)", (follow) => {
+  it.each([false, true])("preserves 41 loaded messages through production compaction and reads the 54-message page (follow=%s)", (follow) => {
     const file = path.join(makeWorkspace(), "events.jsonl");
     const events = Array.from({ length: 160 }, (_, index) => {
-      const content = [{ type: "text", text: `body-${index}:${"x".repeat(3990)}` }];
+      const content = [{ type: "text", text: `body-${index}:${"x".repeat(9 * 1024)}` }];
       const toolCallId = `call-${index}`;
       return [
         { type: "tool_execution_start", toolCallId, toolName: "bash", args: {} },
@@ -590,18 +590,18 @@ describe("native conversation reader — paging and rollover", () => {
     const input = source({ eventsFile: file, status: "completed" });
     reader.read(input, follow);
     const before = reader.loadOlder(2)!;
-    expect(before.messages).toHaveLength(93);
+    expect(before.messages).toHaveLength(41);
     const inode = fileIdentity(file);
     retainCompactionGeneration(file);
     expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 160 });
     expect(fileIdentity(file)).not.toBe(inode);
     const after = reader.read(input, follow);
-    expect(after.messages).toHaveLength(119);
-    expect(after.messages.slice(-93)).toEqual(before.messages);
+    expect(after.messages).toHaveLength(54);
+    expect(after.messages.slice(-41)).toEqual(before.messages);
     expect(after.hasMore).toBe(true);
     expect(after.hasNewer).toBe(false);
     expect(after.revision).toBeGreaterThan(before.revision);
-    expect(reader.loadOlder(2)!.messages).toHaveLength(160);
+    expect(reader.loadOlder(4)!.messages).toHaveLength(160);
     const appended = { role: "user", content: "new-path-offset", timestamp: 999 };
     fs.appendFileSync(file, jsonl([{ type: "message_end", message: appended }]));
     const pinned = reader.read(input, false);
@@ -647,7 +647,7 @@ describe("native conversation reader — paging and rollover", () => {
     const file = path.join(makeWorkspace(), "events.jsonl");
     const triplet = (index: number) => {
       const toolCallId = `unread-${index}`;
-      const content = [{ type: "text", text: `body-${index}:${"x".repeat(3990)}` }];
+      const content = [{ type: "text", text: `body-${index}:${"x".repeat(9 * 1024)}` }];
       const details = { retained: index };
       return [
         { type: "tool_execution_start", toolCallId, toolName: "bash", args: { index } },
@@ -660,7 +660,7 @@ describe("native conversation reader — paging and rollover", () => {
     const input = source({ eventsFile: file, status: "completed" });
     reader.read(input, false);
     const before = reader.loadOlder(2)!;
-    expect(before.messages).toHaveLength(93);
+    expect(before.messages).toHaveLength(41);
     fs.appendFileSync(file, jsonl([...triplet(160), ...triplet(161)]));
     const inode = fileIdentity(file);
     retainCompactionGeneration(file);
@@ -669,7 +669,7 @@ describe("native conversation reader — paging and rollover", () => {
     const compacted = fs.readFileSync(file, "utf8");
     expect(compacted).toContain('"elided":true');
     const after = reader.read(input, follow);
-    expect(after.messages.filter((message) => message.timestamp >= 68 && message.timestamp <= 160)).toEqual(before.messages);
+    expect(after.messages.filter((message) => message.timestamp >= 120 && message.timestamp <= 160)).toEqual(before.messages);
     expect(after.messages.at(-1)?.timestamp).toBe(follow ? 162 : 160);
     expect(after.hasNewer).toBe(!follow);
     const newer = reader.loadNewer()!;
@@ -679,7 +679,7 @@ describe("native conversation reader — paging and rollover", () => {
     expect(tool).toMatchObject({ args: { index: 161 }, status: "completed", argsComplete: true, result: { details: { retained: 161 } } });
     expect(JSON.stringify(tool?.result)).toContain("body-161:");
     expect(reader.loadNewer()!.messages).toEqual(newer.messages);
-    expect(reader.loadOlder(3)!.messages).toHaveLength(162);
+    expect(reader.loadOlder(4)!.messages).toHaveLength(162);
     reader.clear();
   });
   it.each(["session", "events"] as const)("rejects ambiguous %s replacement boundaries and reparses a restored generation", (kind) => {
@@ -711,7 +711,7 @@ describe("native conversation reader — paging and rollover", () => {
 
   it("keeps an unread durable canonical result pending after compacting a loaded execution end across suspension", () => {
     const file = path.join(makeWorkspace(), "events.jsonl");
-    const content = [{ type: "text", text: "full-result:" + "x".repeat(4000) }];
+    const content = [{ type: "text", text: "full-result:" + "x".repeat(9 * 1024) }];
     const details = { exact: { audit: [1, 2, 3] } };
     const result = { content, details };
     fs.writeFileSync(file, jsonl([
@@ -1108,7 +1108,7 @@ describe("native conversation reader — replacement read I/O", () => {
 describe("native conversation reader — initial recovery generation", () => {
   it.each(["missing", "initial EIO"] as const)("admits metadata-only pinned %s recovery before production replacement", (failure) => {
     const file = path.join(makeWorkspace(), "events.jsonl");
-    const message = { ...toolResultMessage("metadata-only", "full-result:" + "x".repeat(4000), 9, true),
+    const message = { ...toolResultMessage("metadata-only", "full-result:" + "x".repeat(9 * 1024), 9, true),
       metadata: { provenance: "canonical-only", nested: { retained: [1, 2, 3] } } };
     const result = { content: message.content, details: message.details, customFlag: { retained: true } };
     const args = { command: "model-free", nested: { keep: [1, 2] } };
@@ -1180,7 +1180,7 @@ describe("native conversation reader — initial recovery generation", () => {
     const file = path.join(makeWorkspace(), "events.jsonl");
     const toolCallId = "recovered-call";
     const args = { command: "model-free", nested: { keep: [1, 2] } };
-    const content = [{ type: "text", text: "full-result:" + "x".repeat(4000) }];
+    const content = [{ type: "text", text: "full-result:" + "x".repeat(9 * 1024) }];
     const details = { exact: { audits: [{ id: "nested-call", args: { path: "whole" } }] } };
     const result = { content, details, customFlag: { retained: true } };
     const partial = { content: [{ type: "text", text: "partial-only" }], details: { progress: 1 } };

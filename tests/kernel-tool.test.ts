@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { emitBeforeAgentStart } from "./helpers/emit-before-agent-start.js";
 
 const toolFor = (kernel: "typescript" | "python", pythonRuntime: "cpython" | "monty" = "cpython", mode: { fullCodeMode?: boolean; schema?: "off" | "enforce"; runtime?: "quickjs" | "node-process" } = {}) => {
   const state = {
@@ -173,7 +174,7 @@ describe("exclusive kernel tool surface", () => {
       expect(rules).not.toMatch(/\bpi\.[a-z]/);
       expect(rules).toContain(hostGlobalsGuidance(false));
       const event = { systemPrompt: "Base", prompt: "inspect", systemPromptOptions: { skills: [] } };
-      const prompt = await handlers.get("before_agent_start")![0]!(event, {});
+      const prompt = await emitBeforeAgentStart(handlers, event, {});
       expect(prompt.systemPrompt).toContain("orchestration-only mode");
       expect(prompt.systemPrompt).not.toContain("full code mode: `fabric_exec` is the only way");
       expect(prompt.systemPrompt).not.toContain("no host globals");

@@ -272,18 +272,30 @@ describe("resident host ownership", () => {
       const binding = vi.spyOn(host.actors, "resolveActivationBinding").mockResolvedValue({ model: "provider/current", thinking: "high" });
       const tell = vi.spyOn(host.actors, "tell").mockReturnValue({ messageId: "accepted" } as ReturnType<typeof host.actors.tell>);
       const ask = vi.spyOn(host.actors, "ask").mockResolvedValue({ id: "accepted" } as Awaited<ReturnType<typeof host.actors.ask>>);
-      const command = { operation, targetId: "actor", commandId: "owner-defaults", message: "keep working", binding: { model: "provider/pinned" }, bindingProvenance: { kind: "owner-defaults" as const, rootId: config.rootId } } as Parameters<typeof handler>[0];
+      const principal = { id: "paul", binding: "voice-call" as const };
+      const command = { operation, principal, targetId: "actor", commandId: "owner-defaults", message: "keep working", binding: { model: "provider/pinned" }, bindingProvenance: { kind: "owner-defaults" as const, rootId: config.rootId } } as Parameters<typeof handler>[0];
       const from = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
       const signal = new AbortController().signal;
-      await expect(handler(command, from, signal)).resolves.toMatchObject({ accepted: true, messageId: "accepted" });
+      await expect(handler(command, from, signal, "mesh")).resolves.toMatchObject({ accepted: true, messageId: "accepted" });
       const options = { overrides: { model: "provider/pinned" } };
-      if (operation === "ask") expect(ask).toHaveBeenCalledWith("actor", "keep working", undefined, signal, options);
+      const provenance = expect.objectContaining({ principal });
+      if (operation === "ask") expect(ask).toHaveBeenCalledWith("actor", "keep working", undefined, signal, { ...options, provenance });
       else {
         expect(binding).toHaveBeenCalledWith("actor", options);
-        expect(tell).toHaveBeenCalledWith("actor", "keep working", undefined, options);
+        expect(tell).toHaveBeenCalledWith("actor", "keep working", undefined, { ...options, provenance });
       }
       await expect(handler(command, { ...from, id: "session:foreign" }, signal)).resolves.toMatchObject({ accepted: false, error: "Invalid actor owner-default binding provenance" });
       expect(operation === "ask" ? ask : tell).toHaveBeenCalledOnce();
+      const { bindingProvenance: _ignored, binding: _pinned, ...resolved } = command;
+      for (const foreignBinding of [undefined, {}, { thinking: "medium" as const }]) {
+        await expect(handler({ ...resolved, ...(foreignBinding ? { binding: foreignBinding } : {}) }, { ...from, id: "session:foreign" }, signal, "bridge")).resolves.toMatchObject({ accepted: true });
+        const foreignOptions = { binding: foreignBinding ?? {} };
+        if (operation === "ask") expect(ask).toHaveBeenLastCalledWith("actor", "keep working", undefined, signal, { ...foreignOptions, provenance });
+        else {
+          expect(binding).toHaveBeenLastCalledWith("actor", foreignOptions);
+          expect(tell).toHaveBeenLastCalledWith("actor", "keep working", undefined, { ...foreignOptions, provenance });
+        }
+      }
     } finally {
       control.mockRestore();
       await host.close();

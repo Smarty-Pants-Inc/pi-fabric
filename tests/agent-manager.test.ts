@@ -1849,7 +1849,11 @@ describe("AgentManager", () => {
       timeoutMs: 5_000,
     });
     expect(native.status).toBe("completed");
-    expect(JSON.parse(native.text).extensionPath).toBeUndefined();
+    // --no-extensions disables Fabric/discovery, not explicitly installed host helpers.
+    // Principal delivery stays available for later admitted steering without widening tools.
+    expect(JSON.parse(native.text).extensionPaths).toEqual([
+      path.resolve("src/worker/principal-delivery.ts"),
+    ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,
       tools: ["read"],

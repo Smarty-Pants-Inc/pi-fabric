@@ -1,3 +1,4 @@
+import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -51,6 +52,8 @@ import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 
 export interface ActorMessageBindingOptions {
+  /** Host-only admitted requester snapshot, separate from payload and bindings. */
+  provenance?: FabricTurnProvenance | undefined;
   /** Per-call values layered over this session binding. */
   overrides?: FabricActorRunBinding;
   /** Already-resolved caller view received through the owner control plane. */
@@ -60,6 +63,7 @@ export interface ActorMessageBindingOptions {
 }
 
 interface ActorQueueItem {
+  provenance?: FabricTurnProvenance | undefined;
   id: string;
   source: string;
   payload: unknown;
@@ -1157,6 +1161,8 @@ export class ActorManager {
     message: string,
     kind: "steer" | "followUp",
     data?: unknown,
+    principal?: FabricPrincipal,
+    signal?: AbortSignal,
   ): Promise<{ queued: true; messageId: string; routed: "mesh" }> {
     if (!this.meshConfig.enabled) {
       throw new Error("Fabric mesh is disabled; cannot steer a remote agent");
@@ -1164,6 +1170,8 @@ export class ActorManager {
     if (!message.trim()) throw new Error("Steering message must not be empty");
     const event = await this.mesh.publish({
       topic: "fabric.steer",
+      principal,
+      signal,
       kind,
       from: this.identity,
       to: targetId,
@@ -2140,6 +2148,7 @@ export class ActorManager {
         .find((item) => item.coalesceKey === options.coalesceKey);
       if (existing) {
         existing.payload = structuredClone(payload);
+        existing.provenance = options.provenance ? structuredClone(options.provenance) : undefined;
         if (options.images && options.images.length > 0) {
           existing.images = options.images.map((image) => ({ ...image }));
         } else {
@@ -2164,6 +2173,7 @@ export class ActorManager {
     const itemId = randomUUID();
     const item: ActorQueueItem = {
       id: itemId,
+      ...(options.provenance ? { provenance: structuredClone(options.provenance) } : {}),
       source,
       payload: structuredClone(payload),
       ...(options.images && options.images.length > 0
@@ -2341,6 +2351,7 @@ export class ActorManager {
               this.#runningActor(actor.id)?.abortController === abortController &&
               actor.status !== "stopped" && this.#actors.has(actor.id) &&
               this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id),
+            () => this.#downgradeOutputPrincipal(actor, item),
           );
           runId = result.id;
           // Captured before any check that can throw: a completed run is never parked and
@@ -2397,6 +2408,8 @@ export class ActorManager {
             throw new Error(result.error || `Actor run ${result.status}`);
           }
           const message = this.#outgoingMessage(actor, item, result);
+          const principal = this.agents.outputPrincipal(result.id);
+          if (principal) message.principal = principal;
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
           this.#failureStreaks.delete(actor.id);
@@ -2412,6 +2425,7 @@ export class ActorManager {
           await this.mesh
             .publish({
               topic: "fabric.actor.output",
+              principal: message.principal,
               kind: message.action ?? "message",
               from: { id: actor.id, name: actor.name, kind: "actor", sessionId: this.sessionId },
               ...(message.text ? { text: message.text } : {}),
@@ -2560,6 +2574,16 @@ export class ActorManager {
     }
   }
 
+  #downgradeOutputPrincipal(actor: ManagedActor, item: ActorQueueItem): void {
+    if (item.provenance) delete item.provenance.principal;
+    // Caller-owned asks are not recovered; durable callerless activations must commit
+    // their cumulative lineage before the child can consume the foreign/UNKNOWN input.
+    if (this.#persistent && !item.resolve && !item.reject &&
+      (this.#inFlight.get(actor.id) !== item || !this.#persistQueue(actor.id, true))) {
+      throw new Error(`Cannot persist output-principal downgrade for Fabric actor ${actor.id}; steering rejected`);
+    }
+  }
+
   #runRequest(
     actor: ManagedActor,
     item: ActorQueueItem,
@@ -2569,6 +2593,7 @@ export class ActorManager {
     capabilityDigest?: string,
   ): AgentRunRequest {
     return {
+      ...(item.provenance ? { provenance: structuredClone(item.provenance) } : {}),
       task: [
         `Fabric actor message from ${item.source}:`,
         JSON.stringify({ source: item.source, payload: item.payload, id: item.id }, null, 2),
@@ -2807,6 +2832,8 @@ export class ActorManager {
     const target = event.to;
     if (!target) return;
     const kind = event.kind === "followUp" ? "followUp" : "steer";
+    const provenance = event.verification === "mesh" || event.verification === "bridge"
+      ? fabricTurnProvenance(event.from, kind, event.verification, event.principal) : undefined;
     const message = typeof event.text === "string" ? event.text : "";
     if (!message) return;
     if (this.#relayParticipantSteering) {
@@ -2815,6 +2842,7 @@ export class ActorManager {
           this.#mainAgent.deliverAgent({
             from: event.from,
             ...(event.verification === undefined ? {} : { verification: event.verification }),
+            principal: event.principal,
             message,
             delivery: kind,
             ...(event.data === undefined ? {} : { data: event.data }),
@@ -2826,8 +2854,8 @@ export class ActorManager {
       }
       try {
         this.agents.status(target);
-        if (kind === "steer") this.agents.steer(target, message);
-        else this.agents.followUp(target, message);
+        if (kind === "steer") this.agents.steer(target, message, undefined, provenance);
+        else this.agents.followUp(target, message, undefined, provenance);
         return;
       } catch (error) {
         if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
@@ -2837,7 +2865,7 @@ export class ActorManager {
     }
     try {
       const actor = this.#requireActor(target);
-      this.tell(actor.id, message, event.data);
+      this.tell(actor.id, message, event.data, { provenance });
     } catch {
       /* target lives in another process or is unknown — best-effort drop */
     }
@@ -2880,6 +2908,8 @@ export class ActorManager {
           // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
           // so a joined key could merge two topics' subjects. Keeps the value's type.
           this.#enqueue(actor, `mesh:${event.topic}`, event, {
+            ...(event.verification === "mesh" || event.verification === "bridge"
+              ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
             ownershipChecked: true,
             // Work waits for room; the monitor offers it again (smarty-dev#754).
             ...(event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
@@ -3375,7 +3405,7 @@ export class ActorManager {
 
   // Returns whether this lineage's file now holds the actor's work. Only then are the predecessor
   // files it took over deleted (review/astra F5 on #79): a failed write keeps them for the next load.
-  #persistQueue(actorId: string): boolean {
+  #persistQueue(actorId: string, durable = false): boolean {
     if (!this.#persistent || this.#closing) return false;
     const actor = this.#actors.get(actorId);
     if (!actor) return false;
@@ -3393,12 +3423,15 @@ export class ActorManager {
           return [JSON.parse(JSON.stringify({
             id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
             activation: item.activation, binding: item.binding, bindingMode: item.bindingMode, bindingVersion: 2,
+            principalLineageVersion: 1,
+            ...(item.provenance ? { provenance: item.provenance } : {}),
             ...(item.images ? { images: item.images } : {}),
             ...(item.coalesceKey ? { coalesceKey: item.coalesceKey } : {}),
             attempts: (item as ActorQueueItem & { attempts?: number }).attempts ?? 0,
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
           }))];
-        } catch {
+        } catch (error) {
+          if (durable) throw error;                         // a security fence cannot omit an activation
           return [];
         }
       });
@@ -3406,7 +3439,7 @@ export class ActorManager {
         writeJsonAtomic(file, {
           format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
           mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
-        });
+        }, { durable });
       }
     } catch {
       return false;                                         // best-effort; memory still runs the work
@@ -3483,17 +3516,22 @@ export class ActorManager {
     const restored: ActorQueueItem[] = [];
     for (const record of records) {
       if (typeof record !== "object" || record === null) continue;
-      const value = record as Partial<ActorQueueItem> & { attempts?: unknown };
+      const value = record as Partial<ActorQueueItem> & { attempts?: unknown; principalLineageVersion?: unknown };
       if (
         typeof value.id !== "string" || typeof value.source !== "string" || held.has(value.id) ||
         typeof value.createdAt !== "number" || typeof value.activation !== "object" || value.activation === null
       ) continue;
       const attempts = (typeof value.attempts === "number" ? value.attempts : 0) + 1;
+      const provenance = copyFabricProvenance(value.provenance);
+      // Old records may still name the launch requester after native-session steering.
+      // Even an unmarked item can have run: older snapshots did not always mark in-flight work.
+      if (provenance && value.principalLineageVersion !== 1) delete provenance.principal;
       const item = {
         id: value.id,
         source: value.source,
         payload: value.payload,
         createdAt: value.createdAt,
+        ...(provenance ? { provenance } : {}),
         activation: shift(value.activation as FabricActorActivation),
         // Old mesh/host bindings were enqueue-time defaults. Old direct bindings may be
         // genuine resolved caller views: preserve them conservatively. Unmarked version 2
@@ -3928,6 +3966,7 @@ export class ActorManager {
       }
       if (this.#newerEvent(item, first)) {
         first.payload = item.payload;
+        first.provenance = item.provenance ? structuredClone(item.provenance) : undefined;
         if (item.images) first.images = item.images;
         else delete first.images;
         first.createdAt = item.createdAt;

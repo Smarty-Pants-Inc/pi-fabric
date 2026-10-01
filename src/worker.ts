@@ -14,6 +14,7 @@ import type {
 } from "./agents/types.js";
 import { applyChildPriority } from "./agents/priority.js";
 import { readProcessIdentity } from "./core/process-identity.js";
+import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -289,6 +290,10 @@ const main = async (): Promise<void> => {
       ? options.thinking
       : undefined;
   const task = fs.readFileSync(options.taskFile, "utf8");
+  const taskProvenance = fs.existsSync(options.taskFile + ".provenance.json")
+    ? copyFabricProvenance(JSON.parse(fs.readFileSync(options.taskFile + ".provenance.json", "utf8"))) : undefined;
+  const deliveryDirectory = path.join(path.dirname(options.taskFile), "deliveries");
+  fs.mkdirSync(deliveryDirectory, { recursive: true, mode: 0o700 });
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
   // Append, never overwrite: retries have distinct workers/runners, and a dead host may
@@ -360,6 +365,9 @@ const main = async (): Promise<void> => {
     piArguments.push("-e", hookPath, "--no-auto-compaction");
   }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
+  const deliveryHook = fileURLToPath(new URL(
+    import.meta.url.endsWith(".ts") ? "./worker/principal-delivery.ts" : "./worker/principal-delivery.js", import.meta.url));
+  piArguments.push("-e", deliveryHook);
   // smarty-dev#967: a structured Pi run replies through one tool call, never its final text.
   const replyTool = options.replyTool === true && options.runner === "pi" && schema !== undefined;
   const replyFile = replyTool ? path.join(path.dirname(options.statusFile), "reply.json") : undefined;
@@ -467,6 +475,7 @@ const main = async (): Promise<void> => {
       PI_FABRIC_ACTIVATION_WORKER_PID: activationWindow ? String(process.pid) : "",
       PI_FABRIC_ACTIVATION_NONCE: activationNonce ?? "",
       PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",
+      PI_FABRIC_DELIVERY_DIR: deliveryDirectory,
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
       PI_FABRIC_AGENT_NAME: options.name,
@@ -570,6 +579,15 @@ const main = async (): Promise<void> => {
 
   // Auth checks and model_select hooks can be slow under concurrent launches.
   // Startup and admission share the overall run timeout below, not a shorter cap.
+  const sendPiDelivery = (message: string, provenance: FabricTurnProvenance | undefined, delivery: "steer" | "followUp", images?: readonly ImageContent[]): void => {
+    if (!provenance?.principal) {
+      child.stdin?.write(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message }) + "\n");
+      return;
+    }
+    const id = randomUUID();
+    fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({ message, provenance, delivery, images }), { mode: 0o600 });
+    child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n");
+  };
   let activationWindowReady = false;
   const modelControl = new PiModelControl(options.id, options.model, thinking, {
     send(frame) {
@@ -592,7 +610,8 @@ const main = async (): Promise<void> => {
         record.thinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
       update();
-      child.stdin?.write(`${JSON.stringify({ type: "prompt", message: task, ...(images.length > 0 ? { images } : {}) })}\n`);
+      if (taskProvenance?.principal) sendPiDelivery(task, taskProvenance, "steer", images);
+      else child.stdin?.write(`${JSON.stringify({ type: "prompt", message: task, ...(images.length > 0 ? { images } : {}) })}\n`);
     },
     fail(error) {
       if (terminalStatus) return;
@@ -1016,16 +1035,12 @@ const main = async (): Promise<void> => {
       toolCallStreamGuard.observe(event);
       if (terminalStatus) return;
     }
-    if (event.type === "message_update" && !terminalStatus) {
-      const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
-      if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
-          typeof delta.delta === "string" && delta.delta.length > 0) recoveryWatchdog.progress();
-    }
+    if (!terminalStatus) recoveryWatchdog.observe(event);
     if (event.type === "agent_start") {
       emitLifecycle("pi.agent_start");
       retryPending = false;
-      // Starting a retry is not proof of recovery: preserve the error and timer
-      // until the model actually produces output.
+      // Starting a retry is not proof of acceptance: preserve the error and timer
+      // until the provider starts a new assistant response.
       return;
     }
     if (event.type === "auto_retry_start" && !terminalStatus) {
@@ -1248,7 +1263,7 @@ const main = async (): Promise<void> => {
         const line = raw.trim();
         if (!line) continue;
         processedCommands += 1;
-        let command: { type?: string; message?: string; mode?: string; instructions?: string };
+        let command: { type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown };
         try {
           command = JSON.parse(line);
         } catch {
@@ -1283,9 +1298,9 @@ const main = async (): Promise<void> => {
             // headless prompt per invocation. The command is dropped, never
             // forwarded to pi-style stdin frames.
           } else if (command.type === "steer" && typeof command.message === "string") {
-            child.stdin?.write(JSON.stringify({ type: "steer", message: command.message }) + "\n");
+            sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "steer");
           } else if (command.type === "follow_up" && typeof command.message === "string") {
-            child.stdin?.write(JSON.stringify({ type: "follow_up", message: command.message }) + "\n");
+            sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp");
           } else if (command.type === "set_steering_mode" && typeof command.mode === "string") {
             child.stdin?.write(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
           } else if (command.type === "set_follow_up_mode" && typeof command.mode === "string") {

@@ -517,6 +517,46 @@ describe("Main followUp drain (unit)", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  // smarty-dev#2793 R2: Pi's deadline aborts the manual controller without owner intent.
+  it.each([0, 120_000].flatMap(flushMs => ["timeout", "owner", "timeout-after-owner-stop"].map(reason => ({ flushMs, reason }))))(
+    "$reason distinguishes operation recovery from durable owner authority (flushMs=$flushMs)",
+    ({ flushMs, reason }) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-deadline-"));
+      const journal = path.join(root, "journal.json");
+      fs.writeFileSync(`${journal}.delivered`, JSON.stringify({ version: 1, ids: [] }));
+      const { pi, sent, emit } = fakePi();
+      const state = { idle: false };
+      const ctx = context(state);
+      const main = new MainAgentController(pi, "session:root", true, root, "root");
+      const stopped = reason !== "timeout";
+      main.attachFollowUpDrain(ctx, flushMs, journal);
+      try {
+        const operation = new AbortController();
+        emit("session_before_compact", { reason: "manual", signal: operation.signal }, ctx);
+        if (reason === "timeout-after-owner-stop") main.halt();
+        operation.abort(reason === "owner" ? undefined : new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
+        state.idle = true;
+        emit("session_compact_failed", { reason: "manual", aborted: reason === "owner", willRetry: false,
+          errorMessage: reason === "owner" ? undefined : "Compaction failed: Compaction exceeded its 20-minute deadline" }, ctx);
+        main.deliverAgent({ from: from("peer"), message: "peer before recovery", delivery: "followUp" });
+        expect(sent.at(-1)!.options.triggerTurn).toBe(false); // Recoverable provider gate or real owner gate.
+        expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+        emit("session_before_compact", { reason: "manual", signal: new AbortController().signal }, ctx);
+        emit("session_compact", { reason: "manual" }, ctx); // Recovery, NOT user input.
+        main.deliverAgent({ from: from("peer"), message: "peer after recovery", delivery: "steer" });
+        expect(sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+        main.closeFollowUpDrain();
+        main.attachFollowUpDrain(ctx, flushMs, journal);
+        main.deliverAgent({ from: from("peer"), message: "fresh peer after reload", delivery: "followUp" });
+        expect(sent.at(-1)!.options.triggerTurn).toBe(!stopped);
+        expect(JSON.parse(fs.readFileSync(`${journal}.delivered`, "utf8")).halted).toBe(stopped ? true : undefined);
+      } finally {
+        main.closeFollowUpDrain();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("drops the pending wake when a later compaction is cancelled, a run starts, or the drain closes", () => {
     for (const end of ["cancelled", "run", "closed"] as const) {
       const { main, sent, emit, ctx, state } = setup();
@@ -1107,7 +1147,7 @@ describe("Main benign compaction rejection and owner cancellation in a real Pi s
 // smarty-dev#2793 S7: session_compact is not terminal while later handlers still run.
 describe("Main manual compaction completion authority in a real Pi session", () => {
   const cases = [0, 60_000].flatMap(flushMs => (["followUp", "steer"] as const).flatMap(delivery =>
-    (["late-owner-abort", "success", "declined"] as const).map(outcome => ({ flushMs, delivery, outcome }))));
+    (["late-owner-abort", "late-deadline", "success", "declined"] as const).map(outcome => ({ flushMs, delivery, outcome }))));
   it.each(cases)(
     "$outcome retains native cancellation evidence through completion and reload (flushMs=$flushMs, delivery=$delivery)",
     async ({ flushMs, delivery, outcome }) => {
@@ -1169,7 +1209,13 @@ describe("Main manual compaction completion authority in a real Pi session", () 
           expect(session.isIdle).toBe(false);
           expect(starts).toBe(initialStarts);
           if (stopped) session.abortCompaction(); // Native SDK cancellation, never main.halt().
-          expect(operation?.aborted).toBe(stopped);
+          if (outcome === "late-deadline") {
+            // Pi 0.87.0 has no deadline timer; exercise the same native controller/reason
+            // used by installed Pi 0.87.1 without waiting twenty minutes.
+            (session as unknown as { _compactionAbortController: AbortController })._compactionAbortController
+              .abort(new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
+          }
+          expect(operation?.aborted).toBe(stopped || outcome === "late-deadline");
           releaseCompletion!();
           await compacting; // Pi versions differ on whether late abort emits compact_failed.
         }

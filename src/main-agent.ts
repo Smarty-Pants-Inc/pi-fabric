@@ -8,6 +8,10 @@ import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 
 const MAIN_AGENT_ALIAS = "main";
+
+/** Mirror Pi's operation cancellation test: its native deadline is a recoverable failure. */
+const isCompactionCancelled = (signal: AbortSignal | undefined): boolean =>
+  signal?.aborted === true && !(signal.reason instanceof DOMException && signal.reason.name === "TimeoutError");
 export type FabricAgentMessageDelivery = "steer" | "followUp";
 /** How a direct agent message goes to Pi: a nextTurn one waits for the next user prompt. */
 export type FabricMainAgentDelivery = FabricAgentMessageDelivery | "nextTurn";
@@ -889,7 +893,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       else if (reason !== undefined) this.#providerFailed = false;
     });
     const settleGate = (event: { outcome?: string }, ctx: ExtensionContext): void => {
-      if (ctx.signal?.aborted || this.#compactionDecline?.aborted ||
+      if (ctx.signal?.aborted || isCompactionCancelled(this.#compactionDecline) ||
         (event.outcome === "aborted" && !this.#compactionDecline)) this.halt();
       else if (event.outcome === "error") { this.#providerFailed = true; this.#stopWake(); }
       else if (event.outcome === "completed") this.#providerFailed = false;
@@ -905,9 +909,10 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#compactionDecline = undefined;
       // Native manual cancellation is owner intent even when Pi has already emitted
       // session_compact and is awaiting later handlers (some hosts emit no late failure).
+      // Pi uses the same controller for its deadline, which is NOT owner intent.
       if (event.reason === "manual" && event.signal) {
         const signal = event.signal;
-        const cancelled = () => this.halt();
+        const cancelled = () => { if (isCompactionCancelled(signal)) this.halt(); };
         signal.addEventListener("abort", cancelled, { once: true });
         this.#offOperationAbort = () => signal.removeEventListener("abort", cancelled);
         if (signal.aborted) cancelled();
@@ -917,10 +922,11 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#context = ctx;
       // The aborted bit alone is ambiguous: an earlier handler may decline and stop
       // dispatch before we see the signal. Escape/halt is explicit; a seen signal
-      // proves cancellation. Never manufacture durable owner intent from a decline.
+      // proves cancellation unless the native deadline expired. Never manufacture
+      // durable owner intent from a decline or recoverable operation timeout.
       const decline = takeCompactionDecline(this.pi);
       const operation = decline && decline.reason === event.reason ? decline.signal : this.#operation;
-      const ownerCancelled = ctx.signal?.aborted || (event.aborted && operation?.aborted);
+      const ownerCancelled = ctx.signal?.aborted || (event.aborted && isCompactionCancelled(operation));
       // Exact Pi no-op outcomes, with or without the host's error envelope. A provider
       // error merely quoting these phrases is still a recoverable failure, not a no-op.
       const message = event.errorMessage?.replace(/^Compaction failed: /, "");

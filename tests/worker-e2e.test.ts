@@ -390,7 +390,9 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     // This ordinary, uniquely paired log is well within every work bound.
     // A platform-wide durability failure must not masquerade as an accepted fallback.
     expect(result.compactionSkipped).toBeUndefined();
-    expect(end.result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify({ content }), "utf8") });
+    // The projected result (image data stubbed) is small, so it stays inline (B72 small-result contract).
+    expect(Buffer.byteLength(JSON.stringify({ content }), "utf8")).toBeLessThanOrEqual(8192);
+    expect(end.result).toEqual({ content });
   }, 30_000);
 
   it.each(["oversized-final", "oversized-error"])(

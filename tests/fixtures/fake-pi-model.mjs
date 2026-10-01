@@ -45,7 +45,7 @@ process.stdin.on("data", chunk => {
       reply(model);
       if (behavior === "reswitch") model = wrong;
     } else if (frame.type === "set_thinking_level") {
-      thinkingLevel = frame.level;
+      thinkingLevel = behavior === "effort-downgrade" ? "low" : frame.level;
       reply();
     } else if (frame.type === "get_state") {
       reply(behavior === "malformed" ? {} : {
@@ -58,7 +58,7 @@ process.stdin.on("data", chunk => {
     } else if (frame.type === "prompt") {
       emit({ type: "agent_start" });
       const actual = behavior === "drift" ? wrong : model;
-      const message = { role: "assistant", provider: actual.provider, model: actual.id, content: [{ type: "text", text: "correct model ran" }], stopReason: "stop", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } };
+      const message = { role: "assistant", provider: actual.provider, model: actual.id, content: [{ type: "text", text: behavior === "refusal" ? "I refuse this judgment." : "correct model ran" }], stopReason: "stop", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } };
       emit({ type: "message_start", message });
       emit({ type: "message_end", message });
       // Late events must never erase the model mismatch failure.

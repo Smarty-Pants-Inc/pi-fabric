@@ -914,7 +914,7 @@ export class AgentManager {
     let routeDispatch: ReturnType<typeof import("./model-route.js")["prepareRouteDispatch"]> | undefined;
     if (request.routeDecision) {
       const { prepareRouteDispatch } = await import("./model-route.js");
-      routeDispatch = prepareRouteDispatch(request.routeDecision, selectedCwd, path.join(this.#runRoot, id), id);
+      routeDispatch = prepareRouteDispatch(request.routeDecision, selectedCwd, path.join(this.#runRoot, id), id, request.routeRecord);
     }
     const startPrepared = async (release: () => void, signal = callerSignal): Promise<AgentHandleInfo> => {
       try {
@@ -1072,6 +1072,7 @@ export class AgentManager {
           ...(model ? ["--model", model] : []),
           ...(thinking ? ["--thinking", thinking] : []),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
+          ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
           ...(sessionFile ? ["--session-file", sessionFile] : []),
           ...(request.inferenceContext ? ["--inference-context", request.inferenceContext] : []),
@@ -1963,6 +1964,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.startupAttempts >= AGENT_STARTUP_MAX_ATTEMPTS ||
       managed.settled ||
@@ -2007,6 +2009,7 @@ export class AgentManager {
     deadline: number,
   ): Promise<boolean> {
     if (
+      managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
       managed.settled ||
       this.#closing ||

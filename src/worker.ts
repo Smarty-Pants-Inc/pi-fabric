@@ -335,6 +335,7 @@ const main = async (): Promise<void> => {
   if (options.sessionFile) piArguments.push("--session", options.sessionFile);
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
+  if (options.judgment) piArguments.push("--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction");
   const activationWindow = options.inferenceContext === "activation";
   const activationNonce = activationWindow ? randomUUID() : undefined;
   let activationHookPath: string | undefined;
@@ -390,7 +391,7 @@ const main = async (): Promise<void> => {
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
   if (options.model) piArguments.push("--model", options.model);
   if (thinking) piArguments.push("--thinking", thinking);
-  if (options.systemPrompt) piArguments.push("--append-system-prompt", options.systemPrompt);
+  if (options.systemPrompt) piArguments.push(options.judgment ? "--system-prompt" : "--append-system-prompt", options.systemPrompt);
   if (schema) {
     piArguments.push(
       "--append-system-prompt",
@@ -584,6 +585,10 @@ const main = async (): Promise<void> => {
     },
     admitted(model, effectiveThinking) {
       if (terminalStatus) return;
+      if (options.judgment && effectiveThinking !== thinking) {
+        modelControl.fail("judgment effort pin was not admitted; task was not sent");
+        return;
+      }
       if (activationWindow && !activationWindowReady) {
         modelControl.fail("activation window hook did not acknowledge readiness; task was not sent");
         return;

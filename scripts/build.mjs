@@ -8,6 +8,7 @@ const primaryEntryPoints = [
   "src/mesh.ts",
   "src/mesh-bridge.ts",
   "src/participants-cli.ts",
+  "src/judge-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/jev.ts",
@@ -32,6 +33,7 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/judge/agent.ts",
   "src/lifecycle/reload-target-profile.ts",
   "src/coordination/unverified-ids.ts",
   "src/core/provider-operations.ts",

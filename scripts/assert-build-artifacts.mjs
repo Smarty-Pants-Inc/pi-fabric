@@ -15,6 +15,7 @@ const stable = [
   "agents.js",
   "jev.js",
   "protocol.js",
+  "judge-cli.js",
   "core/provider-operations.js",
   "worker.js",
   "residency/host.js",
@@ -30,6 +31,7 @@ const stable = [
   "providers/memory-provider.js",
 ];
 const lazy = [
+  "judge/agent.js",
   "lifecycle/reload-target-profile.js",
   "coordination/unverified-ids.js",
   "agents/model-route.js",
@@ -171,6 +173,8 @@ if (actorBashHookFiles.size !== 1) {
 const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
 if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
 if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
+if (/src\/judge(?:\/|-cli)/.test(initialSource)) throw new Error("Judge code escaped into startup graph");
+if (manifest.bin?.["fabric-judge"] !== "./bin/fabric-judge" || !existsSync(join(root, "bin/fabric-judge"))) throw new Error("Missing fabric-judge bin");
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));
 const lazySource = [...lazyFiles].map((file) => readFileSync(file, "utf8")).join("\n");
 const mandatoryPowerShellFactoryImport =

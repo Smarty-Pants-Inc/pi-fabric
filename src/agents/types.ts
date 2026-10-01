@@ -44,6 +44,8 @@ export interface AgentSessionSeed {
 export interface AgentRunRequest {
   /** Host-created shadow decision; never accepted from external argument normalization. */
   routeDecision?: ModelRouteDecision;
+  /** Host-only judgment join; never normalized from public agent arguments. */
+  routeRecord?: { ledger: string; decisionRecorded: boolean };
   task: string;
   images?: ImageContent[];
   name?: string;
@@ -238,6 +240,8 @@ export interface AgentWorkerOptions {
   bashTimeoutSeconds?: number;
   fabricExtensionPath?: string;
   routeHeader?: string;
+  /** Host-only bounded judge: no ambient resources, compaction or retry. */
+  judgment?: boolean;
   model?: string;
   thinking?: string;
   systemPrompt?: string;

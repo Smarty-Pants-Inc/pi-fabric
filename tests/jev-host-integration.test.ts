@@ -13,6 +13,42 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import type { JevRunInfo } from "../src/jev/types.js";
 
 describe("Main lifecycle to Jev observer integration", () => {
+  it.each(["deny", "ask", "auto", "allow"] as const)("SR-5 shadow inference requires explicit current network allow: %s", async network => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-shadow-authority-"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent")); vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
+    const pi = { events: { emit: vi.fn() }, getThinkingLevel: () => "high", sendMessage: vi.fn(), appendEntry: vi.fn(), on: vi.fn(() => () => {}) } as unknown as ExtensionAPI;
+    const available = [{ provider: "test", id: "sol" }];
+    const credential = vi.fn(async () => "offline-test-only");
+    const http = vi.fn(async () => new Response(JSON.stringify({ model: "jev-latest", answers: { route: { type: "choice", choice: "candidate-0", confidence: 1, probabilities: { "candidate-0": 1 } } }, usage: { input_tokens: 1, output_tokens: 1 } })));
+    vi.stubGlobal("fetch", http);
+    const context = { cwd, hasUI: false, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+      modelRegistry: { getAvailable: () => available, find: () => available[0], getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "offline-test-only", headers: {} }), getProviderAuthStatus: () => ({ configured: true }), getApiKeyForProvider: credential },
+      sessionManager: { getSessionId: () => "shadow-authority", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined }, ui: { setStatus: vi.fn(), notify: vi.fn() } } as unknown as ExtensionContext;
+    const config = normalizeFabricConfig({ fullCodeMode: true, mcp: { enabled: false }, mesh: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false }, agents: { enabled: true, nice: 19 }, approvals: { agent: "allow", execute: "allow", read: "allow", network } });
+    const fixture = path.join(cwd, "unused.mjs"); fs.writeFileSync(fixture, "export default {};");
+    const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: { extension: fixture, worker: path.resolve("tests/fixtures/fake-worker.mjs"), residentHost: fixture, skills: cwd } });
+    // The real registry approves the agent action only. That is not a network grant.
+    const approve = vi.fn(async (action: { risk: string }) => { if (action.risk !== "agent" && action.risk !== "read") throw new Error("network not approved"); });
+    const invocation = { cwd, signal: undefined, parentToolCallId: "shadow", nestedToolCallId: "shadow", extensionContext: context, update() {}, approve, audits: [], maxResultChars: 32768 };
+    const spawn = () => runtime.registry.invoke("agents.spawn", { task: "lookup", model: "auto", pinModel: "test/sol", pinThinking: "high", routeClass: "bounded-lookup", protected: false }, invocation) as Promise<{ id: string; routeDecision: { reasonCode: string } }>;
+    try {
+      await runtime.initialize(context, config);
+      const handle = await spawn();
+      expect(handle).toMatchObject({ model: "test/sol", routeDecision: { reasonCode: network === "allow" ? "shadow-choice" : "jev-error", model: "test/sol" } });
+      await runtime.registry.invoke("agents.wait", { id: handle.id }, invocation);
+      expect(credential).toHaveBeenCalledTimes(network === "allow" ? 1 : 0); expect(http).toHaveBeenCalledTimes(network === "allow" ? 1 : 0);
+      const rows = fs.readFileSync(path.join(cwd, "agent/fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(rows).toHaveLength(2); expect(rows[0].reasonCode).toBe(network === "allow" ? "shadow-choice" : "jev-error"); expect(rows[1].decisionId).toBe(rows[0].decisionId);
+      if (network === "allow") {
+        // Current policy is consulted again, not cached at provider installation.
+        runtime.config.approvals.network = "deny";
+        const denied = await spawn(); expect(denied.routeDecision.reasonCode).toBe("jev-error");
+        await runtime.registry.invoke("agents.wait", { id: denied.id }, invocation);
+        expect(credential).toHaveBeenCalledTimes(1); expect(http).toHaveBeenCalledTimes(1);
+      }
+    } finally { await runtime.shutdown(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  }, 30000);
+
   it.each(["credential", "inference"])("R2 revokes and joins routing on Jev retirement during %s and permits fresh generation", async phase => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-jev-route-owner-"));
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent")); vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);

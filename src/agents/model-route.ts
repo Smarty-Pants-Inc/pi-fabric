@@ -136,16 +136,17 @@ export function appendRouteRecord(file: string, record: object): void {
 }
 
 export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string, runDirectory: string, childId: string, options: { ledger?: string; decisionRecorded?: boolean } = {}): {
-  header: string; sessionFile?: string; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
+  header: string; sessionFile?: string; bindCwd: (cwd: string) => void; outcome: (result: Pick<AgentRunResult, "status"> & Partial<AgentRunResult>) => void;
 } {
   const file = options.ledger ?? path.join(resolveAgentDir(), "fabric", "model-routing.jsonl");
   let sessionFile: string | undefined;
+  const sessionHeader = { type: "session", version: CURRENT_SESSION_VERSION,
+    id: childId, timestamp: new Date().toISOString(), cwd };
   try {
     // Seed a real native Pi session so the decision's child ID is not a guessed transport ID.
     fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
     const childSessionFile = path.join(runDirectory, "route-session.jsonl");
-    fs.writeFileSync(childSessionFile, `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION,
-      id: childId, timestamp: new Date().toISOString(), cwd })}\n`, { mode: 0o600 });
+    fs.writeFileSync(childSessionFile, `${JSON.stringify(sessionHeader)}\n`, { mode: 0o600 });
     sessionFile = childSessionFile;
     if (!options.decisionRecorded) appendRouteRecord(file, { type: "decision", ...decision, childSessionId: childId, childAgentId: childId, at: Date.now() });
   } catch (error) {
@@ -160,6 +161,13 @@ export function prepareRouteDispatch(decision: ModelRouteDecision, cwd: string, 
   const pendingFile = path.join(runDirectory, "pending-route-outcome.json");
   return {
     header: routeHeader(decision), ...(sessionFile ? { sessionFile } : {}),
+    bindCwd(finalCwd) {
+      if (!sessionFile || finalCwd === sessionHeader.cwd) return;
+      // Pi opens --session using its header cwd, not the transport's launch cwd.
+      // Only the pristine seed is rebound; retries/resumes keep this same native ID.
+      // A failed rebind must refuse launch rather than fall back to the parent seed.
+      writeJsonAtomic(sessionFile, { ...sessionHeader, cwd: finalCwd }, { durable: true, newline: true });
+    },
     outcome(result) {
       if (appended) return;
       pendingRecord ??= { type: "outcome", decisionId: decision.decisionId, childSessionId: childId,

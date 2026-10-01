@@ -74,6 +74,11 @@ answer, backend error or timeout records a fixed reason and uses the pin. Caller
 cancellation still cancels launch. The existing Jev provider/client supplies the
 backend; `jev.enabled: false`, Schema enforce's unavailable Jev programs, or owner
 retirement yields `jev-error` and pinned dispatch rather than relaxing that gate.
+Optional shadow inference also requires the current host `approvals.network` to
+be explicitly `"allow"`. Agent approval, inherited/session grants, and network
+`"ask"`/`"auto"`/`"deny"` do not authorize this internal call: these cases record
+`jev-error` and dispatch the pin without resolving Jev credentials or sending HTTP.
+This deliberately stricter opt-in does not change normal `jev.evaluate` approvals.
 Evaluation captures the Jev generation's revocation signal; retirement revokes
 evaluations and aborts network work. Cleanup also joins the real host credential
 lookup, not just its abort-raced waiter. The host lookup has no cancellation API:
@@ -97,6 +102,12 @@ records to 64 KiB and the ledger to 64 MiB. Writes use append and `fsync`. This 
 Main/child native session IDs, class, role pin, candidates, shadow choice,
 confidence, probability, fixed reason, latency and time. A seeded native child
 session binds the recorded child ID to Pi, not just to the process transport.
+For worktree tasks, its header is atomically rebound to the final worktree cwd
+before launch; a failed rebind settles preparation failure instead of launching
+against the parent checkout. Retries and resumes retain that session and child ID.
+Once the terminal join is durable and workers have exited, `route-session.jsonl`
+is an owned run artifact collected by normal close/expiry retention. Pending
+outcomes, unresolved workers, links and unknown content still veto collection.
 Terminal `outcome` rows join on `decisionId`, with status, verified admitted model
 and effort, observed model, token/cache/cost counters when known and time.
 Pre-admission failures record null admission, not the requested model. Confirmed

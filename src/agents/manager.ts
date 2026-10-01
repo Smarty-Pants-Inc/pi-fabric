@@ -992,6 +992,9 @@ export class AgentManager {
       }
 
       try {
+        // Keep the durable decision before preparation, but bind Pi's runtime cwd
+        // after the worktree lease exists and before every transport launch path.
+        routeDispatch?.bindCwd(agentCwd);
         const sessionFile = request.sessionSeed
           ? writeHandoffSession(
               request.sessionSeed,

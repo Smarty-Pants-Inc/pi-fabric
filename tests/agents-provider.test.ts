@@ -1051,7 +1051,7 @@ describe("AgentsProvider actor session reset", () => {
     fs.mkdirSync(path.dirname(actor.sessionFile!), { recursive: true });
     fs.writeFileSync(actor.sessionFile!, "{}\n");
     await expect(provider.invoke("resetSession", { id: actor.id }, context)).resolves.toMatchObject({ id: actor.id });
-    expect(fs.existsSync(actor.sessionFile!)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(actor.sessionFile!, "utf8").split("\n", 1)[0]!)).toMatchObject({ type: "session", version: 3 });
     expect(fs.readdirSync(path.dirname(actor.sessionFile!)).some((name) => /^session\.jsonl\..+\.bak$/.test(name))).toBe(true);
   });
 });

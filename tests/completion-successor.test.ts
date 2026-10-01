@@ -14,6 +14,7 @@ import { AgentsProvider } from "../src/providers/agents-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import { ResidentHost } from "../src/residency/host.js";
 import { residentDeliveryPrefix, residentHostId, residentResultPath, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 
@@ -148,6 +149,69 @@ const postRenameFault = (target: string) => {
 };
 
 describe("round 4 completion fences", () => {
+  it.each([true, false])("Astra 3: quiet resident settlement survives a live supervisor; successor notices=%s", async notifyOnComplete => {
+    const h = harness();
+    const a = h.client("A", 100, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      agents: { ...DEFAULT_FABRIC_CONFIG.agents, notifyOnComplete: false, maxConcurrent: 2, budgetUsd: 0, sessionExport: false, nice: 19 },
+      piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
+    });
+    const cfg = a.client.options.config;
+    fs.mkdirSync(cfg.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(cfg.residencyRoot, "config.json"), JSON.stringify(cfg));
+    const host = new ResidentHost(cfg);
+    try {
+      await host.start(); h.setLive([h.participant("A", 100)]);
+      const launchClient = new ResidencyClient({ config: cfg, mesh: host.mesh, participants: host.participants,
+        mainAgent: { local: false } as any }); clients.push(launchClient);
+      const long = await launchClient.spawnAgent({ task: "HANG", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
+      const child = await launchClient.spawnAgent({ task: "LARGE_RESULT", transport: "process", residency: "durable" }, AbortSignal.timeout(5_000));
+      const settled = await host.agents.wait(child.id, { timeoutMs: 5_000, deferConsumption() {} });
+      expect(settled).toMatchObject({ status: "completed", text: "x".repeat(100_000) });
+      expect(fs.existsSync(residentResultPath(cfg.residencyRoot, child.id))).toBe(true);
+      // Model the worker's attempt publication too: this is NOT sufficient while its supervisor lives.
+      saveWorkerCompletion(path.join(host.agents.runDirectory(child.id)!, "status.json"), settled);
+      const provisionalRun = path.join(h.root, "provisional"); fs.mkdirSync(provisionalRun);
+      fs.writeFileSync(path.join(provisionalRun, "completion-recipient.json"), JSON.stringify({
+        meshRoot: h.meshRoot, recipient: h.recipient, supervisor: { pid: process.pid },
+      }));
+      saveWorkerCompletion(path.join(provisionalRun, "status.json"), { ...h.result, status: "failed", text: "PROVISIONAL_ONLY" });
+      expect(host.agents.status(long.id).status).toBe("running");
+      expect(h.mesh.listAll(residentDeliveryPrefix(cfg.rootId))).toHaveLength(0);
+      expect(a.completed).not.toHaveBeenCalled(); expect(a.sendMessage).not.toHaveBeenCalled();
+      // A disappears, but its resident host remains alive and owns the unrelated long run.
+      h.setLive([h.participant("B", 200), h.participant("other-role", 300, { role: "other-lane" }),
+        h.participant("other-cwd", 300, { cwd: path.join(h.root, "other") })]);
+      expect(pendingCompletions(h.meshRoot, h.root).map(value => value.result.id)).toEqual([child.id]);
+      const b = h.client("B", 200, { agents: { ...DEFAULT_FABRIC_CONFIG.agents, notifyOnComplete } }); b.client.start();
+      await waitFor(() => b.client.listAgents().some(value => value.id === child.id && "text" in value));
+      expect(b.client.listAgents().find(value => value.id === child.id)).toMatchObject({
+        text: settled.text, completionDelivery: { status: "undelivered", addressedTo: "A" },
+      });
+      expect(b.client.listAgents().some(value => value.id === h.result.id)).toBe(false);
+      for (const extra of [{ role: "other-lane" }, { cwd: path.join(h.root, "other") }]) {
+        const observer = h.client("observer", 300, extra); observer.client.start();
+        const summary = observer.client.statusAgent(child.id);
+        expect(summary).toMatchObject({ id: child.id, status: "completed" });
+        for (const key of ["text", "error", "value", "task", "logFile", "sessionFile"]) expect(summary).not.toHaveProperty(key);
+        expect(await observer.client.waitAgent(child.id)).not.toHaveProperty("text");
+        expect(completionConsumed(h.meshRoot, child.id)).toBe(false);
+        expect(observer.completed).not.toHaveBeenCalled();
+      }
+      expect(await b.client.waitAgent(child.id)).toMatchObject({ status: "completed", text: settled.text });
+      expect(completionConsumed(h.meshRoot, child.id)).toBe(true);
+      b.turn(); expect(b.sendMessage).not.toHaveBeenCalled(); // explicit wait retracts any inbox notice
+      if (!notifyOnComplete) expect(b.completed).not.toHaveBeenCalled();
+      expect(host.agents.status(long.id).status).toBe("running");
+      await b.client.close(); h.setLive([h.participant("C", 400)]);
+      const c = h.client("C", 400); c.client.start();
+      await new Promise(resolve => setTimeout(resolve, 80)); c.turn();
+      expect(c.client.listAgents()).toHaveLength(0);
+      expect(c.completed).not.toHaveBeenCalled(); expect(c.sendMessage).not.toHaveBeenCalled();
+      expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
+    } finally { await host.close(); }
+  }, 15_000);
+
   it.each(legacyFenceFaults)("F4/journal: unknown legacy fence (%s) blocks claims, bodies and replacement receipts repeatedly", async fault => {
     if (fault === "dangling" && process.platform === "win32") return; // symlink privilege is not portable
     const h = harness(); saveCompletion(h.meshRoot, h.recipient, h.result);

@@ -258,7 +258,6 @@ export class CompletionJournal {
       const receipt = readReceipt(path.join(directory(this.meshRoot), "receipts", `${claim.key.slice(claimPrefix.length)}.json`));
       if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) await this.#retireClaim(receipt.id, claim);
     }
-    if (!deliver) return;
     const pending = this.pending();
     if (!pending.length) return;
     const roots = this.participants.list({ scope: "project", kinds: ["root"], fresh: true });
@@ -276,6 +275,9 @@ export class CompletionJournal {
         } catch { continue; } // Another live successor owns admission; leave the source pending.
       }
       if (completionConsumed(this.meshRoot, envelope.result.id)) { await this.#retireClaim(envelope.result.id); continue; }
+      // Notification policy suppresses only inbox enqueue, not exact-lane recovery ownership.
+      // A quiet successor can still list and explicitly consume its settled result.
+      if (!deliver) continue;
       const redelivered = envelope.recipient.rootId !== this.recipient.rootId;
       this.#enqueued.add(envelope.result.id);
       try {

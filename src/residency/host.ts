@@ -340,15 +340,18 @@ export class ResidentHost {
         const file = residentResultPath(config.residencyRoot, result.id);
         fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
         atomicWrite(file, result);
+        // Rejected queued durable spawns have no admitted worker/source. Keep their local
+        // stop diagnostic, but do not publish them as recoverable public task outcomes.
+        if (!this.agents.runDirectory(result.id)) return;
+        // Logical settlement is recoverable even when inbox notifications are disabled.
+        // Propagate publication faults so the manager retains and retries the full worker source.
+        const original = this.participants.lastKnown?.(config.rootId)?.participant;
+        saveCompletion(config.meshRoot, { rootId: config.rootId, sessionId: config.sessionId,
+          cwd: config.cwd, projectRoot: config.projectRoot, name: config.mainName ?? original?.name ?? "main",
+          role: config.role, startedAt: config.mainStartedAt ?? original?.startedAt ?? 0 }, result);
       },
       onBackgroundComplete: (result) => {
         if (!config.agents.notifyOnComplete) return;
-        const original = this.participants.lastKnown?.(config.rootId)?.participant;
-        try {
-          saveCompletion(config.meshRoot, { rootId: config.rootId, sessionId: config.sessionId,
-            cwd: config.cwd, projectRoot: config.projectRoot, name: config.mainName ?? original?.name ?? "main",
-            role: config.role, startedAt: config.mainStartedAt ?? original?.startedAt ?? 0 }, result);
-        } catch { /* The authenticated mesh envelope below remains the retryable source. */ }
         const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
         const summary = (result.text || result.error || "no result").slice(0, COMPLETION_MAX_CHARS);
         void this.#queueDelivery(

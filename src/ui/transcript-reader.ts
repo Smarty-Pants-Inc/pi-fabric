@@ -3,7 +3,7 @@ import { readJsonlPageFromDescriptor } from "../log-tail.js";
 import type { FabricLogLine } from "../agents/types.js";
 import {
   missingToolStartIds,
-  normalizedToolStarts,
+  toolLifecycleContext,
   parsedEvents,
   parseRaw,
   TranscriptAccumulator,
@@ -315,14 +315,7 @@ export class AgentTranscriptReader {
         MAX_PAGE_BYTES,
       );
       const contextEvents = parsedEvents(contextPage.lines);
-      for (let index = contextEvents.length - 1; index >= 0 && missingStarts.size > 0; index--) {
-        const starts = normalizedToolStarts(contextEvents[index]!);
-        for (let startIndex = starts.length - 1; startIndex >= 0; startIndex--) {
-          const start = starts[startIndex]!;
-          if (!missingStarts.delete(start.id)) continue;
-          lifecycleContext.unshift(start.event);
-        }
-      }
+      lifecycleContext.push(...toolLifecycleContext(contextEvents, missingStarts));
     }
     const accumulator = new TranscriptAccumulator();
     accumulator.append([...lifecycleContext, ...events]);

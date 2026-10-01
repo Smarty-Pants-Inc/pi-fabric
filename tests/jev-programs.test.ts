@@ -61,6 +61,28 @@ describe("Jev reactive programs", () => {
     await manager.wait(waited.id);
     expect(manager.runningCount()).toBe(0);
   });
+  it("bounds the unread result hold even while terminal lease cleanup is delayed (smarty-dev#2216)", async () => {
+    const { provider, registry } = setup();
+    const manager = provider.manager;
+    let release!: () => void, reached!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const releasing = new Promise<void>(resolve => { reached = resolve; });
+    const acquire = registry.acquireCapabilityView.bind(registry);
+    vi.spyOn(registry, "acquireCapabilityView").mockImplementation(async (...args) => {
+      const lease = await acquire(...args);
+      return { ...lease, release: async () => { reached(); await gate; await lease.release(); } };
+    });
+    const run = await callProgram(provider, "spawn", launch("return 7;"));
+    try {
+      await releasing;
+      expect(manager.list()[0]?.state).toBe("completed");
+      expect(manager.runningCount()).toBe(1);
+      expect(manager.runningCount(Date.now() + 10 * 60_000)).toBe(0);
+      expect(manager.status(run.id)).toMatchObject({ state: "completed", result: 7 });
+      expect(manager.runningCount()).toBe(0);
+    } finally { release(); await manager.wait(run.id); }
+  });
+
   it("stops a long-lived loop and is idempotent", async () => {
     const { provider } = setup();
     const run = await callProgram(provider, "spawn", launch("while(true) { await program.sleep(10); }"));

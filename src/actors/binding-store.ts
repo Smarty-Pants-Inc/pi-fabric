@@ -55,22 +55,24 @@ export class ActorBindingStore {
   async setModel(
     actorId: string,
     model: string | undefined,
+    beforeCommit?: (id: string) => void,
   ): Promise<ActorSessionBindingRecord | undefined> {
     const next = model?.trim();
     return this.#update(actorId, (binding) => {
       if (next) binding.model = next;
       else delete binding.model;
-    });
+    }, beforeCommit);
   }
 
   async setThinking(
     actorId: string,
     thinking: FabricThinking | undefined,
+    beforeCommit?: (id: string) => void,
   ): Promise<ActorSessionBindingRecord | undefined> {
     return this.#update(actorId, (binding) => {
       if (thinking) binding.thinking = thinking;
       else delete binding.thinking;
-    });
+    }, beforeCommit);
   }
 
   async delete(actorId: string): Promise<boolean> {
@@ -80,9 +82,12 @@ export class ActorBindingStore {
   async #update(
     actorId: string,
     mutate: (binding: ActorSessionBindingRecord) => void,
+    beforeCommit?: (id: string) => void,
   ): Promise<ActorSessionBindingRecord | undefined> {
     return this.#mutate((bindings) => {
       const binding = bindings.get(actorId) ?? { updatedAt: Date.now() };
+      // Lock acquisition may await: abandonment must still win until mutation.
+      beforeCommit?.(actorId);
       mutate(binding);
       if (!binding.model && !binding.thinking) {
         bindings.delete(actorId);

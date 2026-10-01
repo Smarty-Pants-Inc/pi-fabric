@@ -129,6 +129,10 @@ interface FabricPeerInfo {
   role?: string;
   /** The checkout that owns the root's git common directory. */
   project?: string;
+  /** Normalized repository origin, independent of checkout path or host. */
+  repository?: string;
+  /** False for print/JSON roots, which cannot receive messages or become project leads. */
+  interactive?: boolean;
   name: string;
   kind: "peer";
   status: "idle" | "running";
@@ -156,6 +160,10 @@ interface FabricParticipantInfo {
   role?: string;
   /** The checkout that owns the root's git common directory. */
   project?: string;
+  /** Normalized repository origin, independent of checkout path or host. */
+  repository?: string;
+  /** False for print/JSON roots, which cannot receive messages or become project leads. */
+  interactive?: boolean;
   kind: FabricParticipantKind;
   rootId: string;
   ownerHostId: string;
@@ -321,6 +329,7 @@ interface FabricAgentLog {
   events: FabricLogLine[];
   hasMore: boolean;
   before?: number;
+  generation?: string;
 }
 interface FabricActorLog {
   actorId: string;
@@ -330,6 +339,7 @@ interface FabricActorLog {
   session: FabricLogLine[];
   sessionHasMore: boolean;
   sessionBefore?: number;
+  sessionGeneration?: string;
   run?: {
     runId: string;
     eventsFile: string;
@@ -337,6 +347,7 @@ interface FabricActorLog {
     events: FabricLogLine[];
     hasMore: boolean;
     before?: number;
+    generation?: string;
   };
   retainedRuns: string[];
 }
@@ -828,7 +839,7 @@ interface FabricAgentsApi {
   main(): Promise<FabricMainAgentInfo>;
   sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
-  /** The live project agent for this session's project (role project-agent, same git common checkout). */
+  /** Resolve by normalized repository origin and launch-recorded lead id; throws if unresolved or ambiguous. */
   projectAgent(): Promise<FabricParticipantInfo>;
   subscribe(args: {
     from: string;
@@ -844,9 +855,9 @@ interface FabricAgentsApi {
   stop(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
   cleanup(args: FabricAgentTargetArgs & { deleteBranch?: boolean; delete_branch?: boolean }): Promise<{ cleaned: boolean }>;
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
-  setModel(args: { id: string; model?: string; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
+  setModel(args: { id: string; model?: string; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
-  setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
+  setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope | "global" }): Promise<FabricActorInfo>;
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setNice(args: { id: string; nice: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
@@ -905,6 +916,8 @@ interface FabricAgentsApi {
     type?: "session" | "run" | "all";
     lines?: number;
     before?: number;
+    /** Required with before. Pair the previous page's generation; cursor-stale means restart without either. */
+    beforeGeneration?: string;
     runId?: string;
   }): Promise<FabricActorLog | FabricAgentLog>;
 }

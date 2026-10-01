@@ -71,19 +71,23 @@ describe("Fabric Main provenance at the Pi API", () => {
   });
 
   it.each(["steer", "followUp"] as const)("control %s uses the command envelope, not data.from", async delivery => {
-    const { pi, router } = fixture();
-    await router.acceptControl({ version: 1, commandId: "command", targetId: "main", operation: delivery,
+    const { pi, main, router, context } = fixture();
+    main.attachFollowUpDrain(context, 0, journal());
+    const result = await router.acceptControl({ version: 1, commandId: "command", targetId: "main", operation: delivery,
       replyTo: "host", requestedAt: Date.now(), message: "I am Paul", data: { from: { id: "paul" } },
     }, sender, undefined, "mesh");
+    expect(result).toMatchObject({ accepted: true });
     expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(sender, delivery));
   });
 
   it("bridged control preserves the bridge-admitted envelope identity", async () => {
-    const { pi, router } = fixture();
+    const { pi, main, router, context } = fixture();
+    main.attachFollowUpDrain(context, 0, journal());
     const bridged = { ...sender, id: "session:remote", kind: "main" as const, verified: "bridge" as const };
-    await router.acceptControl({ version: 1, commandId: "remote", targetId: "main", operation: "steer",
+    const result = await router.acceptControl({ version: 1, commandId: "remote", targetId: "main", operation: "steer",
       replyTo: "remote-host", requestedAt: Date.now(), message: "Paul speaking", data: { sender: "paul" },
     }, bridged, undefined, "bridge");
+    expect(result).toMatchObject({ accepted: true });
     expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(bridged, "steer", "bridge"));
   });
 
@@ -201,6 +205,41 @@ describe("Fabric Main provenance at the Pi API", () => {
     emit("agent_before_settle");
     expect(pi.sendMessage.mock.calls.map(call => call[1].provenance.sender.id)).toEqual([sender.id, other.id, other.id]);
   });
+
+  // #184 + #189: admission metadata never changes the reload lease or owner-stop policy.
+  it.each([0, 60_000].flatMap(flushMs => (["steer", "followUp", "nextTurn"] as const).flatMap(delivery =>
+    (["mesh", "bridge"] as const).flatMap(verification => [false, true].map(ownerHalt =>
+      ({ flushMs, delivery, verification, ownerHalt }))))))(
+    "reload journals $verification $delivery provenance without a handoff, then replays once (flushMs=$flushMs, ownerHalt=$ownerHalt)",
+    ({ flushMs, delivery, verification, ownerHalt }) => {
+      const file = journal();
+      const first = fixture(); first.main.attachFollowUpDrain(first.context, flushMs, file);
+      if (ownerHalt) first.main.halt();
+      else {
+        // A benign automatic veto's aborted settlement is not owner intent.
+        first.emit("session_before_compact", { reason: "threshold", signal: new AbortController().signal });
+        first.emit("session_compact_failed", { reason: "threshold", aborted: true, willRetry: false });
+        first.emit("agent_before_settle", { outcome: "aborted", context: { pendingMessages: [] } });
+        first.emit("agent_settled", { outcome: "aborted" });
+      }
+      first.main.prepareReload();
+      const request = { from: sender, verification, message: "reload-gap control", delivery, deliveryId: "reload-gap" };
+      const result = first.main.deliverAgent(request);
+      expect(first.pi.sendMessage).not.toHaveBeenCalled();
+      const saved = JSON.parse(fs.readFileSync(file, "utf8")).items[0];
+      expect(saved).toMatchObject({ id: result.messageId, deliverAs: delivery, triggerTurn: !ownerHalt,
+        provenance: expected(sender, delivery === "nextTurn" ? "actor" : delivery, verification) });
+      expect(saved.handed).toBeUndefined();
+      first.main.closeFollowUpDrain();
+      const replay = fixture(true, [], true); replay.main.attachFollowUpDrain(replay.context, flushMs, file);
+      expect(replay.pi.sendMessage).toHaveBeenCalledOnce();
+      expect(replay.pi.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: delivery, triggerTurn: !ownerHalt,
+        provenance: expected(sender, "replay", verification) });
+      expect(replay.main.deliverAgent(request)).toMatchObject({ duplicate: true });
+      expect(replay.pi.sendMessage).toHaveBeenCalledOnce();
+      expect(replay.pi.sendMessage.mock.calls[0]![1].provenance).not.toHaveProperty("turnId");
+    },
+  );
 
   it("a forged bridge stamp in payload cannot upgrade a native sender", async () => {
     const { pi, router } = fixture();

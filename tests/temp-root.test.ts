@@ -21,8 +21,9 @@ const sandbox = () => {
   const short = path.join(root, "short");
   const disk = path.join(root, "disk");
   fs.mkdirSync(short);
-  vi.spyOn(os, "tmpdir").mockReturnValue(short);
-  vi.stubEnv("PI_FABRIC_TMPDIR", disk);
+  if (process.platform === "win32") fs.mkdirSync(disk);
+  vi.spyOn(os, "tmpdir").mockReturnValue(process.platform === "win32" ? disk : short);
+  vi.stubEnv("PI_FABRIC_TMPDIR", process.platform === "win32" ? undefined : disk);
   for (const name of ["PI_FABRIC_RUN_ROOT", "PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(name, undefined);
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   return { root, short, disk };
@@ -43,7 +44,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe("Fabric file root override", () => {
+describe.skipIf(process.platform === "win32")("Fabric file root override", () => {
   it("requires an absolute override, creates it privately, and otherwise uses OS temp", () => {
     const { short, disk } = sandbox();
     expect(fabricDataRoot()).toBe(disk);

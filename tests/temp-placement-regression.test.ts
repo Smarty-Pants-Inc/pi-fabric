@@ -18,7 +18,7 @@ const setup = () => {
   const short = path.join(root, "short");
   const disk = path.join(root, "disk");
   fs.mkdirSync(short);
-  fs.mkdirSync(disk);
+  fs.mkdirSync(disk, { mode: 0o700 });
   vi.spyOn(os, "tmpdir").mockReturnValue(short);
   vi.stubEnv("PI_FABRIC_TMPDIR", disk);
   for (const key of ["PI_FABRIC_RUN_ROOT", "PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
@@ -35,7 +35,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-it("places every bulky file-root kind in PI_FABRIC_TMPDIR, not OS temp", async () => {
+it.skipIf(process.platform === "win32")("places every bulky file-root kind in PI_FABRIC_TMPDIR, not OS temp", async () => {
   const { root, short, disk, agents, jobs } = setup();
   const actors = new ActorManager("test", { id: "session:test", name: "main", kind: "main", sessionId: "test" }, new MeshStore(path.join(root, "mesh"), 64 * 1024, 100), { ...DEFAULT_FABRIC_CONFIG.mesh, enabled: false }, agents, () => {});
   closers.push(() => actors.close());
@@ -46,7 +46,7 @@ it("places every bulky file-root kind in PI_FABRIC_TMPDIR, not OS temp", async (
   expect(fs.readdirSync(short)).toEqual([]);
 });
 
-it("removes finished session shell roots on close, without shortening live-session retention", async () => {
+it.skipIf(process.platform === "win32")("removes finished session shell roots on close, without shortening live-session retention", async () => {
   const { jobs } = setup();
   const job = jobs.begin("bash", "shutdown");
   job.spill();
@@ -57,7 +57,7 @@ it("removes finished session shell roots on close, without shortening live-sessi
   expect(fs.existsSync(path.dirname(log))).toBe(false);
 });
 
-it("reclaims an abandoned disk-root owner through the manager's existing sweep", async () => {
+it.skipIf(process.platform === "win32")("reclaims an abandoned disk-root owner through the manager's existing sweep", async () => {
   const { disk, agents } = setup();
   const abandoned = fs.mkdtempSync(path.join(disk, "pi-fabric-runs-"));
   fs.writeFileSync(path.join(abandoned, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));

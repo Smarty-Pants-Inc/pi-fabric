@@ -140,7 +140,7 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 
 ## Environment
 
-`PI_FABRIC_TMPDIR`: absolute directory for Fabric temporary file data (created with mode `0700`); defaults to the OS temp directory; socket/pipe paths stay unchanged.
+`PI_FABRIC_TMPDIR`: absolute POSIX directory for Fabric temporary file data (created with mode `0700`); existing roots must be owned by this user, real directories, and not group/world writable. Ancestors must be real directories owned by this user or root, without group/world write access unless sticky. Unsafe paths fail closed without chmod. Windows overrides are rejected pending ACL validation; unset the override to use OS temp. Socket/pipe paths stay unchanged.
 
 ## Reference
 

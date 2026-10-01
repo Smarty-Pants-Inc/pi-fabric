@@ -936,7 +936,11 @@ export class MeshBridge {
     while (true) {
       const start = cursor.after;
       const page = await source.read(start);
-      let rules = await authority();
+      // Empty and allow-list-filtered pages need no routing decision. Authority reads are
+      // deliberately canonical (copied-marker ABA), so doing them on every idle tail poll
+      // parsed the entire fleet state eight times per tick. Presence still renews on its
+      // own schedule; every page with events retains the same fresh authority checks.
+      let rules = page.events.length ? await authority() : { recipients: new Set<string>() };
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);

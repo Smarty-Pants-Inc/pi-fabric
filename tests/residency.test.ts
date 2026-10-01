@@ -1385,8 +1385,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
   });
 
   it.each([
-    ["SIGTERM", false], ["SIGKILL", false], ["SIGKILL", true],
-  ] as const)("relaunches a dead durable host on ordinary tell after %s (fresh dead mesh lock: %s)", { timeout: 100_000 }, async (signal, deadMeshLock) => {
+    ["SIGTERM", false, false], ["SIGKILL", false, false], ["SIGKILL", true, false], ["SIGKILL", false, true],
+  ] as const)("relaunches a dead durable host on ordinary tell after %s (fresh dead mesh lock: %s) (fresh dead registry lock: %s)", { timeout: 100_000 }, async (signal, deadMeshLock, deadRegistryLock) => {
     const state = await rootHarness(`resident-relaunch-${signal}`);
     const launches = launchLog(state.root);
     for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
@@ -1427,8 +1427,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       if (killed.processStartTime) expect(killed.processStartTime).toBe(recorded.started);
       process.kill(killed.pid, signal);
       await waitFor(() => !same(recorded), 20_000);
-      // Send immediately: a dead holder is still unreclaimable during MeshStore's 30 s stale
-      // window. Recovery keeps the tell pending; latency is bounded by that window plus boot/delivery.
+      // Send immediately: complete dead identities must be recoverable without waiting for
+      // the 30 s window reserved for missing/corrupt owner records.
       if (deadMeshLock) {
         // Deterministically model SIGKILL inside a mesh write, without changing MeshStore's fence.
         // Pause our own mesh publishers so they cannot race this owner-file publication.
@@ -1441,6 +1441,13 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         // Resume the sender after publishing the complete dead identity.
         senderRestart = state.participants.start().catch(() => undefined);
         control.start(() => ({ accepted: false }));
+      }
+      if (deadRegistryLock) {
+        // SIGKILL after registry rename can leave its lock younger than acquisition's 5 s
+        // deadline. Use the verified dead launch identity, never an arbitrary/live PID.
+        const registryLock = path.join(state.config.actorRoot, "actors.json.lock");
+        fs.mkdirSync(registryLock, { recursive: true });
+        fs.writeFileSync(path.join(registryLock, "owner"), `dead-host\n${killed.pid}\n${Date.now()}\n${recorded.started}\n`);
       }
       const started = Date.now();
       const result = await router.routeMessage(actor.id, `after ${signal}`, undefined, "followUp");

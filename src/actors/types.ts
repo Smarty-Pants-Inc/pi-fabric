@@ -1,3 +1,4 @@
+import type { FabricPrincipal } from "../fabric-provenance.js";
 import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
 import type { FabricAgentRunner, FabricAgentTransport, FabricPythonRuntime } from "../config.js";
 import type { FabricThinking } from "../thinking.js";
@@ -323,6 +324,8 @@ export interface FabricActorLog {
   session: FabricLogLine[];
   sessionHasMore: boolean;
   sessionBefore?: number;
+  /** Bind sessionBefore using beforeGeneration with type: "session". */
+  sessionGeneration?: string;
   run?: {
     runId: string;
     eventsFile: string;
@@ -330,11 +333,14 @@ export interface FabricActorLog {
     events: FabricLogLine[];
     hasMore: boolean;
     before?: number;
+    /** Bind before using beforeGeneration with type: "run". */
+    generation?: string;
   };
   retainedRuns: string[];
 }
 
 export interface FabricActorMessage {
+  principal?: FabricPrincipal | undefined;
   id: string;
   actorId: string;
   actorName: string;

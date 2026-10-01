@@ -284,6 +284,33 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     }
   }, 30_000);
 
+  it("survives recovery with model streaming for more than 60 seconds and no tool execution", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "terminated-stream-recover";
+    const result = await run("compose a long edit", 120_000);
+    expect(result.status).toBe("completed");
+    expect(result.error).toBeUndefined();
+    expect(result.text).toBe("stream recovered");
+    expect(result.toolCalls).toBe(0);
+    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.filter((event) => event.type === "message_update")).toHaveLength(9);
+    expect(events.some((event) => event.type === "fabric_recovery_error")).toBe(false);
+  }, 90_000);
+
+  it("survives an accepted retry followed by 70 seconds of silent reasoning", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "terminated-silent-recover";
+    const result = await run("reason silently then answer", 120_000);
+    expect(result.status).toBe("completed");
+    expect(result.error).toBeUndefined();
+    expect(result.text).toBe("silent reasoning recovered");
+    expect(result.toolCalls).toBe(0);
+    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.filter((event) => event.type === "message_start")).toEqual([
+      { type: "message_start", message: { role: "assistant", content: [], stopReason: "stop" } },
+    ]);
+    expect(events.filter((event) => event.type === "message_update")).toHaveLength(1);
+    expect(events.some((event) => event.type === "fabric_recovery_error")).toBe(false);
+  }, 90_000);
+
   it.each(["terminated-hang", "retry-hang"])(
     "kills a stalled %s despite lifecycle chatter, EOF and SIGTERM refusal", async (behavior) => {
       process.env.FAKE_PI_BEHAVIOR = behavior;
@@ -292,7 +319,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
       const result = await run("recover or fail", 120_000);
       expect(result.status).toBe("failed");
       expect(result.error).toContain("Error: Terminated");
-      expect(result.error).toContain("no recovery progress for 60000ms");
+      expect(result.error).toContain("no model stream or tool event for 60000ms");
       const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
       const pid = events.find((event) => event.type === "fake_child_pid").pid;
       expect(() => process.kill(pid, 0)).toThrow();
@@ -352,8 +379,20 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(log.length).toBeLessThan(10_000);
     const events = log.trim().split("\n").map((line) => JSON.parse(line));
     const stub = { type: "image", elided: true, bytes: ((5 * 1024 * 1024 + 4) * 3) / 4, mimeType: "image/png" };
-    expect(events.find((event) => event.type === "tool_execution_end")?.result.content[1]).toEqual(stub);
-    expect(events.find((event) => event.message?.role === "toolResult")?.message.content[1]).toEqual(stub);
+    const ends = events.filter((event) => event.type === "tool_execution_end");
+    const canonicals = events.filter((event) => event.type === "message_end" && event.message?.role === "toolResult");
+    expect(ends).toHaveLength(1);
+    expect(canonicals).toHaveLength(1);
+    const end = ends[0];
+    const content = [{ type: "text", text: "Read image file [image/png]" }, stub];
+    expect(end).toMatchObject({ toolCallId: "read-1", toolName: "read", isError: false });
+    expect(canonicals[0].message).toEqual({ role: "toolResult", toolCallId: "read-1", toolName: "read", content });
+    // This ordinary, uniquely paired log is well within every work bound.
+    // A platform-wide durability failure must not masquerade as an accepted fallback.
+    expect(result.compactionSkipped).toBeUndefined();
+    // The projected result (image data stubbed) is small, so it stays inline (B72 small-result contract).
+    expect(Buffer.byteLength(JSON.stringify({ content }), "utf8")).toBeLessThanOrEqual(8192);
+    expect(end.result).toEqual({ content });
   }, 30_000);
 
   it.each(["oversized-final", "oversized-error"])(

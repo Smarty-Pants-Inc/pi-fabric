@@ -1,4 +1,5 @@
 import type { ModelRouteDecision } from "./model-route.js";
+import type { FabricTurnProvenance } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
   SessionEntry,
@@ -44,6 +45,8 @@ export interface AgentSessionSeed {
 export interface AgentRunRequest {
   /** Host-created shadow decision; never accepted from external argument normalization. */
   routeDecision?: ModelRouteDecision;
+  /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
+  provenance?: FabricTurnProvenance | undefined;
   task: string;
   images?: ImageContent[];
   name?: string;
@@ -172,6 +175,8 @@ export interface AgentRunRecord {
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
   compaction?: AgentCompactionStatus;
+  /** Terminal event-log optimization was skipped; the full original log remains. */
+  compactionSkipped?: string;
 }
 
 export interface AgentRunResult extends AgentRunRecord {
@@ -179,6 +184,8 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** Present on terminal status snapshots when the full log was retained. */
+  compactionSkipped?: string;
   id: string;
   name: string;
   status: AgentRunStatus;
@@ -329,12 +336,15 @@ export interface FabricAgentLog {
   status?: AgentRunRecord;
   events: FabricLogLine[];
   hasMore: boolean;
+  /** Exclusive byte offset; pair with generation as beforeGeneration on the next request. */
   before?: number;
+  generation?: string;
 }
 
 export type FabricSteeringMode = "all" | "one-at-a-time";
 
 export interface AgentSteerEntry {
+  provenance?: FabricTurnProvenance | undefined;
   type: "steer" | "follow_up" | "set_steering_mode" | "set_follow_up_mode" | "compact";
   id: string;
   message?: string;

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { compactTerminalRunLog } from "../src/worker/run-log.js";
+import { descriptorIdentity, fileIdentity, replaceGeneration, retainCompactionGeneration } from "./helpers/native-reader-file-generation.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NativeConversationReader,
@@ -495,7 +496,7 @@ describe("native conversation reader — paging and rollover", () => {
       expect(before.messages.length).toBeGreaterThan(initial.messages.length);
       const replacement = `${file}.new`;
       fs.writeFileSync(replacement, jsonl(records("new", padding)));
-      fs.renameSync(replacement, file);
+      replaceGeneration(replacement, file);
       const after = reader.read(input, follow);
       expect(after.messages.length).toBeGreaterThanOrEqual(before.messages.length);
       expect(after.messages.every((message) => message.role === "user" &&
@@ -526,7 +527,7 @@ describe("native conversation reader — paging and rollover", () => {
     fs.writeFileSync(`${events}.new`, jsonl(Array.from({ length: 160 }, (_, index) => ({
       type: "message_end", message: { role: "user", content: `replacement-${index}:${"x".repeat(4000)}`, timestamp: 1000 + index },
     }))));
-    fs.renameSync(`${events}.new`, events);
+    replaceGeneration(`${events}.new`, events);
     const replaced = reader.read(input, follow);
     expect(replaced.messages.filter((message) => message.timestamp < 1000)).toEqual(sessionMessages);
     expect(JSON.stringify(replaced.messages)).not.toContain("old-run");
@@ -561,9 +562,9 @@ describe("native conversation reader — paging and rollover", () => {
     const appendRecord = kind === "events" ? { type: "message_end", message: appended }
       : { ...entryBase("m150", "m149"), type: "message", message: appended };
     fs.writeFileSync(`${file}.new`, jsonl([...header, ...records, appendRecord]));
-    const inode = fs.statSync(file).ino;
-    fs.renameSync(`${file}.new`, file);
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    const inode = fileIdentity(file);
+    replaceGeneration(`${file}.new`, file);
+    expect(fileIdentity(file)).not.toBe(inode);
     const refreshed = reader.read(input, false);
     expect(refreshed.messages).toEqual(pinned.messages);
     expect(refreshed.hasMore).toBe(pinned.hasMore);
@@ -590,9 +591,10 @@ describe("native conversation reader — paging and rollover", () => {
     reader.read(input, follow);
     const before = reader.loadOlder(2)!;
     expect(before.messages).toHaveLength(93);
-    const inode = fs.statSync(file).ino;
+    const inode = fileIdentity(file);
+    retainCompactionGeneration(file);
     expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 160 });
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    expect(fileIdentity(file)).not.toBe(inode);
     const after = reader.read(input, follow);
     expect(after.messages).toHaveLength(119);
     expect(after.messages.slice(-93)).toEqual(before.messages);
@@ -624,9 +626,9 @@ describe("native conversation reader — paging and rollover", () => {
     expect(before.leafId).toBe("u149");
     fs.appendFileSync(file, jsonl(records("new", 152).slice(-2)));
     fs.writeFileSync(`${file}.new`, jsonl(records("new", 152)));
-    const inode = fs.statSync(file).ino;
-    fs.renameSync(`${file}.new`, file);
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    const inode = fileIdentity(file);
+    replaceGeneration(`${file}.new`, file);
+    expect(fileIdentity(file)).not.toBe(inode);
     const after = reader.read(input, follow);
     expect(after.messages.filter((message) => message.timestamp >= 50 && message.timestamp < 150).map((message) => message.timestamp)).toEqual(before.messages.map((message) => message.timestamp));
     expect(JSON.stringify(after.messages)).not.toContain("old-");
@@ -660,9 +662,10 @@ describe("native conversation reader — paging and rollover", () => {
     const before = reader.loadOlder(2)!;
     expect(before.messages).toHaveLength(93);
     fs.appendFileSync(file, jsonl([...triplet(160), ...triplet(161)]));
-    const inode = fs.statSync(file).ino;
+    const inode = fileIdentity(file);
+    retainCompactionGeneration(file);
     expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 162 });
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    expect(fileIdentity(file)).not.toBe(inode);
     const compacted = fs.readFileSync(file, "utf8");
     expect(compacted).toContain('"elided":true');
     const after = reader.read(input, follow);
@@ -691,14 +694,14 @@ describe("native conversation reader — paging and rollover", () => {
     reader.read(input, false);
     const replacement = { ...record, message: { ...message, content: "new" } };
     fs.writeFileSync(`${file}.new`, jsonl([...header, replacement, replacement]));
-    fs.renameSync(`${file}.new`, file);
+    replaceGeneration(`${file}.new`, file);
     const failed = reader.read(input, false);
     expect(failed.messages).toEqual([]);
     expect(failed.error).toContain("ambiguous");
     expect(failed.unavailable).toEqual(kind === "session" ? { sessionFile: true } : { eventsFile: true });
     expect(reader.loadNewer()!.messages).toEqual([]);
     fs.writeFileSync(`${file}.new`, original);
-    fs.renameSync(`${file}.new`, file);
+    replaceGeneration(`${file}.new`, file);
     const restored = reader.read(input, false);
     expect(restored.messages).toEqual([message]);
     expect(restored.error).toBeUndefined();
@@ -723,9 +726,10 @@ describe("native conversation reader — paging and rollover", () => {
     expect(reader.suspend()).toBe(true);
     const canonical = { role: "toolResult", toolCallId: "boundary", toolName: "bash", content, details, isError: false, timestamp: 9 };
     fs.appendFileSync(file, jsonl([{ type: "message_end", message: canonical }]));
-    const inode = fs.statSync(file).ino;
+    const inode = fileIdentity(file);
+    retainCompactionGeneration(file);
     expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 1 });
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    expect(fileIdentity(file)).not.toBe(inode);
     const pinned = reader.read(input, false);
     expect(pinned.messages).toEqual([]);
     expect(pinned.hasNewer).toBe(true);
@@ -823,18 +827,18 @@ describe("native conversation reader — identical-prefix continuation", () => {
     reader.read(input, false);
     const before = reader.loadOlder()!;
     expect(before.hasMore).toBe(true);
-    const oldStat = fs.statSync(file);
+    const oldIdentity = fileIdentity(file);
     fs.writeFileSync(`${file}.new`, bytes + jsonl(records.slice(150)));
-    fs.renameSync(`${file}.new`, file);
-    const newStat = fs.statSync(file);
-    expect([newStat.dev, newStat.ino]).not.toEqual([oldStat.dev, oldStat.ino]);
+    replaceGeneration(`${file}.new`, file);
+    const newIdentity = fileIdentity(file);
+    expect(newIdentity).not.toBe(oldIdentity);
     const realRead = fs.readSync.bind(fs);
     let verifiedReads = 0;
     let injected = 0;
     let failedFd = -1;
     const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
       const stack = new Error().stack ?? "";
-      if (fs.fstatSync(fd).ino === newStat.ino) {
+      if (descriptorIdentity(fd) === newIdentity) {
         if (stack.includes("matchesLoadedPages")) verifiedReads++;
         else if (stack.includes("readForwardPage") && position === Buffer.byteLength(bytes)) {
           expect(verifiedReads).toBeGreaterThan(0);
@@ -860,7 +864,7 @@ describe("native conversation reader — identical-prefix continuation", () => {
     expect(() => fs.fstatSync(failedFd)).toThrow();
     reads.mockRestore();
     const recovered = reader.read(input, false);
-    expect(fs.statSync(file).ino).toBe(newStat.ino);
+    expect(fileIdentity(file)).toBe(newIdentity);
     expect(recovered.messages).toEqual(before.messages);
     expect(recovered.leafId).toBe(before.leafId);
     expect(recovered.hasMore).toBe(before.hasMore);
@@ -889,17 +893,17 @@ describe("native conversation reader — identical-prefix continuation", () => {
     const reader = new NativeConversationReader();
     const input = source({ eventsFile: file });
     expect(reader.read(input, false).streaming.tools[0]?.result).toBeDefined();
-    const oldInode = fs.statSync(file).ino;
+    const oldInode = fileIdentity(file);
     fs.writeFileSync(`${file}.new`, bytes + jsonl([{ type: "message_end", message: canonical }]));
-    fs.renameSync(`${file}.new`, file);
-    const inode = fs.statSync(file).ino;
+    replaceGeneration(`${file}.new`, file);
+    const inode = fileIdentity(file);
     expect(inode).not.toBe(oldInode);
     const realRead = fs.readSync.bind(fs);
     let verified = false;
     let injected = 0;
     const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
       const stack = new Error().stack ?? "";
-      if (fs.fstatSync(fd).ino === inode) {
+      if (descriptorIdentity(fd) === inode) {
         if (stack.includes("matchesLoadedPages")) verified = true;
         else if (stack.includes("readForwardPage") && position === Buffer.byteLength(bytes)) {
           expect(verified).toBe(true);
@@ -919,7 +923,7 @@ describe("native conversation reader — identical-prefix continuation", () => {
     expect(failed!.error).not.toContain("private");
     reads.mockRestore();
     const recovered = reader.read(input, false);
-    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fileIdentity(file)).toBe(inode);
     expect(recovered.streaming.tools[0]?.result).toEqual({ content: [{ type: "text", text: "partial" }] });
     expect(recovered.hasNewer).toBe(true);
     expect(reader.loadNewer()!.messages).toEqual([canonical]);
@@ -951,11 +955,11 @@ describe("native conversation reader — replacement read I/O", () => {
     reader.read(input, false);
     const before = reader.loadOlder()!;
     expect(before.hasMore).toBe(true);
-    const oldInode = fs.statSync(file).ino;
+    const oldInode = fileIdentity(file);
     const replacementRecords = records("new-generation", 152);
     fs.writeFileSync(`${file}.new`, jsonl(replacementRecords));
-    fs.renameSync(`${file}.new`, file);
-    const newInode = fs.statSync(file).ino;
+    replaceGeneration(`${file}.new`, file);
+    const newInode = fileIdentity(file);
     expect(newInode).not.toBe(oldInode);
     const realRead = fs.readSync.bind(fs);
     const trace: Array<{ phase: string; fd: number; position: number; length: number; failed: boolean }> = [];
@@ -965,7 +969,7 @@ describe("native conversation reader — replacement read I/O", () => {
       const stack = new Error().stack ?? "";
       const actualPhase = stack.includes("matchesLoadedPages") ? "verification" : stack.includes("relocateBounds") ? "relocation"
         : stack.includes("readBackwardPage") ? "backward" : stack.includes("replaceWindowIfNeeded") ? "unread" : "ordinary";
-      const target = fs.fstatSync(fd).ino === newInode;
+      const target = descriptorIdentity(fd) === newInode;
       const failed = target && fail && actualPhase === faultPhase;
       if (target) trace.push({ phase: actualPhase, fd, position, length, failed });
       if (failed) throw Object.assign(new Error("EIO private payload must not appear " + "secret".repeat(100)), { code: "EIO" });
@@ -998,7 +1002,7 @@ describe("native conversation reader — replacement read I/O", () => {
     fail = false;
     const follow = api === "loadNewer" || api === "readFollow";
     const restored = reader.read(input, follow);
-    expect(fs.statSync(file).ino).toBe(newInode);
+    expect(fileIdentity(file)).toBe(newInode);
     expect(restored.error).toBeUndefined();
     expect(restored.unavailable).toBeUndefined();
     expect(JSON.stringify(restored.messages)).not.toContain("old-");
@@ -1034,15 +1038,15 @@ describe("native conversation reader — replacement read I/O", () => {
     expect(before.streaming.tools[0]?.result).toEqual(result("old"));
     const canonical = { role: "toolResult", toolCallId: "pending", toolName: "bash", ...result("new"), isError: false, timestamp: 1 };
     fs.writeFileSync(`${file}.new`, jsonl([...loaded("new"), { type: "message_end", message: canonical }]));
-    const oldInode = fs.statSync(file).ino;
-    fs.renameSync(`${file}.new`, file);
-    const inode = fs.statSync(file).ino;
+    const oldInode = fileIdentity(file);
+    replaceGeneration(`${file}.new`, file);
+    const inode = fileIdentity(file);
     expect(inode).not.toBe(oldInode);
     const realRead = fs.readSync.bind(fs);
     let injected = 0;
     const reads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
       const stack = new Error().stack ?? "";
-      if (fs.fstatSync(args[0]).ino === inode && stack.includes("replaceWindowIfNeeded") && stack.includes("readForwardPage") && !stack.includes("relocateBounds") && !stack.includes("matchesLoadedPages")) {
+      if (descriptorIdentity(args[0]) === inode && stack.includes("replaceWindowIfNeeded") && stack.includes("readForwardPage") && !stack.includes("relocateBounds") && !stack.includes("matchesLoadedPages")) {
         injected++;
         throw Object.assign(new Error("private EIO"), { code: "EIO" });
       }
@@ -1056,7 +1060,7 @@ describe("native conversation reader — replacement read I/O", () => {
     expect(failed.unavailable?.eventsFile).toBe(true);
     reads.mockRestore();
     const recovered = reader.read(input, false);
-    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fileIdentity(file)).toBe(inode);
     expect(recovered.error).toBeUndefined();
     expect(recovered.messages).toEqual([]);
     expect(recovered.hasNewer).toBe(true);
@@ -1145,11 +1149,12 @@ describe("native conversation reader — initial recovery generation", () => {
     expect(reads).not.toHaveBeenCalled(); // identity observed, zero records consumed
     reads.mockRestore();
     fs.appendFileSync(file, jsonl([{ type: "message_end", message }]));
-    const inode = fs.statSync(file).ino;
+    const inode = fileIdentity(file);
+    retainCompactionGeneration(file);
     const compacted = compactTerminalRunLog(file, "failed");
     expect(compacted).toMatchObject({ compacted: 1 });
     expect(compacted.error).toBeUndefined();
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    expect(fileIdentity(file)).not.toBe(inode);
     const records = fs.readFileSync(file, "utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
     expect(records[1].resultMetadata).toEqual({ customFlag: result.customFlag });
     expect(records[2]).toEqual({ type: "message_end", message });
@@ -1258,11 +1263,12 @@ describe("native conversation reader — initial recovery generation", () => {
     }
     if (!follow) expect(reader.read(input, false).streaming.tools).toEqual(recovered.streaming.tools);
     fs.appendFileSync(file, jsonl([{ type: "message_end", message: canonical }]));
-    const inode = fs.statSync(file).ino;
+    const inode = fileIdentity(file);
+    retainCompactionGeneration(file);
     const compacted = compactTerminalRunLog(file, "failed");
     expect(compacted).toMatchObject({ compacted: 1 });
     expect(compacted.error).toBeUndefined();
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    expect(fileIdentity(file)).not.toBe(inode);
     const bytes = fs.readFileSync(file);
     const lines = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
     expect(lines[2].resultMetadata).toEqual({ customFlag: result.customFlag });

@@ -341,9 +341,19 @@ interface NativeReaderState {
 
 type NativeReaderMetadata = Omit<NativeConversationTranscript, "messages" | "entries" | "streaming" | "pendingMessages">;
 
-interface FileWindow {
-  device?: number;
-  inode?: number;
+interface DescriptorGeneration {
+  device: bigint;
+  inode: bigint;
+  birthtime: bigint;
+  mtime: bigint;
+}
+
+interface OpenedDescriptor extends DescriptorGeneration {
+  descriptor: number;
+  size: number;
+}
+
+interface FileWindow extends Partial<DescriptorGeneration> {
   /** Oldest byte loaded so far (record-aligned); 0 once history start is reached. */
   head: number;
   /** Newest byte consumed so far. */
@@ -385,17 +395,23 @@ const classifyFile = (filePath: string): FileKind | "unreadable" => {
 
 const openDescriptor = (
   filePath: string,
-): { descriptor: number; size: number; device: number; inode: number } | { error: string } | undefined => {
+): OpenedDescriptor | { error: string } | undefined => {
+  let descriptor: number | undefined;
   try {
     const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-    const descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-    const stat = fs.fstatSync(descriptor);
+    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    // Windows file IDs exceed Number.MAX_SAFE_INTEGER. Preserve the exact ID
+    // AND creation/modification metadata from the descriptor we actually read.
+    const stat = fs.fstatSync(descriptor, { bigint: true });
     if (!stat.isFile()) {
       closeQuietly(descriptor);
       return { error: "not a regular file" };
     }
-    return { descriptor, size: stat.size, device: stat.dev, inode: stat.ino };
+    const size = Number(stat.size);
+    if (!Number.isSafeInteger(size)) throw new Error("file size exceeds safe byte offsets");
+    return { descriptor, size, device: stat.dev, inode: stat.ino, birthtime: stat.birthtimeNs, mtime: stat.mtimeNs };
   } catch (error) {
+    if (descriptor !== undefined) closeQuietly(descriptor);
     return { error: clipError(error) };
   }
 };
@@ -447,7 +463,7 @@ export class NativeConversationReader {
   #persisted = new Set<string>();
   #messageKeys = new WeakMap<NativeAgentMessage, string>();
   #entryProjections = new WeakMap<SessionEntry, { entry: NativeTranscriptEntry; messages: NativeAgentMessage[] }>();
-  #logClassification: { path: string; kind: FileKind; dev: number; ino: number; size: number; mtimeMs: number } | undefined;
+  #logClassification: { path: string; kind: FileKind; dev: bigint; ino: bigint; size: bigint; birthtime: bigint; mtime: bigint } | undefined;
   #checkpoint: NativeReaderCheckpoint<NativeReaderState> | undefined;
   #suspendedMetadata: NativeReaderMetadata | undefined;
   readonly #loadedRanges = new Map<FileKind, Array<[number, number]>>();
@@ -866,6 +882,8 @@ export class NativeConversationReader {
         size: opened.size,
         device: opened.device,
         inode: opened.inode,
+        birthtime: opened.birthtime,
+        mtime: opened.mtime,
         hasOlder: page.start > 0,
         loadedRecords: page.records.length,
         unavailable: false,
@@ -890,6 +908,8 @@ export class NativeConversationReader {
     }
     try {
       if (this.#replaceWindowIfNeeded(kind, opened)) return true;
+      window.size = opened.size;
+      window.mtime = opened.mtime;
       if (!window.hasOlder || window.head <= 0) return false;
       let page: RecordPage;
       try {
@@ -930,6 +950,7 @@ export class NativeConversationReader {
       // shorten the file OR grow a near-empty end into the compact marker.
       if (this.#replaceWindowIfNeeded(kind, opened, followLatest)) return true;
       window.size = opened.size;
+      window.mtime = opened.mtime;
       window.unavailable = false;
       if (!followLatest || opened.size <= window.tail) return false;
       const page = readForwardPage(opened.descriptor, window.tail, opened.size, GROWTH_PAGE_BYTES);
@@ -963,10 +984,10 @@ export class NativeConversationReader {
 
   #replaceWindowIfNeeded(
     kind: FileKind,
-    opened: { descriptor: number; device: number; inode: number; size: number },
+    opened: OpenedDescriptor,
     followLatest?: boolean,
   ): boolean {
-    const { device, inode } = opened;
+    const { device, inode, birthtime, mtime } = opened;
     const window = this.#windows.get(kind);
     if (!window) return false;
     if (!window.replacementPending && window.head === 0 && window.tail === 0 &&
@@ -978,9 +999,21 @@ export class NativeConversationReader {
       // including replacement of that still-unconsumed generation.
       window.device = device;
       window.inode = inode;
+      window.birthtime = birthtime;
+      window.mtime = mtime;
       return false;
     }
-    if (!window.replacementPending && window.device === device && window.inode === inode) return false;
+    // Exact IDs prevent rounding collisions, not genuine inode reuse. Creation
+    // time distinguishes reused IDs, including replacements larger than the
+    // consumed generation. Shrink or a same-size modification still requires
+    // content proof even if creation time is unchanged. Within an unchanged,
+    // known creation generation the writer is append-only: do not reread loaded
+    // history on every append, or any bytes at all on settled metadata reads.
+    // If the filesystem supplies no creation time, changed metadata cannot
+    // establish that cheap append-only path and must take content verification.
+    if (!window.replacementPending && window.device === device && window.inode === inode &&
+      window.birthtime === birthtime && opened.size >= window.size &&
+      (window.mtime === mtime || (birthtime !== 0n && opened.size > window.size))) return false;
     // Only primitive bookmarks/evidence are retained across failure. Decoded
     // payloads from the replaced generation must never be rolled back as truth.
     const originalWindow = { ...window };
@@ -995,6 +1028,8 @@ export class NativeConversationReader {
       if (!window.replacementPending && this.#matchesLoadedPages(kind, opened.descriptor, opened.size)) {
         window.device = device;
         window.inode = inode;
+        window.birthtime = birthtime;
+        window.mtime = mtime;
         window.size = opened.size;
         window.unavailable = false;
         // Growth must consume its one unread page inside this transaction:
@@ -1054,7 +1089,7 @@ export class NativeConversationReader {
       }
       this.#windows.set(kind, {
         head: pages.at(-1)!.start, tail: bounds.tail, size: opened.size,
-        device, inode, hasOlder: pages.at(-1)!.start > 0,
+        device, inode, birthtime, mtime, hasOlder: pages.at(-1)!.start > 0,
         loadedRecords: pages.reduce((count, page) => count + page.records.length, 0), unavailable: false,
       });
       if (this.#followed) {
@@ -1446,14 +1481,15 @@ export class NativeConversationReader {
   #classifyLog(filePath: string): FileKind | "unreadable" {
     const cached = this.#logClassification;
     try {
-      const stat = fs.lstatSync(filePath);
+      const stat = fs.lstatSync(filePath, { bigint: true });
       if (cached?.path === filePath && stat.isFile() && cached.dev === stat.dev && cached.ino === stat.ino &&
-        cached.size > 0 && (stat.size > cached.size || (stat.size === cached.size && stat.mtimeMs === cached.mtimeMs))) {
+        cached.birthtime === stat.birthtimeNs && cached.size > 0n &&
+        (stat.size > cached.size || (stat.size === cached.size && stat.mtimeNs === cached.mtime))) {
         return cached.kind;
       }
       const kind = classifyFile(filePath);
       if (kind !== "unreadable") {
-        this.#logClassification = { path: filePath, kind, dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+        this.#logClassification = { path: filePath, kind, dev: stat.dev, ino: stat.ino, size: stat.size, birthtime: stat.birthtimeNs, mtime: stat.mtimeNs };
         return kind;
       }
     } catch {

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeConversationReader, type NativeConversationTranscript } from "../src/ui/conversation-native-reader.js";
 import { NativeReaderCheckpoint } from "../src/ui/conversation-native-reader-checkpoint.js";
 import { compactTerminalRunLog } from "../src/worker/run-log.js";
+import { descriptorIdentity, fileIdentity, replaceGeneration, retainCompactionGeneration } from "./helpers/native-reader-file-generation.js";
 
 const directories: string[] = [];
 const workspace = () => {
@@ -57,16 +58,16 @@ describe("native reader identical-prefix paging", () => {
     const before = reader.loadOlder()!;
     const olderReader = new NativeConversationReader();
     const olderBefore = olderReader.read(input, api === "readFollow");
-    const oldInode = fs.statSync(file).ino;
+    const oldInode = fileIdentity(file);
     fs.writeFileSync(`${file}.new`, bytes + jsonl(records.slice(150)));
-    fs.renameSync(`${file}.new`, file);
-    const inode = fs.statSync(file).ino;
+    replaceGeneration(`${file}.new`, file);
+    const inode = fileIdentity(file);
     expect(inode).not.toBe(oldInode);
     const realRead = fs.readSync.bind(fs);
     const suffixReads: Array<{ position: number; length: number; replacement: boolean }> = [];
     const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
       const stack = new Error().stack ?? "";
-      if (fs.fstatSync(fd).ino === inode && stack.includes("readForwardPage") && !stack.includes("matchesLoadedPages")) {
+      if (descriptorIdentity(fd) === inode && stack.includes("readForwardPage") && !stack.includes("matchesLoadedPages")) {
         suffixReads.push({ position, length, replacement: stack.includes("replaceWindowIfNeeded") });
       }
       return realRead(fd, buffer, offset, length, position);
@@ -112,10 +113,10 @@ describe("native reader identical-prefix paging", () => {
     const input = { id: "reader", status: "running", ...(kind === "session" ? { sessionFile: file } : { eventsFile: file }) };
     const reader = new NativeConversationReader();
     const before = reader.read(input, true);
-    const inode = fs.statSync(file).ino;
+    const inode = fileIdentity(file);
     fs.writeFileSync(`${file}.new`, bytes);
-    fs.renameSync(`${file}.new`, file);
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    replaceGeneration(`${file}.new`, file);
+    expect(fileIdentity(file)).not.toBe(inode);
     const realRead = fs.readSync.bind(fs);
     const positions: number[] = [];
     const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number) => {
@@ -194,11 +195,12 @@ describe("native reader initial recovery suspension", () => {
     expect(reader.suspended).toBe(true);
     const checkpointDirectory = temporary.mock.results[0]!.value as string;
     fs.appendFileSync(file, jsonl([{ type: "message_end", message: canonical }]));
-    const inode = fs.statSync(file).ino;
+    const inode = fileIdentity(file);
+    retainCompactionGeneration(file);
     const compacted = compactTerminalRunLog(file, "failed");
     expect(compacted).toMatchObject({ compacted: 1 });
     expect(compacted.error).toBeUndefined();
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    expect(fileIdentity(file)).not.toBe(inode);
     const bytes = fs.readFileSync(file);
     const lines = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
     expect(lines[2].resultMetadata).toEqual({ customFlag: result.customFlag });
@@ -270,10 +272,10 @@ describe("native reader disk suspension", () => {
     fs.writeFileSync(file, jsonl([header, { ...entry(0, 16), message: { ...entry(0, 16).message, content: "mutated" } }]));
     reader.loadLatest(); // Contradictory interval permanently poisons the proof.
     const newRecord = { ...entry(0, 16), message: { ...entry(0, 16).message, content: "new-generation" } };
-    const oldInode = fs.statSync(file).ino;
+    const oldInode = fileIdentity(file);
     fs.writeFileSync(`${file}.new`, jsonl([header, newRecord, entry(1, 16)]));
-    fs.renameSync(`${file}.new`, file);
-    const inode = fs.statSync(file).ino;
+    replaceGeneration(`${file}.new`, file);
+    const inode = fileIdentity(file);
     expect(inode).not.toBe(oldInode);
     const realRead = fs.readSync.bind(fs);
     let injected = 0;
@@ -281,7 +283,7 @@ describe("native reader disk suspension", () => {
       const stack = new Error().stack ?? "";
       const actualPhase = stack.includes("relocateBounds") ? "relocation"
         : stack.includes("replaceWindowIfNeeded") && !stack.includes("readBackwardPage") ? "unread" : "other";
-      if (fs.fstatSync(args[0]).ino === inode && actualPhase === phase) {
+      if (descriptorIdentity(args[0]) === inode && actualPhase === phase) {
         injected++;
         throw Object.assign(new Error("private payload EIO"), { code: "EIO" });
       }
@@ -295,7 +297,7 @@ describe("native reader disk suspension", () => {
     expect(failed.error).not.toContain("private");
     reads.mockRestore();
     const recovered = reader.read(input, false);
-    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fileIdentity(file)).toBe(inode);
     expect(recovered.messages).toEqual([newRecord.message]);
     expect(recovered.leafId).toBe("m0");
     expect(recovered.hasNewer).toBe(true);
@@ -326,10 +328,10 @@ describe("native reader disk suspension", () => {
     const reader = new NativeConversationReader();
     const before = reader.read(input, false);
     const replaceIdentically = (replacementBytes = bytes) => {
-      const inode = fs.statSync(file).ino;
+      const inode = fileIdentity(file);
       fs.writeFileSync(`${file}.new`, replacementBytes);
-      fs.renameSync(`${file}.new`, file);
-      expect(fs.statSync(file).ino).not.toBe(inode);
+      replaceGeneration(`${file}.new`, file);
+      expect(fileIdentity(file)).not.toBe(inode);
     };
     const reads = vi.spyOn(fs, "readSync");
     replaceIdentically();
@@ -428,7 +430,7 @@ describe("native reader disk suspension", () => {
     const bytes = (i: number) => jsonl([header, { ...entry(0, 16), message: { role: "user", content: String(i).padStart(16, "0"), timestamp: 0 } }]);
     fs.writeFileSync(file, bytes(0));
     const size = fs.statSync(file).size;
-    const inode = fs.statSync(file).ino;
+    const inode = fileIdentity(file);
     const reader = new NativeConversationReader();
     reader.read(input, false);
     const stringify = vi.spyOn(JSON, "stringify");
@@ -444,7 +446,7 @@ describe("native reader disk suspension", () => {
     const hashes = stringify.mock.calls.filter(([value]) => Array.isArray(value) && value.length === 2 && typeof value[0] === "string" && value[0].startsWith('{"type":"session"')).length;
     stringify.mockRestore();
     expect(fs.statSync(file).size).toBe(size);
-    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fileIdentity(file)).toBe(inode);
     expect(hashes).toBeLessThanOrEqual(2);
     const temporary = trackCheckpoints();
     expect(reader.suspend()).toBe(true);
@@ -470,7 +472,7 @@ describe("native reader disk suspension", () => {
       message: { role: "user", content: String(i).padStart(variant === "grow" ? 16 + i : variant === "shrink" ? 272 - i : 16, "x"), timestamp: variant === "timestamp" ? 1000 + i : 0 },
     });
     fs.writeFileSync(file, jsonl([header, record(0)]));
-    const inode = fs.statSync(file).ino;
+    const inode = fileIdentity(file);
     const initialSize = fs.statSync(file).size;
     const reader = new NativeConversationReader();
     const stringify = vi.spyOn(JSON, "stringify");
@@ -497,7 +499,7 @@ describe("native reader disk suspension", () => {
     const rereadCount = reads.mock.calls.length;
     reads.mockRestore();
     evidenceSet.mockRestore();
-    expect(fs.statSync(file).ino).toBe(inode);
+    expect(fileIdentity(file)).toBe(inode);
     expect(Math.sign(fs.statSync(file).size - initialSize)).toBe(variant === "grow" ? 1 : variant === "shrink" ? -1 : 0);
     // The same two logical records must not generate 256 obsolete fingerprints.
     expect(evidenceSizes.length).toBeLessThanOrEqual(257);
@@ -526,8 +528,8 @@ describe("native reader disk suspension", () => {
     fs.writeFileSync(checkpoint, checkpointBytes);
     expect(reader.last!.messages).toEqual([record(256).message]);
     fs.copyFileSync(file, `${file}.new`);
-    fs.renameSync(`${file}.new`, file);
-    expect(fs.statSync(file).ino).not.toBe(inode);
+    replaceGeneration(`${file}.new`, file);
+    expect(fileIdentity(file)).not.toBe(inode);
     const fresh = new NativeConversationReader();
     const expected = fresh.read(input, false);
     const relocated = reader.read(input, false);

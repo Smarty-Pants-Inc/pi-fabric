@@ -7,6 +7,11 @@ import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 
 const MAIN_AGENT_ALIAS = "main";
+// Pi can report idle while a prompt's preflight still runs. Sending a followUp then puts it
+// in Pi's native queue, behind later followUps flushed as steers by this drain (#754).
+// Older hosts do not expose this optional capability.
+const promptPending = (ctx: ExtensionContext): boolean =>
+  "isPromptPending" in ctx && typeof ctx.isPromptPending === "function" && ctx.isPromptPending() === true;
 export type FabricAgentMessageDelivery = "steer" | "followUp";
 /** How a direct agent message goes to Pi: a nextTurn one waits for the next user prompt. */
 export type FabricMainAgentDelivery = FabricAgentMessageDelivery | "nextTurn";
@@ -440,7 +445,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         if (replaced) { this.#consumedDirty = true; this.#trySave(); }
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
-      if (this.#context!.isIdle()) this.#release(true);
+      if (this.#context!.isIdle() && !promptPending(this.#context!)) this.#release(true);
     } else if (deliveryId !== undefined) {
       // A sent message may wait in Pi's volatile queue (prompt preflight, a settle): it stays in
       // the journal until the session holds it, and a restart replays it (#confirm, #replay).
@@ -990,7 +995,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   #drainActive(): boolean {
     return !this.#closed && this.#context !== undefined &&
-      (this.#held.length > 0 || this.#context.isIdle() === false);
+      (this.#held.length > 0 || this.#context.isIdle() === false || promptPending(this.#context));
   }
 
   /**

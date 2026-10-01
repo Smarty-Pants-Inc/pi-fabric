@@ -84,6 +84,25 @@ describe("Main followUp drain (unit)", () => {
     expect(sent[0]!.message.details).toMatchObject({ id: result.messageId, delivery: "followUp", sentAt: "2026-09-27T20:00:00.000Z" });
   });
 
+  it("keeps a HANDOFF arriving during an idle prompt preflight ahead of its busy correction (#754)", () => {
+    const { main, sent, ctx, state, emit } = setup(120_000, true);
+    let preflight = true;
+    Object.assign(ctx, { isPromptPending: () => preflight });
+    const handoff = main.deliverAgent({ from: from("lane"), message: `HANDOFF proof ${"x".repeat(3000)}`, delivery: "followUp" });
+    expect(sent).toHaveLength(0); // Must not escape into Pi's separate native followUp queue.
+    expect(handoff.pendingFollowUps).toBe(1);
+    preflight = false;
+    state.idle = false;
+    const correction = main.deliverAgent({ from: from("lane"), message: "checksum correction", delivery: "followUp" });
+    vi.advanceTimersByTime(120_000);
+    emit("turn_end", toolTurn, ctx);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.details.items.map((item: { id: string }) => item.id))
+      .toEqual([handoff.messageId, correction.messageId]);
+    expect(sent[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
+    main.closeFollowUpDrain();
+  });
+
   it("stamps a steer with sent_at and sends it at once, even to a busy Main", () => {
     const { main, sent } = setup();
     main.deliverAgent({ from: from("a"), message: "now", delivery: "steer" });
@@ -643,6 +662,70 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 // The real Pi agent loop: Main chains tool calls; the followUp must arrive at a tool boundary,
 // never inside a call, and behind a steer that was queued before it.
 describe("Main followUp drain in a real Pi session", () => {
+  it("delivers a full HANDOFF then correction in order across prompt preflight (#754)", async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-order-754-"));
+    roots.push(root);
+    const faux = fauxProvider();
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "auth.json") });
+    modelRuntime.registerNativeProvider(faux.provider);
+    let main: MainAgentController | undefined;
+    let releasePreflight: (() => void) | undefined;
+    let releaseTool: (() => void) | undefined;
+    let preflights = 0;
+    let preflightCapability = false;
+    const loader = new DefaultResourceLoader({
+      cwd: root, agentDir: path.join(root, "agent"), noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [{ name: "ordering-754", factory: (pi: ExtensionAPI) => {
+        pi.on("before_agent_start", async () => {
+          if (++preflights === 1) await new Promise<void>((resolve) => { releasePreflight = resolve; });
+        });
+        pi.registerTool({ name: "work", label: "work", description: "held tool boundary", parameters: Type.Object({}),
+          execute: async () => {
+            await new Promise<void>((resolve) => { releaseTool = resolve; });
+            return { content: [{ type: "text", text: "done" }], details: {} };
+          },
+        });
+        pi.on("session_start", (_event, ctx) => {
+          preflightCapability = "isPromptPending" in ctx && typeof ctx.isPromptPending === "function";
+          main = new MainAgentController(pi, "session:root", true, root, "root");
+          main.attachFollowUpDrain(ctx, 10);
+        });
+      } }],
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({ cwd: root, agentDir: path.join(root, "agent"), modelRuntime,
+      model: faux.getModel(), resourceLoader: loader, sessionManager: SessionManager.inMemory(root), tools: ["work"] });
+    sessions.push(session);
+    await session.bindExtensions({});
+    // Upstream 0.87.0 lacks the preflight capability; the installed fleet SDK exposes it.
+    // The unit regression still runs on both, and the native regression runs on the real host.
+    if (!preflightCapability) t.skip();
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("work", {}), { stopReason: "toolUse" }),
+      fauxAssistantMessage("read messages"), fauxAssistantMessage("finished")]);
+    const run = session.prompt("existing supervisor turn");
+    try {
+      await waitFor(() => releasePreflight !== undefined);
+      const handoff = main!.deliverAgent({ from: from("lane"), message: `HANDOFF proof ${"x".repeat(3000)}`, delivery: "followUp" });
+      releasePreflight!();
+      await waitFor(() => releaseTool !== undefined);
+      const correction = main!.deliverAgent({ from: from("lane"), message: "checksum correction", delivery: "followUp" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      releaseTool!();
+      await run;
+      const items = session.messages.filter((message) => message.role === "custom" &&
+        (message as { customType?: string }).customType === "pi-fabric-agent-message")
+        .flatMap((message) => {
+          const details = (message as { details: { id: string; items?: Array<{ id: string }> } }).details;
+          return details.items ?? [details];
+        });
+      expect(items.map((item) => item.id)).toEqual([handoff.messageId, correction.messageId]);
+    } finally {
+      releasePreflight?.(); releaseTool?.();
+      await session.abort(); await run.catch(() => undefined);
+      main?.closeFollowUpDrain();
+    }
+  });
+
   it("delivers a due followUp at the next tool boundary, behind an earlier steer, while Main keeps working", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-drain-"));
     roots.push(root);

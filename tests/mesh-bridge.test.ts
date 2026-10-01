@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MainAgentController } from "../src/main-agent.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
@@ -411,6 +411,9 @@ describe("mesh bridge", () => {
     const sendMessage = vi.fn();
     const pi = { hostCapabilities: { turnProvenance: 1 }, sendMessage, sendUserMessage: vi.fn() } as unknown as ExtensionAPI;
     const main = new MainAgentController(pi, lane.identity.id, true, os.tmpdir(), "lane");
+    // Control command IDs require durable admission even with Pi's native drain.
+    main.attachFollowUpDrain({ isIdle: () => true, sessionManager: { getEntries: () => [] } } as unknown as ExtensionContext,
+      0, path.join(scratch(), "main-followups.json"));
     const router = new AgentMessageRouter({} as any, { identity: lane.identity } as any, main,
       { get: () => undefined } as any, undefined, binding => binding);
     const control = new FabricControlPlane(hub, lane.identity, { enabled: true, hostId: lane.hostId, pollMs: 10 });

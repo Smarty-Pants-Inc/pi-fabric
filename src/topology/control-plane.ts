@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { mainExecutionCeilingAbortReason } from "../async-settlement.js";
-import type { FabricActorRunBinding } from "../actors/types.js";
+import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
@@ -46,6 +46,7 @@ export interface FabricControlCommand {
   data?: unknown;
   triggerTurn?: boolean;
   binding?: FabricActorRunBinding;
+  bindingProvenance?: FabricActorBindingProvenance;
   cancelCommandId?: string;
   requestedAt: number;
   deadlineAt?: number;
@@ -140,6 +141,9 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
     (data.destinationRemoteHost !== undefined && data.destinationRemoteHost !== null &&
       typeof data.destinationRemoteHost !== "string") ||
     (data.operation === "cancel" && typeof data.cancelCommandId !== "string") ||
+    (data.bindingProvenance !== undefined &&
+      (!isObject(data.bindingProvenance) || data.bindingProvenance.kind !== "owner-defaults" ||
+        typeof data.bindingProvenance.rootId !== "string")) ||
     (data.binding !== undefined &&
       (!isObject(data.binding) ||
         (data.binding.model !== undefined && typeof data.binding.model !== "string") ||
@@ -194,7 +198,31 @@ export interface FabricControlInput {
   data?: unknown;
   triggerTurn?: boolean;
   binding?: FabricActorRunBinding;
+  bindingProvenance?: FabricActorBindingProvenance;
 }
+
+/** Trust owner-default provenance only from a validated member of that actor's root. */
+export const controlActorBindingOptions = (
+  command: Pick<FabricControlCommand, "binding" | "bindingProvenance">,
+  from: MeshIdentity,
+  actorRootId: string | undefined,
+  senderRootId: string | undefined,
+): { overrides?: FabricActorRunBinding; binding?: FabricActorRunBinding } => {
+  const provenance = command.bindingProvenance;
+  if (provenance) {
+    if (provenance.kind !== "owner-defaults" || !actorRootId || provenance.rootId !== actorRootId ||
+      (from.id !== actorRootId && senderRootId !== actorRootId)) {
+      throw new Error("Invalid actor owner-default binding provenance");
+    }
+    return { overrides: command.binding ?? {} };
+  }
+  // An explicit caller view is fixed, even when one or both fields are absent.
+  if (command.binding !== undefined) return { binding: command.binding };
+  // Preserve legacy unbound own-root requests, but never promote an empty foreign
+  // view into the owner's private session defaults.
+  return actorRootId && (from.id === actorRootId || senderRootId === actorRootId)
+    ? {} : { binding: {} };
+};
 
 export interface FabricControlRequestOptions {
   /** Snapshot from the validated participant, never from message/data. */
@@ -243,6 +271,7 @@ export class FabricControlPlane {
   #mirrorWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   #closed = false;
+  #paused = false;
   #handler: FabricControlHandler | undefined;
   #seenCleanupAt = 0;
   #legacySeenCleanupAt = Date.now();
@@ -278,6 +307,7 @@ export class FabricControlPlane {
     this.#handler = handler;
     if (!this.options.enabled || this.#timer) return;
     this.#closed = false;
+    this.#paused = false;
     this.#timer = setInterval(() => void this.#poll().catch(() => undefined), this.#pollMs);
     this.#timer.unref();
   }
@@ -458,6 +488,7 @@ export class FabricControlPlane {
           ...(input.data !== undefined ? { data: input.data } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
           ...(input.binding !== undefined ? { binding: input.binding } : {}),
+          ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
           requestedAt: committedAt,
           deadlineAt: committedAt + timeoutMs,
         }),
@@ -580,12 +611,19 @@ export class FabricControlPlane {
     }).catch(() => undefined);
   }
 
+  /** Reload: leave new commands unclaimed in the durable mesh log for the next runtime. */
+  pause(): void {
+    this.#paused = true;
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = undefined;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     await this.#polling?.catch(() => undefined);
-    await this.#drain().catch(() => undefined);
+    if (!this.#paused) await this.#drain().catch(() => undefined);
     this.#closed = true;
     this.#sharedClaims.clear();
     this.#unpublished.clear();
@@ -603,7 +641,7 @@ export class FabricControlPlane {
   }
 
   async #poll(): Promise<void> {
-    if (this.#closed || !this.options.enabled) return;
+    if (this.#closed || this.#paused || !this.options.enabled) return;
     if (this.#polling) return this.#polling;
     const operation = this.#drain();
     this.#polling = operation;
@@ -621,6 +659,7 @@ export class FabricControlPlane {
     while (true) {
       const tail = this.mesh.tail(this.#offset, 100);
       for (const event of tail.events) {
+        if (this.#paused) return;
         if (event.sequence <= this.#lastSequence) continue;
         // An event is consumed only once handled: a command that hit a lock timeout throws,
         // and the next poll reads this page again from it (smarty-dev#424). Each retry is

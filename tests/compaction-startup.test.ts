@@ -35,7 +35,7 @@ const harness = async (options: CompactionHookOptions = { getEngine: () => "fabr
   const { registerLazyCompactionHook } = await import("../src/compaction/lazy-hook.js");
   registerLazyCompactionHook(pi, options);
   const context = { hasUI: true, ui: { notify: vi.fn() }, model: { provider: "test", id: "model", contextWindow: 100_000 } } as unknown as ExtensionContext;
-  return { context, handlers, emit: (name: string, event: unknown) => handlers.get(name)!(event, context) };
+  return { pi, context, handlers, emit: (name: string, event: unknown) => handlers.get(name)!(event, context) };
 };
 
 describe("lazy compaction registration", () => {
@@ -83,6 +83,39 @@ describe("lazy compaction registration", () => {
     expect(await h.emit("session_before_compact", compactEvent({ reason: "threshold" }))).toEqual({ cancel: true });
     expect(await h.emit("session_before_compact", compactEvent({ reason: "manual" }))).toBeUndefined();
     expect(loaded).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])("carries lazy veto provenance and the actual operation signal (aborted=%s)", async (aborted) => {
+    const h = await harness({ getEngine: () => "pi", getThresholdTokens: () => 2000 });
+    const { takeCompactionDecline } = await import("../src/compaction/cancellation.js");
+    const operation = new AbortController();
+    if (aborted) operation.abort();
+    const event = compactEvent({ reason: "threshold", signal: operation.signal });
+    expect(await h.emit("session_before_compact", event)).toEqual({ cancel: true });
+    const other = await harness();
+    expect(takeCompactionDecline(other.pi)).toBeUndefined();
+    expect(takeCompactionDecline(h.pi)).toEqual({ reason: "threshold", signal: operation.signal });
+    expect(takeCompactionDecline(h.pi)).toBeUndefined();
+  });
+
+  it.each([
+    { customInstructions: "__pi_fabric_compact_request_v1__:not-json" },
+    { branchEntries: [] },
+  ])("carries lazy Fabric rejection provenance for $customInstructions", async (extra) => {
+    const h = await harness();
+    const { takeCompactionDecline } = await import("../src/compaction/cancellation.js");
+    const operation = new AbortController();
+    expect(await h.emit("session_before_compact", compactEvent({ reason: "manual", signal: operation.signal, ...extra }))).toEqual({ cancel: true });
+    expect(takeCompactionDecline(h.pi)).toEqual({ reason: "manual", signal: operation.signal });
+  });
+
+  it("does not manufacture decline provenance for delegated or successful compaction", async () => {
+    const h = await harness();
+    const { takeCompactionDecline } = await import("../src/compaction/cancellation.js");
+    for (const extra of [{ customInstructions: "__pi_vcc__" }, { branchEntries: [], _piVccOverriding: true }, {}]) {
+      await h.emit("session_before_compact", compactEvent(extra));
+      expect(takeCompactionDecline(h.pi)).toBeUndefined();
+    }
   });
 
   it("preserves instruction rejection notifications and pi-vcc fallback", async () => {

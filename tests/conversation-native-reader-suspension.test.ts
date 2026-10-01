@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeConversationReader, type NativeConversationTranscript } from "../src/ui/conversation-native-reader.js";
 import { NativeReaderCheckpoint } from "../src/ui/conversation-native-reader-checkpoint.js";
+import { compactTerminalRunLog } from "../src/worker/run-log.js";
 
 const directories: string[] = [];
 const workspace = () => {
@@ -128,6 +129,113 @@ describe("native reader identical-prefix paging", () => {
     reader.clear();
   });
 });
+describe("native reader initial recovery suspension", () => {
+  it.each([
+    ["missing", true], ["missing", false], ["initial EIO", true], ["initial EIO", false],
+  ] as const)("resumes canonical after %s recovery and production replacement (follow=%s)", (failure, follow) => {
+    const file = path.join(workspace(), "events.jsonl");
+    const input = { id: "reader", status: "running", eventsFile: file };
+    const toolCallId = "suspended-recovery";
+    const args = { command: "model-free", nested: { keep: [1, 2] } };
+    const content = [{ type: "text", text: "full-result:" + "x".repeat(4000) }];
+    const details = { exact: { audits: [{ id: "nested-call", args: { path: "whole" } }] } };
+    const result = { content, details, customFlag: { retained: true } };
+    const partial = { content: [{ type: "text", text: "partial-only" }], details: { progress: 1 } };
+    const prefix = jsonl([
+      { type: "tool_execution_start", toolCallId, toolName: "bash", args },
+      { type: "tool_execution_update", toolCallId, partialResult: partial },
+      { type: "tool_execution_end", toolCallId, toolName: "bash", result, isError: true },
+    ]);
+    const canonical = { role: "toolResult", toolCallId, toolName: "bash", content, details, isError: true, timestamp: 9,
+      metadata: { provenance: "canonical-only", padding: "m".repeat(600) } };
+    if (failure === "initial EIO") fs.writeFileSync(file, prefix);
+    const reader = new NativeConversationReader();
+    const realRead = fs.readSync.bind(fs);
+    let injected = 0;
+    let failedFd = -1;
+    const fault = failure === "initial EIO" ? vi.spyOn(fs, "readSync").mockImplementation(((...values: Parameters<typeof fs.readSync>) => {
+      if (/readBackwardPage|readForwardPage/.test(new Error().stack ?? "")) {
+        injected++;
+        failedFd = values[0];
+        throw Object.assign(new Error("initial page EIO"), { code: "EIO" });
+      }
+      return realRead(...values);
+    }) as typeof fs.readSync) : undefined;
+    const realOpen = fs.openSync.bind(fs);
+    let admissionFailures = 0;
+    const admission = failure === "initial EIO" ? vi.spyOn(fs, "openSync").mockImplementation(((...values: Parameters<typeof fs.openSync>) => {
+      if ((new Error().stack ?? "").includes("growFile")) {
+        admissionFailures++;
+        throw Object.assign(new Error("initial retry EIO"), { code: "EIO" });
+      }
+      return realOpen(...values);
+    }) as typeof fs.openSync) : undefined;
+    const initial = reader.read(input, false);
+    fault?.mockRestore();
+    admission?.mockRestore();
+    expect(initial.eventsFile).toBe(file);
+    expect(initial.messages).toEqual([]);
+    expect(initial.streaming.tools).toEqual([]);
+    expect(initial.unavailable?.eventsFile).toBe(true);
+    if (failure === "initial EIO") {
+      expect(injected).toBe(1); // actual initial page read failed
+      expect(admissionFailures).toBe(1); // same-call retry remained unavailable
+      expect(() => fs.fstatSync(failedFd)).toThrow();
+    } else fs.writeFileSync(file, prefix);
+    const recovered = reader.read(input, true);
+    expect(recovered.messages).toEqual([]);
+    expect(recovered.unavailable).toBeUndefined();
+    expect(recovered.streaming.tools).toHaveLength(1);
+    expect(recovered.streaming.tools[0]).toMatchObject({ toolCallId, toolName: "bash", args, executionStarted: true,
+      argsComplete: true, status: "failed", isError: true, result: { content, details }, partial });
+    if (!follow) expect(reader.read(input, false).streaming.tools).toEqual(recovered.streaming.tools);
+    const temporary = trackCheckpoints();
+    expect(reader.suspend()).toBe(true);
+    expect(reader.suspended).toBe(true);
+    const checkpointDirectory = temporary.mock.results[0]!.value as string;
+    fs.appendFileSync(file, jsonl([{ type: "message_end", message: canonical }]));
+    const inode = fs.statSync(file).ino;
+    const compacted = compactTerminalRunLog(file, "failed");
+    expect(compacted).toMatchObject({ compacted: 1 });
+    expect(compacted.error).toBeUndefined();
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const bytes = fs.readFileSync(file);
+    const lines = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
+    expect(lines[2].resultMetadata).toEqual({ customFlag: result.customFlag });
+    expect(lines[2].result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify(result)) });
+    expect(lines[3]).toEqual({ type: "message_end", message: canonical });
+    const canonicalStart = bytes.indexOf(Buffer.from('{"type":"message_end"'));
+    const consumed = Buffer.byteLength(prefix);
+    expect(canonicalStart).toBeGreaterThan(0);
+    expect(canonicalStart).toBeLessThan(consumed);
+    expect(consumed).toBeLessThan(bytes.length);
+    expect(() => JSON.parse(bytes.subarray(consumed).toString("utf8"))).toThrow();
+    const resumed = reader.read({ ...input, status: "failed" }, follow);
+    expect(reader.suspended).toBe(false);
+    expect(fs.existsSync(checkpointDirectory)).toBe(false);
+    if (!follow) {
+      expect(resumed.messages).toEqual([]);
+      expect(resumed.hasNewer).toBe(true);
+      expect.soft(resumed.streaming.tools[0]?.result).toBeUndefined(); // still reach the canonical-loss assertion
+      expect(resumed.streaming.tools[0]?.partial).toEqual(partial);
+    }
+    const completed = follow ? resumed : reader.loadNewer()!;
+    expect(completed.messages).toEqual([canonical]);
+    expect(completed.streaming.tools).toHaveLength(1);
+    expect(completed.streaming.tools[0]).toEqual({ toolCallId, toolName: "bash", args, executionStarted: true,
+      argsComplete: true, status: "failed", isError: true, result: { content, details }, partial });
+    expect(completed.error).toBeUndefined();
+    expect(completed.unavailable).toBeUndefined();
+    expect(completed.hasMore).toBe(false); // no session branch is required for events-only sources
+    expect(completed.hasNewer).toBe(false);
+    const reads = vi.spyOn(fs, "readSync");
+    expect(reader.read({ ...input, status: "failed" }, true).messages).toEqual([canonical]);
+    expect(reader.loadNewer()!.messages).toEqual([canonical]);
+    expect(sourceReadCalls(reads)).toHaveLength(0);
+    reader.clear();
+  });
+});
+
 describe("native reader disk suspension", () => {
   it("counts real session/events source reads but excludes corrupt checkpoint reads", () => {
     const temporary = trackCheckpoints();

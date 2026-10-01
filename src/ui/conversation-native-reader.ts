@@ -844,15 +844,15 @@ export class NativeConversationReader {
   }
 
   #initWindow(kind: FileKind, filePath: string): void {
+    // A failed loadLatest must not detach already consumed records/evidence
+    // from their generation. Only a genuinely new window starts at zero.
+    const previous = this.#windows.get(kind);
+    const unavailable: FileWindow = previous
+      ? { ...previous, unavailable: true }
+      : { head: 0, tail: 0, size: 0, hasOlder: false, unavailable: true };
     const opened = openDescriptor(filePath);
     if (!opened || "error" in opened) {
-      this.#windows.set(kind, {
-        head: 0,
-        tail: 0,
-        size: 0,
-        hasOlder: false,
-        unavailable: true,
-      });
+      this.#windows.set(kind, unavailable);
       if (opened && "error" in opened) this.#setError(`${filePath}: ${opened.error}`);
       return;
     }
@@ -871,13 +871,7 @@ export class NativeConversationReader {
         unavailable: false,
       });
     } catch (error) {
-      this.#windows.set(kind, {
-        head: 0,
-        tail: 0,
-        size: 0,
-        hasOlder: false,
-        unavailable: true,
-      });
+      this.#windows.set(kind, unavailable);
       this.#setError(`${filePath}: ${clipError(error)}`);
     } finally {
       closeQuietly(opened.descriptor);
@@ -974,8 +968,19 @@ export class NativeConversationReader {
   ): boolean {
     const { device, inode } = opened;
     const window = this.#windows.get(kind);
-    if (!window || window.device === undefined ||
-      (!window.replacementPending && window.device === device && window.inode === inode)) return false;
+    if (!window) return false;
+    if (!window.replacementPending && window.head === 0 && window.tail === 0 &&
+      (window.loadedRecords ?? 0) === 0 && !this.#loadedPages.get(kind)?.size &&
+      !this.#loadedRanges.get(kind)?.length) {
+      // Initial failure, an empty file, or pinned metadata-only recovery has
+      // consumed nothing: no history boundary needs relocation. Bind to the
+      // SAME descriptor used by grow/loadOlder before admitting any offsets,
+      // including replacement of that still-unconsumed generation.
+      window.device = device;
+      window.inode = inode;
+      return false;
+    }
+    if (!window.replacementPending && window.device === device && window.inode === inode) return false;
     // Only primitive bookmarks/evidence are retained across failure. Decoded
     // payloads from the replaced generation must never be rolled back as truth.
     const originalWindow = { ...window };

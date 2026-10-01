@@ -1101,6 +1101,205 @@ describe("native conversation reader — replacement read I/O", () => {
   });
 });
 
+describe("native conversation reader — initial recovery generation", () => {
+  it.each(["missing", "initial EIO"] as const)("admits metadata-only pinned %s recovery before production replacement", (failure) => {
+    const file = path.join(makeWorkspace(), "events.jsonl");
+    const message = { ...toolResultMessage("metadata-only", "full-result:" + "x".repeat(4000), 9, true),
+      metadata: { provenance: "canonical-only", nested: { retained: [1, 2, 3] } } };
+    const result = { content: message.content, details: message.details, customFlag: { retained: true } };
+    const args = { command: "model-free", nested: { keep: [1, 2] } };
+    const prefix = jsonl([
+      { type: "tool_execution_start", toolCallId: message.toolCallId, toolName: "bash", args },
+      { type: "tool_execution_end", toolCallId: message.toolCallId, toolName: "bash", result, isError: true },
+    ]);
+    if (failure === "initial EIO") fs.writeFileSync(file, prefix);
+    const reader = new NativeConversationReader();
+    const input = source({ eventsFile: file });
+    const realRead = fs.readSync.bind(fs);
+    const realOpen = fs.openSync.bind(fs);
+    let injected = 0;
+    const fault = failure === "initial EIO" ? vi.spyOn(fs, "readSync").mockImplementation(((...values: Parameters<typeof fs.readSync>) => {
+      if ((new Error().stack ?? "").includes("readBackwardPage")) {
+        injected++;
+        throw Object.assign(new Error("initial page EIO"), { code: "EIO" });
+      }
+      return realRead(...values);
+    }) as typeof fs.readSync) : undefined;
+    const admission = failure === "initial EIO" ? vi.spyOn(fs, "openSync").mockImplementation(((...values: Parameters<typeof fs.openSync>) => {
+      if ((new Error().stack ?? "").includes("growFile")) throw Object.assign(new Error("initial retry EIO"), { code: "EIO" });
+      return realOpen(...values);
+    }) as typeof fs.openSync) : undefined;
+    const initial = reader.read(input, false);
+    fault?.mockRestore();
+    admission?.mockRestore();
+    expect(initial.unavailable?.eventsFile).toBe(true);
+    expect(initial.streaming.tools).toEqual([]);
+    if (failure === "initial EIO") expect(injected).toBe(1);
+    else fs.writeFileSync(file, prefix);
+    const reads = vi.spyOn(fs, "readSync");
+    const metadataOnly = reader.read(input, false);
+    expect(metadataOnly.messages).toEqual([]);
+    expect(metadataOnly.streaming.tools).toEqual([]);
+    expect(metadataOnly.unavailable).toBeUndefined();
+    expect(metadataOnly.hasNewer).toBe(true);
+    expect(reads).not.toHaveBeenCalled(); // identity observed, zero records consumed
+    reads.mockRestore();
+    fs.appendFileSync(file, jsonl([{ type: "message_end", message }]));
+    const inode = fs.statSync(file).ino;
+    const compacted = compactTerminalRunLog(file, "failed");
+    expect(compacted).toMatchObject({ compacted: 1 });
+    expect(compacted.error).toBeUndefined();
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const records = fs.readFileSync(file, "utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
+    expect(records[1].resultMetadata).toEqual({ customFlag: result.customFlag });
+    expect(records[2]).toEqual({ type: "message_end", message });
+    const completed = reader.loadNewer()!;
+    expect(completed.messages).toEqual([message]);
+    expect(completed.streaming.tools).toEqual([{ toolCallId: message.toolCallId, toolName: "bash", args,
+      status: "failed", executionStarted: true, argsComplete: true, isError: true,
+      result: { content: message.content, details: message.details } }]);
+    expect(completed.error).toBeUndefined();
+    expect(completed.unavailable).toBeUndefined();
+    expect(completed.hasNewer).toBe(false);
+    const settledReads = vi.spyOn(fs, "readSync");
+    expect(reader.loadNewer()!.messages).toEqual([message]);
+    expect(reader.read(input, true).messages).toEqual([message]);
+    expect(settledReads).not.toHaveBeenCalled();
+    reader.clear();
+  });
+
+  it.each([
+    ["missing", true], ["missing", false], ["initial EIO", true], ["initial EIO", false],
+    ["readable", true], ["readable", false], ["loadLatest EIO", true], ["loadLatest EIO", false],
+  ] as const)("consumes canonical after %s recovery and production replacement (follow=%s)", (failure, follow) => {
+    const file = path.join(makeWorkspace(), "events.jsonl");
+    const toolCallId = "recovered-call";
+    const args = { command: "model-free", nested: { keep: [1, 2] } };
+    const content = [{ type: "text", text: "full-result:" + "x".repeat(4000) }];
+    const details = { exact: { audits: [{ id: "nested-call", args: { path: "whole" } }] } };
+    const result = { content, details, customFlag: { retained: true } };
+    const partial = { content: [{ type: "text", text: "partial-only" }], details: { progress: 1 } };
+    const prefix = jsonl([
+      { type: "tool_execution_start", toolCallId, toolName: "bash", args },
+      { type: "tool_execution_update", toolCallId, partialResult: partial },
+      { type: "tool_execution_end", toolCallId, toolName: "bash", result, isError: true },
+    ]);
+    const canonical = { role: "toolResult", toolCallId, toolName: "bash", content, details, isError: true, timestamp: 9,
+      metadata: { provenance: "canonical-only", padding: "m".repeat(600) } };
+    const reader = new NativeConversationReader();
+    // Explicit eventsFile attaches a window even while the source is absent;
+    // logFile classification would instead defer attaching the missing file.
+    const input = source({ eventsFile: file });
+    if (failure !== "missing") fs.writeFileSync(file, prefix);
+    const realRead = fs.readSync.bind(fs);
+    let injected = 0;
+    let failedFd = -1;
+    const fault = failure === "initial EIO" ? vi.spyOn(fs, "readSync").mockImplementation(((...values: Parameters<typeof fs.readSync>) => {
+      if (/readBackwardPage|readForwardPage/.test(new Error().stack ?? "")) {
+        injected++;
+        failedFd = values[0];
+        throw Object.assign(new Error("initial page EIO"), { code: "EIO" });
+      }
+      return realRead(...values);
+    }) as typeof fs.readSync) : undefined;
+    // Keep same-call admission unavailable after the initial page fault; a
+    // pinned ingest otherwise clears unavailable without reading any page.
+    const realOpen = fs.openSync.bind(fs);
+    let admissionFailures = 0;
+    const admission = failure === "initial EIO" ? vi.spyOn(fs, "openSync").mockImplementation(((...values: Parameters<typeof fs.openSync>) => {
+      if ((new Error().stack ?? "").includes("growFile")) {
+        admissionFailures++;
+        throw Object.assign(new Error("initial retry EIO"), { code: "EIO" });
+      }
+      return realOpen(...values);
+    }) as typeof fs.openSync) : undefined;
+    const initial = reader.read(input, false);
+    fault?.mockRestore();
+    admission?.mockRestore();
+    if (failure === "missing" || failure === "initial EIO") {
+      expect(initial.messages).toEqual([]);
+      expect(initial.streaming.tools).toEqual([]);
+      expect(initial.eventsFile).toBe(file);
+      expect(initial.unavailable?.eventsFile).toBe(true);
+      if (failure === "initial EIO") {
+        expect(injected).toBe(1); // actual initial page read failed
+        expect(admissionFailures).toBe(1); // same-call retry could not erase the failure
+        expect(() => fs.fstatSync(failedFd)).toThrow();
+      }
+    }
+    if (failure === "missing") fs.writeFileSync(file, prefix);
+    // Both geometries actually consume the live prefix before pinning.
+    const recovered = reader.read(input, true);
+    expect(recovered.unavailable).toBeUndefined();
+    expect(recovered.messages).toEqual([]);
+    expect(recovered.streaming.tools).toHaveLength(1);
+    expect(recovered.streaming.tools[0]).toMatchObject({ toolCallId, toolName: "bash", args, executionStarted: true,
+      argsComplete: true, status: "failed", isError: true, result: { content, details }, partial });
+    if (failure === "loadLatest EIO") {
+      let latestInjected = 0;
+      const latestFault = vi.spyOn(fs, "readSync").mockImplementation(((...values: Parameters<typeof fs.readSync>) => {
+        if (/readBackwardPage|readForwardPage/.test(new Error().stack ?? "")) {
+          latestInjected++;
+          throw Object.assign(new Error("loadLatest page EIO"), { code: "EIO" });
+        }
+        return realRead(...values);
+      }) as typeof fs.readSync);
+      const latestAdmission = vi.spyOn(fs, "openSync").mockImplementation(((...values: Parameters<typeof fs.openSync>) => {
+        if ((new Error().stack ?? "").includes("growFile")) throw Object.assign(new Error("loadLatest retry EIO"), { code: "EIO" });
+        return realOpen(...values);
+      }) as typeof fs.openSync);
+      const failedLatest = reader.loadLatest()!;
+      latestFault.mockRestore();
+      latestAdmission.mockRestore();
+      expect(latestInjected).toBeGreaterThan(0);
+      expect(failedLatest.unavailable?.eventsFile).toBe(true);
+      // The previously consumed live prefix is still the coverage bookmark.
+      expect(failedLatest.streaming.tools[0]?.result).toEqual({ content, details });
+    }
+    if (!follow) expect(reader.read(input, false).streaming.tools).toEqual(recovered.streaming.tools);
+    fs.appendFileSync(file, jsonl([{ type: "message_end", message: canonical }]));
+    const inode = fs.statSync(file).ino;
+    const compacted = compactTerminalRunLog(file, "failed");
+    expect(compacted).toMatchObject({ compacted: 1 });
+    expect(compacted.error).toBeUndefined();
+    expect(fs.statSync(file).ino).not.toBe(inode);
+    const bytes = fs.readFileSync(file);
+    const lines = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
+    expect(lines[2].resultMetadata).toEqual({ customFlag: result.customFlag });
+    expect(lines[2].result).toEqual({ elided: true, bytes: Buffer.byteLength(JSON.stringify(result)) });
+    expect(lines[3]).toEqual({ type: "message_end", message: canonical });
+    const canonicalStart = bytes.indexOf(Buffer.from('{"type":"message_end"'));
+    const consumed = Buffer.byteLength(prefix);
+    // A stale byte cursor lands inside the canonical JSON, not at a boundary
+    // or beyond EOF. This is the reviewer geometry, produced by the real writer.
+    expect(canonicalStart).toBeGreaterThan(0);
+    expect(canonicalStart).toBeLessThan(consumed);
+    expect(consumed).toBeLessThan(bytes.length);
+    expect(() => JSON.parse(bytes.subarray(consumed).toString("utf8"))).toThrow();
+    const refreshed = reader.read({ ...input, status: "failed" }, follow);
+    if (!follow) {
+      expect(refreshed.messages).toEqual([]);
+      expect(refreshed.hasNewer).toBe(true);
+      expect.soft(refreshed.streaming.tools[0]?.result).toBeUndefined(); // still reach the canonical-loss assertion
+      expect(refreshed.streaming.tools[0]?.partial).toEqual(partial);
+    }
+    const completed = follow ? refreshed : reader.loadNewer()!;
+    expect(completed.messages).toEqual([canonical]);
+    expect(completed.streaming.tools).toHaveLength(1);
+    expect(completed.streaming.tools[0]).toEqual({ toolCallId, toolName: "bash", args, executionStarted: true,
+      argsComplete: true, status: "failed", isError: true, result: { content, details }, partial });
+    expect(completed.error).toBeUndefined();
+    expect(completed.unavailable).toBeUndefined();
+    expect(completed.hasMore).toBe(false); // no session branch is required for events-only sources
+    expect(completed.hasNewer).toBe(false);
+    const reads = vi.spyOn(fs, "readSync");
+    expect(reader.read({ ...input, status: "failed" }, true).messages).toEqual([canonical]);
+    expect(reader.loadNewer()!.messages).toEqual([canonical]);
+    expect(reads).not.toHaveBeenCalled(); // settled repeated reads are quiescent
+    reader.clear();
+  });
+});
+
 describe("native conversation reader — unavailable files", () => {
   it("reports unreadable sources through bounded fields without throwing", () => {
     const reader = new NativeConversationReader();

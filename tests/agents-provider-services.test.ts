@@ -162,7 +162,8 @@ describe("agents provider message routing service boundaries", () => {
       expect(await result).toMatchObject({ value: { queued: true } });
       expect(ensureActor).toHaveBeenCalledWith("actor");
       expect(ports.control.request).toHaveBeenLastCalledWith("resident", "actor", "followUp",
-        { message: "immediate", data: undefined }, live.ownerIdentityId, { routedRemoteHost: null });
+        { message: "immediate", data: undefined, bindingProvenance: { kind: "owner-defaults", rootId: "main" } },
+        live.ownerIdentityId, { routedRemoteHost: null });
       expect(ports.main.deliverAgent).not.toHaveBeenCalled();
       expect(Date.now() - started).toBeLessThanOrEqual(40_000);
       // Dead does not mean immediately reclaimable: latency is bounded by the mesh stale window.

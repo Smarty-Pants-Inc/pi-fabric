@@ -11,6 +11,7 @@ import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import type { FabricActorDeliveryRequest, FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -87,6 +88,118 @@ const visiblePiModels = [
 ];
 
 describe("fleet model policy (#2490)", () => {
+  it.each(["session", "durable"] as const)("round 3 F3 refuses an unknown Veda backend default before %s admission", async residency => {
+    const state = setup([], [], undefined, { agentsConfig: { runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], veda: { binary: DEFAULT_FABRIC_CONFIG.agents.veda.binary, persona: DEFAULT_FABRIC_CONFIG.agents.veda.persona, backend: "pi" } } });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("spawn", { task: "review", residency }, context)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", message: expect.stringContaining("default") });
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(state.root, "runs"))).toBe(false);
+      if (residency === "session") {
+        const allowed = await state.provider.invoke("spawn", { task: "review", model: "veda/cliproxyapi/gpt-6.1-sol", transport: "process" }, context) as AgentHandleInfo;
+        expect((await state.agents.wait(allowed.id)).status).toBe("completed");
+        state.agents.config.veda.model = "veda/cliproxyapi/gpt-6.1-sol";
+        const configured = await state.provider.invoke("spawn", { task: "review", transport: "process" }, context) as AgentHandleInfo;
+        expect((await state.agents.wait(configured.id)).status).toBe("completed");
+      }
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each((["create", "global-create", "import", "session-set", "project-set", "global-set"] as const)
+    .flatMap(operation => (["Escape", "deadline", "revocation"] as const).map(ending => [operation, ending] as const)))("round 3 F4 public cancellation during refresh leaves %s uncommitted (%s)", async (operation, ending) => {
+    const state = setup();
+    const { provider, actors, globalActors, agents, root, mesh } = state;
+    let args: Record<string, unknown> = { name: "late-subscriber", instructions: "Review.", model: "provider/late", topics: ["round3.work"] };
+    const action = operation.endsWith("set") ? "setModel" : operation === "import" ? "import" : "create";
+    if (operation === "global-create") args.scope = "global";
+    if (operation.endsWith("set")) {
+      const target = operation === "global-set"
+        ? globalActors.create({ name: "original", instructions: "Review.", model: "provider/model-a" })
+        : await actors.create({ name: "original", instructions: "Review.", model: "provider/model-a" });
+      args = { id: target.id, model: "provider/late", scope: operation.split("-")[0] };
+    } else if (operation === "import") {
+      const template = globalActors.create({ name: "late-subscriber", instructions: "Review.", model: "provider/late", topics: ["round3.work"] });
+      args = { id: template.id };
+    }
+    const beforeActors = actors.list(); const beforeTemplates = globalActors.list();
+    const snapshot = (directory: string): Record<string, string> => {
+      const result: Record<string, string> = {};
+      const visit = (at: string) => { if (!fs.existsSync(at)) return; for (const entry of fs.readdirSync(at, { withFileTypes: true })) {
+        const file = path.join(at, entry.name); if (entry.isDirectory()) visit(file); else result[path.relative(directory, file)] = fs.readFileSync(file, "utf8");
+      } }; visit(directory); return result;
+    };
+    const beforeFiles = snapshot(path.join(root, "actors"));
+    const beforePresence = mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 });
+    const beforePresenceKeys = mesh.listAll("actors/presence/").map(entry => entry.key);
+    let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+    let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+    let finished!: () => void; const done = new Promise<void>(resolve => { finished = resolve; });
+    let refreshed = false;
+    const modelRegistry = { getAvailable: () => refreshed ? [...visiblePiModels, { provider: "provider", id: "late" }] : visiblePiModels,
+      async refresh() { enter(); await held; refreshed = true; } };
+    const invoke = provider.invoke.bind(provider);
+    const spy = vi.spyOn(provider, "invoke").mockImplementation(async (...params) => { try { return await invoke(...params); } finally { finished(); } });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+    if (ending === "deadline") config.executor.timeoutMs = 1_000;
+    const registry = new ActionRegistry(); registry.register(provider);
+    const service = new FabricExecutionService(registry, config);
+    const abort = new AbortController();
+    try {
+      const running = service.execute({ code: `return await agents.${action}(${JSON.stringify(args)});`, signal: abort.signal, parentToolCallId: "round3-cancel",
+        context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false, modelRegistry } as unknown as ExtensionContext, onPartial() {} });
+      await entered;
+      if (ending === "Escape") abort.abort(new Error("Escape"));
+      if (ending === "revocation") registry.revokeProvider("agents");
+      expect((await running).success).toBe(false);
+      release(); await done;
+      expect(actors.list()).toEqual(beforeActors);
+      expect(globalActors.list()).toEqual(beforeTemplates);
+      expect(snapshot(path.join(root, "actors"))).toEqual(beforeFiles);
+      expect(mesh.listAll("actors/presence/").map(entry => entry.key)).toEqual(beforePresenceKeys);
+      expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 })).toEqual(beforePresence);
+      await mesh.publish({ topic: "round3.work", from: state.identity, data: { task: "never activate cancelled actor" } });
+      // Allow several real actor-monitor polls; a leaked subscription must not
+      // start work after the caller has already received cancellation.
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(agents.list()).toEqual([]);
+      expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 })).toEqual(beforePresence);
+      // An uncancelled call using the same now-resolved model remains supported.
+      spy.mockRestore();
+      await expect(provider.invoke(action, args, { ...context, extensionContext: { modelRegistry } as unknown as ExtensionContext })).resolves.toMatchObject({ model: "provider/late" });
+    } finally { release(); await done; spy.mockRestore(); }
+  });
+
+  it("round 3 F4 public cancellation under the binding lock cannot change a local overlay", async () => {
+    const { provider, actors, root } = setup();
+    const actor = await actors.create({ name: "locked", instructions: "Review.", model: "provider/model-a" });
+    await actors.setThinking(actor.id, "low", "session");
+    const bindings = path.join(root, "actors", "bindings");
+    const bindingFile = path.join(bindings, fs.readdirSync(bindings).find(file => file.endsWith(".json"))!);
+    const bytes = fs.readFileSync(bindingFile, "utf8"); const before = actors.status(actor.id);
+    const lock = `${bindingFile}.lock`; fs.mkdirSync(lock);
+    fs.writeFileSync(path.join(lock, "owner"), `held-by-test\n${process.pid}\n${Date.now()}\n`);
+    let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+    let finished!: () => void; const done = new Promise<void>(resolve => { finished = resolve; });
+    const original = ActorBindingStore.prototype.setModel;
+    const spy = vi.spyOn(ActorBindingStore.prototype, "setModel").mockImplementation(async function (this: ActorBindingStore, ...args) {
+      enter(); try { return await original.apply(this, args); } finally { finished(); }
+    });
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG); config.approvals.agent = "allow";
+    const registry = new ActionRegistry(); registry.register(provider);
+    const service = new FabricExecutionService(registry, config); const abort = new AbortController();
+    try {
+      const running = service.execute({ code: `return await agents.setModel({ id: ${JSON.stringify(actor.id)}, model: "provider/model-b" });`, signal: abort.signal,
+        parentToolCallId: "round3-binding-lock", context: { ...context.extensionContext, cwd: process.cwd(), hasUI: false } as ExtensionContext, onPartial() {} });
+      await entered; abort.abort(new Error("Escape")); expect((await running).success).toBe(false);
+      fs.rmSync(lock, { recursive: true, force: true }); await done;
+      expect(fs.readFileSync(bindingFile, "utf8")).toBe(bytes);
+      expect(actors.status(actor.id)).toEqual(before);
+      spy.mockRestore();
+      await expect(provider.invoke("setModel", { id: actor.id, model: "provider/model-b" }, context)).resolves.toMatchObject({ model: "provider/model-b" });
+    } finally { fs.rmSync(lock, { recursive: true, force: true }); await done; spy.mockRestore(); }
+  });
+
   it.each(["session", "durable"] as const)("review round F1 refuses explicit and default Veda backend selectors before %s submission", async (residency) => {
     const { provider, agents, root } = setup([], [], undefined, { agentsConfig: { runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", model: "veda/cliproxyapi/gpt-6-astra" } } });
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");

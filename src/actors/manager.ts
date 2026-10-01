@@ -512,7 +512,7 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false, beforeCommit }: { asRegistryOwner?: boolean; beforeCommit?: (id: string) => void | Promise<void> } = {},
+    { asRegistryOwner = false, beforeCommit, checkActive }: { asRegistryOwner?: boolean; beforeCommit?: (id: string) => void | Promise<void>; checkActive?: () => void } = {},
   ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
@@ -577,8 +577,12 @@ export class ActorManager {
     const id = randomUUID().replaceAll("-", "");
     // Fence after async validation/model preparation, before even predecessor removal.
     await beforeCommit?.(id);
+    // The async directory/predecessor hook may outlive cancellation. The local
+    // invocation fence must run synchronously next to each persistent effect.
+    checkActive?.();
     // A stopped predecessor may still end a run: its removal finishes behind it, not in the way.
     if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false });
+    checkActive?.();
     const actorDirectory = path.join(this.#actorRoot, id);
     fs.mkdirSync(actorDirectory, { recursive: true, mode: 0o700 });
     const actor: ManagedActor = {

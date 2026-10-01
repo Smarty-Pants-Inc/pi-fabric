@@ -77,7 +77,7 @@ import {
 import { resolvePiModel } from "../core/model-refresh.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
-import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
+import { mainExecutionCeilingAbortReason, throwIfExecutionExpired, withoutMainExecutionCeiling } from "../async-settlement.js";
 import {
   AGENT_WAIT_MAX_MS,
   AgentWaitBoundError,
@@ -493,8 +493,8 @@ export class AgentsProvider implements FabricProvider {
         ? args.runner
         : this.manager.config.runner);
     const model = typeof args.model === "string" ? args.model.trim() : "";
+    this.manager.assertModelAllowed(model || undefined, runner);
     if (!model) return args;
-    this.manager.assertModelAllowed(model, runner);
     if (runner !== "pi") return args;
     const thinking = isFabricThinking(args.thinking) ? args.thinking
       : aliasThinking(this.modelsConfig().aliases, model);
@@ -682,6 +682,8 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<unknown> {
+    const checkCommit = (): void => throwIfExecutionExpired(context);
+    checkCommit();
     switch (actionName) {
       case "run": {
         const main = isInteractiveMain(context.extensionContext);
@@ -1055,9 +1057,10 @@ export class AgentsProvider implements FabricProvider {
           actorRequest(args, context, this.manager, args.scope !== "global", this.callerThinking()), context,
         );
         if (args.scope === "global") {
+          checkCommit();
           return this.globalActors.create(request);
         }
-        const actor = await this.#createActor(request, context.signal);
+        const actor = await this.#createActor(request, context);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;
@@ -1220,6 +1223,7 @@ export class AgentsProvider implements FabricProvider {
           const template = this.globalActors.resolve(id);
           if (!template) throw new Error(`Unknown global actor: ${id}`);
           const resolved = model && template.runner === "pi" ? await this.#resolvePiModel(model, context) : model;
+          checkCommit();
           return this.globalActors.update(template.id, { model: resolved });
         }
         const target = this.#resolveActorTarget(id);
@@ -1239,6 +1243,7 @@ export class AgentsProvider implements FabricProvider {
           id,
           resolvedModel,
           args.scope === "project" ? "project" : "session",
+          checkCommit,
         );
       }
       case "setThinking": {
@@ -1254,7 +1259,7 @@ export class AgentsProvider implements FabricProvider {
           operation: "setThinking", id: resident.id, ...(isFabricThinking(thinking) ? { thinking } : {}),
           scope: args.scope === "project" ? "project" : "session",
         }, context.signal);
-        return this.actorManager.setThinking(id, thinking || undefined, args.scope === "project" ? "project" : "session");
+        return this.actorManager.setThinking(id, thinking || undefined, args.scope === "project" ? "project" : "session", checkCommit);
       }
       case "setTools": {
         const tools = stringArray(args.tools) ?? [];
@@ -1264,7 +1269,7 @@ export class AgentsProvider implements FabricProvider {
         }
         const resident = this.#residentActorOwner(String(args.id));
         if (resident) return this.#setResidentActor(resident, { operation: "setTools", id: resident.id, tools }, context.signal);
-        return this.actorManager.setTools(String(args.id), tools);
+        return this.actorManager.setTools(String(args.id), tools, checkCommit);
       }
       case "setNice": {
         const nice = parseAgentNice(args.nice);
@@ -1295,7 +1300,7 @@ export class AgentsProvider implements FabricProvider {
         if (args.scope === "global") return this.globalActors.update(String(args.id), { activationFilter });
         const resident = this.#residentActorOwner(String(args.id));
         if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter }, context.signal);
-        return this.actorManager.setActivationFilter(String(args.id), activationFilter);
+        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit);
       }
       case "setEvents": {
         const events = Array.isArray(args.events)
@@ -1360,7 +1365,7 @@ export class AgentsProvider implements FabricProvider {
         if (global) return this.globalActors.update(id, { instructions });
         const resident = this.#residentActorOwner(id);
         if (resident) return this.#setResidentActor(resident, { operation: "setInstructions", id: resident.id, instructions }, context.signal);
-        return this.actorManager.setInstructions(id, instructions);
+        return this.actorManager.setInstructions(id, instructions, checkCommit);
       }
       case "import": {
         const key =
@@ -1378,7 +1383,7 @@ export class AgentsProvider implements FabricProvider {
         const resolvedRequest = await this.#admitActorRequest(
           actorRequest(request as unknown as Record<string, unknown>, context, this.manager, true, this.callerThinking()), context,
         );
-        const actor = await this.#createActor(resolvedRequest, context.signal);
+        const actor = await this.#createActor(resolvedRequest, context);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;
@@ -1485,7 +1490,10 @@ export class AgentsProvider implements FabricProvider {
     return this.#router.resolveActorTarget(id);
   }
 
-  async #createActor(request: FabricActorRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
+  async #createActor(request: FabricActorRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
+    const { signal } = context;
+    const checkCommit = (): void => throwIfExecutionExpired(context);
+    checkCommit();
     // Also freeze imported templates before any resident host sees the request.
     const extensions = request.extensions ?? true;
     const kernel = this.manager.resolveKernel({ ...request, extensions });
@@ -1496,7 +1504,7 @@ export class AgentsProvider implements FabricProvider {
       extensions,
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
     };
-    if (request.residency !== "durable") return this.actorManager.create(request);
+    if (request.residency !== "durable") return this.actorManager.create(request, { beforeCommit: checkCommit, checkActive: checkCommit });
     // Even the first actor in an empty registry must use the authoritative
     // host's capability check and request fence. A local-create/cede path can
     // publish after cancellation with neither a decision nor a known-ID receipt.

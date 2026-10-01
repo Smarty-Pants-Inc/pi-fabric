@@ -93,6 +93,34 @@ afterEach(async () => {
 });
 
 describe("ActorManager fleet model policy (#2490)", () => {
+  it.each(["hook", "predecessor"] as const)("round 3 F4 rechecks the synchronous invocation fence after %s wait", async wait => {
+    const { actors, root, mesh } = setup(true);
+    const abort = new AbortController();
+    let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
+    let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+    let remove: ReturnType<typeof vi.spyOn> | undefined;
+    if (wait === "predecessor") {
+      const previous = await actors.create({ name: "fenced", instructions: "Previous." });
+      await actors.stop(previous.id);
+      const original = actors.remove.bind(actors);
+      remove = vi.spyOn(actors, "remove").mockImplementation(async (...args) => { const result = await original(...args); enter(); await held; return result; });
+    }
+    const check = () => abort.signal.throwIfAborted();
+    const pending = actors.create({ name: "fenced", instructions: "Never publish after cancellation.", topics: ["round3.work"] }, {
+      async beforeCommit() { check(); if (wait === "hook") { enter(); await held; } }, checkActive: check,
+    }).catch(error => error);
+    try {
+      await entered; abort.abort(new Error("cancelled admission")); release();
+      expect(await pending).toMatchObject({ message: "cancelled admission" });
+      expect(actors.list().filter(actor => actor.name === "fenced")).toEqual([]);
+      const actorRoot = path.join(root, "actors");
+      expect(fs.existsSync(actorRoot) ? fs.readdirSync(actorRoot, { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== "bindings") : []).toEqual([]);
+      expect(mesh.read({ topic: "fabric.actor.lifecycle", limit: 100 }).filter(event => event.kind === "created")).toHaveLength(wait === "hook" ? 0 : 1);
+      remove?.mockRestore();
+      await expect(actors.create({ name: "fenced", instructions: "Allowed control." }, { checkActive() {} })).resolves.toMatchObject({ name: "fenced" });
+    } finally { release(); await pending; remove?.mockRestore(); }
+  });
+
   it.each(["session", "project"] as const)("review round A2 refuses %s clear against the owning Pi fallback and preserves both layers", async (scope) => {
     const denied = "cliproxyapi/gpt-6-astra";
     const allowed = "cliproxyapi/gpt-6.1-sol";

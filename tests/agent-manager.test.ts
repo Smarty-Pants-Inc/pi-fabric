@@ -120,6 +120,22 @@ afterEach(async () => {
 });
 
 describe("AgentManager fleet model admission (#2490)", () => {
+  it("round 3 F3 rejects unknown Veda defaults before queue admission and preserves allowed configured default", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-default-policy-")); roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "veda", deniedModels: ["cliproxyapi/gpt-6-astra"], budgetUsd: 0,
+      veda: { binary: DEFAULT_FABRIC_CONFIG.agents.veda.binary, persona: DEFAULT_FABRIC_CONFIG.agents.veda.persona, backend: "pi" },
+    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root }); managers.push(manager);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "backend default must not launch" })).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root).filter(entry => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
+      manager.config.veda.model = "veda/cliproxyapi/gpt-6.1-sol";
+      expect((await manager.run({ task: "allowed configured default", transport: "process" })).status).toBe("completed");
+      expect(launch).toHaveBeenCalledOnce();
+    } finally { launch.mockRestore(); }
+  });
+
   it.each([
     ["veda", "veda/cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-astra"],
     ["claude", "claude/denied-backend", "denied-backend"],

@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertFabricModelAllowed } from "../core/model-policy.js";
+import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import {
@@ -723,6 +723,13 @@ export class AgentManager {
   }
 
   assertModelAllowed(model: string | undefined, runner?: FabricAgentRunner): void {
+    // Veda owns its backend default. With an active deny policy, absence cannot
+    // prove admission; require a selector before queueing or durable dispatch.
+    if (runner === "veda" && !model?.trim() && this.config.deniedModels.length > 0) {
+      const error = new FabricModelDeniedError("veda/<unresolved-backend-default>", this.config.deniedModelReplacement);
+      error.message = "Fabric cannot admit the unresolved Veda backend default; set agents.veda.model or pass an explicit model. " + error.message;
+      throw error;
+    }
     assertFabricModelAllowed(model, this.config);
     // Admit the exact backend selector sent by each runner's argv builder too.
     if (model && runner === "claude") assertFabricModelAllowed(normalizeClaudeModel(model), this.config);
